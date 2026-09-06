@@ -1,33 +1,33 @@
 # action	Zellij mapping and constraints	Herdr mapping and constraints
-menu:open	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
+menu:open	Muxe menu state; no portable Zellij Action. Separately, `muxe menu/pane open --host zellij` is source-proven to use the origin-client typed bridge for `NewTiledPane` (all four directions) or `NewFloatingPane` overlay with an exact argv/CWD vector and forced menu focus; no transient tab or live-host proof	Broker UI control; no Herdr RPC
 menu:return	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
 menu:quit	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
 menu.page:prev	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
 menu.page:next	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
 config:reload	Broker configuration control; no Zellij RPC	Broker configuration control; no Herdr RPC
-keyboard:send	`Action::Write` or `Action::WriteChars` candidate; current focus only, no target-pane field	`pane.send_keys` or `pane.send_text` to the captured origin pane; keys/text must be strings
+keyboard:send	Origin-targeted `WriteCharsToPaneId`/`WriteToPaneId`; finite bridge encoding supports text/C0/ESC-meta/VT100/CSI modifiers and rejects super/hyper/keypad/media/F13+ precisely	`pane.send_keys` or `pane.send_text` to the captured origin pane; keys/text must be strings
 command:execute	Broker-owned supervised local process; no Zellij RPC	Broker-owned supervised local process; no Herdr RPC
-tab:create	No exact mapping; `NewTab` and `new_tab` use name/cwd/layout semantics, not workspace ID	`tab.create(workspace_id or null)`
+tab:create	Bare action maps to `NewTab`; supplied `workspace-id` is rejected because Zellij has no workspaces	`tab.create(workspace_id or null)`
 tab:close	`Action::CloseTab` or `close_focused_tab`; current focused tab only	`tab.close` on the captured origin tab
-tab:rename	Pending runtime candidate: resolve the captured origin tab index before `RenameTab`; source mapping is not implemented	`tab.rename` on the captured origin tab only when `name` is supplied; bare rename is incompatible
+tab:rename	Name plus captured origin tab index maps to `RenameTab`; bare rename is rejected because Zellij has no prompt variant	`tab.rename` on the captured origin tab only when `name` is supplied; bare rename is incompatible
 tab:focus	Partial: `GoToTab`, `GoToNextTab`, and `GoToPreviousTab`; only index and next/previous	Pending runtime candidate: resolve the requested target through captured-workspace `tab.list` before host focus; source mapping is not implemented
-tab:move	Partial: `MoveTab { direction }`; no portable index destination	Pending runtime candidate: resolve direction through captured-workspace `tab.list` before `tab.move`; source mapping is not implemented
+tab:move	Direction maps to `MoveTab`; index is rejected because Zellij exposes no index destination primitive	Pending runtime candidate: resolve direction through captured-workspace `tab.list` before `tab.move`; source mapping is not implemented
 tab:swap	Pending runtime composition; no source-proven one-to-one Action or shim operation	Nonnegative index only: list captured workspace, make two direct moves, and verify ordering; partial failure has no replay and a lost move response is OutcomeUnknown
 pane:create	`Action::NewPane` or `new_pane`; placement is host-determined in the focused tab	Incompatible
 pane:split	`NewTiledPane` or `NewPane`; adapter must supply nonportable fields and uses the current tab	`pane.split(origin_pane_id, direction)` only for explicit `right` or `down`; no inferred direction
-pane:close	`Action::CloseFocus` or `close_focus`; current focused pane only	`pane.close` on the captured origin pane
-pane:focus	Partial: direct focus actions cover direction; index needs a runtime inventory candidate	Pending runtime candidate: resolve an index/direction through host pane state before focus; source mapping is not implemented
-pane:move	Partial: direct direction action; index needs a runtime inventory candidate	Pending runtime candidate: resolve destination through host pane state; source mapping is not implemented
+pane:close	`CloseFocusByPaneId` on the captured origin pane	`pane.close` on the captured origin pane
+pane:focus	Direction uses bridge-tracked geometry and index uses bridge manifest order; neither falls back to menu-relative focus	Pending runtime candidate: resolve an index/direction through host pane state before focus; source mapping is not implemented
+pane:move	Direction maps to `MovePaneByPaneId` on the captured origin pane; index is rejected because no primitive exists	Pending runtime candidate: resolve destination through host pane state; source mapping is not implemented
 pane:swap	Pending runtime composition; no source-proven one-to-one pinned operation	`pane.swap(origin_pane_id, direction)` only for left/right/up/down
-pane:resize	Partial: `Action::Resize`; no portable scalar amount semantics	`pane.resize(origin_pane_id, direction, optional numeric amount)` only for left/right/up/down
-pane:zoom	Not idempotent; only fullscreen toggles are available	`pane.zoom(origin_pane_id, mode toggle/on/off)`; boolean or omitted input
-pane:fullscreen	Not exposed as idempotent; only a fullscreen toggle exists	Incompatible; no protocol-20 method
-pane:floating	Not exposed as idempotent; only embed/floating toggles exist	Incompatible; no protocol-20 method
-pane:frame	No exact boolean mapping; `SetPaneFrameStyle` requires a style	Incompatible; no protocol-20 method
+pane:resize	`ResizeByPaneId` on the captured origin pane; omitted amount increases, explicit amount is rejected	`pane.resize(origin_pane_id, direction, optional numeric amount)` only for left/right/up/down
+pane:zoom	Bare action maps to `ToggleFocusFullscreenByPaneId`; explicit boolean is rejected	`pane.zoom(origin_pane_id, mode toggle/on/off)`; boolean or omitted input
+pane:fullscreen	Bare action maps to `ToggleFocusFullscreenByPaneId`; explicit boolean is rejected	Incompatible; no protocol-20 method
+pane:floating	Bare action maps to `TogglePaneEmbedOrFloatingByPaneId`; explicit boolean is rejected	Incompatible; no protocol-20 method
+pane:frame	Rejected: `TogglePaneFrames` is menu-relative, not origin-pane targeted	Incompatible; no protocol-20 method
 session:create	No one-to-one plugin API	Incompatible; only read-only `session.snapshot` exists
 session:attach	No one-to-one plugin API	Incompatible; only read-only `session.snapshot` exists
 session:switch	`switch_session(Some(name))` candidate; changes plugin/client session context	Incompatible; only read-only `session.snapshot` exists
 session:rename	`rename_session(name)` candidate; current session context	Incompatible; only read-only `session.snapshot` exists
 session:detach	`detach()` candidate; client/plugin context dependent	Incompatible; only read-only `session.snapshot` exists
-session:quit	Not exposed; `quit_zellij()` terminates the server, not a portable session	Incompatible; only read-only `session.snapshot` exists
-session:kill	Not exposed; `kill_sessions` requires explicit names	Incompatible; only read-only `session.snapshot` exists
+session:quit	Rejected: `quit_zellij()` terminates the server, not one portable session	Incompatible; only read-only `session.snapshot` exists
+session:kill	`kill_sessions([captured origin session])`, distinct from server quit	Incompatible; only read-only `session.snapshot` exists
