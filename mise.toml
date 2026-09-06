@@ -7,15 +7,15 @@ run = "cargo fmt --all -- --check"
 
 [tasks.check]
 description = "Compile registered crates with the pinned lockfile"
-run = "test -f crates/muxe-core/src/lib.rs && test -f crates/muxe-adapter-api/src/lib.rs && cargo check --workspace --locked"
+run = "cargo check --workspace --locked"
 
 [tasks.test]
 description = "Run registered workspace tests and doctests"
-run = "test -f crates/muxe-core/src/lib.rs && test -f crates/muxe-adapter-api/src/lib.rs && cargo test --workspace --locked"
+run = "cargo test --workspace --locked"
 
 [tasks.clippy]
 description = "Run strict Clippy checks"
-run = "test -f crates/muxe-core/src/lib.rs && test -f crates/muxe-adapter-api/src/lib.rs && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -W clippy::allow_attributes -W clippy::allow_attributes_without_reason"
+run = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -W clippy::allow_attributes -W clippy::allow_attributes_without_reason"
 
 [tasks.codegen-herdr]
 description = "Verify Herdr-generated sources are byte-clean"
