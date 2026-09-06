@@ -1,0 +1,1169 @@
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use regex::Regex;
+
+use crate::action::{
+    ActionKind, ActionSpec, CommandAction, ConfigAction, Direction, IndexOrDirection, KeyboardAction,
+    MenuAction, MenuTarget, NativeActionCandidate, PaneAction, PortableAction, PortableActionKind,
+    TabAction,
+};
+use crate::condition::ConditionProgram;
+use crate::config::{
+    merge_values, CompileInput, CompiledConfig, ConfigDocument, ConfigField, ConfigValue,
+    ConfigValueKind, KeyboardProfile, NativeActionValidator,
+};
+use crate::context::{ContextReference, ContextType};
+use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceId, SourceSpan};
+use crate::execution::{
+    AfterAction, ExecutionCapabilities, ExecutionMode, ExecutionPolicy, MenuControlAction,
+    TimeoutAction,
+};
+use crate::key::{CanonicalKey, KeyCapabilities};
+use crate::menu::{
+    binding_index, BindingConditions, BindingId, BindingSettings, CompiledBinding, CompiledGeneration,
+    CompiledMenu, LayoutSettings, MenuId,
+};
+
+const BUILTINS: &str = r#"
+settings:
+  timeout: 10s
+  after_action: quit
+  execution:
+    mode: await
+    timeout: off
+    on-timeout: detach
+    on-menu-control: detach
+inject:
+  Builtin.escape:
+    select: { type: all }
+    action:
+      type: override
+      bindings:
+        esc: { hidden: true, action: "menu:quit" }
+  Builtin.backspace:
+    select: { type: all }
+    action:
+      type: override
+      bindings:
+        backspace: { hidden: true, action: "menu:return" }
+  Builtin.pagination:
+    select: { type: all }
+    action:
+      type: override
+      bindings:
+        left:
+          hidden: true
+          action: "menu.page:prev"
+          conditions: { include: "pages.count > 1", enable: "pages.current > 1" }
+        pgup:
+          hidden: true
+          action: "menu.page:prev"
+          conditions: { include: "pages.count > 1", enable: "pages.current > 1" }
+        right:
+          hidden: true
+          action: "menu.page:next"
+          conditions: { include: "pages.count > 1", enable: "pages.current < pages.count" }
+        pgdn:
+          hidden: true
+          action: "menu.page:next"
+          conditions: { include: "pages.count > 1", enable: "pages.current < pages.count" }
+"#;
+
+pub(crate) fn compile_effective(
+    input: CompileInput,
+    native_validator: Option<&dyn NativeActionValidator>,
+) -> Result<CompiledConfig, Vec<ConfigDiagnostic>> {
+    let builtin = ConfigDocument::parse(SourceId::new("<muxe built-in>"), Arc::<str>::from(BUILTINS))
+        .map_err(|diagnostic| vec![diagnostic])?;
+    let mut root = builtin.root;
+    merge_values(&mut root, input.base.root.clone());
+    if let Some(override_document) = &input.host_override {
+        if let Some(version) = override_document.root.field("version") {
+            return Err(vec![ConfigDiagnostic::error(
+                DiagnosticCode::InvalidVersion,
+                "host override files inherit the base version and may not set `version`",
+                version.name_span.clone(),
+            )]);
+        }
+        merge_values(&mut root, override_document.root.clone());
+    }
+
+    validate_fields(
+        &root,
+        &["version", "keyboard", "settings", "layout", "menus", "inject", "theme", "color-scheme"],
+    )?;
+    validate_version(&root)?;
+    apply_injections(&mut root)?;
+    let keyboard = compile_keyboard(root.field("keyboard").map(|field| &field.value), input.key_capabilities)?;
+    let global_settings = compile_settings(root.field("settings").map(|field| &field.value), EffectiveSettings::default(), false)?;
+    let inactivity_timeout = global_settings.timeout;
+    let global_layout = compile_layout(root.field("layout").map(|field| &field.value), LayoutSettings::default())?;
+
+    let menus_value = required_field(&root, "menus")?;
+    let mut raw_menus = mapping_fields(&menus_value.value, "`menus` must be an ordered mapping")?.to_vec();
+    if raw_menus.is_empty() {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            "`menus` must define at least one root menu",
+            menus_value.value.span.clone(),
+        )]);
+    }
+    let mut inline_counter = 0_u64;
+    let mut inline_menus = Vec::new();
+    for menu in &mut raw_menus {
+        collect_inline_menus(&mut menu.value, &menu.name, &mut inline_counter, &mut inline_menus);
+    }
+    raw_menus.extend(inline_menus);
+    let known_menus = raw_menus.iter().map(|field| field.name.clone()).collect::<BTreeSet<_>>();
+
+    let mut compiler = MenuCompiler {
+        generation: input.generation,
+        keyboard: &keyboard,
+        global_settings,
+        global_layout,
+        known_menus: &known_menus,
+        native_validator,
+        next_binding: 0,
+        diagnostics: Vec::new(),
+    };
+    let mut menus = Vec::with_capacity(raw_menus.len());
+    for menu in &raw_menus {
+        if let Some(menu) = compiler.compile_menu(menu) {
+            menus.push(menu);
+        }
+    }
+    if !compiler.diagnostics.is_empty() {
+        return Err(compiler.diagnostics);
+    }
+    validate_menu_cycles(&menus)?;
+    let bindings = binding_index(&menus);
+    Ok(CompiledConfig { generation: input.generation, keyboard, inactivity_timeout, menus, bindings })
+}
+
+fn validate_version(root: &ConfigValue) -> Result<(), Vec<ConfigDiagnostic>> {
+    let version = required_field(root, "version")?;
+    match version.value.kind {
+        ConfigValueKind::Integer(1) => Ok(()),
+        _ => Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidVersion,
+            "Muxe configuration requires `version: 1`",
+            version.value.span.clone(),
+        )]),
+    }
+}
+
+fn compile_keyboard(
+    value: Option<&ConfigValue>,
+    host_capabilities: KeyCapabilities,
+) -> Result<KeyboardProfile, Vec<ConfigDiagnostic>> {
+    let Some(value) = value else {
+        return Ok(KeyboardProfile::Vt100 { escape_timeout: Duration::from_millis(25) });
+    };
+    validate_fields(value, &["mode", "vt100", "kitty"])?;
+    let mode = optional_string(value, "mode")?.unwrap_or("vt100");
+    match mode {
+        "vt100" => {
+            let timeout = if let Some(field) = value.field("vt100") {
+                validate_fields(&field.value, &["escape-timeout"])?;
+                optional_duration(&field.value, "escape-timeout", false)?
+                    .unwrap_or(Duration::from_millis(25))
+            } else {
+                Duration::from_millis(25)
+            };
+            Ok(KeyboardProfile::Vt100 { escape_timeout: timeout })
+        }
+        "kitty" => {
+            let mut effective = host_capabilities;
+            if let Some(kitty) = value.field("kitty") {
+                validate_fields(
+                    &kitty.value,
+                    &["event-types", "alternate-keys", "all-keys-as-escape-codes"],
+                )?;
+                effective.event_types = keyboard_flag(
+                    &kitty.value,
+                    "event-types",
+                    host_capabilities.event_types,
+                    host_capabilities.event_types,
+                )?;
+                effective.alternate_keys = keyboard_flag(
+                    &kitty.value,
+                    "alternate-keys",
+                    host_capabilities.alternate_keys,
+                    host_capabilities.alternate_keys,
+                )?;
+                effective.all_keys_as_escape_codes = keyboard_flag(
+                    &kitty.value,
+                    "all-keys-as-escape-codes",
+                    host_capabilities.all_keys_as_escape_codes,
+                    host_capabilities.all_keys_as_escape_codes,
+                )?;
+            }
+            Ok(KeyboardProfile::Kitty(effective))
+        }
+        _ => Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            "`keyboard.mode` must be `vt100` or `kitty`",
+            value.field("mode").map_or_else(|| value.span.clone(), |field| field.value.span.clone()),
+        )]),
+    }
+}
+
+fn keyboard_flag(
+    value: &ConfigValue,
+    name: &str,
+    default: bool,
+    supported: bool,
+) -> Result<bool, Vec<ConfigDiagnostic>> {
+    let Some(field) = value.field(name) else { return Ok(default) };
+    let enabled = expect_bool(&field.value, format!("`keyboard.kitty.{name}` must be boolean"))?;
+    if enabled && !supported {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::KeyCapability,
+            format!("`keyboard.kitty.{name}` is not supported by the active adapter"),
+            field.value.span.clone(),
+        )]);
+    }
+    Ok(enabled)
+}
+
+#[derive(Clone)]
+struct EffectiveSettings {
+    timeout: Option<Duration>,
+    after_action: AfterAction,
+    execution: ExecutionPolicy,
+    repeat: Option<bool>,
+}
+
+impl Default for EffectiveSettings {
+    fn default() -> Self {
+        Self {
+            timeout: Some(Duration::from_secs(10)),
+            after_action: AfterAction::Quit,
+            execution: ExecutionPolicy::default(),
+            repeat: None,
+        }
+    }
+}
+
+fn compile_settings(
+    value: Option<&ConfigValue>,
+    mut base: EffectiveSettings,
+    binding: bool,
+) -> Result<EffectiveSettings, Vec<ConfigDiagnostic>> {
+    let Some(value) = value else { return Ok(base) };
+    let allowed = if binding {
+        &["timeout", "after_action", "execution", "repeat"][..]
+    } else {
+        &["timeout", "after_action", "execution", "reload", "host"][..]
+    };
+    validate_fields(value, allowed)?;
+    if let Some(timeout) = value.field("timeout") {
+        base.timeout = parse_duration_value(&timeout.value, true)?;
+    }
+    if let Some(after) = value.field("after_action") {
+        base.after_action = parse_after_action(&after.value)?;
+    }
+    if let Some(repeat) = value.field("repeat") {
+        if !binding {
+            return Err(vec![ConfigDiagnostic::error(
+                DiagnosticCode::UnknownField,
+                "`repeat` is a binding-only setting",
+                repeat.name_span.clone(),
+            )]);
+        }
+        base.repeat = Some(expect_bool(&repeat.value, "`repeat` must be boolean")?);
+    }
+    if let Some(execution) = value.field("execution") {
+        validate_fields(&execution.value, &["mode", "timeout", "on-timeout", "on-menu-control"])?;
+        if let Some(mode) = execution.value.field("mode") {
+            base.execution.mode = match expect_string(&mode.value, "execution mode must be a string")? {
+                "await" => ExecutionMode::Await,
+                "detach" => ExecutionMode::Detach,
+                _ => return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "execution mode must be `await` or `detach`", mode.value.span.clone())]),
+            };
+        }
+        if let Some(timeout) = execution.value.field("timeout") {
+            base.execution.timeout = parse_duration_value(&timeout.value, true)?;
+        }
+        if let Some(action) = execution.value.field("on-timeout") {
+            base.execution.on_timeout = match expect_string(&action.value, "on-timeout must be a string")? {
+                "detach" => TimeoutAction::Detach,
+                "cancel" => TimeoutAction::Cancel,
+                _ => return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "on-timeout must be `detach` or `cancel`", action.value.span.clone())]),
+            };
+        }
+        if let Some(action) = execution.value.field("on-menu-control") {
+            base.execution.on_menu_control = match expect_string(&action.value, "on-menu-control must be a string")? {
+                "detach" => MenuControlAction::Detach,
+                "cancel" => MenuControlAction::Cancel,
+                _ => return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "on-menu-control must be `detach` or `cancel`", action.value.span.clone())]),
+            };
+        }
+    }
+    Ok(base)
+}
+
+fn parse_after_action(value: &ConfigValue) -> Result<AfterAction, Vec<ConfigDiagnostic>> {
+    match expect_string(value, "after_action must be a string")? {
+        "quit" => Ok(AfterAction::Quit),
+        "return" => Ok(AfterAction::Return),
+        "stay" => Ok(AfterAction::Stay),
+        _ => Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            "after_action must be `quit`, `return`, or `stay`",
+            value.span.clone(),
+        )]),
+    }
+}
+
+fn compile_layout(
+    value: Option<&ConfigValue>,
+    mut layout: LayoutSettings,
+) -> Result<LayoutSettings, Vec<ConfigDiagnostic>> {
+    let Some(value) = value else { return Ok(layout) };
+    validate_fields(value, &["padding", "max-item-title-length"])?;
+    if let Some(limit) = value.field("max-item-title-length") {
+        layout.max_item_title_length = nonnegative_u16(&limit.value, "max-item-title-length")?;
+    }
+    if let Some(padding) = value.field("padding") {
+        validate_fields(
+            &padding.value,
+            &["left", "right", "top", "bottom", "between-rows", "between-columns"],
+        )?;
+        let mut resolved = layout.padding;
+        for (name, slot) in [
+            ("left", &mut resolved.left),
+            ("right", &mut resolved.right),
+            ("top", &mut resolved.top),
+            ("bottom", &mut resolved.bottom),
+            ("between-rows", &mut resolved.between_rows),
+            ("between-columns", &mut resolved.between_columns),
+        ] {
+            if let Some(value) = padding.value.field(name) {
+                *slot = nonnegative_u16(&value.value, name)?;
+            }
+        }
+        layout.padding = resolved;
+    }
+    Ok(layout)
+}
+
+fn nonnegative_u16(value: &ConfigValue, name: &str) -> Result<u16, Vec<ConfigDiagnostic>> {
+    match value.kind {
+        ConfigValueKind::Integer(value) if (0..=u16::MAX as i64).contains(&value) => Ok(value as u16),
+        _ => Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            format!("`{name}` must be a non-negative integer no greater than {}", u16::MAX),
+            value.span.clone(),
+        )]),
+    }
+}
+
+struct MenuCompiler<'a> {
+    generation: CompiledGeneration,
+    keyboard: &'a KeyboardProfile,
+    global_settings: EffectiveSettings,
+    global_layout: LayoutSettings,
+    known_menus: &'a BTreeSet<String>,
+    native_validator: Option<&'a dyn NativeActionValidator>,
+    next_binding: u64,
+    diagnostics: Vec<ConfigDiagnostic>,
+}
+
+impl<'a> MenuCompiler<'a> {
+    fn compile_menu(&mut self, field: &ConfigField) -> Option<CompiledMenu> {
+        let mapping = match mapping_fields(&field.value, "a menu must be a mapping") {
+            Ok(mapping) => mapping,
+            Err(mut errors) => {
+                self.diagnostics.append(&mut errors);
+                return None;
+            }
+        };
+        if let Err(mut errors) = validate_fields(&field.value, &["title", "tags", "settings", "layout", "bindings", "_muxe_inline_id"]) {
+            self.diagnostics.append(&mut errors);
+            return None;
+        }
+        let title = match optional_string(&field.value, "title") {
+            Ok(title) => title.map(str::to_owned),
+            Err(mut errors) => {
+                self.diagnostics.append(&mut errors);
+                return None;
+            }
+        };
+        let tags = match string_sequence(field.value.field("tags").map(|field| &field.value), "tags") {
+            Ok(tags) => tags,
+            Err(mut errors) => {
+                self.diagnostics.append(&mut errors);
+                return None;
+            }
+        };
+        let settings = match compile_settings(field.value.field("settings").map(|field| &field.value), self.global_settings.clone(), false) {
+            Ok(settings) => settings,
+            Err(mut errors) => {
+                self.diagnostics.append(&mut errors);
+                return None;
+            }
+        };
+        let layout = match compile_layout(field.value.field("layout").map(|field| &field.value), self.global_layout) {
+            Ok(layout) => layout,
+            Err(mut errors) => {
+                self.diagnostics.append(&mut errors);
+                return None;
+            }
+        };
+        let bindings_value = match field.value.field("bindings") {
+            Some(binding) => &binding.value,
+            None => {
+                self.diagnostics.push(ConfigDiagnostic::error(DiagnosticCode::MissingField, "menu requires `bindings`", field.value.span.clone()));
+                return None;
+            }
+        };
+        let bindings = match mapping_fields(bindings_value, "`bindings` must be an ordered mapping") {
+            Ok(bindings) => bindings,
+            Err(mut errors) => {
+                self.diagnostics.append(&mut errors);
+                return None;
+            }
+        };
+        let mut compiled = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            match self.compile_binding(binding, &settings) {
+                Ok(binding) => compiled.push(binding),
+                Err(mut errors) => self.diagnostics.append(&mut errors),
+            }
+        }
+        let _ = mapping;
+        Some(CompiledMenu {
+            id: MenuId::new(field.name.clone()),
+            title,
+            tags,
+            bindings: compiled,
+            layout,
+        })
+    }
+
+    fn compile_binding(
+        &mut self,
+        field: &ConfigField,
+        menu_settings: &EffectiveSettings,
+    ) -> Result<CompiledBinding, Vec<ConfigDiagnostic>> {
+        validate_fields(&field.value, &["label", "hidden", "action", "settings", "conditions"])?;
+        let key = CanonicalKey::parse_diagnostic(&field.name, field.name_span.clone()).map_err(|error| vec![error])?;
+        let hidden = field.value.field("hidden").map(|field| expect_bool(&field.value, "`hidden` must be boolean")).transpose()?.unwrap_or(false);
+        let label = optional_string(&field.value, "label")?.map(str::to_owned);
+        if !hidden && label.as_deref().is_none_or(str::is_empty) {
+            return Err(vec![ConfigDiagnostic::error(
+                DiagnosticCode::MissingField,
+                "every visible binding requires a non-empty `label`",
+                field.value.span.clone(),
+            )]);
+        }
+        let settings = compile_settings(field.value.field("settings").map(|field| &field.value), menu_settings.clone(), true)?;
+        let action_value = required_field(&field.value, "action")?;
+        let (action, execution) = self.parse_action(&action_value.value)?;
+        validate_execution(&settings.execution, execution, action_value.value.span.clone())?;
+        let profile = match self.keyboard {
+            KeyboardProfile::Vt100 { .. } => KeyCapabilities::default(),
+            KeyboardProfile::Kitty(capabilities) => *capabilities,
+        };
+        let required = key.required_capabilities(settings.repeat);
+        validate_key_capabilities(required, profile, &field.name_span)?;
+        let conditions = compile_conditions(
+            field.value.field("conditions").map(|field| &field.value),
+            matches!(action.kind(), ActionKind::Portable(PortableActionKind::MenuPagePrev | PortableActionKind::MenuPageNext)),
+        )?;
+        let id = BindingId::new(self.generation, self.next_binding);
+        self.next_binding += 1;
+        Ok(CompiledBinding {
+            id,
+            key,
+            label,
+            hidden,
+            action,
+            settings: BindingSettings {
+                after_action: settings.after_action,
+                execution: settings.execution,
+                repeat: settings.repeat,
+            },
+            conditions,
+        })
+    }
+
+    fn parse_action(&self, value: &ConfigValue) -> Result<(ActionSpec, ExecutionCapabilities), Vec<ConfigDiagnostic>> {
+        let (type_name, type_span, fields) = action_fields(value)?;
+        let kind = ActionKind::parse(&type_name).ok_or_else(|| vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidAction,
+            format!("unknown action `{type_name}`"),
+            type_span.clone(),
+        )])?;
+        match kind {
+            ActionKind::Native(_) => {
+                for field in &fields {
+                    validate_context_references(&field.value)?;
+                }
+                let candidate = NativeActionCandidate { type_name, type_span, fields };
+                let Some(validator) = self.native_validator else {
+                    return Err(vec![ConfigDiagnostic::error(
+                        DiagnosticCode::NativeActionRejected,
+                        "native actions require an active adapter validator",
+                        value.span.clone(),
+                    )]);
+                };
+                let validated = validator.validate_native(&candidate).map_err(|diagnostic| vec![diagnostic])?;
+                Ok((ActionSpec::Native(candidate), validated.execution))
+            }
+            ActionKind::Portable(kind) => self.parse_portable(kind, fields, type_span),
+        }
+    }
+
+    fn parse_portable(
+        &self,
+        kind: PortableActionKind,
+        fields: Vec<ConfigField>,
+        span: SourceSpan,
+    ) -> Result<(ActionSpec, ExecutionCapabilities), Vec<ConfigDiagnostic>> {
+        let action = match kind {
+            PortableActionKind::MenuOpen => {
+                let menu = field_named(&fields, "menu");
+                let submenu = field_named(&fields, "submenu");
+                if menu.is_some() == submenu.is_some() {
+                    return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "menu:open requires exactly one of `menu` or `submenu`", span)]);
+                }
+                ensure_action_fields(&fields, &["menu", "submenu"])?;
+                let target = if let Some(menu) = menu {
+                    let target = expect_string(&menu.value, "`menu` must be a menu ID")?.to_owned();
+                    if !self.known_menus.contains(&target) {
+                        return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidMenuReference, format!("unknown menu `{target}`"), menu.value.span.clone())]);
+                    }
+                    MenuTarget::Named(target)
+                } else {
+                    let submenu = submenu.expect("checked");
+                    let inline_id = required_field(&submenu.value, "_muxe_inline_id")?;
+                    let target = expect_string(&inline_id.value, "invalid compiler inline menu ID")?.to_owned();
+                    MenuTarget::Inline(target)
+                };
+                PortableAction::Menu(MenuAction::Open(target))
+            }
+            PortableActionKind::MenuReturn => { ensure_action_fields(&fields, &[])?; PortableAction::Menu(MenuAction::Return) }
+            PortableActionKind::MenuQuit => { ensure_action_fields(&fields, &[])?; PortableAction::Menu(MenuAction::Quit) }
+            PortableActionKind::MenuPagePrev => { ensure_action_fields(&fields, &[])?; PortableAction::Menu(MenuAction::PagePrev) }
+            PortableActionKind::MenuPageNext => { ensure_action_fields(&fields, &[])?; PortableAction::Menu(MenuAction::PageNext) }
+            PortableActionKind::ConfigReload => { ensure_action_fields(&fields, &[])?; PortableAction::Config(ConfigAction::Reload) }
+            PortableActionKind::KeyboardSend => {
+                if field_named(&fields, "sequence").is_some() {
+                    return Err(vec![ConfigDiagnostic::error(DiagnosticCode::UnsupportedFeature, "keyboard:send `sequence` is not supported in schema version 1", field_named(&fields, "sequence").expect("checked").value.span.clone())]);
+                }
+                ensure_action_fields(&fields, &["keys", "text", "sequence"])?;
+                match (field_named(&fields, "keys"), field_named(&fields, "text")) {
+                    (Some(keys), None) => PortableAction::Keyboard(KeyboardAction::SendKeys(parse_key_sequence(&keys.value)?)),
+                    (None, Some(text)) => PortableAction::Keyboard(KeyboardAction::SendText(expect_string(&text.value, "keyboard text must be a string")?.to_owned())),
+                    _ => return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "keyboard:send requires exactly one of `keys` or `text`", span)]),
+                }
+            }
+            PortableActionKind::CommandExecute => {
+                ensure_action_fields(&fields, &["program", "args", "cwd", "env"])?;
+                let program = expect_string(&required_action_field(&fields, "program")?.value, "command program must be a string")?.to_owned();
+                let args = string_sequence(field_named(&fields, "args").map(|field| &field.value), "command args")?;
+                let cwd = field_named(&fields, "cwd").map(|field| field.value.clone());
+                if let Some(cwd) = &cwd {
+                    validate_context_value(cwd, ContextType::AbsolutePath)?;
+                }
+                let env = string_mapping(field_named(&fields, "env").map(|field| &field.value), "command env")?;
+                PortableAction::Command(CommandAction { program, args, cwd, env })
+            }
+            PortableActionKind::TabCreate => { ensure_action_fields(&fields, &[])?; PortableAction::Tab(TabAction::Create) }
+            PortableActionKind::TabClose => { ensure_action_fields(&fields, &[])?; PortableAction::Tab(TabAction::Close) }
+            PortableActionKind::TabRename => {
+                ensure_action_fields(&fields, &["name"])?;
+                PortableAction::Tab(TabAction::Rename { name: field_named(&fields, "name").map(|field| expect_string(&field.value, "tab name must be a string").map(str::to_owned)).transpose()? })
+            }
+            PortableActionKind::TabFocus => PortableAction::Tab(TabAction::Focus(index_or_direction(&fields)?)),
+            PortableActionKind::TabMove => PortableAction::Tab(TabAction::Move(index_or_direction(&fields)?)),
+            PortableActionKind::PaneSplit => {
+                ensure_action_fields(&fields, &["direction"])?;
+                PortableAction::Pane(PaneAction::Split { direction: field_named(&fields, "direction").map(|field| parse_direction(&field.value)).transpose()? })
+            }
+            PortableActionKind::PaneClose => { ensure_action_fields(&fields, &[])?; PortableAction::Pane(PaneAction::Close) }
+            PortableActionKind::PaneFocus => PortableAction::Pane(PaneAction::Focus(index_or_direction(&fields)?)),
+            PortableActionKind::PaneMove => PortableAction::Pane(PaneAction::Move(index_or_direction(&fields)?)),
+            PortableActionKind::PaneSwap => PortableAction::Pane(PaneAction::Swap(index_or_direction(&fields)?)),
+            PortableActionKind::PaneResize => {
+                ensure_action_fields(&fields, &["direction", "amount"])?;
+                let direction = parse_direction(&required_action_field(&fields, "direction")?.value)?;
+                let amount = field_named(&fields, "amount").map(|field| scalar_text(&field.value)).transpose()?;
+                PortableAction::Pane(PaneAction::Resize { direction, amount })
+            }
+            PortableActionKind::PaneZoom => PortableAction::Pane(PaneAction::Zoom { enabled: optional_bool_field(&fields, "enabled")? }),
+        };
+        let capabilities = match kind {
+            PortableActionKind::MenuOpen
+            | PortableActionKind::MenuReturn
+            | PortableActionKind::MenuQuit
+            | PortableActionKind::MenuPagePrev
+            | PortableActionKind::MenuPageNext => ExecutionCapabilities::SYNCHRONOUS,
+            PortableActionKind::CommandExecute => ExecutionCapabilities { awaitable: true, detachable: true, cancellable: true },
+            _ => ExecutionCapabilities::ASYNCHRONOUS,
+        };
+        Ok((ActionSpec::Portable(action), capabilities))
+    }
+}
+
+fn action_fields(value: &ConfigValue) -> Result<(String, SourceSpan, Vec<ConfigField>), Vec<ConfigDiagnostic>> {
+    match &value.kind {
+        ConfigValueKind::String(compact) => compact_action_fields(compact, value.span.clone()),
+        ConfigValueKind::Mapping(fields) => {
+            let type_field = fields.iter().find(|field| field.name == "type").ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::MissingField, "action mapping requires `type`", value.span.clone())])?;
+            let type_name = expect_string(&type_field.value, "action `type` must be a string")?.to_owned();
+            let fields = fields
+                .iter()
+                .filter(|field| field.name != "type")
+                .map(|field| {
+                    Ok(ConfigField {
+                        name: field.name.clone(),
+                        name_span: field.name_span.clone(),
+                        value: normalize_action_value(&field.value)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Vec<ConfigDiagnostic>>>()?;
+            Ok((type_name, type_field.value.span.clone(), fields))
+        }
+        _ => Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidAction, "action must be a compact string or tagged mapping", value.span.clone())]),
+    }
+}
+
+fn normalize_action_value(value: &ConfigValue) -> Result<ConfigValue, Vec<ConfigDiagnostic>> {
+    if let Some(reference) = context_reference(value)? {
+        return Ok(ConfigValue { span: value.span.clone(), kind: ConfigValueKind::Context(reference) });
+    }
+    let kind = match &value.kind {
+        ConfigValueKind::Sequence(values) => ConfigValueKind::Sequence(
+            values.iter().map(normalize_action_value).collect::<Result<_, _>>()?,
+        ),
+        ConfigValueKind::Mapping(fields) => ConfigValueKind::Mapping(
+            fields
+                .iter()
+                .map(|field| {
+                    Ok(ConfigField {
+                        name: field.name.clone(),
+                        name_span: field.name_span.clone(),
+                        value: normalize_action_value(&field.value)?,
+                    })
+                })
+                .collect::<Result<_, Vec<ConfigDiagnostic>>>()?,
+        ),
+        _ => return Ok(value.clone()),
+    };
+    Ok(ConfigValue { span: value.span.clone(), kind })
+}
+
+fn compact_action_fields(value: &str, span: SourceSpan) -> Result<(String, SourceSpan, Vec<ConfigField>), Vec<ConfigDiagnostic>> {
+    let tokens = compact_tokens(value).map_err(|message| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, message, span.clone())])?;
+    let Some((type_name, arguments)) = tokens.split_first() else {
+        return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidAction, "action is empty", span)]);
+    };
+    let kind = ActionKind::parse(type_name).ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidAction, format!("unknown action `{type_name}`"), span.clone())])?;
+    let positional = positional_fields(&kind);
+    let mut fields = Vec::new();
+    let mut named = false;
+    let mut position = 0;
+    let mut seen = HashSet::new();
+    for argument in arguments {
+        let (name, value) = if let Some((name, value)) = argument.split_once('=') {
+            named = true;
+            (name.to_owned(), compact_scalar(value, span.clone()))
+        } else {
+            if named {
+                return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "positional action arguments must precede named arguments", span.clone())]);
+            }
+            let Some(name) = positional.get(position) else {
+                return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "too many positional action arguments", span.clone())]);
+            };
+            position += 1;
+            ((*name).to_owned(), compact_scalar(argument, span.clone()))
+        };
+        if !seen.insert(name.clone()) {
+            return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, format!("duplicate action argument `{name}`"), span.clone())]);
+        }
+        fields.push(ConfigField { name, name_span: span.clone(), value });
+    }
+    Ok((type_name.clone(), span, fields))
+}
+
+fn compact_tokens(value: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+        } else if character == '\\' && quote == Some('"') {
+            escaped = true;
+        } else if matches!(character, '\'' | '"') {
+            match quote {
+                Some(active) if active == character => quote = None,
+                Some(_) => current.push(character),
+                None => quote = Some(character),
+            }
+        } else if character.is_whitespace() && quote.is_none() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    if quote.is_some() || escaped {
+        return Err("unterminated quoted compact action argument".to_owned());
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn compact_scalar(value: &str, span: SourceSpan) -> ConfigValue {
+    let kind = match value {
+        "null" | "~" => ConfigValueKind::Null,
+        "true" => ConfigValueKind::Boolean(true),
+        "false" => ConfigValueKind::Boolean(false),
+        _ => match value.parse::<i64>() {
+            Ok(value) => ConfigValueKind::Integer(value),
+            Err(_) => match value.parse::<f64>() {
+                Ok(value) => ConfigValueKind::Float(value),
+                Err(_) => ConfigValueKind::String(value.to_owned()),
+            },
+        },
+    };
+    ConfigValue { span, kind }
+}
+
+fn positional_fields(kind: &ActionKind) -> &'static [&'static str] {
+    match kind {
+        ActionKind::Portable(PortableActionKind::MenuOpen) => &["menu"],
+        ActionKind::Portable(PortableActionKind::PaneSplit) => &["direction"],
+        ActionKind::Portable(PortableActionKind::TabFocus | PortableActionKind::PaneFocus) => &["index"],
+        ActionKind::Portable(PortableActionKind::TabMove | PortableActionKind::PaneMove | PortableActionKind::PaneSwap) => &["direction"],
+        _ => &[],
+    }
+}
+
+fn validate_execution(policy: &ExecutionPolicy, capabilities: ExecutionCapabilities, span: SourceSpan) -> Result<(), Vec<ConfigDiagnostic>> {
+    if policy.mode == ExecutionMode::Await && !capabilities.awaitable && capabilities.detachable {
+        return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "action cannot be awaited", span)]);
+    }
+    if policy.mode == ExecutionMode::Detach && !capabilities.detachable && capabilities.awaitable {
+        return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "action cannot be detached", span)]);
+    }
+    if policy.execution_timeout_is_cancel() && !capabilities.cancellable {
+        return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "on-timeout: cancel requires a cancellable action", span)]);
+    }
+    if policy.on_menu_control == MenuControlAction::Cancel && !capabilities.cancellable {
+        return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "on-menu-control: cancel requires a cancellable action", span)]);
+    }
+    Ok(())
+}
+
+trait ExecutionPolicyExt {
+    fn execution_timeout_is_cancel(&self) -> bool;
+}
+
+impl ExecutionPolicyExt for ExecutionPolicy {
+    fn execution_timeout_is_cancel(&self) -> bool {
+        self.timeout.is_some() && self.on_timeout == TimeoutAction::Cancel
+    }
+}
+
+fn validate_key_capabilities(required: KeyCapabilities, active: KeyCapabilities, span: &SourceSpan) -> Result<(), Vec<ConfigDiagnostic>> {
+    let unavailable = (required.event_types && !active.event_types)
+        || (required.alternate_keys && !active.alternate_keys)
+        || (required.all_keys_as_escape_codes && !active.all_keys_as_escape_codes);
+    unavailable.then(|| vec![ConfigDiagnostic::error(DiagnosticCode::KeyCapability, "binding requires a disabled keyboard capability", span.clone())]).map_or(Ok(()), Err)
+}
+
+fn compile_conditions(value: Option<&ConfigValue>, pager: bool) -> Result<BindingConditions, Vec<ConfigDiagnostic>> {
+    let Some(value) = value else { return Ok(BindingConditions::default()) };
+    validate_fields(value, &["include", "enable", "show"])?;
+    let compile = |name: &str| -> Result<Option<ConditionProgram>, Vec<ConfigDiagnostic>> {
+        let Some(field) = value.field(name) else { return Ok(None) };
+        let source = expect_string(&field.value, "condition must be a CEL string")?;
+        let program = ConditionProgram::compile(source, field.value.span.clone()).map_err(|error| vec![error])?;
+        if program.uses_pages() && !pager {
+            return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidCondition, "`pages.*` is available only to pager bindings", field.value.span.clone())]);
+        }
+        Ok(Some(program))
+    };
+    Ok(BindingConditions { include: compile("include")?, enable: compile("enable")?, show: compile("show")? })
+}
+
+fn apply_injections(root: &mut ConfigValue) -> Result<(), Vec<ConfigDiagnostic>> {
+    let injections = root.field("inject").map(|field| field.value.clone());
+    let Some(injections) = injections else { return Ok(()) };
+    let injections = mapping_fields(&injections, "`inject` must be an ordered mapping")?.to_vec();
+    let menus = required_field_mut(root, "menus")?;
+    for injection in injections {
+        let spec = Injection::parse(&injection)?;
+        apply_injection_to_menus(&mut menus.value, &spec)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct Injection {
+    selector: Selector,
+    defaults: bool,
+    patch: ConfigValue,
+}
+
+impl Injection {
+    fn parse(field: &ConfigField) -> Result<Self, Vec<ConfigDiagnostic>> {
+        validate_fields(&field.value, &["select", "action"])?;
+        let select = required_field(&field.value, "select")?;
+        validate_fields(&select.value, &["type", "value"])?;
+        let selector_type = expect_string(&required_field(&select.value, "type")?.value, "selector type must be string")?;
+        let selector_value = select.value.field("value").map(|field| expect_string(&field.value, "selector value must be string").map(str::to_owned)).transpose()?;
+        let selector = Selector::parse(selector_type, selector_value, select.value.span.clone())?;
+        let action = required_field(&field.value, "action")?;
+        validate_fields(&action.value, &["type", "bindings", "title", "tags", "settings"])?;
+        let defaults = match expect_string(&required_field(&action.value, "type")?.value, "injection action type must be string")? {
+            "override" => false,
+            "defaults" => true,
+            _ => return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidInjection, "injection action type must be `override` or `defaults`", action.value.span.clone())]),
+        };
+        let mut patch = action.value.clone();
+        patch.remove_field("type");
+        Ok(Self { selector, defaults, patch })
+    }
+}
+
+#[derive(Clone)]
+enum Selector {
+    All,
+    IdExact(String),
+    IdRegex(Regex),
+    TitleExact(String),
+    TitleRegex(Regex),
+    TagsContain(String),
+}
+
+impl Selector {
+    fn parse(kind: &str, value: Option<String>, span: SourceSpan) -> Result<Self, Vec<ConfigDiagnostic>> {
+        let require = |value: Option<String>| value.ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::MissingField, "selector requires `value`", span.clone())]);
+        match kind {
+            "all" => Ok(Self::All),
+            "id:exact" => Ok(Self::IdExact(require(value)?)),
+            "id:regex" => Regex::new(&require(value)?).map(Self::IdRegex).map_err(|error| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidInjection, error.to_string(), span)]),
+            "title:exact" => Ok(Self::TitleExact(require(value)?)),
+            "title:regex" => Regex::new(&require(value)?).map(Self::TitleRegex).map_err(|error| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidInjection, error.to_string(), span)]),
+            "tags:contain" => Ok(Self::TagsContain(require(value)?)),
+            _ => Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidInjection, "unknown injection selector", span)]),
+        }
+    }
+
+    fn matches(&self, menu: &ConfigValue, id: Option<&str>) -> bool {
+        let title = menu.field("title").and_then(|field| field.value.as_str());
+        let tags = menu.field("tags").and_then(|field| match &field.value.kind { ConfigValueKind::Sequence(values) => Some(values.iter().filter_map(ConfigValue::as_str)), _ => None });
+        match self {
+            Self::All => true,
+            Self::IdExact(expected) => id == Some(expected),
+            Self::IdRegex(regex) => id.is_some_and(|id| regex.is_match(id)),
+            Self::TitleExact(expected) => title == Some(expected),
+            Self::TitleRegex(regex) => title.is_some_and(|title| regex.is_match(title)),
+            Self::TagsContain(expected) => tags.is_some_and(|mut tags| tags.any(|tag| tag == expected)),
+        }
+    }
+}
+
+fn apply_injection_to_menus(menus: &mut ConfigValue, injection: &Injection) -> Result<(), Vec<ConfigDiagnostic>> {
+    let menu_fields = mapping_fields_mut(menus, "`menus` must be an ordered mapping")?;
+    for menu in menu_fields {
+        apply_injection_to_menu(&mut menu.value, Some(&menu.name), injection)?;
+    }
+    Ok(())
+}
+
+fn apply_injection_to_menu(menu: &mut ConfigValue, id: Option<&str>, injection: &Injection) -> Result<(), Vec<ConfigDiagnostic>> {
+    if injection.selector.matches(menu, id) {
+        if injection.defaults {
+            merge_defaults(menu, &injection.patch);
+        } else {
+            merge_values(menu, injection.patch.clone());
+        }
+    }
+    if let Some(bindings) = menu.field_mut("bindings") {
+        if let Some(bindings) = bindings.value.as_mapping_mut() {
+            for binding in bindings {
+                if let Some(action) = binding.value.field_mut("action") {
+                    if let Some(submenu) = action.value.field_mut("submenu") {
+                        apply_injection_to_menu(&mut submenu.value, None, injection)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_defaults(target: &mut ConfigValue, defaults: &ConfigValue) {
+    let (Some(target), Some(defaults)) = (target.as_mapping_mut(), defaults.as_mapping()) else { return };
+    for default in defaults {
+        if let Some(existing) = target.iter_mut().find(|field| field.name == default.name) {
+            merge_defaults(&mut existing.value, &default.value);
+        } else {
+            target.push(default.clone());
+        }
+    }
+}
+
+fn collect_inline_menus(menu: &mut ConfigValue, parent: &str, next: &mut u64, output: &mut Vec<ConfigField>) {
+    let mut discovered = Vec::new();
+    if let Some(bindings) = menu.field_mut("bindings").and_then(|field| field.value.as_mapping_mut()) {
+        for binding in bindings {
+            let Some(action) = binding.value.field_mut("action") else { continue };
+            let Some(submenu) = action.value.field_mut("submenu") else { continue };
+            if submenu.value.as_mapping().is_none() { continue }
+            let id = format!("{parent}@{}", *next);
+            *next += 1;
+            let marker = ConfigField { name: "_muxe_inline_id".to_owned(), name_span: submenu.value.span.clone(), value: ConfigValue::string(id.clone()) };
+            submenu.value.as_mapping_mut().expect("checked").push(marker);
+            let mut inline = ConfigField { name: id, name_span: submenu.name_span.clone(), value: submenu.value.clone() };
+            collect_inline_menus(&mut inline.value, &inline.name, next, output);
+            discovered.push(inline);
+        }
+    }
+    output.extend(discovered);
+}
+
+fn validate_menu_cycles(menus: &[CompiledMenu]) -> Result<(), Vec<ConfigDiagnostic>> {
+    let graph = menus
+        .iter()
+        .map(|menu| {
+            let edges = menu.bindings.iter().filter_map(|binding| match &binding.action {
+                ActionSpec::Portable(PortableAction::Menu(MenuAction::Open(MenuTarget::Named(target) | MenuTarget::Inline(target)))) => Some(target.clone()),
+                _ => None,
+            }).collect::<Vec<_>>();
+            (menu.id.as_str().to_owned(), edges)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for node in graph.keys() {
+        if detect_cycle(node, &graph, &mut visiting, &mut visited) {
+            return Err(vec![ConfigDiagnostic::error(DiagnosticCode::MenuCycle, format!("menu reference cycle includes `{node}`"), SourceSpan::new(SourceId::new("<compiled configuration>"), 0, 0))]);
+        }
+    }
+    Ok(())
+}
+
+fn detect_cycle(
+    node: &str,
+    graph: &BTreeMap<String, Vec<String>>,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if visited.contains(node) { return false }
+    if !visiting.insert(node.to_owned()) { return true }
+    let cycle = graph.get(node).is_some_and(|edges| edges.iter().any(|edge| detect_cycle(edge, graph, visiting, visited)));
+    visiting.remove(node);
+    visited.insert(node.to_owned());
+    cycle
+}
+
+fn validate_context_references(value: &ConfigValue) -> Result<(), Vec<ConfigDiagnostic>> {
+    if let Some(reference) = context_reference(value)? {
+        let _ = reference;
+        return Ok(());
+    }
+    match &value.kind {
+        ConfigValueKind::Sequence(values) => {
+            for value in values { validate_context_references(value)?; }
+        }
+        ConfigValueKind::Mapping(fields) => {
+            for field in fields { validate_context_references(&field.value)?; }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_context_value(value: &ConfigValue, expected: ContextType) -> Result<(), Vec<ConfigDiagnostic>> {
+    if let Some(reference) = context_reference(value)? {
+        if reference.expected_type() != expected {
+            return Err(vec![ConfigDiagnostic::error(DiagnosticCode::ContextTypeMismatch, "context reference has an incompatible parameter type", value.span.clone())]);
+        }
+    } else if value.as_str().is_none() {
+        return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "action parameter must be a scalar or context reference", value.span.clone())]);
+    }
+    Ok(())
+}
+fn context_reference(value: &ConfigValue) -> Result<Option<ContextReference>, Vec<ConfigDiagnostic>> {
+    if let ConfigValueKind::Context(reference) = &value.kind {
+        return Ok(Some(reference.clone()));
+    }
+    let Some(mapping) = value.as_mapping() else { return Ok(None) };
+    if mapping.len() != 1 || mapping[0].name != "$context" {
+        return Ok(None);
+    }
+    let path = expect_string(&mapping[0].value, "`$context` must be a string")?;
+    ContextReference::parse(path, mapping[0].value.span.clone()).map(Some).map_err(|error| vec![error])
+}
+
+fn index_or_direction(fields: &[ConfigField]) -> Result<IndexOrDirection, Vec<ConfigDiagnostic>> {
+    ensure_action_fields(fields, &["index", "direction"])?;
+    match (field_named(fields, "index"), field_named(fields, "direction")) {
+        (Some(index), None) => match index.value.kind {
+            ConfigValueKind::Integer(value) if value >= 0 => Ok(IndexOrDirection::Index(value as u64)),
+            _ => Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "index must be a non-negative integer", index.value.span.clone())]),
+        },
+        (None, Some(direction)) => Ok(IndexOrDirection::Direction(parse_direction(&direction.value)?)),
+        _ => Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "action requires exactly one of `index` or `direction`", fields.first().map_or_else(|| SourceSpan::new(SourceId::new("<compact action>"), 0, 0), |field| field.value.span.clone()))]),
+    }
+}
+
+fn parse_direction(value: &ConfigValue) -> Result<Direction, Vec<ConfigDiagnostic>> {
+    match expect_string(value, "direction must be a string")? {
+        "left" => Ok(Direction::Left),
+        "right" => Ok(Direction::Right),
+        "up" => Ok(Direction::Up),
+        "down" => Ok(Direction::Down),
+        "next" => Ok(Direction::Next),
+        "previous" => Ok(Direction::Previous),
+        _ => Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "direction must be left, right, up, down, next, or previous", value.span.clone())]),
+    }
+}
+
+
+fn optional_bool_field(fields: &[ConfigField], name: &str) -> Result<Option<bool>, Vec<ConfigDiagnostic>> {
+    ensure_action_fields(fields, &[name])?;
+    field_named(fields, name).map(|field| expect_bool(&field.value, "value must be boolean")).transpose()
+}
+
+fn parse_key_sequence(value: &ConfigValue) -> Result<Vec<CanonicalKey>, Vec<ConfigDiagnostic>> {
+    let ConfigValueKind::Sequence(values) = &value.kind else { return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "keys must be an array", value.span.clone())]) };
+    values.iter().map(|value| {
+        let key = expect_string(value, "key must be a canonical key string")?;
+        CanonicalKey::parse_diagnostic(key, value.span.clone()).map_err(|error| vec![error])
+    }).collect()
+}
+
+fn string_sequence(value: Option<&ConfigValue>, name: &str) -> Result<Vec<String>, Vec<ConfigDiagnostic>> {
+    let Some(value) = value else { return Ok(Vec::new()) };
+    let ConfigValueKind::Sequence(values) = &value.kind else { return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, format!("{name} must be an array"), value.span.clone())]) };
+    values.iter().map(|value| expect_string(value, format!("{name} values must be strings")).map(str::to_owned)).collect()
+}
+
+fn string_mapping(value: Option<&ConfigValue>, name: &str) -> Result<BTreeMap<String, String>, Vec<ConfigDiagnostic>> {
+    let Some(value) = value else { return Ok(BTreeMap::new()) };
+    mapping_fields(value, &format!("{name} must be a mapping"))?.iter().map(|field| Ok((field.name.clone(), expect_string(&field.value, format!("{name} values must be strings"))?.to_owned()))).collect()
+}
+
+fn scalar_text(value: &ConfigValue) -> Result<String, Vec<ConfigDiagnostic>> {
+    Ok(match &value.kind {
+        ConfigValueKind::String(value) => value.clone(),
+        ConfigValueKind::Integer(value) => value.to_string(),
+        ConfigValueKind::Float(value) => value.to_string(),
+        ConfigValueKind::Boolean(value) => value.to_string(),
+        _ => return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "expected scalar", value.span.clone())]),
+    })
+}
+
+fn optional_duration(value: &ConfigValue, name: &str, off_allowed: bool) -> Result<Option<Duration>, Vec<ConfigDiagnostic>> {
+    value
+        .field(name)
+        .map(|field| parse_duration_value(&field.value, off_allowed))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn parse_duration_value(value: &ConfigValue, off_allowed: bool) -> Result<Option<Duration>, Vec<ConfigDiagnostic>> {
+    let text = expect_string(value, "duration must be a string")?;
+    if text == "off" {
+        return off_allowed.then_some(None).ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "`off` is not valid here", value.span.clone())]);
+    }
+    let parse = |suffix: &str, multiplier: u64| text.strip_suffix(suffix).and_then(|number| number.parse::<u64>().ok()).and_then(|number| number.checked_mul(multiplier)).map(Duration::from_millis);
+    parse("ms", 1).or_else(|| parse("s", 1_000)).or_else(|| parse("m", 60_000)).map(Some).ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, "duration must use ms, s, m, or off", value.span.clone())])
+}
+
+fn required_field<'a>(value: &'a ConfigValue, name: &str) -> Result<&'a ConfigField, Vec<ConfigDiagnostic>> {
+    value.field(name).ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::MissingField, format!("missing required `{name}`"), value.span.clone())])
+}
+
+fn required_field_mut<'a>(value: &'a mut ConfigValue, name: &str) -> Result<&'a mut ConfigField, Vec<ConfigDiagnostic>> {
+    let span = value.span.clone();
+    value.field_mut(name).ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::MissingField, format!("missing required `{name}`"), span)])
+}
+
+fn required_action_field<'a>(fields: &'a [ConfigField], name: &str) -> Result<&'a ConfigField, Vec<ConfigDiagnostic>> {
+    field_named(fields, name).ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::MissingField, format!("action requires `{name}`"), fields.first().map_or_else(|| SourceSpan::new(SourceId::new("<compact action>"), 0, 0), |field| field.value.span.clone()))])
+}
+
+fn field_named<'a>(fields: &'a [ConfigField], name: &str) -> Option<&'a ConfigField> {
+    fields.iter().find(|field| field.name == name)
+}
+
+fn expect_string<'a>(value: &'a ConfigValue, message: impl Into<String>) -> Result<&'a str, Vec<ConfigDiagnostic>> {
+    value.as_str().ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, message.into(), value.span.clone())])
+}
+
+fn optional_string<'a>(value: &'a ConfigValue, name: &str) -> Result<Option<&'a str>, Vec<ConfigDiagnostic>> {
+    value.field(name).map(|field| expect_string(&field.value, format!("`{name}` must be a string"))).transpose()
+}
+
+fn expect_bool(value: &ConfigValue, message: impl Into<String>) -> Result<bool, Vec<ConfigDiagnostic>> {
+    value.as_bool().ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, message.into(), value.span.clone())])
+}
+
+fn mapping_fields<'a>(value: &'a ConfigValue, message: &str) -> Result<&'a [ConfigField], Vec<ConfigDiagnostic>> {
+    value.as_mapping().ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, message, value.span.clone())])
+}
+
+fn mapping_fields_mut<'a>(value: &'a mut ConfigValue, message: &str) -> Result<&'a mut Vec<ConfigField>, Vec<ConfigDiagnostic>> {
+    let span = value.span.clone();
+    value.as_mapping_mut().ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, message, span)])
+}
+
+fn validate_fields(value: &ConfigValue, allowed: &[&str]) -> Result<(), Vec<ConfigDiagnostic>> {
+    let fields = mapping_fields(value, "expected a mapping")?;
+    let mut errors = Vec::new();
+    for field in fields {
+        if !allowed.contains(&field.name.as_str()) && !field.name.starts_with('_') {
+            let suggestion = nearest(&field.name, allowed);
+            let diagnostic = ConfigDiagnostic::error(DiagnosticCode::UnknownField, format!("unknown field `{}`", field.name), field.name_span.clone());
+            errors.push(if let Some(suggestion) = suggestion { diagnostic.with_help(format!("did you mean `{suggestion}`?")) } else { diagnostic });
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+fn ensure_action_fields(fields: &[ConfigField], allowed: &[&str]) -> Result<(), Vec<ConfigDiagnostic>> {
+    let mut errors = Vec::new();
+    for field in fields {
+        if !allowed.contains(&field.name.as_str()) {
+            errors.push(ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, format!("unknown action argument `{}`", field.name), field.name_span.clone()));
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+fn nearest<'a>(value: &str, options: &'a [&str]) -> Option<&'a str> {
+    options.iter().copied().min_by_key(|option| edit_distance(value, option)).filter(|option| edit_distance(value, option) <= 3)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut row = (0..=right.chars().count()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = left_index + 1;
+        for (right_index, right_character) in right.chars().enumerate() {
+            let previous = row[right_index + 1];
+            row[right_index + 1] = (row[right_index + 1] + 1)
+                .min(row[right_index] + 1)
+                .min(diagonal + usize::from(left_character != right_character));
+            diagonal = previous;
+        }
+    }
+    row[right.chars().count()]
+}

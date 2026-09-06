@@ -1,0 +1,11 @@
+[package]
+name = "muxe-adapter-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+muxe-core = { path = "../muxe-core" }
+thiserror.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "muxe-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ariadne.workspace = true
+cel.workspace = true
+minijinja.workspace = true
+regex.workspace = true
+serde.workspace = true
+saphyr.workspace = true
+serde-saphyr.workspace = true
+thiserror.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rstest.workspace = true
