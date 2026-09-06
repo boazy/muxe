@@ -1902,6 +1902,7 @@ name = "muxe-zellij-gen"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "prettyplease",
  "quote",
  "serde",
  "serde_json",
