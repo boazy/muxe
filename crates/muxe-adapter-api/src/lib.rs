@@ -42,8 +42,14 @@ macro_rules! opaque_id {
 
 opaque_id!(UiSessionId, "Opaque broker UI-session identity.");
 opaque_id!(ModalScopeId, "Opaque host modal-scope identity.");
-opaque_id!(CaptureLeaseId, "Opaque exclusive active-input-capture lease identity.");
-opaque_id!(ExecutionCorrelationId, "Adapter correlation identity for a broker execution.");
+opaque_id!(
+    CaptureLeaseId,
+    "Opaque exclusive active-input-capture lease identity."
+);
+opaque_id!(
+    ExecutionCorrelationId,
+    "Adapter correlation identity for a broker execution."
+);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HostKind {
@@ -161,7 +167,9 @@ impl ResolvedNativeAction {
         candidate: &NativeActionCandidate,
         origin: &OriginContext,
     ) -> Result<Self, ContextResolutionError> {
-        Ok(Self { candidate: candidate.resolve_context(origin)? })
+        Ok(Self {
+            candidate: candidate.resolve_context(origin)?,
+        })
     }
 }
 
@@ -206,9 +214,17 @@ pub struct DispatchAccepted {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DispatchCompletion {
-    Succeeded { execution: ExecutionId },
-    Failed { execution: ExecutionId, error: AdapterError },
-    OutcomeUnknown { execution: ExecutionId, error: AdapterError },
+    Succeeded {
+        execution: ExecutionId,
+    },
+    Failed {
+        execution: ExecutionId,
+        error: AdapterError,
+    },
+    OutcomeUnknown {
+        execution: ExecutionId,
+        error: AdapterError,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,12 +235,25 @@ pub enum CaptureLossReason {
 }
 
 pub enum AdapterHealthEvent {
-    Healthy { identity: HostIdentity },
+    Healthy {
+        identity: HostIdentity,
+    },
     /// `None` means server-wide health; `Some` isolates loss to one modal scope.
-    Unhealthy { modal_scope: Option<ModalScopeId>, error: AdapterError },
-    Reconnected { previous: HostIdentity, current: HostIdentity },
-    CaptureReady { lease: CaptureLease },
-    CaptureLost { lease: CaptureLease, reason: CaptureLossReason },
+    Unhealthy {
+        modal_scope: Option<ModalScopeId>,
+        error: AdapterError,
+    },
+    Reconnected {
+        previous: HostIdentity,
+        current: HostIdentity,
+    },
+    CaptureReady {
+        lease: CaptureLease,
+    },
+    CaptureLost {
+        lease: CaptureLease,
+        reason: CaptureLossReason,
+    },
     DispatchCompleted(DispatchCompletion),
 }
 
@@ -238,9 +267,10 @@ pub enum AdapterErrorKind {
     OutcomeUnknown,
     CaptureLost,
     CancelUnsupported,
+    /// The selected host cannot participate in this lifecycle transition.
+    Unsupported,
     Shutdown,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterError {
     pub kind: AdapterErrorKind,
@@ -250,7 +280,11 @@ pub struct AdapterError {
 
 impl AdapterError {
     pub fn new(kind: AdapterErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), diagnostic: None }
+        Self {
+            kind,
+            message: message.into(),
+            diagnostic: None,
+        }
     }
 
     pub fn with_diagnostic(mut self, diagnostic: ConfigDiagnostic) -> Self {
@@ -266,6 +300,20 @@ impl fmt::Display for AdapterError {
 }
 
 impl std::error::Error for AdapterError {}
+
+/// Per-client commit-gate evidence for activation readiness: which current
+/// clients hold a fresh compatible registration in this attempt. Client IDs
+/// and counts only, never payloads. The broker maps this to the protocol
+/// readiness record; adapters that cannot observe per-client registration
+/// report `None` through the default method and the broker gates on adapter
+/// health instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationReadiness {
+    /// Client IDs holding a fresh compatible registration in this attempt.
+    pub registered_clients: Vec<String>,
+    /// Current membership the registrations are measured against.
+    pub member_clients: u64,
+}
 
 /// One constructor-injected adapter per broker. Implementations must retain their own typed host
 /// payloads; bridge envelopes belong to protocol crates and never appear here.
@@ -292,10 +340,16 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
 
     /// Idempotently closes only a revalidated pending UI pane. Implementations must never infer or
     /// close an origin pane/tab from stale launch metadata.
-    async fn close_pending_pane(&self, registration: PendingPaneRegistration) -> Result<(), AdapterError>;
+    async fn close_pending_pane(
+        &self,
+        registration: PendingPaneRegistration,
+    ) -> Result<(), AdapterError>;
 
     /// Captures and enriches a typed immutable origin before dispatchable focus can move.
-    async fn capture_origin(&self, request: OriginCaptureRequest) -> Result<OriginContext, AdapterError>;
+    async fn capture_origin(
+        &self,
+        request: OriginCaptureRequest,
+    ) -> Result<OriginContext, AdapterError>;
 
     async fn dispatch_portable(
         &self,
@@ -314,6 +368,32 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
     /// Waits for the next host lifecycle, capture, or completion event without exposing a runtime
     /// stream type through this minimal contract.
     async fn next_health_event(&self) -> Result<AdapterHealthEvent, AdapterError>;
+
+    /// Stops the retained host subscription after broker-owned UI state drains and before the
+    /// old endpoint is released to a target. Implementations must return an explicit unsupported
+    /// error rather than silently retaining the old host adapter.
+    async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "this host adapter cannot suspend for activation",
+        ))
+    }
+
+    /// Re-establishes the old adapter after an activation abort before the old endpoint accepts
+    /// dispatch again. Implementations must revalidate live compatibility and retained transport.
+    async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "this host adapter cannot resume after an activation abort",
+        ))
+    }
+
+    /// Reports per-client commit-gate evidence for activation readiness.
+    /// Defaults to `None`: adapters that cannot observe per-client
+    /// registration leave the broker gating on adapter health.
+    async fn activation_readiness(&self) -> Result<Option<ActivationReadiness>, AdapterError> {
+        Ok(None)
+    }
 
     async fn shutdown(&self) -> Result<(), AdapterError>;
 }
