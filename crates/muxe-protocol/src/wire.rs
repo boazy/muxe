@@ -1090,6 +1090,48 @@ impl Validate for RegisterPendingPane {
     }
 }
 
+/// Immutable launcher-captured origin supplied by a UI process. The broker converts it only at
+/// the concrete adapter boundary; it never substitutes current focus or process environment.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
+)]
+pub struct UiOriginBootstrap {
+    pub workspace: WorkspaceId,
+    pub tab: HostTabId,
+    pub pane: HostPaneId,
+    pub cwd: String,
+}
+
+impl Validate for UiOriginBootstrap {
+    fn validate(&self) -> Result<(), SemanticError> {
+        self.workspace.validate()?;
+        self.tab.validate()?;
+        self.pane.validate()?;
+        validate_absolute_path("origin cwd", &self.cwd)
+    }
+}
+
+/// The attaching UI pane's independently reported identity. It is checked against the host's
+/// fresh snapshot and is never used as a fallback origin.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
+)]
+pub struct UiCallerIdentityWire {
+    pub workspace: WorkspaceId,
+    pub tab: HostTabId,
+    pub pane: HostPaneId,
+    pub cwd: String,
+}
+
+impl Validate for UiCallerIdentityWire {
+    fn validate(&self) -> Result<(), SemanticError> {
+        self.workspace.validate()?;
+        self.tab.validate()?;
+        self.pane.validate()?;
+        validate_absolute_path("caller cwd", &self.cwd)
+    }
+}
+
 #[derive(
     Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -1097,6 +1139,8 @@ pub struct AttachUi {
     pub root: MenuId,
     pub pane: HostPaneId,
     pub pending_launch: Option<PendingLaunchToken>,
+    pub origin: Option<UiOriginBootstrap>,
+    pub caller_identity: Option<UiCallerIdentityWire>,
 }
 
 impl Validate for AttachUi {
@@ -1105,6 +1149,12 @@ impl Validate for AttachUi {
         self.pane.validate()?;
         if let Some(token) = self.pending_launch {
             token.validate()?;
+        }
+        if let Some(origin) = &self.origin {
+            origin.validate()?;
+        }
+        if let Some(caller_identity) = &self.caller_identity {
+            caller_identity.validate()?;
         }
         Ok(())
     }
@@ -1583,17 +1633,22 @@ pub fn validate_archived_wire_message(
         (
             MessageDirection::BrokerToPeer,
             ConnectionPhase::Ready,
-            ArchivedWireMessage::Response { request_id, .. },
+            ArchivedWireMessage::Response {
+                request_id,
+                response,
+            },
         ) => {
             validate_archived_nonce(&request_id.0, "RequestId")?;
+            validate_archived_response(response)?;
             Ok(ConnectionPhase::Ready)
         }
         (
             MessageDirection::BrokerToPeer,
             ConnectionPhase::Ready,
-            ArchivedWireMessage::Event { event_id, .. },
+            ArchivedWireMessage::Event { event_id, event },
         ) => {
             validate_archived_nonce(&event_id.0, "EventId")?;
+            validate_archived_event(event)?;
             Ok(ConnectionPhase::Ready)
         }
         (
@@ -1681,6 +1736,12 @@ fn validate_archived_request(request: &ArchivedClientRequest) -> Result<(), Sema
             if let Some(token) = value.pending_launch.as_ref() {
                 validate_archived_nonce(&token.0, "PendingLaunchToken")?;
             }
+            if let Some(origin) = value.origin.as_ref() {
+                validate_archived_origin_bootstrap(origin)?;
+            }
+            if let Some(caller_identity) = value.caller_identity.as_ref() {
+                validate_archived_caller_identity(caller_identity)?;
+            }
             Ok(())
         }
         ArchivedClientRequest::CommitUiLaunch(value) => {
@@ -1709,6 +1770,276 @@ fn validate_archived_request(request: &ArchivedClientRequest) -> Result<(), Sema
         }
         ArchivedClientRequest::Heartbeat => Ok(()),
     }
+}
+
+fn validate_archived_response(response: &ArchivedBrokerResponse) -> Result<(), SemanticError> {
+    match response {
+        ArchivedBrokerResponse::LaunchPrepared {
+            token,
+            lease_millis,
+        } => {
+            validate_archived_nonce(&token.0, "PendingLaunchToken")?;
+            (lease_millis.to_native() > 0)
+                .then_some(())
+                .ok_or(SemanticError::ZeroLease)
+        }
+        ArchivedBrokerResponse::UiAttached { session, snapshot } => {
+            validate_archived_identifier("UiSessionId", session.0.as_str())?;
+            validate_archived_attachment(snapshot)
+        }
+        ArchivedBrokerResponse::InvocationAccepted { execution } => {
+            validate_archived_nonce(&execution.0, "ExecutionId")
+        }
+        ArchivedBrokerResponse::Error(diagnostic) => validate_archived_diagnostic(diagnostic),
+        ArchivedBrokerResponse::PendingPaneRegistered
+        | ArchivedBrokerResponse::AttachPending
+        | ArchivedBrokerResponse::Detached
+        | ArchivedBrokerResponse::Acknowledged => Ok(()),
+    }
+}
+
+fn validate_archived_event(event: &ArchivedBrokerEvent) -> Result<(), SemanticError> {
+    match event {
+        ArchivedBrokerEvent::ExecutionCompleted {
+            session,
+            execution,
+            diagnostic,
+            ..
+        } => {
+            validate_archived_identifier("UiSessionId", session.0.as_str())?;
+            validate_archived_nonce(&execution.0, "ExecutionId")?;
+            validate_archived_optional_diagnostic(diagnostic.as_ref())
+        }
+        ArchivedBrokerEvent::BindingAvailabilityChanged {
+            session,
+            generation,
+            binding,
+            availability,
+            diagnostic,
+        } => {
+            validate_archived_identifier("UiSessionId", session.0.as_str())?;
+            let generation = generation.to_native();
+            validate_archived_generation(generation)?;
+            validate_archived_generation(binding.generation.to_native())?;
+            if binding.generation.to_native() != generation {
+                return Err(SemanticError::BindingGenerationMismatch);
+            }
+            match (availability, diagnostic.as_ref()) {
+                (ArchivedBindingAvailability::Enabled, Some(_)) => {
+                    Err(SemanticError::UnexpectedDiagnostic)
+                }
+                (ArchivedBindingAvailability::Blocked, None) => Err(SemanticError::MissingDiagnostic),
+                (_, Some(diagnostic)) => validate_archived_diagnostic(diagnostic),
+                (_, None) => Ok(()),
+            }
+        }
+        ArchivedBrokerEvent::AdapterHealthChanged { diagnostic, .. } => {
+            validate_archived_optional_diagnostic(diagnostic.as_ref())
+        }
+        ArchivedBrokerEvent::Fatal(diagnostic) => validate_archived_diagnostic(diagnostic),
+        ArchivedBrokerEvent::BrokerRetiring => Ok(()),
+    }
+}
+
+fn validate_archived_attachment(value: &ArchivedUiAttachmentWire) -> Result<(), SemanticError> {
+    validate_archived_menu_view(&value.menu)?;
+    validate_archived_keyboard(&value.keyboard)?;
+    validate_archived_theme(&value.theme)
+}
+
+fn validate_archived_menu_view(value: &ArchivedMenuViewWire) -> Result<(), SemanticError> {
+    let generation = value.generation.to_native();
+    validate_archived_generation(generation)?;
+    validate_archived_identifier("MenuId", value.root.0.as_str())?;
+    let mut root_found = false;
+    for (index, menu) in value.menus.iter().enumerate() {
+        validate_archived_menu(menu)?;
+        if menu.id.0.as_str() == value.root.0.as_str() {
+            root_found = true;
+        }
+        if value
+            .menus
+            .iter()
+            .take(index)
+            .any(|prior| prior.id.0.as_str() == menu.id.0.as_str())
+        {
+            return Err(SemanticError::DuplicateMenu);
+        }
+        for binding in menu.bindings.iter() {
+            if binding.id.generation.to_native() != generation {
+                return Err(SemanticError::BindingGenerationMismatch);
+            }
+            if let Some(ArchivedLocalMenuActionWire::Open { target }) =
+                binding.local_menu_action.as_ref()
+            {
+                if !value
+                    .menus
+                    .iter()
+                    .any(|candidate| candidate.id.0.as_str() == target.0.as_str())
+                {
+                    return Err(SemanticError::UnknownMenuTarget);
+                }
+            }
+        }
+    }
+    root_found.then_some(()).ok_or(SemanticError::MissingRootMenu)
+}
+
+fn validate_archived_menu(value: &ArchivedMenuViewMenuWire) -> Result<(), SemanticError> {
+    validate_archived_identifier("MenuId", value.id.0.as_str())?;
+    if value.layout.max_item_title_length.to_native() == 0 {
+        return Err(SemanticError::ZeroLayoutTitleLength);
+    }
+    if let Some(title) = value.title.as_ref() {
+        validate_archived_clean_text("menu title", title.as_str())?;
+    }
+    for binding in value.bindings.iter() {
+        validate_archived_binding(binding)?;
+    }
+    Ok(())
+}
+
+fn validate_archived_binding(value: &ArchivedBindingViewWire) -> Result<(), SemanticError> {
+    validate_archived_generation(value.id.generation.to_native())?;
+    validate_archived_text("binding key", value.key.as_str(), true)?;
+    if let Some(label) = value.label.as_ref() {
+        validate_archived_clean_text("binding label", label.as_str())?;
+    }
+    if value.state.included && value.state.shown && !value.hidden {
+        let label = value
+            .label
+            .as_ref()
+            .ok_or(SemanticError::MissingVisibleLabel)?;
+        validate_archived_text("visible binding label", label.as_str(), true)?;
+    }
+    if let Some(action) = value.local_menu_action.as_ref() {
+        validate_archived_local_action(action)?;
+    }
+    match (value.state.blocked, value.diagnostic.as_ref()) {
+        (false, Some(_)) => Err(SemanticError::UnexpectedDiagnostic),
+        (true, None) => Err(SemanticError::MissingDiagnostic),
+        (_, Some(diagnostic)) => validate_archived_diagnostic(diagnostic),
+        (_, None) => Ok(()),
+    }
+}
+
+fn validate_archived_local_action(value: &ArchivedLocalMenuActionWire) -> Result<(), SemanticError> {
+    match value {
+        ArchivedLocalMenuActionWire::Open { target } => {
+            validate_archived_identifier("MenuId", target.0.as_str())
+        }
+        ArchivedLocalMenuActionWire::Control(_)
+        | ArchivedLocalMenuActionWire::PagePrevious
+        | ArchivedLocalMenuActionWire::PageNext => Ok(()),
+    }
+}
+
+fn validate_archived_keyboard(value: &ArchivedKeyboardProfileWire) -> Result<(), SemanticError> {
+    match value {
+        ArchivedKeyboardProfileWire::Vt100 {
+            escape_timeout_millis,
+        } if escape_timeout_millis.to_native() == 0 => Err(SemanticError::ZeroEscapeTimeout),
+        ArchivedKeyboardProfileWire::Vt100 { .. } | ArchivedKeyboardProfileWire::Kitty(_) => Ok(()),
+    }
+}
+
+fn validate_archived_theme(value: &ArchivedCompiledThemeWire) -> Result<(), SemanticError> {
+    validate_archived_theme_section(&value.common)?;
+    validate_archived_theme_section(&value.menu)?;
+    for setting in value.settings.iter() {
+        validate_archived_named_string(setting)?;
+    }
+    validate_archived_color_scheme(&value.scheme)
+}
+
+fn validate_archived_theme_section(value: &ArchivedThemeSectionWire) -> Result<(), SemanticError> {
+    for style in value.styles.iter() {
+        validate_archived_named_style(style)?;
+    }
+    for template in value.templates.iter() {
+        validate_archived_named_string(template)?;
+    }
+    Ok(())
+}
+
+fn validate_archived_named_style(value: &ArchivedNamedStyleWire) -> Result<(), SemanticError> {
+    validate_archived_identifier("style name", value.name.as_str())?;
+    for color in [&value.style.foreground, &value.style.background] {
+        if let Some(color) = color.as_ref() {
+            validate_archived_clean_text("style color", color.as_str())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_archived_named_string(value: &ArchivedNamedStringWire) -> Result<(), SemanticError> {
+    validate_archived_identifier("render-model name", value.name.as_str())?;
+    validate_archived_clean_text("render-model value", value.value.as_str())
+}
+
+fn validate_archived_color_scheme(value: &ArchivedColorSchemeWire) -> Result<(), SemanticError> {
+    validate_archived_clean_text("color-scheme title", value.title.as_str())?;
+    for entry in value.palette.iter().chain(value.colors.iter()) {
+        validate_archived_named_string(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_archived_origin_bootstrap(
+    value: &ArchivedUiOriginBootstrap,
+) -> Result<(), SemanticError> {
+    validate_archived_identifier("WorkspaceId", value.workspace.0.as_str())?;
+    validate_archived_identifier("HostTabId", value.tab.0.as_str())?;
+    validate_archived_identifier("HostPaneId", value.pane.0.as_str())?;
+    validate_archived_absolute_path("origin cwd", value.cwd.as_str())
+}
+
+fn validate_archived_caller_identity(
+    value: &ArchivedUiCallerIdentityWire,
+) -> Result<(), SemanticError> {
+    validate_archived_identifier("WorkspaceId", value.workspace.0.as_str())?;
+    validate_archived_identifier("HostTabId", value.tab.0.as_str())?;
+    validate_archived_identifier("HostPaneId", value.pane.0.as_str())?;
+    validate_archived_absolute_path("caller cwd", value.cwd.as_str())
+}
+
+fn validate_archived_diagnostic(value: &ArchivedProtocolDiagnostic) -> Result<(), SemanticError> {
+    let message = value.message.as_str();
+    if message.len() > MAX_DIAGNOSTIC_LEN {
+        return Err(SemanticError::TooLong {
+            field: "protocol diagnostic",
+            maximum: MAX_DIAGNOSTIC_LEN,
+            actual: message.len(),
+        });
+    }
+    validate_archived_text("protocol diagnostic", message, true)
+}
+
+fn validate_archived_optional_diagnostic(
+    value: Option<&ArchivedProtocolDiagnostic>,
+) -> Result<(), SemanticError> {
+    value.map(validate_archived_diagnostic).transpose().map(|_| ())
+}
+
+fn validate_archived_absolute_path(field: &'static str, value: &str) -> Result<(), SemanticError> {
+    validate_archived_text(field, value, true)?;
+    value
+        .starts_with('/')
+        .then_some(())
+        .ok_or(SemanticError::RelativePath { field })
+}
+
+fn validate_archived_clean_text(
+    field: &'static str,
+    value: &str,
+) -> Result<(), SemanticError> {
+    validate_archived_text(field, value, false)
+}
+
+fn validate_archived_generation(generation: u64) -> Result<(), SemanticError> {
+    (generation > 0)
+        .then_some(())
+        .ok_or(SemanticError::ZeroGeneration)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2045,6 +2376,8 @@ pub enum SemanticError {
     DuplicateMenu,
     #[error("menu graph does not contain its root menu")]
     MissingRootMenu,
+    #[error("{field} must be an absolute path")]
+    RelativePath { field: &'static str },
     #[error("binding ID generation does not match the containing menu graph")]
     BindingGenerationMismatch,
     #[error("local menu action targets a menu outside the menu graph")]
@@ -2087,6 +2420,14 @@ fn validate_clean_text(field: &'static str, value: &str) -> Result<(), SemanticE
         return Err(SemanticError::Control { field });
     }
     Ok(())
+}
+
+fn validate_absolute_path(field: &'static str, value: &str) -> Result<(), SemanticError> {
+    validate_text(field, value)?;
+    value
+        .starts_with('/')
+        .then_some(())
+        .ok_or(SemanticError::RelativePath { field })
 }
 
 fn validate_diagnostic(field: &'static str, value: &str) -> Result<(), SemanticError> {
@@ -2170,6 +2511,208 @@ mod tests {
             local_menu_action: action,
             diagnostic: None,
         }
+    }
+
+    fn live_server() -> LiveServerIdentity {
+        LiveServerIdentity {
+            host: HostKind::Herdr,
+            discovery_key: "socket".into(),
+            server_id: ServerId::new("server"),
+        }
+    }
+
+    fn welcome() -> WireMessage {
+        WireMessage::Welcome {
+            request_id: RequestId([1; 16]),
+            welcome: Welcome {
+                broker_version: "0.1.0".into(),
+                live_server: live_server(),
+                accepted_frame_len: MAX_FRAME_LEN,
+            },
+        }
+    }
+
+    fn hello() -> WireMessage {
+        WireMessage::Hello {
+            request_id: RequestId([1; 16]),
+            hello: Hello {
+                process_version: "0.1.0".into(),
+                live_server: live_server(),
+            },
+        }
+    }
+
+    fn attachment() -> UiAttachmentWire {
+        UiAttachmentWire {
+            menu: MenuViewWire {
+                generation: 1,
+                root: MenuId::new("root"),
+                menus: vec![MenuViewMenuWire {
+                    id: MenuId::new("root"),
+                    title: None,
+                    layout: layout(),
+                    bindings: Vec::new(),
+                }],
+            },
+            keyboard: KeyboardProfileWire::Vt100 {
+                escape_timeout_millis: 25,
+            },
+            inactivity_timeout_millis: None,
+            theme: CompiledThemeWire {
+                common: ThemeSectionWire {
+                    styles: Vec::new(),
+                    templates: Vec::new(),
+                },
+                menu: ThemeSectionWire {
+                    styles: Vec::new(),
+                    templates: Vec::new(),
+                },
+                settings: Vec::new(),
+                scheme: ColorSchemeWire {
+                    title: String::new(),
+                    palette: Vec::new(),
+                    colors: Vec::new(),
+                },
+            },
+        }
+    }
+
+    fn append_message(bytes: &mut Vec<u8>, message: &WireMessage) {
+        let frame = crate::encode_frame(message).unwrap();
+        bytes.extend_from_slice(frame.prefix());
+        bytes.extend_from_slice(frame.payload());
+    }
+
+    fn client_stream(message: &WireMessage) -> Vec<u8> {
+        let mut bytes = crate::Prelude::rkyv(PeerRole::Ui, SchemaFingerprint::application())
+            .encode()
+            .to_vec();
+        append_message(&mut bytes, &welcome());
+        append_message(&mut bytes, message);
+        bytes
+    }
+
+    fn broker_stream(message: &WireMessage) -> Vec<u8> {
+        let mut bytes = crate::Prelude::rkyv(PeerRole::Ui, SchemaFingerprint::application())
+            .encode()
+            .to_vec();
+        append_message(&mut bytes, &hello());
+        append_message(&mut bytes, message);
+        bytes
+    }
+
+    fn client_decoder() -> crate::ConnectionDecoder {
+        crate::ConnectionDecoder::new(crate::ConnectionPolicy::client(
+            PeerRole::Ui,
+            SchemaFingerprint::application(),
+        ))
+    }
+
+    fn broker_decoder() -> crate::ConnectionDecoder {
+        crate::ConnectionDecoder::new(crate::ConnectionPolicy::broker(
+            PeerRole::Ui,
+            SchemaFingerprint::application(),
+        ))
+    }
+
+    #[test]
+    fn decoder_rejects_archived_response_theme_and_event_generation_payloads() {
+        let mut snapshot = attachment();
+        snapshot.theme.common.styles.push(NamedStyleWire {
+            name: "cell".into(),
+            style: StyleWire {
+                foreground: Some("bad\ncolor".into()),
+                background: None,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+            },
+        });
+        let response = WireMessage::Response {
+            request_id: RequestId([2; 16]),
+            response: BrokerResponse::UiAttached {
+                session: UiSessionId::new("ui"),
+                snapshot,
+            },
+        };
+        assert!(matches!(
+            client_decoder().push(&client_stream(&response), |_| {}),
+            Err(crate::DecodeError::Semantic(SemanticError::Control {
+                field: "style color"
+            }))
+        ));
+
+        let event = WireMessage::Event {
+            event_id: EventId([3; 16]),
+            event: BrokerEvent::BindingAvailabilityChanged {
+                session: UiSessionId::new("ui"),
+                generation: 0,
+                binding: BindingId {
+                    generation: 0,
+                    ordinal: 0,
+                },
+                availability: BindingAvailability::Enabled,
+                diagnostic: None,
+            },
+        };
+        assert!(matches!(
+            client_decoder().push(&client_stream(&event), |_| {}),
+            Err(crate::DecodeError::Semantic(SemanticError::ZeroGeneration))
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_archived_attach_origin_and_caller_boundaries() {
+        let origin = WireMessage::Request {
+            request_id: RequestId([2; 16]),
+            request: ClientRequest::AttachUi(AttachUi {
+                root: MenuId::new("root"),
+                pane: HostPaneId::new("ui-pane"),
+                pending_launch: Some(PendingLaunchToken([3; 16])),
+                origin: Some(UiOriginBootstrap {
+                    workspace: WorkspaceId::new("workspace"),
+                    tab: HostTabId::new("tab"),
+                    pane: HostPaneId::new("origin-pane"),
+                    cwd: "relative".into(),
+                }),
+                caller_identity: None,
+            }),
+        };
+        assert!(matches!(
+            broker_decoder().push(&broker_stream(&origin), |_| {}),
+            Err(crate::DecodeError::Semantic(SemanticError::RelativePath {
+                field: "origin cwd"
+            }))
+        ));
+
+        let caller = WireMessage::Request {
+            request_id: RequestId([4; 16]),
+            request: ClientRequest::AttachUi(AttachUi {
+                root: MenuId::new("root"),
+                pane: HostPaneId::new("ui-pane"),
+                pending_launch: Some(PendingLaunchToken([5; 16])),
+                origin: Some(UiOriginBootstrap {
+                    workspace: WorkspaceId::new("workspace"),
+                    tab: HostTabId::new("tab"),
+                    pane: HostPaneId::new("origin-pane"),
+                    cwd: "/origin".into(),
+                }),
+                caller_identity: Some(UiCallerIdentityWire {
+                    workspace: WorkspaceId::new("workspace"),
+                    tab: HostTabId::new("tab"),
+                    pane: HostPaneId::new("caller-pane"),
+                    cwd: "relative".into(),
+                }),
+            }),
+        };
+        assert!(matches!(
+            broker_decoder().push(&broker_stream(&caller), |_| {}),
+            Err(crate::DecodeError::Semantic(SemanticError::RelativePath {
+                field: "caller cwd"
+            }))
+        ));
     }
 
     #[test]
