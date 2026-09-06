@@ -316,17 +316,19 @@ impl fmt::Display for AdapterError {
 impl std::error::Error for AdapterError {}
 
 /// Per-client commit-gate evidence for activation readiness: which current
-/// clients hold a fresh compatible registration in this attempt. Client IDs
-/// and counts only, never payloads. The broker maps this to the protocol
-/// readiness record; adapters that cannot observe per-client registration
-/// report `None` through the default method and the broker gates on adapter
-/// health instead.
+/// clients hold a fresh compatible registration in this attempt, measured
+/// against the authoritative membership of the same snapshot round. Client
+/// IDs only, never payloads. The broker maps this to the protocol readiness
+/// record; adapters that cannot observe per-client registration report `None`
+/// through the default method and the broker gates on adapter health instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivationReadiness {
     /// Client IDs holding a fresh compatible registration in this attempt.
     pub registered_clients: Vec<String>,
-    /// Current membership the registrations are measured against.
-    pub member_clients: u64,
+    /// Authoritative member IDs of the same snapshot round, canonical order,
+    /// deduplicated. A count alone cannot prove coverage: a newcomer could
+    /// mask a missing member.
+    pub member_clients: Vec<String>,
 }
 
 /// One constructor-injected adapter per broker. Implementations must retain their own typed host
