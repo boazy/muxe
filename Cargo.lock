@@ -1857,6 +1857,7 @@ dependencies = [
  "muxe-ui",
  "muxe-zellij-protocol",
  "nix",
+ "parking_lot",
  "platform-dirs",
  "serde",
  "serde_json",

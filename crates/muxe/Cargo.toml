@@ -28,6 +28,7 @@ platform-dirs.workspace = true
 serde.workspace = true
 sha2.workspace = true
 async-trait.workspace = true
+parking_lot.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
