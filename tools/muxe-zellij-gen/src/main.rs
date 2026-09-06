@@ -1109,6 +1109,9 @@ fn command_validated_to_source_expression(
             "&{}",
             command_validated_to_source_expression(&reference.elem, value, generic_types, mirror_schema)?
         )),
+        Type::Slice(slice) if !source_conversion_needed(&slice.elem, mirror_schema) => {
+            Ok(format!("&{value}"))
+        }
         Type::Slice(slice) => {
             let item = command_validated_to_source_expression(&slice.elem, "item", generic_types, mirror_schema)?;
             Ok(format!("&{value}.into_iter().map(|item| {item}).collect::<Vec<_>>()"))
@@ -1248,6 +1251,9 @@ fn source_return_to_validated_expression(
     generic_types: &BTreeMap<String, Type>,
     mirror_schema: &MirrorSchema,
 ) -> Result<String> {
+    if !source_conversion_needed(ty, mirror_schema) {
+        return Ok(value.to_owned());
+    }
     match ty {
         Type::Reference(reference) => source_return_to_validated_expression(&reference.elem, value, generic_types, mirror_schema),
         Type::Slice(slice) => {
@@ -1865,6 +1871,9 @@ fn raw_to_validated_expression(
     value: &str,
     mirror_schema: &MirrorSchema,
 ) -> Result<String> {
+    if !raw_validation_conversion_needed(ty, mirror_schema) {
+        return Ok(value.to_owned());
+    }
     match ty {
         Type::Path(path) => {
             let segment = path.path.segments.last().expect("path has a segment");
@@ -1929,6 +1938,59 @@ fn raw_to_validated_expression(
         Type::Group(group) => raw_to_validated_expression(&group.elem, value, mirror_schema),
         Type::Paren(paren) => raw_to_validated_expression(&paren.elem, value, mirror_schema),
         _ => Ok(value.to_owned()),
+    }
+}
+
+fn raw_validation_conversion_needed(ty: &Type, mirror_schema: &MirrorSchema) -> bool {
+    match ty {
+        Type::Path(path) => {
+            let segment = path.path.segments.last().expect("path has a segment");
+            let name = segment.ident.to_string();
+            if let Some(definition) = selected_definition(&name, mirror_schema) {
+                return match &definition.item {
+                    ParsedType::Alias(alias) => raw_validation_conversion_needed(&alias.ty, mirror_schema),
+                    ParsedType::Struct(_) | ParsedType::Enum(_) => true,
+                };
+            }
+            if matches!(name.as_str(), "BTreeMap" | "HashMap") {
+                return true;
+            }
+            type_arguments(segment)
+                .map(|arguments| arguments.into_iter().any(|argument| raw_validation_conversion_needed(argument, mirror_schema)))
+                .unwrap_or(true)
+        }
+        Type::Array(array) => raw_validation_conversion_needed(&array.elem, mirror_schema),
+        Type::Reference(reference) => raw_validation_conversion_needed(&reference.elem, mirror_schema),
+        Type::Slice(slice) => raw_validation_conversion_needed(&slice.elem, mirror_schema),
+        Type::Tuple(tuple) => tuple.elems.iter().any(|element| raw_validation_conversion_needed(element, mirror_schema)),
+        Type::Group(group) => raw_validation_conversion_needed(&group.elem, mirror_schema),
+        Type::Paren(paren) => raw_validation_conversion_needed(&paren.elem, mirror_schema),
+        _ => false,
+    }
+}
+
+fn source_conversion_needed(ty: &Type, mirror_schema: &MirrorSchema) -> bool {
+    match ty {
+        Type::Path(path) => {
+            let segment = path.path.segments.last().expect("path has a segment");
+            let name = segment.ident.to_string();
+            if let Some(definition) = selected_definition(&name, mirror_schema) {
+                return match &definition.item {
+                    ParsedType::Alias(alias) => source_conversion_needed(&alias.ty, mirror_schema),
+                    ParsedType::Struct(_) | ParsedType::Enum(_) => true,
+                };
+            }
+            type_arguments(segment)
+                .map(|arguments| arguments.into_iter().any(|argument| source_conversion_needed(argument, mirror_schema)))
+                .unwrap_or(true)
+        }
+        Type::Array(array) => source_conversion_needed(&array.elem, mirror_schema),
+        Type::Reference(reference) => source_conversion_needed(&reference.elem, mirror_schema),
+        Type::Slice(slice) => source_conversion_needed(&slice.elem, mirror_schema),
+        Type::Tuple(tuple) => tuple.elems.iter().any(|element| source_conversion_needed(element, mirror_schema)),
+        Type::Group(group) => source_conversion_needed(&group.elem, mirror_schema),
+        Type::Paren(paren) => source_conversion_needed(&paren.elem, mirror_schema),
+        _ => false,
     }
 }
 fn render_upstream_converters(mirror_schema: &MirrorSchema, output: &mut String) -> Result<()> {
@@ -2081,6 +2143,9 @@ fn render_upstream_enum_converter(
 }
 
 fn into_source_expression(ty: &Type, value: &str, mirror_schema: &MirrorSchema) -> Result<String> {
+    if !source_conversion_needed(ty, mirror_schema) {
+        return Ok(value.to_owned());
+    }
     match ty {
         Type::Path(path) => {
             let segment = path.path.segments.last().expect("path has a segment");
