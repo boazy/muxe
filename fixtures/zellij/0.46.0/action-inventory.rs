@@ -673,7 +673,7 @@ pub const UNSUPPORTED_PUBLIC_PLUGIN_FUNCTIONS: &[&str] = &[
 
 pub mod action_mirror {
     use serde::{Deserialize, Serialize};
-    use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, path::PathBuf};
+    use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf};
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum Action {
@@ -1159,7 +1159,7 @@ pub mod action_mirror {
         },
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub enum BareKey {
         PageDown,
         PageUp,
@@ -1199,7 +1199,7 @@ pub mod action_mirror {
 
     pub type Context = BTreeMap < String , String >;
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub enum Direction {
         Left,
         Right,
@@ -1242,7 +1242,7 @@ pub mod action_mirror {
         pub default_bg: Option < String >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub enum InputMode {
         # [serde (alias = "normal")]
         Normal,
@@ -1274,7 +1274,7 @@ pub mod action_mirror {
         Tmux,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub enum KeyModifier {
         Ctrl,
         Alt,
@@ -1282,13 +1282,13 @@ pub mod action_mirror {
         Super,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub struct KeyWithModifier {
         pub bare_key: BareKey,
         pub key_modifiers: BTreeSet < KeyModifier >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub enum LayoutConstraint {
         MaxPanes(usize, ),
         MinPanes(usize, ),
@@ -1375,15 +1375,15 @@ pub mod action_mirror {
         pub context: Context,
     }
 
-# [serde (rename_all = "lowercase")]
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    # [serde (rename_all = "lowercase")]
     pub enum PaneFrameStyle {
         Full,
         Titles,
         None,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub enum PaneId {
         Terminal(u32, ),
         Plugin(u32, ),
@@ -1410,7 +1410,7 @@ pub mod action_mirror {
         pub run_plugin: Option < RunPlugin >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub struct PluginTag(pub String, );
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

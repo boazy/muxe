@@ -641,7 +641,7 @@ fn generate(
     output.push_str("];\n\n");
     output.push_str("pub mod action_mirror {\n");
     output.push_str("    use serde::{Deserialize, Serialize};\n");
-    output.push_str("    use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, path::PathBuf};\n\n");
+    output.push_str("    use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf};\n\n");
     for name in &mirror_schema.selected {
         let definition = mirror_schema
             .definitions
@@ -669,14 +669,14 @@ fn generate(
 fn render_mirror_type(definition: &TypeDefinition, output: &mut String) -> Result<()> {
     match &definition.item {
         ParsedType::Struct(item) => {
-            render_serde_attributes(&item.attrs, "", output)?;
-            writeln!(output, "    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]")?;
+            writeln!(output, "    #[derive({})]", mirror_derives(&item.attrs))?;
+            render_serde_attributes(&item.attrs, "    ", output)?;
             write!(output, "    pub struct {}", item.ident)?;
             render_struct_fields(&item.fields, output)?;
         }
         ParsedType::Enum(item) => {
-            render_serde_attributes(&item.attrs, "", output)?;
-            writeln!(output, "    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]")?;
+            writeln!(output, "    #[derive({})]", mirror_derives(&item.attrs))?;
+            render_serde_attributes(&item.attrs, "    ", output)?;
             writeln!(output, "    pub enum {} {{", item.ident)?;
             for variant in &item.variants {
                 render_enum_variant(variant, output)?;
@@ -689,6 +689,21 @@ fn render_mirror_type(definition: &TypeDefinition, output: &mut String) -> Resul
         }
     }
     Ok(())
+}
+
+fn mirror_derives(attributes: &[Attribute]) -> &'static str {
+    if attributes.iter().any(|attribute| {
+        attribute.path().is_ident("derive")
+            && attribute
+                .meta
+                .require_list()
+                .map(|list| list.tokens.to_string().split(',').any(|item| item.trim() == "Ord"))
+                .unwrap_or(false)
+    }) {
+        "Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize"
+    } else {
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+    }
 }
 
 fn render_struct_fields(fields: &Fields, output: &mut String) -> Result<()> {
