@@ -16,3 +16,7 @@ run = "test -f crates/muxe-core/src/lib.rs && test -f crates/muxe-adapter-api/sr
 [tasks.clippy]
 description = "Run strict Clippy checks"
 run = "test -f crates/muxe-core/src/lib.rs && test -f crates/muxe-adapter-api/src/lib.rs && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -W clippy::allow_attributes -W clippy::allow_attributes_without_reason"
+
+[tasks.codegen-herdr]
+description = "Verify Herdr-generated sources are byte-clean"
+run = "cargo run --locked -p muxe-herdr-gen -- --check"
