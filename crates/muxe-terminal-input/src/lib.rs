@@ -74,6 +74,10 @@ pub enum KeyIdentity {
     Unicode(char),
     /// A documented non-Unicode functional key.
     Functional(FunctionalKey),
+    /// A valid Kitty functional-key code not assigned by the canonical protocol table.
+    ///
+    /// It remains a raw identity but never claims to be a supported named key.
+    UnknownFunctional(u32),
     /// Kitty's `0` key code: text exists, but no physical key is known.
     Unidentified,
 }
@@ -807,8 +811,7 @@ fn decode_kitty(parameters: CsiParameters, final_byte: u8, bytes: usize) -> Inpu
 
     let (primary, keypad) = match primary_identity(primary_fields.values[0].expect("checked above"))
     {
-        Ok(Some(identity)) => identity,
-        Ok(None) => return unknown_csi(final_byte, bytes),
+        Ok(identity) => identity,
         Err(reason) => return malformed(SequenceClass::Csi, reason, saturating_u8(bytes)),
     };
     let shifted = match primary_fields.len {
@@ -970,30 +973,28 @@ fn decode_shift_tab(parameters: CsiParameters, final_byte: u8, bytes: usize) -> 
     }
 }
 
-fn primary_identity(
-    value: u32,
-) -> Result<Option<(KeyIdentity, Option<KeypadKey>)>, MalformedReason> {
+fn primary_identity(value: u32) -> Result<(KeyIdentity, Option<KeypadKey>), MalformedReason> {
+    let primary = reported_identity(value)?;
+    let keypad = functional_identity(value).and_then(|(_, keypad)| keypad);
+    Ok((primary, keypad))
+}
+
+fn reported_identity(value: u32) -> Result<KeyIdentity, MalformedReason> {
     if value == 0 {
-        return Ok(Some((KeyIdentity::Unidentified, None)));
+        return Ok(KeyIdentity::Unidentified);
     }
-    if let Some((primary, keypad)) = functional_identity(value) {
-        return Ok(Some((KeyIdentity::Functional(primary), keypad)));
+    if let Some((primary, _)) = functional_identity(value) {
+        return Ok(KeyIdentity::Functional(primary));
     }
     let character = char::from_u32(value).ok_or(MalformedReason::InvalidScalar)?;
     if (0xe000..=0xf8ff).contains(&value) {
-        return Ok(None);
+        return Ok(KeyIdentity::UnknownFunctional(value));
     }
-    Ok(Some((KeyIdentity::Unicode(character), None)))
+    Ok(KeyIdentity::Unicode(character))
 }
 
 fn optional_alternate_identity(value: Option<u32>) -> Result<Option<KeyIdentity>, MalformedReason> {
-    value
-        .map(|value| {
-            char::from_u32(value)
-                .map(KeyIdentity::Unicode)
-                .ok_or(MalformedReason::InvalidScalar)
-        })
-        .transpose()
+    value.map(reported_identity).transpose()
 }
 
 fn functional_identity(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)> {
@@ -1002,13 +1003,27 @@ fn functional_identity(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)>
         13 => (FunctionalKey::Enter, None),
         27 => (FunctionalKey::Escape, None),
         127 => (FunctionalKey::Backspace, None),
+        57344 => (FunctionalKey::Escape, None),
+        57345 => (FunctionalKey::Enter, None),
+        57346 => (FunctionalKey::Tab, None),
+        57347 => (FunctionalKey::Backspace, None),
+        57348 => (FunctionalKey::Insert, None),
+        57349 => (FunctionalKey::Delete, None),
+        57350 => (FunctionalKey::Left, None),
+        57351 => (FunctionalKey::Right, None),
+        57352 => (FunctionalKey::Up, None),
+        57353 => (FunctionalKey::Down, None),
+        57354 => (FunctionalKey::PageUp, None),
+        57355 => (FunctionalKey::PageDown, None),
+        57356 => (FunctionalKey::Home, None),
+        57357 => (FunctionalKey::End, None),
         57358 => (FunctionalKey::CapsLock, None),
         57359 => (FunctionalKey::ScrollLock, None),
         57360 => (FunctionalKey::NumLock, None),
         57361 => (FunctionalKey::PrintScreen, None),
         57362 => (FunctionalKey::Pause, None),
         57363 => (FunctionalKey::Menu, None),
-        57376..=57398 => (FunctionalKey::Function((value - 57376 + 13) as u8), None),
+        57364..=57398 => (FunctionalKey::Function((value - 57364 + 1) as u8), None),
         57399..=57408 => {
             let digit = (value - 57399) as u8;
             (
@@ -1243,6 +1258,136 @@ mod tests {
         events
     }
 
+    fn kitty_functional_table_oracle(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)> {
+        let key = match value {
+            9 => (FunctionalKey::Tab, None),
+            13 => (FunctionalKey::Enter, None),
+            27 => (FunctionalKey::Escape, None),
+            127 => (FunctionalKey::Backspace, None),
+            57344 => (FunctionalKey::Escape, None),
+            57345 => (FunctionalKey::Enter, None),
+            57346 => (FunctionalKey::Tab, None),
+            57347 => (FunctionalKey::Backspace, None),
+            57348 => (FunctionalKey::Insert, None),
+            57349 => (FunctionalKey::Delete, None),
+            57350 => (FunctionalKey::Left, None),
+            57351 => (FunctionalKey::Right, None),
+            57352 => (FunctionalKey::Up, None),
+            57353 => (FunctionalKey::Down, None),
+            57354 => (FunctionalKey::PageUp, None),
+            57355 => (FunctionalKey::PageDown, None),
+            57356 => (FunctionalKey::Home, None),
+            57357 => (FunctionalKey::End, None),
+            57358 => (FunctionalKey::CapsLock, None),
+            57359 => (FunctionalKey::ScrollLock, None),
+            57360 => (FunctionalKey::NumLock, None),
+            57361 => (FunctionalKey::PrintScreen, None),
+            57362 => (FunctionalKey::Pause, None),
+            57363 => (FunctionalKey::Menu, None),
+            57364..=57398 => (FunctionalKey::Function((value - 57364 + 1) as u8), None),
+            57399..=57408 => {
+                let keypad = KeypadKey::Digit((value - 57399) as u8);
+                (FunctionalKey::Keypad(keypad), Some(keypad))
+            }
+            57409 => (
+                FunctionalKey::Keypad(KeypadKey::Decimal),
+                Some(KeypadKey::Decimal),
+            ),
+            57410 => (
+                FunctionalKey::Keypad(KeypadKey::Divide),
+                Some(KeypadKey::Divide),
+            ),
+            57411 => (
+                FunctionalKey::Keypad(KeypadKey::Multiply),
+                Some(KeypadKey::Multiply),
+            ),
+            57412 => (
+                FunctionalKey::Keypad(KeypadKey::Subtract),
+                Some(KeypadKey::Subtract),
+            ),
+            57413 => (FunctionalKey::Keypad(KeypadKey::Add), Some(KeypadKey::Add)),
+            57414 => (
+                FunctionalKey::Keypad(KeypadKey::Enter),
+                Some(KeypadKey::Enter),
+            ),
+            57415 => (
+                FunctionalKey::Keypad(KeypadKey::Equal),
+                Some(KeypadKey::Equal),
+            ),
+            57416 => (
+                FunctionalKey::Keypad(KeypadKey::Separator),
+                Some(KeypadKey::Separator),
+            ),
+            57417 => (
+                FunctionalKey::Keypad(KeypadKey::Left),
+                Some(KeypadKey::Left),
+            ),
+            57418 => (
+                FunctionalKey::Keypad(KeypadKey::Right),
+                Some(KeypadKey::Right),
+            ),
+            57419 => (FunctionalKey::Keypad(KeypadKey::Up), Some(KeypadKey::Up)),
+            57420 => (
+                FunctionalKey::Keypad(KeypadKey::Down),
+                Some(KeypadKey::Down),
+            ),
+            57421 => (
+                FunctionalKey::Keypad(KeypadKey::PageUp),
+                Some(KeypadKey::PageUp),
+            ),
+            57422 => (
+                FunctionalKey::Keypad(KeypadKey::PageDown),
+                Some(KeypadKey::PageDown),
+            ),
+            57423 => (
+                FunctionalKey::Keypad(KeypadKey::Home),
+                Some(KeypadKey::Home),
+            ),
+            57424 => (FunctionalKey::Keypad(KeypadKey::End), Some(KeypadKey::End)),
+            57425 => (
+                FunctionalKey::Keypad(KeypadKey::Insert),
+                Some(KeypadKey::Insert),
+            ),
+            57426 => (
+                FunctionalKey::Keypad(KeypadKey::Delete),
+                Some(KeypadKey::Delete),
+            ),
+            57427 => (
+                FunctionalKey::Keypad(KeypadKey::Begin),
+                Some(KeypadKey::Begin),
+            ),
+            57428 => (FunctionalKey::Media(MediaKey::Play), None),
+            57429 => (FunctionalKey::Media(MediaKey::Pause), None),
+            57430 => (FunctionalKey::Media(MediaKey::PlayPause), None),
+            57431 => (FunctionalKey::Media(MediaKey::Reverse), None),
+            57432 => (FunctionalKey::Media(MediaKey::Stop), None),
+            57433 => (FunctionalKey::Media(MediaKey::FastForward), None),
+            57434 => (FunctionalKey::Media(MediaKey::Rewind), None),
+            57435 => (FunctionalKey::Media(MediaKey::TrackNext), None),
+            57436 => (FunctionalKey::Media(MediaKey::TrackPrevious), None),
+            57437 => (FunctionalKey::Media(MediaKey::Record), None),
+            57438 => (FunctionalKey::Media(MediaKey::LowerVolume), None),
+            57439 => (FunctionalKey::Media(MediaKey::RaiseVolume), None),
+            57440 => (FunctionalKey::Media(MediaKey::MuteVolume), None),
+            57441 => (FunctionalKey::Modifier(ModifierKey::LeftShift), None),
+            57442 => (FunctionalKey::Modifier(ModifierKey::LeftControl), None),
+            57443 => (FunctionalKey::Modifier(ModifierKey::LeftAlt), None),
+            57444 => (FunctionalKey::Modifier(ModifierKey::LeftSuper), None),
+            57445 => (FunctionalKey::Modifier(ModifierKey::LeftHyper), None),
+            57446 => (FunctionalKey::Modifier(ModifierKey::LeftMeta), None),
+            57447 => (FunctionalKey::Modifier(ModifierKey::RightShift), None),
+            57448 => (FunctionalKey::Modifier(ModifierKey::RightControl), None),
+            57449 => (FunctionalKey::Modifier(ModifierKey::RightAlt), None),
+            57450 => (FunctionalKey::Modifier(ModifierKey::RightSuper), None),
+            57451 => (FunctionalKey::Modifier(ModifierKey::RightHyper), None),
+            57452 => (FunctionalKey::Modifier(ModifierKey::RightMeta), None),
+            57453 => (FunctionalKey::Modifier(ModifierKey::IsoLevel3Shift), None),
+            57454 => (FunctionalKey::Modifier(ModifierKey::IsoLevel5Shift), None),
+            _ => return None,
+        };
+        Some(key)
+    }
+
     #[test]
     fn kitty_event_keeps_each_reported_identity_and_state() {
         let events = parse_chunks(&[b"\x1b[97:65:113;198:2;65u"], true);
@@ -1315,45 +1460,29 @@ mod tests {
     }
 
     #[test]
-    fn every_documented_private_key_code_handles_each_event_kind() {
-        for key_code in (57358..=57363).chain(57376..=57454) {
-            for (encoded_kind, expected_kind) in [
-                (1, EventKind::Press),
-                (2, EventKind::Repeat),
-                (3, EventKind::Release),
-            ] {
-                let stream = format!("\x1b[{key_code};1:{encoded_kind}u");
-                let events = parse_chunks(&[stream.as_bytes()], true);
-                assert!(matches!(
-                    events.as_slice(),
-                    [InputEvent::Key(RawKeyEvent {
-                        primary: KeyIdentity::Functional(_),
-                        kind,
-                        ..
-                    })] if *kind == expected_kind
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn kitty_modifier_masks_keep_locks_separate_for_every_event_kind() {
-        for modifier_value in 1..=256 {
-            for (encoded_kind, expected_kind) in [
-                (1, EventKind::Press),
-                (2, EventKind::Repeat),
-                (3, EventKind::Release),
-            ] {
-                let stream = format!("\x1b[57442;{modifier_value}:{encoded_kind}u");
-                let events = parse_chunks(&[stream.as_bytes()], true);
-                let [InputEvent::Key(event)] = events.as_slice() else {
-                    panic!("valid modifier event did not decode: {stream:?}");
-                };
-                let bits = (modifier_value - 1) as u8;
-                assert_eq!(event.modifiers.bits(), bits & 0b0011_1111);
-                assert_eq!(event.locks.caps_lock, bits & 0b0100_0000 != 0);
-                assert_eq!(event.locks.num_lock, bits & 0b1000_0000 != 0);
-                assert_eq!(event.kind, expected_kind);
+    fn every_canonical_kitty_functional_key_preserves_identity_modifiers_and_event_kind() {
+        for key_code in [9_u32, 13, 27, 127].into_iter().chain(57344..=57454) {
+            let (expected_primary, expected_keypad) =
+                kitty_functional_table_oracle(key_code).expect("canonical Kitty table entry");
+            for modifier_value in 1..=256 {
+                for (encoded_kind, expected_kind) in [
+                    (1, EventKind::Press),
+                    (2, EventKind::Repeat),
+                    (3, EventKind::Release),
+                ] {
+                    let stream = format!("\x1b[{key_code};{modifier_value}:{encoded_kind}u");
+                    let events = parse_chunks(&[stream.as_bytes()], true);
+                    let [InputEvent::Key(event)] = events.as_slice() else {
+                        panic!("canonical Kitty event did not decode: {stream:?}");
+                    };
+                    let bits = (modifier_value - 1) as u8;
+                    assert_eq!(event.primary, KeyIdentity::Functional(expected_primary));
+                    assert_eq!(event.keypad, expected_keypad);
+                    assert_eq!(event.modifiers.bits(), bits & 0b0011_1111);
+                    assert_eq!(event.locks.caps_lock, bits & 0b0100_0000 != 0);
+                    assert_eq!(event.locks.num_lock, bits & 0b1000_0000 != 0);
+                    assert_eq!(event.kind, expected_kind);
+                }
             }
         }
     }
@@ -1372,6 +1501,29 @@ mod tests {
                 locks: LockState::NONE,
                 keypad: Some(KeypadKey::Digit(1)),
             })]
+        );
+    }
+
+    #[test]
+    fn unknown_kitty_functional_keys_keep_their_raw_identity_and_metadata() {
+        let events = parse_chunks(&[b"\x1b[57455:57456:57457;198:3;65uz"], true);
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::Key(RawKeyEvent {
+                    primary: KeyIdentity::UnknownFunctional(57455),
+                    shifted: Some(KeyIdentity::UnknownFunctional(57456)),
+                    base: Some(KeyIdentity::UnknownFunctional(57457)),
+                    modifiers: Modifiers::SHIFT | Modifiers::CONTROL,
+                    kind: EventKind::Release,
+                    locks: LockState {
+                        caps_lock: true,
+                        num_lock: true,
+                    },
+                    keypad: None,
+                }),
+                InputEvent::Key(RawKeyEvent::plain(KeyIdentity::Unicode('z'))),
+            ]
         );
     }
 
@@ -1421,7 +1573,7 @@ mod tests {
 
     #[test]
     fn parameter_limits_and_unknown_well_formed_sequences_are_distinct() {
-        let events = parse_chunks(&[b"\x1b[1;1;1;1ux\x1b[57344uy"], true);
+        let events = parse_chunks(&[b"\x1b[1;1;1;1ux\x1b[?1uy"], true);
         assert!(matches!(
             events.as_slice(),
             [
@@ -1467,6 +1619,13 @@ mod tests {
         );
     }
 
+    fn ordinary_unicode_scalar() -> impl Strategy<Value = char> {
+        any::<char>().prop_filter("not a Kitty functional code", |character| {
+            !matches!(*character as u32, 0 | 9 | 13 | 27 | 127)
+                && !('\u{e000}'..='\u{f8ff}').contains(character)
+        })
+    }
+
     proptest! {
         #[test]
         fn arbitrary_bytes_never_panic_and_have_chunking_invariance(
@@ -1491,6 +1650,50 @@ mod tests {
         }
 
         #[test]
+        fn valid_unicode_and_alternate_identities_are_preserved(
+            primary in ordinary_unicode_scalar(),
+            shifted in prop::option::of(ordinary_unicode_scalar()),
+            base in prop::option::of(ordinary_unicode_scalar()),
+            modifier_value in 1u32..=256,
+            encoded_kind in 1u32..=3,
+        ) {
+            let mut stream = format!("\x1b[{}", primary as u32);
+            if shifted.is_some() || base.is_some() {
+                stream.push(':');
+                if let Some(shifted) = shifted {
+                    stream.push_str(&(shifted as u32).to_string());
+                }
+                if let Some(base) = base {
+                    stream.push(':');
+                    stream.push_str(&(base as u32).to_string());
+                }
+            }
+            stream.push_str(&format!(";{modifier_value}:{encoded_kind};65u"));
+
+            let events = parse_chunks(&[stream.as_bytes()], true);
+            let [InputEvent::Key(event)] = events.as_slice() else {
+                prop_assert!(false, "valid Kitty Unicode event did not decode: {stream:?}");
+                return Ok(());
+            };
+            let bits = (modifier_value - 1) as u8;
+            prop_assert_eq!(event.primary, KeyIdentity::Unicode(primary));
+            prop_assert_eq!(event.shifted, shifted.map(KeyIdentity::Unicode));
+            prop_assert_eq!(event.base, base.map(KeyIdentity::Unicode));
+            prop_assert_eq!(event.modifiers.bits(), bits & 0b0011_1111);
+            prop_assert_eq!(event.locks.caps_lock, bits & 0b0100_0000 != 0);
+            prop_assert_eq!(event.locks.num_lock, bits & 0b1000_0000 != 0);
+            prop_assert_eq!(
+                event.kind,
+                match encoded_kind {
+                    1 => EventKind::Press,
+                    2 => EventKind::Repeat,
+                    3 => EventKind::Release,
+                    _ => unreachable!(),
+                },
+            );
+        }
+
+        #[test]
         fn unicode_scalar_boundaries_are_accepted_or_rejected_deterministically(
             scalar in prop_oneof![
                 Just(0xd7ff_u32),
@@ -1506,11 +1709,8 @@ mod tests {
             let stream = format!("\x1b[{scalar}u");
             let events = parse_chunks(&[stream.as_bytes()], true);
             match char::from_u32(scalar) {
-                Some(_) if !(0xe000..=0xf8ff).contains(&scalar) => {
-                    prop_assert!(matches!(events.as_slice(), [InputEvent::Key(_)]));
-                }
                 Some(_) => {
-                    prop_assert!(matches!(events.as_slice(), [InputEvent::Unknown(_)]));
+                    prop_assert!(matches!(events.as_slice(), [InputEvent::Key(_)]));
                 }
                 None => {
                     let is_invalid_scalar = matches!(
