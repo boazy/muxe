@@ -10,11 +10,11 @@ pub mod frame;
 pub mod wire;
 
 pub use control::{
-    ControlDecoder, ControlMessage, ControlOperation, ControlRequest, ControlResponse,
-    HandoffId,
+    ActivationStatus, CompatibilityRecord, ControlDecoder, ControlDirection, ControlMessage,
+    ControlOperation, ControlPolicy, ControlRequest, ControlRequestId, ControlResponse, HandoffId,
 };
 pub use frame::{
-    encode_frame, ArchivedFrame, ConnectionDecoder, ConnectionPolicy, DecodeError, Prelude,
-    PRELUDE_LEN,
+    ArchivedFrame, ConnectionDecoder, ConnectionPolicy, DecodeError, EncodedFrame, PRELUDE_LEN,
+    Prelude, encode_frame,
 };
 pub use wire::*;

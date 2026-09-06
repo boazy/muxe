@@ -4,8 +4,8 @@ use rkyv::{rancor::Error as RkyvError, util::AlignedVec};
 use thiserror::Error;
 
 use crate::wire::{
-    Codec, ConnectionPhase, MessageDirection, PeerRole, SchemaFingerprint, SemanticError,
-    WireMessage, ArchivedWireMessage, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    ArchivedWireMessage, Codec, ConnectionPhase, MAX_FRAME_LEN, MessageDirection, PROTOCOL_VERSION,
+    PeerRole, SchemaFingerprint, SemanticError, WireMessage, validate_archived_wire_message,
 };
 
 pub const PRELUDE_LEN: usize = 44;
@@ -153,8 +153,7 @@ impl ArchivedFrame {
     }
 
     pub fn archived(&self) -> Result<&ArchivedWireMessage, DecodeError> {
-        rkyv::access::<ArchivedWireMessage, RkyvError>(self.bytes.as_slice())
-            .map_err(archive_error)
+        rkyv::access::<ArchivedWireMessage, RkyvError>(self.bytes.as_slice()).map_err(archive_error)
     }
 
     pub fn deserialize(&self) -> Result<WireMessage, DecodeError> {
@@ -163,22 +162,48 @@ impl ArchivedFrame {
     }
 }
 
-pub fn encode_frame(message: &WireMessage) -> Result<Vec<u8>, DecodeError> {
+/// A frame split into its endian-stable prefix and aligned archive payload.
+///
+/// Writers must write the two slices in order instead of joining them into another allocation.
+#[derive(Debug)]
+pub struct EncodedFrame {
+    prefix: [u8; LENGTH_PREFIX_LEN],
+    payload: AlignedVec,
+}
+
+impl EncodedFrame {
+    pub fn prefix(&self) -> &[u8; LENGTH_PREFIX_LEN] {
+        &self.prefix
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
+
+    pub fn into_parts(self) -> ([u8; LENGTH_PREFIX_LEN], AlignedVec) {
+        (self.prefix, self.payload)
+    }
+}
+
+pub fn encode_frame(message: &WireMessage) -> Result<EncodedFrame, DecodeError> {
     let payload = rkyv::to_bytes::<RkyvError>(message).map_err(archive_error)?;
     let payload_len = u32::try_from(payload.len()).map_err(|_| DecodeError::FrameTooLarge {
         declared: u32::MAX,
         maximum: MAX_FRAME_LEN,
     })?;
+    if payload_len == 0 {
+        return Err(DecodeError::EmptyFrame);
+    }
     if payload_len > MAX_FRAME_LEN {
         return Err(DecodeError::FrameTooLarge {
             declared: payload_len,
             maximum: MAX_FRAME_LEN,
         });
     }
-    let mut frame = Vec::with_capacity(LENGTH_PREFIX_LEN + payload.len());
-    frame.extend_from_slice(&payload_len.to_be_bytes());
-    frame.extend_from_slice(payload.as_slice());
-    Ok(frame)
+    Ok(EncodedFrame {
+        prefix: payload_len.to_be_bytes(),
+        payload,
+    })
 }
 
 #[derive(Debug)]
@@ -225,12 +250,17 @@ impl ConnectionDecoder {
         self.prelude
     }
 
-    pub fn push(&mut self, mut input: &[u8]) -> Result<Vec<ArchivedFrame>, DecodeError> {
+    /// Decodes arbitrary stream chunks and calls `on_frame` for each valid frame before any later
+    /// coalesced frame can close the connection. Earlier valid messages therefore never disappear
+    /// merely because a subsequent frame is malformed.
+    pub fn push<F>(&mut self, mut input: &[u8], mut on_frame: F) -> Result<(), DecodeError>
+    where
+        F: FnMut(ArchivedFrame),
+    {
         if self.failed {
             return Err(DecodeError::DecoderClosed);
         }
 
-        let mut frames = Vec::new();
         while !input.is_empty() {
             let state = mem::replace(&mut self.state, DecoderState::Failed);
             match state {
@@ -273,6 +303,9 @@ impl ConnectionDecoder {
                         continue;
                     }
                     let declared_len = u32::from_be_bytes(bytes);
+                    if declared_len == 0 {
+                        return self.fail(DecodeError::EmptyFrame);
+                    }
                     if declared_len > MAX_FRAME_LEN {
                         return self.fail(DecodeError::FrameTooLarge {
                             declared: declared_len,
@@ -302,11 +335,12 @@ impl ConnectionDecoder {
                     }
 
                     let frame = ArchivedFrame { bytes };
-                    let message = match frame.deserialize() {
-                        Ok(message) => message,
+                    let archived = match frame.archived() {
+                        Ok(archived) => archived,
                         Err(error) => return self.fail(error),
                     };
-                    let next_phase = match message.validate_for_peer(
+                    let next_phase = match validate_archived_wire_message(
+                        archived,
                         self.policy.role,
                         self.policy.direction,
                         self.phase,
@@ -319,12 +353,12 @@ impl ConnectionDecoder {
                         bytes: [0; LENGTH_PREFIX_LEN],
                         filled: 0,
                     };
-                    frames.push(frame);
+                    on_frame(frame);
                 }
                 DecoderState::Failed => return self.fail(DecodeError::DecoderClosed),
             }
         }
-        Ok(frames)
+        Ok(())
     }
 
     pub fn finish(&mut self) -> Result<(), DecodeError> {
@@ -334,9 +368,13 @@ impl ConnectionDecoder {
         let truncated = match &self.state {
             DecoderState::Prelude { filled, .. } => Some(TruncationStage::Prelude(*filled)),
             DecoderState::LengthPrefix { filled: 0, .. } if self.prelude.is_some() => None,
-            DecoderState::LengthPrefix { filled, .. } => Some(TruncationStage::LengthPrefix(*filled)),
+            DecoderState::LengthPrefix { filled, .. } => {
+                Some(TruncationStage::LengthPrefix(*filled))
+            }
             DecoderState::Payload {
-                declared_len, bytes, ..
+                declared_len,
+                bytes,
+                ..
             } => Some(TruncationStage::Payload {
                 expected: *declared_len,
                 received: bytes.len() as u32,
@@ -407,6 +445,8 @@ pub enum DecodeError {
     SchemaFingerprintMismatch,
     #[error("frame limit mismatch: expected {expected}, received {received}")]
     FrameLimitMismatch { expected: u32, received: u32 },
+    #[error("zero-length frames are not valid rkyv archives")]
+    EmptyFrame,
     #[error("frame length {declared} exceeds maximum {maximum}")]
     FrameTooLarge { declared: u32, maximum: u32 },
     #[error("truncated {0:?}")]
@@ -456,11 +496,17 @@ mod tests {
             .to_vec()
     }
 
+    fn append_frame(output: &mut Vec<u8>, frame: EncodedFrame) {
+        output.extend_from_slice(frame.prefix());
+        output.extend_from_slice(frame.payload());
+    }
+
     #[test]
-    fn accepts_coalesced_hello_and_request() {
+    fn delivers_valid_coalesced_frames_before_later_processing() {
         let mut bytes = prelude();
-        bytes.extend(encode_frame(&hello()).unwrap());
-        bytes.extend(
+        append_frame(&mut bytes, encode_frame(&hello()).unwrap());
+        append_frame(
+            &mut bytes,
             encode_frame(&WireMessage::Request {
                 request_id: request_id(2),
                 request: crate::wire::ClientRequest::Heartbeat,
@@ -468,30 +514,63 @@ mod tests {
             .unwrap(),
         );
 
-        let frames = decoder().push(&bytes).unwrap();
+        let mut frames = Vec::new();
+        decoder().push(&bytes, |frame| frames.push(frame)).unwrap();
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].deserialize().unwrap(), hello());
+        assert!(matches!(
+            frames[0].archived().unwrap(),
+            ArchivedWireMessage::Hello { .. }
+        ));
+    }
+
+    #[test]
+    fn delivers_a_valid_frame_before_a_later_coalesced_malformed_frame() {
+        let mut bytes = prelude();
+        append_frame(&mut bytes, encode_frame(&hello()).unwrap());
+        bytes.extend_from_slice(&4_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+        let mut delivered = 0;
+        assert!(matches!(
+            decoder().push(&bytes, |_| delivered += 1),
+            Err(DecodeError::InvalidArchive(_))
+        ));
+        assert_eq!(delivered, 1);
     }
 
     #[test]
     fn accepts_every_source_alignment_after_copying_to_aligned_storage() {
         let mut stream = prelude();
-        stream.extend(encode_frame(&hello()).unwrap());
+        append_frame(&mut stream, encode_frame(&hello()).unwrap());
         for offset in 0..32 {
             let mut source = vec![0; offset];
             source.extend_from_slice(&stream);
-            let frames = decoder().push(&source[offset..]).unwrap();
-            assert_eq!(frames.len(), 1);
-            assert_eq!(frames[0].as_bytes().as_ptr() as usize % AlignedVec::<16>::ALIGNMENT, 0);
+            let mut aligned = false;
+            decoder()
+                .push(&source[offset..], |frame| {
+                    aligned = frame.as_bytes().as_ptr() as usize % AlignedVec::<16>::ALIGNMENT == 0;
+                })
+                .unwrap();
+            assert!(aligned);
         }
     }
 
     #[test]
-    fn rejects_oversized_length_before_collecting_payload() {
-        let mut stream = prelude();
-        stream.extend_from_slice(&(MAX_FRAME_LEN + 1).to_be_bytes());
+    fn rejects_empty_and_oversized_length_before_collecting_payload() {
+        let mut empty = prelude();
+        empty.extend_from_slice(&0_u32.to_be_bytes());
+        assert!(matches!(
+            decoder().push(&empty, |_| {}),
+            Err(DecodeError::EmptyFrame)
+        ));
+
+        let mut oversized = prelude();
+        oversized.extend_from_slice(&(MAX_FRAME_LEN + 1).to_be_bytes());
         let mut decoder = decoder();
-        assert!(matches!(decoder.push(&stream), Err(DecodeError::FrameTooLarge { .. })));
+        assert!(matches!(
+            decoder.push(&oversized, |_| {}),
+            Err(DecodeError::FrameTooLarge { .. })
+        ));
         assert_eq!(decoder.buffered_payload_len(), 0);
     }
 
@@ -500,14 +579,14 @@ mod tests {
         let prelude = prelude();
         for cutoff in 0..PRELUDE_LEN {
             let mut decoder = decoder();
-            decoder.push(&prelude[..cutoff]).unwrap();
+            decoder.push(&prelude[..cutoff], |_| {}).unwrap();
             assert!(matches!(decoder.finish(), Err(DecodeError::Truncated(_))));
         }
         let mut stream = prelude;
         stream.extend_from_slice(&[0, 0, 0, 4]);
         for cutoff in PRELUDE_LEN + 1..PRELUDE_LEN + LENGTH_PREFIX_LEN {
             let mut decoder = decoder();
-            decoder.push(&stream[..cutoff]).unwrap();
+            decoder.push(&stream[..cutoff], |_| {}).unwrap();
             assert!(matches!(decoder.finish(), Err(DecodeError::Truncated(_))));
         }
     }
@@ -517,49 +596,50 @@ mod tests {
         let mut malformed = prelude();
         malformed.extend_from_slice(&4_u32.to_be_bytes());
         malformed.extend_from_slice(&[0, 0, 0, 0]);
-        assert!(matches!(decoder().push(&malformed), Err(DecodeError::InvalidArchive(_))));
+        assert!(matches!(
+            decoder().push(&malformed, |_| {}),
+            Err(DecodeError::InvalidArchive(_))
+        ));
 
         let valid = encode_frame(&hello()).unwrap();
-        let declared = u32::from_be_bytes(valid[..4].try_into().unwrap());
+        let declared = u32::from_be_bytes(*valid.prefix());
         let mut short = prelude();
         short.extend_from_slice(&(declared - 1).to_be_bytes());
-        short.extend_from_slice(&valid[4..]);
-        assert!(decoder().push(&short).is_err());
+        short.extend_from_slice(valid.payload());
+        assert!(decoder().push(&short, |_| {}).is_err());
 
         let mut long = prelude();
         long.extend_from_slice(&(declared + 1).to_be_bytes());
-        long.extend_from_slice(&valid[4..]);
+        long.extend_from_slice(valid.payload());
         let mut decoder = decoder();
-        decoder.push(&long).unwrap();
+        decoder.push(&long, |_| {}).unwrap();
         assert!(matches!(decoder.finish(), Err(DecodeError::Truncated(_))));
     }
 
     #[test]
-    fn rejects_wrong_role_and_schema_without_delivering_a_frame() {
+    fn rejects_wrong_role_schema_and_role_specific_messages() {
         let mut wrong_role = Prelude::rkyv(PeerRole::Launcher, SchemaFingerprint::application())
             .encode()
             .to_vec();
-        wrong_role.extend(encode_frame(&hello()).unwrap());
+        append_frame(&mut wrong_role, encode_frame(&hello()).unwrap());
         assert!(matches!(
-            decoder().push(&wrong_role),
+            decoder().push(&wrong_role, |_| {}),
             Err(DecodeError::PeerRoleMismatch { .. })
         ));
 
         let mut wrong_schema = Prelude::rkyv(PeerRole::Ui, SchemaFingerprint::ZERO)
             .encode()
             .to_vec();
-        wrong_schema.extend(encode_frame(&hello()).unwrap());
+        append_frame(&mut wrong_schema, encode_frame(&hello()).unwrap());
         assert!(matches!(
-            decoder().push(&wrong_schema),
+            decoder().push(&wrong_schema, |_| {}),
             Err(DecodeError::SchemaFingerprintMismatch)
         ));
-    }
 
-    #[test]
-    fn rejects_illegal_role_specific_messages() {
-        let mut stream = prelude();
-        stream.extend(encode_frame(&hello()).unwrap());
-        stream.extend(
+        let mut illegal = prelude();
+        append_frame(&mut illegal, encode_frame(&hello()).unwrap());
+        append_frame(
+            &mut illegal,
             encode_frame(&WireMessage::Request {
                 request_id: request_id(2),
                 request: crate::wire::ClientRequest::PrepareUiLaunch(
@@ -572,14 +652,17 @@ mod tests {
             })
             .unwrap(),
         );
-        assert!(matches!(decoder().push(&stream), Err(DecodeError::Semantic(_))));
+        assert!(matches!(
+            decoder().push(&illegal, |_| {}),
+            Err(DecodeError::Semantic(_))
+        ));
     }
 
     proptest! {
         #[test]
         fn arbitrary_input_never_panics_or_waits_after_finish(input in prop::collection::vec(any::<u8>(), 0..8192)) {
             let mut decoder = decoder();
-            let _ = decoder.push(&input);
+            let _ = decoder.push(&input, |_| {});
             let _ = decoder.finish();
         }
     }
