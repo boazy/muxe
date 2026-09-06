@@ -1,34 +1,49 @@
 use std::time::Duration;
 
-use muxe_core::{CanonicalKey, EventKind, KeyCapabilities, KeyboardProfile};
+use muxe_core::{
+    AfterAction, CanonicalKey, EventKind, ExecutionId as CoreExecutionId, KeyCapabilities,
+    KeyboardProfile, MenuControl as CoreMenuControl, MenuId as CoreMenuId, MenuSession,
+    MenuSessionEvent, MenuSessionInput, MenuSessionOutput, MenuSessionState, SessionInstant,
+};
 use muxe_protocol::{
-    evaluate_archived_binding_state, ArchivedKeyboardProfileWire, ArchivedLocalMenuActionWire,
-    ArchivedMenuControl, ArchivedMenuViewMenuWire, BindingId, ConditionEvaluationErrorWire,
-    MenuControl, PagesContextWire,
+    ArchivedKeyboardProfileWire, ArchivedLocalMenuActionWire, ArchivedMenuControl,
+    ArchivedMenuViewMenuWire, BindingAvailability, BindingId, BrokerEvent,
+    ConditionEvaluationErrorWire, ExecutionId as WireExecutionId, ExecutionOutcome, MenuControl,
+    PagesContextWire, evaluate_archived_binding_state,
 };
 use ratatui::layout::Rect;
 use thiserror::Error;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    arrange_cells, sanitize_single_line, ArchivedUiSnapshot, BreadcrumbTemplate, Cell,
-    CellTemplate, ConvertedInput, GridPlan, GridRect, MenuStatus, PaginationTemplate, RenderedText,
-    SnapshotError, StatusTemplate, SurfaceFrame, SurfacePadding, TemplateError, TemplateRenderer,
+    ArchivedUiSnapshot, BreadcrumbTemplate, Cell, CellTemplate, ConvertedInput, GridPlan, GridRect,
+    MenuStatus, PaginationTemplate, RenderedText, SnapshotError, StatusTemplate, SurfaceFrame,
+    SurfacePadding, TemplateError, TemplateRenderer, arrange_cells, sanitize_single_line,
 };
 
-/// A broker request or local redraw selected by a checked menu binding.
+/// A broker request or local state transition selected by a checked menu binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiCommand {
     /// The broker remains authoritative for this ordinary binding.
     Invoke { generation: u64, binding: BindingId },
-    /// The host must send this control request to the broker.
+    /// The broker must apply this control to a pending execution.
     MenuControl(MenuControl),
+    /// The attached session must be released without a further menu-control request.
+    Detach,
     /// The UI consumed input by changing local menu or pager state.
     Redraw,
     /// The input does not select a visible, enabled binding.
     Ignored,
 }
 
+/// Broker-authoritative disposition for one accepted binding invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvocationDisposition {
+    /// The broker will emit one terminal completion for this full wire execution ID.
+    Await,
+    /// The configured post-action transition applies immediately.
+    Detached,
+}
 /// A fully rendered page derived from one checked archived attachment.
 pub struct PreparedMenu {
     pub title: String,
@@ -74,11 +89,33 @@ pub enum UiError {
     InvalidBindingKey(String),
     #[error("page-dependent binding conditions did not reach a stable page count")]
     UnstablePageConditions,
+    #[error("menu session is already dismissed")]
+    SessionDismissed,
+    #[error("attachment does not contain binding {generation}:{ordinal}")]
+    MissingBinding { generation: u64, ordinal: u64 },
+    #[error("UI-local execution sequence overflowed")]
+    ExecutionSequenceExhausted,
 }
 
 struct StatusMessage {
     level: String,
     message: String,
+}
+
+struct BindingAvailabilityOverlay {
+    binding: BindingId,
+    availability: BindingAvailability,
+    diagnostic: Option<String>,
+}
+
+struct PendingExecution {
+    wire: WireExecutionId,
+    core: CoreExecutionId,
+    after_action: AfterAction,
+}
+
+struct BindingPolicy {
+    after_action: AfterAction,
 }
 
 /// UI-local state around a checked archived attachment.
@@ -90,38 +127,53 @@ pub struct UiRuntime {
     snapshot: ArchivedUiSnapshot,
     renderer: TemplateRenderer,
     keyboard_profile: KeyboardProfile,
-    current_menu: usize,
-    menu_stack: Vec<usize>,
+    menu_session: MenuSession,
     current_page: usize,
     last_page_count: usize,
+    last_area: Option<Rect>,
     status: Option<StatusMessage>,
+    availability: Vec<BindingAvailabilityOverlay>,
+    pending: Option<PendingExecution>,
+    next_execution: u64,
 }
 
 impl UiRuntime {
     /// Attaches a checked broker response and compiles its supplied templates once.
     pub fn attach(frame: muxe_protocol::ArchivedFrame) -> Result<Self, UiError> {
+        Self::attach_at(frame, SessionInstant(Duration::ZERO))
+    }
+
+    /// Attaches a checked broker response at the caller-supplied monotonic session time.
+    pub fn attach_at(
+        frame: muxe_protocol::ArchivedFrame,
+        now: SessionInstant,
+    ) -> Result<Self, UiError> {
         let snapshot = ArchivedUiSnapshot::new(frame)?;
         let renderer = snapshot
             .with_attachment(|attachment| TemplateRenderer::from_archived(&attachment.theme))??;
         let keyboard_profile = snapshot.with_attachment(keyboard_profile_from_attachment)?;
-        let current_menu = snapshot.with_attachment(|attachment| {
-            attachment
-                .menu
-                .menus
-                .iter()
-                .position(|menu| menu.id.0.as_str() == attachment.menu.root.0.as_str())
-                .ok_or(UiError::MissingRoot)
-        })??;
+        let (root, timeout) = snapshot.with_attachment(|attachment| {
+            (
+                CoreMenuId::new(attachment.menu.root.0.as_str()),
+                attachment
+                    .inactivity_timeout_millis
+                    .as_ref()
+                    .map(|timeout| Duration::from_millis(timeout.to_native())),
+            )
+        })?;
         snapshot.with_attachment(validate_binding_keys)??;
         Ok(Self {
             snapshot,
             renderer,
             keyboard_profile,
-            current_menu,
-            menu_stack: Vec::new(),
+            menu_session: MenuSession::new(root, timeout, now),
             current_page: 0,
             last_page_count: 1,
+            last_area: None,
             status: None,
+            availability: Vec::new(),
+            pending: None,
+            next_execution: 0,
         })
     }
 
@@ -135,9 +187,356 @@ impl UiRuntime {
         Ok(self.keyboard_profile.clone())
     }
 
+    /// Returns the next caller-supplied inactivity deadline, if it is not paused.
+    pub fn inactivity_deadline(&self) -> Option<SessionInstant> {
+        self.menu_session.deadline()
+    }
+
+    /// Applies one converted terminal input at a caller-supplied monotonic session time.
+    pub fn handle_input_at(
+        &mut self,
+        input: &ConvertedInput,
+        at: SessionInstant,
+    ) -> Result<UiCommand, UiError> {
+        let ConvertedInput::Key(input) = input else {
+            return Ok(UiCommand::Ignored);
+        };
+        if input.event.kind == EventKind::Release {
+            let output = self.menu_session.handle(MenuSessionEvent::Key {
+                at,
+                input: MenuSessionInput::Unknown,
+            });
+            return Ok(self.menu_output(output));
+        }
+
+        let current_menu = self.current_menu_id()?;
+        let selection = self.snapshot.with_attachment(|attachment| {
+            let menu = attachment
+                .menu
+                .menus
+                .iter()
+                .find(|menu| menu.id.0.as_str() == current_menu.as_str())
+                .ok_or(UiError::MissingRoot)?;
+            select_binding(
+                menu,
+                &self.keyboard_profile,
+                input,
+                self.current_page,
+                self.last_page_count,
+                &self.availability,
+            )
+        })??;
+        let active = matches!(self.menu_session.state(), MenuSessionState::Active);
+        match selection {
+            Selection::Ignored => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                Ok(self.menu_output(output))
+            }
+            Selection::Unavailable(message) => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                if active {
+                    self.status = Some(StatusMessage {
+                        level: "blocked".into(),
+                        message,
+                    });
+                    return Ok(UiCommand::Redraw);
+                }
+                Ok(self.menu_output(output))
+            }
+            Selection::Open(target) if active => {
+                let output = self.menu_session.handle(MenuSessionEvent::OpenSubmenu {
+                    at,
+                    menu: CoreMenuId::new(target),
+                });
+                Ok(self.menu_output(output))
+            }
+            Selection::Open(_) => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                Ok(self.menu_output(output))
+            }
+            Selection::Control(control) => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Control(wire_to_core_control(control)),
+                });
+                Ok(self.menu_output(output))
+            }
+            Selection::PagePrevious | Selection::PageNext if active => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                if !matches!(output, Some(MenuSessionOutput::UnknownKeySwallowed)) {
+                    return Ok(self.menu_output(output));
+                }
+                let previous = matches!(selection, Selection::PagePrevious);
+                let moved = if previous {
+                    if self.current_page > 0 {
+                        self.current_page -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                } else if self.current_page.saturating_add(1) < self.last_page_count {
+                    self.current_page += 1;
+                    true
+                } else {
+                    false
+                };
+                if moved {
+                    self.status = None;
+                    Ok(UiCommand::Redraw)
+                } else {
+                    Ok(UiCommand::Ignored)
+                }
+            }
+            Selection::PagePrevious | Selection::PageNext => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                Ok(self.menu_output(output))
+            }
+            Selection::Binding(binding) => {
+                self.status = None;
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Binding(core_binding_id(binding)),
+                });
+                Ok(self.menu_output(output))
+            }
+        }
+    }
+
+    /// Advances the pure session clock to its next caller-owned deadline.
+    pub fn tick(&mut self, at: SessionInstant) -> UiCommand {
+        let output = self.menu_session.handle(MenuSessionEvent::Tick { at });
+        self.menu_output(output)
+    }
+
+    /// Records the broker's authoritative acceptance disposition for a selected binding.
+    pub fn invocation_accepted(
+        &mut self,
+        binding: BindingId,
+        execution: WireExecutionId,
+        disposition: InvocationDisposition,
+        at: SessionInstant,
+    ) -> Result<UiCommand, UiError> {
+        let policy = self.binding_policy(&binding)?;
+        if disposition == InvocationDisposition::Await {
+            if !matches!(self.menu_session.state(), MenuSessionState::Active)
+                || self.pending.is_some()
+            {
+                return Ok(UiCommand::Ignored);
+            }
+            self.next_execution = self
+                .next_execution
+                .checked_add(1)
+                .ok_or(UiError::ExecutionSequenceExhausted)?;
+            let core = CoreExecutionId(self.next_execution);
+            self.pending = Some(PendingExecution {
+                wire: execution,
+                core,
+                after_action: policy.after_action,
+            });
+            let output = self.menu_session.handle(MenuSessionEvent::ActionPending {
+                at,
+                execution: core,
+            });
+            Ok(self.menu_output(output))
+        } else {
+            let output = self
+                .menu_session
+                .handle(MenuSessionEvent::DetachedAccepted {
+                    at,
+                    execution: CoreExecutionId(0),
+                    after_action: policy.after_action,
+                });
+            Ok(self.menu_output(output))
+        }
+    }
+
+    /// Applies the broker's correlated acknowledgement of one pending menu control.
+    pub fn pending_control_completed(
+        &mut self,
+        execution: &WireExecutionId,
+        control: MenuControl,
+        at: SessionInstant,
+    ) -> UiCommand {
+        let Some(pending) = self.pending.as_ref() else {
+            return UiCommand::Ignored;
+        };
+        if &pending.wire != execution {
+            return UiCommand::Ignored;
+        }
+        let core = pending.core;
+        let output = self
+            .menu_session
+            .handle(MenuSessionEvent::PendingControlCompleted {
+                at,
+                execution: core,
+                control: wire_to_core_control(control),
+            });
+        if !matches!(
+            self.menu_session.state(),
+            MenuSessionState::Pending {
+                execution,
+                ..
+            } if *execution == core
+        ) {
+            self.pending = None;
+        }
+        self.menu_output(output)
+    }
+
+    /// Applies one asynchronous broker event without replacing the pinned attachment.
+    pub fn handle_broker_event(
+        &mut self,
+        event: &BrokerEvent,
+        at: SessionInstant,
+    ) -> Result<UiCommand, UiError> {
+        match event {
+            BrokerEvent::ExecutionCompleted {
+                session,
+                execution,
+                outcome,
+                diagnostic,
+            } if session.as_str() == self.session_id()? => {
+                let Some(pending) = self.pending.as_ref() else {
+                    return Ok(UiCommand::Ignored);
+                };
+                if pending.wire != *execution {
+                    return Ok(UiCommand::Ignored);
+                }
+                let core = pending.core;
+                let after_action = pending.after_action;
+                let output = self.menu_session.handle(MenuSessionEvent::ActionCompleted {
+                    at,
+                    execution: core,
+                    success: matches!(outcome, ExecutionOutcome::Succeeded),
+                    after_action,
+                });
+                let still_pending = matches!(
+                    self.menu_session.state(),
+                    MenuSessionState::Pending {
+                        execution,
+                        ..
+                    } if *execution == core
+                );
+                if !still_pending {
+                    self.pending = None;
+                }
+                if output.is_some() {
+                    return Ok(self.menu_output(output));
+                }
+                if !still_pending {
+                    let (level, fallback) = execution_status(*outcome);
+                    self.status = Some(StatusMessage {
+                        level: level.into(),
+                        message: diagnostic
+                            .as_ref()
+                            .map(|diagnostic| diagnostic.message.clone())
+                            .unwrap_or_else(|| fallback.into()),
+                    });
+                    return Ok(UiCommand::Redraw);
+                }
+                Ok(UiCommand::Ignored)
+            }
+            BrokerEvent::BindingAvailabilityChanged {
+                session,
+                generation,
+                binding,
+                availability,
+                diagnostic,
+            } if session.as_str() == self.session_id()? => {
+                let known = self.snapshot.with_attachment(|attachment| {
+                    attachment.menu.generation.to_native() == *generation
+                        && attachment
+                            .menu
+                            .menus
+                            .iter()
+                            .flat_map(|menu| menu.bindings.iter())
+                            .any(|candidate| {
+                                candidate.id.generation.to_native() == binding.generation
+                                    && candidate.id.ordinal.to_native() == binding.ordinal
+                            })
+                })?;
+                if !known {
+                    return Ok(UiCommand::Ignored);
+                }
+                if let Some(current) = self
+                    .availability
+                    .iter_mut()
+                    .find(|current| current.binding == *binding)
+                {
+                    current.availability = *availability;
+                    current.diagnostic = diagnostic
+                        .as_ref()
+                        .map(|diagnostic| diagnostic.message.clone());
+                } else {
+                    self.availability.push(BindingAvailabilityOverlay {
+                        binding: binding.clone(),
+                        availability: *availability,
+                        diagnostic: diagnostic
+                            .as_ref()
+                            .map(|diagnostic| diagnostic.message.clone()),
+                    });
+                }
+                Ok(UiCommand::Redraw)
+            }
+            BrokerEvent::AdapterHealthChanged {
+                healthy,
+                diagnostic,
+            } => {
+                self.status = Some(StatusMessage {
+                    level: if *healthy { "ready" } else { "blocked" }.into(),
+                    message: diagnostic
+                        .as_ref()
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .unwrap_or_else(|| {
+                            if *healthy {
+                                "Host adapter is available".into()
+                            } else {
+                                "Host adapter is unavailable".into()
+                            }
+                        }),
+                });
+                Ok(UiCommand::Redraw)
+            }
+            BrokerEvent::BrokerRetiring | BrokerEvent::Fatal(_) => Ok(UiCommand::Detach),
+            _ => Ok(UiCommand::Ignored),
+        }
+    }
+
+    /// Shows a recoverable broker diagnostic without replacing the pinned attachment.
+    pub fn report_broker_error(&mut self, message: String) {
+        self.status = Some(StatusMessage {
+            level: "error".into(),
+            message,
+        });
+    }
+
     /// Renders the current menu against the exact terminal rectangle before a surface redraw.
     pub fn prepare(&mut self, area: Rect) -> Result<PreparedMenu, UiError> {
-        let current_menu = self.current_menu;
+        if self
+            .last_area
+            .replace(area)
+            .is_some_and(|previous| previous != area)
+        {
+            self.current_page = 0;
+            self.last_page_count = 1;
+        }
+        let current_menu = self.current_menu_id()?;
+        let stack = self.menu_session.stack();
         let current_page = self.current_page;
         let last_page_count = self.last_page_count;
         let status = self.status.as_ref();
@@ -145,8 +544,9 @@ impl UiRuntime {
             let menu = attachment
                 .menu
                 .menus
-                .get(current_menu)
-                .ok_or(UiError::MissingMenu(current_menu))?;
+                .iter()
+                .find(|menu| menu.id.0.as_str() == current_menu.as_str())
+                .ok_or(UiError::MissingRoot)?;
             let padding = SurfacePadding {
                 left: menu.layout.padding.left.to_native(),
                 right: menu.layout.padding.right.to_native(),
@@ -164,7 +564,13 @@ impl UiRuntime {
                     current: page.saturating_add(1) as u64,
                     count: count as u64,
                 };
-                let cells = render_visible_cells(&self.renderer, menu, pages, max_title_width)?;
+                let cells = render_visible_cells(
+                    &self.renderer,
+                    menu,
+                    pages,
+                    max_title_width,
+                    &self.availability,
+                )?;
                 let layout_cells = cells
                     .iter()
                     .map(|rendered| Cell {
@@ -180,12 +586,7 @@ impl UiRuntime {
                 let next_count = plan.page_count.max(1);
                 let next_page = page.min(next_count.saturating_sub(1));
                 if next_count == count && next_page == page {
-                    let breadcrumbs = render_breadcrumbs(
-                        &self.renderer,
-                        attachment,
-                        &self.menu_stack,
-                        current_menu,
-                    )?;
+                    let breadcrumbs = render_breadcrumbs(&self.renderer, attachment, stack)?;
                     let pager =
                         render_pager(&self.renderer, menu, &plan, page, grid.width as usize)?;
                     let status = status
@@ -224,93 +625,102 @@ impl UiRuntime {
         Ok(prepared)
     }
 
-    /// Applies one converted key against the checked current menu.
-    pub fn handle_input(&mut self, input: &ConvertedInput) -> Result<UiCommand, UiError> {
-        let ConvertedInput::Key(input) = input else {
-            return Ok(UiCommand::Ignored);
-        };
-        if input.event.kind == EventKind::Release {
-            return Ok(UiCommand::Ignored);
-        }
-        let selection = self.snapshot.with_attachment(|attachment| {
-            select_binding(
-                attachment
-                    .menu
-                    .menus
-                    .get(self.current_menu)
-                    .ok_or(UiError::MissingMenu(self.current_menu))?,
-                &self.keyboard_profile,
-                input,
-                self.current_page,
-                self.last_page_count,
-            )
-        })??;
-        match selection {
-            Selection::Ignored => Ok(UiCommand::Ignored),
-            Selection::Unavailable(message) => {
-                self.status = Some(StatusMessage {
-                    level: "blocked".into(),
-                    message,
-                });
-                Ok(UiCommand::Redraw)
+    fn current_menu_id(&self) -> Result<CoreMenuId, UiError> {
+        self.menu_session
+            .current_menu()
+            .cloned()
+            .ok_or(UiError::SessionDismissed)
+    }
+
+    fn binding_policy(&self, binding: &BindingId) -> Result<BindingPolicy, UiError> {
+        self.snapshot.with_attachment(|attachment| {
+            attachment
+                .menu
+                .menus
+                .iter()
+                .flat_map(|menu| menu.bindings.iter())
+                .find(|candidate| {
+                    candidate.id.generation.to_native() == binding.generation
+                        && candidate.id.ordinal.to_native() == binding.ordinal
+                })
+                .map(|binding| BindingPolicy {
+                    after_action: archived_after_action(&binding.settings.after_action),
+                })
+                .ok_or(UiError::MissingBinding {
+                    generation: binding.generation,
+                    ordinal: binding.ordinal,
+                })
+        })?
+    }
+
+    fn menu_output(&mut self, output: Option<MenuSessionOutput>) -> UiCommand {
+        match output {
+            Some(MenuSessionOutput::InvokeBinding(binding)) => UiCommand::Invoke {
+                generation: binding.generation().0,
+                binding: BindingId {
+                    generation: binding.generation().0,
+                    ordinal: binding.ordinal(),
+                },
+            },
+            Some(MenuSessionOutput::RequestPendingControl { control, .. }) => {
+                UiCommand::MenuControl(core_to_wire_control(control))
             }
-            Selection::Open(target) => {
-                let target_index = self.snapshot.with_attachment(|attachment| {
-                    attachment
-                        .menu
-                        .menus
-                        .iter()
-                        .position(|menu| menu.id.0.as_str() == target)
-                        .ok_or(UiError::MissingRoot)
-                })??;
-                self.menu_stack.push(self.current_menu);
-                self.current_menu = target_index;
+            Some(MenuSessionOutput::NavigatedTo(_)) | Some(MenuSessionOutput::ReturnedTo(_)) => {
                 self.current_page = 0;
                 self.last_page_count = 1;
                 self.status = None;
-                Ok(UiCommand::Redraw)
+                UiCommand::Redraw
             }
-            Selection::Control(MenuControl::Return) => {
-                if let Some(menu) = self.menu_stack.pop() {
-                    self.current_menu = menu;
-                    self.current_page = 0;
-                    self.last_page_count = 1;
-                    self.status = None;
-                    Ok(UiCommand::Redraw)
-                } else {
-                    Ok(UiCommand::MenuControl(MenuControl::Return))
-                }
-            }
-            Selection::Control(control) => Ok(UiCommand::MenuControl(control)),
-            Selection::PagePrevious => {
-                if self.current_page > 0 {
-                    self.current_page -= 1;
-                    self.status = None;
-                    Ok(UiCommand::Redraw)
-                } else {
-                    Ok(UiCommand::Ignored)
-                }
-            }
-            Selection::PageNext => {
-                if self.current_page.saturating_add(1) < self.last_page_count {
-                    self.current_page += 1;
-                    self.status = None;
-                    Ok(UiCommand::Redraw)
-                } else {
-                    Ok(UiCommand::Ignored)
-                }
-            }
-            Selection::Invoke {
-                generation,
-                binding,
-            } => {
-                self.status = None;
-                Ok(UiCommand::Invoke {
-                    generation,
-                    binding,
-                })
-            }
+            Some(MenuSessionOutput::Dismissed) => UiCommand::Detach,
+            Some(MenuSessionOutput::UnknownKeySwallowed)
+            | Some(MenuSessionOutput::PendingInputSwallowed)
+            | None => UiCommand::Ignored,
         }
+    }
+
+    #[cfg(test)]
+    fn handle_input(&mut self, input: &ConvertedInput) -> Result<UiCommand, UiError> {
+        self.handle_input_at(input, SessionInstant(Duration::ZERO))
+    }
+}
+
+fn execution_status(outcome: ExecutionOutcome) -> (&'static str, &'static str) {
+    match outcome {
+        ExecutionOutcome::Succeeded => ("ready", "Action completed"),
+        ExecutionOutcome::Failed => ("error", "Action failed"),
+        ExecutionOutcome::Cancelled => ("blocked", "Action cancelled"),
+        ExecutionOutcome::TimedOut => ("error", "Action timed out"),
+        ExecutionOutcome::Detached => ("ready", "Action continues detached"),
+        ExecutionOutcome::OutcomeUnknown => ("error", "Action outcome is unknown"),
+    }
+}
+
+fn core_binding_id(binding: BindingId) -> muxe_core::BindingId {
+    muxe_core::BindingId::new(
+        muxe_core::CompiledGeneration(binding.generation),
+        binding.ordinal,
+    )
+}
+
+fn wire_to_core_control(control: MenuControl) -> CoreMenuControl {
+    match control {
+        MenuControl::Quit => CoreMenuControl::Quit,
+        MenuControl::Return => CoreMenuControl::Return,
+    }
+}
+
+fn core_to_wire_control(control: CoreMenuControl) -> MenuControl {
+    match control {
+        CoreMenuControl::Quit => MenuControl::Quit,
+        CoreMenuControl::Return => MenuControl::Return,
+    }
+}
+
+fn archived_after_action(after_action: &muxe_protocol::ArchivedAfterAction) -> AfterAction {
+    match after_action {
+        muxe_protocol::ArchivedAfterAction::Quit => AfterAction::Quit,
+        muxe_protocol::ArchivedAfterAction::Return => AfterAction::Return,
+        muxe_protocol::ArchivedAfterAction::Stay => AfterAction::Stay,
     }
 }
 
@@ -350,6 +760,7 @@ fn render_visible_cells(
     menu: &ArchivedMenuViewMenuWire,
     pages: PagesContextWire,
     max_title_width: usize,
+    availability: &[BindingAvailabilityOverlay],
 ) -> Result<Vec<RenderedText>, UiError> {
     let mut cells = Vec::new();
     for binding in menu.bindings.iter() {
@@ -357,6 +768,15 @@ fn render_visible_cells(
         if !state.included || !state.shown || binding.hidden {
             continue;
         }
+        let binding_id = BindingId {
+            generation: binding.id.generation.to_native(),
+            ordinal: binding.id.ordinal.to_native(),
+        };
+        let blocked = availability
+            .iter()
+            .find(|current| current.binding == binding_id)
+            .map(|current| current.availability == BindingAvailability::Blocked)
+            .unwrap_or(state.blocked);
         cells.push(
             renderer.render_cell(CellTemplate {
                 key: binding.key.as_str(),
@@ -365,8 +785,8 @@ fn render_visible_cells(
                     .as_ref()
                     .map(|label| label.as_str())
                     .unwrap_or_default(),
-                disabled: !state.enabled,
-                blocked: state.blocked,
+                disabled: !state.enabled || blocked,
+                blocked,
                 max_title_width,
             })?,
         );
@@ -377,14 +797,17 @@ fn render_visible_cells(
 fn render_breadcrumbs(
     renderer: &TemplateRenderer,
     attachment: &muxe_protocol::ArchivedUiAttachmentWire,
-    stack: &[usize],
-    current_menu: usize,
+    stack: &[CoreMenuId],
 ) -> Result<RenderedText, UiError> {
     let crumbs = stack
         .iter()
-        .copied()
-        .chain(core::iter::once(current_menu))
-        .filter_map(|index| attachment.menu.menus.get(index))
+        .filter_map(|id| {
+            attachment
+                .menu
+                .menus
+                .iter()
+                .find(|menu| menu.id.0.as_str() == id.as_str())
+        })
         .filter_map(|menu| menu.title.as_ref().map(|title| title.as_str()))
         .collect::<Vec<_>>();
     renderer
@@ -439,7 +862,7 @@ enum Selection {
     Control(MenuControl),
     PagePrevious,
     PageNext,
-    Invoke { generation: u64, binding: BindingId },
+    Binding(BindingId),
 }
 
 fn validate_binding_keys(
@@ -463,6 +886,7 @@ fn select_binding(
     input: &crate::ConvertedKeyEvent,
     page: usize,
     page_count: usize,
+    availability: &[BindingAvailabilityOverlay],
 ) -> Result<Selection, UiError> {
     let pages = PagesContextWire {
         current: page.saturating_add(1) as u64,
@@ -487,13 +911,28 @@ fn select_binding(
         if !state.included || !state.shown || binding.hidden {
             continue;
         }
-        if !state.enabled || state.blocked {
+        let binding_id = BindingId {
+            generation: binding.id.generation.to_native(),
+            ordinal: binding.id.ordinal.to_native(),
+        };
+        let availability = availability
+            .iter()
+            .find(|current| current.binding == binding_id);
+        let blocked = availability
+            .map(|current| current.availability == BindingAvailability::Blocked)
+            .unwrap_or(state.blocked);
+        if !state.enabled || blocked {
             return Ok(Selection::Unavailable(
-                binding
-                    .diagnostic
-                    .as_ref()
-                    .map(|diagnostic| diagnostic.message.as_str().to_owned())
-                    .unwrap_or_else(|| "Binding is unavailable".into()),
+                availability
+                    .and_then(|current| current.diagnostic.as_deref())
+                    .or_else(|| {
+                        binding
+                            .diagnostic
+                            .as_ref()
+                            .map(|diagnostic| diagnostic.message.as_str())
+                    })
+                    .unwrap_or("Binding is unavailable")
+                    .to_owned(),
             ));
         }
         return Ok(match binding.local_menu_action.as_ref() {
@@ -508,31 +947,25 @@ fn select_binding(
             }
             Some(ArchivedLocalMenuActionWire::PagePrevious) => Selection::PagePrevious,
             Some(ArchivedLocalMenuActionWire::PageNext) => Selection::PageNext,
-            None => Selection::Invoke {
-                generation: binding.id.generation.to_native(),
-                binding: BindingId {
-                    generation: binding.id.generation.to_native(),
-                    ordinal: binding.id.ordinal.to_native(),
-                },
-            },
+            None => Selection::Binding(binding_id),
         });
     }
     Ok(Selection::Ignored)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
 
-    use muxe_core::{compiled_default_theme, ThemeSection};
+    use muxe_core::{ThemeSection, compiled_default_theme};
     use muxe_protocol::{
-        encode_frame, AfterAction, BindingConditionsWire, BindingSettingsWire, BindingStateWire,
-        BrokerResponse, ColorSchemeWire, CompiledThemeWire, ConnectionDecoder, ConnectionPolicy,
-        ExecutionMode, ExecutionPolicyWire, HostKind, KeyCapabilitiesWire, KeyboardProfileWire,
-        LayoutPaddingWire, LayoutSettingsWire, LiveServerIdentity, MenuControlAction, MenuId,
-        MenuViewMenuWire, MenuViewWire, NamedStringWire, NamedStyleWire, PeerRole, Prelude,
-        RequestId, SchemaFingerprint, ServerId, StyleWire, ThemeSectionWire, TimeoutAction,
-        UiAttachmentWire, UiSessionId, Welcome, WireMessage,
+        AfterAction, BindingConditionsWire, BindingSettingsWire, BindingStateWire, BrokerResponse,
+        ColorSchemeWire, CompiledThemeWire, ConnectionDecoder, ConnectionPolicy, ExecutionMode,
+        ExecutionPolicyWire, HostKind, KeyCapabilitiesWire, KeyboardProfileWire, LayoutPaddingWire,
+        LayoutSettingsWire, LiveServerIdentity, MenuControlAction, MenuId, MenuViewMenuWire,
+        MenuViewWire, NamedStringWire, NamedStyleWire, PeerRole, Prelude, RequestId,
+        SchemaFingerprint, ServerId, StyleWire, ThemeSectionWire, TimeoutAction, UiAttachmentWire,
+        UiSessionId, Welcome, WireMessage, encode_frame,
     };
     use muxe_terminal_input::{
         EventKind as RawEventKind, InputEvent, KeyIdentity as RawKeyIdentity, LockState,
@@ -626,6 +1059,25 @@ mod tests {
             local_menu_action,
             diagnostic: None,
         }
+    }
+
+    pub(crate) fn binding_with_policy(
+        ordinal: u64,
+        key: &str,
+        after_action: AfterAction,
+        execution_mode: ExecutionMode,
+        local_menu_action: Option<muxe_protocol::LocalMenuActionWire>,
+    ) -> muxe_protocol::BindingViewWire {
+        let mut binding = binding(
+            ordinal,
+            key,
+            key,
+            BindingConditionsWire::default(),
+            local_menu_action,
+        );
+        binding.settings.after_action = after_action;
+        binding.settings.execution.mode = execution_mode;
+        binding
     }
 
     fn layout() -> LayoutSettingsWire {
@@ -753,6 +1205,14 @@ mod tests {
         keyboard: KeyboardProfileWire,
         bindings: Vec<muxe_protocol::BindingViewWire>,
     ) -> muxe_protocol::ArchivedFrame {
+        profiled_attachment_with_timeout(keyboard, bindings, None)
+    }
+
+    pub(crate) fn profiled_attachment_with_timeout(
+        keyboard: KeyboardProfileWire,
+        bindings: Vec<muxe_protocol::BindingViewWire>,
+        inactivity_timeout_millis: Option<u64>,
+    ) -> muxe_protocol::ArchivedFrame {
         archive_attachment(UiAttachmentWire {
             menu: MenuViewWire {
                 generation: 7,
@@ -765,7 +1225,7 @@ mod tests {
                 }],
             },
             keyboard,
-            inactivity_timeout_millis: None,
+            inactivity_timeout_millis,
             theme: default_theme_wire(),
         })
     }
@@ -798,6 +1258,331 @@ mod tests {
             locks: LockState::NONE,
             keypad: None,
         }))
+    }
+    #[test]
+    fn broker_availability_events_overlay_the_pinned_attachment_without_replacing_it() {
+        let mut runtime = UiRuntime::attach(archived_attachment()).expect("archive attaches");
+        let binding = BindingId {
+            generation: 7,
+            ordinal: 1,
+        };
+        let blocked = BrokerEvent::BindingAvailabilityChanged {
+            session: UiSessionId::new("ui"),
+            generation: 7,
+            binding: binding.clone(),
+            availability: BindingAvailability::Blocked,
+            diagnostic: Some(muxe_protocol::ProtocolDiagnostic {
+                code: muxe_protocol::DiagnosticCode::ActionBlocked,
+                message: "Herdr is reconnecting".into(),
+            }),
+        };
+        assert_eq!(
+            runtime
+                .handle_broker_event(&blocked, SessionInstant(Duration::ZERO))
+                .expect("event applies to this session"),
+            UiCommand::Redraw
+        );
+        assert_eq!(
+            runtime
+                .handle_input(&press('a'))
+                .expect("blocked binding is handled locally"),
+            UiCommand::Redraw
+        );
+        assert!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("status renders")
+                .status
+                .expect("availability diagnostic is visible")
+                .plain
+                .contains("Herdr is reconnecting")
+        );
+
+        let enabled = BrokerEvent::BindingAvailabilityChanged {
+            session: UiSessionId::new("ui"),
+            generation: 7,
+            binding,
+            availability: BindingAvailability::Enabled,
+            diagnostic: None,
+        };
+        assert_eq!(
+            runtime
+                .handle_broker_event(&enabled, SessionInstant(Duration::ZERO))
+                .expect("event restores this binding"),
+            UiCommand::Redraw
+        );
+        assert_eq!(
+            runtime
+                .handle_input(&press('a'))
+                .expect("restored binding invokes its pinned generation"),
+            UiCommand::Invoke {
+                generation: 7,
+                binding: BindingId {
+                    generation: 7,
+                    ordinal: 1,
+                },
+            }
+        );
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::BindingAvailabilityChanged {
+                        session: UiSessionId::new("ui"),
+                        generation: 8,
+                        binding: BindingId {
+                            generation: 8,
+                            ordinal: 1,
+                        },
+                        availability: BindingAvailability::Blocked,
+                        diagnostic: None,
+                    },
+                    SessionInstant(Duration::ZERO),
+                )
+                .expect("newer generations must not replace this attachment"),
+            UiCommand::Ignored
+        );
+    }
+
+    fn at(milliseconds: u64) -> SessionInstant {
+        SessionInstant(Duration::from_millis(milliseconds))
+    }
+
+    #[test]
+    fn unknown_input_resets_inactivity_before_the_session_dismisses() {
+        let mut runtime = UiRuntime::attach_at(
+            profiled_attachment_with_timeout(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                Vec::new(),
+                Some(10),
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+
+        assert_eq!(
+            runtime
+                .handle_input_at(&press('x'), at(9))
+                .expect("unknown input is swallowed"),
+            UiCommand::Ignored
+        );
+        assert_eq!(runtime.tick(at(10)), UiCommand::Ignored);
+        assert_eq!(runtime.tick(at(18)), UiCommand::Ignored);
+        assert_eq!(runtime.tick(at(19)), UiCommand::Detach);
+    }
+
+    #[test]
+    fn awaited_control_uses_the_core_session_and_ignores_stale_completion_nonces() {
+        let mut runtime = UiRuntime::attach_at(
+            profiled_attachment_with_timeout(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![
+                    binding_with_policy(1, "a", AfterAction::Stay, ExecutionMode::Await, None),
+                    binding_with_policy(
+                        2,
+                        "r",
+                        AfterAction::Stay,
+                        ExecutionMode::Await,
+                        Some(muxe_protocol::LocalMenuActionWire::Control(
+                            MenuControl::Return,
+                        )),
+                    ),
+                ],
+                Some(10),
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+        let execution = muxe_protocol::ExecutionId([1; 16]);
+
+        assert_eq!(
+            runtime
+                .handle_input_at(&press('a'), at(1))
+                .expect("binding invokes"),
+            UiCommand::Invoke {
+                generation: 7,
+                binding: BindingId {
+                    generation: 7,
+                    ordinal: 1,
+                },
+            }
+        );
+        assert_eq!(
+            runtime
+                .invocation_accepted(
+                    BindingId {
+                        generation: 7,
+                        ordinal: 1,
+                    },
+                    execution.clone(),
+                    InvocationDisposition::Await,
+                    at(2),
+                )
+                .expect("awaited action is staged"),
+            UiCommand::Ignored
+        );
+        assert_eq!(runtime.inactivity_deadline(), None);
+        assert_eq!(
+            runtime
+                .handle_input_at(&press('x'), at(3))
+                .expect("pending input is swallowed"),
+            UiCommand::Ignored
+        );
+        assert_eq!(
+            runtime
+                .handle_input_at(&press('r'), at(4))
+                .expect("pending return is broker-controlled"),
+            UiCommand::MenuControl(MenuControl::Return)
+        );
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::ExecutionCompleted {
+                        session: UiSessionId::new("ui"),
+                        execution: muxe_protocol::ExecutionId([2; 16]),
+                        outcome: muxe_protocol::ExecutionOutcome::Succeeded,
+                        diagnostic: None,
+                    },
+                    at(5),
+                )
+                .expect("mismatched nonce is stale"),
+            UiCommand::Ignored
+        );
+        assert_eq!(
+            runtime.pending_control_completed(&execution, MenuControl::Return, at(6)),
+            UiCommand::Detach
+        );
+    }
+
+    #[test]
+    fn accepted_actions_apply_their_archived_after_action_only_on_the_matching_lifecycle_event() {
+        let binding = BindingId {
+            generation: 7,
+            ordinal: 1,
+        };
+        let mut awaited = UiRuntime::attach_at(
+            profiled_attachment(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![binding_with_policy(
+                    1,
+                    "a",
+                    AfterAction::Quit,
+                    ExecutionMode::Await,
+                    None,
+                )],
+            ),
+            at(0),
+        )
+        .expect("awaited attachment attaches");
+        let awaited_execution = muxe_protocol::ExecutionId([3; 16]);
+        assert!(matches!(
+            awaited.handle_input_at(&press('a'), at(1)),
+            Ok(UiCommand::Invoke { .. })
+        ));
+        assert_eq!(
+            awaited
+                .invocation_accepted(
+                    binding.clone(),
+                    awaited_execution.clone(),
+                    InvocationDisposition::Await,
+                    at(2),
+                )
+                .expect("awaited action is staged"),
+            UiCommand::Ignored
+        );
+        assert_eq!(
+            awaited
+                .handle_broker_event(
+                    &BrokerEvent::ExecutionCompleted {
+                        session: UiSessionId::new("ui"),
+                        execution: awaited_execution,
+                        outcome: muxe_protocol::ExecutionOutcome::Succeeded,
+                        diagnostic: None,
+                    },
+                    at(3),
+                )
+                .expect("matching completion applies after-action"),
+            UiCommand::Detach
+        );
+
+        let mut detached = UiRuntime::attach_at(
+            profiled_attachment(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![binding_with_policy(
+                    1,
+                    "a",
+                    AfterAction::Quit,
+                    ExecutionMode::Detach,
+                    None,
+                )],
+            ),
+            at(0),
+        )
+        .expect("detached attachment attaches");
+        assert!(matches!(
+            detached.handle_input_at(&press('a'), at(1)),
+            Ok(UiCommand::Invoke { .. })
+        ));
+        assert_eq!(
+            detached
+                .invocation_accepted(
+                    binding,
+                    muxe_protocol::ExecutionId([4; 16]),
+                    InvocationDisposition::Detached,
+                    at(2),
+                )
+                .expect("detached disposition applies immediately"),
+            UiCommand::Detach
+        );
+    }
+
+    #[test]
+    fn terminal_resize_resets_a_paginated_menu_to_its_first_page() {
+        let bindings = (1..=8)
+            .map(|ordinal| {
+                binding(
+                    ordinal,
+                    &format!("f{ordinal}"),
+                    &format!("Binding {ordinal}"),
+                    BindingConditionsWire::default(),
+                    None,
+                )
+            })
+            .collect();
+        let mut runtime = UiRuntime::attach(profiled_attachment(
+            KeyboardProfileWire::Vt100 {
+                escape_timeout_millis: 25,
+            },
+            bindings,
+        ))
+        .expect("attachment attaches");
+
+        let first = runtime
+            .prepare(Rect::new(0, 0, 12, 3))
+            .expect("small terminal renders");
+        assert!(first.plan.page_count > 1);
+        runtime.current_page = 1;
+        assert_eq!(
+            runtime
+                .prepare(Rect::new(0, 0, 12, 3))
+                .expect("same terminal preserves the selected page")
+                .page,
+            1
+        );
+        assert_eq!(
+            runtime
+                .prepare(Rect::new(0, 0, 12, 4))
+                .expect("resized terminal renders")
+                .page,
+            0
+        );
     }
 
     #[test]

@@ -1,12 +1,12 @@
 use std::{
-    collections::{vec_deque::Drain, VecDeque},
+    collections::VecDeque,
     io::{self, Write},
 };
 
 use crossterm::{
+    QueueableCommand,
     cursor::{Hide, MoveTo, Show},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
-    QueueableCommand,
 };
 use muxe_core::{KeyCapabilities, KeyboardProfile};
 use muxe_terminal_input::{Parser, ProtocolResponse};
@@ -15,8 +15,8 @@ use thiserror::Error;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    convert_input, widget::write_rendered, ConvertedInput, GridPlan, MenuGrid, MenuStatus,
-    RenderedText,
+    ConvertedInput, GridPlan, MenuGrid, MenuStatus, RenderedText, convert_input,
+    widget::write_rendered,
 };
 
 /// Maximum parsed input events held while a Kitty response is pending.
@@ -148,9 +148,11 @@ impl KittyNegotiation {
         }
     }
 
-    /// Returns preserved input after exact mode confirmation.
-    pub fn drain_pending(&mut self) -> Drain<'_, ConvertedInput> {
-        self.pending_input.drain(..)
+    /// Restores buffered stream-order input ahead of unread parser results after confirmation.
+    pub fn prepend_pending_to(&mut self, input: &mut VecDeque<ConvertedInput>) {
+        while let Some(pending) = self.pending_input.pop_back() {
+            input.push_front(pending);
+        }
     }
 }
 
@@ -416,8 +418,12 @@ mod tests {
             Ok(NegotiationUpdate::Confirmed)
         );
         assert!(negotiation.is_confirmed());
-        let preserved = negotiation.drain_pending().collect::<Vec<_>>();
-        assert!(matches!(preserved.as_slice(), [ConvertedInput::Key(_)]));
+        let mut preserved = VecDeque::new();
+        negotiation.prepend_pending_to(&mut preserved);
+        assert!(matches!(
+            preserved.pop_front(),
+            Some(ConvertedInput::Key(_))
+        ));
     }
 
     #[test]
