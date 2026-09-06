@@ -71,18 +71,29 @@ jobs:
           mise trust
           mise run wasm-build
       - name: stage digest
+        # The manifest names the bare basename so every consumer checks it
+          # inside one known directory, never by searching the workspace.
         run: |
           set -euo pipefail
+          file_digest() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
+            elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
+          manifest_check() {
+            if command -v sha256sum >/dev/null 2>&1; then (cd "$2" && sha256sum -c "$1");
+            elif command -v shasum >/dev/null 2>&1; then (cd "$2" && shasum -a 256 -c "$1");
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
           test -f dist-wasm/muxe-zellij.wasm
           file dist-wasm/muxe-zellij.wasm | tee wasm-file.out
           grep -Fi "WebAssembly" wasm-file.out
-          sha256sum dist-wasm/muxe-zellij.wasm | tee wasm.sha256
+          (cd dist-wasm && printf '%s  %s\n' "$(file_digest muxe-zellij.wasm)" muxe-zellij.wasm > muxe-zellij.sha256)
+          manifest_check muxe-zellij.sha256 dist-wasm
       - uses: actions/upload-artifact@v4
         with:
           name: bridge-wasm
-          path: |
-            dist-wasm/muxe-zellij.wasm
-            wasm.sha256
+          path: dist-wasm/
 
   assets:
     name: build ${{ matrix.asset }}
@@ -138,18 +149,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: bridge-wasm
-          path: bridge-stage
+          path: bridge-stage/
       - name: verify producer bytes before packaging
         run: |
           set -euo pipefail
-          wasm_path="$(find bridge-stage -name muxe-zellij.wasm -print -quit)"
-          test -n "$wasm_path"
-          digest_path="$(find bridge-stage -name wasm.sha256 -print -quit)"
-          test -n "$digest_path"
-          file "$wasm_path" | tee bridge-file.out
+          manifest_check() {
+            if command -v sha256sum >/dev/null 2>&1; then (cd "$2" && sha256sum -c "$1");
+            elif command -v shasum >/dev/null 2>&1; then (cd "$2" && shasum -a 256 -c "$1");
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
+          test -f bridge-stage/muxe-zellij.wasm
+          test -f bridge-stage/muxe-zellij.sha256
+          file bridge-stage/muxe-zellij.wasm | tee bridge-file.out
           grep -Fi "WebAssembly" bridge-file.out
-          (cd "$(dirname "$wasm_path")" && sha256sum -c "$(basename "$digest_path")")
-          echo "WASM_PATH=$wasm_path" >> "$GITHUB_ENV"
+          manifest_check muxe-zellij.sha256 bridge-stage
+          echo "WASM_PATH=bridge-stage/muxe-zellij.wasm" >> "$GITHUB_ENV"
       - name: musl toolchain (linux only)
         if: matrix.static
         run: |
@@ -170,18 +184,36 @@ jobs:
         if: matrix.static
         run: |
           set -euo pipefail
+          command -v readelf >/dev/null 2>&1 || {
+            echo "MISSING: readelf (binutils) on this runner"
+            exit 1
+          }
           bin="target/${{ matrix.target }}/release/muxe"
           # A dynamically linked binary under a musl asset name is a release
-          # failure, never a silent mislabel. Static-PIE has no interpreter
-          # and no dynamic dependencies, so assert exactly that.
-          if readelf -l "$bin" | grep -q "INTERP"; then
-            echo "release failure: $bin carries an ELF interpreter"
+          # failure, never a silent mislabel. Capture first, then match: a
+          # live `readelf | grep -q` pipe lets SIGPIPE report the producer's
+          # death instead of the match, so no pipe carries the decision here.
+          if ! headers="$(readelf -lW "$bin")"; then
+            echo "release failure: readelf cannot parse $bin"
             exit 1
           fi
-          if readelf -d "$bin" 2>/dev/null | grep -q "NEEDED"; then
-            echo "release failure: $bin carries dynamic dependencies"
-            exit 1
+          case "$headers" in
+            *INTERP*)
+              echo "release failure: $bin carries an ELF interpreter"
+              exit 1
+              ;;
+          esac
+          if ! dynamic="$(readelf -dW "$bin" 2>/dev/null)"; then
+            # A static binary has no dynamic section; parseability was proven
+            # above, so only a NEEDED entry below can still fail the gate.
+            dynamic=""
           fi
+          case "$dynamic" in
+            *NEEDED*)
+              echo "release failure: $bin carries dynamic dependencies"
+              exit 1
+              ;;
+          esac
       - name: binary architecture and version assert
         run: |
           set -euo pipefail
@@ -234,21 +266,44 @@ jobs:
           archives=(dist/muxe-v*.tar.gz)
           test "${#archives[@]}" -eq 4
           printf '%s\n' "${archives[@]}"
+      - name: checksums (missing checksum fails the release)
+        run: |
+          set -euo pipefail
+          file_digest() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
+            elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
+          manifest_check() {
+            if command -v sha256sum >/dev/null 2>&1; then (cd "$2" && sha256sum -c "$1");
+            elif command -v shasum >/dev/null 2>&1; then (cd "$2" && shasum -a 256 -c "$1");
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
+          rm -f dist/SHA256SUMS
+          for archive in dist/muxe-v*.tar.gz; do
+            printf '%s  %s\n' "$(file_digest "$archive")" "$(basename "$archive")" >> dist/SHA256SUMS
+          done
+          manifest_check SHA256SUMS dist
+          cp dist/SHA256SUMS .
       - name: producer digest coupling
         # The identical-bytes check below is not self-referential: the digest
         # must also equal the single producer job's recorded digest.
         uses: actions/download-artifact@v4
         with:
           name: bridge-wasm
-          path: producer
+          path: producer/
       - name: layout and identical WASM bytes
         run: |
           set -euo pipefail
+          file_digest() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
+            elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
           rm -rf verify-tmp
           mkdir verify-tmp
-          expected_path="$(find producer -name wasm.sha256 -print -quit)"
-          test -n "$expected_path"
-          expected="$(cut -d' ' -f1 "$expected_path")"
+          test -f producer/muxe-zellij.sha256
+          expected="$(cut -d' ' -f1 producer/muxe-zellij.sha256)"
           test -n "$expected"
           first_digest=""
           for archive in dist/muxe-v*.tar.gz; do
@@ -260,7 +315,7 @@ jobs:
             test -f "verify-tmp/$name/share/muxe/completions/_muxe"
             test -f "verify-tmp/$name/share/muxe/completions/muxe.fish"
             test -f "verify-tmp/$name/LICENSE"
-            digest="$(sha256sum "verify-tmp/$name/lib/muxe/muxe-zellij.wasm" | cut -d' ' -f1)"
+            digest="$(file_digest "verify-tmp/$name/lib/muxe/muxe-zellij.wasm")"
             if [ -z "$first_digest" ]; then
               first_digest="$digest"
             elif [ "$digest" != "$first_digest" ]; then
@@ -403,10 +458,15 @@ jobs:
       - name: pre-publish checksum gate (fail on anything missing)
         run: |
           set -euo pipefail
+          manifest_check() {
+            if command -v sha256sum >/dev/null 2>&1; then (cd "$2" && sha256sum -c "$1");
+            elif command -v shasum >/dev/null 2>&1; then (cd "$2" && shasum -a 256 -c "$1");
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
           archives=(dist/muxe-v*.tar.gz)
           test "${#archives[@]}" -eq 4
           test -f dist/SHA256SUMS
-          (cd dist && sha256sum -c SHA256SUMS)
+          manifest_check SHA256SUMS dist
       - name: create release (archives plus checksums, attestations already made)
         run: |
           set -euo pipefail

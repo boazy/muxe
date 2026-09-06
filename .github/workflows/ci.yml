@@ -63,16 +63,24 @@ jobs:
           env -u RUSTUP_TOOLCHAIN cargo test --locked \
             -p muxe-adapter-herdr --test recorded_socket
 
-  full-matrix:
-    name: full matrix (${{ matrix.os }})
-    if: github.event_name == 'schedule' || github.event_name == 'push'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
+      - name: divan comparisons
+        # Benchmark entrypoints are owned by their source crates; this step
+        # only runs the comparisons. Non-blocking: no blanket threshold.
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo bench --locked
+      - name: CodSpeed runner dependency (pinned)
+        # The upload step below shells out to cargo-codspeed; install the
+        # exact runner instead of assuming it exists on the image.
+        run: |
+          set -euo pipefail
+          command -v cargo-codspeed >/dev/null 2>&1 || \
+            env -u RUSTUP_TOOLCHAIN cargo install cargo-codspeed --locked --version 5.0.1
+          env -u RUSTUP_TOOLCHAIN cargo codspeed --version
+      - name: build benchmarks for CodSpeed
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo codspeed build
       - uses: jdx/mise-action@v2
         with:
           install: true
@@ -82,11 +90,37 @@ jobs:
           mise trust
           pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$pin"
-          cargo --version | grep -F "cargo $pin"
       - name: full workspace tests (locked)
         run: |
           set -euo pipefail
           env -u RUSTUP_TOOLCHAIN cargo test --workspace --locked
+      - name: pinned Zellij host (0.46.0)
+        # Minimum and latest-verified coincide at 0.46.0, so the host matrix
+        # is one pinned version per runner OS, fetched from the official
+        # release and version-asserted before use.
+        run: |
+          set -euo pipefail
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) zasset="zellij-x86_64-unknown-linux-musl.tar.gz" ;;
+            Darwin-arm64) zasset="zellij-aarch64-apple-darwin.tar.gz" ;;
+            *) echo "no pinned Zellij asset for $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          zdir="$(mktemp -d)"
+          trap 'rm -rf "$zdir"' EXIT
+          curl -fSL "https://github.com/zellij-org/zellij/releases/download/v0.46.0/$zasset" -o "$zdir/zellij-host.tar.gz"
+          mkdir -p "$zdir/host"
+          tar -xzf "$zdir/zellij-host.tar.gz" -C "$zdir/host"
+          echo "$zdir/host" >> "$GITHUB_PATH"
+          "$zdir/host/zellij" --version | grep -F "0.46.0"
+      - name: pinned Herdr host (0.8.2)
+        run: |
+          set -euo pipefail
+          command -v herdr >/dev/null 2>&1 || {
+            echo "MISSING: herdr 0.8.2 has no CI install mechanism yet;"
+            echo "host provisioning owns this gap."
+            exit 1
+          }
+          herdr --version | grep -F "0.8.2"
 
   benches:
     name: benchmarks (non-blocking)
@@ -139,26 +173,14 @@ jobs:
           set -euo pipefail
           # Both pinned hosts must be present or this gate fails explicitly.
           # A missing capability is a failing gate, never a silent skip.
-          missing=""
-          command -v zellij >/dev/null || missing="$missing zellij"
-          command -v herdr >/dev/null || missing="$missing herdr"
-          if [ -n "$missing" ]; then
-            echo "REALHOST CAPABILITY MISSING:$missing" >> "$GITHUB_STEP_SUMMARY"
-            echo "missing=$missing" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          zellij --version
-          herdr --version
-      - name: pinned version check
-        run: |
-          set -euo pipefail
-          zellij --version | grep -F "0.46.0"
-          herdr --version | grep -F "0.8.2"
       - name: temp-scoped smoke
         # All smoke state lives under a fresh TempDir; never the default host.
-        # The broker/input-owned live scenario runner wires into this job once
-        # their rerun lands; until then the probe, version, and compatibility
-        # checks above are the complete real-host gate, and they fail closed.
+        # No real-host scenario command is ready or authorized under the
+        # current no-live-host scope (broker owner: owned Herdr scenario
+        # awaits review; input owns the TempDir CLI pane smoke separately).
+        # Until an exact retained-child/explicit-endpoint command lands, the
+        # probe, version, and binary checks above are the complete gate, and
+        # they fail closed. Nothing here stands in for a host interaction.
         run: |
           set -euo pipefail
           SMOKE_DIR="$(mktemp -d)"
