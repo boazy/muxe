@@ -324,13 +324,6 @@ pub(crate) enum PlannedUnit {
 }
 
 impl PlannedUnit {
-    pub(crate) fn host_kind(&self) -> &'static str {
-        match self {
-            Self::Herdr { .. } => "herdr",
-            Self::Zellij { .. } => "zellij",
-        }
-    }
-
     fn unit_kind(&self) -> UnitKind {
         match self {
             Self::Herdr { entry } => UnitKind::Herdr {
@@ -1445,8 +1438,7 @@ mod tests {
     use super::*;
     use muxe_protocol::control::{ControlDecoder, ControlPolicy};
     use muxe_protocol::wire::{HostKind, LiveServerIdentity, ServerId};
-    use parking_lot::Mutex;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::{net::UnixListener, task::JoinHandle};
 
     fn old_record() -> CompatibilityRecord {
@@ -1552,14 +1544,20 @@ mod tests {
                     ControlOperation::Prepare { target } => {
                         assert_eq!(target.muxe_version, "0.2.0");
                         if script.fail_prepare {
-                            events.lock().push("prepare-refused".to_owned());
+                            events
+                                .lock()
+                                .expect("fixture events are not poisoned")
+                                .push("prepare-refused".to_owned());
                             ControlResult::Error {
                                 diagnostic: "prepare refused: non-cancellable work".to_owned(),
                             }
                         } else {
                             let handoff = handoff(script.handoff_byte);
                             prepared_handoff = Some(handoff);
-                            events.lock().push("prepared".to_owned());
+                            events
+                                .lock()
+                                .expect("fixture events are not poisoned")
+                                .push("prepared".to_owned());
                             // Drain: close and unlink the listener while
                             // keeping this accepted stream open.
                             drop(listener_slot.take());
@@ -1574,7 +1572,10 @@ mod tests {
                     }
                     ControlOperation::Commit { handoff_id } => {
                         if Some(handoff_id) == prepared_handoff {
-                            events.lock().push("old-committed".to_owned());
+                            events
+                                .lock()
+                                .expect("fixture events are not poisoned")
+                                .push("old-committed".to_owned());
                             ControlResult::Committed(status_of(
                                 &target_record(),
                                 Some(handoff_id),
@@ -1589,7 +1590,10 @@ mod tests {
                     }
                     ControlOperation::Abort { handoff_id } => {
                         if Some(handoff_id) == prepared_handoff {
-                            events.lock().push("old-aborted".to_owned());
+                            events
+                                .lock()
+                                .expect("fixture events are not poisoned")
+                                .push("old-aborted".to_owned());
                             ControlResult::Aborted(status_of(
                                 &script.current,
                                 None,
@@ -1778,6 +1782,7 @@ mod tests {
         fn reload_bridge(&self, session: &str, bridge_url: &str) -> Result<(), ActivateError> {
             self.reloaded
                 .lock()
+                .expect("fixture reloads are not poisoned")
                 .push((session.to_owned(), bridge_url.to_owned()));
             if self.fail_sessions.iter().any(|entry| entry == session) {
                 return Err(ActivateError::Reload {
@@ -1919,7 +1924,7 @@ mod tests {
             }]
         );
         assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
-        let events = fixture.events.lock();
+        let events = fixture.events.lock().expect("fixture events are not poisoned");
         assert!(events.contains(&"prepared".to_owned()));
         assert!(events.contains(&"old-committed".to_owned()));
         old.abort();
@@ -1943,7 +1948,7 @@ mod tests {
         ));
         // The old broker refused prepare and was never drained, so there is
         // nothing to abort and no target was spawned.
-        let events = fixture.events.lock();
+        let events = fixture.events.lock().expect("fixture events are not poisoned");
         assert!(events.contains(&"prepare-refused".to_owned()));
         assert!(!events.contains(&"old-aborted".to_owned()));
         old.abort();
@@ -1960,7 +1965,7 @@ mod tests {
             report.units[0],
             UnitOutcome::RolledBack { .. }
         ));
-        let events = fixture.events.lock();
+        let events = fixture.events.lock().expect("fixture events are not poisoned");
         assert!(events.contains(&"old-aborted".to_owned()));
         old.abort();
     }

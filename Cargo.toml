@@ -42,7 +42,6 @@ getrandom = "0.2.17"
 data-encoding = "2.9.0"
 sha2 = "0.10.9"
 async-trait = "0.1.89"
-parking_lot = "0.12.5"
 zellij-tile = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f", package = "zellij-tile" }
 zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f", package = "zellij-utils" }
 syn = { version = "2.0.108", features = ["full"] }
