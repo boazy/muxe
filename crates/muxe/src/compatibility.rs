@@ -104,6 +104,10 @@ pub enum PackagedWasmArtifact {
 pub struct NativeCompatibilityRecord {
     /// Cross-process compatibility used by broker handoffs.
     pub handoff: CompatibilityRecord,
+    /// Native-report-only exercised Herdr surface, borrowed from the
+    /// adapter's authoritative constant. Never part of the handoff schema,
+    /// so omission stays valid for old v1 records.
+    pub herdr_verified_methods: &'static [&'static str],
     /// Producer-attested identity of the bridge package distributed beside us.
     pub packaged_wasm: PackagedWasmArtifact,
     /// Still-blocked evidence for the bytes a live host loaded.
@@ -163,12 +167,9 @@ pub fn embedded_record() -> Result<NativeCompatibilityRecord, CompatibilityError
                 schema_version: u32::try_from(schema_version)
                     .map_err(|_| CompatibilityError::HerdrSchemaOutOfRange(schema_version))?,
                 schema_fingerprint,
-                verified_methods: muxe_adapter_herdr::VERIFIED_HERDR_METHODS
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
             }),
         },
+        herdr_verified_methods: muxe_adapter_herdr::VERIFIED_HERDR_METHODS,
         packaged_wasm: packaged_wasm_artifact()?,
         bridge_registration: BridgeRegistrationDigest::current(),
     })
@@ -253,8 +254,8 @@ pub fn render_human(record: &NativeCompatibilityRecord) -> String {
             ));
             lines.push(format!(
                 "Herdr verified methods ({}): {}",
-                herdr.verified_methods.len(),
-                herdr.verified_methods.join(", ")
+                record.herdr_verified_methods.len(),
+                record.herdr_verified_methods.join(", ")
             ));
         }
         None => lines.push(
@@ -315,7 +316,7 @@ pub fn render_json(record: &NativeCompatibilityRecord) -> Value {
             "schema_fingerprint": hex_lower(&herdr.schema_fingerprint.0),
             "raw_schema_sha256": muxe_adapter_herdr::generated::BUNDLED_RAW_SCHEMA_SHA256,
             "request_schema_sha256": muxe_adapter_herdr::generated::BUNDLED_REQUEST_SCHEMA_SHA256,
-            "verified_methods": herdr.verified_methods,
+            "verified_methods": record.herdr_verified_methods,
         })
     });
     let packaged_wasm = match &record.packaged_wasm {
