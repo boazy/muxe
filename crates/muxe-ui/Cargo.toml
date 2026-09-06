@@ -1,0 +1,20 @@
+[package]
+name = "muxe-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+crossterm.workspace = true
+minijinja.workspace = true
+muxe-core = { path = "../muxe-core" }
+muxe-protocol = { path = "../muxe-protocol" }
+muxe-terminal-input = { path = "../muxe-terminal-input" }
+ratatui.workspace = true
+rkyv.workspace = true
+thiserror.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
