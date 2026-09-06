@@ -282,12 +282,16 @@ pub trait HostReloader {
 /// command itself touches only the named session.
 #[derive(Clone, Debug)]
 pub struct ZellijCliReloader {
-    pub program: PathBuf,
+    pub program: Option<PathBuf>,
 }
 
 impl HostReloader for ZellijCliReloader {
     fn reload_bridge(&self, session: &str, bridge_url: &str) -> Result<(), ActivateError> {
-        let output = std::process::Command::new(&self.program)
+        let program = self.program.as_ref().ok_or_else(|| ActivateError::Reload {
+            session: session.to_owned(),
+            detail: "no Zellij executable is installed; cannot reload the bridge".to_owned(),
+        })?;
+        let output = std::process::Command::new(program)
             .args([
                 "--session",
                 session,
@@ -318,10 +322,189 @@ impl HostReloader for ZellijCliReloader {
 }
 
 /// Preflight checks owned by configuration and host-adapter modules.
+#[expect(
+    async_fn_in_trait,
+    reason = "coordinator traits use static dispatch with one implementation per process; no Send bound is required"
+)]
 pub trait Preflight {
-    fn validate_config(&self) -> Result<(), String>;
-    fn revalidate_herdr_actions(&self, discovery_key: &str) -> Result<(), String>;
-    fn check_host_version(&self, host_kind: &str, discovery_key: &str) -> Result<(), String>;
+    async fn validate_config(&self) -> Result<(), String>;
+    async fn revalidate_herdr_actions(&self, discovery_key: &str) -> Result<(), String>;
+    async fn check_host_version(&self, host_kind: &str, discovery_key: &str) -> Result<(), String>;
+}
+/// Production preflight: fail-fast configuration and host checks before any
+/// unit mutates.
+///
+/// Full per-adapter validation still happens at target startup with rollback;
+/// these gates reject an unreadable or invalid configuration, an unreachable
+/// or incompatible Herdr host, and an out-of-policy host version early.
+pub struct LivePreflight<'a> {
+    /// Absolute Muxe configuration file the target brokers will serve.
+    pub config_path: PathBuf,
+    /// Cache base for Herdr schema records.
+    pub cache_dir: PathBuf,
+    /// Absolute pinned Herdr executable for live host probes. Required only
+    /// when a Herdr unit is selected.
+    pub herdr_binary: Option<PathBuf>,
+    /// Absolute pinned Zellij executable for version probes. Required only
+    /// when a Zellij unit is selected.
+    pub zellij_exe: Option<PathBuf>,
+    /// Persistent logger for policy warnings; failures always error.
+    pub logger: Option<&'a Logger>,
+}
+
+impl LivePreflight<'_> {
+    fn compile_config(&self) -> Result<muxe_core::CompiledConfig, String> {
+        let yaml = std::fs::read_to_string(&self.config_path)
+            .map_err(|error| format!("cannot read {}: {error}", self.config_path.display()))?;
+        // Permissive key capabilities: preflight must never reject a form the
+        // target accepts. Host-specific action validation happens at target
+        // startup with rollback.
+        let capabilities = muxe_core::KeyCapabilities {
+            event_types: true,
+            alternate_keys: true,
+            all_keys_as_escape_codes: true,
+        };
+        muxe_core::compile_yaml(
+            muxe_core::CompiledGeneration(1),
+            muxe_core::SourceId::new(self.config_path.display().to_string()),
+            yaml,
+            capabilities,
+            None,
+        )
+        .map_err(|diagnostics| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+
+    fn herdr_runtime(
+        &self,
+        discovery_key: &str,
+    ) -> impl Future<Output = Result<muxe_adapter_herdr::HerdrRuntime, String>> {
+        let binary = self
+            .herdr_binary
+            .clone()
+            .ok_or_else(|| "no Herdr executable is installed; cannot probe Herdr hosts".to_owned());
+        let config = binary.map(|herdr_binary| muxe_adapter_herdr::HerdrAdapterConfig {
+            socket_path: PathBuf::from(discovery_key),
+            herdr_binary,
+            cache_dir: self.cache_dir.clone(),
+        });
+        async move {
+            let config = config?;
+            muxe_adapter_herdr::HerdrRuntime::connect(config)
+                .await
+                .map_err(|error| format!("Herdr host {discovery_key} is unreachable: {error}"))
+        }
+    }
+
+    /// Splits `major.minor.patch` into comparable numbers.
+    fn version_numbers(version: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = version.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((major, minor, patch))
+    }
+
+    fn warn(&self, host: &str, message: String) {
+        if let Some(logger) = &self.logger
+            && let Ok(event) = crate::logging::LogEvent::new(
+                env!("CARGO_PKG_VERSION"),
+                host,
+                "activate-preflight",
+                message,
+            )
+        {
+            let _ = logger.append(&event);
+        }
+    }
+}
+impl Preflight for LivePreflight<'_> {
+    async fn validate_config(&self) -> Result<(), String> {
+        self.compile_config().map(|_| ())
+    }
+
+    async fn revalidate_herdr_actions(&self, discovery_key: &str) -> Result<(), String> {
+        self.herdr_runtime(discovery_key).await.map(|_| ())
+    }
+
+    async fn check_host_version(&self, host_kind: &str, discovery_key: &str) -> Result<(), String> {
+        let policy = self
+            .compile_config()
+            .map_err(|error| format!("cannot read version policy: {error}"))?
+            .host
+            .version_check;
+        let (minimum, latest, live) = match host_kind {
+            "herdr" => {
+                let identity = self.herdr_runtime(discovery_key).await?.identity().clone();
+                let version = identity
+                    .live_server_id
+                    .split("/ver:")
+                    .nth(1)
+                    .and_then(|tail| tail.split('/').next())
+                    .ok_or_else(|| {
+                        format!("Herdr host {discovery_key} reports an unrecognized identity shape")
+                    })?;
+                (
+                    crate::compatibility::HERDR_MINIMUM,
+                    crate::compatibility::HERDR_LATEST_VERIFIED,
+                    version.to_owned(),
+                )
+            }
+            "zellij" => {
+                let program = self.zellij_exe.as_ref().ok_or_else(|| {
+                    "no Zellij executable is installed; cannot probe Zellij hosts".to_owned()
+                })?;
+                let output = std::process::Command::new(program)
+                    .arg("--version")
+                    .output()
+                    .map_err(|error| format!("cannot probe the Zellij executable: {error}"))?;
+                if !output.status.success() {
+                    return Err("the Zellij executable refuses its version probe".to_owned());
+                }
+                let text = String::from_utf8_lossy(&output.stdout);
+                let version = text.split_whitespace().nth(1).ok_or_else(|| {
+                    format!("the Zellij executable reports an unrecognized version line")
+                })?;
+                (
+                    crate::compatibility::ZELLIJ_MINIMUM,
+                    crate::compatibility::ZELLIJ_LATEST_VERIFIED,
+                    version.to_owned(),
+                )
+            }
+            other => return Err(format!("unknown host kind {other}")),
+        };
+        let live_numbers = Self::version_numbers(&live).ok_or_else(|| {
+            format!("host {discovery_key} reports an unparsable version {live:?}")
+        })?;
+        let minimum_numbers = Self::version_numbers(minimum).expect("embedded minimum is semver");
+        let latest_numbers = Self::version_numbers(latest).expect("embedded latest is semver");
+        if live_numbers < minimum_numbers {
+            return Err(match policy {
+                muxe_core::HostVersionCheck::Off => format!(
+                    "host {discovery_key} runs {live}, below minimum {minimum}; refusing even with version gating off because protocol checks cannot pass"
+                ),
+                _ => format!("host {discovery_key} runs {live}, below minimum {minimum}"),
+            });
+        }
+        if live_numbers > latest_numbers {
+            let message =
+                format!("host {discovery_key} runs {live}, newer than latest verified {latest}");
+            match policy {
+                muxe_core::HostVersionCheck::Strict => return Err(message),
+                muxe_core::HostVersionCheck::Min => self.warn(host_kind, message),
+                muxe_core::HostVersionCheck::Off => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One planned activation unit.
@@ -379,7 +562,7 @@ pub struct ActivateInputs<'a, C, S, R, P> {
     pub preflight: &'a P,
     /// Builds the exact owned spawn request per member: the current executable
     /// plus the broker-authored serve arguments.
-    pub spawn_argv: &'a dyn Fn(&SpawnMember) -> (PathBuf, Vec<OsString>),
+    pub spawn_argv: &'a dyn Fn(&SpawnMember) -> Result<(PathBuf, Vec<OsString>), ActivateError>,
     pub readiness_deadline: Duration,
     pub poll_interval: Duration,
     pub hooks: ActivateHooks,
@@ -420,7 +603,9 @@ where
     }
 
     // Global preflight before any unit mutates.
-    let verified_bridge = global_preflight(&inputs, &units).map_err(ActivateError::Preflight)?;
+    let verified_bridge = global_preflight(&inputs, &units)
+        .await
+        .map_err(ActivateError::Preflight)?;
     inputs.hooks.check(ActivateStep::PreflightDone)?;
 
     let mut report = ActivateReport::default();
@@ -526,7 +711,7 @@ fn group_zellij(live: &[BrokerEntry]) -> Vec<PlannedUnit> {
         .collect()
 }
 
-fn global_preflight<C, S, R, P>(
+async fn global_preflight<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     units: &[PlannedUnit],
 ) -> Result<Option<compatibility::NativeAssetVerification>, String>
@@ -548,16 +733,18 @@ where
     } else {
         None
     };
-    inputs.preflight.validate_config()?;
+    inputs.preflight.validate_config().await?;
     for unit in units {
         match unit {
             PlannedUnit::Herdr { entry } => {
                 inputs
                     .preflight
-                    .check_host_version("herdr", &entry.discovery_key)?;
+                    .check_host_version("herdr", &entry.discovery_key)
+                    .await?;
                 inputs
                     .preflight
-                    .revalidate_herdr_actions(&entry.discovery_key)?;
+                    .revalidate_herdr_actions(&entry.discovery_key)
+                    .await?;
             }
             PlannedUnit::Zellij {
                 bridge_path,
@@ -573,7 +760,8 @@ where
                 for entry in entries {
                     inputs
                         .preflight
-                        .check_host_version("zellij", &entry.discovery_key)?;
+                        .check_host_version("zellij", &entry.discovery_key)
+                        .await?;
                 }
             }
         }
@@ -582,7 +770,6 @@ where
         .map_err(|error| format!("activation journal directory is not writable: {error}"))?;
     Ok(verified_bridge)
 }
-
 async fn activate_unit<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     unit: &PlannedUnit,
@@ -741,7 +928,13 @@ where
             handoff_hex: member.handoff_hex.clone(),
             endpoint: member.entry.socket.clone(),
         };
-        let (program, args) = (inputs.spawn_argv)(&spawn_member);
+        let (program, args) = match (inputs.spawn_argv)(&spawn_member) {
+            Ok(pair) => pair,
+            Err(error) => {
+                spawn_failure = Some(error.to_string());
+                break;
+            }
+        };
         match inputs.spawner.spawn_target(&SpawnRequest {
             program,
             args,
@@ -1859,13 +2052,17 @@ mod tests {
     }
 
     impl Preflight for FixturePreflight {
-        fn validate_config(&self) -> Result<(), String> {
+        async fn validate_config(&self) -> Result<(), String> {
             self.fail_config.clone().map_or(Ok(()), Err)
         }
-        fn revalidate_herdr_actions(&self, _discovery_key: &str) -> Result<(), String> {
+        async fn revalidate_herdr_actions(&self, _discovery_key: &str) -> Result<(), String> {
             Ok(())
         }
-        fn check_host_version(&self, _host_kind: &str, _discovery_key: &str) -> Result<(), String> {
+        async fn check_host_version(
+            &self,
+            _host_kind: &str,
+            _discovery_key: &str,
+        ) -> Result<(), String> {
             Ok(())
         }
     }
@@ -1953,13 +2150,15 @@ mod tests {
                 cache_dir: &self.cache,
                 target: target_record(),
                 staged_bridge: None,
+                spawn_argv: &|_member| {
+                    Ok((PathBuf::from("/bin/sleep"), vec![OsString::from("30")]))
+                },
                 scope: HostScope::Herdr,
                 current: None,
                 control: &self.control,
                 spawner: &self.spawner,
                 reloader: &self.reloader,
                 preflight: &self.preflight,
-                spawn_argv: &|_member| (PathBuf::from("/bin/sleep"), vec![OsString::from("30")]),
                 readiness_deadline: Duration::from_secs(5),
                 poll_interval: Duration::from_millis(5),
                 hooks: ActivateHooks::default(),
@@ -2167,7 +2366,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let reloader = ZellijCliReloader {
-            program: program.clone(),
+            program: Some(program.clone()),
         };
         reloader
             .reload_bridge("session-a", "file:/bridge.wasm")

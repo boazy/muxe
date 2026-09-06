@@ -21,9 +21,9 @@ pub mod retire;
 
 pub use activate::{
     ActivateError, ActivateHooks, ActivateInputs, ActivateReport, ActivateStep, BrokerSpawner,
-    ControlPort, ControlSession, DetectedHost, HostReloader, LiveControl, Preflight,
-    ProcessSpawner, RecoveryOutcome, SpawnMember, SpawnRequest, StagedBridge, TargetHandle,
-    UnitOutcome, ZellijCliReloader, activate, recover,
+    ControlPort, ControlSession, DetectedHost, HostReloader, LiveControl, LivePreflight,
+    Preflight, ProcessSpawner, RecoveryOutcome, SpawnMember, SpawnRequest, StagedBridge,
+    TargetHandle, UnitOutcome, ZellijCliReloader, activate, recover,
 };
 pub use journal::{JournalState, MemberState, MemberTransition, UnitKind};
 pub use registry::{BrokerEntry, Liveness, Registry};
