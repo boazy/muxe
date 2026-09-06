@@ -1,0 +1,18 @@
+[package]
+name = "codegen-completions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "codegen-completions"
+path = "src/main.rs"
+
+[dependencies]
+muxe = { path = "../../crates/muxe" }
+clap.workspace = true
+clap_complete.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
