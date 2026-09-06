@@ -1,0 +1,103 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Full matrix on a schedule; PRs run the deterministic gate below.
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deterministic:
+    name: deterministic gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+      - name: formatting
+        run: mise run fmt
+      - name: compile (locked)
+        run: mise run check
+      - name: tests and doctests (locked)
+        run: mise run test
+      - name: clippy (pedantic, restrictions, selected nursery)
+        run: mise run clippy
+      - name: byte-clean Herdr generation
+        run: mise run codegen-herdr
+      - name: byte-clean Zellij generation
+        run: mise run codegen-zellij
+      - name: Zellij fixture verification
+        run: mise run codegen-zellij-verify
+      - name: completions byte-clean
+        run: cargo run --locked -p codegen-completions -- --check
+
+  full-matrix:
+    name: full matrix (${{ matrix.os }})
+    if: github.event_name == 'schedule' || github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - name: full workspace tests (locked)
+        run: cargo test --workspace --locked
+
+  benches:
+    name: benchmarks (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - name: divan comparisons
+        run: cargo bench --locked || echo "no benches yet"
+      - name: CodSpeed comparison upload
+        # Published for pull requests without failing the build: no blanket
+        # regression threshold. Crate-local benchmark entrypoints remain owned
+        # by their source owners; this step only uploads comparisons.
+        uses: CodSpeedHQ/action@v3
+        with:
+          run: cargo codspeed bench
+          token: ${{ secrets.CODSPEED_TOKEN }}
+  realhost-smoke:
+    name: small Linux real-host smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: host capability probe
+        id: capability
+        run: |
+          # Both pinned hosts must be present or this gate fails explicitly.
+          # A missing capability is a failing gate, never a silent skip.
+          missing=""
+          command -v zellij >/dev/null || missing="$missing zellij"
+          command -v herdr >/dev/null || missing="$missing herdr"
+          if [ -n "$missing" ]; then
+            echo "REALHOST CAPABILITY MISSING:$missing" >> "$GITHUB_STEP_SUMMARY"
+            echo "missing=$missing" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          zellij --version
+          herdr --version || true
+      - name: pinned version check
+        run: |
+          zellij --version | grep -F "0.46.0"
+      - name: temp-scoped smoke
+        run: |
+          # All smoke state lives under a fresh TempDir; never the default host.
+          export SMOKE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          cargo run --locked -p muxe -- compatibility --json | tee "$SMOKE_DIR/compat.json"

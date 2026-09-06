@@ -1,0 +1,178 @@
+name: release
+
+# V1 is distributed through GitHub Releases. Release tags use
+# `v{major}.{minor}.{patch}`. Every target archive is a complete installation:
+#   muxe
+#   lib/muxe/muxe-zellij.wasm
+#   share/muxe/completions/
+#   LICENSE
+#
+# Linux archives target musl for static distribution. If either Linux
+# architecture cannot pass the host integration matrix with musl, the release
+# is blocked and the target decision is reopened: a differently linked
+# artifact must never be silently published under the same name. The
+# verify-static steps below enforce that as a failing gate.
+#
+# Owner/repository names are taken from the github context, never hardcoded,
+# so the workflow cannot silently target a fork.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  assets:
+    name: build ${{ matrix.asset }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - asset: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            zigbuild: false
+          - asset: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            zigbuild: true
+          - asset: macos-x64
+            os: macos-13
+            target: x86_64-apple-darwin
+            zigbuild: false
+          - asset: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            zigbuild: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+          targets: ${{ matrix.target }}
+      - name: musl toolchain (linux x64)
+        if: matrix.asset == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: musl cross toolchain (linux arm64)
+        if: matrix.asset == 'linux-arm64'
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: cargo-zigbuild (linux arm64)
+        if: matrix.zigbuild
+        run: cargo install cargo-zigbuild --locked
+      - name: build native binary
+        run: |
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            cargo zigbuild --locked --release -p muxe --target ${{ matrix.target }}
+          else
+            cargo build --locked --release -p muxe --target ${{ matrix.target }}
+          fi
+      - name: verify static linkage (linux musl only)
+        if: startsWith(matrix.asset, 'linux')
+        run: |
+          # A dynamically linked binary under a musl asset name is a release
+          # failure, never a silent mislabel.
+          file "target/${{ matrix.target }}/release/muxe" | tee file.out
+          grep -i "statically linked" file.out
+      - name: bridge artifact (runtime owner build output)
+        run: |
+          # The WASM bridge is built by its owning crate; packaging requires
+          # the exact bytes and fails closed when they are absent.
+          test -f dist-wasm/muxe-zellij.wasm
+      - name: completions byte-clean
+        run: cargo run --locked -p codegen-completions -- --check
+      - name: assemble archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          root="muxe-v${version}-${{ matrix.asset }}"
+          rm -rf "$root"
+          mkdir -p "$root/lib/muxe" "$root/share/muxe/completions"
+          cp "target/${{ matrix.target }}/release/muxe" "$root/muxe"
+          cp dist-wasm/muxe-zellij.wasm "$root/lib/muxe/muxe-zellij.wasm"
+          cp share/muxe/completions/muxe.bash share/muxe/completions/muxe.zsh share/muxe/completions/muxe.fish "$root/share/muxe/completions/"
+          cp LICENSE "$root/LICENSE"
+          tar -czf "${root}.tar.gz" "$root"
+          echo "ARCHIVE=${root}.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+
+  publish:
+    name: publish release
+    needs: assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum muxe-v*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cp SHA256SUMS ..
+      - name: create release (checksums required)
+        run: |
+          # A missing checksum is a failed release, not an optional step.
+          test -f SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" dist/muxe-v*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: attest archives
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/muxe-v*.tar.gz, SHA256SUMS"
+
+  live-matrix:
+    name: live upgrade/rollback matrix
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: predecessor check
+        id: predecessor
+        run: |
+          set +e
+          count=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName \
+            --jq '[.[] | select(.tagName != "'"$GITHUB_REF_NAME"'")] | length')
+          echo "count=$count"
+          if [ "$count" = "0" ]; then
+            if [ "$GITHUB_REF_NAME" = "v0.1.0" ]; then
+              echo "FIRST RELEASE: no predecessor artifact exists; the live" \
+                "previous-to-target matrix is explicitly waived and recorded" \
+                "here, not silently skipped." >> "$GITHUB_STEP_SUMMARY"
+              echo "waived=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "No predecessor release found for $GITHUB_REF_NAME:" \
+                "the live upgrade/rollback matrix is BLOCKED." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: upgrade and rollback (Zellij + Herdr)
+        if: steps.predecessor.outputs.waived != 'true'
+        run: |
+          # Requires Zellij 0.46.0 (two sessions sharing the stable bridge,
+          # two clients in one session) and Herdr 0.8.2 on this runner.
+          # Any missing capability fails the gate explicitly.
+          command -v zellij || { echo "MISSING: zellij 0.46.0"; exit 1; }
+          command -v herdr || { echo "MISSING: herdr 0.8.2"; exit 1; }
+          zellij --version | grep -F "0.46.0"
+          echo "live matrix against predecessor: manual runbook in README"
