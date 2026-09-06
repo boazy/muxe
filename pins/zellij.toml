@@ -3,6 +3,6 @@ repository = "https://github.com/zellij-org/zellij"
 revision = "af38660c5884f50bb3726682fb92961326c4268f"
 host_version = "0.46.0"
 crate = "zellij-tile"
-source_inputs = ["zellij-tile/src/shim.rs", "zellij-utils/src/input/actions.rs", "zellij-utils/src/plugin_api/action.proto", "zellij-utils/src/plugin_api/plugin_command.proto", "zellij-client/src/cli_client.rs", "zellij-server/src/route.rs", "zellij-server/src/panes/terminal_pane.rs", "zellij-server/src/panes/grid.rs"]
+source_inputs = ["zellij-tile/src/shim.rs", "zellij-utils/src/input/actions.rs", "zellij-utils/src/input/command.rs", "zellij-utils/src/input/layout.rs", "zellij-utils/src/input/mouse.rs", "zellij-utils/src/input/options.rs", "zellij-utils/src/position.rs", "zellij-utils/src/data.rs", "zellij-utils/src/plugin_api/action.proto", "zellij-utils/src/plugin_api/plugin_command.proto", "zellij-client/src/cli_client.rs", "zellij-server/src/route.rs", "zellij-server/src/panes/terminal_pane.rs", "zellij-server/src/panes/grid.rs"]
 cache_root = ".local/pins/zellij"
 fixture_policy = "minimized checked-in fixtures are derived only from this revision; runtime builds use the same git revision"
