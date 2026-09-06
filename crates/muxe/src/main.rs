@@ -649,14 +649,42 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
 async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     let logger = muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
         .wrap_err("could not open the broker service audit log")?;
-    let adapter =
+    let adapter = std::sync::Arc::new(
         muxe_adapter_zellij::ZellijAdapter::connect(muxe_adapter_zellij::ZellijAdapterConfig {
             session_name: command.session.clone(),
             zellij_exe: command.zellij_exe.clone(),
         })
         .await
-        .wrap_err("could not connect the pinned Zellij session for broker startup")?;
-    let broker = muxe_broker::Broker::load(Arc::new(adapter), &command.config)
+        .wrap_err("could not connect the pinned Zellij session for broker startup")?,
+    );
+    // Establish the initial census round before the broker loads: no UI or
+    // commit may proceed until the adapter reports readiness. Retry on
+    // failure; exhausting the deadline fails startup closed.
+    let round_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match adapter.establish_initial_round().await {
+            Ok(()) => break,
+            Err(error) => {
+                if std::time::Instant::now() >= round_deadline {
+                    serve_event(
+                        &logger,
+                        "zellij",
+                        "broker-serve",
+                        format!("initial census round never established: {error}"),
+                    );
+                    return Err(error).wrap_err("Zellij initial census round never established");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    serve_event(
+        &logger,
+        "zellij",
+        "broker-serve",
+        "initial census round established".to_owned(),
+    );
+    let broker = muxe_broker::Broker::load(adapter, &command.config)
         .await
         .wrap_err("could not load the broker configuration")?;
     let live_server = broker
@@ -801,6 +829,7 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
             journal_present: true,
             inconsistent: true,
             member_ready: false,
+            target_live: false,
             member_committed: false,
             recover_after: Duration::ZERO,
         };
@@ -832,10 +861,17 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
+        // A Ready journal is durable, but only a live Ready target owns
+        // completion: probe the member's recorded control socket at map time
+        // so a dead target restores the old unit instead of self-completing.
+        // A completed OS-level accept matches the registry liveness probe.
+        let socket = member.target_socket.as_ref().unwrap_or(&member.old_socket);
+        let target_live = std::os::unix::net::UnixStream::connect(socket).is_ok();
         muxe_broker::RecoveryView {
             journal_present: true,
             inconsistent: false,
             member_ready,
+            target_live,
             member_committed,
             recover_after: Duration::from_secs(journal.recovery_deadline.saturating_sub(now)),
         }
@@ -1676,9 +1712,7 @@ fn select_launcher_origin(get: &dyn Fn(&str) -> Option<String>) -> Result<Select
 /// Saved origin triple plus optional cwd from the launcher environment.
 type SavedOriginTuple = (String, String, String, Option<PathBuf>);
 
-fn saved_origin_tuple(
-    get: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<SavedOriginTuple>> {
+fn saved_origin_tuple(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<SavedOriginTuple>> {
     const NAMES: [&str; 3] = [
         "MUXE_HERDR_ORIGIN_WORKSPACE_ID",
         "MUXE_HERDR_ORIGIN_TAB_ID",
