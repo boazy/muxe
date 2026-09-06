@@ -6,8 +6,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+async-trait.workspace = true
 crossterm.workspace = true
 minijinja.workspace = true
+nix.workspace = true
 muxe-core = { path = "../muxe-core" }
 muxe-protocol = { path = "../muxe-protocol" }
 muxe-terminal-input = { path = "../muxe-terminal-input" }
@@ -15,7 +17,9 @@ ratatui.workspace = true
 serde.workspace = true
 rkyv.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+divan.workspace = true
