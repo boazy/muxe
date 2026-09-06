@@ -21,6 +21,7 @@ tokio.workspace = true
 muxe-broker = { path = "../muxe-broker" }
 muxe-core = { path = "../muxe-core" }
 muxe-ui = { path = "../muxe-ui" }
+muxe-zellij-protocol = { path = "../muxe-zellij-protocol" }
 thiserror.workspace = true
 kdl.workspace = true
 platform-dirs.workspace = true

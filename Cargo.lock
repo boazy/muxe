@@ -1813,6 +1813,7 @@ dependencies = [
  "muxe-core",
  "muxe-protocol",
  "muxe-ui",
+ "muxe-zellij-protocol",
  "platform-dirs",
  "serde",
  "serde_json",
