@@ -9,16 +9,17 @@
 # Phase 2 downloads the predecessor linux-x64 archive from its published
 #   release and records the same fields. With no predecessor release the
 #   upgrade matrix cannot run; that fails closed here, never as a waiver.
-# Phase 3 hands both extracted stacks to the broker-owned session scenario
-#   through MUXE_UPGRADE_SCENARIO_CMD, which must name an executable that
-#   accepts "<old_dir> <target_dir>". The command stays unset until the
-#   broker owner lands the approved scenario; an unset command fails closed
-#   naming that runtime prerequisite, not this driver.
+# Phase 3 hands the staged stacks to the broker-owned concrete Rust runner
+#   with fixed old/target/host arguments (Herdr vertical first). Until that
+#   entrypoint lands in this checkout the driver stops here naming it; the
+#   library suites are not wired as a surrogate for it. The live session
+#   handoff across real sessions and clients is part of that same
+#   broker-owned scenario, which runs only under the approvals gated by the
+#   calling workflow before this driver ever executes.
 #
 # Every phase prints the facts it established. Nothing here echoes success
 # for work that did not run.
 set -euo pipefail
-
 file_digest() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
@@ -68,7 +69,5 @@ test "$PREV_VERSION" = "${PREV#v}" || fail "predecessor binary reports $PREV_VER
 test "$PREV_VERSION" != "$TARGET_VERSION" || fail "predecessor and target report the same version $PREV_VERSION; no upgrade to rehearse"
 PREV_WASM="$(file_digest "$PREV_ROOT/lib/muxe/muxe-zellij.wasm")"
 echo "predecessor: tag=$PREV binary=$PREV_VERSION wasm_sha256=$PREV_WASM"
-
-test -n "${MUXE_UPGRADE_SCENARIO_CMD:-}" || fail "session handoff scenario is not wired: MUXE_UPGRADE_SCENARIO_CMD is unset pending the broker-owned approved scenario (parent review) plus the live-host approvals; old=$PREV_VERSION target=$TARGET_VERSION stacks are staged above"
-test -x "$MUXE_UPGRADE_SCENARIO_CMD" || fail "MUXE_UPGRADE_SCENARIO_CMD=$MUXE_UPGRADE_SCENARIO_CMD is not executable"
-"$MUXE_UPGRADE_SCENARIO_CMD" "$PREV_ROOT" "$TARGET_ROOT"
+echo "staged inputs: old=$PREV_ROOT@$PREV_VERSION target=$TARGET_ROOT@$TARGET_VERSION"
+fail "no upgrade rehearsal entrypoint exists in this checkout: the broker-owned concrete Rust runner with fixed old/target/host arguments (Herdr vertical first) has not landed; wire its literal invocation here once the broker owner confirms the target name"
