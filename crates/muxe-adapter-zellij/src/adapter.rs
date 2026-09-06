@@ -1343,37 +1343,67 @@ impl HostAdapter for ZellijAdapter {
         &self,
         request: OriginCaptureRequest,
     ) -> Result<OriginContext, AdapterError> {
+        let hint = request.origin_hint.as_ref().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::ContextUnavailable,
+                "Zellij AttachUi did not provide the saved origin bootstrap tuple",
+            )
+        })?;
+        let caller = request.caller_identity.as_ref().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::ContextUnavailable,
+                "Zellij AttachUi did not provide the UI caller identity tuple",
+            )
+        })?;
+        if caller.pane_id != request.ui_pane {
+            return Err(AdapterError::new(
+                AdapterErrorKind::InvalidRequest,
+                "Zellij caller pane does not match the pane that is attaching the UI",
+            ));
+        }
         let ui_pane = request.ui_pane.as_str().to_owned();
         // The claim fan-out in modal_scope usually cached the snapshot already;
         // reuse it so attach costs no second host round-trip.
-        if let Some(snapshot) = self.inner.snapshots.lock().await.get(&ui_pane).cloned() {
-            return build_origin_context(
-                &snapshot,
-                &self.inner.config.session_name,
-                &ui_pane,
-                None,
-                None,
-                None,
-            )
-            .map_err(|error| {
-                AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
-            });
+        let snapshot =
+            if let Some(snapshot) = self.inner.snapshots.lock().await.get(&ui_pane).cloned() {
+                snapshot
+            } else {
+                let ui_session = format!("origin-{}", hex_id(&self.mint_id()));
+                self.resolve_client_for_pane(&ui_session, &ui_pane).await?;
+                self.inner
+                    .snapshots
+                    .lock()
+                    .await
+                    .get(&ui_pane)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AdapterError::new(
+                            AdapterErrorKind::Unavailable,
+                            "origin snapshot missing after claim",
+                        )
+                    })?
+            };
+        if snapshot.ui_pane_id != ui_pane {
+            return Err(AdapterError::new(
+                AdapterErrorKind::InvalidRequest,
+                "origin snapshot is for a different UI pane",
+            ));
         }
-        let ui_session = format!("origin-{}", hex_id(&self.mint_id()));
-        self.resolve_client_for_pane(&ui_session, &ui_pane).await?;
-        let snapshot = self
-            .inner
-            .snapshots
-            .lock()
-            .await
-            .get(&ui_pane)
-            .cloned()
-            .ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    "origin snapshot missing after claim",
-                )
-            })?;
+        match &snapshot.prior_pane_id {
+            Some(prior) if prior == hint.pane_id.as_str() => {}
+            Some(_) => {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::InvalidRequest,
+                    "saved origin pane does not match the live bridge prior pane",
+                ));
+            }
+            None => {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::ContextUnavailable,
+                    "bridge tracked no prior pane for origin",
+                ));
+            }
+        }
         build_origin_context(
             &snapshot,
             &self.inner.config.session_name,
@@ -1476,6 +1506,20 @@ impl HostAdapter for ZellijAdapter {
             .recv()
             .await
             .ok_or_else(|| AdapterError::new(AdapterErrorKind::Shutdown, "adapter shut down"))
+    }
+
+    async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "Zellij cannot suspend for activation: bridge-sharing group activation needs whole-group coordinator support",
+        ))
+    }
+
+    async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "Zellij cannot resume after an activation abort: no suspendible subscription exists",
+        ))
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
@@ -1767,6 +1811,117 @@ mod tests {
             }
             _ => panic!("expected dispatch payload"),
         }
+        adapter.shutdown().await.expect("shutdown");
+    }
+    #[tokio::test]
+    async fn activation_suspend_and_resume_are_explicitly_unsupported() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        let suspend = adapter
+            .suspend_for_activation()
+            .await
+            .expect_err("suspend fails");
+        assert_eq!(suspend.kind, AdapterErrorKind::Unsupported);
+        let resume = adapter
+            .resume_after_activation_abort()
+            .await
+            .expect_err("resume fails");
+        assert_eq!(resume.kind, AdapterErrorKind::Unsupported);
+        adapter.shutdown().await.expect("shutdown");
+    }
+    fn origin_request(
+        ui_pane: &str,
+        hint_pane: Option<&str>,
+        caller_pane: Option<&str>,
+    ) -> OriginCaptureRequest {
+        use muxe_adapter_api::{HostCallerIdentity, OriginHintSource, UntrustedOriginHint};
+        OriginCaptureRequest {
+            ui_session: UiSessionId::new("session-1"),
+            ui_pane: PaneId::new(ui_pane),
+            origin_hint: hint_pane.map(|pane| UntrustedOriginHint {
+                workspace_id: muxe_core::WorkspaceId::new("workspace-1"),
+                tab_id: muxe_core::TabId::new("tab-1"),
+                pane_id: PaneId::new(pane),
+                cwd: Some(std::path::PathBuf::from("/work")),
+                source: OriginHintSource::LauncherBootstrap,
+            }),
+            caller_identity: caller_pane.map(|pane| HostCallerIdentity {
+                workspace_id: muxe_core::WorkspaceId::new("workspace-1"),
+                tab_id: muxe_core::TabId::new("tab-1"),
+                pane_id: PaneId::new(pane),
+                cwd: Some(std::path::PathBuf::from("/work")),
+            }),
+        }
+    }
+
+    fn origin_snapshot(ui_pane: &str, prior: Option<&str>) -> muxe_zellij_protocol::ZellijOrigin {
+        muxe_zellij_protocol::ZellijOrigin {
+            client_id: "client-1".to_owned(),
+            session_name: Some("session-alpha".to_owned()),
+            prior_pane_id: prior.map(str::to_owned),
+            ui_pane_id: ui_pane.to_owned(),
+            prior_pane_cwd: Some("/work".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_origin_requires_hint_and_caller() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        let missing_hint = adapter
+            .capture_origin(origin_request("plugin-9", None, Some("plugin-9")))
+            .await
+            .expect_err("missing hint fails");
+        assert_eq!(missing_hint.kind, AdapterErrorKind::ContextUnavailable);
+        let missing_caller = adapter
+            .capture_origin(origin_request("plugin-9", Some("terminal_2"), None))
+            .await
+            .expect_err("missing caller fails");
+        assert_eq!(missing_caller.kind, AdapterErrorKind::ContextUnavailable);
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn capture_origin_validates_caller_and_prior_pane() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        adapter.inner.snapshots.lock().await.insert(
+            "plugin-9".to_owned(),
+            origin_snapshot("plugin-9", Some("terminal_2")),
+        );
+        let caller_mismatch = adapter
+            .capture_origin(origin_request(
+                "plugin-9",
+                Some("terminal_2"),
+                Some("terminal_7"),
+            ))
+            .await
+            .expect_err("caller mismatch fails");
+        assert_eq!(caller_mismatch.kind, AdapterErrorKind::InvalidRequest);
+        let prior_mismatch = adapter
+            .capture_origin(origin_request(
+                "plugin-9",
+                Some("terminal_9"),
+                Some("plugin-9"),
+            ))
+            .await
+            .expect_err("prior mismatch fails");
+        assert_eq!(prior_mismatch.kind, AdapterErrorKind::InvalidRequest);
+        let matched = adapter
+            .capture_origin(origin_request(
+                "plugin-9",
+                Some("terminal_2"),
+                Some("plugin-9"),
+            ))
+            .await
+            .expect("matched hint and caller capture");
+        assert_eq!(
+            matched.pane_id.as_ref().map(|pane| pane.as_str()),
+            Some("plugin-9")
+        );
         adapter.shutdown().await.expect("shutdown");
     }
 
