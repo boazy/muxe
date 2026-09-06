@@ -3,32 +3,32 @@ rust = "1.97.1"
 
 [tasks.fmt]
 description = "Check Rust formatting on the pinned toolchain"
-run = "cargo fmt --all -- --check"
+run = "env -u RUSTUP_TOOLCHAIN cargo fmt --all -- --check"
 
 [tasks.check]
 description = "Compile registered crates with the pinned lockfile"
-run = "cargo check --workspace --locked"
+run = "env -u RUSTUP_TOOLCHAIN cargo check --workspace --locked"
 
 [tasks.test]
 description = "Run registered workspace tests and doctests"
-run = "cargo test --workspace --locked"
+run = "env -u RUSTUP_TOOLCHAIN cargo test --workspace --locked"
 
 [tasks.clippy]
 description = "Run strict Clippy checks"
-run = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -W clippy::allow_attributes -W clippy::allow_attributes_without_reason"
+run = "env -u RUSTUP_TOOLCHAIN cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -W clippy::allow_attributes -W clippy::allow_attributes_without_reason"
 
 [tasks.codegen-herdr]
 description = "Verify Herdr-generated sources are byte-clean"
-run = "cargo run --locked -p muxe-herdr-gen -- --check"
+run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-herdr-gen -- --check"
 
 [tasks.codegen-zellij]
 description = "Verify Zellij-generated sources are byte-clean"
-run = "cargo run --locked -p muxe-zellij-gen -- --check"
+run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-zellij-gen -- --check"
 
 [tasks.codegen-zellij-materialize]
 description = "Materialize minimized Zellij fixtures from the pinned source"
-run = "cargo run --locked -p muxe-zellij-gen -- --materialize-fixtures"
+run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-zellij-gen -- --materialize-fixtures"
 
 [tasks.codegen-zellij-verify]
 description = "Verify Zellij fixtures from a fresh pinned source materialization"
-run = "cargo run --locked -p muxe-zellij-gen -- --verify-fixtures"
+run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-zellij-gen -- --verify-fixtures"
