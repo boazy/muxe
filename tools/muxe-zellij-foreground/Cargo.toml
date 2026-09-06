@@ -8,6 +8,10 @@ publish = false
 name = "muxe-zellij-foreground"
 path = "src/main.rs"
 
+[[bin]]
+name = "muxe-fault-injector"
+path = "src/fault_injector.rs"
+
 [dependencies]
 zellij-server = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f" }
 zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f" }
