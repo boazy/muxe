@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::action::{ActionSpec, MenuAction, MenuTarget, PortableAction};
 use crate::condition::{ConditionEvaluationError, ConditionProgram, PagesContext};
 use crate::execution::{AfterAction, ExecutionPolicy, MenuControl};
-use crate::config::KeyboardProfile;
+use crate::config::{KeyboardProfile, ThemeSelection};
 use crate::key::CanonicalKey;
 use crate::theme::CompiledTheme;
 
@@ -46,6 +46,13 @@ impl BindingId {
     pub const fn ordinal(self) -> u64 {
         self.ordinal
     }
+}
+
+/// Compact location of the one authoritative compiled binding payload in its owning menu.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BindingLocation {
+    pub menu: usize,
+    pub binding: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,6 +243,7 @@ pub struct UiAttachmentView {
     pub menu: MenuView,
     pub keyboard: KeyboardProfile,
     pub inactivity_timeout: Option<Duration>,
+    pub theme_selection: ThemeSelection,
     pub theme: CompiledTheme,
 }
 
@@ -293,11 +301,19 @@ pub fn menu_view(
     })
 }
 
-/// Indexes broker-authoritative bindings after compilation without exposing payloads to views.
-pub fn binding_index(menus: &[CompiledMenu]) -> BTreeMap<BindingId, CompiledBinding> {
+/// Indexes broker-authoritative bindings without duplicating action payloads.
+pub fn binding_index(menus: &[CompiledMenu]) -> BTreeMap<BindingId, BindingLocation> {
     menus
         .iter()
-        .flat_map(|menu| menu.bindings.iter().cloned())
-        .map(|binding| (binding.id, binding))
+        .enumerate()
+        .flat_map(|(menu, compiled)| {
+            compiled
+                .bindings
+                .iter()
+                .enumerate()
+                .map(move |(binding, compiled_binding)| {
+                    (compiled_binding.id, BindingLocation { menu, binding })
+                })
+        })
         .collect()
 }

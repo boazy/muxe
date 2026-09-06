@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use muxe_core::{
-    CompiledGeneration, ConfigDiagnostic, ContextResolutionError, ExecutionCapabilities, ExecutionId,
-    NativeActionCandidate, NativeActionValidator, OriginContext, PaneId, PortableAction, TabId,
-    WorkspaceId,
+    ActionValidator, CompiledGeneration, ConfigDiagnostic, ContextResolutionError,
+    ExecutionCapabilities, ExecutionId, NativeActionCandidate, OriginContext, PaneId,
+    PortableAction, PortableActionResolutionError, TabId, WorkspaceId,
 };
 
 macro_rules! opaque_id {
@@ -95,6 +95,15 @@ pub struct CaptureLease {
     pub modal_scope: ModalScopeId,
 }
 
+/// Broker-registered pending UI placement. The pending-launch token remains broker-only; adapters
+/// receive only concrete host identities to revalidate before idempotent cleanup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPaneRegistration {
+    pub ui_session: UiSessionId,
+    pub pane: PaneId,
+    pub temporary_tab: Option<TabId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureReleaseReason {
     UiDismissed,
@@ -156,10 +165,28 @@ impl ResolvedNativeAction {
     }
 }
 
+/// An adapter-independent portable request after every scalar context reference has resolved and
+/// been concretely revalidated against the immutable origin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedPortableAction {
+    pub action: PortableAction,
+}
+
+impl ResolvedPortableAction {
+    pub fn from_origin(
+        action: &PortableAction,
+        origin: &OriginContext,
+    ) -> Result<Self, PortableActionResolutionError> {
+        Ok(Self {
+            action: action.resolve_context(origin)?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PortableDispatchRequest {
     pub execution: ExecutionId,
-    pub action: PortableAction,
+    pub action: ResolvedPortableAction,
     pub origin: OriginContext,
 }
 
@@ -243,7 +270,7 @@ impl std::error::Error for AdapterError {}
 /// One constructor-injected adapter per broker. Implementations must retain their own typed host
 /// payloads; bridge envelopes belong to protocol crates and never appear here.
 #[async_trait]
-pub trait HostAdapter: NativeActionValidator + Send + Sync {
+pub trait HostAdapter: ActionValidator + Send + Sync {
     async fn identity(&self) -> Result<HostIdentity, AdapterError>;
 
     async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError>;
@@ -262,6 +289,10 @@ pub trait HostAdapter: NativeActionValidator + Send + Sync {
         lease: CaptureLease,
         reason: CaptureReleaseReason,
     ) -> Result<(), AdapterError>;
+
+    /// Idempotently closes only a revalidated pending UI pane. Implementations must never infer or
+    /// close an origin pane/tab from stale launch metadata.
+    async fn close_pending_pane(&self, registration: PendingPaneRegistration) -> Result<(), AdapterError>;
 
     /// Captures and enriches a typed immutable origin before dispatchable focus can move.
     async fn capture_origin(&self, request: OriginCaptureRequest) -> Result<OriginContext, AdapterError>;

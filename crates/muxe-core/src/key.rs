@@ -674,6 +674,78 @@ impl CanonicalKey {
     }
 }
 
+/// Profile-dependent VT100 representation of one configured binding key.
+///
+/// The legacy terminal stream cannot distinguish several canonical keys. The compiler uses this
+/// projection to reject ambiguous bindings before they reach the UI.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Vt100BindingKey {
+    ControlByte(u8),
+    Exact(CanonicalKey),
+}
+
+impl CanonicalKey {
+    /// Returns the legacy input projection used for VT100 collision checks.
+    pub(crate) fn vt100_binding_key(&self) -> Vt100BindingKey {
+        legacy_control_code(self)
+            .map(Vt100BindingKey::ControlByte)
+            .unwrap_or_else(|| Vt100BindingKey::Exact(self.clone()))
+    }
+
+    /// Matches a legacy VT100 event without inventing modifier or identity fields that the
+    /// terminal did not supply.
+    pub(crate) fn matches_vt100(&self, event: &KeyEvent) -> bool {
+        match legacy_control_code(self) {
+            Some(expected) => legacy_event_control_code(event) == Some(expected),
+            None => self.matches(event),
+        }
+    }
+}
+
+fn legacy_control_code(key: &CanonicalKey) -> Option<u8> {
+    if key.source != KeyIdentitySource::Primary {
+        return None;
+    }
+    match &key.identity {
+        KeyIdentity::Named(NamedKey::Escape) if key.modifiers == Modifiers::empty() => Some(0x1b),
+        KeyIdentity::Named(NamedKey::Enter) if key.modifiers == Modifiers::empty() => Some(0x0d),
+        KeyIdentity::Named(NamedKey::Tab) if key.modifiers == Modifiers::empty() => Some(0x09),
+        KeyIdentity::Named(NamedKey::Backspace) if key.modifiers == Modifiers::empty() => Some(0x08),
+        KeyIdentity::Text(character)
+            if key.modifiers.contains(Modifiers::CTRL)
+                && key.modifiers.bits() & !(Modifiers::CTRL | Modifiers::SHIFT) == 0 =>
+        {
+            legacy_control_text_code(*character)
+        }
+        _ => None,
+    }
+}
+
+fn legacy_control_text_code(character: char) -> Option<u8> {
+    match character.to_ascii_uppercase() {
+        'A'..='Z' => Some(character.to_ascii_uppercase() as u8 - b'@'),
+        '[' => Some(0x1b),
+        _ => None,
+    }
+}
+
+fn legacy_event_control_code(event: &KeyEvent) -> Option<u8> {
+    if event.modifiers != Modifiers::empty()
+        || event.locks != LockModifiers::default()
+        || event.keypad
+    {
+        return None;
+    }
+    match event.primary.as_ref()? {
+        KeyIdentity::Named(NamedKey::Escape) => Some(0x1b),
+        KeyIdentity::Named(NamedKey::Enter) => Some(0x0d),
+        KeyIdentity::Named(NamedKey::Tab) => Some(0x09),
+        KeyIdentity::Named(NamedKey::Backspace) => Some(0x08),
+        KeyIdentity::Text(character) if character.is_control() => u8::try_from(*character as u32).ok(),
+        _ => None,
+    }
+}
+
 impl fmt::Display for CanonicalKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.canonical_string())

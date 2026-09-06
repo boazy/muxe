@@ -294,7 +294,6 @@ impl MenuSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::menu::CompiledGeneration;
 
     fn at(milliseconds: u64) -> SessionInstant {
         SessionInstant(Duration::from_millis(milliseconds))

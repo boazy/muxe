@@ -4,14 +4,14 @@ use std::time::Duration;
 
 use saphyr::{LoadableYamlNode, MarkedYamlOwned, ScalarOwned, ScanError, YamlDataOwned};
 
-use crate::action::NativeActionCandidate;
+use crate::action::{NativeActionCandidate, PortableAction};
 use crate::context::{ContextReference, ContextValue, OriginContext};
 use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceId, SourceSpan};
 use crate::execution::ExecutionCapabilities;
-use crate::key::KeyCapabilities;
+use crate::key::{CanonicalKey, KeyCapabilities, KeyEvent};
 use crate::menu::{
-    menu_view, BindingId, CompiledBinding, CompiledGeneration, CompiledMenu, MenuId,
-    UiAttachmentView,
+    menu_view, BindingId, BindingLocation, CompiledBinding, CompiledGeneration, CompiledMenu,
+    MenuId, UiAttachmentView,
 };
 use crate::theme::CompiledTheme;
 
@@ -331,6 +331,7 @@ pub struct CompileInput {
     pub base: ConfigDocument,
     pub host_override: Option<ConfigDocument>,
     pub key_capabilities: KeyCapabilities,
+    pub theme_assets: ThemeAssets,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,20 +340,94 @@ pub enum KeyboardProfile {
     Kitty(KeyCapabilities),
 }
 
-/// Native validation lives behind this source-aware, host-independent compiler callback.
+impl KeyboardProfile {
+    /// Matches a configured binding against one event according to the effective input profile.
+    ///
+    /// VT100 matching recognizes only the legacy control-byte aliases that the terminal cannot
+    /// distinguish. Kitty matching preserves the supplied identities and modifiers.
+    pub fn matches_binding(&self, binding: &CanonicalKey, event: &KeyEvent) -> bool {
+        match self {
+            Self::Vt100 { .. } => binding.matches_vt100(event),
+            Self::Kitty(_) => binding.matches(event),
+        }
+    }
+}
+
+/// Effective reload behavior. The broker owns filesystem watching and applies this immutable
+/// policy to the compiled generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReloadSettings {
+    pub watch: bool,
+    pub debounce: Duration,
+}
+
+impl Default for ReloadSettings {
+    fn default() -> Self {
+        Self { watch: true, debounce: Duration::from_millis(200) }
+    }
+}
+
+/// Host version gate independent from schema and action-capability validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostVersionCheck {
+    Min,
+    Strict,
+    Off,
+}
+
+impl Default for HostVersionCheck {
+    fn default() -> Self {
+        Self::Min
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostSettings {
+    pub version_check: HostVersionCheck,
+}
+
+/// Pure external-asset inputs. The broker reads the configured theme and color-scheme files and
+/// supplies their already source-tracked YAML documents here; this crate performs all parsing and
+/// pairing validation without filesystem access.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ThemeAssets {
+    pub themes: BTreeMap<String, ConfigDocument>,
+    pub color_schemes: BTreeMap<String, ConfigDocument>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThemeSelection {
+    pub theme: String,
+    pub color_scheme: String,
+}
+
+impl Default for ThemeSelection {
+    fn default() -> Self {
+        Self { theme: "default".to_owned(), color_scheme: "default".to_owned() }
+    }
+}
+
+/// Active-host action validation lives behind this source-aware compiler boundary.
 ///
-/// Concrete adapter/schema code receives structured fields rather than a JSON `Value` escape hatch,
-/// and reports diagnostics against the exact YAML candidates. It must revalidate fully resolved
-/// values immediately before dispatch; this load-time callback never replaces that check.
-pub trait NativeActionValidator: Send + Sync {
+/// Concrete adapters receive fully parsed portable actions and structured native candidates,
+/// report action-specific execution capabilities, and attach incompatibility diagnostics to the
+/// exact action discriminator. They must validate again immediately before dispatch; load-time
+/// acceptance never replaces that check.
+pub trait ActionValidator: Send + Sync {
+    fn validate_portable(
+        &self,
+        action: &PortableAction,
+        action_span: &SourceSpan,
+    ) -> Result<ActionValidation, ConfigDiagnostic>;
+
     fn validate_native(
         &self,
         candidate: &NativeActionCandidate,
-    ) -> Result<NativeActionValidation, ConfigDiagnostic>;
+    ) -> Result<ActionValidation, ConfigDiagnostic>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeActionValidation {
+pub struct ActionValidation {
     pub execution: ExecutionCapabilities,
 }
 
@@ -362,8 +437,14 @@ pub struct CompiledConfig {
     pub generation: CompiledGeneration,
     pub keyboard: KeyboardProfile,
     pub inactivity_timeout: Option<Duration>,
+    pub reload: ReloadSettings,
+    pub host: HostSettings,
+    pub theme_selection: ThemeSelection,
+    pub theme: CompiledTheme,
+    /// The sole owner of compiled action payloads.
     pub menus: Vec<CompiledMenu>,
-    pub bindings: BTreeMap<BindingId, CompiledBinding>,
+    /// Compact generation-scoped locations into `menus`, never cloned payloads.
+    pub bindings: BTreeMap<BindingId, BindingLocation>,
 }
 
 impl CompiledConfig {
@@ -371,20 +452,21 @@ impl CompiledConfig {
         self.menus.iter().find(|menu| &menu.id == id)
     }
 
-    pub fn attachment_view(&self, root: &MenuId, theme: CompiledTheme) -> Option<UiAttachmentView> {
+    pub fn attachment_view(&self, root: &MenuId) -> Option<UiAttachmentView> {
         Some(UiAttachmentView {
             menu: menu_view(self.generation, root, &self.menus)?,
             keyboard: self.keyboard.clone(),
             inactivity_timeout: self.inactivity_timeout,
-            theme,
+            theme_selection: self.theme_selection.clone(),
+            theme: self.theme.clone(),
         })
     }
 
-    /// Rejects generation mismatch before an action can be retrieved.
     pub fn binding(&self, generation: CompiledGeneration, id: BindingId) -> Option<&CompiledBinding> {
         (generation == self.generation && id.generation() == generation)
             .then(|| self.bindings.get(&id))
             .flatten()
+            .and_then(|location| self.menus.get(location.menu)?.bindings.get(location.binding))
     }
 }
 
@@ -396,9 +478,9 @@ impl Compiler {
     pub fn compile(
         &self,
         input: CompileInput,
-        native_validator: Option<&dyn NativeActionValidator>,
+        action_validator: Option<&dyn ActionValidator>,
     ) -> Result<CompiledConfig, Vec<ConfigDiagnostic>> {
-        crate::compiler::compile_effective(input, native_validator)
+        crate::compiler::compile_effective(input, action_validator)
     }
 }
 
@@ -408,12 +490,18 @@ pub fn compile_yaml(
     source: SourceId,
     yaml: impl Into<Arc<str>>,
     key_capabilities: KeyCapabilities,
-    native_validator: Option<&dyn NativeActionValidator>,
+    action_validator: Option<&dyn ActionValidator>,
 ) -> Result<CompiledConfig, Vec<ConfigDiagnostic>> {
     let base = ConfigDocument::parse(source, yaml).map_err(|diagnostic| vec![diagnostic])?;
     Compiler.compile(
-        CompileInput { generation, base, host_override: None, key_capabilities },
-        native_validator,
+        CompileInput {
+            generation,
+            base,
+            host_override: None,
+            key_capabilities,
+            theme_assets: ThemeAssets::default(),
+        },
+        action_validator,
     )
 }
 
