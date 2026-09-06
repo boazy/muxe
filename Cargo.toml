@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 # Runtime members are added only when their source owners have real crate roots.
-members = ["crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "crates/muxe-ui", "crates/muxe-broker", "crates/muxe", "tools/muxe-herdr-gen", "tools/muxe-zellij-gen", "crates/muxe-zellij-protocol", "crates/muxe-adapter-zellij", "tools/codegen-completions"]
+members = ["crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "crates/muxe-ui", "crates/muxe-broker", "crates/muxe", "tools/muxe-herdr-gen", "tools/muxe-zellij-gen", "crates/muxe-zellij-protocol", "crates/muxe-adapter-zellij", "tools/codegen-completions", "crates/muxe-zellij-wasm"]
 
 [workspace.package]
 edition = "2024"

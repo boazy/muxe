@@ -1996,6 +1996,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "muxe-zellij-wasm"
+version = "0.1.0"
+dependencies = [
+ "muxe-protocol",
+ "muxe-zellij-protocol",
+ "serde",
+ "serde_json",
+ "zellij-tile",
+ "zellij-utils",
+]
+
+[[package]]
 name = "names"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
