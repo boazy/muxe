@@ -876,7 +876,6 @@ version = "0.1.0"
 dependencies = [
  "muxe-adapter-api",
  "muxe-core",
- "parking_lot",
  "regex",
  "regress 0.12.0",
  "serde",
