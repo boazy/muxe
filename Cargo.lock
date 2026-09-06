@@ -1027,6 +1027,7 @@ dependencies = [
  "proptest",
  "ratatui",
  "rkyv",
+ "serde",
  "thiserror",
  "unicode-width 0.2.2",
 ]
