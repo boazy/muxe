@@ -32,3 +32,11 @@ run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-zellij-gen -- --materi
 [tasks.codegen-zellij-verify]
 description = "Verify Zellij fixtures from a fresh pinned source materialization"
 run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-zellij-gen -- --verify-fixtures"
+
+[tasks.completions]
+description = "Generate committed shell completions from the clap definition"
+run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p codegen-completions"
+
+[tasks.wasm-build]
+description = "Build the pinned Zellij bridge WASM and stage dist-wasm/muxe-zellij.wasm"
+run = "env -u RUSTUP_TOOLCHAIN cargo build --locked -p muxe-zellij-wasm --target wasm32-wasip1 && mkdir -p dist-wasm && cp target/wasm32-wasip1/debug/muxe_zellij_wasm.wasm dist-wasm/muxe-zellij.wasm"
