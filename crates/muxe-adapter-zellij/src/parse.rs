@@ -51,10 +51,7 @@ pub enum ParseError {
 
 impl ParseError {
     /// Renders the failure as a span-anchored configuration diagnostic.
-    pub fn to_diagnostic(
-        &self,
-        type_span: &muxe_core::SourceSpan,
-    ) -> ConfigDiagnostic {
+    pub fn to_diagnostic(&self, type_span: &muxe_core::SourceSpan) -> ConfigDiagnostic {
         let (code, message) = match self {
             Self::NotZellij { .. } => (DiagnosticCode::InvalidAction, self.to_string()),
             Self::UnknownName { .. } => (DiagnosticCode::InvalidAction, self.to_string()),
@@ -87,7 +84,11 @@ pub fn fields_to_json_map(
 ) -> Result<Map<String, Value>, ParseError> {
     let mut map = Map::with_capacity(fields.len());
     for field in fields {
-        let key = if top_snake { field_to_snake(&field.name) } else { field.name.clone() };
+        let key = if top_snake {
+            field_to_snake(&field.name)
+        } else {
+            field.name.clone()
+        };
         let value = value_to_json(&field.value, &key, allow_context)?;
         map.insert(key, value);
     }
@@ -102,30 +103,32 @@ fn leaf_key(key: &str) -> String {
 /// Converts a string leaf holding a pinned text identity (`terminal_<n>`).
 fn pane_id_json(text: &str, field: &str) -> Result<Value, ParseError> {
     if let Some(number) = text.strip_prefix("terminal_") {
-        return number.parse::<u32>().map(|id| {
-            Value::Object(Map::from_iter([("Terminal".to_owned(), Value::from(id))]))
-        }).map_err(|_| ParseError::InvalidArguments {
-            kind: "value",
-            name: field.to_owned(),
-            message: format!("invalid terminal pane ID '{text}'"),
-        });
+        return number
+            .parse::<u32>()
+            .map(|id| Value::Object(Map::from_iter([("Terminal".to_owned(), Value::from(id))])))
+            .map_err(|_| ParseError::InvalidArguments {
+                kind: "value",
+                name: field.to_owned(),
+                message: format!("invalid terminal pane ID '{text}'"),
+            });
     }
     if let Some(number) = text.strip_prefix("plugin_") {
-        return number.parse::<u32>().map(|id| {
-            Value::Object(Map::from_iter([("Plugin".to_owned(), Value::from(id))]))
-        }).map_err(|_| ParseError::InvalidArguments {
+        return number
+            .parse::<u32>()
+            .map(|id| Value::Object(Map::from_iter([("Plugin".to_owned(), Value::from(id))])))
+            .map_err(|_| ParseError::InvalidArguments {
+                kind: "value",
+                name: field.to_owned(),
+                message: format!("invalid plugin pane ID '{text}'"),
+            });
+    }
+    text.parse::<u32>()
+        .map(|id| Value::Object(Map::from_iter([("Terminal".to_owned(), Value::from(id))])))
+        .map_err(|_| ParseError::InvalidArguments {
             kind: "value",
             name: field.to_owned(),
-            message: format!("invalid plugin pane ID '{text}'"),
-        });
-    }
-    text.parse::<u32>().map(|id| {
-        Value::Object(Map::from_iter([("Terminal".to_owned(), Value::from(id))]))
-    }).map_err(|_| ParseError::InvalidArguments {
-        kind: "value",
-        name: field.to_owned(),
-        message: format!("pane ID '{text}' is not terminal_<n>, plugin_<n>, or a bare number"),
-    })
+            message: format!("pane ID '{text}' is not terminal_<n>, plugin_<n>, or a bare number"),
+        })
 }
 
 /// Maps a closed kebab literal set to its PascalCase mirror variant.
@@ -135,11 +138,14 @@ fn closed_literal(
     cases: &[(&str, &str)],
     what: &str,
 ) -> Result<Value, ParseError> {
-    cases.iter().find_map(|(kebab, variant)| (*kebab == text).then(|| Value::String((*variant).to_owned()))).ok_or_else(|| ParseError::InvalidArguments {
-        kind: "value",
-        name: field.to_owned(),
-        message: format!("invalid {what} '{text}'"),
-    })
+    cases
+        .iter()
+        .find_map(|(kebab, variant)| (*kebab == text).then(|| Value::String((*variant).to_owned())))
+        .ok_or_else(|| ParseError::InvalidArguments {
+            kind: "value",
+            name: field.to_owned(),
+            message: format!("invalid {what} '{text}'"),
+        })
 }
 
 /// Key-directed string-leaf conversion for closed mirror types. Returns `None`
@@ -150,37 +156,49 @@ fn typed_leaf(key: &str, text: &str, field: &str) -> Result<Option<Value>, Parse
         "direction" => closed_literal(
             text,
             field,
-            &[("left", "Left"), ("right", "Right"), ("up", "Up"), ("down", "Down")],
+            &[
+                ("left", "Left"),
+                ("right", "Right"),
+                ("up", "Up"),
+                ("down", "Down"),
+            ],
             "direction",
-        ).map(Some),
+        )
+        .map(Some),
         "resize" => closed_literal(
             text,
             field,
             &[("increase", "Increase"), ("decrease", "Decrease")],
             "resize",
-        ).map(Some),
+        )
+        .map(Some),
         "input_mode" => closed_literal(
             text,
             field,
             &[
-                ("normal", "Normal"), ("locked", "Locked"), ("resize", "Resize"),
-                ("pane", "Pane"), ("tab", "Tab"), ("scroll", "Scroll"),
-                ("entersearch", "EnterSearch"), ("search", "Search"),
-                ("rename-tab", "RenameTab"), ("rename-pane", "RenamePane"),
-                ("session", "Session"), ("move", "Move"), ("prompt", "Prompt"),
+                ("normal", "Normal"),
+                ("locked", "Locked"),
+                ("resize", "Resize"),
+                ("pane", "Pane"),
+                ("tab", "Tab"),
+                ("scroll", "Scroll"),
+                ("entersearch", "EnterSearch"),
+                ("search", "Search"),
+                ("rename-tab", "RenameTab"),
+                ("rename-pane", "RenamePane"),
+                ("session", "Session"),
+                ("move", "Move"),
+                ("prompt", "Prompt"),
                 ("tmux", "Tmux"),
             ],
             "input mode",
-        ).map(Some),
+        )
+        .map(Some),
         _ => Ok(None),
     }
 }
 
-fn value_to_json(
-    value: &ConfigValue,
-    key: &str,
-    allow_context: bool,
-) -> Result<Value, ParseError> {
+fn value_to_json(value: &ConfigValue, key: &str, allow_context: bool) -> Result<Value, ParseError> {
     match &value.kind {
         ConfigValueKind::Null => Ok(Value::Null),
         ConfigValueKind::Boolean(flag) => Ok(Value::Bool(*flag)),
@@ -244,21 +262,25 @@ pub fn candidate_to_raw(
     allow_context: bool,
 ) -> Result<RawNativeCommand, ParseError> {
     match parse_native_type(type_name) {
-        None => Err(ParseError::NotZellij { type_name: type_name.to_owned() }),
+        None => Err(ParseError::NotZellij {
+            type_name: type_name.to_owned(),
+        }),
         Some(NativeType::Command(kebab)) => {
             if !crate::names::is_exposed_command(&kebab) {
-                return Err(ParseError::UnknownName { kind: "command", name: kebab });
+                return Err(ParseError::UnknownName {
+                    kind: "command",
+                    name: kebab,
+                });
             }
             let mut envelope = Map::with_capacity(2);
             envelope.insert("command".to_owned(), Value::String(kebab.clone()));
             // Unit commands carry no arguments key; struct commands carry
             // their kebab-case argument map.
-            if fields.is_empty() {
-                if let Ok(raw) = serde_json::from_value::<RawNativeCommand>(Value::Object(
-                    envelope.clone(),
-                )) {
-                    return Ok(raw);
-                }
+            if fields.is_empty()
+                && let Ok(raw) =
+                    serde_json::from_value::<RawNativeCommand>(Value::Object(envelope.clone()))
+            {
+                return Ok(raw);
             }
             envelope.insert(
                 "arguments".to_owned(),
@@ -273,18 +295,21 @@ pub fn candidate_to_raw(
             })
         }
         Some(NativeType::Action(kebab)) => {
-            let variant = action_kebab_to_variant(&kebab).ok_or_else(|| ParseError::UnknownName {
-                kind: "action",
-                name: kebab.clone(),
-            })?;
+            let variant =
+                action_kebab_to_variant(&kebab).ok_or_else(|| ParseError::UnknownName {
+                    kind: "action",
+                    name: kebab.clone(),
+                })?;
             // Unit action variants serialize as bare strings; struct variants
             // carry their snake-case field map.
-            if fields.is_empty() {
-                if let Ok(action) = serde_json::from_value::<raw::Action>(Value::String(
-                    variant.to_owned(),
-                )) {
-                    return Ok(RawNativeCommand::RunAction { action, context: Vec::new() });
-                }
+            if fields.is_empty()
+                && let Ok(action) =
+                    serde_json::from_value::<raw::Action>(Value::String(variant.to_owned()))
+            {
+                return Ok(RawNativeCommand::RunAction {
+                    action,
+                    context: Vec::new(),
+                });
             }
             let mut envelope = Map::with_capacity(1);
             envelope.insert(
@@ -299,14 +324,21 @@ pub fn candidate_to_raw(
                         message: bounded(error.to_string()),
                     }
                 })?;
-            Ok(RawNativeCommand::RunAction { action, context: Vec::new() })
+            Ok(RawNativeCommand::RunAction {
+                action,
+                context: Vec::new(),
+            })
         }
     }
 }
 
 fn bounded(message: String) -> String {
     const LIMIT: usize = 1024;
-    if message.len() > LIMIT { message[..LIMIT].to_owned() } else { message }
+    if message.len() > LIMIT {
+        message[..LIMIT].to_owned()
+    } else {
+        message
+    }
 }
 
 #[cfg(test)]
@@ -323,12 +355,19 @@ mod tests {
     }
 
     fn field(name: &str, kind: ConfigValueKind) -> ConfigField {
-        ConfigField { name: name.to_owned(), name_span: span(), value: value(kind) }
+        ConfigField {
+            name: name.to_owned(),
+            name_span: span(),
+            value: value(kind),
+        }
     }
 
     #[test]
     fn parses_exposed_command_with_kebab_fields() {
-        let fields = [field("should-float-if-hidden", ConfigValueKind::Boolean(true))];
+        let fields = [field(
+            "should-float-if-hidden",
+            ConfigValueKind::Boolean(true),
+        )];
         let raw = candidate_to_raw("native.zellij.command:show-self", &fields, false)
             .expect("show-self parses");
         assert!(matches!(raw, RawNativeCommand::ShowSelf { .. }));
@@ -357,7 +396,10 @@ mod tests {
 
     #[test]
     fn wrong_field_type_reports_arguments() {
-        let fields = [field("tab-index", ConfigValueKind::String("nope".to_owned()))];
+        let fields = [field(
+            "tab-index",
+            ConfigValueKind::String("nope".to_owned()),
+        )];
         let error = candidate_to_raw("native.zellij.command:close-tab-with-index", &fields, false)
             .expect_err("string index is rejected");
         assert!(matches!(error, ParseError::InvalidArguments { .. }));
@@ -375,7 +417,9 @@ mod tests {
         let reference =
             muxe_core::ContextReference::parse("origin.pane.id", span()).expect("valid path");
         let fields = [field("pane-id", ConfigValueKind::Context(reference))];
-        assert!(candidate_to_raw("native.zellij.command:close-pane-with-id", &fields, true).is_ok());
+        assert!(
+            candidate_to_raw("native.zellij.command:close-pane-with-id", &fields, true).is_ok()
+        );
         let error = candidate_to_raw("native.zellij.command:close-pane-with-id", &fields, false)
             .expect_err("surviving marker is rejected");
         assert!(matches!(error, ParseError::UnresolvedContext { .. }));

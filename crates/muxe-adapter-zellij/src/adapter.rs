@@ -74,6 +74,9 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long origin fan-out waits per client attempt before trying the next one.
 const ORIGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
+type CaptureReady = Result<String, AdapterError>;
+type CaptureWaiters = BTreeMap<[u8; 16], oneshot::Sender<CaptureReady>>;
+
 /// Static adapter configuration. Live-server identity beyond the session name
 /// is verified against bridge registrations, never assumed.
 #[derive(Clone, Debug)]
@@ -90,6 +93,10 @@ impl ZellijAdapterConfig {
     /// # Errors
     ///
     /// Returns [`AdapterError`] when the session name is empty.
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the public host-adapter error; boxing it would burden every caller"
+    )]
     pub fn validate(&self) -> Result<(), AdapterError> {
         if self.session_name.is_empty() {
             return Err(AdapterError::new(
@@ -114,6 +121,10 @@ impl ZellijAdapterConfig {
 ///
 /// Returns [`AdapterError`] when the variable is missing, empty, or not
 /// valid UTF-8.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the launcher-facing error contract; boxing it would add an allocation"
+)]
 pub fn zellij_session_from_env() -> Result<String, AdapterError> {
     match std::env::var("ZELLIJ_SESSION_NAME") {
         Ok(name) if !name.is_empty() => Ok(name),
@@ -142,6 +153,10 @@ pub fn zellij_session_from_env() -> Result<String, AdapterError> {
 ///
 /// Returns [`AdapterError`] when `PATH` is missing or no `zellij` entry is
 /// found in it.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the launcher-facing error contract; boxing it would add an allocation"
+)]
 pub fn resolve_zellij_exe() -> Result<PathBuf, AdapterError> {
     let path = std::env::var_os("PATH").ok_or_else(|| {
         AdapterError::new(
@@ -195,7 +210,7 @@ struct AdapterInner {
     in_flight: Mutex<Option<InFlight>>,
     live_executions: Mutex<HashSet<u64>>,
     pending_origin: Mutex<BTreeMap<String, oneshot::Sender<Result<ZellijOrigin, OriginError>>>>,
-    pending_capture: Mutex<BTreeMap<[u8; 16], oneshot::Sender<Result<String, AdapterError>>>>,
+    pending_capture: Mutex<CaptureWaiters>,
     pane_claims: Mutex<BTreeMap<String, String>>,
     snapshots: Mutex<BTreeMap<String, ZellijOrigin>>,
     generation: AtomicU64,
@@ -315,7 +330,12 @@ impl ZellijAdapter {
 
     /// Milliseconds elapsed on the monotonic adapter clock, for lease times.
     fn clock_millis(&self) -> u64 {
-        self.inner.started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+        self.inner
+            .started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     fn correlation(&self) -> ExecutionCorrelationId {
@@ -370,12 +390,24 @@ impl ZellijAdapter {
                 registration,
                 identity,
                 ..
-            } => self.on_register(client_id, current_pane, registration, identity).await,
-            PipeEventKind::RequestReleased { request_id, channel_generation, registration } => {
-                self.on_released(request_id, channel_generation, registration).await;
+            } => {
+                self.on_register(client_id, current_pane, registration, identity)
+                    .await
+            }
+            PipeEventKind::RequestReleased {
+                request_id,
+                channel_generation,
+                registration,
+            } => {
+                self.on_released(request_id, channel_generation, registration)
+                    .await;
             }
             PipeEventKind::DispatchAccepted { .. } => {}
-            PipeEventKind::DispatchCompleted { request_id, execution, outcome } => {
+            PipeEventKind::DispatchCompleted {
+                request_id,
+                execution,
+                outcome,
+            } => {
                 self.on_completed(request_id, execution, outcome).await;
             }
             PipeEventKind::OriginSnapshot { ui_session, origin } => {
@@ -416,7 +448,10 @@ impl ZellijAdapter {
                 })
                 .await;
             }
-            PipeEventKind::Heartbeat { registration, client_id } => {
+            PipeEventKind::Heartbeat {
+                registration,
+                client_id,
+            } => {
                 let now = self.clock_millis();
                 let _ = self
                     .inner
@@ -440,24 +475,31 @@ impl ZellijAdapter {
         // the plugin SDK exposes no digest of its own loaded bytes. Only
         // Unattested is an honest bridge report; anything else fails closed
         // until the user decides the artifact-hash proposal.
-        let honestly_attested =
-            matches!(identity.artifact, muxe_zellij_protocol::BridgeArtifact::Unattested);
+        let honestly_attested = matches!(
+            identity.artifact,
+            muxe_zellij_protocol::BridgeArtifact::Unattested
+        );
         let compatible = honestly_attested
             && identity.source_revision == pinned_source_revision()
             && identity.action_fingerprint == generated_action_fingerprint().0
             && identity.protocol_fingerprint == bridge_protocol_fingerprint().0;
         let now = self.clock_millis();
-        let displaced = self
-            .inner
-            .registry
-            .lock()
-            .await
-            .register(&client_id, registration, current_pane, identity.muxe_version, compatible, now);
+        let displaced = self.inner.registry.lock().await.register(
+            &client_id,
+            registration,
+            current_pane,
+            identity.muxe_version,
+            compatible,
+            now,
+        );
         if displaced.is_err() {
             return;
         }
         if compatible {
-            self.emit(AdapterHealthEvent::Healthy { identity: self.host_identity() }).await;
+            self.emit(AdapterHealthEvent::Healthy {
+                identity: self.host_identity(),
+            })
+            .await;
         } else {
             self.emit(AdapterHealthEvent::Unhealthy {
                 modal_scope: Some(Self::scope_for_client(&client_id)),
@@ -477,11 +519,17 @@ impl ZellijAdapter {
         channel_generation: u64,
         registration: [u8; 16],
     ) {
-        let matches = self.inner.in_flight.lock().await.as_ref().is_some_and(|pending| {
-            pending.request_id == request_id
-                && pending.generation == channel_generation
-                && pending.registration == registration
-        });
+        let matches = self
+            .inner
+            .in_flight
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.request_id == request_id
+                    && pending.generation == channel_generation
+                    && pending.registration == registration
+            });
         if !matches {
             // Late acknowledgement from a restarted channel: ignore.
             return;
@@ -498,20 +546,27 @@ impl ZellijAdapter {
     ) {
         let _ = request_id;
         let execution_id: u64 = execution.parse().unwrap_or(u64::MAX);
-        if !self.inner.live_executions.lock().await.remove(&execution_id) {
+        if !self
+            .inner
+            .live_executions
+            .lock()
+            .await
+            .remove(&execution_id)
+        {
             // Completion for a forgotten execution (restart cleared it): ignore.
             return;
         }
         let completion = match outcome.status {
-            muxe_zellij_protocol::CommandStatus::Succeeded => {
-                DispatchCompletion::Succeeded { execution: ExecutionId(execution_id) }
-            }
+            muxe_zellij_protocol::CommandStatus::Succeeded => DispatchCompletion::Succeeded {
+                execution: ExecutionId(execution_id),
+            },
             muxe_zellij_protocol::CommandStatus::Failed => DispatchCompletion::Failed {
                 execution: ExecutionId(execution_id),
                 error: AdapterError::new(AdapterErrorKind::DispatchFailed, outcome.detail),
             },
         };
-        self.emit(AdapterHealthEvent::DispatchCompleted(completion)).await;
+        self.emit(AdapterHealthEvent::DispatchCompleted(completion))
+            .await;
     }
 
     async fn enqueue(&self, item: QueuedItem) {
@@ -567,7 +622,10 @@ impl ZellijAdapter {
             };
             let item = {
                 let mut queues = self.inner.queues.lock().await;
-                match queues.get_mut(client_id).and_then(|queue| queue.pop_front()) {
+                match queues
+                    .get_mut(client_id)
+                    .and_then(|queue| queue.pop_front())
+                {
                     Some(item) => item,
                     None => return false,
                 }
@@ -672,9 +730,14 @@ impl ZellijAdapter {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             tokio::time::sleep(RELEASE_TIMEOUT).await;
-            let stuck = inner.in_flight.lock().await.as_ref().is_some_and(|pending| {
-                pending.request_id == request_id && pending.generation == generation
-            });
+            let stuck = inner
+                .in_flight
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.request_id == request_id && pending.generation == generation
+                });
             if !stuck {
                 return;
             }
@@ -760,10 +823,16 @@ impl ZellijAdapter {
         ModalScopeId::new(format!("zellij-client:{client_id}"))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the HostAdapter implementation returns AdapterError without allocations"
+    )]
     fn client_for_scope(scope: &ModalScopeId) -> Result<String, AdapterError> {
-        scope.as_str().strip_prefix("zellij-client:").map(str::to_owned).ok_or_else(|| {
-            invalid_request("modal scope is not a Zellij client scope")
-        })
+        scope
+            .as_str()
+            .strip_prefix("zellij-client:")
+            .map(str::to_owned)
+            .ok_or_else(|| invalid_request("modal scope is not a Zellij client scope"))
     }
 
     async fn active_registration(&self, client_id: &str) -> Result<[u8; 16], AdapterError> {
@@ -787,7 +856,11 @@ impl ZellijAdapter {
     /// focused pane is the UI pane answers, the rest decline. Retries until the
     /// bootstrap budget expires (focus may not have settled yet), then fails
     /// rather than guessing.
-    async fn resolve_client_for_pane(&self, ui_session: &str, ui_pane: &str) -> Result<String, AdapterError> {
+    async fn resolve_client_for_pane(
+        &self,
+        ui_session: &str,
+        ui_pane: &str,
+    ) -> Result<String, AdapterError> {
         if let Some(client) = self.inner.pane_claims.lock().await.get(ui_pane).cloned() {
             return Ok(client);
         }
@@ -802,18 +875,29 @@ impl ZellijAdapter {
                     .client_ids()
                     .into_iter()
                     .filter_map(|client| {
-                        registry.get(&client).filter(|record| record.compatible).map(|record| {
-                            (client, record.registration)
-                        })
+                        registry
+                            .get(&client)
+                            .filter(|record| record.compatible)
+                            .map(|record| (client, record.registration))
                     })
                     .collect()
             };
             for (client_id, registration) in clients {
-                match self.request_origin_from(&client_id, registration, ui_session, ui_pane).await
+                match self
+                    .request_origin_from(&client_id, registration, ui_session, ui_pane)
+                    .await
                 {
                     Ok(snapshot) => {
-                        self.inner.pane_claims.lock().await.insert(ui_pane.to_owned(), client_id.clone());
-                        self.inner.snapshots.lock().await.insert(ui_pane.to_owned(), snapshot);
+                        self.inner
+                            .pane_claims
+                            .lock()
+                            .await
+                            .insert(ui_pane.to_owned(), client_id.clone());
+                        self.inner
+                            .snapshots
+                            .lock()
+                            .await
+                            .insert(ui_pane.to_owned(), snapshot);
                         return Ok(client_id);
                     }
                     Err(_) => continue,
@@ -864,13 +948,24 @@ impl ZellijAdapter {
             });
         }
         let (sender, receiver) = oneshot::channel();
-        self.inner.pending_origin.lock().await.insert(ui_session.to_owned(), sender);
+        self.inner
+            .pending_origin
+            .lock()
+            .await
+            .insert(ui_session.to_owned(), sender);
         let result = timeout(ORIGIN_ATTEMPT_TIMEOUT, receiver).await;
         self.inner.pending_origin.lock().await.remove(ui_session);
         match result {
             Ok(Ok(snapshot)) => {
                 // The bridge must still own this registration when answering.
-                if self.inner.registry.lock().await.check(client_id, registration).is_err() {
+                if self
+                    .inner
+                    .registry
+                    .lock()
+                    .await
+                    .check(client_id, registration)
+                    .is_err()
+                {
                     return Err(OriginError::InvalidId {
                         field: "registration",
                         reason: "bridge registration turned over during capture",
@@ -891,15 +986,18 @@ impl ZellijAdapter {
         origin: &OriginContext,
         commands: Vec<RawNativeCommand>,
     ) -> Result<DispatchAccepted, AdapterError> {
-        let client_id = origin.client_id.as_ref().map(|id| id.as_str().to_owned()).ok_or_else(
-            || {
+        let client_id = origin
+            .client_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned())
+            .ok_or_else(|| {
                 AdapterError::new(
                     AdapterErrorKind::ContextUnavailable,
                     "Zellij dispatch requires the captured origin client",
                 )
-            },
-        )?;
-        self.dispatch_to_client(execution, client_id, commands).await
+            })?;
+        self.dispatch_to_client(execution, client_id, commands)
+            .await
     }
 
     async fn dispatch_to_client(
@@ -978,7 +1076,8 @@ impl ZellijAdapter {
                 self.resolve_client_for_pane(&probe, pane.as_str()).await?
             }
         };
-        self.dispatch_to_client(execution, client_id, vec![raw]).await
+        self.dispatch_to_client(execution, client_id, vec![raw])
+            .await
     }
 
     async fn enqueue_lifecycle(&self, client_id: String, payload: BridgeRequest) {
@@ -1002,6 +1101,10 @@ fn hex_id(id: &[u8; 16]) -> String {
     text
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "this parser feeds the allocation-free HostAdapter error path"
+)]
 fn parse_hex_lease(text: &str) -> Result<[u8; 16], AdapterError> {
     if text.len() != 32 || !text.chars().all(|character| character.is_ascii_hexdigit()) {
         return Err(invalid_request("capture lease is not a 128-bit hex ID"));
@@ -1025,23 +1128,27 @@ fn invalid_request(message: impl Into<String>) -> AdapterError {
 /// Parses a Zellij pane ID string using the exact pinned text format
 /// (`terminal_<u32>`, `plugin_<u32>`, or a bare `<u32>` meaning terminal), from
 /// `zellij-utils/src/data.rs` (`FromStr for PaneId`).
-fn parse_pane_id(
-    text: &str,
-) -> Result<muxe_zellij_protocol::generated::raw::PaneId, AdapterError> {
+#[expect(
+    clippy::result_large_err,
+    reason = "this parser feeds the allocation-free HostAdapter error path"
+)]
+fn parse_pane_id(text: &str) -> Result<muxe_zellij_protocol::generated::raw::PaneId, AdapterError> {
     use muxe_zellij_protocol::generated::raw::PaneId;
     if let Some(number) = text.strip_prefix("terminal_") {
-        return number.parse::<u32>().map(PaneId::Terminal).map_err(|_| {
-            invalid_request(format!("invalid Zellij pane ID '{text}'"))
-        });
+        return number
+            .parse::<u32>()
+            .map(PaneId::Terminal)
+            .map_err(|_| invalid_request(format!("invalid Zellij pane ID '{text}'")));
     }
     if let Some(number) = text.strip_prefix("plugin_") {
-        return number.parse::<u32>().map(PaneId::Plugin).map_err(|_| {
-            invalid_request(format!("invalid Zellij pane ID '{text}'"))
-        });
+        return number
+            .parse::<u32>()
+            .map(PaneId::Plugin)
+            .map_err(|_| invalid_request(format!("invalid Zellij pane ID '{text}'")));
     }
-    text.parse::<u32>().map(PaneId::Terminal).map_err(|_| {
-        invalid_request(format!("invalid Zellij pane ID '{text}'"))
-    })
+    text.parse::<u32>()
+        .map(PaneId::Terminal)
+        .map_err(|_| invalid_request(format!("invalid Zellij pane ID '{text}'")))
 }
 
 impl ActionValidator for ZellijAdapter {
@@ -1085,12 +1192,16 @@ impl HostAdapter for ZellijAdapter {
         // A throwaway session namespace keeps the claim fan-out keyed without
         // allocating a broker session.
         let probe_session = format!("claim-{}", hex_id(&self.mint_id()));
-        let client =
-            self.resolve_client_for_pane(&probe_session, ui_pane.as_str()).await?;
+        let client = self
+            .resolve_client_for_pane(&probe_session, ui_pane.as_str())
+            .await?;
         Ok(Self::scope_for_client(&client))
     }
 
-    async fn begin_capture(&self, request: CaptureRequest) -> Result<ApiCaptureLease, AdapterError> {
+    async fn begin_capture(
+        &self,
+        request: CaptureRequest,
+    ) -> Result<ApiCaptureLease, AdapterError> {
         let client_id = Self::client_for_scope(&request.modal_scope)?;
         // Guard: a live compatible bridge must own the client before capture.
         let _registration = self.active_registration(&client_id).await?;
@@ -1104,7 +1215,11 @@ impl HostAdapter for ZellijAdapter {
                 })?;
         }
         let (sender, receiver) = oneshot::channel();
-        self.inner.pending_capture.lock().await.insert(lease, sender);
+        self.inner
+            .pending_capture
+            .lock()
+            .await
+            .insert(lease, sender);
         self.enqueue_lifecycle(
             client_id.clone(),
             BridgeRequest::BeginCapture {
@@ -1131,7 +1246,12 @@ impl HostAdapter for ZellijAdapter {
             }
             _ => {
                 self.inner.pending_capture.lock().await.remove(&lease);
-                let _ = self.inner.captures.lock().await.release(&client_id, lease, false);
+                let _ = self
+                    .inner
+                    .captures
+                    .lock()
+                    .await
+                    .release(&client_id, lease, false);
                 Err(AdapterError::new(
                     AdapterErrorKind::Unavailable,
                     "timed out waiting for Zellij Locked-mode capture",
@@ -1175,7 +1295,10 @@ impl HostAdapter for ZellijAdapter {
             };
             self.enqueue_lifecycle(
                 client_id,
-                BridgeRequest::EndCapture { lease: lease_id, reason: end_reason },
+                BridgeRequest::EndCapture {
+                    lease: lease_id,
+                    reason: end_reason,
+                },
             )
             .await;
         }
@@ -1232,12 +1355,20 @@ impl HostAdapter for ZellijAdapter {
                 None,
                 None,
             )
-            .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string()));
+            .map_err(|error| {
+                AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
+            });
         }
         let ui_session = format!("origin-{}", hex_id(&self.mint_id()));
         self.resolve_client_for_pane(&ui_session, &ui_pane).await?;
-        let snapshot =
-            self.inner.snapshots.lock().await.get(&ui_pane).cloned().ok_or_else(|| {
+        let snapshot = self
+            .inner
+            .snapshots
+            .lock()
+            .await
+            .get(&ui_pane)
+            .cloned()
+            .ok_or_else(|| {
                 AdapterError::new(
                     AdapterErrorKind::Unavailable,
                     "origin snapshot missing after claim",
@@ -1263,18 +1394,21 @@ impl HostAdapter for ZellijAdapter {
                 "broker-owned portable action must not reach the host adapter",
             )),
             Ok(PortableMapping::HostAction { commands }) => {
-                self.dispatch_commands(request.execution, &request.origin, commands).await
+                self.dispatch_commands(request.execution, &request.origin, commands)
+                    .await
             }
             Ok(PortableMapping::BridgeFocus { request: focus }) => {
-                let client_id =
-                    request.origin.client_id.as_ref().map(|id| id.as_str().to_owned()).ok_or_else(
-                        || {
-                            AdapterError::new(
-                                AdapterErrorKind::ContextUnavailable,
-                                "Zellij focus requires the captured origin client",
-                            )
-                        },
-                    )?;
+                let client_id = request
+                    .origin
+                    .client_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned())
+                    .ok_or_else(|| {
+                        AdapterError::new(
+                            AdapterErrorKind::ContextUnavailable,
+                            "Zellij focus requires the captured origin client",
+                        )
+                    })?;
                 self.active_registration(&client_id).await?;
                 let payload = match focus {
                     crate::FocusRequest::ByIndex { index } => BridgeRequest::FocusPaneByIndex {
@@ -1288,7 +1422,11 @@ impl HostAdapter for ZellijAdapter {
                         }
                     }
                 };
-                self.inner.live_executions.lock().await.insert(request.execution.0);
+                self.inner
+                    .live_executions
+                    .lock()
+                    .await
+                    .insert(request.execution.0);
                 self.enqueue(QueuedItem {
                     request_id: self.mint_id(),
                     execution: Some(request.execution),
@@ -1315,12 +1453,12 @@ impl HostAdapter for ZellijAdapter {
         request: NativeDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
         let candidate = &request.action.candidate;
-        let raw = candidate_to_raw(&candidate.type_name, &candidate.fields, false).map_err(
-            |error| {
+        let raw =
+            candidate_to_raw(&candidate.type_name, &candidate.fields, false).map_err(|error| {
                 AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
-            },
-        )?;
-        self.dispatch_commands(request.execution, &request.origin, vec![raw]).await
+            })?;
+        self.dispatch_commands(request.execution, &request.origin, vec![raw])
+            .await
     }
 
     async fn cancel(&self, _execution: ExecutionId) -> Result<(), AdapterError> {
@@ -1389,11 +1527,7 @@ mod tests {
     fn candidate() -> NativeActionCandidate {
         NativeActionCandidate {
             type_name: "native.zellij.command:close-focus".to_owned(),
-            type_span: muxe_core::SourceSpan::new(
-                muxe_core::SourceId::new("<test>"),
-                0,
-                1,
-            ),
+            type_span: muxe_core::SourceSpan::new(muxe_core::SourceId::new("<test>"), 0, 1),
             fields: Vec::new(),
         }
     }
@@ -1417,10 +1551,7 @@ mod tests {
         }
     }
 
-    fn test_adapter(
-        request: &Arc<ScriptedChannel>,
-        event: &Arc<ScriptedChannel>,
-    ) -> ZellijAdapter {
+    fn test_adapter(request: &Arc<ScriptedChannel>, event: &Arc<ScriptedChannel>) -> ZellijAdapter {
         ZellijAdapter::new(
             ZellijAdapterConfig {
                 session_name: "session-alpha".to_owned(),
@@ -1476,8 +1607,8 @@ mod tests {
                     origin: test_origin(),
                 })
                 .await;
-            if result.is_ok() {
-                break result.expect("accepted");
+            if let Ok(accepted) = result {
+                break accepted;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
@@ -1488,10 +1619,7 @@ mod tests {
         assert_eq!(frame.target.client_id, "client-1");
         assert_eq!(frame.target.registration, [7; 16]);
         let request_id = frame.request_id;
-        assert!(matches!(
-            frame.payload,
-            BridgeRequest::Dispatch { .. }
-        ));
+        assert!(matches!(frame.payload, BridgeRequest::Dispatch { .. }));
 
         // Transport release unblocks the pipe; completion follows on events.
         event.push_line(
@@ -1526,9 +1654,9 @@ mod tests {
             AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
                 execution: ExecutionId(7),
             }) => {}
-            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
-                execution,
-            }) => panic!("wrong execution: {}", execution.0),
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded { execution }) => {
+                panic!("wrong execution: {}", execution.0)
+            }
             AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Failed {
                 execution,
                 error,
@@ -1617,8 +1745,8 @@ mod tests {
                     },
                 )
                 .await;
-            if result.is_ok() {
-                break result.expect("accepted");
+            if let Ok(accepted) = result {
+                break accepted;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };

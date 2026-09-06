@@ -241,7 +241,12 @@ impl SubprocessChannel {
 
     /// Bounded retained stderr tail for fault reports.
     pub async fn stderr_tail(&self) -> Vec<u8> {
-        let tail = self.state.lock().await.as_ref().map(|live| Arc::clone(&live.stderr_tail));
+        let tail = self
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .map(|live| Arc::clone(&live.stderr_tail));
         match tail {
             Some(tail) => tail.lock().await.iter().copied().collect(),
             None => Vec::new(),
@@ -294,26 +299,35 @@ async fn read_lines(
         match stdout.read(&mut chunk).await {
             Err(error) => {
                 let _ = lines_tx
-                    .send((epoch, Err(PipeTransportError::Read {
-                        reason: bounded(error.to_string()),
-                    })))
+                    .send((
+                        epoch,
+                        Err(PipeTransportError::Read {
+                            reason: bounded(error.to_string()),
+                        }),
+                    ))
                     .await;
                 return;
             }
             Ok(0) => {
                 let _ = lines_tx
-                    .send((epoch, Err(PipeTransportError::Read {
-                        reason: "zellij pipe child exited".to_owned(),
-                    })))
+                    .send((
+                        epoch,
+                        Err(PipeTransportError::Read {
+                            reason: "zellij pipe child exited".to_owned(),
+                        }),
+                    ))
                     .await;
                 return;
             }
             Ok(count) => {
                 if pending.len() + count > MAX_PIPE_LINE_LEN + 1 {
                     let _ = lines_tx
-                        .send((epoch, Err(PipeTransportError::Oversized {
-                            actual: pending.len() + count,
-                        })))
+                        .send((
+                            epoch,
+                            Err(PipeTransportError::Oversized {
+                                actual: pending.len() + count,
+                            }),
+                        ))
                         .await;
                     return;
                 }
@@ -325,9 +339,12 @@ async fn read_lines(
                         Ok(text) => text,
                         Err(_) => {
                             let _ = lines_tx
-                                .send((epoch, Err(PipeTransportError::Read {
-                                    reason: "pipe line is not valid UTF-8".to_owned(),
-                                })))
+                                .send((
+                                    epoch,
+                                    Err(PipeTransportError::Read {
+                                        reason: "pipe line is not valid UTF-8".to_owned(),
+                                    }),
+                                ))
                                 .await;
                             return;
                         }
@@ -366,18 +383,27 @@ impl PipeChannel for SubprocessChannel {
         }
         let stdin = {
             let guard = self.state.lock().await;
-            guard.as_ref().map(|live| Arc::clone(&live.stdin)).ok_or(PipeTransportError::Closed)?
+            guard
+                .as_ref()
+                .map(|live| Arc::clone(&live.stdin))
+                .ok_or(PipeTransportError::Closed)?
         };
         let mut guard = stdin.lock().await;
         let stream = guard.as_mut().ok_or(PipeTransportError::Closed)?;
         {
             use tokio::io::AsyncWriteExt;
-            stream.write_all(line.as_bytes()).await.map_err(|error| {
-                PipeTransportError::Write { reason: bounded(error.to_string()) }
-            })?;
-            stream.flush().await.map_err(|error| PipeTransportError::Write {
-                reason: bounded(error.to_string()),
-            })?;
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|error| PipeTransportError::Write {
+                    reason: bounded(error.to_string()),
+                })?;
+            stream
+                .flush()
+                .await
+                .map_err(|error| PipeTransportError::Write {
+                    reason: bounded(error.to_string()),
+                })?;
         }
         Ok(())
     }
@@ -417,16 +443,22 @@ impl PipeChannel for SubprocessChannel {
 
 fn bounded(reason: String) -> String {
     const LIMIT: usize = 512;
-    if reason.len() > LIMIT { reason[..LIMIT].to_owned() } else { reason }
+    if reason.len() > LIMIT {
+        reason[..LIMIT].to_owned()
+    } else {
+        reason
+    }
 }
 /// Deterministic in-memory channels for the adapter-contract suite and unit tests.
 ///
 /// Plain `cargo check` builds report no in-crate caller; the module serves the
 /// external contract suite through the injected `PipeChannel` boundary.
-#[allow(dead_code, reason = "no in-crate caller in non-test builds; used by tests and the external contract suite")]
+#[allow(
+    dead_code,
+    reason = "no in-crate caller in non-test builds; used by tests and the external contract suite"
+)]
 pub mod testing {
     use super::*;
-    use std::collections::VecDeque as StdVecDeque;
     use std::sync::Mutex as StdMutex;
 
     /// Scripted line channel: `send_line` records outbound lines, `next_line`
@@ -451,25 +483,27 @@ pub mod testing {
 
         /// Queues one inbound line for the next `next_line` call.
         pub fn push_line(&self, line: impl Into<String>) {
-            if let Ok(guard) = self.inbound_tx.lock() {
-                if let Some(sender) = guard.as_ref() {
-                    let _ = sender.send(Ok(line.into()));
-                }
+            if let Ok(guard) = self.inbound_tx.lock()
+                && let Some(sender) = guard.as_ref()
+            {
+                let _ = sender.send(Ok(line.into()));
             }
         }
 
-        /// Queues one inbound failure.
         pub fn push_error(&self, error: PipeTransportError) {
-            if let Ok(guard) = self.inbound_tx.lock() {
-                if let Some(sender) = guard.as_ref() {
-                    let _ = sender.send(Err(error));
-                }
+            if let Ok(guard) = self.inbound_tx.lock()
+                && let Some(sender) = guard.as_ref()
+            {
+                let _ = sender.send(Err(error));
             }
         }
 
         /// Drains recorded outbound lines.
         pub fn take_outbound(&self) -> Vec<String> {
-            self.outbound.lock().map(|mut guard| std::mem::take(&mut *guard)).unwrap_or_default()
+            self.outbound
+                .lock()
+                .map(|mut guard| std::mem::take(&mut *guard))
+                .unwrap_or_default()
         }
     }
 
@@ -495,7 +529,10 @@ pub mod testing {
 
         async fn next_line(&self) -> Result<String, PipeTransportError> {
             let mut guard = self.inbound_rx.lock().await;
-            guard.recv().await.unwrap_or(Err(PipeTransportError::Closed))
+            guard
+                .recv()
+                .await
+                .unwrap_or(Err(PipeTransportError::Closed))
         }
 
         async fn close(&self) {
@@ -513,11 +550,20 @@ pub mod testing {
         async fn scripted_channel_records_and_replays() {
             let channel = ScriptedChannel::new();
             channel.push_line("{\"sequence\":1}");
-            channel.send_line("request\n".to_owned()).await.expect("sends");
-            assert_eq!(channel.next_line().await.expect("replays"), "{\"sequence\":1}");
+            channel
+                .send_line("request\n".to_owned())
+                .await
+                .expect("sends");
+            assert_eq!(
+                channel.next_line().await.expect("replays"),
+                "{\"sequence\":1}"
+            );
             assert_eq!(channel.take_outbound(), vec!["request\n".to_owned()]);
             channel.close().await;
-            assert!(matches!(channel.next_line().await, Err(PipeTransportError::Closed)));
+            assert!(matches!(
+                channel.next_line().await,
+                Err(PipeTransportError::Closed)
+            ));
         }
     }
 }
@@ -568,12 +614,21 @@ done
             SubprocessChannel::launch(exe.clone(), "test".to_owned(), "pipe".to_owned(), None)
                 .await
                 .expect("launches fake cli");
-        channel.send_line("one\n".to_owned()).await.expect("first line");
-        channel.send_line("two\n".to_owned()).await.expect("second line");
+        channel
+            .send_line("one\n".to_owned())
+            .await
+            .expect("first line");
+        channel
+            .send_line("two\n".to_owned())
+            .await
+            .expect("second line");
         assert_eq!(channel.next_line().await.expect("first reply"), "got:one");
         assert_eq!(channel.next_line().await.expect("second reply"), "got:two");
         // Oversized output is rejected by the bound instead of buffering it.
-        channel.send_line("BIG\n".to_owned()).await.expect("big trigger");
+        channel
+            .send_line("BIG\n".to_owned())
+            .await
+            .expect("big trigger");
         assert!(matches!(
             channel.next_line().await,
             Err(PipeTransportError::Oversized { .. })
@@ -581,10 +636,16 @@ done
         // Respawn reaps the old child and starts a fresh epoch over the same
         // exact argv; stale output can no longer surface.
         channel.respawn().await.expect("respawns");
-        channel.send_line("three\n".to_owned()).await.expect("third line");
+        channel
+            .send_line("three\n".to_owned())
+            .await
+            .expect("third line");
         assert_eq!(channel.next_line().await.expect("third reply"), "got:three");
         // Fake exit propagates as EOF; close reaps and stays idempotent.
-        channel.send_line("EXIT\n".to_owned()).await.expect("exit trigger");
+        channel
+            .send_line("EXIT\n".to_owned())
+            .await
+            .expect("exit trigger");
         assert!(matches!(
             channel.next_line().await,
             Err(PipeTransportError::Read { .. })
