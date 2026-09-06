@@ -382,8 +382,6 @@ where
     R: HostReloader,
     P: Preflight,
 {
-    // Recover journals left by a dead coordinator before planning: an
-    // interrupted unit must converge before a new transaction starts.
     let recovered = recover(
         inputs.cache_dir,
         inputs.control,
@@ -391,7 +389,14 @@ where
         inputs.logger,
     )
     .await?;
-    let _ = recovered;
+    if let Some(RecoveryOutcome::Preserved { unit, reason }) = recovered
+        .iter()
+        .find(|outcome| matches!(outcome, RecoveryOutcome::Preserved { .. }))
+    {
+        return Err(ActivateError::UnitFailed {
+            reason: format!("activation recovery remains unresolved for {unit}: {reason}"),
+        });
+    }
     inputs.hooks.check(ActivateStep::PreflightDone)?;
 
     let registry = Registry::open(inputs.cache_dir)?;
@@ -1279,7 +1284,12 @@ where
             }
         }
         if failures.is_empty() {
-            let _ = journal::remove_journal(path);
+            if let Err(error) = journal::remove_journal(path) {
+                return RecoveryOutcome::Preserved {
+                    unit,
+                    reason: format!("target state is committed but the journal could not be removed: {error}"),
+                };
+            }
             return RecoveryOutcome::Committed { unit };
         }
         return RecoveryOutcome::Preserved {
@@ -1287,36 +1297,20 @@ where
             reason: failures.join("; "),
         };
     }
-    // Restoration path: shut down whoever answers, restore the verified
-    // bridge, reload every recorded session, then resume olds.
-    // A journal that never reached prepare names no handoff anywhere. When
-    // every member answers running without a handoff, nothing was ever
-    // mutated: remove the journal and report a truthful rollback.
-    if journal
-        .members
-        .iter()
-        .all(|record| record.handoff_id.is_none())
-    {
-        let untouched = probes.iter().all(|probe| match probe {
-            Probe::Answer { status } => {
-                matches!(status.lifecycle, LifecycleState::Running)
-                    && status.handoff_id.is_none()
-            }
-            Probe::Silent => false,
-        });
-        if untouched {
-            let _ = journal::remove_journal(path);
-            return RecoveryOutcome::RolledBack {
-                unit,
-                reason: "prepare never began; nothing was mutated".to_owned(),
-            };
-        }
-    }
+    // A journal with no durable handoff cannot prove that prepare never began:
+    // an interrupted write must remain diagnosable rather than claiming a
+    // zero-handoff rollback or deleting the sole transaction record.
     let mut failures = Vec::new();
     let mut contacted_any = false;
     for (record, probe) in journal.members.iter().zip(probes.iter()) {
         if matches!(probe, Probe::Silent) {
-            continue;
+            return RecoveryOutcome::Preserved {
+                unit,
+                reason: format!(
+                    "{} is unreachable during recovery; the complete old unit cannot be restored",
+                    record.host_identity
+                ),
+            };
         }
         let Some(hex) = record.handoff_id.as_ref() else {
             // An answered member with no recorded or observed handoff: the
@@ -1357,7 +1351,12 @@ where
         }
     }
     if failures.is_empty() && contacted_any {
-        let _ = journal::remove_journal(path);
+        if let Err(error) = journal::remove_journal(path) {
+            return RecoveryOutcome::Preserved {
+                unit,
+                reason: format!("old unit was restored but the journal could not be removed: {error}"),
+            };
+        }
         RecoveryOutcome::RolledBack {
             unit,
             reason: "incomplete targets; complete old unit restored".to_owned(),
@@ -1762,7 +1761,7 @@ mod tests {
     };
 
     struct Fixture {
-        temp: tempfile::TempDir,
+        _temp: tempfile::TempDir,
         cache: PathBuf,
         config: PathBuf,
         control: LiveControl,
@@ -1828,7 +1827,7 @@ mod tests {
             Self {
                 cache,
                 config,
-                temp,
+                _temp: temp,
                 control: LiveControl,
                 spawner: ProcessSpawner,
                 reloader: FixtureReloader::default(),
@@ -2019,7 +2018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn announced_journal_with_untouched_old_rolls_back() {
+    async fn announced_journal_without_handoff_is_preserved_for_diagnosis() {
         let fixture = Fixture::new();
         let (socket, old) = fixture.old_broker("server", herdr_script()).await;
         // Crash between the Announced write and prepare: the old still runs.
@@ -2044,11 +2043,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(outcomes[0], RecoveryOutcome::RolledBack { .. }),
+            matches!(outcomes[0], RecoveryOutcome::Preserved { .. }),
             "{:?}",
             outcomes[0]
         );
-        assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
+        assert_eq!(journal::list_journals(&fixture.cache).unwrap().len(), 1);
         old.abort();
     }
     #[tokio::test]

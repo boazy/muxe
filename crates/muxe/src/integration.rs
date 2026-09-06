@@ -653,6 +653,7 @@ fn resume_with(
                     resume_with_staged(directory, &journal, Some(staged), hooks, logger)
                 }
                 None => {
+                    verify_pre_swap_bridge_state(directory, &journal)?;
                     remove_journal(directory)?;
                     Ok(ResumeOutcome::RolledBack)
                 }
@@ -708,9 +709,8 @@ fn validated_staging(
 
 /// Scans for orphan staging files from a crash before the staged name was
 /// journaled. A candidate whose digest matches the journaled packaged digest
-/// is adopted by deterministic identity; non-matching staging orphans (our
-/// own name pattern in our own directory) are discarded. Anything else is
-/// left untouched.
+/// is adopted by deterministic identity. A mismatching candidate makes the
+/// transaction inconsistent, so recovery preserves it for diagnosis.
 fn adopt_or_clean_staging(
     directory: &Path,
     journal: &InstallJournal,
@@ -742,8 +742,10 @@ fn adopt_or_clean_staging(
         if fsutil::sha256_hex(&bytes) == journal.packaged_digest {
             adopted = Some(path);
         } else {
-            fs::remove_file(&path)
-                .map_err(|source| fsutil::io_error("removing staging file", &path, source))?;
+            return Err(IntegrationError::InconsistentJournal(format!(
+                "staging file {} does not match the journaled bridge digest",
+                path.display()
+            )));
         }
     }
     if adopted.is_some() {
@@ -866,6 +868,45 @@ fn check_prior_receipt(
     Ok(receipt)
 }
 
+/// Verifies that the bridge still has exactly its pre-swap authority before
+/// a recovery can discard a journal whose staged bytes are missing.
+fn verify_pre_swap_bridge_state(
+    directory: &Path,
+    journal: &InstallJournal,
+) -> Result<(), IntegrationError> {
+    let receipt = check_prior_receipt(directory, journal)?;
+    let stable = directory.join(BRIDGE_FILE_NAME);
+    match (receipt, fs::read(&stable)) {
+        (None, Err(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        (None, Ok(_)) => Err(IntegrationError::InconsistentJournal(
+            "unreceipted stable bridge exists while staged bridge is missing".to_owned(),
+        )),
+        (None, Err(source)) => Err(IntegrationError::Fs(fsutil::io_error(
+            "reading stable bridge",
+            &stable,
+            source,
+        ))),
+        (Some(receipt), Ok(bytes))
+            if fsutil::sha256_hex(&bytes) == receipt.bridge.installed_digest =>
+        {
+            Ok(())
+        }
+        (Some(_), Ok(_)) => Err(IntegrationError::InconsistentJournal(
+            "stable bridge changed while staged bridge is missing".to_owned(),
+        )),
+        (Some(_), Err(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Err(IntegrationError::InconsistentJournal(
+                "receipted stable bridge is missing while staged bridge is missing".to_owned(),
+            ))
+        }
+        (Some(_), Err(source)) => Err(IntegrationError::Fs(fsutil::io_error(
+            "reading stable bridge",
+            &stable,
+            source,
+        ))),
+    }
+}
+
 /// Fresh KDL re-application during recovery, under recorded consent.
 enum Reapply {
     /// The edit aborts with a manual snippet (mirrors the fresh flow).
@@ -909,6 +950,7 @@ fn rollback_kdl_and_journal(
     logger: Option<&Logger>,
     context: String,
 ) -> Result<ResumeOutcome, IntegrationError> {
+    verify_pre_swap_bridge_state(directory, journal)?;
     if journal.apply_config {
         let config_path = journal.config_path.clone().ok_or_else(|| {
             IntegrationError::InconsistentJournal("journal lacks the config path".to_owned())
@@ -997,6 +1039,11 @@ fn commit_resumed(
                 ));
             }
             if staged.is_none() {
+                if journal.phase == InstallPhase::BridgeCommitted {
+                    return Err(IntegrationError::InconsistentJournal(
+                        "bridge-committed journal has no stable or staged bridge".to_owned(),
+                    ));
+                }
                 remove_journal(directory)?;
                 return Ok(ResumeOutcome::RolledBack);
             }
@@ -1755,6 +1802,39 @@ mod tests {
         }
         assert!(!stable_bridge_path(temp.path()).exists());
         assert!(receipt::load(&integration_dir(temp.path())).unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_staging_with_changed_prior_bridge_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let first = b"wasm-v1";
+        let first_digest = fsutil::sha256_hex(first);
+        install(install_inputs(temp.path(), first, &first_digest)).unwrap();
+
+        let replacement = b"wasm-v2";
+        let replacement_digest = fsutil::sha256_hex(replacement);
+        let mut interrupted = install_inputs(temp.path(), replacement, &replacement_digest);
+        interrupted.hooks.fail_after = Some(InstallStep::BeforeBridgeSwap);
+        assert!(matches!(
+            install(interrupted),
+            Err(IntegrationError::FaultInjected { .. })
+        ));
+        for entry in fs::read_dir(integration_dir(temp.path())).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        fs::write(stable_bridge_path(temp.path()), b"out-of-band-bridge").unwrap();
+
+        let error = resume_install(temp.path(), &Hooks::default(), None).unwrap_err();
+        assert!(matches!(error, IntegrationError::InconsistentJournal(_)));
+        assert!(journal_path(&integration_dir(temp.path())).exists());
     }
     #[test]
     fn staged_missing_with_modified_kdl_fails_closed() {

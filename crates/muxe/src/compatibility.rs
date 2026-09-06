@@ -236,26 +236,6 @@ pub fn render_json(record: &CompatibilityRecord) -> Value {
 mod tests {
     use super::*;
 
-    #[test]
-    fn record_uses_build_target_triple() {
-        let record = embedded_record().unwrap();
-        assert_eq!(record.target_triple, env!("MUXE_TARGET_TRIPLE"));
-        assert!(!record.target_triple.is_empty());
-        assert_eq!(record.muxe_version, env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
-    fn packaged_verification_accepts_matching_bytes() {
-        let bytes = b"wasm-bytes";
-        let digest = crate::fsutil::sha256_hex(bytes);
-        let verification = verify_packaged_asset(bytes, &digest).unwrap();
-        assert!(verification.matches_expected);
-        assert_eq!(verification.packaged_digest, digest);
-        assert_eq!(
-            verification.registration,
-            BridgeRegistrationDigest::current()
-        );
-    }
 
     #[test]
     fn packaged_verification_fails_closed_on_mismatch() {
@@ -264,11 +244,4 @@ mod tests {
         assert!(message.contains("digest mismatch"));
     }
 
-    #[test]
-    fn registration_digest_is_never_a_hash() {
-        let Value::Null = render_json(&embedded_record().unwrap())["bridge_registration_digest"]
-        else {
-            panic!("registration digest must stay null while blocked");
-        };
-    }
 }

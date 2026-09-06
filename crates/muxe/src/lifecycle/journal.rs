@@ -340,14 +340,15 @@ mod tests {
     fn write_read_round_trip_is_owner_only() {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-        let path = write_journal(temp.path(), &fixture_journal()).unwrap();
+        let journal = fixture_journal();
+        let path = write_journal(temp.path(), &journal).unwrap();
         assert!(
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("herdr-"))
         );
         crate::logging::assert_owner_only(&path);
-        assert_eq!(read_journal(&path).unwrap(), fixture_journal());
+        assert_eq!(read_journal(&path).unwrap(), journal);
     }
 
     #[test]

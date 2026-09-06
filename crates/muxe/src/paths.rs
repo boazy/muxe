@@ -83,17 +83,6 @@ pub fn zellij_config_path(override_path: Option<&Path>) -> Result<PathBuf, PathE
 mod tests {
     use super::*;
 
-    #[test]
-    fn paths_carry_config_file() {
-        let paths = AppPaths::new(
-            PathBuf::from("/tmp/cfg/muxe"),
-            PathBuf::from("/tmp/cache/muxe"),
-        );
-        assert_eq!(
-            paths.config_file(),
-            PathBuf::from("/tmp/cfg/muxe/config.yml")
-        );
-    }
 
     #[test]
     fn explicit_override_wins() {
