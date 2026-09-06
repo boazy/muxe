@@ -22,6 +22,10 @@ muxe-broker = { path = "../muxe-broker" }
 muxe-core = { path = "../muxe-core" }
 muxe-ui = { path = "../muxe-ui" }
 thiserror.workspace = true
+kdl.workspace = true
+platform-dirs.workspace = true
+serde.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
