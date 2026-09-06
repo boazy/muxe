@@ -27,6 +27,7 @@ kdl.workspace = true
 platform-dirs.workspace = true
 serde.workspace = true
 sha2.workspace = true
+async-trait.workspace = true
 nix.workspace = true
 
 [dev-dependencies]

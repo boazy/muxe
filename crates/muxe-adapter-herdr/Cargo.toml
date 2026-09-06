@@ -11,6 +11,7 @@ muxe-core = { path = "../muxe-core" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+nix.workspace = true
 regex.workspace = true
 regress.workspace = true
 thiserror.workspace = true
@@ -20,3 +21,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+muxe-adapter-zellij = { path = "../muxe-adapter-zellij" }
