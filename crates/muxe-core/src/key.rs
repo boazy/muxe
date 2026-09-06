@@ -1,6 +1,6 @@
-use std::fmt;
-
 use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceSpan};
+use std::fmt;
+use std::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EventKind {
@@ -22,14 +22,17 @@ impl Modifiers {
     pub const CAPS_LOCK: u16 = 1 << 6;
     pub const NUM_LOCK: u16 = 1 << 7;
 
+    #[must_use]
     pub const fn empty() -> Self {
         Self(0)
     }
 
+    #[must_use]
     pub const fn bits(self) -> u16 {
         self.0
     }
 
+    #[must_use]
     pub const fn contains(self, flag: u16) -> bool {
         self.0 & flag != 0
     }
@@ -38,6 +41,7 @@ impl Modifiers {
         self.0 |= flag;
     }
 
+    #[must_use]
     pub const fn has_lock_modifier(self) -> bool {
         self.contains(Self::CAPS_LOCK) || self.contains(Self::NUM_LOCK)
     }
@@ -249,6 +253,7 @@ impl NamedKey {
         Self::IsoLevel3Shift,
         Self::IsoLevel5Shift,
     ];
+    #[must_use]
     pub const fn is_text_producing_keypad(self) -> bool {
         matches!(
             self,
@@ -261,6 +266,7 @@ impl NamedKey {
         )
     }
 
+    #[must_use]
     pub const fn is_modifier_key(self) -> bool {
         matches!(
             self,
@@ -281,6 +287,7 @@ impl NamedKey {
         )
     }
 
+    #[must_use]
     pub const fn requires_all_keys_for_event_type(self) -> bool {
         matches!(self, Self::Enter | Self::Tab | Self::Backspace)
     }
@@ -288,16 +295,13 @@ impl NamedKey {
     /// Converts every assigned Kitty `CSI ... u` functional key code accepted by v1. The published
     /// map is contiguous through `57454`; only values outside it return `None` and stay
     /// non-matching.
-    pub const fn from_kitty_functional_code(code: u32) -> Option<Self> {
+    #[must_use]
+    pub fn from_kitty_functional_code(code: u32) -> Option<Self> {
         Some(match code {
-            9 => Self::Tab,
-            13 => Self::Enter,
-            27 => Self::Escape,
-            127 => Self::Backspace,
-            57344 => Self::Escape,
-            57345 => Self::Enter,
-            57346 => Self::Tab,
-            57347 => Self::Backspace,
+            9 | 57346 => Self::Tab,
+            13 | 57345 => Self::Enter,
+            27 | 57344 => Self::Escape,
+            127 | 57347 => Self::Backspace,
             57348 => Self::Insert,
             57349 => Self::Delete,
             57350 => Self::Left,
@@ -314,8 +318,8 @@ impl NamedKey {
             57361 => Self::PrintScreen,
             57362 => Self::Pause,
             57363 => Self::Menu,
-            57364..=57398 => Self::Function((code - 57363) as u8),
-            57399..=57408 => Self::Keypad((code - 57399) as u8),
+            57364..=57398 => Self::Function(u8::try_from(code - 57363).ok()?),
+            57399..=57408 => Self::Keypad(u8::try_from(code - 57399).ok()?),
             57409 => Self::KeypadDecimal,
             57410 => Self::KeypadDivide,
             57411 => Self::KeypadMultiply,
@@ -366,6 +370,7 @@ impl NamedKey {
         })
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "esc" => Self::Escape,
@@ -441,7 +446,9 @@ impl NamedKey {
     fn parse_numbered(value: &str) -> Option<Self> {
         if let Some(function) = value.strip_prefix('f') {
             let function = function.parse::<u8>().ok()?;
-            return (1..=35).contains(&function).then_some(Self::Function(function));
+            return (1..=35)
+                .contains(&function)
+                .then_some(Self::Function(function));
         }
         if let Some(keypad) = value.strip_prefix("keypad+") {
             let keypad = keypad.parse::<u8>().ok()?;
@@ -450,6 +457,7 @@ impl NamedKey {
         None
     }
 
+    #[must_use]
     pub fn as_str(self) -> String {
         match self {
             Self::Escape => "esc".to_owned(),
@@ -550,7 +558,6 @@ pub struct CanonicalKey {
     pub identity: KeyIdentity,
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeyParseError {
     Empty,
@@ -569,11 +576,15 @@ impl fmt::Display for KeyParseError {
             Self::Empty => formatter.write_str("key is empty"),
             Self::UnknownModifier(value) => write!(formatter, "unknown modifier `{value}`"),
             Self::DuplicateModifier(value) => write!(formatter, "duplicate modifier `{value}`"),
-            Self::NonCanonicalModifierOrder => formatter.write_str("modifiers are not in canonical order"),
+            Self::NonCanonicalModifierOrder => {
+                formatter.write_str("modifiers are not in canonical order")
+            }
             Self::MissingIdentity => formatter.write_str("key has no identity"),
             Self::InvalidUnicode(value) => write!(formatter, "invalid Unicode scalar `{value}`"),
             Self::UnknownNamedKey(value) => write!(formatter, "unknown named key `{value}`"),
-            Self::InvalidSelector(value) => write!(formatter, "unknown identity selector `{value}`"),
+            Self::InvalidSelector(value) => {
+                write!(formatter, "unknown identity selector `{value}`")
+            }
         }
     }
 }
@@ -581,6 +592,11 @@ impl fmt::Display for KeyParseError {
 impl std::error::Error for KeyParseError {}
 
 impl CanonicalKey {
+    /// Parses canonical key syntax.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyParseError`] when the selector, modifiers, or identity are invalid.
     pub fn parse(value: &str) -> Result<Self, KeyParseError> {
         let (source, key) = if let Some((selector, remainder)) = value.split_once(':') {
             let source = match selector {
@@ -601,8 +617,8 @@ impl CanonicalKey {
         let mut previous_order = None;
         if !modifiers_text.is_empty() {
             for modifier in modifiers_text.split('+') {
-                let (order, flag) =
-                    modifier_flag(modifier).ok_or_else(|| KeyParseError::UnknownModifier(modifier.to_owned()))?;
+                let (order, flag) = modifier_flag(modifier)
+                    .ok_or_else(|| KeyParseError::UnknownModifier(modifier.to_owned()))?;
                 if previous_order.is_some_and(|previous| previous > order) {
                     return Err(KeyParseError::NonCanonicalModifierOrder);
                 }
@@ -613,15 +629,25 @@ impl CanonicalKey {
                 previous_order = Some(order);
             }
         }
-        Ok(Self { source, modifiers, identity: parse_identity(identity)? })
+        Ok(Self {
+            source,
+            modifiers,
+            identity: parse_identity(identity)?,
+        })
     }
 
+    /// Parses canonical key syntax and labels any failure at the supplied source span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigDiagnostic`] when canonical key parsing fails.
     pub fn parse_diagnostic(value: &str, span: SourceSpan) -> Result<Self, ConfigDiagnostic> {
         Self::parse(value).map_err(|error| {
             ConfigDiagnostic::error(DiagnosticCode::InvalidKey, error.to_string(), span)
         })
     }
 
+    #[must_use]
     pub fn required_capabilities(&self, explicit_repeat: Option<bool>) -> KeyCapabilities {
         let mut capabilities = KeyCapabilities::default();
         if self.source != KeyIdentitySource::Primary {
@@ -629,7 +655,9 @@ impl CanonicalKey {
         }
         let all_keys_identity = match self.identity {
             KeyIdentity::Text(_) => self.modifiers.has_lock_modifier(),
-            KeyIdentity::Named(named) => named.is_modifier_key() || named.is_text_producing_keypad(),
+            KeyIdentity::Named(named) => {
+                named.is_modifier_key() || named.is_text_producing_keypad()
+            }
         };
         capabilities.all_keys_as_escape_codes = all_keys_identity;
         if explicit_repeat.is_some() {
@@ -643,6 +671,7 @@ impl CanonicalKey {
         capabilities
     }
 
+    #[must_use]
     pub fn matches(&self, event: &KeyEvent) -> bool {
         let identity = match self.source {
             KeyIdentitySource::Primary => event.primary.as_ref(),
@@ -652,6 +681,7 @@ impl CanonicalKey {
         identity == Some(&self.identity) && event.modifiers == self.modifiers
     }
 
+    #[must_use]
     pub fn canonical_string(&self) -> String {
         let mut output = String::new();
         match self.source {
@@ -666,8 +696,15 @@ impl CanonicalKey {
             }
         }
         match &self.identity {
-            KeyIdentity::Text(character) if character.is_ascii_graphic() && *character != '+' && *character != ':' => output.push(*character),
-            KeyIdentity::Text(character) => output.push_str(&format!("unicode+{:x}", *character as u32)),
+            KeyIdentity::Text(character)
+                if character.is_ascii_graphic() && *character != '+' && *character != ':' =>
+            {
+                output.push(*character);
+            }
+            KeyIdentity::Text(character) => {
+                write!(&mut output, "unicode+{:x}", u32::from(*character))
+                    .expect("writing to String cannot fail");
+            }
             KeyIdentity::Named(named) => output.push_str(&named.as_str()),
         }
         output
@@ -687,9 +724,10 @@ pub(crate) enum Vt100BindingKey {
 impl CanonicalKey {
     /// Returns the legacy input projection used for VT100 collision checks.
     pub(crate) fn vt100_binding_key(&self) -> Vt100BindingKey {
-        legacy_control_code(self)
-            .map(Vt100BindingKey::ControlByte)
-            .unwrap_or_else(|| Vt100BindingKey::Exact(self.clone()))
+        legacy_control_code(self).map_or_else(
+            || Vt100BindingKey::Exact(self.clone()),
+            Vt100BindingKey::ControlByte,
+        )
     }
 
     /// Matches a legacy VT100 event without inventing modifier or identity fields that the
@@ -710,7 +748,9 @@ fn legacy_control_code(key: &CanonicalKey) -> Option<u8> {
         KeyIdentity::Named(NamedKey::Escape) if key.modifiers == Modifiers::empty() => Some(0x1b),
         KeyIdentity::Named(NamedKey::Enter) if key.modifiers == Modifiers::empty() => Some(0x0d),
         KeyIdentity::Named(NamedKey::Tab) if key.modifiers == Modifiers::empty() => Some(0x09),
-        KeyIdentity::Named(NamedKey::Backspace) if key.modifiers == Modifiers::empty() => Some(0x08),
+        KeyIdentity::Named(NamedKey::Backspace) if key.modifiers == Modifiers::empty() => {
+            Some(0x08)
+        }
         KeyIdentity::Text(character)
             if key.modifiers.contains(Modifiers::CTRL)
                 && key.modifiers.bits() & !(Modifiers::CTRL | Modifiers::SHIFT) == 0 =>
@@ -741,7 +781,9 @@ fn legacy_event_control_code(event: &KeyEvent) -> Option<u8> {
         KeyIdentity::Named(NamedKey::Enter) => Some(0x0d),
         KeyIdentity::Named(NamedKey::Tab) => Some(0x09),
         KeyIdentity::Named(NamedKey::Backspace) => Some(0x08),
-        KeyIdentity::Text(character) if character.is_control() => u8::try_from(*character as u32).ok(),
+        KeyIdentity::Text(character) if character.is_control() => {
+            u8::try_from(*character as u32).ok()
+        }
         _ => None,
     }
 }
@@ -766,14 +808,16 @@ const CANONICAL_MODIFIERS: [(&str, u16); 8] = [
 fn modifier_flag(value: &str) -> Option<(u8, u16)> {
     CANONICAL_MODIFIERS
         .iter()
-        .enumerate()
-        .find_map(|(index, (name, flag))| (*name == value).then_some((index as u8, *flag)))
+        .zip(0_u8..)
+        .find_map(|((name, flag), index)| (*name == value).then_some((index, *flag)))
 }
 
 fn parse_identity(value: &str) -> Result<KeyIdentity, KeyParseError> {
     if let Some(codepoint) = value.strip_prefix("unicode+") {
-        let scalar = u32::from_str_radix(codepoint, 16).map_err(|_| KeyParseError::InvalidUnicode(codepoint.to_owned()))?;
-        let character = char::from_u32(scalar).ok_or_else(|| KeyParseError::InvalidUnicode(codepoint.to_owned()))?;
+        let scalar = u32::from_str_radix(codepoint, 16)
+            .map_err(|_| KeyParseError::InvalidUnicode(codepoint.to_owned()))?;
+        let character = char::from_u32(scalar)
+            .ok_or_else(|| KeyParseError::InvalidUnicode(codepoint.to_owned()))?;
         return Ok(KeyIdentity::Text(character));
     }
     if value.chars().count() == 1 {
@@ -790,10 +834,11 @@ fn parse_identity(value: &str) -> Result<KeyIdentity, KeyParseError> {
 fn split_modifiers_and_identity(key: &str) -> Result<(&str, &str), KeyParseError> {
     let mut structured_identity: Option<usize> = None;
     for marker in ["unicode+", "keypad+"] {
-        if let Some(start) = key.rfind(marker) {
-            if start == 0 || key.as_bytes().get(start - 1) == Some(&b'+') {
-                structured_identity = Some(structured_identity.map_or(start, |current| current.max(start)));
-            }
+        if let Some(start) = key.rfind(marker)
+            && (start == 0 || key.as_bytes().get(start - 1) == Some(&b'+'))
+        {
+            structured_identity =
+                Some(structured_identity.map_or(start, |current| current.max(start)));
         }
     }
     if let Some(start) = structured_identity {
@@ -820,7 +865,15 @@ mod tests {
 
     #[test]
     fn canonical_key_round_trips_examples() {
-        for key in ["super+g", "ctrl+shift+a", "f13", "keypad+1", "unicode+1f642", "esc", "backspace"] {
+        for key in [
+            "super+g",
+            "ctrl+shift+a",
+            "f13",
+            "keypad+1",
+            "unicode+1f642",
+            "esc",
+            "backspace",
+        ] {
             let key = CanonicalKey::parse(key).unwrap();
             assert_eq!(CanonicalKey::parse(&key.canonical_string()).unwrap(), key);
         }
@@ -828,9 +881,11 @@ mod tests {
 
     #[test]
     fn non_canonical_modifiers_are_rejected() {
-        assert_eq!(CanonicalKey::parse("shift+ctrl+a"), Err(KeyParseError::NonCanonicalModifierOrder));
+        assert_eq!(
+            CanonicalKey::parse("shift+ctrl+a"),
+            Err(KeyParseError::NonCanonicalModifierOrder)
+        );
     }
-
 
     #[test]
     fn key_capabilities_are_derived_without_inventing_events() {
@@ -838,7 +893,11 @@ mod tests {
         assert!(alternate.required_capabilities(None).alternate_keys);
         let repeat_text = CanonicalKey::parse("a").unwrap();
         assert!(repeat_text.required_capabilities(Some(true)).event_types);
-        assert!(repeat_text.required_capabilities(Some(true)).all_keys_as_escape_codes);
+        assert!(
+            repeat_text
+                .required_capabilities(Some(true))
+                .all_keys_as_escape_codes
+        );
     }
 
     #[test]
@@ -852,9 +911,11 @@ mod tests {
     #[test]
     fn every_assigned_kitty_functional_code_has_a_core_identity() {
         for code in 57_344..=57_454 {
-            assert!(NamedKey::from_kitty_functional_code(code).is_some(), "missing {code}");
+            assert!(
+                NamedKey::from_kitty_functional_code(code).is_some(),
+                "missing {code}"
+            );
         }
         assert_eq!(NamedKey::from_kitty_functional_code(57_455), None);
     }
-
 }

@@ -8,7 +8,11 @@ fn document(name: &str, yaml: &str) -> ConfigDocument {
     ConfigDocument::parse(SourceId::new(name), yaml).unwrap()
 }
 
-fn compile(base: &str, host: Option<&str>, capabilities: KeyCapabilities) -> Result<muxe_core::CompiledConfig, Vec<muxe_core::ConfigDiagnostic>> {
+fn compile(
+    base: &str,
+    host: Option<&str>,
+    capabilities: KeyCapabilities,
+) -> Result<muxe_core::CompiledConfig, Vec<muxe_core::ConfigDiagnostic>> {
     Compiler.compile(
         CompileInput {
             generation: CompiledGeneration(9),
@@ -66,9 +70,21 @@ inject:
 
     assert!(config.menu(&muxe_core::MenuId::new("remove-me")).is_none());
     let main = config.menu(&muxe_core::MenuId::new("main")).unwrap();
-    assert!(main.bindings.iter().all(|binding| binding.key.canonical_string() != "esc"));
-    assert!(main.bindings.iter().all(|binding| binding.key.canonical_string() != "backspace"));
-    let action = main.bindings.iter().find(|binding| binding.key.canonical_string() == "a").unwrap();
+    assert!(
+        main.bindings
+            .iter()
+            .all(|binding| binding.key.canonical_string() != "esc")
+    );
+    assert!(
+        main.bindings
+            .iter()
+            .all(|binding| binding.key.canonical_string() != "backspace")
+    );
+    let action = main
+        .bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "a")
+        .unwrap();
     assert_eq!(action.settings.after_action, muxe_core::AfterAction::Quit);
 }
 
@@ -87,7 +103,11 @@ menus:
         KeyCapabilities::default(),
     )
     .unwrap_err();
-    assert!(cycle.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::MenuCycle));
+    assert!(
+        cycle
+            .iter()
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::MenuCycle)
+    );
 
     let mismatch = compile(
         r"
@@ -106,12 +126,20 @@ menus:
         KeyCapabilities::default(),
     )
     .unwrap_err();
-    assert!(mismatch.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::ContextTypeMismatch));
+    assert!(
+        mismatch
+            .iter()
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::ContextTypeMismatch)
+    );
 }
 
 #[test]
 fn kitty_capability_validation_keeps_documented_ctrl_l_repeat_path() {
-    let host = KeyCapabilities { event_types: true, alternate_keys: true, all_keys_as_escape_codes: false };
+    let host = KeyCapabilities {
+        event_types: true,
+        alternate_keys: true,
+        all_keys_as_escape_codes: false,
+    };
     let valid = compile(
         r"
 version: 1
@@ -129,7 +157,10 @@ menus:
         None,
         host,
     );
-    assert!(valid.is_ok(), "the documented Herdr ctrl+l repeat case is valid");
+    assert!(
+        valid.is_ok(),
+        "the documented Herdr ctrl+l repeat case is valid"
+    );
 
     let invalid = compile(
         r"
@@ -149,7 +180,11 @@ menus:
         host,
     )
     .unwrap_err();
-    assert!(invalid.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::KeyCapability));
+    assert!(
+        invalid
+            .iter()
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::KeyCapability)
+    );
 }
 
 #[test]
@@ -272,7 +307,6 @@ fn source_aware_yaml_and_unknown_field_errors_keep_the_candidate_inactive() {
     assert_eq!(error.labels[0].span.source.as_str(), "bad.yml");
 }
 
-
 #[test]
 fn reload_and_host_version_settings_are_typed_retained_and_strictly_validated() {
     let config = compile(
@@ -298,7 +332,10 @@ menus:
             debounce: std::time::Duration::from_millis(350),
         }
     );
-    assert_eq!(config.host.version_check, muxe_core::HostVersionCheck::Strict);
+    assert_eq!(
+        config.host.version_check,
+        muxe_core::HostVersionCheck::Strict
+    );
 
     let invalid = compile(
         r"
@@ -314,7 +351,11 @@ menus:
         KeyCapabilities::default(),
     )
     .unwrap_err();
-    assert!(invalid.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::UnknownField));
+    assert!(
+        invalid
+            .iter()
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::UnknownField)
+    );
 
     let nested = compile(
         r"
@@ -330,7 +371,11 @@ menus:
         KeyCapabilities::default(),
     )
     .unwrap_err();
-    assert!(nested.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::UnknownField));
+    assert!(
+        nested
+            .iter()
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::UnknownField)
+    );
 }
 
 #[test]
@@ -351,41 +396,70 @@ menus:
         KeyCapabilities::default(),
     )
     .expect("quoted tokens and YAML core scalars should keep their distinct meanings");
-    let bindings = &config.menu(&muxe_core::MenuId::new("main")).unwrap().bindings;
-    let attach = bindings.iter().find(|binding| binding.key.canonical_string() == "a").unwrap();
+    let bindings = &config
+        .menu(&muxe_core::MenuId::new("main"))
+        .unwrap()
+        .bindings;
+    let attach = bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "a")
+        .unwrap();
     let muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Session(
         muxe_core::SessionAction::Attach { name },
-    )) = &attach.action else {
+    )) = &attach.action
+    else {
         panic!("expected session attach");
     };
     assert_eq!(name.value.as_str(), Some("a=b"));
 
-    let command = bindings.iter().find(|binding| binding.key.canonical_string() == "b").unwrap();
-    let muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Command(command)) = &command.action else {
+    let command = bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "b")
+        .unwrap();
+    let muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Command(command)) =
+        &command.action
+    else {
         panic!("expected command");
     };
     assert_eq!(command.program.value.as_str(), Some(""));
 
-    let fullscreen = bindings.iter().find(|binding| binding.key.canonical_string() == "c").unwrap();
+    let fullscreen = bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "c")
+        .unwrap();
     let muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Pane(
-        muxe_core::PaneAction::Fullscreen { enabled: Some(enabled) },
-    )) = &fullscreen.action else {
+        muxe_core::PaneAction::Fullscreen {
+            enabled: Some(enabled),
+        },
+    )) = &fullscreen.action
+    else {
         panic!("expected fullscreen");
     };
     assert_eq!(enabled.value.as_bool(), Some(true));
 
-    let focus = bindings.iter().find(|binding| binding.key.canonical_string() == "d").unwrap();
+    let focus = bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "d")
+        .unwrap();
     let muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Tab(
         muxe_core::TabAction::Focus(muxe_core::IndexOrDirection::Index(index)),
-    )) = &focus.action else {
+    )) = &focus.action
+    else {
         panic!("expected tab focus");
     };
-    assert!(matches!(index.value.kind, muxe_core::ConfigValueKind::Integer(16)));
+    assert!(matches!(
+        index.value.kind,
+        muxe_core::ConfigValueKind::Integer(16)
+    ));
 
-    let literal_context = bindings.iter().find(|binding| binding.key.canonical_string() == "e").unwrap();
+    let literal_context = bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "e")
+        .unwrap();
     let muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Session(
         muxe_core::SessionAction::Attach { name },
-    )) = &literal_context.action else {
+    )) = &literal_context.action
+    else {
         panic!("expected literal session attach");
     };
     assert_eq!(name.value.as_str(), Some("$origin.workspace.id"));
@@ -499,9 +573,11 @@ menus:
             None,
         )
         .expect_err("an absent selected theme must not compile");
-    assert!(unknown
-        .iter()
-        .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme));
+    assert!(
+        unknown
+            .iter()
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme)
+    );
 
     let invalid_pair = Compiler
         .compile(
@@ -549,11 +625,12 @@ colors: { base: { text: foreground } }
             None,
         )
         .expect_err("an invalid selected theme pair must not compile");
-    assert!(invalid_pair
-        .iter()
-        .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme));
+    assert!(
+        invalid_pair
+            .iter()
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme)
+    );
 }
-
 
 struct DirectionalHostValidator;
 
@@ -611,7 +688,12 @@ impl muxe_core::ActionValidator for BatchHostValidator {
         self.batches
             .lock()
             .expect("batch observations are not poisoned")
-            .push(candidates.iter().map(|candidate| candidate.type_name.clone()).collect());
+            .push(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.type_name.clone())
+                    .collect(),
+            );
         let validation_count = candidates
             .len()
             .saturating_sub(usize::from(self.omit_last_validation));
@@ -693,37 +775,43 @@ menus:
             Some(&validator),
         )
         .expect_err("incomplete native validation results must reject the config");
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::NativeActionRejected));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::NativeActionRejected)
+    );
 }
 
 #[test]
 fn active_host_portable_validation_rejects_an_incompatible_candidate_before_activation() {
     let validator = DirectionalHostValidator;
-    let rejected = Compiler.compile(
-        CompileInput {
-            generation: CompiledGeneration(12),
-            base: document(
-                "config.yml",
-                r"
+    let rejected = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(12),
+                base: document(
+                    "config.yml",
+                    r"
 version: 1
 menus:
   main:
     bindings:
       s: { label: split, action: pane:split right }
 ",
-            ),
-            host_override: None,
-            key_capabilities: KeyCapabilities::default(),
-            theme_assets: ThemeAssets::default(),
-        },
-        Some(&validator),
-    )
-    .unwrap_err();
+                ),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: ThemeAssets::default(),
+            },
+            Some(&validator),
+        )
+        .unwrap_err();
     assert!(rejected.iter().any(|diagnostic| {
         diagnostic.code == muxe_core::DiagnosticCode::InvalidActionArguments
-            && diagnostic.labels.iter().any(|label| label.span.source.as_str() == "config.yml")
+            && diagnostic
+                .labels
+                .iter()
+                .any(|label| label.span.source.as_str() == "config.yml")
     }));
 }
 
@@ -845,13 +933,20 @@ fn command_context_values_preserve_source_and_revalidate_cwd() {
     let origin = origin_with_context_values();
     let muxe_core::PortableAction::Command(command) = action
         .resolve_context(&origin)
-        .expect("command context should resolve") else {
+        .expect("command context should resolve")
+    else {
         panic!("expected resolved command");
     };
     assert_eq!(command.program.value.as_str(), Some("selected text"));
     assert_eq!(command.args[0].value.as_str(), Some("selected text"));
-    assert_eq!(command.cwd.expect("configured cwd").value.as_str(), Some("/tmp/project"));
-    assert_eq!(command.env["SELECTED"].value.as_str(), Some("selected text"));
+    assert_eq!(
+        command.cwd.expect("configured cwd").value.as_str(),
+        Some("/tmp/project")
+    );
+    assert_eq!(
+        command.env["SELECTED"].value.as_str(),
+        Some("selected text")
+    );
 
     let relative_cwd_origin = muxe_core::OriginContext {
         pane_cwd: Some(std::path::PathBuf::from("relative/project")),
@@ -873,17 +968,24 @@ fn tab_and_keyboard_context_values_revalidate_to_their_declared_types() {
     let tab_action = portable_main_action(&config, "t");
     let muxe_core::PortableAction::Tab(muxe_core::TabAction::Focus(
         muxe_core::IndexOrDirection::Index(index),
-    )) = tab_action.resolve_context(&origin).expect("tab index context resolves") else {
+    )) = tab_action
+        .resolve_context(&origin)
+        .expect("tab index context resolves")
+    else {
         panic!("expected resolved tab index");
     };
-    assert!(matches!(index.value.kind, muxe_core::ConfigValueKind::Integer(4)));
+    assert!(matches!(
+        index.value.kind,
+        muxe_core::ConfigValueKind::Integer(4)
+    ));
 
     let create_action = portable_main_action(&config, "w");
     let muxe_core::PortableAction::Tab(muxe_core::TabAction::Create {
         workspace_id: Some(workspace_id),
     }) = create_action
         .resolve_context(&origin)
-        .expect("workspace context resolves") else {
+        .expect("workspace context resolves")
+    else {
         panic!("expected resolved workspace-targeted tab create");
     };
     assert_eq!(workspace_id.value.as_str(), Some("workspace"));
@@ -919,6 +1021,7 @@ fn missing_context_value_fails_resolution() {
     ));
 }
 
+#[expect(clippy::too_many_lines, reason = "single exhaustive alias-collision table; splitting would scatter the collision matrix")]
 #[test]
 fn vt100_aliases_collide_at_compile_time_and_match_their_single_legacy_event() {
     let aliases = compile(
@@ -948,7 +1051,11 @@ menus:
         .filter(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::KeyCollision)
         .collect::<Vec<_>>();
     assert_eq!(collisions.len(), 5);
-    assert!(collisions.iter().all(|diagnostic| diagnostic.labels.len() == 2));
+    assert!(
+        collisions
+            .iter()
+            .all(|diagnostic| diagnostic.labels.len() == 2)
+    );
 
     let profile = muxe_core::KeyboardProfile::Vt100 {
         escape_timeout: std::time::Duration::from_millis(25),
@@ -983,7 +1090,10 @@ menus:
         locks: muxe_core::LockModifiers::default(),
         keypad: false,
     };
-    assert!(profile.matches_binding(&muxe_core::CanonicalKey::parse("ctrl+a").unwrap(), &control_a));
+    assert!(profile.matches_binding(
+        &muxe_core::CanonicalKey::parse("ctrl+a").unwrap(),
+        &control_a
+    ));
     assert!(profile.matches_binding(
         &muxe_core::CanonicalKey::parse("ctrl+shift+a").unwrap(),
         &control_a,
@@ -1054,7 +1164,10 @@ menus:
     else {
         panic!("expected command action");
     };
-    assert_eq!(command.cwd.as_ref().unwrap().value.as_str(), Some("relative/project"));
+    assert_eq!(
+        command.cwd.as_ref().unwrap().value.as_str(),
+        Some("relative/project")
+    );
 }
 
 #[test]
@@ -1071,10 +1184,18 @@ menus:
         KeyCapabilities::default(),
     )
     .unwrap();
-    let menu_binding = &config.menu(&muxe_core::MenuId::new("main")).unwrap().bindings[0];
+    let menu_binding = &config
+        .menu(&muxe_core::MenuId::new("main"))
+        .unwrap()
+        .bindings[0];
     let indexed = config.binding(config.generation, menu_binding.id).unwrap();
     assert!(std::ptr::eq(menu_binding, indexed));
-    assert!(config
-        .binding(muxe_core::CompiledGeneration(config.generation.0 + 1), menu_binding.id)
-        .is_none());
+    assert!(
+        config
+            .binding(
+                muxe_core::CompiledGeneration(config.generation.0 + 1),
+                menu_binding.id
+            )
+            .is_none()
+    );
 }
