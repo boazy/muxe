@@ -7,6 +7,8 @@ publish = false
 
 [dependencies]
 eyre.workspace = true
+serde_json.workspace = true
+zellij-tile.workspace = true
 quote.workspace = true
 sha2.workspace = true
 syn.workspace = true
