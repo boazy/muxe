@@ -1852,6 +1852,7 @@ dependencies = [
  "muxe-adapter-api",
  "muxe-adapter-zellij",
  "muxe-core",
+ "muxe-zellij-protocol",
  "nix",
  "regex",
  "regress 0.12.0",

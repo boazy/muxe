@@ -22,3 +22,4 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 muxe-adapter-zellij = { path = "../muxe-adapter-zellij" }
+muxe-zellij-protocol = { path = "../muxe-zellij-protocol" }
