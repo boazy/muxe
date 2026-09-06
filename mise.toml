@@ -24,3 +24,11 @@ run = "cargo run --locked -p muxe-herdr-gen -- --check"
 [tasks.codegen-zellij]
 description = "Verify Zellij-generated sources are byte-clean"
 run = "cargo run --locked -p muxe-zellij-gen -- --check"
+
+[tasks.codegen-zellij-materialize]
+description = "Materialize minimized Zellij fixtures from the pinned source"
+run = "cargo run --locked -p muxe-zellij-gen -- --materialize-fixtures"
+
+[tasks.codegen-zellij-verify]
+description = "Verify Zellij fixtures from a fresh pinned source materialization"
+run = "cargo run --locked -p muxe-zellij-gen -- --verify-fixtures"
