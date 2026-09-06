@@ -935,6 +935,7 @@ dependencies = [
 name = "muxe-adapter-herdr"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "muxe-adapter-api",
  "muxe-core",
  "regex",
@@ -952,6 +953,7 @@ dependencies = [
 name = "muxe-broker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "data-encoding",
  "muxe-adapter-api",
  "muxe-core",
