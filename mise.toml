@@ -1,5 +1,6 @@
 [tools]
 rust = "1.97.1"
+"cargo:cargo-codspeed" = "5.0.1"
 
 [tasks.fmt]
 description = "Check Rust formatting on the pinned toolchain"
@@ -40,3 +41,11 @@ run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p codegen-completions"
 [tasks.wasm-build]
 description = "Build the pinned Zellij bridge WASM (release) and stage dist-wasm/muxe-zellij.wasm"
 run = "env -u RUSTUP_TOOLCHAIN cargo build --locked --release -p muxe-zellij-wasm --target wasm32-wasip1 && mkdir -p dist-wasm && cp target/wasm32-wasip1/release/muxe_zellij_wasm.wasm dist-wasm/muxe-zellij.wasm"
+
+[tasks.verify-packaged-wasm]
+description = "Verify the native packaged-WASM digest against the real producer bytes"
+run = "env -u RUSTUP_TOOLCHAIN cargo build --locked --release -p muxe-zellij-wasm --target wasm32-wasip1 && mkdir -p dist-wasm && cp target/wasm32-wasip1/release/muxe_zellij_wasm.wasm dist-wasm/muxe-zellij.wasm && MUXE_WASM_SHA256=\"$(sha256sum dist-wasm/muxe-zellij.wasm | cut -d' ' -f1)\" env -u RUSTUP_TOOLCHAIN cargo test --locked -p muxe --lib -- --ignored --exact compatibility::tests::packaged_wasm_matches_producer_bytes_and_rejects_tampering"
+
+[tasks.bench-codspeed]
+description = "Build CodSpeed comparisons with the pinned runner"
+run = "env -u RUSTUP_TOOLCHAIN cargo codspeed build --locked"

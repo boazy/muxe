@@ -14,9 +14,12 @@ use thiserror::Error;
 use crate::{cli::HostScope, logging::Logger};
 
 use super::{
-    activate::{ActivateError, ControlPort, ControlSession, DetectedHost, PlannedUnit, select_units, unit_label},
+    activate::{
+        ActivateError, ControlPort, ControlSession, DetectedHost, PlannedUnit, select_units,
+        unit_label,
+    },
     control::ControlError,
-    registry::{Registry, RegistryError},
+    registry::{BrokerEntry, Registry, RegistryError},
 };
 
 #[derive(Debug, Error)]
@@ -65,9 +68,9 @@ where
     let units = select_units(&entries, inputs.scope, inputs.current.as_ref())?;
     let mut report = RetireReport::default();
     for unit in units {
-        report.units.push(
-            retire_unit(inputs.control, &registry, &unit, inputs.logger).await?,
-        );
+        report
+            .units
+            .push(retire_unit(inputs.control, &registry, &unit, inputs.logger).await?);
     }
     Ok(report)
 }
@@ -82,19 +85,19 @@ where
     C: ControlPort,
 {
     let label = unit_label(unit);
-    let sockets: Vec<std::path::PathBuf> = match unit {
-        PlannedUnit::Herdr { entry } => vec![entry.socket.clone()],
-        PlannedUnit::Zellij { entries, .. } => {
-            entries.iter().map(|entry| entry.socket.clone()).collect()
-        }
+    let entries: Vec<&BrokerEntry> = match unit {
+        PlannedUnit::Herdr { entry } => vec![entry],
+        PlannedUnit::Zellij { entries, .. } => entries.iter().collect(),
     };
     let mut retired_any = false;
-    for socket in &sockets {
+    for entry in entries {
         // One retained session per member: retire, then drop the record.
-        let outcome = match control.connect(socket).await {
+        // Removal is scoped to the exact observed entry so a replacement
+        // that rebound the same socket is never deleted.
+        let outcome = match control.connect(&entry.socket).await {
             Ok(mut session) => session.retire().await.map(|_| ()),
             Err(ControlError::Connect { .. }) | Err(ControlError::Closed) => {
-                let _ = registry.unregister_socket(socket);
+                let _ = registry.unregister_entry(entry);
                 continue;
             }
             Err(error) => Err(error),
@@ -102,13 +105,13 @@ where
         match outcome {
             Ok(()) => {
                 retired_any = true;
-                let _ = registry.unregister_socket(socket);
+                let _ = registry.unregister_entry(entry);
             }
             Err(error) => {
                 log(
                     logger,
                     &label,
-                    &format!("retire of {} failed: {error}", socket.display()),
+                    &format!("retire of {} failed: {error}", entry.socket.display()),
                 )?;
                 return Ok(RetireOutcome::AlreadyGone { unit: label });
             }
@@ -251,7 +254,11 @@ mod tests {
     #[tokio::test]
     async fn retire_is_idempotent_when_no_broker_answers() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let cache = temp.path().join("cache");
         register(&cache, cache.join("gone.sock"));
         let control = GoneControl;
@@ -270,13 +277,23 @@ mod tests {
                 unit: "herdr:server".to_owned()
             }]
         );
-        assert!(Registry::open(&cache).unwrap().entries().unwrap().is_empty());
+        assert!(
+            Registry::open(&cache)
+                .unwrap()
+                .entries()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn retire_drains_and_unregisters() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let cache = temp.path().join("cache");
         register(&cache, cache.join("live.sock"));
         let control = LiveRetireControl;
@@ -295,6 +312,12 @@ mod tests {
                 unit: "herdr:server".to_owned()
             }]
         );
-        assert!(Registry::open(&cache).unwrap().entries().unwrap().is_empty());
+        assert!(
+            Registry::open(&cache)
+                .unwrap()
+                .entries()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

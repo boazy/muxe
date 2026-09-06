@@ -242,8 +242,15 @@ impl HostAdapter for RecordedContractAdapter {
         &self,
         request: NativeDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
-        self.validate_native(&request.action.candidate)
-            .map_err(|diagnostic| AdapterError::new(AdapterErrorKind::InvalidRequest, diagnostic.message))?;
+        let candidate = &request.action.candidate;
+        self.validate_native_batch(std::slice::from_ref(&candidate))
+            .map_err(|diagnostics| {
+                let message = diagnostics
+                    .first()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .unwrap_or_else(|| "the recorded contract rejected the native action".to_owned());
+                AdapterError::new(AdapterErrorKind::InvalidRequest, message)
+            })?;
         self.dispatches
             .lock()
             .expect("recorded dispatches are not poisoned")
@@ -364,11 +371,13 @@ async fn recorded_common_contract_preserves_broker_visible_transitions() {
             .expect("recorded capabilities")
             .supports_native_cancellation
     );
-    assert!(adapter.validate_native(&candidate("native.recorded:complete")).is_ok());
+    assert!(adapter
+        .validate_native_batch(&[&candidate("native.recorded:complete")])
+        .is_ok());
     assert_eq!(
         adapter
-            .validate_native(&candidate("native.recorded:unknown"))
-            .expect_err("unknown native action is rejected")
+            .validate_native_batch(&[&candidate("native.recorded:unknown")])
+            .expect_err("unknown native action is rejected")[0]
             .code,
         DiagnosticCode::InvalidAction
     );
@@ -435,8 +444,8 @@ async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
         .supports_native_cancellation);
     assert_eq!(
         adapter
-            .validate_native(&candidate("native.zellij.command:close-focus"))
-            .expect_err("other host namespace is rejected")
+            .validate_native_batch(&[&candidate("native.zellij.command:close-focus")])
+            .expect_err("other host namespace is rejected")[0]
             .code,
         DiagnosticCode::NativeActionRejected
     );
@@ -480,7 +489,7 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
         .expect("Zellij capabilities")
         .supports_native_cancellation);
     assert!(adapter
-        .validate_native(&candidate("native.zellij.command:close-focus"))
+        .validate_native_batch(&[&candidate("native.zellij.command:close-focus")])
         .is_ok());
 
     event.push_line(
