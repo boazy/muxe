@@ -1,0 +1,13 @@
+# Schema provenance captured from the installed Herdr release.
+repository = "https://github.com/herdrdev/herdr"
+revision = "9eb521456ac0d19d3ab3d9d7cea3cca10baa8a4c"
+host_version = "0.8.2"
+protocol = 20
+schema_version = 1
+schema_url = "https://herdr.dev/docs/socket-api/"
+schema_command = "herdr api schema --output .local/pins/herdr/herdr-api.schema.json"
+schema_cache = ".local/pins/herdr/herdr-api.schema.json"
+schema_sha256 = "c48f1f54ee0150ca27e11fd44455fe94aeadb20fdf4e4a62393ed822a4e5b150"
+canonical_schema_sha256 = "daad08ecaf32968a14bf9e0b226e9208a1905d9df961ab452d30373ace567631"
+source_inputs = ["src/api/schema/panes.rs", "src/cli/api.rs"]
+fixture_policy = "checked-in minimized schema fixture is generated from this exact protocol/schema pair"
