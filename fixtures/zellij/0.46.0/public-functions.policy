@@ -138,7 +138,7 @@ rename_session	exposed
 rename_tab	exposed
 rename_tab_with_id	exposed
 rename_terminal_pane	exposed
-rename_web_token	exposed
+rename_web_token	unsupported
 replace_pane_with_existing_pane	exposed
 report_panic	unsupported
 request_permission	internal

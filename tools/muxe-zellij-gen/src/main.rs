@@ -52,6 +52,7 @@ const BACKGROUND_INTEGRATIONS: &[&str] = &[
     "post_message_to",
     "post_message_to_plugin",
     "reload_plugin_with_id",
+    "rename_web_token",
     "report_panic",
     "revoke_all_web_tokens",
     "revoke_web_login_token",
