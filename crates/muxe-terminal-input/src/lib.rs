@@ -203,19 +203,21 @@ pub struct Modifiers(u8);
 
 impl Modifiers {
     pub const NONE: Self = Self(0);
-    pub const SHIFT: Self = Self(0b000001);
-    pub const ALT: Self = Self(0b000010);
-    pub const CONTROL: Self = Self(0b000100);
-    pub const SUPER: Self = Self(0b001000);
-    pub const HYPER: Self = Self(0b010000);
-    pub const META: Self = Self(0b100000);
+    pub const SHIFT: Self = Self(0b00_0001);
+    pub const ALT: Self = Self(0b00_0010);
+    pub const CONTROL: Self = Self(0b00_0100);
+    pub const SUPER: Self = Self(0b00_1000);
+    pub const HYPER: Self = Self(0b01_0000);
+    pub const META: Self = Self(0b10_0000);
 
     /// Returns the six protocol modifier bits, excluding lock state.
+    #[must_use]
     pub const fn bits(self) -> u8 {
         self.0
     }
 
     /// Returns whether every bit in `other` is active.
+    #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
@@ -322,6 +324,7 @@ impl Default for Parser {
 
 impl Parser {
     /// Creates a parser in its ground state.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             state: State::Ground,
@@ -361,9 +364,9 @@ impl Parser {
                     pending.len += 1;
                     if pending.len == pending.expected {
                         let mut value =
-                            (pending.bytes[0] & utf8_initial_mask(pending.expected)) as u32;
+                            u32::from(pending.bytes[0] & utf8_initial_mask(pending.expected));
                         for continuation in &pending.bytes[1..pending.expected as usize] {
-                            value = (value << 6) | (continuation & 0b0011_1111) as u32;
+                            value = (value << 6) | u32::from(continuation & 0b0011_1111);
                         }
                         self.state = State::Ground;
                         match char::from_u32(value) {
@@ -425,7 +428,7 @@ impl Parser {
         F: FnMut(InputEvent),
     {
         match self.state {
-            State::Ground => {}
+            State::Ground | State::DiscardCsi => {}
             State::Escape => emit(InputEvent::Key(RawKeyEvent::plain(
                 KeyIdentity::Functional(FunctionalKey::Escape),
             ))),
@@ -444,12 +447,12 @@ impl Parser {
                 MalformedReason::IncompleteAtEof,
                 0,
             )),
-            State::DiscardCsi => {}
         }
         self.reset();
     }
 
     /// Returns whether the only pending unit is a bare Escape byte.
+    #[must_use]
     pub const fn has_pending_escape(&self) -> bool {
         matches!(self.state, State::Escape)
     }
@@ -687,7 +690,7 @@ fn decode_csi(bytes: &[u8], final_byte: u8) -> InputEvent {
         Err(reason) => return malformed(SequenceClass::Csi, reason, saturating_u8(bytes.len())),
     };
 
-    if let Some(response) = decode_protocol_response(parameters, final_byte) {
+    if let Some(response) = decode_protocol_response(&parameters, final_byte) {
         return InputEvent::ProtocolResponse(response);
     }
     if parameters.prefix.is_some() || bytes.iter().any(|byte| (0x20..=0x2f).contains(byte)) {
@@ -695,34 +698,34 @@ fn decode_csi(bytes: &[u8], final_byte: u8) -> InputEvent {
     }
 
     match final_byte {
-        b'u' => decode_kitty(parameters, final_byte, bytes.len()),
-        b'~' => decode_tilde(parameters, final_byte, bytes.len()),
-        b'A' => decode_direct(parameters, FunctionalKey::Up, final_byte, bytes.len()),
-        b'B' => decode_direct(parameters, FunctionalKey::Down, final_byte, bytes.len()),
-        b'C' => decode_direct(parameters, FunctionalKey::Right, final_byte, bytes.len()),
-        b'D' => decode_direct(parameters, FunctionalKey::Left, final_byte, bytes.len()),
-        b'H' => decode_direct(parameters, FunctionalKey::Home, final_byte, bytes.len()),
-        b'F' => decode_direct(parameters, FunctionalKey::End, final_byte, bytes.len()),
+        b'u' => decode_kitty(&parameters, final_byte, bytes.len()),
+        b'~' => decode_tilde(&parameters, final_byte, bytes.len()),
+        b'A' => decode_direct(&parameters, FunctionalKey::Up, final_byte, bytes.len()),
+        b'B' => decode_direct(&parameters, FunctionalKey::Down, final_byte, bytes.len()),
+        b'C' => decode_direct(&parameters, FunctionalKey::Right, final_byte, bytes.len()),
+        b'D' => decode_direct(&parameters, FunctionalKey::Left, final_byte, bytes.len()),
+        b'H' => decode_direct(&parameters, FunctionalKey::Home, final_byte, bytes.len()),
+        b'F' => decode_direct(&parameters, FunctionalKey::End, final_byte, bytes.len()),
         b'P' => decode_direct(
-            parameters,
+            &parameters,
             FunctionalKey::Function(1),
             final_byte,
             bytes.len(),
         ),
         b'Q' => decode_direct(
-            parameters,
+            &parameters,
             FunctionalKey::Function(2),
             final_byte,
             bytes.len(),
         ),
         b'R' => decode_direct(
-            parameters,
+            &parameters,
             FunctionalKey::Function(3),
             final_byte,
             bytes.len(),
         ),
         b'S' => decode_direct(
-            parameters,
+            &parameters,
             FunctionalKey::Function(4),
             final_byte,
             bytes.len(),
@@ -737,14 +740,17 @@ fn decode_csi(bytes: &[u8], final_byte: u8) -> InputEvent {
                 locks: LockState::NONE,
                 keypad: Some(KeypadKey::Begin),
             };
-            decode_direct_event(parameters, event, final_byte, bytes.len())
+            decode_direct_event(&parameters, event, final_byte, bytes.len())
         }
-        b'Z' => decode_shift_tab(parameters, final_byte, bytes.len()),
+        b'Z' => decode_shift_tab(&parameters, final_byte, bytes.len()),
         _ => unknown_csi(final_byte, bytes.len()),
     }
 }
 
-fn decode_protocol_response(parameters: CsiParameters, final_byte: u8) -> Option<ProtocolResponse> {
+fn decode_protocol_response(
+    parameters: &CsiParameters,
+    final_byte: u8,
+) -> Option<ProtocolResponse> {
     if parameters.prefix != Some(b'?')
         || final_byte != b'u'
         || parameters.len != 1
@@ -800,7 +806,7 @@ fn parse_csi_parameters(bytes: &[u8]) -> Result<CsiParameters, MalformedReason> 
                 let current = parsed.values[parameter_index].values[component_index].unwrap_or(0);
                 let value = current
                     .checked_mul(10)
-                    .and_then(|value| value.checked_add((digit - b'0') as u32))
+                    .and_then(|value| value.checked_add(u32::from(digit - b'0')))
                     .ok_or(MalformedReason::NumericOverflow)?;
                 parsed.values[parameter_index].values[component_index] = Some(value);
             }
@@ -809,14 +815,16 @@ fn parse_csi_parameters(bytes: &[u8]) -> Result<CsiParameters, MalformedReason> 
                 if component_index == MAX_ASSOCIATED_TEXT_SCALARS {
                     return Err(MalformedReason::TooManyParameters);
                 }
-                parsed.values[parameter_index].len = (component_index + 1) as u8;
+                parsed.values[parameter_index].len = u8::try_from(component_index + 1)
+                    .map_err(|_| MalformedReason::TooManyParameters)?;
             }
             b';' => {
                 parameter_index += 1;
                 if parameter_index == MAX_CSI_PARAMETERS {
                     return Err(MalformedReason::TooManyParameters);
                 }
-                parsed.len = (parameter_index + 1) as u8;
+                parsed.len = u8::try_from(parameter_index + 1)
+                    .map_err(|_| MalformedReason::TooManyParameters)?;
                 parsed.values[parameter_index].len = 1;
                 component_index = 0;
             }
@@ -828,7 +836,7 @@ fn parse_csi_parameters(bytes: &[u8]) -> Result<CsiParameters, MalformedReason> 
     Ok(parsed)
 }
 
-fn decode_kitty(parameters: CsiParameters, final_byte: u8, bytes: usize) -> InputEvent {
+fn decode_kitty(parameters: &CsiParameters, final_byte: u8, bytes: usize) -> InputEvent {
     if parameters.len == 0 {
         return unknown_csi(final_byte, bytes);
     }
@@ -888,7 +896,7 @@ fn decode_kitty(parameters: CsiParameters, final_byte: u8, bytes: usize) -> Inpu
 }
 
 fn kitty_event_details(
-    parameters: CsiParameters,
+    parameters: &CsiParameters,
 ) -> Result<(Modifiers, LockState, EventKind), MalformedReason> {
     if parameters.len < 2 {
         return Ok((Modifiers::NONE, LockState::NONE, EventKind::Press));
@@ -911,7 +919,7 @@ fn kitty_event_details(
     Ok((modifier_set, locks, kind))
 }
 
-fn validate_associated_text(parameters: CsiParameters) -> Result<(), MalformedReason> {
+fn validate_associated_text(parameters: &CsiParameters) -> Result<(), MalformedReason> {
     if parameters.len < 3 {
         return Ok(());
     }
@@ -929,7 +937,7 @@ fn validate_associated_text(parameters: CsiParameters) -> Result<(), MalformedRe
     Ok(())
 }
 
-fn decode_tilde(parameters: CsiParameters, final_byte: u8, bytes: usize) -> InputEvent {
+fn decode_tilde(parameters: &CsiParameters, final_byte: u8, bytes: usize) -> InputEvent {
     if parameters.len == 0 || parameters.len > 2 || parameters.values[0].len != 1 {
         return unknown_csi(final_byte, bytes);
     }
@@ -960,7 +968,7 @@ fn decode_tilde(parameters: CsiParameters, final_byte: u8, bytes: usize) -> Inpu
 }
 
 fn decode_direct(
-    parameters: CsiParameters,
+    parameters: &CsiParameters,
     key: FunctionalKey,
     final_byte: u8,
     bytes: usize,
@@ -974,7 +982,7 @@ fn decode_direct(
 }
 
 fn decode_direct_event(
-    parameters: CsiParameters,
+    parameters: &CsiParameters,
     mut event: RawKeyEvent,
     final_byte: u8,
     bytes: usize,
@@ -999,7 +1007,7 @@ fn decode_direct_event(
     InputEvent::Key(event)
 }
 
-fn decode_shift_tab(parameters: CsiParameters, final_byte: u8, bytes: usize) -> InputEvent {
+fn decode_shift_tab(parameters: &CsiParameters, final_byte: u8, bytes: usize) -> InputEvent {
     let mut event = RawKeyEvent::plain(KeyIdentity::Functional(FunctionalKey::Tab));
     event.modifiers = Modifiers::SHIFT;
     match parameters.len {
@@ -1045,151 +1053,113 @@ fn optional_alternate_identity(value: Option<u32>) -> Result<Option<KeyIdentity>
 }
 
 fn functional_identity(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)> {
-    let key = match value {
-        9 => (FunctionalKey::Tab, None),
-        13 => (FunctionalKey::Enter, None),
-        27 => (FunctionalKey::Escape, None),
-        127 => (FunctionalKey::Backspace, None),
-        57344 => (FunctionalKey::Escape, None),
-        57345 => (FunctionalKey::Enter, None),
-        57346 => (FunctionalKey::Tab, None),
-        57347 => (FunctionalKey::Backspace, None),
-        57348 => (FunctionalKey::Insert, None),
-        57349 => (FunctionalKey::Delete, None),
-        57350 => (FunctionalKey::Left, None),
-        57351 => (FunctionalKey::Right, None),
-        57352 => (FunctionalKey::Up, None),
-        57353 => (FunctionalKey::Down, None),
-        57354 => (FunctionalKey::PageUp, None),
-        57355 => (FunctionalKey::PageDown, None),
-        57356 => (FunctionalKey::Home, None),
-        57357 => (FunctionalKey::End, None),
-        57358 => (FunctionalKey::CapsLock, None),
-        57359 => (FunctionalKey::ScrollLock, None),
-        57360 => (FunctionalKey::NumLock, None),
-        57361 => (FunctionalKey::PrintScreen, None),
-        57362 => (FunctionalKey::Pause, None),
-        57363 => (FunctionalKey::Menu, None),
-        57364..=57398 => (FunctionalKey::Function((value - 57364 + 1) as u8), None),
-        57399..=57408 => {
-            let digit = (value - 57399) as u8;
-            (
-                FunctionalKey::from_keypad(KeypadKey::Digit(digit)),
-                Some(KeypadKey::Digit(digit)),
-            )
-        }
-        57409 => (
-            FunctionalKey::from_keypad(KeypadKey::Decimal),
-            Some(KeypadKey::Decimal),
-        ),
-        57410 => (
-            FunctionalKey::from_keypad(KeypadKey::Divide),
-            Some(KeypadKey::Divide),
-        ),
-        57411 => (
-            FunctionalKey::from_keypad(KeypadKey::Multiply),
-            Some(KeypadKey::Multiply),
-        ),
-        57412 => (
-            FunctionalKey::from_keypad(KeypadKey::Subtract),
-            Some(KeypadKey::Subtract),
-        ),
-        57413 => (
-            FunctionalKey::from_keypad(KeypadKey::Add),
-            Some(KeypadKey::Add),
-        ),
-        57414 => (
-            FunctionalKey::from_keypad(KeypadKey::Enter),
-            Some(KeypadKey::Enter),
-        ),
-        57415 => (
-            FunctionalKey::from_keypad(KeypadKey::Equal),
-            Some(KeypadKey::Equal),
-        ),
-        57416 => (
-            FunctionalKey::from_keypad(KeypadKey::Separator),
-            Some(KeypadKey::Separator),
-        ),
-        57417 => (
-            FunctionalKey::from_keypad(KeypadKey::Left),
-            Some(KeypadKey::Left),
-        ),
-        57418 => (
-            FunctionalKey::from_keypad(KeypadKey::Right),
-            Some(KeypadKey::Right),
-        ),
-        57419 => (
-            FunctionalKey::from_keypad(KeypadKey::Up),
-            Some(KeypadKey::Up),
-        ),
-        57420 => (
-            FunctionalKey::from_keypad(KeypadKey::Down),
-            Some(KeypadKey::Down),
-        ),
-        57421 => (
-            FunctionalKey::from_keypad(KeypadKey::PageUp),
-            Some(KeypadKey::PageUp),
-        ),
-        57422 => (
-            FunctionalKey::from_keypad(KeypadKey::PageDown),
-            Some(KeypadKey::PageDown),
-        ),
-        57423 => (
-            FunctionalKey::from_keypad(KeypadKey::Home),
-            Some(KeypadKey::Home),
-        ),
-        57424 => (
-            FunctionalKey::from_keypad(KeypadKey::End),
-            Some(KeypadKey::End),
-        ),
-        57425 => (
-            FunctionalKey::from_keypad(KeypadKey::Insert),
-            Some(KeypadKey::Insert),
-        ),
-        57426 => (
-            FunctionalKey::from_keypad(KeypadKey::Delete),
-            Some(KeypadKey::Delete),
-        ),
-        57427 => (
-            FunctionalKey::from_keypad(KeypadKey::Begin),
-            Some(KeypadKey::Begin),
-        ),
-        57428 => (FunctionalKey::Media(MediaKey::Play), None),
-        57429 => (FunctionalKey::Media(MediaKey::Pause), None),
-        57430 => (FunctionalKey::Media(MediaKey::PlayPause), None),
-        57431 => (FunctionalKey::Media(MediaKey::Reverse), None),
-        57432 => (FunctionalKey::Media(MediaKey::Stop), None),
-        57433 => (FunctionalKey::Media(MediaKey::FastForward), None),
-        57434 => (FunctionalKey::Media(MediaKey::Rewind), None),
-        57435 => (FunctionalKey::Media(MediaKey::TrackNext), None),
-        57436 => (FunctionalKey::Media(MediaKey::TrackPrevious), None),
-        57437 => (FunctionalKey::Media(MediaKey::Record), None),
-        57438 => (FunctionalKey::Media(MediaKey::LowerVolume), None),
-        57439 => (FunctionalKey::Media(MediaKey::RaiseVolume), None),
-        57440 => (FunctionalKey::Media(MediaKey::MuteVolume), None),
-        57441 => (FunctionalKey::Modifier(ModifierKey::LeftShift), None),
-        57442 => (FunctionalKey::Modifier(ModifierKey::LeftControl), None),
-        57443 => (FunctionalKey::Modifier(ModifierKey::LeftAlt), None),
-        57444 => (FunctionalKey::Modifier(ModifierKey::LeftSuper), None),
-        57445 => (FunctionalKey::Modifier(ModifierKey::LeftHyper), None),
-        57446 => (FunctionalKey::Modifier(ModifierKey::LeftMeta), None),
-        57447 => (FunctionalKey::Modifier(ModifierKey::RightShift), None),
-        57448 => (FunctionalKey::Modifier(ModifierKey::RightControl), None),
-        57449 => (FunctionalKey::Modifier(ModifierKey::RightAlt), None),
-        57450 => (FunctionalKey::Modifier(ModifierKey::RightSuper), None),
-        57451 => (FunctionalKey::Modifier(ModifierKey::RightHyper), None),
-        57452 => (FunctionalKey::Modifier(ModifierKey::RightMeta), None),
-        57453 => (FunctionalKey::Modifier(ModifierKey::IsoLevel3Shift), None),
-        57454 => (FunctionalKey::Modifier(ModifierKey::IsoLevel5Shift), None),
-        _ => return None,
-    };
-    Some(key)
+    named_functional_identity(value)
+        .or_else(|| function_key_identity(value))
+        .or_else(|| keypad_functional_identity(value))
+        .or_else(|| media_functional_identity(value))
+        .or_else(|| modifier_functional_identity(value))
 }
 
-impl FunctionalKey {
-    fn from_keypad(keypad: KeypadKey) -> Self {
-        Self::Keypad(keypad)
-    }
+fn named_functional_identity(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)> {
+    let key = match value {
+        9 | 57346 => FunctionalKey::Tab,
+        13 | 57345 => FunctionalKey::Enter,
+        27 | 57344 => FunctionalKey::Escape,
+        127 | 57347 => FunctionalKey::Backspace,
+        57348 => FunctionalKey::Insert,
+        57349 => FunctionalKey::Delete,
+        57350 => FunctionalKey::Left,
+        57351 => FunctionalKey::Right,
+        57352 => FunctionalKey::Up,
+        57353 => FunctionalKey::Down,
+        57354 => FunctionalKey::PageUp,
+        57355 => FunctionalKey::PageDown,
+        57356 => FunctionalKey::Home,
+        57357 => FunctionalKey::End,
+        57358 => FunctionalKey::CapsLock,
+        57359 => FunctionalKey::ScrollLock,
+        57360 => FunctionalKey::NumLock,
+        57361 => FunctionalKey::PrintScreen,
+        57362 => FunctionalKey::Pause,
+        57363 => FunctionalKey::Menu,
+        _ => return None,
+    };
+    Some((key, None))
+}
+
+fn function_key_identity(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)> {
+    let number = u8::try_from(value.checked_sub(57363)?).ok()?;
+    (1..=35)
+        .contains(&number)
+        .then_some((FunctionalKey::Function(number), None))
+}
+
+fn keypad_functional_identity(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)> {
+    let key = match value {
+        57399..=57408 => KeypadKey::Digit(u8::try_from(value - 57399).ok()?),
+        57409 => KeypadKey::Decimal,
+        57410 => KeypadKey::Divide,
+        57411 => KeypadKey::Multiply,
+        57412 => KeypadKey::Subtract,
+        57413 => KeypadKey::Add,
+        57414 => KeypadKey::Enter,
+        57415 => KeypadKey::Equal,
+        57416 => KeypadKey::Separator,
+        57417 => KeypadKey::Left,
+        57418 => KeypadKey::Right,
+        57419 => KeypadKey::Up,
+        57420 => KeypadKey::Down,
+        57421 => KeypadKey::PageUp,
+        57422 => KeypadKey::PageDown,
+        57423 => KeypadKey::Home,
+        57424 => KeypadKey::End,
+        57425 => KeypadKey::Insert,
+        57426 => KeypadKey::Delete,
+        57427 => KeypadKey::Begin,
+        _ => return None,
+    };
+    Some((FunctionalKey::Keypad(key), Some(key)))
+}
+
+fn media_functional_identity(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)> {
+    let key = match value {
+        57428 => MediaKey::Play,
+        57429 => MediaKey::Pause,
+        57430 => MediaKey::PlayPause,
+        57431 => MediaKey::Reverse,
+        57432 => MediaKey::Stop,
+        57433 => MediaKey::FastForward,
+        57434 => MediaKey::Rewind,
+        57435 => MediaKey::TrackNext,
+        57436 => MediaKey::TrackPrevious,
+        57437 => MediaKey::Record,
+        57438 => MediaKey::LowerVolume,
+        57439 => MediaKey::RaiseVolume,
+        57440 => MediaKey::MuteVolume,
+        _ => return None,
+    };
+    Some((FunctionalKey::Media(key), None))
+}
+
+fn modifier_functional_identity(value: u32) -> Option<(FunctionalKey, Option<KeypadKey>)> {
+    let key = match value {
+        57441 => ModifierKey::LeftShift,
+        57442 => ModifierKey::LeftControl,
+        57443 => ModifierKey::LeftAlt,
+        57444 => ModifierKey::LeftSuper,
+        57445 => ModifierKey::LeftHyper,
+        57446 => ModifierKey::LeftMeta,
+        57447 => ModifierKey::RightShift,
+        57448 => ModifierKey::RightControl,
+        57449 => ModifierKey::RightAlt,
+        57450 => ModifierKey::RightSuper,
+        57451 => ModifierKey::RightHyper,
+        57452 => ModifierKey::RightMeta,
+        57453 => ModifierKey::IsoLevel3Shift,
+        57454 => ModifierKey::IsoLevel5Shift,
+        _ => return None,
+    };
+    Some((FunctionalKey::Modifier(key), None))
 }
 
 fn tilde_identity(value: u32) -> Option<(KeyIdentity, Option<KeypadKey>)> {
@@ -1224,7 +1194,7 @@ fn kitty_modifiers(value: u32) -> Result<(Modifiers, LockState), MalformedReason
     if !(1..=256).contains(&value) {
         return Err(MalformedReason::InvalidModifier);
     }
-    let bits = (value - 1) as u8;
+    let bits = u8::try_from(value - 1).map_err(|_| MalformedReason::InvalidModifier)?;
     Ok((
         Modifiers(bits & 0b0011_1111),
         LockState {
@@ -1234,11 +1204,7 @@ fn kitty_modifiers(value: u32) -> Result<(Modifiers, LockState), MalformedReason
     ))
 }
 
-const fn malformed(
-    class: SequenceClass,
-    reason: MalformedReason,
-    observed_bytes: u8,
-) -> InputEvent {
+fn malformed(class: SequenceClass, reason: MalformedReason, observed_bytes: u8) -> InputEvent {
     InputEvent::Malformed(MalformedInput {
         class,
         reason,
@@ -1246,7 +1212,7 @@ const fn malformed(
     })
 }
 
-const fn unknown_csi(final_byte: u8, bytes: usize) -> InputEvent {
+fn unknown_csi(final_byte: u8, bytes: usize) -> InputEvent {
     InputEvent::Unknown(UnknownSequence {
         class: SequenceClass::Csi,
         final_byte,
@@ -1254,12 +1220,8 @@ const fn unknown_csi(final_byte: u8, bytes: usize) -> InputEvent {
     })
 }
 
-const fn saturating_u8(value: usize) -> u8 {
-    if value > u8::MAX as usize {
-        u8::MAX
-    } else {
-        value as u8
-    }
+fn saturating_u8(value: usize) -> u8 {
+    u8::try_from(value).unwrap_or(u8::MAX)
 }
 
 const fn is_csi_final(byte: u8) -> bool {
