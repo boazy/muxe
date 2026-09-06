@@ -30,11 +30,10 @@ pub struct MethodSchema {
     pub name: String,
     params: ParameterSchema,
 }
-
 #[derive(Clone, Debug)]
 enum ParameterSchema {
     Reference(String),
-    Inline(Value),
+    Inline { schema: Value, schema_path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -119,8 +118,7 @@ impl ApiSchema {
             .and_then(Value::as_array)
             .ok_or_else(|| malformed("#/schemas/request", "request.oneOf must be an array"))?;
         let mut methods = BTreeMap::new();
-
-        for branch in branches {
+        for (index, branch) in branches.iter().enumerate() {
             let Some(properties) = branch.get("properties").and_then(Value::as_object) else {
                 continue;
             };
@@ -136,7 +134,10 @@ impl ApiSchema {
             };
             let params = match params.get("$ref").and_then(Value::as_str) {
                 Some(reference) => ParameterSchema::Reference(reference.to_owned()),
-                None => ParameterSchema::Inline(params.clone()),
+                None => ParameterSchema::Inline {
+                    schema: params.clone(),
+                    schema_path: format!("#/schemas/request/oneOf/{index}/properties/params"),
+                },
             };
             methods
                 .entry(method.to_owned())
@@ -201,10 +202,7 @@ impl ApiSchema {
             ParameterSchema::Reference(reference) => {
                 (self.resolve_reference(reference, "#")?, reference.as_str())
             }
-            ParameterSchema::Inline(schema) => (
-                schema,
-                "#/schemas/request/oneOf/<selected>/properties/params",
-            ),
+            ParameterSchema::Inline { schema, schema_path } => (schema, schema_path.as_str()),
         };
         self.validate(root, params, "#", schema_path, 0)
     }
@@ -908,9 +906,9 @@ impl ExactInteger {
         match (self, other) {
             (Self::Signed(left), Self::Signed(right)) => left.cmp(&right),
             (Self::Unsigned(left), Self::Unsigned(right)) => left.cmp(&right),
-            (Self::Signed(left), Self::Unsigned(right)) if left < 0 => Ordering::Less,
+            (Self::Signed(left), Self::Unsigned(_)) if left < 0 => Ordering::Less,
             (Self::Signed(left), Self::Unsigned(right)) => (left as u64).cmp(&right),
-            (Self::Unsigned(left), Self::Signed(right)) if right < 0 => Ordering::Greater,
+            (Self::Unsigned(_), Self::Signed(right)) if right < 0 => Ordering::Greater,
             (Self::Unsigned(left), Self::Signed(right)) => left.cmp(&(right as u64)),
         }
     }

@@ -7,8 +7,10 @@
 #![forbid(unsafe_code)]
 
 pub mod generated;
+mod origin;
 mod schema;
 mod transport;
 
+pub use origin::capture_origin;
 pub use schema::{ApiSchema, MethodSchema, ValidationCode, ValidationError, VALIDATOR_FORMAT_VERSION};
 pub use transport::{DeliveryState, HerdrResponse, HerdrSocketClient, SocketError};
