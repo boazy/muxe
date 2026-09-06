@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 # Runtime members are added only when their source owners have real crate roots.
-members = ["crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "crates/muxe-ui", "tools/muxe-herdr-gen"]
+members = ["crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "crates/muxe-ui", "tools/muxe-herdr-gen", "tools/muxe-zellij-gen"]
 
 [workspace.package]
 edition = "2024"
@@ -41,7 +41,7 @@ data-encoding = "2.9.0"
 sha2 = "0.10.9"
 async-trait = "0.1.89"
 zellij-tile = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f", package = "zellij-tile" }
-syn = "2.0.108"
+syn = { version = "2.0.108", features = ["full"] }
 quote = "1.0.41"
 proc-macro2 = "1.0.103"
 prettyplease = "0.2.37"

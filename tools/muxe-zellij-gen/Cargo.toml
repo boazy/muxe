@@ -1,0 +1,12 @@
+[package]
+name = "muxe-zellij-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+eyre.workspace = true
+quote.workspace = true
+sha2.workspace = true
+syn.workspace = true
