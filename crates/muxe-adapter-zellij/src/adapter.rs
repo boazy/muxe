@@ -834,6 +834,15 @@ impl ZellijAdapter {
                 )
             },
         )?;
+        self.dispatch_to_client(execution, client_id, commands).await
+    }
+
+    async fn dispatch_to_client(
+        &self,
+        execution: ExecutionId,
+        client_id: String,
+        commands: Vec<RawNativeCommand>,
+    ) -> Result<DispatchAccepted, AdapterError> {
         // Gate acceptance on a live compatible registration: pump re-resolves
         // the registration at send time, but an unknown or incompatible
         // client must fail here instead of queueing forever.
@@ -865,6 +874,36 @@ impl ZellijAdapter {
             execution,
             capabilities: ExecutionCapabilities::ASYNCHRONOUS,
         })
+    }
+
+    /// Launches one host pane for `muxe menu open` / `muxe pane open`.
+    ///
+    /// The launch builds a pinned directional or floating action with the
+    /// exact command vector, validates it through the generated conversion,
+    /// and dispatches it to the target client with the same correlation as
+    /// any native action. Menu launches require focus; the constructor in
+    /// [`build_launch_command`](crate::launch::build_launch_command)
+    /// enforces that before anything reaches the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] for invalid launch specs, unresolvable
+    /// targets, or clients without a live compatible bridge.
+    pub async fn launch_pane(
+        &self,
+        execution: ExecutionId,
+        launch: crate::launch::ZellijPaneLaunch,
+    ) -> Result<DispatchAccepted, AdapterError> {
+        let raw = crate::launch::build_launch_command(&launch)
+            .map_err(|error| error.into_adapter_error())?;
+        let client_id = match launch.target {
+            crate::launch::LaunchTarget::Client(client) => client,
+            crate::launch::LaunchTarget::UiPane(pane) => {
+                let probe = format!("launch-{}", hex_id(&self.mint_id()));
+                self.resolve_client_for_pane(&probe, pane.as_str()).await?
+            }
+        };
+        self.dispatch_to_client(execution, client_id, vec![raw]).await
     }
 
     async fn enqueue_lifecycle(&self, client_id: String, payload: BridgeRequest) {
@@ -1469,6 +1508,62 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(request.take_outbound().is_empty());
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    /// Launch dispatch targets the origin client with the exact command
+    /// vector: a menu split carries program, argv, cwd, direction, and focus.
+    #[tokio::test]
+    async fn launch_pane_targets_origin_client() {
+        use crate::launch::{
+            LaunchKind, LaunchTarget, ZellijPaneLaunch, ZellijPlacement, ZellijSplitDirection,
+        };
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        event.push_line(
+            encode_event_line(&register_event([7; 16], BridgeArtifact::Unattested))
+                .expect("register encodes"),
+        );
+        let accepted = loop {
+            let result = adapter
+                .launch_pane(
+                    ExecutionId(21),
+                    ZellijPaneLaunch {
+                        kind: LaunchKind::Menu,
+                        target: LaunchTarget::Client("client-1".to_owned()),
+                        cwd: Some(std::path::PathBuf::from("/work")),
+                        program: std::path::PathBuf::from("muxe"),
+                        args: vec!["ui".to_owned(), "menu".to_owned(), "main".to_owned()],
+                        placement: ZellijPlacement::Split {
+                            direction: ZellijSplitDirection::Down,
+                        },
+                        focus: true,
+                    },
+                )
+                .await;
+            if result.is_ok() {
+                break result.expect("accepted");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(accepted.execution, ExecutionId(21));
+        let line = poll_outbound(&request).await;
+        let frame = decode_request_line(&line).expect("typed request frame");
+        assert_eq!(frame.target.client_id, "client-1");
+        match frame.payload {
+            BridgeRequest::Dispatch { execution, command } => {
+                assert_eq!(execution, "21");
+                let RawNativeCommand::RunAction { action, .. } = command else {
+                    panic!("expected run-action wrap");
+                };
+                assert!(matches!(
+                    action,
+                    muxe_zellij_protocol::generated::raw::Action::NewTiledPane { .. }
+                ));
+            }
+            _ => panic!("expected dispatch payload"),
+        }
         adapter.shutdown().await.expect("shutdown");
     }
 }
