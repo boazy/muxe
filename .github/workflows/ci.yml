@@ -17,10 +17,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: jdx/mise-action@v2
         with:
-          toolchain: "1.97.1"
-          components: rustfmt, clippy
+          install: true
+      - name: trust project tasks and assert pinned toolchain
+        # The Rust pin lives only in mise.toml; no step repeats the version.
+        run: |
+          set -euo pipefail
+          mise trust
+          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$pin"
+          cargo --version | grep -F "cargo $pin"
       - name: formatting
         run: mise run fmt
       - name: compile (locked)
@@ -36,7 +43,25 @@ jobs:
       - name: Zellij fixture verification
         run: mise run codegen-zellij-verify
       - name: completions byte-clean
-        run: cargo run --locked -p codegen-completions -- --check
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo run --locked \
+            -p codegen-completions -- --check
+      - name: owned no-host fixtures (activation transactions)
+        # TempDir framed-control old/target fixtures from the native library.
+        # Deterministic and host-free: this is NOT the real-host smoke below.
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo test --locked -p muxe \
+            --lib lifecycle::activate::tests
+      - name: owned no-host fixtures (recorded Herdr socket)
+        # Production adapter against recorded socket fixtures, including the
+        # exact pane argv/cwd exchange. Deterministic and host-free: this is
+        # NOT the real-host smoke below.
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo test --locked \
+            -p muxe-adapter-herdr --test recorded_socket
 
   full-matrix:
     name: full matrix (${{ matrix.os }})
@@ -48,11 +73,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: jdx/mise-action@v2
         with:
-          toolchain: "1.97.1"
+          install: true
+      - name: trust project tasks and assert pinned toolchain
+        run: |
+          set -euo pipefail
+          mise trust
+          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$pin"
+          cargo --version | grep -F "cargo $pin"
       - name: full workspace tests (locked)
-        run: cargo test --workspace --locked
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo test --workspace --locked
 
   benches:
     name: benchmarks (non-blocking)
@@ -60,11 +94,22 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: jdx/mise-action@v2
         with:
-          toolchain: "1.97.1"
+          install: true
+      - name: trust project tasks and assert pinned toolchain
+        run: |
+          set -euo pipefail
+          mise trust
+          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$pin"
+          cargo --version | grep -F "cargo $pin"
       - name: divan comparisons
-        run: cargo bench --locked || echo "no benches yet"
+        # Benchmark entrypoints are owned by their source crates; this step
+        # only runs the comparisons. Non-blocking: no blanket threshold.
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo bench --locked
       - name: CodSpeed comparison upload
         # Published for pull requests without failing the build: no blanket
         # regression threshold. Crate-local benchmark entrypoints remain owned
@@ -77,9 +122,21 @@ jobs:
     name: small Linux real-host smoke
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - name: trust project tasks and assert pinned toolchain
+        run: |
+          set -euo pipefail
+          mise trust
+          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$pin"
+          cargo --version | grep -F "cargo $pin"
       - name: host capability probe
         id: capability
         run: |
+          set -euo pipefail
           # Both pinned hosts must be present or this gate fails explicitly.
           # A missing capability is a failing gate, never a silent skip.
           missing=""
@@ -91,24 +148,21 @@ jobs:
             exit 1
           fi
           zellij --version
-          herdr --version || true
+          herdr --version
       - name: pinned version check
         run: |
+          set -euo pipefail
           zellij --version | grep -F "0.46.0"
-      - name: activation old/target fixtures (no live host)
-        run: |
-          # Owned TempDir framed-control transaction fixtures from the native
-          # library; a missing runner fails here by name, never silently.
-          cargo test --locked -p muxe --lib lifecycle::activate::tests
-      - name: Herdr recorded-socket smoke (no live host)
-        run: |
-          # Production adapter against recorded socket fixtures, including
-          # the exact pane argv/cwd exchange.
-          cargo test --locked -p muxe-adapter-herdr --test recorded_socket
+          herdr --version | grep -F "0.8.2"
       - name: temp-scoped smoke
+        # All smoke state lives under a fresh TempDir; never the default host.
+        # The broker/input-owned live scenario runner wires into this job once
+        # their rerun lands; until then the probe, version, and compatibility
+        # checks above are the complete real-host gate, and they fail closed.
         run: |
-          # All smoke state lives under a fresh TempDir; never the default host.
+          set -euo pipefail
           SMOKE_DIR="$(mktemp -d)"
           export SMOKE_DIR
           trap 'rm -rf "$SMOKE_DIR"' EXIT
-          cargo run --locked -p muxe -- compatibility --json | tee "$SMOKE_DIR/compat.json"
+          env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe -- \
+            compatibility --json | tee "$SMOKE_DIR/compat.json"

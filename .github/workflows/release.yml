@@ -234,17 +234,22 @@ jobs:
           archives=(dist/muxe-v*.tar.gz)
           test "${#archives[@]}" -eq 4
           printf '%s\n' "${archives[@]}"
-      - name: checksums (missing checksum fails the release)
-        run: |
-          set -euo pipefail
-          (cd dist && sha256sum muxe-v*.tar.gz > SHA256SUMS)
-          (cd dist && sha256sum -c SHA256SUMS)
-          cp dist/SHA256SUMS .
+      - name: producer digest coupling
+        # The identical-bytes check below is not self-referential: the digest
+        # must also equal the single producer job's recorded digest.
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-wasm
+          path: producer
       - name: layout and identical WASM bytes
         run: |
           set -euo pipefail
           rm -rf verify-tmp
           mkdir verify-tmp
+          expected_path="$(find producer -name wasm.sha256 -print -quit)"
+          test -n "$expected_path"
+          expected="$(cut -d' ' -f1 "$expected_path")"
+          test -n "$expected"
           first_digest=""
           for archive in dist/muxe-v*.tar.gz; do
             name="$(basename "$archive" .tar.gz)"
@@ -263,8 +268,13 @@ jobs:
               exit 1
             fi
           done
+          test "$first_digest" = "$expected" || {
+            echo "release failure: archive WASM digest $first_digest"
+            echo "does not match producer digest $expected"
+            exit 1
+          }
           echo "$first_digest" > WASM_SHA256
-          echo "WASM bytes identical in all archives: $first_digest"
+          echo "WASM bytes identical in all archives and match producer: $first_digest"
       - name: runnable native smoke (linux-x64 on its own arch)
         run: |
           set -euo pipefail
