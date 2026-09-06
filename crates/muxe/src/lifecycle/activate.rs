@@ -44,7 +44,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use muxe_protocol::control::{ActivationStatus, CompatibilityRecord, HandoffId, LifecycleState};
+use muxe_protocol::control::{
+    ActivationStatus, CompatibilityRecord, HandoffId, LifecycleState, TargetReadiness,
+};
 use thiserror::Error;
 
 use crate::{
@@ -471,7 +473,7 @@ impl Preflight for LivePreflight<'_> {
                 }
                 let text = String::from_utf8_lossy(&output.stdout);
                 let version = text.split_whitespace().nth(1).ok_or_else(|| {
-                    format!("the Zellij executable reports an unrecognized version line")
+                    "the Zellij executable reports an unrecognized version line".to_owned()
                 })?;
                 (
                     crate::compatibility::ZELLIJ_MINIMUM,
@@ -548,6 +550,11 @@ pub struct ActivateReport {
 }
 
 /// Inputs for `muxe activate`.
+/// Renders the exact owned spawn request for one prepared member: the current
+/// executable plus the broker-authored serve arguments.
+pub type SpawnArgv<'a> =
+    &'a dyn Fn(&SpawnMember) -> Result<(PathBuf, Vec<OsString>), ActivateError>;
+
 pub struct ActivateInputs<'a, C, S, R, P> {
     pub config_dir: &'a Path,
     pub cache_dir: &'a Path,
@@ -560,15 +567,22 @@ pub struct ActivateInputs<'a, C, S, R, P> {
     pub spawner: &'a S,
     pub reloader: &'a R,
     pub preflight: &'a P,
-    /// Builds the exact owned spawn request per member: the current executable
-    /// plus the broker-authored serve arguments.
-    pub spawn_argv: &'a dyn Fn(&SpawnMember) -> Result<(PathBuf, Vec<OsString>), ActivateError>,
+    /// Builds the exact owned spawn request per member.
+    pub spawn_argv: SpawnArgv<'a>,
     pub readiness_deadline: Duration,
     pub poll_interval: Duration,
     pub hooks: ActivateHooks,
     pub logger: Option<&'a Logger>,
 }
 
+/// Runs one activation across every selected unit, committing or rolling back
+/// each independently.
+///
+/// # Errors
+///
+/// Fails when recovery finds an unresolved journal, when no live units match
+/// the scope, or when global preflight fails. Per-unit failures surface in
+/// the returned report, never as an early return.
 pub async fn activate<C, S, R, P>(
     inputs: ActivateInputs<'_, C, S, R, P>,
 ) -> Result<ActivateReport, ActivateError>
@@ -1060,8 +1074,10 @@ where
     }
 
     // Wait for every target to report ready: exact expected handoff, matching
-    // host identity, and the full target compatibility record. The broker
-    // attests bridge registrations before reporting the target record.
+    // host identity, and the full target compatibility record. Zellij members
+    // additionally prove a complete census from one snapshot round; Herdr
+    // members keep the subscription/health gate. Any member that never
+    // reports ready rolls the whole unit back.
     let deadline = Instant::now() + inputs.readiness_deadline;
     for member in &prepared {
         if let Err(error) = wait_ready(
@@ -1235,16 +1251,58 @@ fn activation_authority(
 
 /// A target is ready only when it reports the exact expected handoff, the
 /// matching host identity, and the complete target compatibility record.
+/// Zellij members additionally require a complete, nonempty, duplicate-free
+/// census from one snapshot round: every snapshot member holds a fresh
+/// compatible registration, so a partially or spuriously registered target
+/// can never commit. Herdr keeps its subscription/health gate and never
+/// requires this census.
 fn target_ready(
     status: &ActivationStatus,
     member: &BrokerEntry,
     expected_handoff: &HandoffId,
     target: &CompatibilityRecord,
 ) -> bool {
-    status.current == *target
-        && status.handoff_id == Some(*expected_handoff)
-        && status.live_server.discovery_key == member.discovery_key
-        && matches!(status.lifecycle, LifecycleState::Running)
+    if status.current != *target
+        || status.handoff_id != Some(*expected_handoff)
+        || status.live_server.discovery_key != member.discovery_key
+        || !matches!(status.lifecycle, LifecycleState::Running)
+    {
+        return false;
+    }
+    if member.host_kind == "zellij" {
+        return status.ready.as_ref().is_some_and(zellij_census_covered);
+    }
+    true
+}
+
+/// Checks one snapshot round of Zellij commit-gate evidence: the registered
+/// set must equal the authoritative member set exactly — no gaps, extras, or
+/// duplicates — with every ID nonempty. The count is consistency-checked,
+/// never proof. A missing report is never ready; a present-but-empty
+/// snapshot with no registrations is a legitimate zero-client unit.
+fn zellij_census_covered(ready: &TargetReadiness) -> bool {
+    let Some(original) = ready.member_ids.as_ref() else {
+        return false;
+    };
+    if original.iter().map(String::as_str).any(str::is_empty)
+        || ready
+            .registered_clients
+            .iter()
+            .map(String::as_str)
+            .any(str::is_empty)
+    {
+        return false;
+    }
+    let mut members = original.clone();
+    members.sort();
+    members.dedup();
+    if members.len() != original.len() || members.len() as u64 != ready.member_clients {
+        return false;
+    }
+    let mut registered = ready.registered_clients.clone();
+    registered.sort();
+    registered.dedup();
+    registered == members
 }
 
 async fn wait_ready<C>(
@@ -2396,5 +2454,343 @@ mod tests {
         assert!(matches!(result, Err(ActivateError::Preflight(_))));
         assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
         old.abort();
+    }
+
+    fn ready_census(registered: &[&str], members: Option<&[&str]>) -> TargetReadiness {
+        TargetReadiness {
+            registered_clients: registered.iter().map(ToString::to_string).collect(),
+            member_clients: members.map_or(0, <[_]>::len) as u64,
+            member_ids: members.map(|set| set.iter().map(ToString::to_string).collect()),
+        }
+    }
+
+    fn census_member(socket: PathBuf, host_kind: &str, discovery: &str) -> BrokerEntry {
+        BrokerEntry {
+            host_kind: host_kind.to_owned(),
+            discovery_key: discovery.to_owned(),
+            socket,
+            server_pid: 1,
+            started_at: 1,
+            bridge_path: None,
+            live_server: None,
+        }
+    }
+
+    fn census_status(
+        handoff: HandoffId,
+        discovery: &str,
+        ready: Option<TargetReadiness>,
+    ) -> ActivationStatus {
+        ActivationStatus {
+            lifecycle: LifecycleState::Running,
+            live_server: identity(discovery),
+            current: target_record(),
+            target: None,
+            handoff_id: Some(handoff),
+            ready,
+        }
+    }
+
+    #[test]
+    fn zellij_census_requires_exact_set_coverage() {
+        assert!(zellij_census_covered(&ready_census(
+            &["b", "a"],
+            Some(&["a", "b"])
+        )));
+        assert!(!zellij_census_covered(&ready_census(
+            &["a"],
+            Some(&["a", "b"])
+        )));
+        assert!(!zellij_census_covered(&ready_census(
+            &["a", "newcomer"],
+            Some(&["a", "b"])
+        )));
+        assert!(!zellij_census_covered(&ready_census(
+            &["a", "b", "c"],
+            Some(&["a", "b"])
+        )));
+        assert!(!zellij_census_covered(&ready_census(
+            &["a", "a"],
+            Some(&["a", "b"])
+        )));
+        assert!(!zellij_census_covered(&ready_census(
+            &["a", "b"],
+            Some(&["a", "a", "b"])
+        )));
+        assert!(!zellij_census_covered(&ready_census(&["a", "b"], None)));
+        assert!(zellij_census_covered(&ready_census(&[], Some(&[]))));
+        assert!(!zellij_census_covered(&ready_census(
+            &[],
+            Some(&["a", "b"])
+        )));
+        assert!(!zellij_census_covered(&ready_census(&[""], Some(&[""]))));
+        assert!(!zellij_census_covered(&ready_census(
+            &["a"],
+            Some(&["a", ""])
+        )));
+    }
+
+    #[test]
+    fn target_ready_gates_zellij_census_but_not_herdr_health() {
+        let expected = handoff(9);
+        let socket = PathBuf::from("/run/census.sock");
+        let herdr = census_member(socket.clone(), "herdr", "herdr.sock");
+        assert!(target_ready(
+            &census_status(expected, "herdr.sock", None),
+            &herdr,
+            &expected,
+            &target_record(),
+        ));
+        let zellij = census_member(socket, "zellij", "session-a");
+        assert!(!target_ready(
+            &census_status(expected, "session-a", None),
+            &zellij,
+            &expected,
+            &target_record(),
+        ));
+        assert!(!target_ready(
+            &census_status(
+                expected,
+                "session-a",
+                Some(ready_census(&["a"], Some(&["a", "b"])))
+            ),
+            &zellij,
+            &expected,
+            &target_record(),
+        ));
+        assert!(target_ready(
+            &census_status(
+                expected,
+                "session-a",
+                Some(ready_census(&["a", "b"], Some(&["a", "b"])))
+            ),
+            &zellij,
+            &expected,
+            &target_record(),
+        ));
+        assert!(!target_ready(
+            &census_status(
+                expected,
+                "session-a",
+                Some(ready_census(&["a", "b"], Some(&["a", "b"])))
+            ),
+            &zellij,
+            &handoff(3),
+            &target_record(),
+        ));
+    }
+
+    /// Serves one fixed readiness status over the real control framing so
+    /// `wait_ready` is proven through the production client, not a scripted
+    /// session type. Accepts every connection in a loop because the
+    /// coordinator reconnects on each poll.
+    fn serve_readiness_status(socket: PathBuf, status: ActivationStatus) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = UnixListener::bind(&socket).expect("bind readiness peer");
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let status = status.clone();
+                tokio::spawn(async move {
+                    if send_broker_prelude(&mut stream).await.is_err() {
+                        return;
+                    }
+                    let mut decoder = ControlDecoder::new(ControlPolicy::broker());
+                    let mut buffer = [0u8; 8192];
+                    loop {
+                        let read = match AsyncReadExt::read(&mut stream, &mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => read,
+                        };
+                        let mut pending = Vec::new();
+                        decoder
+                            .push(&buffer[..read], |message| {
+                                if let ControlMessage::Request(request) = message {
+                                    pending.push(request.request_id);
+                                }
+                            })
+                            .expect("decode readiness frame");
+                        for request_id in pending {
+                            let response = ControlMessage::Response(ControlResponse {
+                                request_id,
+                                result: ControlResult::Status(status.clone()),
+                            });
+                            let payload = serde_json::to_vec(&response).unwrap();
+                            let length =
+                                u32::try_from(payload.len()).expect("status frame fits u32");
+                            if stream.write_all(&length.to_be_bytes()).await.is_err() {
+                                return;
+                            }
+                            if stream.write_all(&payload).await.is_err() {
+                                return;
+                            }
+                            if stream.flush().await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// Serves an evolving round sequence over the real control framing: each
+    /// status poll consumes the next round, saturating at the last. Proves a
+    /// fresh target with a nonempty session stays unready through empty early
+    /// rounds and opens only when real registrations arrive.
+    fn serve_readiness_rounds(socket: PathBuf, rounds: Vec<ActivationStatus>) -> JoinHandle<()> {
+        use std::sync::{Arc, Mutex};
+        let rounds = Arc::new(Mutex::new(rounds));
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = UnixListener::bind(&socket).expect("bind rounds peer");
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let rounds = Arc::clone(&rounds);
+                tokio::spawn(async move {
+                    if send_broker_prelude(&mut stream).await.is_err() {
+                        return;
+                    }
+                    let mut decoder = ControlDecoder::new(ControlPolicy::broker());
+                    let mut buffer = [0u8; 8192];
+                    loop {
+                        let read = match AsyncReadExt::read(&mut stream, &mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => read,
+                        };
+                        let mut pending = Vec::new();
+                        decoder
+                            .push(&buffer[..read], |message| {
+                                if let ControlMessage::Request(request) = message {
+                                    pending.push(request.request_id);
+                                }
+                            })
+                            .expect("decode rounds frame");
+                        for request_id in pending {
+                            let status = {
+                                let mut rounds = rounds.lock().expect("rounds are readable");
+                                if rounds.len() > 1 {
+                                    rounds.remove(0)
+                                } else {
+                                    rounds.first().cloned().expect("rounds never empty")
+                                }
+                            };
+                            let response = ControlMessage::Response(ControlResponse {
+                                request_id,
+                                result: ControlResult::Status(status),
+                            });
+                            let payload = serde_json::to_vec(&response).unwrap();
+                            let length =
+                                u32::try_from(payload.len()).expect("status frame fits u32");
+                            if stream.write_all(&length.to_be_bytes()).await.is_err() {
+                                return;
+                            }
+                            if stream.write_all(&payload).await.is_err() {
+                                return;
+                            }
+                            if stream.flush().await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn wait_ready_blocks_partial_census_and_passes_full() {
+        let temp = tempfile::tempdir().expect("readiness sockets");
+        let handoff = handoff(7);
+        let partial = temp.path().join("partial.sock");
+        serve_readiness_status(
+            partial.clone(),
+            census_status(
+                handoff,
+                "session-a",
+                Some(ready_census(&["a"], Some(&["a", "b"]))),
+            ),
+        );
+        let member = census_member(partial, "zellij", "session-a");
+        let blocked = wait_ready(
+            &LiveControl,
+            &member,
+            &handoff,
+            &target_record(),
+            Instant::now() + Duration::from_millis(150),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a partial census never reads ready");
+        assert!(
+            matches!(blocked, ActivateError::ReadinessTimeout { .. }),
+            "a partial census fails closed by timeout, never by commit"
+        );
+        let full = temp.path().join("full.sock");
+        serve_readiness_status(
+            full.clone(),
+            census_status(
+                handoff,
+                "session-a",
+                Some(ready_census(&["a", "b"], Some(&["a", "b"]))),
+            ),
+        );
+        let member = census_member(full, "zellij", "session-a");
+        wait_ready(
+            &LiveControl,
+            &member,
+            &handoff,
+            &target_record(),
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("a full fresh census reads ready");
+    }
+
+    #[tokio::test]
+    async fn wait_ready_opens_only_on_real_regs_with_empty_valid() {
+        let temp = tempfile::tempdir().expect("rounds sockets");
+        let handoff = handoff(11);
+        let evolving = temp.path().join("evolving.sock");
+        let empty_round =
+            census_status(handoff, "session-a", Some(ready_census(&[], Some(&["a"]))));
+        let full_round = census_status(
+            handoff,
+            "session-a",
+            Some(ready_census(&["a"], Some(&["a"]))),
+        );
+        serve_readiness_rounds(evolving.clone(), vec![empty_round, full_round]);
+        let member = census_member(evolving, "zellij", "session-a");
+        wait_ready(
+            &LiveControl,
+            &member,
+            &handoff,
+            &target_record(),
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("real registrations open a fresh target");
+        let vacant = temp.path().join("vacant.sock");
+        serve_readiness_status(
+            vacant.clone(),
+            census_status(handoff, "session-a", Some(ready_census(&[], Some(&[])))),
+        );
+        let member = census_member(vacant, "zellij", "session-a");
+        wait_ready(
+            &LiveControl,
+            &member,
+            &handoff,
+            &target_record(),
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("a genuinely queried empty snapshot reads ready");
     }
 }
