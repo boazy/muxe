@@ -117,12 +117,13 @@ pub struct ControlClient {
 impl ControlClient {
     /// Connects to a broker control socket and sends the coordinator prelude.
     pub async fn connect(socket: &Path) -> Result<Self, ControlError> {
-        let mut stream = UnixStream::connect(socket).await.map_err(|source| {
-            ControlError::Connect {
-                socket: socket.to_path_buf(),
-                source,
-            }
-        })?;
+        let mut stream =
+            UnixStream::connect(socket)
+                .await
+                .map_err(|source| ControlError::Connect {
+                    socket: socket.to_path_buf(),
+                    source,
+                })?;
         let prelude = Prelude::control(PeerRole::ActivationCoordinator).encode();
         stream.write_all(&prelude).await?;
         stream.flush().await?;
@@ -156,8 +157,14 @@ impl ControlClient {
     }
 
     /// Sends `commit` for a handoff ID from the journal.
-    pub async fn commit(&mut self, handoff_id: HandoffId) -> Result<ActivationStatus, ControlError> {
-        match self.round_trip(ControlOperation::Commit { handoff_id }).await? {
+    pub async fn commit(
+        &mut self,
+        handoff_id: HandoffId,
+    ) -> Result<ActivationStatus, ControlError> {
+        match self
+            .round_trip(ControlOperation::Commit { handoff_id })
+            .await?
+        {
             ControlResult::Committed(status) => Ok(status),
             _ => Err(ControlError::UnexpectedResult("non-committed")),
         }
@@ -165,7 +172,10 @@ impl ControlClient {
 
     /// Sends `abort` for a handoff ID from the journal.
     pub async fn abort(&mut self, handoff_id: HandoffId) -> Result<ActivationStatus, ControlError> {
-        match self.round_trip(ControlOperation::Abort { handoff_id }).await? {
+        match self
+            .round_trip(ControlOperation::Abort { handoff_id })
+            .await?
+        {
             ControlResult::Aborted(status) => Ok(status),
             _ => Err(ControlError::UnexpectedResult("non-aborted")),
         }
@@ -249,6 +259,7 @@ mod tests {
             current: current_record(),
             target: None,
             handoff_id: None,
+            ready: None,
         }
     }
     fn current_record() -> CompatibilityRecord {
@@ -327,7 +338,11 @@ mod tests {
     #[tokio::test]
     async fn status_round_trip_over_real_framing() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let socket = temp.path().join("control.sock");
         // Broker prelude check: the server validates our coordinator prelude
         // through the shared decoder before answering.
@@ -351,7 +366,11 @@ mod tests {
     #[tokio::test]
     async fn broker_error_maps_to_rejection() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let socket = temp.path().join("control.sock");
         let server = tokio::spawn({
             let socket = socket.clone();
@@ -373,7 +392,11 @@ mod tests {
     #[tokio::test]
     async fn mismatched_result_kind_is_unexpected() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let socket = temp.path().join("control.sock");
         let server = tokio::spawn({
             let socket = socket.clone();

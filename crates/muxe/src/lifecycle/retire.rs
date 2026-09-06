@@ -161,6 +161,7 @@ mod tests {
             },
             target: None,
             handoff_id: None,
+            ready: None,
         }
     }
 

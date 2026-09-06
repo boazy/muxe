@@ -58,8 +58,8 @@ use crate::{
 use super::{
     control::{ControlClient, ControlError, handoff_from_hex},
     journal::{
-        self, ActivationJournal, JournalError, JournalState, MemberState, MemberTransition, UnitKind,
-        unit_hash,
+        self, ActivationJournal, JournalError, JournalState, MemberState, MemberTransition,
+        UnitKind, unit_hash,
     },
     registry::{BrokerEntry, Registry, RegistryError},
 };
@@ -130,15 +130,22 @@ pub enum ActivateError {
 /// The invoking host for `--host current` scoping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DetectedHost {
-    Zellij { session: String, bridge_path: PathBuf },
-    Herdr { discovery_key: String },
+    Zellij {
+        session: String,
+        bridge_path: PathBuf,
+    },
+    Herdr {
+        discovery_key: String,
+    },
 }
 
-/// Staged replacement bridge bytes with their verified digest.
+/// Candidate replacement bridge bytes.
+///
+/// Activation verifies these against the executable's embedded producer digest
+/// before preparing any selected Zellij unit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedBridge {
     pub bytes: Vec<u8>,
-    pub digest: String,
 }
 
 /// One retained coordinator control session.
@@ -146,7 +153,10 @@ pub struct StagedBridge {
 /// Sessions are held across status, prepare, commit, and abort for a single
 /// member because the old broker unlinks its listener at prepare: only the
 /// retained stream still reaches the old broker afterwards.
-#[expect(async_fn_in_trait, reason = "coordinator traits use static dispatch with one implementation per process; no Send bound is required")]
+#[expect(
+    async_fn_in_trait,
+    reason = "coordinator traits use static dispatch with one implementation per process; no Send bound is required"
+)]
 pub trait ControlSession {
     async fn status(&mut self) -> Result<ActivationStatus, ControlError>;
     async fn prepare(
@@ -180,7 +190,10 @@ impl ControlSession for ControlClient {
 }
 
 /// Factory for retained coordinator control sessions.
-#[expect(async_fn_in_trait, reason = "coordinator traits use static dispatch with one implementation per process; no Send bound is required")]
+#[expect(
+    async_fn_in_trait,
+    reason = "coordinator traits use static dispatch with one implementation per process; no Send bound is required"
+)]
 pub trait ControlPort {
     type Session: ControlSession;
     async fn connect(&self, socket: &Path) -> Result<Self::Session, ControlError>;
@@ -407,14 +420,14 @@ where
     }
 
     // Global preflight before any unit mutates.
-    if let Err(reason) = global_preflight(&inputs, &units) {
-        return Err(ActivateError::Preflight(reason));
-    }
+    let verified_bridge = global_preflight(&inputs, &units).map_err(ActivateError::Preflight)?;
     inputs.hooks.check(ActivateStep::PreflightDone)?;
 
     let mut report = ActivateReport::default();
     for unit in units {
-        report.units.push(activate_unit(&inputs, &unit).await);
+        report
+            .units
+            .push(activate_unit(&inputs, &unit, verified_bridge.as_ref()).await);
     }
     Ok(report)
 }
@@ -516,27 +529,25 @@ fn group_zellij(live: &[BrokerEntry]) -> Vec<PlannedUnit> {
 fn global_preflight<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     units: &[PlannedUnit],
-) -> Result<(), String>
+) -> Result<Option<compatibility::NativeAssetVerification>, String>
 where
     P: Preflight,
 {
-    if let Some(staged) = inputs.staged_bridge.as_ref() {
-        let found = fsutil::sha256_hex(&staged.bytes);
-        if found != staged.digest {
-            return Err(format!(
-                "staged bridge digest mismatch: expected {}, found {found}",
-                staged.digest
-            ));
-        }
-    }
-    if units
+    let zellij_selected = units
         .iter()
-        .any(|unit| matches!(unit, PlannedUnit::Zellij { .. }))
-        && inputs.staged_bridge.is_none()
-    {
-        return Err("a Zellij unit is selected but no staged replacement bridge was provided"
-            .to_owned());
-    }
+        .any(|unit| matches!(unit, PlannedUnit::Zellij { .. }));
+    let verified_bridge = if zellij_selected {
+        let staged = inputs.staged_bridge.as_ref().ok_or_else(|| {
+            "a Zellij unit is selected but no staged replacement bridge was provided".to_owned()
+        })?;
+        Some(
+            compatibility::verify_packaged_asset(&staged.bytes).map_err(|error| {
+                format!("staged bridge rejected by native package identity: {error}")
+            })?,
+        )
+    } else {
+        None
+    };
     inputs.preflight.validate_config()?;
     for unit in units {
         match unit {
@@ -548,7 +559,10 @@ where
                     .preflight
                     .revalidate_herdr_actions(&entry.discovery_key)?;
             }
-            PlannedUnit::Zellij { bridge_path, entries } => {
+            PlannedUnit::Zellij {
+                bridge_path,
+                entries,
+            } => {
                 let expected = integration::stable_bridge_path(inputs.config_dir);
                 if *bridge_path != expected {
                     return Err(format!(
@@ -564,15 +578,15 @@ where
             }
         }
     }
-    fsutil::ensure_owner_dir(&journal::activation_dir(inputs.cache_dir)).map_err(|error| {
-        format!("activation journal directory is not writable: {error}")
-    })?;
-    Ok(())
+    fsutil::ensure_owner_dir(&journal::activation_dir(inputs.cache_dir))
+        .map_err(|error| format!("activation journal directory is not writable: {error}"))?;
+    Ok(verified_bridge)
 }
 
 async fn activate_unit<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     unit: &PlannedUnit,
+    verified_bridge: Option<&compatibility::NativeAssetVerification>,
 ) -> UnitOutcome
 where
     C: ControlPort,
@@ -581,7 +595,7 @@ where
     P: Preflight,
 {
     let label = unit_label(unit);
-    match activate_unit_inner(inputs, unit).await {
+    match activate_unit_inner(inputs, unit, verified_bridge).await {
         Ok(outcome) => outcome,
         Err(ActivateError::FaultInjected { step }) => UnitOutcome::Failed {
             unit: label,
@@ -615,6 +629,7 @@ struct PreparedMember<C: ControlPort> {
 async fn activate_unit_inner<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     unit: &PlannedUnit,
+    verified_bridge: Option<&compatibility::NativeAssetVerification>,
 ) -> Result<UnitOutcome, ActivateError>
 where
     C: ControlPort,
@@ -684,8 +699,20 @@ where
         }
     }
     if let Some(reason) = drain_failure {
-        let rollback = abort_prepared(inputs, unit, &journal, &journal_path, prepared, Vec::new(), None).await;
-        return Ok(UnitOutcome::RolledBack { unit: label, reason: with_rollback(reason, rollback) });
+        let rollback = abort_prepared(
+            inputs,
+            unit,
+            &journal,
+            &journal_path,
+            prepared,
+            Vec::new(),
+            None,
+        )
+        .await;
+        return Ok(UnitOutcome::RolledBack {
+            unit: label,
+            reason: with_rollback(reason, rollback),
+        });
     }
     // Rewrite the journal with real old records and handoff IDs.
     journal.state = JournalState::Prepared;
@@ -697,12 +724,10 @@ where
         record.handoff_id = Some(member.handoff_hex.clone());
     }
     if matches!(unit, PlannedUnit::Zellij { .. }) {
-        let staged = inputs.staged_bridge.as_ref().ok_or_else(|| {
-            ActivateError::UnitFailed {
-                reason: "missing staged bridge for Zellij unit".to_owned(),
-            }
+        let verification = verified_bridge.ok_or_else(|| ActivateError::UnitFailed {
+            reason: "Zellij bridge was not verified during global preflight".to_owned(),
         })?;
-        journal.staged_bridge_digest = Some(staged.digest.clone());
+        journal.staged_bridge_digest = Some(verification.packaged_digest.clone());
     }
     journal::write_journal(inputs.cache_dir, &journal)?;
     inputs.hooks.check(ActivateStep::OldPrepared)?;
@@ -741,32 +766,54 @@ where
         }
     }
     if let Some(reason) = spawn_failure {
-        let rollback = abort_prepared(inputs, unit, &journal, &journal_path, prepared, targets, None).await;
-        return Ok(UnitOutcome::RolledBack { unit: label, reason: with_rollback(reason, rollback) });
+        let rollback = abort_prepared(
+            inputs,
+            unit,
+            &journal,
+            &journal_path,
+            prepared,
+            targets,
+            None,
+        )
+        .await;
+        return Ok(UnitOutcome::RolledBack {
+            unit: label,
+            reason: with_rollback(reason, rollback),
+        });
     }
     journal::write_journal(inputs.cache_dir, &journal)?;
     inputs.hooks.check(ActivateStep::TargetSpawned)?;
 
     // Zellij bridge transaction: swap once, reload every session.
     if let PlannedUnit::Zellij { .. } = unit {
-        let staged = inputs.staged_bridge.as_ref().ok_or_else(|| {
-            ActivateError::UnitFailed {
+        let staged = inputs
+            .staged_bridge
+            .as_ref()
+            .ok_or_else(|| ActivateError::UnitFailed {
                 reason: "missing staged bridge for Zellij unit".to_owned(),
-            }
-        })?;
-        let verification = compatibility::verify_packaged_asset(&staged.bytes, &staged.digest)?;
+            })?;
         let stable = integration::stable_bridge_path(inputs.config_dir);
         let directory = integration::integration_dir(inputs.config_dir);
         fsutil::ensure_owner_dir(&directory)?;
         let (expected_current, authority) = match activation_authority(&directory, &stable) {
             Ok(authority) => authority,
             Err(reason) => {
-                let rollback = abort_prepared(inputs, unit, &journal, &journal_path, prepared, targets, None)
-                    .await;
-                return Ok(UnitOutcome::RolledBack { unit: label, reason: with_rollback(reason, rollback) });
+                let rollback = abort_prepared(
+                    inputs,
+                    unit,
+                    &journal,
+                    &journal_path,
+                    prepared,
+                    targets,
+                    None,
+                )
+                .await;
+                return Ok(UnitOutcome::RolledBack {
+                    unit: label,
+                    reason: with_rollback(reason, rollback),
+                });
             }
         };
-        let _ = verification;
         let disk_staged = integration::bridge::stage(&stable, &staged.bytes)?;
         if stable.exists() {
             let record = integration::bridge::ensure_backup(&stable, authority.as_deref())?;
@@ -779,8 +826,20 @@ where
         {
             let reason = error.to_string();
             integration::bridge::discard_staging(&disk_staged);
-            let rollback = abort_prepared(inputs, unit, &journal, &journal_path, prepared, targets, None).await;
-            return Ok(UnitOutcome::RolledBack { unit: label, reason: with_rollback(reason, rollback) });
+            let rollback = abort_prepared(
+                inputs,
+                unit,
+                &journal,
+                &journal_path,
+                prepared,
+                targets,
+                None,
+            )
+            .await;
+            return Ok(UnitOutcome::RolledBack {
+                unit: label,
+                reason: with_rollback(reason, rollback),
+            });
         }
         inputs.hooks.check(ActivateStep::BridgeSwapped)?;
         let bridge_url = integration::kdl::bridge_url(&stable);
@@ -798,7 +857,10 @@ where
                     Some(&bridge_url),
                 )
                 .await;
-                return Ok(UnitOutcome::RolledBack { unit: label, reason: with_rollback(reason, rollback) });
+                return Ok(UnitOutcome::RolledBack {
+                    unit: label,
+                    reason: with_rollback(reason, rollback),
+                });
             }
         }
         inputs.hooks.check(ActivateStep::ReloadIssued)?;
@@ -836,7 +898,10 @@ where
                 bridge_url.as_deref(),
             )
             .await;
-            return Ok(UnitOutcome::RolledBack { unit: label, reason: with_rollback(reason, rollback) });
+            return Ok(UnitOutcome::RolledBack {
+                unit: label,
+                reason: with_rollback(reason, rollback),
+            });
         }
     }
     journal.state = JournalState::Ready;
@@ -851,7 +916,10 @@ where
     let mut commit_failures = Vec::new();
     for member in prepared.iter_mut() {
         if let Err(error) = member.old_session.commit(&member.handoff).await {
-            commit_failures.push(format!("commit old {}: {error}", member.entry.discovery_key));
+            commit_failures.push(format!(
+                "commit old {}: {error}",
+                member.entry.discovery_key
+            ));
         }
     }
     for member in &prepared {
@@ -907,12 +975,9 @@ where
         .prepare(&inputs.target)
         .await
         .map_err(|error| format!("prepare failed for {}: {error}", entry.discovery_key))?;
-    let handoff = prepared.handoff_id.ok_or_else(|| {
-        format!(
-            "prepare gave no handoff ID for {}",
-            entry.discovery_key
-        )
-    })?;
+    let handoff = prepared
+        .handoff_id
+        .ok_or_else(|| format!("prepare gave no handoff ID for {}", entry.discovery_key))?;
     Ok(PreparedMember {
         old_record: status.current,
         entry: entry.clone(),
@@ -1075,9 +1140,7 @@ where
                         for record in &journal.members {
                             let session = record.host_identity.clone();
                             if let Err(error) = inputs.reloader.reload_bridge(&session, url) {
-                                rollback_errors.push(format!(
-                                    "rollback reload {session}: {error}"
-                                ));
+                                rollback_errors.push(format!("rollback reload {session}: {error}"));
                             }
                         }
                     }
@@ -1121,12 +1184,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// closed instead of swallowing the sink error.
 fn log(logger: Option<&Logger>, unit: &str, message: &str) -> Result<(), ActivateError> {
     if let Some(logger) = logger {
-        let event = crate::logging::LogEvent::new(
-            logger.version().to_owned(),
-            unit,
-            "activate",
-            message,
-        )?;
+        let event =
+            crate::logging::LogEvent::new(logger.version().to_owned(), unit, "activate", message)?;
         logger.append(&event)?;
     }
     Ok(())
@@ -1199,9 +1258,7 @@ where
     // journals. Whoever answers — drained old, live old, or claimed target —
     // reports exact lifecycle, record, and handoff for comparison.
     enum Probe {
-        Answer {
-            status: ActivationStatus,
-        },
+        Answer { status: ActivationStatus },
         Silent,
     }
     let mut probes = Vec::new();
@@ -1287,7 +1344,9 @@ where
             if let Err(error) = journal::remove_journal(path) {
                 return RecoveryOutcome::Preserved {
                     unit,
-                    reason: format!("target state is committed but the journal could not be removed: {error}"),
+                    reason: format!(
+                        "target state is committed but the journal could not be removed: {error}"
+                    ),
                 };
             }
             return RecoveryOutcome::Committed { unit };
@@ -1354,7 +1413,9 @@ where
         if let Err(error) = journal::remove_journal(path) {
             return RecoveryOutcome::Preserved {
                 unit,
-                reason: format!("old unit was restored but the journal could not be removed: {error}"),
+                reason: format!(
+                    "old unit was restored but the journal could not be removed: {error}"
+                ),
             };
         }
         RecoveryOutcome::RolledBack {
@@ -1390,15 +1451,18 @@ where
 {
     let (stable, backup, staged_digest, old_digest) = match journal.unit.clone() {
         UnitKind::Zellij { .. } => {
-            let backup = journal.backup_path.clone().ok_or_else(|| {
-                "no recorded bridge backup; diagnosis required".to_owned()
-            })?;
-            let staged = journal.staged_bridge_digest.clone().ok_or_else(|| {
-                "no recorded staged digest; diagnosis required".to_owned()
-            })?;
-            let old = journal.old_bridge_digest.clone().ok_or_else(|| {
-                "no recorded old digest; diagnosis required".to_owned()
-            })?;
+            let backup = journal
+                .backup_path
+                .clone()
+                .ok_or_else(|| "no recorded bridge backup; diagnosis required".to_owned())?;
+            let staged = journal
+                .staged_bridge_digest
+                .clone()
+                .ok_or_else(|| "no recorded staged digest; diagnosis required".to_owned())?;
+            let old = journal
+                .old_bridge_digest
+                .clone()
+                .ok_or_else(|| "no recorded old digest; diagnosis required".to_owned())?;
             // The stable path lives under the integration directory, not the
             // cache directory; recover it from the backup's parent.
             let stable = backup
@@ -1410,16 +1474,16 @@ where
         UnitKind::Herdr { .. } => return Ok(()),
     };
     let _ = cache_dir;
-    let current = std::fs::read(&stable)
-        .map_err(|error| format!("cannot read stable bridge: {error}"))?;
+    let current =
+        std::fs::read(&stable).map_err(|error| format!("cannot read stable bridge: {error}"))?;
     if fsutil::sha256_hex(&current) != staged_digest {
         return Err("stable bridge is neither staged nor old; diagnosis required".to_owned());
     }
     std::fs::rename(&backup, &stable)
         .map_err(|error| format!("cannot restore old bridge: {error}"))?;
     let _ = fsutil::sync_dir_of(&stable);
-    let restored =
-        std::fs::read(&stable).map_err(|error| format!("cannot verify restored bridge: {error}"))?;
+    let restored = std::fs::read(&stable)
+        .map_err(|error| format!("cannot verify restored bridge: {error}"))?;
     if fsutil::sha256_hex(&restored) != old_digest {
         return Err("restored bridge digest mismatch; diagnosis required".to_owned());
     }
@@ -1519,122 +1583,121 @@ mod tests {
             let mut decoder = ControlDecoder::new(ControlPolicy::broker());
             let mut buffer = [0u8; 8192];
             loop {
-                let read =
-                    match tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => read,
-                    };
+                let read = match tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
                 let mut requests = Vec::new();
                 decoder
                     .push(&buffer[..read], |message| {
                         if let ControlMessage::Request(request) = message {
                             requests.push(request);
                         }
-                })
-                .expect("decode coordinator frame");
-            for request in requests {
-                let result = match request.operation {
-                    ControlOperation::Status => ControlResult::Status(status_of(
-                        &script.current,
-                        None,
-                        &discovery,
-                        LifecycleState::Running,
-                    )),
-                    ControlOperation::Prepare { target } => {
-                        assert_eq!(target.muxe_version, "0.2.0");
-                        if script.fail_prepare {
-                            events
-                                .lock()
-                                .expect("fixture events are not poisoned")
-                                .push("prepare-refused".to_owned());
-                            ControlResult::Error {
-                                diagnostic: "prepare refused: non-cancellable work".to_owned(),
-                            }
-                        } else {
-                            let handoff = handoff(script.handoff_byte);
-                            prepared_handoff = Some(handoff);
-                            events
-                                .lock()
-                                .expect("fixture events are not poisoned")
-                                .push("prepared".to_owned());
-                            // Drain: close and unlink the listener while
-                            // keeping this accepted stream open.
-                            drop(listener_slot.take());
-                            let _ = std::fs::remove_file(&socket);
-                            ControlResult::Prepared(status_of(
-                                &script.current,
-                                Some(handoff),
-                                &discovery,
-                                LifecycleState::Draining,
-                            ))
-                        }
-                    }
-                    ControlOperation::Commit { handoff_id } => {
-                        if Some(handoff_id) == prepared_handoff {
-                            events
-                                .lock()
-                                .expect("fixture events are not poisoned")
-                                .push("old-committed".to_owned());
-                            ControlResult::Committed(status_of(
-                                &target_record(),
-                                Some(handoff_id),
-                                &discovery,
-                                LifecycleState::SupervisorOnly,
-                            ))
-                        } else {
-                            ControlResult::Error {
-                                diagnostic: "handoff mismatch".to_owned(),
+                    })
+                    .expect("decode coordinator frame");
+                for request in requests {
+                    let result = match request.operation {
+                        ControlOperation::Status => ControlResult::Status(status_of(
+                            &script.current,
+                            None,
+                            &discovery,
+                            LifecycleState::Running,
+                        )),
+                        ControlOperation::Prepare { target } => {
+                            assert_eq!(target.muxe_version, "0.2.0");
+                            if script.fail_prepare {
+                                events
+                                    .lock()
+                                    .expect("fixture events are not poisoned")
+                                    .push("prepare-refused".to_owned());
+                                ControlResult::Error {
+                                    diagnostic: "prepare refused: non-cancellable work".to_owned(),
+                                }
+                            } else {
+                                let handoff = handoff(script.handoff_byte);
+                                prepared_handoff = Some(handoff);
+                                events
+                                    .lock()
+                                    .expect("fixture events are not poisoned")
+                                    .push("prepared".to_owned());
+                                // Drain: close and unlink the listener while
+                                // keeping this accepted stream open.
+                                drop(listener_slot.take());
+                                let _ = std::fs::remove_file(&socket);
+                                ControlResult::Prepared(status_of(
+                                    &script.current,
+                                    Some(handoff),
+                                    &discovery,
+                                    LifecycleState::Draining,
+                                ))
                             }
                         }
-                    }
-                    ControlOperation::Abort { handoff_id } => {
-                        if Some(handoff_id) == prepared_handoff {
-                            events
-                                .lock()
-                                .expect("fixture events are not poisoned")
-                                .push("old-aborted".to_owned());
-                            ControlResult::Aborted(status_of(
-                                &script.current,
-                                None,
-                                &discovery,
-                                LifecycleState::Running,
-                            ))
-                        } else {
-                            ControlResult::Error {
-                                diagnostic: "handoff mismatch".to_owned(),
+                        ControlOperation::Commit { handoff_id } => {
+                            if Some(handoff_id) == prepared_handoff {
+                                events
+                                    .lock()
+                                    .expect("fixture events are not poisoned")
+                                    .push("old-committed".to_owned());
+                                ControlResult::Committed(status_of(
+                                    &target_record(),
+                                    Some(handoff_id),
+                                    &discovery,
+                                    LifecycleState::SupervisorOnly,
+                                ))
+                            } else {
+                                ControlResult::Error {
+                                    diagnostic: "handoff mismatch".to_owned(),
+                                }
                             }
                         }
+                        ControlOperation::Abort { handoff_id } => {
+                            if Some(handoff_id) == prepared_handoff {
+                                events
+                                    .lock()
+                                    .expect("fixture events are not poisoned")
+                                    .push("old-aborted".to_owned());
+                                ControlResult::Aborted(status_of(
+                                    &script.current,
+                                    None,
+                                    &discovery,
+                                    LifecycleState::Running,
+                                ))
+                            } else {
+                                ControlResult::Error {
+                                    diagnostic: "handoff mismatch".to_owned(),
+                                }
+                            }
+                        }
+                        ControlOperation::Retire => ControlResult::Retired(status_of(
+                            &script.current,
+                            None,
+                            &discovery,
+                            LifecycleState::Retired,
+                        )),
+                    };
+                    let response = ControlMessage::Response(ControlResponse {
+                        request_id: request.request_id,
+                        result,
+                    });
+                    let payload = serde_json::to_vec(&response).unwrap();
+                    use tokio::io::AsyncWriteExt;
+                    // Polling coordinators may drop between status and read; a
+                    // dead stream ends this connection, never the task.
+                    if stream
+                        .write_all(&(payload.len() as u32).to_be_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
-                    ControlOperation::Retire => ControlResult::Retired(status_of(
-                        &script.current,
-                        None,
-                        &discovery,
-                        LifecycleState::Retired,
-                    )),
-                };
-                let response = ControlMessage::Response(ControlResponse {
-                    request_id: request.request_id,
-                    result,
-                });
-                let payload = serde_json::to_vec(&response).unwrap();
-                use tokio::io::AsyncWriteExt;
-                // Polling coordinators may drop between status and read; a
-                // dead stream ends this connection, never the task.
-                if stream
-                    .write_all(&(payload.len() as u32).to_be_bytes())
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                if stream.write_all(&payload).await.is_err() {
-                    break;
-                }
-                if stream.flush().await.is_err() {
-                    break;
+                    if stream.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                    if stream.flush().await.is_err() {
+                        break;
+                    }
                 }
             }
-        }
         }
     }
 
@@ -1650,6 +1713,7 @@ mod tests {
             current: current.clone(),
             target: None,
             handoff_id: handoff,
+            ready: None,
         }
     }
 
@@ -1690,17 +1754,13 @@ mod tests {
                 for request in requests {
                     let handoff = handoff(script.handoff_byte);
                     let result = match request.operation {
-                        ControlOperation::Status => {
-                            ControlResult::Status(status_of(
-                                &script.target,
-                                Some(handoff),
-                                &discovery,
-                                LifecycleState::Running,
-                            ))
-                        }
-                        ControlOperation::Commit { handoff_id }
-                            if handoff_id == handoff =>
-                        {
+                        ControlOperation::Status => ControlResult::Status(status_of(
+                            &script.target,
+                            Some(handoff),
+                            &discovery,
+                            LifecycleState::Running,
+                        )),
+                        ControlOperation::Commit { handoff_id } if handoff_id == handoff => {
                             ControlResult::Committed(status_of(
                                 &script.target,
                                 Some(handoff),
@@ -1751,9 +1811,9 @@ mod tests {
                     if stream.flush().await.is_err() {
                         break;
                     }
+                }
             }
         }
-    }
     }
 
     use muxe_protocol::control::{
@@ -1813,7 +1873,11 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::TempDir::new().unwrap();
-            std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(
+                temp.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
             let cache = temp.path().join("cache");
             let config = temp.path().join("config");
             for directory in [&cache, &config] {
@@ -1838,7 +1902,11 @@ mod tests {
 
         /// Registers a framed old broker and returns its socket. The listener
         /// stays bound (liveness probe connects) until prepare unlinks it.
-        async fn old_broker(&self, discovery_key: &str, script: BrokerScript) -> (PathBuf, JoinHandle<()>) {
+        async fn old_broker(
+            &self,
+            discovery_key: &str,
+            script: BrokerScript,
+        ) -> (PathBuf, JoinHandle<()>) {
             let socket = self.cache.join(format!("{discovery_key}.sock"));
             std::fs::create_dir_all(&self.cache).unwrap();
             let registry = Registry::open(&self.cache).unwrap();
@@ -1867,11 +1935,18 @@ mod tests {
             (socket, handle)
         }
 
-        fn spawn_target_task(&self, socket: PathBuf, script: TargetScript, discovery: &str) -> JoinHandle<()> {
+        fn spawn_target_task(
+            &self,
+            socket: PathBuf,
+            script: TargetScript,
+            discovery: &str,
+        ) -> JoinHandle<()> {
             tokio::spawn(serve_target(socket, script, discovery.to_owned()))
         }
 
-        fn herdr_inputs(&self) -> ActivateInputs<'_, LiveControl, ProcessSpawner, FixtureReloader, FixturePreflight>
+        fn herdr_inputs(
+            &self,
+        ) -> ActivateInputs<'_, LiveControl, ProcessSpawner, FixtureReloader, FixturePreflight>
         {
             ActivateInputs {
                 config_dir: &self.config,
@@ -1923,7 +1998,10 @@ mod tests {
             }]
         );
         assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
-        let events = fixture.events.lock().expect("fixture events are not poisoned");
+        let events = fixture
+            .events
+            .lock()
+            .expect("fixture events are not poisoned");
         assert!(events.contains(&"prepared".to_owned()));
         assert!(events.contains(&"old-committed".to_owned()));
         old.abort();
@@ -1933,21 +2011,23 @@ mod tests {
     #[tokio::test]
     async fn prepare_refusal_rolls_back_without_mutation() {
         let fixture = Fixture::new();
-        let (_socket, old) = fixture.old_broker(
-            "server",
-            BrokerScript {
-                fail_prepare: true,
-                ..herdr_script()
-            },
-        ).await;
+        let (_socket, old) = fixture
+            .old_broker(
+                "server",
+                BrokerScript {
+                    fail_prepare: true,
+                    ..herdr_script()
+                },
+            )
+            .await;
         let report = activate(fixture.herdr_inputs()).await.unwrap();
-        assert!(matches!(
-            report.units[0],
-            UnitOutcome::RolledBack { .. }
-        ));
+        assert!(matches!(report.units[0], UnitOutcome::RolledBack { .. }));
         // The old broker refused prepare and was never drained, so there is
         // nothing to abort and no target was spawned.
-        let events = fixture.events.lock().expect("fixture events are not poisoned");
+        let events = fixture
+            .events
+            .lock()
+            .expect("fixture events are not poisoned");
         assert!(events.contains(&"prepare-refused".to_owned()));
         assert!(!events.contains(&"old-aborted".to_owned()));
         old.abort();
@@ -1960,11 +2040,11 @@ mod tests {
         // No target task is spawned by the test, but the spawner still runs
         // real process mechanics (/bin/sleep child, killed on abort).
         let report = activate(fixture.herdr_inputs()).await.unwrap();
-        assert!(matches!(
-            report.units[0],
-            UnitOutcome::RolledBack { .. }
-        ));
-        let events = fixture.events.lock().expect("fixture events are not poisoned");
+        assert!(matches!(report.units[0], UnitOutcome::RolledBack { .. }));
+        let events = fixture
+            .events
+            .lock()
+            .expect("fixture events are not poisoned");
         assert!(events.contains(&"old-aborted".to_owned()));
         old.abort();
     }
@@ -2059,10 +2139,7 @@ mod tests {
         let outcomes = recover(&fixture.cache, &fixture.control, &fixture.reloader, None)
             .await
             .unwrap();
-        assert!(matches!(
-            outcomes[0],
-            RecoveryOutcome::Preserved { .. }
-        ));
+        assert!(matches!(outcomes[0], RecoveryOutcome::Preserved { .. }));
         assert!(path.exists());
     }
 
@@ -2072,7 +2149,11 @@ mod tests {
         // Command path, argument vector, and failure detection run without
         // touching any live host.
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let recorded = temp.path().join("args");
         let program = temp.path().join("zellij");
         std::fs::write(
@@ -2092,9 +2173,14 @@ mod tests {
             .reload_bridge("session-a", "file:/bridge.wasm")
             .unwrap();
         let args = std::fs::read_to_string(&recorded).unwrap();
-        assert!(args.contains("--session\nsession-a\naction\nstart-or-reload-plugin\nfile:/bridge.wasm")
-            || args.contains("start-or-reload-plugin"));
-        let error = reloader.reload_bridge("bad", "file:/bridge.wasm").unwrap_err();
+        assert!(
+            args.contains(
+                "--session\nsession-a\naction\nstart-or-reload-plugin\nfile:/bridge.wasm"
+            ) || args.contains("start-or-reload-plugin")
+        );
+        let error = reloader
+            .reload_bridge("bad", "file:/bridge.wasm")
+            .unwrap_err();
         assert!(matches!(error, ActivateError::Reload { .. }));
     }
 
