@@ -407,14 +407,7 @@ jobs:
           echo "previous=$prev" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: pinned host presence and versions
-        run: |
-          set -euo pipefail
-          command -v zellij || { echo "MISSING: zellij 0.46.0 on this runner"; exit 1; }
-          command -v herdr || { echo "MISSING: herdr 0.8.2 on this runner"; exit 1; }
-          zellij --version | grep -F "0.46.0"
-          herdr --version | grep -F "0.8.2"
-      - name: live-host approval opt-in
+      - name: live-host approval opt-in (before costly installs)
         # The isolated Zellij probe permissions and the bridge-digest design
         # decision are user approvals, not CI autodetects. The gate fails
         # closed naming them until the release owner records approval by
@@ -429,22 +422,65 @@ jobs:
               "after those approvals exist."
             exit 1
           }
-      - name: session handoff scenario
-        # All prerequisites above passed. The multi-session bridge-sharing
-        # upgrade/rollback scenario (two Zellij sessions, two clients in one
-        # session, Herdr subscription move) runs from a checked-in runner so
-        # this gate exercises production paths instead of echoing a runbook.
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - name: pinned Zellij host (source build at pin)
+        # Mirrors the scheduled host matrix: no official 0.46.0 release
+        # asset exists, so build the exact pinned source revision. Pin
+        # values come from pins/zellij.toml, never from this file.
         run: |
           set -euo pipefail
-          test -f tools/release/live-upgrade.sh || {
-            echo "BLOCKED: all live prerequisites pass but" \
-              "tools/release/live-upgrade.sh is not yet wired; the scenario" \
-              "runner is the missing prerequisite."
+          zrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/zellij.toml)"
+          zrev="$(sed -n 's/^revision = "\(.*\)"$/\1/p' pins/zellij.toml)"
+          zver="$(sed -n 's/^host_version = "\(.*\)"$/\1/p' pins/zellij.toml)"
+          test -n "$zrepo"
+          test -n "$zrev"
+          test -n "$zver"
+          zdir="$RUNNER_TEMP/zellij-host"
+          mkdir -p "$zdir"
+          env -u RUSTUP_TOOLCHAIN cargo install --git "$zrepo" --rev "$zrev" \
+            --locked --root "$zdir" zellij
+          echo "$zdir/bin" >> "$GITHUB_PATH"
+          "$zdir/bin/zellij" --version | grep -F "$zver"
+      - name: pinned Herdr host (0.8.2, digest-verified)
+        # Official v0.8.2 assets with published SHA-256 digests
+        # (release id 373248423), verified here before use.
+        run: |
+          set -euo pipefail
+          file_digest() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
+            elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
+          hasset="herdr-linux-x86_64"
+          hdigest="976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4"
+          hdir="$RUNNER_TEMP/herdr-host"
+          mkdir -p "$hdir"
+          curl -fSL "https://github.com/herdrdev/herdr/releases/download/v0.8.2/$hasset" -o "$hdir/herdr"
+          test "$(file_digest "$hdir/herdr")" = "$hdigest" || {
+            echo "Herdr release asset digest mismatch for $hasset"
             exit 1
           }
+          chmod 755 "$hdir/herdr"
+          echo "$hdir" >> "$GITHUB_PATH"
+          "$hdir/herdr" --version | grep -F "0.8.2"
+      - name: target archives for the driver
+        uses: actions/download-artifact@v4
+        with:
+          path: target-dist
+          merge-multiple: true
+      - name: upgrade and rollback driver
+        # tools/release/live-upgrade.sh stages both stacks from real archives
+        # and hands them to the broker-owned session scenario. Until that
+        # scenario command exists the driver fails closed naming it; the
+        # predecessor, host, and approval checks above are all real.
+        run: |
+          set -euo pipefail
           test -n "${PREVIOUS:-}" || { echo "BLOCKED: no predecessor recorded"; exit 1; }
-          bash tools/release/live-upgrade.sh "$PREVIOUS" "$GITHUB_REF_NAME"
-
+          bash tools/release/live-upgrade.sh "$PREVIOUS" "$GITHUB_REF_NAME" target-dist upgrade-work
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   publish:
     name: publish release (all gates green)
     needs: [verify, live-matrix, live-upgrade]
