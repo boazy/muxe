@@ -12,22 +12,25 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use eyre::{bail, Result, WrapErr};
 use quote::ToTokens;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use syn::{Attribute, Fields, FnArg, Item, ItemEnum, ItemFn, ItemStruct, ItemType, Pat, ReturnType, Type, Variant, Visibility};
 
 use crate::classification::{ConverterClass, FunctionClass};
 
-const DEFAULT_SOURCE_ROOT: &str = ".local/pins/zellij/checkout";
+const DEFAULT_SOURCE_ROOT: &str = "fixtures/zellij/0.46.0/source";
 const DEFAULT_PIN: &str = "pins/zellij.toml";
 const DEFAULT_FUNCTION_POLICY: &str = "fixtures/zellij/0.46.0/public-functions.policy";
 const DEFAULT_CONVERTER_POLICY: &str = "fixtures/zellij/0.46.0/action-converters.policy";
 const DEFAULT_OUTPUT: &str = "fixtures/zellij/0.46.0/action-inventory.rs";
+const FIXTURE_HASHES: &str = "source-inputs.sha256";
 const ACTION_SOURCE: &str = "zellij-utils/src/input/actions.rs";
 const SHIM_SOURCE: &str = "zellij-tile/src/shim.rs";
 
@@ -76,15 +79,31 @@ struct Arguments {
     converter_policy: PathBuf,
     output: PathBuf,
     check: bool,
+    materialize_fixtures: bool,
+    verify_fixtures: bool,
     write_function_template: bool,
     write_converter_template: bool,
 }
 
 #[derive(Debug)]
 struct Pin {
+    repository: String,
     revision: String,
     host_version: String,
+    crate_name: String,
     source_inputs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackage>,
+}
+
+#[derive(Deserialize)]
+struct CargoPackage {
+    name: String,
+    source: Option<String>,
+    manifest_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -145,10 +164,62 @@ fn run() -> Result<()> {
     }
     require_input(&pin, SHIM_SOURCE)?;
 
-    let actions_path = arguments.source_root.join(ACTION_SOURCE);
-    let shim_path = arguments.source_root.join(SHIM_SOURCE);
-    let actions_source = read(&actions_path)?;
-    let shim_source = read(&shim_path)?;
+    if arguments.materialize_fixtures {
+        let source_root = resolved_cargo_source_root(&pin)?;
+        materialize_fixture_corpus(&source_root, &arguments.source_root, &pin)?;
+        return Ok(());
+    }
+
+    if arguments.verify_fixtures {
+        let source_root = resolved_cargo_source_root(&pin)?;
+        let fresh_root = fresh_fixture_root()?;
+        materialize_fixture_corpus(&source_root, &fresh_root, &pin)?;
+        if let Err(error) = compare_fixture_corpus(&arguments.source_root, &fresh_root, &pin)
+            .and_then(|()| {
+                let source_hashes = fixture_source_hashes(&fresh_root, &pin)?;
+                let generated = generate_from_source(&arguments, &pin, &fresh_root, &source_hashes)?;
+                let existing = read(&arguments.output)?;
+                (existing == generated).then_some(()).ok_or_else(|| {
+                    eyre::eyre!(
+                        "{} differs from a freshly materialized pinned fixture corpus at {}",
+                        arguments.output.display(),
+                        fresh_root.display()
+                    )
+                })
+            })
+        {
+            return Err(error);
+        }
+        fs::remove_dir_all(&fresh_root)
+            .wrap_err_with(|| format!("could not remove fresh fixture directory {}", fresh_root.display()))?;
+        return Ok(());
+    }
+
+    let source_hashes = fixture_source_hashes(&arguments.source_root, &pin)?;
+    let generated = generate_from_source(&arguments, &pin, &arguments.source_root, &source_hashes)?;
+    if arguments.check {
+        let existing = read(&arguments.output)?;
+        if existing != generated {
+            bail!(
+                "{} is not reproducible from pin {}; run muxe-zellij-gen",
+                arguments.output.display(),
+                arguments.pin.display()
+            );
+        }
+    } else {
+        write_file(&arguments.output, generated)?;
+    }
+    Ok(())
+}
+
+fn generate_from_source(
+    arguments: &Arguments,
+    pin: &Pin,
+    source_root: &Path,
+    source_hashes: &BTreeMap<String, String>,
+) -> Result<String> {
+    let actions_source = read(&source_root.join(ACTION_SOURCE))?;
+    let shim_source = read(&source_root.join(SHIM_SOURCE))?;
     let action_variants = parse_action_variants(&actions_source)?;
     let direct_types = direct_action_types(&actions_source)?;
     let shim_functions = public_function_specs(&shim_source)?;
@@ -176,36 +247,20 @@ fn run() -> Result<()> {
     reject_unsupported_converters(&converter_policy)?;
     let mut mirror_roots = direct_types.clone();
     mirror_roots.extend(command_type_roots(&shim_functions, &function_policy));
-    let mirror_schema = mirror_schema(&arguments.source_root, &mirror_roots)?;
+    let mirror_schema = mirror_schema(source_root, &mirror_roots)?;
     validate_unsupported_function_policy(&function_policy)?;
 
-
-    let source_hashes = source_hashes(&arguments.source_root, &pin.source_inputs)?;
-    let generated = generate(
-        &pin,
+    generate(
+        pin,
         &mirror_schema,
-        &source_hashes,
+        source_hashes,
         &shim_functions,
         &action_variants,
         &direct_types,
         &public_functions,
         &function_policy,
         &converter_policy,
-    )?;
-
-    if arguments.check {
-        let existing = read(&arguments.output)?;
-        if existing != generated {
-            bail!(
-                "{} is not reproducible from pin {}; run muxe-zellij-gen",
-                arguments.output.display(),
-                arguments.pin.display()
-            );
-        }
-    } else {
-        write_file(&arguments.output, generated)?;
-    }
-    Ok(())
+    )
 }
 
 fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Arguments> {
@@ -216,6 +271,8 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
         converter_policy: PathBuf::from(DEFAULT_CONVERTER_POLICY),
         output: PathBuf::from(DEFAULT_OUTPUT),
         check: false,
+        materialize_fixtures: false,
+        verify_fixtures: false,
         write_function_template: false,
         write_converter_template: false,
     };
@@ -228,17 +285,25 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
             "--converter-policy" => result.converter_policy = PathBuf::from(next_value(&mut arguments, "--converter-policy")?),
             "--output" => result.output = PathBuf::from(next_value(&mut arguments, "--output")?),
             "--check" => result.check = true,
+            "--materialize-fixtures" => result.materialize_fixtures = true,
+            "--verify-fixtures" => result.verify_fixtures = true,
             "--write-function-template" => result.write_function_template = true,
             "--write-converter-template" => result.write_converter_template = true,
             "--help" | "-h" => {
-                println!("Usage: muxe-zellij-gen [--source-root PATH] [--pin PATH] [--function-policy PATH] [--converter-policy PATH] [--output PATH] [--check] [--write-function-template] [--write-converter-template]");
+                println!("Usage: muxe-zellij-gen [--source-root PATH] [--pin PATH] [--function-policy PATH] [--converter-policy PATH] [--output PATH] [--check | --materialize-fixtures | --verify-fixtures] [--write-function-template] [--write-converter-template]");
                 std::process::exit(0);
             }
             _ => bail!("unknown argument {argument:?}"),
         }
     }
-    if result.check && (result.write_function_template || result.write_converter_template) {
-        bail!("--check cannot be combined with a template-writing option");
+    let special_modes = u8::from(result.materialize_fixtures) + u8::from(result.verify_fixtures);
+    if special_modes > 1 {
+        bail!("--materialize-fixtures and --verify-fixtures are mutually exclusive");
+    }
+    if (result.check || special_modes > 0)
+        && (result.write_function_template || result.write_converter_template)
+    {
+        bail!("--check and fixture modes cannot be combined with template-writing options");
     }
     Ok(result)
 }
@@ -251,15 +316,22 @@ fn next_value(arguments: &mut impl Iterator<Item = String>, option: &str) -> Res
 
 fn parse_pin(path: &Path) -> Result<Pin> {
     let source = read(path)?;
+    let repository = pin_scalar(&source, "repository")?;
     let revision = pin_scalar(&source, "revision")?;
     let host_version = pin_scalar(&source, "host_version")?;
+    let crate_name = pin_scalar(&source, "crate")?;
     let source_inputs = pin_array(&source, "source_inputs")?;
     if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("{} has invalid revision {revision:?}", path.display());
     }
+    if !repository.starts_with("https://") {
+        bail!("{} has a non-HTTPS repository {repository:?}", path.display());
+    }
     Ok(Pin {
+        repository,
         revision,
         host_version,
+        crate_name,
         source_inputs,
     })
 }
@@ -312,6 +384,224 @@ fn require_input(pin: &Pin, required: &str) -> Result<()> {
     } else {
         bail!("pinned source_inputs must explicitly include {required}")
     }
+}
+
+fn resolved_cargo_source_root(pin: &Pin) -> Result<PathBuf> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .args(["metadata", "--locked", "--format-version", "1"])
+        .output()
+        .wrap_err("could not run cargo metadata for the pinned Zellij SDK")?;
+    if !output.status.success() {
+        bail!(
+            "cargo metadata could not resolve the pinned Zellij SDK: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let metadata: CargoMetadata =
+        serde_json::from_slice(&output.stdout).wrap_err("cargo metadata returned invalid JSON")?;
+    let packages = metadata
+        .packages
+        .iter()
+        .filter(|package| package.name == pin.crate_name)
+        .collect::<Vec<_>>();
+    if packages.len() != 1 {
+        bail!(
+            "cargo metadata must resolve exactly one pinned SDK package {:?}, found {}",
+            pin.crate_name,
+            packages.len()
+        );
+    }
+    let package = packages[0];
+    let source = package
+        .source
+        .as_deref()
+        .ok_or_else(|| eyre::eyre!("resolved SDK package {:?} is not a git source", pin.crate_name))?;
+    let (source_with_query, resolved_revision) = source
+        .rsplit_once('#')
+        .ok_or_else(|| eyre::eyre!("resolved SDK source has no revision fragment: {source:?}"))?;
+    let source_with_query = source_with_query
+        .strip_prefix("git+")
+        .ok_or_else(|| eyre::eyre!("resolved SDK source is not git: {source:?}"))?;
+    let (resolved_repository, query) = source_with_query
+        .split_once('?')
+        .ok_or_else(|| eyre::eyre!("resolved SDK source has no revision query: {source:?}"))?;
+    if resolved_repository.trim_end_matches(".git") != pin.repository.trim_end_matches(".git")
+        || query != format!("rev={}", pin.revision)
+        || resolved_revision != pin.revision
+    {
+        bail!(
+            "resolved SDK source differs from pins/zellij.toml: expected repository {:?} and revision {:?}, found {source:?}",
+            pin.repository,
+            pin.revision
+        );
+    }
+    let source_root = package
+        .manifest_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| eyre::eyre!("resolved SDK manifest has no repository root: {}", package.manifest_path.display()))?
+        .to_owned();
+    source_hashes(&source_root, &pin.source_inputs)?;
+    Ok(source_root)
+}
+
+fn fixture_source_paths() -> BTreeSet<String> {
+    MIRROR_SOURCES
+        .iter()
+        .copied()
+        .chain(std::iter::once(SHIM_SOURCE))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn materialize_fixture_corpus(source_root: &Path, fixture_root: &Path, pin: &Pin) -> Result<()> {
+    let hashes = source_hashes(source_root, &pin.source_inputs)?;
+    for relative in fixture_source_paths() {
+        require_input(pin, &relative)?;
+        let source = read(&source_root.join(&relative))?;
+        let reduced = if relative == SHIM_SOURCE {
+            minimized_shim_source(&source, &relative)?
+        } else {
+            minimized_model_source(&source, &relative)?
+        };
+        write_file(&fixture_root.join(relative), reduced)?;
+    }
+    write_file(&fixture_root.join(FIXTURE_HASHES), render_fixture_hashes(&hashes)?)?;
+    Ok(())
+}
+
+fn minimized_model_source(source: &str, relative: &str) -> Result<String> {
+    let file = syn::parse_file(source)
+        .wrap_err_with(|| format!("could not parse pinned fixture source {relative}"))?;
+    let mut reduced = String::new();
+    let mut retained = 0usize;
+    for item in file.items {
+        match item {
+            Item::Struct(item) => {
+                writeln!(reduced, "{}\n", item.to_token_stream())?;
+                retained += 1;
+            }
+            Item::Enum(item) => {
+                writeln!(reduced, "{}\n", item.to_token_stream())?;
+                retained += 1;
+            }
+            Item::Type(item) => {
+                writeln!(reduced, "{}\n", item.to_token_stream())?;
+                retained += 1;
+            }
+            _ => {}
+        }
+    }
+    if retained == 0 {
+        bail!("minimized fixture source {relative} would contain no type declarations");
+    }
+    format_minimized_fixture(reduced, relative)
+}
+
+fn minimized_shim_source(source: &str, relative: &str) -> Result<String> {
+    let file = syn::parse_file(source)
+        .wrap_err_with(|| format!("could not parse pinned fixture source {relative}"))?;
+    let mut reduced = String::new();
+    let mut retained = 0usize;
+    for item in file.items {
+        let Item::Fn(function) = item else {
+            continue;
+        };
+        if !matches!(function.vis, Visibility::Public(_)) {
+            continue;
+        }
+        writeln!(reduced, "pub {} {{}}\n", function.sig.to_token_stream())?;
+        retained += 1;
+    }
+    if retained == 0 {
+        bail!("minimized fixture source {relative} would contain no public functions");
+    }
+    format_minimized_fixture(reduced, relative)
+}
+
+fn format_minimized_fixture(reduced: String, relative: &str) -> Result<String> {
+    let parsed = syn::parse_file(&reduced)
+        .wrap_err_with(|| format!("could not format minimized fixture source {relative}"))?;
+    Ok(format!(
+        "// Minimized from the exact pinned source: {relative}\n\n{}",
+        prettyplease::unparse(&parsed)
+    ))
+}
+
+fn render_fixture_hashes(hashes: &BTreeMap<String, String>) -> Result<String> {
+    let mut rendered = String::from(
+        "# SHA-256 of every full upstream source input; generated with --materialize-fixtures.\n",
+    );
+    for (path, hash) in hashes {
+        writeln!(rendered, "{path}\t{hash}")?;
+    }
+    Ok(rendered)
+}
+
+fn fixture_source_hashes(fixture_root: &Path, pin: &Pin) -> Result<BTreeMap<String, String>> {
+    let path = fixture_root.join(FIXTURE_HASHES);
+    let mut hashes = BTreeMap::new();
+    for (line_number, line) in read(&path)?.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (source, hash) = line
+            .split_once('\t')
+            .ok_or_else(|| eyre::eyre!("{}:{} must be SOURCE<TAB>SHA256", path.display(), line_number + 1))?;
+        if source.is_empty()
+            || hash.len() != 64
+            || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("{}:{} has an invalid source hash", path.display(), line_number + 1);
+        }
+        if hashes.insert(source.to_owned(), hash.to_owned()).is_some() {
+            bail!("{}:{} duplicates fixture source {source:?}", path.display(), line_number + 1);
+        }
+    }
+    let expected = pin.source_inputs.iter().cloned().collect::<BTreeSet<_>>();
+    let actual = hashes.keys().cloned().collect::<BTreeSet<_>>();
+    if expected != actual {
+        bail!(
+            "{} source set drifts from pins/zellij.toml: missing [{}]; stale [{}]",
+            path.display(),
+            expected.difference(&actual).cloned().collect::<Vec<_>>().join(", "),
+            actual.difference(&expected).cloned().collect::<Vec<_>>().join(", "),
+        );
+    }
+    Ok(hashes)
+}
+
+fn compare_fixture_corpus(expected_root: &Path, fresh_root: &Path, pin: &Pin) -> Result<()> {
+    for relative in fixture_source_paths()
+        .into_iter()
+        .chain(std::iter::once(FIXTURE_HASHES.to_owned()))
+    {
+        let expected = fs::read(expected_root.join(&relative))
+            .wrap_err_with(|| format!("could not read checked-in fixture {}", expected_root.join(&relative).display()))?;
+        let fresh = fs::read(fresh_root.join(&relative))
+            .wrap_err_with(|| format!("could not read fresh fixture {}", fresh_root.join(&relative).display()))?;
+        if expected != fresh {
+            bail!(
+                "checked-in minimized fixture {} differs from fresh materialization at {}",
+                expected_root.join(&relative).display(),
+                fresh_root.join(&relative).display()
+            );
+        }
+    }
+    fixture_source_hashes(expected_root, pin)?;
+    Ok(())
+}
+
+fn fresh_fixture_root() -> Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .wrap_err("system clock predates Unix epoch")?
+        .as_nanos();
+    let root = env::temp_dir().join(format!("muxe-zellij-fixture-{}-{nonce}", std::process::id()));
+    fs::create_dir(&root).wrap_err_with(|| format!("could not create fresh fixture directory {}", root.display()))?;
+    Ok(root)
 }
 
 fn parse_action_variants(source: &str) -> Result<Vec<ActionVariant>> {
