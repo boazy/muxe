@@ -160,9 +160,11 @@ pub fn arrange_cells(
 }
 
 fn cell_rows_for_height(height: u16, between_rows: u16) -> u16 {
-    (height > 0)
-        .then_some(1 + (height - 1) / between_rows.saturating_add(1))
-        .unwrap_or(0)
+    if height == 0 {
+        0
+    } else {
+        1 + (height - 1) / between_rows.saturating_add(1)
+    }
 }
 
 fn empty_plan(rows_per_page: u16, row_gap: u16) -> GridPlan {

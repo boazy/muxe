@@ -296,13 +296,13 @@ impl UiSession {
             let Some(input) = self.pending_inputs.pop_front() else {
                 return Ok(None);
             };
-            if let Some(negotiation) = self.kitty.as_mut() {
-                if !negotiation.is_confirmed() {
-                    if negotiation.observe(input)? == crate::NegotiationUpdate::Confirmed {
-                        negotiation.prepend_pending_to(&mut self.pending_inputs);
-                    }
-                    continue;
+            if let Some(negotiation) = self.kitty.as_mut()
+                && !negotiation.is_confirmed()
+            {
+                if negotiation.observe(input)? == crate::NegotiationUpdate::Confirmed {
+                    negotiation.prepend_pending_to(&mut self.pending_inputs);
                 }
+                continue;
             }
             return Ok(Some(self.runtime.handle_input_at(&input, self.now())?));
         }
@@ -492,7 +492,7 @@ where
                 binding,
             } => {
                 let response = control
-                    .invoke(generation, binding.clone())
+                    .invoke(generation, binding)
                     .await
                     .map_err(|error| UiRunError::Control(Box::new(error)))?;
                 match response {

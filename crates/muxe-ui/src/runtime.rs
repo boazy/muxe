@@ -484,7 +484,7 @@ impl UiRuntime {
                         .map(|diagnostic| diagnostic.message.clone());
                 } else {
                     self.availability.push(BindingAvailabilityOverlay {
-                        binding: binding.clone(),
+                        binding: *binding,
                         availability: *availability,
                         diagnostic: diagnostic
                             .as_ref()
@@ -1269,7 +1269,7 @@ pub(crate) mod tests {
         let blocked = BrokerEvent::BindingAvailabilityChanged {
             session: UiSessionId::new("ui"),
             generation: 7,
-            binding: binding.clone(),
+            binding,
             availability: BindingAvailability::Blocked,
             diagnostic: Some(muxe_protocol::ProtocolDiagnostic {
                 code: muxe_protocol::DiagnosticCode::ActionBlocked,
@@ -1417,7 +1417,7 @@ pub(crate) mod tests {
                         generation: 7,
                         ordinal: 1,
                     },
-                    execution.clone(),
+                    execution,
                     InvocationDisposition::Await,
                     at(2),
                 )
@@ -1487,8 +1487,8 @@ pub(crate) mod tests {
         assert_eq!(
             awaited
                 .invocation_accepted(
-                    binding.clone(),
-                    awaited_execution.clone(),
+                    binding,
+                    awaited_execution,
                     InvocationDisposition::Await,
                     at(2),
                 )
