@@ -101,6 +101,71 @@ impl ZellijAdapterConfig {
     }
 }
 
+/// Reads the live Zellij session name for host-first launcher selection.
+///
+/// The single source is `ZELLIJ_SESSION_NAME`; no `HERDR_*` value is read on
+/// this path, so an explicit or auto-detected Zellij selection can never be
+/// routed by Herdr environment. The broker may instead pass a session name
+/// it already verified (current-session startup) directly into
+/// [`ZellijAdapterConfig`]; this helper covers launchers that only inherit
+/// the host environment.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] when the variable is missing, empty, or not
+/// valid UTF-8.
+pub fn zellij_session_from_env() -> Result<String, AdapterError> {
+    match std::env::var("ZELLIJ_SESSION_NAME") {
+        Ok(name) if !name.is_empty() => Ok(name),
+        Ok(_) => Err(AdapterError::new(
+            AdapterErrorKind::InvalidRequest,
+            "ZELLIJ_SESSION_NAME must not be empty for a Zellij launch",
+        )),
+        Err(std::env::VarError::NotPresent) => Err(AdapterError::new(
+            AdapterErrorKind::InvalidRequest,
+            "ZELLIJ_SESSION_NAME is required for a Zellij launch",
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(AdapterError::new(
+            AdapterErrorKind::InvalidRequest,
+            "ZELLIJ_SESSION_NAME must be valid UTF-8",
+        )),
+    }
+}
+
+/// Resolves the `zellij` executable for pipe-child production spawns.
+///
+/// The resolver searches `PATH` in order and returns the first `zellij`
+/// entry with readable metadata, mirroring the Herdr launcher's binary
+/// search. No directory, alias, or fallback executable is consulted.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] when `PATH` is missing or no `zellij` entry is
+/// found in it.
+pub fn resolve_zellij_exe() -> Result<PathBuf, AdapterError> {
+    let path = std::env::var_os("PATH").ok_or_else(|| {
+        AdapterError::new(
+            AdapterErrorKind::InvalidRequest,
+            "PATH is required to resolve the installed Zellij executable",
+        )
+    })?;
+    find_zellij_in_dirs(std::env::split_paths(&path)).ok_or_else(|| {
+        AdapterError::new(
+            AdapterErrorKind::InvalidRequest,
+            "could not find a zellij executable on PATH",
+        )
+    })
+}
+
+/// Searches explicit directories for a `zellij` executable entry. Pure core
+/// of [`resolve_zellij_exe`], kept separate so tests cover the search
+/// without mutating the process environment.
+fn find_zellij_in_dirs(directories: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    directories
+        .map(|directory| directory.join("zellij"))
+        .find(|candidate| std::fs::metadata(candidate).is_ok())
+}
+
 /// One queued pipe payload. Dispatches carry an execution for completion
 /// correlation; lifecycle lines (capture, origin) correlate through their own
 /// waiters instead.
@@ -878,12 +943,21 @@ impl ZellijAdapter {
 
     /// Launches one host pane for `muxe menu open` / `muxe pane open`.
     ///
-    /// The launch builds a pinned directional or floating action with the
-    /// exact command vector, validates it through the generated conversion,
-    /// and dispatches it to the target client with the same correlation as
-    /// any native action. Menu launches require focus; the constructor in
-    /// [`build_launch_command`](crate::launch::build_launch_command)
-    /// enforces that before anything reaches the host.
+    /// The launch is validated purely predispatch (program, menu focus, menu
+    /// working directory, placement) before any host contact, then resolved
+    /// to its target client and dispatched with the same correlation as any
+    /// native action. Menu launches require focus and the captured absolute
+    /// origin working directory; the constructor enforces both before
+    /// anything reaches the host. An explicit parent pane (`UiPane`) selects
+    /// the destination client scope through live registrations and fails
+    /// rather than guessing; placement stays relative to that client's
+    /// focused pane because the pinned actions expose no parent-pane field.
+    /// The returned acceptance means Zellij took the dispatch, never that
+    /// the launched process succeeded.
+    ///
+    /// This method performs no focus substitution: the target is always the
+    /// explicit client or the resolved owning client, never a guessed
+    /// currently focused client.
     ///
     /// # Errors
     ///
@@ -894,9 +968,10 @@ impl ZellijAdapter {
         execution: ExecutionId,
         launch: crate::launch::ZellijPaneLaunch,
     ) -> Result<DispatchAccepted, AdapterError> {
-        let raw = crate::launch::build_launch_command(&launch)
+        let (raw, target) = launch
+            .into_command()
             .map_err(|error| error.into_adapter_error())?;
-        let client_id = match launch.target {
+        let client_id = match target {
             crate::launch::LaunchTarget::Client(client) => client,
             crate::launch::LaunchTarget::UiPane(pane) => {
                 let probe = format!("launch-{}", hex_id(&self.mint_id()));
@@ -1565,5 +1640,23 @@ mod tests {
             _ => panic!("expected dispatch payload"),
         }
         adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[test]
+    fn zellij_exe_search_uses_owned_dir_entries() {
+        let dir = std::env::temp_dir().join(format!("muxe-exe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let exe = dir.join("zellij");
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").expect("fake exe");
+        let found =
+            super::find_zellij_in_dirs([dir.clone()].into_iter()).expect("finds owned fake");
+        assert_eq!(found, exe);
+        assert!(
+            super::find_zellij_in_dirs(
+                [std::env::temp_dir().join("muxe-exe-test-missing-dir")].into_iter()
+            )
+            .is_none()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
