@@ -65,6 +65,7 @@ pub struct HostIdentity {
     pub live_server_id: String,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "four independent Kitty protocol flag bits negotiated with the host")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyboardCapabilities {
     pub kitty_baseline: bool,
@@ -120,7 +121,7 @@ pub enum CaptureReleaseReason {
 }
 
 /// An atomic, typed launch-time origin tuple. The adapter must treat it as untrusted and validate
-/// all IDs together against the live host before returning an immutable OriginContext.
+/// all IDs together against the live host before returning an immutable [`OriginContext`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UntrustedOriginHint {
     pub workspace_id: WorkspaceId,
@@ -163,6 +164,12 @@ pub struct ResolvedNativeAction {
 }
 
 impl ResolvedNativeAction {
+    /// Resolves the candidate's context references against the immutable origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`ContextResolutionError`] when a field reference
+    /// cannot resolve against the origin.
     pub fn from_origin(
         candidate: &NativeActionCandidate,
         origin: &OriginContext,
@@ -181,6 +188,12 @@ pub struct ResolvedPortableAction {
 }
 
 impl ResolvedPortableAction {
+    /// Resolves the portable action against the immutable origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`PortableActionResolutionError`] when the action
+    /// cannot resolve against the origin.
     pub fn from_origin(
         action: &PortableAction,
         origin: &OriginContext,
@@ -287,6 +300,7 @@ impl AdapterError {
         }
     }
 
+    #[must_use]
     pub fn with_diagnostic(mut self, diagnostic: ConfigDiagnostic) -> Self {
         self.diagnostic = Some(diagnostic);
         self
