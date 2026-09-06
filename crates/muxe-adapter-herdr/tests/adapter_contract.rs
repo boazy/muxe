@@ -135,7 +135,10 @@ impl RecordedContractAdapter {
     }
 
     fn unsupported() -> AdapterError {
-        AdapterError::new(AdapterErrorKind::Unavailable, "not exercised by the recorded contract")
+        AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            "not exercised by the recorded contract",
+        )
     }
 }
 
@@ -248,7 +251,9 @@ impl HostAdapter for RecordedContractAdapter {
                 let message = diagnostics
                     .first()
                     .map(|diagnostic| diagnostic.message.clone())
-                    .unwrap_or_else(|| "the recorded contract rejected the native action".to_owned());
+                    .unwrap_or_else(|| {
+                        "the recorded contract rejected the native action".to_owned()
+                    });
                 AdapterError::new(AdapterErrorKind::InvalidRequest, message)
             })?;
         self.dispatches
@@ -258,9 +263,11 @@ impl HostAdapter for RecordedContractAdapter {
         self.completions
             .lock()
             .expect("recorded completions are not poisoned")
-            .push_back(AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
-                execution: request.execution,
-            }));
+            .push_back(AdapterHealthEvent::DispatchCompleted(
+                DispatchCompletion::Succeeded {
+                    execution: request.execution,
+                },
+            ));
         Ok(DispatchAccepted {
             correlation: ExecutionCorrelationId::new(format!(
                 "recorded-{}",
@@ -285,6 +292,15 @@ impl HostAdapter for RecordedContractAdapter {
             .expect("recorded completions are not poisoned")
             .pop_front()
             .ok_or_else(|| AdapterError::new(AdapterErrorKind::Shutdown, "recording is complete"))
+    }
+
+    async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
+        // Mirrors the production adapters: resume without a prior suspend is
+        // an Unavailable error, never a fabricated healthy subscription.
+        Err(AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            "the recorded contract was never suspended; refusing to fabricate a resumed subscription",
+        ))
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
@@ -354,26 +370,100 @@ async fn next_outbound(channel: &RecordedPipeChannel) -> String {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+/// Host-specific expectations for the one shared observable driver.
+struct ContractExpectations {
+    kind: HostKind,
+    supports_native_cancellation: bool,
+    valid_native: &'static str,
+}
 
+/// The one shared observable driver for the host-neutral boundary (DES1642).
+///
+/// It runs the transport-independent assertions against any production
+/// constructor: live-server identity shape, capability truthfulness,
+/// load-time batch validation, validation-before-dispatch (a never-validated
+/// candidate is never accepted), truthful cancellation, and the
+/// no-fabricated-resume guard. Dispatch acceptance, completion correlation,
+/// capture-origin turnover, and subscription reconnect stay per-host: Herdr
+/// dispatches need a captured continuity epoch and Zellij dispatches need a
+/// bridge registration first, so no single dispatch path can observe them.
+async fn drive_shared_contract(adapter: &dyn HostAdapter, expectations: &ContractExpectations) {
+    let identity = adapter
+        .identity()
+        .await
+        .expect("the shared contract reports a live identity");
+    assert_eq!(identity.kind, expectations.kind);
+    assert!(
+        !identity.discovery_key.is_empty(),
+        "the shared contract reports a discovery key"
+    );
+    assert!(
+        !identity.live_server_id.is_empty(),
+        "the shared contract reports a live server id"
+    );
+    assert_eq!(
+        adapter
+            .capabilities()
+            .await
+            .expect("the shared contract reports capabilities")
+            .supports_native_cancellation,
+        expectations.supports_native_cancellation,
+        "cancellation capability is truthful"
+    );
+    assert!(
+        adapter
+            .validate_native_batch(&[&candidate(expectations.valid_native)])
+            .is_ok(),
+        "the shared contract accepts its host namespace"
+    );
+    assert!(
+        !adapter
+            .validate_native_batch(&[&candidate("native.unknown:does-not-exist")])
+            .expect_err("an unknown native action is rejected")
+            .is_empty(),
+        "rejection carries diagnostics"
+    );
+    assert!(
+        adapter
+            .dispatch_native(NativeDispatchRequest {
+                execution: ExecutionId(9_999_001),
+                action: muxe_adapter_api::ResolvedNativeAction {
+                    candidate: candidate("native.unknown:does-not-exist"),
+                },
+                origin: origin(),
+            })
+            .await
+            .is_err(),
+        "a never-validated candidate is never accepted"
+    );
+    let cancellation = adapter.cancel(ExecutionId(9_999_002)).await;
+    assert_eq!(
+        cancellation.is_ok(),
+        expectations.supports_native_cancellation,
+        "cancellation behavior matches the reported capability"
+    );
+    if !expectations.supports_native_cancellation {
+        assert_eq!(
+            cancellation
+                .expect_err("unsupported cancellation reports its kind")
+                .kind,
+            AdapterErrorKind::CancelUnsupported
+        );
+    }
+    assert_eq!(
+        adapter
+            .resume_after_activation_abort()
+            .await
+            .expect_err("resume without suspend never fabricates health")
+            .kind,
+        AdapterErrorKind::Unavailable
+    );
+}
 /// The host-neutral boundary promises observable identity/capability/action
 /// validation/correlation/cancellation semantics independent of host transport.
 #[tokio::test]
 async fn recorded_common_contract_preserves_broker_visible_transitions() {
     let adapter = RecordedContractAdapter::new();
-    assert_eq!(
-        adapter.identity().await.expect("recorded identity").live_server_id,
-        "recorded-server"
-    );
-    assert!(
-        adapter
-            .capabilities()
-            .await
-            .expect("recorded capabilities")
-            .supports_native_cancellation
-    );
-    assert!(adapter
-        .validate_native_batch(&[&candidate("native.recorded:complete")])
-        .is_ok());
     assert_eq!(
         adapter
             .validate_native_batch(&[&candidate("native.recorded:unknown")])
@@ -401,7 +491,10 @@ async fn recorded_common_contract_preserves_broker_visible_transitions() {
             execution: ExecutionId(41)
         })
     ));
-    adapter.cancel(execution).await.expect("recorded cancellation");
+    adapter
+        .cancel(execution)
+        .await
+        .expect("recorded cancellation");
     assert_eq!(
         *adapter
             .dispatches
@@ -416,6 +509,15 @@ async fn recorded_common_contract_preserves_broker_visible_transitions() {
             .expect("recorded cancellations are not poisoned"),
         vec![execution]
     );
+    drive_shared_contract(
+        &adapter,
+        &ContractExpectations {
+            kind: HostKind::Herdr,
+            supports_native_cancellation: true,
+            valid_native: "native.recorded:complete",
+        },
+    )
+    .await;
 }
 
 /// Exercises the actual Herdr constructor boundary with an owned shell schema
@@ -427,9 +529,14 @@ async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
         .expect("recorded production-connect fixture starts");
     let adapter = HerdrAdapter::connect(fixture.adapter_config())
         .await
-        .expect("production Herdr connect accepts the recorded schema, ping, probe, and subscription");
+        .expect(
+            "production Herdr connect accepts the recorded schema, ping, probe, and subscription",
+        );
 
-    let observed = adapter.identity().await.expect("retained subscription is healthy");
+    let observed = adapter
+        .identity()
+        .await
+        .expect("retained subscription is healthy");
     assert_eq!(
         observed,
         fixture
@@ -437,11 +544,13 @@ async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
             .await
             .expect("fixture reads the same raw endpoint identity")
     );
-    assert!(!adapter
-        .capabilities()
-        .await
-        .expect("Herdr capabilities")
-        .supports_native_cancellation);
+    assert!(
+        !adapter
+            .capabilities()
+            .await
+            .expect("Herdr capabilities")
+            .supports_native_cancellation
+    );
     assert_eq!(
         adapter
             .validate_native_batch(&[&candidate("native.zellij.command:close-focus")])
@@ -449,14 +558,16 @@ async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
             .code,
         DiagnosticCode::NativeActionRejected
     );
-    assert_eq!(
-        adapter
-            .cancel(ExecutionId(99))
-            .await
-            .expect_err("Herdr has no unary cancellation")
-            .kind,
-        AdapterErrorKind::CancelUnsupported
-    );
+    drive_shared_contract(
+        &*adapter,
+        &ContractExpectations {
+            kind: HostKind::Herdr,
+            supports_native_cancellation: false,
+            valid_native: "native.herdr.agent:list",
+        },
+    )
+    .await;
+    fixture.wait_for_requests(2).await;
     assert_eq!(
         fixture
             .requests()
@@ -464,7 +575,10 @@ async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
             .into_iter()
             .map(|request| request["method"].clone())
             .collect::<Vec<_>>(),
-        vec![serde_json::json!("ping"), serde_json::json!("events.subscribe")]
+        vec![
+            serde_json::json!("ping"),
+            serde_json::json!("events.subscribe")
+        ]
     );
     adapter.shutdown().await.expect("Herdr shutdown");
 }
@@ -483,14 +597,18 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
         Arc::clone(&request) as Arc<dyn PipeChannel>,
         Arc::clone(&event) as Arc<dyn PipeChannel>,
     );
-    assert!(!adapter
-        .capabilities()
-        .await
-        .expect("Zellij capabilities")
-        .supports_native_cancellation);
-    assert!(adapter
-        .validate_native_batch(&[&candidate("native.zellij.command:close-focus")])
-        .is_ok());
+    assert!(
+        !adapter
+            .capabilities()
+            .await
+            .expect("Zellij capabilities")
+            .supports_native_cancellation
+    );
+    assert!(
+        adapter
+            .validate_native_batch(&[&candidate("native.zellij.command:close-focus")])
+            .is_ok()
+    );
 
     event.push_line(
         encode_event_line(&register_event([7; 16], BridgeArtifact::Unattested))
@@ -569,6 +687,15 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
             execution: ExecutionId(7)
         })
     ));
+    drive_shared_contract(
+        &adapter,
+        &ContractExpectations {
+            kind: HostKind::Zellij,
+            supports_native_cancellation: false,
+            valid_native: "native.zellij.command:close-focus",
+        },
+    )
+    .await;
     adapter.shutdown().await.expect("Zellij adapter shutdown");
 
     let request = RecordedPipeChannel::new();
@@ -611,5 +738,89 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
     .expect("self-attestation is contained before timeout");
     assert!(rejection.message.contains("incompatible"));
     assert!(request.take_outbound().is_empty());
-    contained.shutdown().await.expect("contained Zellij adapter shutdown");
+    contained
+        .shutdown()
+        .await
+        .expect("contained Zellij adapter shutdown");
+}
+
+/// Drives the production monitor through a retained-subscription loss with
+/// recorded ping/probe/subscribe exchanges: the adapter reports Unhealthy,
+/// reconnects without restarting the broker, and reports the reconnected
+/// endpoint identity. No Herdr host process is started.
+#[tokio::test]
+async fn recorded_herdr_reconnect_reestablishes_subscription_with_recorded_messages() {
+    let mut exchanges = ProductionConnectFixture::initial_handshake();
+    exchanges.push(ProductionConnectFixture::ping_exchange());
+    exchanges.push(ProductionConnectFixture::subscription_exchange());
+    let fixture = ProductionConnectFixture::start_scripted(exchanges)
+        .await
+        .expect("recorded reconnect fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production Herdr connect accepts the recorded handshake");
+    let before = adapter
+        .identity()
+        .await
+        .expect("identity before continuity loss");
+    let connected = tokio::time::timeout(Duration::from_secs(10), adapter.next_health_event())
+        .await
+        .expect("connect reports promptly")
+        .expect("connect is a valid event");
+    assert!(
+        matches!(
+            connected,
+            AdapterHealthEvent::Healthy { ref identity } if *identity == before
+        ),
+        "connect reports the live endpoint as Healthy"
+    );
+    fixture.lose_retained_subscriptions();
+    let unhealthy = tokio::time::timeout(Duration::from_secs(10), adapter.next_health_event())
+        .await
+        .expect("continuity loss surfaces promptly")
+        .expect("continuity loss is a valid event");
+    assert!(
+        matches!(unhealthy, AdapterHealthEvent::Unhealthy { .. }),
+        "continuity loss reports Unhealthy, never silent health"
+    );
+    let reconnected = tokio::time::timeout(Duration::from_secs(10), adapter.next_health_event())
+        .await
+        .expect("the monitor reconnects through recorded messages")
+        .expect("reconnect is a valid event");
+    let (previous, current) = match reconnected {
+        AdapterHealthEvent::Reconnected { previous, current } => (previous, current),
+        _ => panic!("expected a Reconnected event after the recorded reconnect"),
+    };
+    assert_eq!(previous, before);
+    // Endpoint peer credentials are diagnostic only and may legitimately
+    // differ after a reconnect; continuity rests on the fresh subscription
+    // plus the epoch, never on equal endpoint observations.
+    assert_eq!(current.kind, HostKind::Herdr);
+    assert_eq!(current.discovery_key, before.discovery_key);
+    assert_eq!(
+        adapter.identity().await.expect("identity after reconnect"),
+        current
+    );
+    // The fresh epoch still enforces origin currency: an uncaptured origin
+    // is rejected as stale-context, proving the adapter is back to
+    // healthy-epoch operation rather than stuck unhealthy or promiscuous.
+    assert_eq!(
+        adapter
+            .dispatch_native(NativeDispatchRequest {
+                execution: ExecutionId(7_700_001),
+                action: muxe_adapter_api::ResolvedNativeAction {
+                    candidate: candidate("native.herdr.agent:list"),
+                },
+                origin: origin(),
+            })
+            .await
+            .expect_err("an uncaptured origin stays rejected after reconnect")
+            .kind,
+        AdapterErrorKind::ContextUnavailable
+    );
+    adapter.shutdown().await.expect("Herdr shutdown");
+    assert!(matches!(
+        adapter.next_health_event().await,
+        Err(error) if error.kind == AdapterErrorKind::Shutdown
+    ));
 }
