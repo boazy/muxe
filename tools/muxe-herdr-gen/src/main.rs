@@ -329,10 +329,10 @@ fn rewrite_request_references(schema: &mut Value) {
             if let Some(definitions) = object.remove("$defs") {
                 object.insert("definitions".to_owned(), definitions);
             }
-            if let Some(Value::String(reference)) = object.get_mut("$ref") {
-                if let Some(rewritten) = reference.strip_prefix("#/schemas/request/$defs/") {
-                    *reference = format!("#/definitions/{rewritten}");
-                }
+            if let Some(Value::String(reference)) = object.get_mut("$ref")
+                && let Some(rewritten) = reference.strip_prefix("#/schemas/request/$defs/")
+            {
+                *reference = format!("#/definitions/{rewritten}");
             }
             for (keyword, value) in object {
                 if keyword != "$ref" {

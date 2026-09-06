@@ -46,8 +46,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             println!("created {}", result.color_schemes_directory.display());
             Ok(())
         }
-        Command::Compatibility(command) => compatibility(command),
-        Command::Purge(command) => purge(command),
+        Command::Compatibility(command) => compatibility(&command),
+        Command::Purge(command) => purge(&command),
         Command::Menu(menu) => match menu.command {
             MenuSubcommand::Open(open) => launch_menu(open).await,
         },
@@ -75,7 +75,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn compatibility(command: CompatibilityCommand) -> Result<()> {
+fn compatibility(command: &CompatibilityCommand) -> Result<()> {
     let record = muxe::compatibility::embedded_record()?;
     if command.json {
         println!("{}", muxe::compatibility::render_json(&record));
@@ -85,7 +85,7 @@ fn compatibility(command: CompatibilityCommand) -> Result<()> {
     Ok(())
 }
 
-fn purge(command: PurgeCommand) -> Result<()> {
+fn purge(command: &PurgeCommand) -> Result<()> {
     let paths = muxe::paths::resolve()?;
     let logger = muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION"))?;
     let presenter = |preview: &muxe::purge::PurgePreview| {
@@ -141,7 +141,7 @@ async fn retire_brokers(scope: HostScope) -> Result<()> {
         match outcome {
             muxe::lifecycle::RetireOutcome::Retired { unit } => println!("retired {unit}"),
             muxe::lifecycle::RetireOutcome::AlreadyGone { unit } => {
-                println!("already retired {unit}")
+                println!("already retired {unit}");
             }
         }
     }
@@ -199,19 +199,23 @@ fn install_zellij(command: muxe::cli::InstallIntegrationCommand) -> Result<()> {
         hooks: muxe::integration::Hooks::default(),
     })
     .wrap_err("could not install the Zellij bridge")?;
-    println!(
-        "installed bridge {} (sha256 {})",
-        outcome.receipt_path.display(),
-        outcome.bridge_digest
-    );
-    match outcome.config_path {
-        Some(path) if outcome.config_edited => {
-            println!("edited {}", path.display());
+    // Quiet is an explicit CLI contract: no status lines on stdout, success
+    // reported by exit status and the persistent audit log only.
+    if !options.quiet {
+        println!(
+            "installed bridge {} (sha256 {})",
+            outcome.receipt_path.display(),
+            outcome.bridge_digest
+        );
+        match outcome.config_path {
+            Some(path) if outcome.config_edited => {
+                println!("edited {}", path.display());
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    if let Some(snippet) = outcome.manual_snippet {
-        println!("{snippet}");
+        if let Some(snippet) = outcome.manual_snippet {
+            println!("{snippet}");
+        }
     }
     Ok(())
 }
@@ -233,21 +237,32 @@ fn uninstall_zellij(command: muxe::cli::UninstallIntegrationCommand) -> Result<(
         logger: Some(&logger),
     })
     .wrap_err("could not remove the Zellij bridge")?;
-    println!(
-        "removed bridge={} receipt={} restored={} removed_nodes={} unresolved={}",
-        outcome.bridge_removed,
-        outcome.receipt_removed,
-        outcome.restored_nodes.len(),
-        outcome.removed_nodes.len(),
-        outcome.unresolved.len()
-    );
-    for record in &outcome.unresolved {
-        println!("left: {}", record.reason);
+    if options.quiet {
+        // Quiet keeps normal stdout empty, but unresolved artifacts that keep
+        // the receipt (user-modified nodes, restore failures) still warn on
+        // stderr. Nodes left purely by an explicit never-configure policy are
+        // expected, not surprising, so they stay silent.
+        let never_only = matches!(explicit_policy, Some(muxe::cli::ConfigurationPolicy::Never));
+        if !never_only {
+            for record in &outcome.unresolved {
+                eprintln!("left: {}", record.reason);
+            }
+        }
+    } else {
+        println!(
+            "removed bridge={} receipt={} restored={} removed_nodes={} unresolved={}",
+            outcome.bridge_removed,
+            outcome.receipt_removed,
+            outcome.restored_nodes.len(),
+            outcome.removed_nodes.len(),
+            outcome.unresolved.len()
+        );
+        for record in &outcome.unresolved {
+            println!("left: {}", record.reason);
+        }
     }
     Ok(())
 }
-/// Detects the invoking host for `--host current` from the launcher
-/// environment. A Zellij session resolves its canonical bridge through the
 /// live registry; anything else fails closed.
 fn detect_current_host(cache_dir: &Path) -> Result<muxe::lifecycle::DetectedHost> {
     if let Some(socket) = env::var_os("HERDR_SOCKET_PATH").filter(|value| !value.is_empty()) {
@@ -288,24 +303,54 @@ fn detect_current_host(cache_dir: &Path) -> Result<muxe::lifecycle::DetectedHost
 /// independently with a printed per-unit outcome.
 async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
     let paths = muxe::paths::resolve()?;
-    let logger = muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION"))
-        .wrap_err("could not open the activation audit log")?;
-    let record = muxe::compatibility::embedded_record()
-        .wrap_err("could not load the embedded compatibility record")?;
     let current = match command.host {
         HostScope::Current => Some(detect_current_host(&paths.cache_dir)?),
         _ => None,
     };
+    let report = run_activation(command.host, current).await?;
+    for unit in &report.units {
+        match unit {
+            muxe::lifecycle::UnitOutcome::Committed { unit } => println!("committed {unit}"),
+            muxe::lifecycle::UnitOutcome::Unchanged { unit } => println!("unchanged {unit}"),
+            muxe::lifecycle::UnitOutcome::RolledBack { unit, reason } => {
+                println!("rolled back {unit}: {reason}");
+            }
+            muxe::lifecycle::UnitOutcome::Failed { unit, reason } => {
+                println!("failed {unit}: {reason}");
+            }
+        }
+    }
+    // A rolled-back unit restored the old broker, but the requested activation
+    // still failed: report every outcome, then exit nonzero like any error so
+    // CLI callers observe the original failure instead of a quiet success.
+    if activation_incomplete(&report.units) {
+        bail!("activation did not complete every selected unit");
+    }
+    Ok(())
+}
+
+/// Drives the activation transaction for one scope. CLI `activate` and
+/// coldstart stale-record recovery share this exact path: a stale broker is
+/// never replaced by a parallel transaction.
+async fn run_activation(
+    scope: HostScope,
+    current: Option<muxe::lifecycle::DetectedHost>,
+) -> Result<muxe::lifecycle::ActivateReport> {
+    let paths = muxe::paths::resolve()?;
+    let logger = muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION"))
+        .wrap_err("could not open the activation audit log")?;
+    let record = muxe::compatibility::embedded_record()
+        .wrap_err("could not load the embedded compatibility record")?;
     let registry = muxe::lifecycle::Registry::open(&paths.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
     let live = registry
         .probe()
         .wrap_err("could not probe the owner-only broker registry")?
         .live;
-    let herdr_selected = !matches!(command.host, HostScope::Zellij)
-        && live.iter().any(|entry| entry.host_kind == "herdr");
-    let zellij_selected = !matches!(command.host, HostScope::Herdr)
-        && live.iter().any(|entry| entry.host_kind == "zellij");
+    let herdr_selected =
+        !matches!(scope, HostScope::Zellij) && live.iter().any(|entry| entry.host_kind == "herdr");
+    let zellij_selected =
+        !matches!(scope, HostScope::Herdr) && live.iter().any(|entry| entry.host_kind == "zellij");
     let herdr_binary = herdr_selected.then(herdr_binary_from_path).transpose()?;
     let zellij_exe = zellij_selected
         .then(|| {
@@ -337,8 +382,8 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
             &executable,
             &config_file,
             &cache_dir,
-            &spawn_herdr_binary,
-            &spawn_zellij_exe,
+            spawn_herdr_binary.as_ref(),
+            spawn_zellij_exe.as_ref(),
             &entries,
             member,
         )
@@ -350,12 +395,12 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
         zellij_exe: zellij_exe.clone(),
         logger: Some(&logger),
     };
-    let report = muxe::lifecycle::activate(muxe::lifecycle::ActivateInputs {
+    muxe::lifecycle::activate(muxe::lifecycle::ActivateInputs {
         config_dir: &paths.config_dir,
         cache_dir: &paths.cache_dir,
         target: record.handoff,
         staged_bridge,
-        scope: command.host,
+        scope,
         current,
         control: &muxe::lifecycle::LiveControl,
         spawner: &muxe::lifecycle::ProcessSpawner,
@@ -364,48 +409,144 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
         },
         preflight: &preflight,
         spawn_argv: &spawn_argv,
-        readiness_deadline: Duration::from_secs(120),
+        readiness_deadline: Duration::from_mins(2),
         poll_interval: Duration::from_millis(200),
         hooks: muxe::lifecycle::ActivateHooks::default(),
         logger: Some(&logger),
     })
     .await
-    .map_err(|error| color_eyre::eyre::eyre!("activation failed: {error}"))?;
-    for unit in &report.units {
-        match unit {
-            muxe::lifecycle::UnitOutcome::Committed { unit } => println!("committed {unit}"),
-            muxe::lifecycle::UnitOutcome::Unchanged { unit } => println!("unchanged {unit}"),
-            muxe::lifecycle::UnitOutcome::RolledBack { unit, reason } => {
-                println!("rolled back {unit}: {reason}")
-            }
-            muxe::lifecycle::UnitOutcome::Failed { unit, reason } => {
-                println!("failed {unit}: {reason}")
+    .map_err(|error| color_eyre::eyre::eyre!("activation failed: {error}"))
+}
+
+/// Ensures a live Herdr broker for this runtime, cold-starting an ordinary
+/// broker when none answers. A stale compiled record drives the same
+/// activation transaction as CLI `activate` before return; a wrong identity
+/// fails closed without a second broker. Returns the verified broker socket.
+async fn ensure_herdr_broker(
+    cache_dir: &Path,
+    config_file: &Path,
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
+) -> Result<PathBuf> {
+    let record = muxe::compatibility::embedded_record()
+        .wrap_err("could not load the embedded compatibility record")?;
+    let discovery = runtime.identity().discovery_key.clone();
+    let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Herdr, &discovery)
+        .wrap_err("could not derive the normal Herdr broker endpoint")?;
+    let executable = env::current_exe().wrap_err("could not locate the running muxe executable")?;
+    let inputs = muxe::lifecycle::ColdstartInputs {
+        cache_dir,
+        config_file,
+        executable: &executable,
+        endpoint,
+        host: muxe::lifecycle::ColdstartHost::Herdr {
+            discovery_key: discovery,
+            herdr_binary: herdr_binary_from_path()?,
+            herdr_socket: required_absolute_environment_path("HERDR_SOCKET_PATH")?,
+        },
+        current_record: record.handoff,
+        spawner: &muxe::lifecycle::ProcessSpawner,
+        control: &muxe::lifecycle::LiveControl,
+        reloader: None::<&muxe::lifecycle::ZellijCliReloader>,
+        readiness_deadline: Duration::from_mins(2),
+        poll_interval: Duration::from_millis(200),
+    };
+    match muxe::lifecycle::ensure_broker(&inputs)
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("could not ensure the Herdr broker: {error}"))?
+    {
+        muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.socket),
+        muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
+            run_activation(HostScope::Herdr, None).await?;
+            match muxe::lifecycle::ensure_broker(&inputs)
+                .await
+                .map_err(|error| {
+                    color_eyre::eyre::eyre!("could not re-verify the Herdr broker: {error}")
+                })? {
+                muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.socket),
+                muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
+                    bail!("activation did not converge the Herdr broker record")
+                }
             }
         }
     }
-    if report
-        .units
-        .iter()
-        .any(|unit| matches!(unit, muxe::lifecycle::UnitOutcome::Failed { .. }))
-    {
-        bail!("activation reported a failed unit");
-    }
-    Ok(())
 }
 
-/// Renders the exact owned spawn request for one prepared member. Herdr
-/// members derive everything from the discovery key; Zellij members use the
-/// canonical stable bridge enforced by preflight. The journal path recomputes
-/// deterministically because selected units always hash these same inputs.
-/// Registry entries resolve the member kind authoritatively; the broker's
+/// Ensures a live Zellij broker for this session: a brokerless session
+/// cold-starts one ordinary broker, reloads the stable bridge, and awaits
+/// the fresh compatible round before return, never a second incompatible
+/// broker. A stale record activates the invoking bridge group first.
+async fn ensure_zellij_broker(
+    cache_dir: &Path,
+    config_file: &Path,
+    session: &str,
+    zellij_exe: &Path,
+) -> Result<PathBuf> {
+    let record = muxe::compatibility::embedded_record()
+        .wrap_err("could not load the embedded compatibility record")?;
+    let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Zellij, session)
+        .wrap_err("could not derive the normal Zellij broker endpoint")?;
+    let executable = env::current_exe().wrap_err("could not locate the running muxe executable")?;
+    let reloader = muxe::lifecycle::ZellijCliReloader {
+        program: Some(zellij_exe.to_path_buf()),
+    };
+    let inputs = muxe::lifecycle::ColdstartInputs {
+        cache_dir,
+        config_file,
+        executable: &executable,
+        endpoint,
+        host: muxe::lifecycle::ColdstartHost::Zellij {
+            session: session.to_owned(),
+            zellij_exe: zellij_exe.to_path_buf(),
+        },
+        current_record: record.handoff,
+        spawner: &muxe::lifecycle::ProcessSpawner,
+        control: &muxe::lifecycle::LiveControl,
+        reloader: Some(&reloader),
+        readiness_deadline: Duration::from_mins(2),
+        poll_interval: Duration::from_millis(200),
+    };
+    match muxe::lifecycle::ensure_broker(&inputs)
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("could not ensure the Zellij broker: {error}"))?
+    {
+        muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.socket),
+        muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
+            let current = Some(detect_current_host(cache_dir)?);
+            run_activation(HostScope::Current, current).await?;
+            match muxe::lifecycle::ensure_broker(&inputs)
+                .await
+                .map_err(|error| {
+                    color_eyre::eyre::eyre!("could not re-verify the Zellij broker: {error}")
+                })? {
+                muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.socket),
+                muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
+                    bail!("activation did not converge the Zellij broker record")
+                }
+            }
+        }
+    }
+}
+
+/// Activation exit boundary: any failed or rolled-back unit is a nonzero
+/// exit, even when the rollback itself succeeded. Only all-committed or
+/// unchanged reports succeed.
+fn activation_incomplete(units: &[muxe::lifecycle::UnitOutcome]) -> bool {
+    units.iter().any(|unit| {
+        matches!(
+            unit,
+            muxe::lifecycle::UnitOutcome::Failed { .. }
+                | muxe::lifecycle::UnitOutcome::RolledBack { .. }
+        )
+    })
+}
 /// normal-endpoint stem (`b-z-`/`b-h-`) covers a member registered between
 /// the coordinator's probe and this spawn.
 fn activate_spawn_argv(
     executable: &Path,
     config_file: &Path,
     cache_dir: &Path,
-    herdr_binary: &Option<PathBuf>,
-    zellij_exe: &Option<PathBuf>,
+    herdr_binary: Option<&PathBuf>,
+    zellij_exe: Option<&PathBuf>,
     entries: &std::collections::HashMap<PathBuf, String>,
     member: &muxe::lifecycle::SpawnMember,
 ) -> Result<(PathBuf, Vec<OsString>), muxe::lifecycle::ActivateError> {
@@ -452,7 +593,7 @@ fn activate_spawn_argv(
         let spawn = muxe_broker::ServeZellijSpawn {
             binary: program.clone(),
             socket: member.endpoint.clone(),
-            zellij_exe: zellij_exe.clone().ok_or_else(|| {
+            zellij_exe: zellij_exe.cloned().ok_or_else(|| {
                 muxe::lifecycle::ActivateError::Spawn(
                     "no Zellij executable is installed for a Zellij target".to_owned(),
                 )
@@ -477,7 +618,7 @@ fn activate_spawn_argv(
     let spawn = muxe_broker::ServeHerdrSpawn {
         binary: program.clone(),
         socket: member.endpoint.clone(),
-        herdr_binary: herdr_binary.clone().ok_or_else(|| {
+        herdr_binary: herdr_binary.cloned().ok_or_else(|| {
             muxe::lifecycle::ActivateError::Spawn(
                 "no Herdr executable is installed for a Herdr target".to_owned(),
             )
@@ -496,7 +637,7 @@ fn activate_spawn_argv(
 
 /// Appends one broker-service audit record. Failures to write the log never
 /// change the service outcome; the caller still returns its own result.
-fn serve_event(logger: &muxe::logging::Logger, host: &str, operation: &str, message: String) {
+fn serve_event(logger: &muxe::logging::Logger, host: &str, operation: &str, message: &str) {
     if let Ok(event) = muxe::logging::LogEvent::new(
         env!("CARGO_PKG_VERSION"),
         host,
@@ -512,9 +653,38 @@ fn serve_event(logger: &muxe::logging::Logger, host: &str, operation: &str, mess
 /// It accepts concrete paths from the coordinator, never an ambient command hook. A target reads
 /// the durable journal and proves its own compatibility record, live Herdr identity, normal
 /// endpoint, and nonzero handoff before it is allowed to bind.
+#[expect(
+    clippy::too_many_lines,
+    reason = "broker serve transaction: endpoint lock, adapter connect, identity match, journal authorization, registry token, bind, and run form one ordered startup that must stay together to keep the construction/bind gap closed"
+)]
 async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     let logger = muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
         .wrap_err("could not open the broker service audit log")?;
+    // Earliest lock ownership, mirroring the Zellij path: the Herdr discovery
+    // key is the server socket string, so the normal endpoint derives from
+    // argv before any host contact. A live endpoint exits before adapter
+    // construction; the held guard is consumed by bind below.
+    let pre_endpoint = RuntimeEndpoint::for_host(
+        ProtocolHostKind::Herdr,
+        &command.herdr_socket.to_string_lossy(),
+    )
+    .wrap_err("could not derive the normal Herdr broker endpoint")?;
+    if pre_endpoint.socket() != command.socket {
+        bail!(
+            "broker endpoint {} does not match the recorded normal Herdr endpoint {}",
+            pre_endpoint.socket().display(),
+            command.socket.display()
+        );
+    }
+    let pre_lock = pre_endpoint.acquire_startup_lock().map_err(|error| {
+        color_eyre::eyre::eyre!("another broker starter holds the Herdr endpoint: {error}")
+    })?;
+    if let Err(error) = pre_endpoint.remove_validated_stale_socket() {
+        drop(pre_lock);
+        return Err(color_eyre::eyre::eyre!(
+            "could not claim the Herdr broker endpoint: {error}"
+        ));
+    }
     let adapter =
         muxe_adapter_herdr::HerdrAdapter::connect(muxe_adapter_herdr::HerdrAdapterConfig {
             socket_path: command.herdr_socket.clone(),
@@ -564,11 +734,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
             {
                 bail!("activation journal does not authorize this Herdr target record");
             }
-            let handoff_hex = handoff
-                .0
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+            let handoff_hex = handoff_hex(&handoff);
             let authorized = journal.members.iter().any(|member| {
                 member.host_identity == live_server.discovery_key
                     && member.old_socket == command.socket
@@ -608,11 +774,14 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
         discovery_key: live_server.discovery_key.clone(),
     });
     let endpoint_path = endpoint.socket().display().to_string();
-    let server = match muxe_broker::BrokerServer::start_activation(
+    // The held startup guard is consumed here, exactly like the Zellij path:
+    // bind reuses the pre-connect claim, closing the construction/bind gap.
+    let server = match muxe_broker::BrokerServer::start_activation_with_lock(
         Arc::clone(&broker),
         endpoint,
         bootstrap,
         Some(recovery),
+        pre_lock,
     )
     .await
     {
@@ -621,7 +790,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
                 &logger,
                 "herdr",
                 "broker-serve",
-                format!("serving {endpoint_path}"),
+                &format!("serving {endpoint_path}"),
             );
             server
         }
@@ -630,7 +799,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
                 &logger,
                 "herdr",
                 "broker-serve",
-                format!("startup failed: {error}"),
+                &format!("startup failed: {error}"),
             );
             let _ = registry.unregister(&registration);
             return Err(error).wrap_err("could not start the Herdr broker endpoint");
@@ -639,16 +808,45 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let result = server.run(shutdown_rx).await;
     let _ = registry.unregister(&registration);
-    serve_event(&logger, "herdr", "broker-serve", "stopped".to_owned());
+    serve_event(&logger, "herdr", "broker-serve", "stopped");
     result.wrap_err("Herdr broker service stopped unexpectedly")
 }
 
 /// Hidden Zellij broker child mode, mirroring `serve_herdr_broker`: fixed typed
 /// inputs, normal-endpoint enforcement from the live session identity,
 /// journal/handoff target authorization, and owner-token registry cleanup.
+#[expect(
+    clippy::too_many_lines,
+    reason = "broker serve transaction: endpoint lock, adapter connect, identity match, journal and bridge authorization, registry token, bind, initial round, and run form one ordered startup that must stay together to keep the construction/bind gap closed"
+)]
 async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     let logger = muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
         .wrap_err("could not open the broker service audit log")?;
+    // Earliest lock ownership: serialize with concurrent starters before
+    // touching the host, so two children never hold overlapping adapters. A
+    // live endpoint means another broker won: exit before adapter
+    // construction. The guard drops before start_inner re-acquires; passing
+    // the held guard through bind awaits the broker-owned lock API.
+    let pre_endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Zellij, &command.session)
+        .wrap_err("could not derive the normal Zellij broker endpoint")?;
+    if pre_endpoint.socket() != command.socket {
+        bail!(
+            "broker endpoint {} does not match the recorded normal Zellij endpoint {}",
+            pre_endpoint.socket().display(),
+            command.socket.display()
+        );
+    }
+    let pre_lock = pre_endpoint.acquire_startup_lock().map_err(|error| {
+        color_eyre::eyre::eyre!("another broker starter holds the Zellij endpoint: {error}")
+    })?;
+    if let Err(error) = pre_endpoint.remove_validated_stale_socket() {
+        drop(pre_lock);
+        return Err(color_eyre::eyre::eyre!(
+            "could not claim the Zellij broker endpoint: {error}"
+        ));
+    }
+    // inherent input API directly, while the broker shares the same Arc as a
+    // trait object after load.
     let adapter = std::sync::Arc::new(
         muxe_adapter_zellij::ZellijAdapter::connect(muxe_adapter_zellij::ZellijAdapterConfig {
             session_name: command.session.clone(),
@@ -657,34 +855,15 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         .await
         .wrap_err("could not connect the pinned Zellij session for broker startup")?,
     );
-    // Establish the initial census round before the broker loads: no UI or
-    // commit may proceed until the adapter reports readiness. Retry on
-    // failure; exhausting the deadline fails startup closed.
-    let round_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        match adapter.establish_initial_round().await {
-            Ok(()) => break,
-            Err(error) => {
-                if std::time::Instant::now() >= round_deadline {
-                    serve_event(
-                        &logger,
-                        "zellij",
-                        "broker-serve",
-                        format!("initial census round never established: {error}"),
-                    );
-                    return Err(error).wrap_err("Zellij initial census round never established");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        }
-    }
-    serve_event(
-        &logger,
-        "zellij",
-        "broker-serve",
-        "initial census round established".to_owned(),
-    );
-    let broker = muxe_broker::Broker::load(adapter, &command.config)
+    // Load and authorize before binding. The initial census round splits by
+    // bootstrap kind: ordinary Running has no broker-side UI latch (adapter
+    // health is broadcast-only), so its round completes before the endpoint
+    // binds and any UI observes readiness from the first byte. An activation
+    // target must bind first and serve TargetGated status with ready=None
+    // before the coordinator swaps the bridge; its round runs concurrently
+    // with serving below.
+    let adapter_object: std::sync::Arc<dyn muxe_adapter_api::HostAdapter> = adapter.clone();
+    let broker = muxe_broker::Broker::load(adapter_object, &command.config)
         .await
         .wrap_err("could not load the broker configuration")?;
     let live_server = broker
@@ -708,6 +887,10 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         );
     }
     let current = muxe::compatibility::embedded_record()?.handoff;
+    // A half pair bails in the bootstrap match below; the flag only steers the
+    // initial-round placement (pre-bind for ordinary Running, concurrent with
+    // serving for an activation target).
+    let is_target = command.handoff.is_some();
     let recovery_path: Option<PathBuf> = match (&command.handoff, &command.activation_journal) {
         (None, None) => zellij_journal_for(&command.cache_dir, &command.session, &command.socket),
         (Some(_), Some(journal)) => Some(journal.clone()),
@@ -733,11 +916,21 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
             {
                 bail!("activation journal does not authorize this Zellij target record");
             }
-            let handoff_hex = handoff
-                .0
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+            // The registration below must carry the canonical stable managed
+            // bridge path (receipt authority), and the journal must name that
+            // same bridge: a target serving any other path would split the
+            // bridge-sharing group the coordinator commits atomically.
+            let config_dir = command.config.parent().ok_or_else(|| {
+                color_eyre::eyre::eyre!("broker configuration file has no parent directory")
+            })?;
+            let journal_bridge = muxe::integration::stable_bridge_path(config_dir);
+            if let muxe::lifecycle::UnitKind::Zellij { bridge_path_hash } = &journal.unit
+                && *bridge_path_hash
+                    != muxe::lifecycle::journal::unit_hash(&journal_bridge.display().to_string())
+            {
+                bail!("activation journal does not authorize this Zellij bridge path");
+            }
+            let handoff_hex = handoff_hex(&handoff);
             let authorized = journal.members.iter().any(|member| {
                 member.host_identity == live_server.discovery_key
                     && member.old_socket == command.socket
@@ -759,25 +952,76 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         }
         _ => bail!("broker target startup requires both --handoff and --activation-journal"),
     };
+    if !is_target {
+        // Ordinary Running admits UI the moment the endpoint binds (adapter
+        // health is broadcast-only, never a broker-side latch), so the single
+        // bounded round completes here: after bind every attach already
+        // observes readiness. Exhausting the budget fails startup closed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+        if let Err(error) = establish_initial_round_until(&adapter, deadline).await {
+            serve_event(
+                &logger,
+                "zellij",
+                "broker-serve",
+                &format!("initial census round never established: {error}"),
+            );
+            return Err(error).wrap_err("Zellij initial census round never established");
+        }
+        serve_event(
+            &logger,
+            "zellij",
+            "broker-serve",
+            "initial census round established",
+        );
+    }
     let registry = muxe::lifecycle::Registry::open(&command.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
+    // Every Zellij registration carries the canonical stable managed bridge
+    // path: without it select_units/group_zellij drop the entry and the broker
+    // is never selected or grouped for activation, and --host current cannot
+    // resolve the invoking session. Derived from the served config file (the
+    // receipt-canonical path the coordinator enforces in preflight), never a
+    // packaged path or a guessed byte hash; the target arm above already
+    // proved the journal names this same bridge.
+    let serve_config_dir = command.config.parent().ok_or_else(|| {
+        color_eyre::eyre::eyre!("broker configuration file has no parent directory")
+    })?;
+    let serve_bridge = muxe::integration::stable_bridge_path(serve_config_dir);
+    // A receipt naming any other bridge path refuses rather than registering
+    // a divergent bridge_path that would split the atomic bridge group.
+    if let Some(receipt) =
+        muxe::integration::receipt::load(&muxe::integration::integration_dir(serve_config_dir))
+            .wrap_err("could not read the Zellij integration receipt")?
+        && receipt.bridge.canonical_path != serve_bridge
+    {
+        bail!(
+            "integration receipt names {} but this broker serves {}; refusing a divergent bridge registration",
+            receipt.bridge.canonical_path.display(),
+            serve_bridge.display()
+        );
+    }
     let mut entry = muxe::lifecycle::BrokerEntry::now(
         "zellij",
         live_server.discovery_key.clone(),
         command.socket.clone(),
         std::process::id(),
     );
+    entry.bridge_path = Some(serve_bridge);
     entry.live_server = Some(live_server.server_id.as_str().to_owned());
     // Owner-token cleanup, exactly like the Herdr path: this broker removes only
     // its exact entry, never a target sharing the normal socket.
     let registration = registry
         .register(entry)
         .wrap_err("could not register the Zellij broker endpoint")?;
-    let server = match muxe_broker::BrokerServer::start_activation(
+    // The endpoint was claimed before adapter construction and the guard is
+    // consumed here: bind reuses the held lock instead of re-acquiring, so no
+    // gap admits a second child between construction and bind.
+    let server = match muxe_broker::BrokerServer::start_activation_with_lock(
         Arc::clone(&broker),
         endpoint,
         bootstrap,
         Some(recovery),
+        pre_lock,
     )
     .await
     {
@@ -786,7 +1030,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 &logger,
                 "zellij",
                 "broker-serve",
-                format!("serving {}", command.socket.display()),
+                &format!("serving {}", command.socket.display()),
             );
             server
         }
@@ -795,17 +1039,84 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 &logger,
                 "zellij",
                 "broker-serve",
-                format!("startup failed: {error}"),
+                &format!("startup failed: {error}"),
             );
             let _ = registry.unregister(&registration);
             return Err(error).wrap_err("could not start the Zellij broker endpoint");
         }
     };
+    if is_target {
+        // The endpoint is already bound and serving TargetGated status with
+        // ready=None, so the coordinator observes the target before the
+        // bridge swap. The round runs concurrently with serving: retry on
+        // Err with the transport intact, while the outer deadline bounds even
+        // a hanging call. Expiry requests shutdown, awaits the owned service
+        // (whose run epilogue unlinks the endpoint), unregisters the owned
+        // entry, and propagates the round failure.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+        if let Err(error) = establish_initial_round_until(&adapter, deadline).await {
+            serve_event(
+                &logger,
+                "zellij",
+                "broker-serve",
+                &format!("initial census round never established: {error}"),
+            );
+            let _ = shutdown_tx.send(true);
+            let _ = server_handle.await;
+            let _ = registry.unregister(&registration);
+            return Err(error).wrap_err("Zellij initial census round never established");
+        }
+        serve_event(
+            &logger,
+            "zellij",
+            "broker-serve",
+            "initial census round established",
+        );
+        let joined = server_handle.await;
+        let _ = registry.unregister(&registration);
+        serve_event(&logger, "zellij", "broker-serve", "stopped");
+        return joined
+            .wrap_err("Zellij broker service task ended unexpectedly")?
+            .wrap_err("Zellij broker service stopped unexpectedly");
+    }
     let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let result = server.run(shutdown_rx).await;
     let _ = registry.unregister(&registration);
-    serve_event(&logger, "zellij", "broker-serve", "stopped".to_owned());
+    serve_event(&logger, "zellij", "broker-serve", "stopped");
     result.wrap_err("Zellij broker service stopped unexpectedly")
+}
+
+/// Retries the inherent initial census round until success or the outer
+/// deadline. Each attempt is bounded by the remaining budget, so even a
+/// hanging call cannot outlive `deadline`; `Err` retries after a short pause
+/// with the transport intact (no churn, no park). Cancellation-safe: dropping
+/// a timed-out attempt leaves partial stamps for the next retry, and an
+/// established adapter returns immediately.
+async fn establish_initial_round_until(
+    adapter: &std::sync::Arc<muxe_adapter_zellij::ZellijAdapter>,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let mut last_error = String::from("startup budget elapsed before the first attempt");
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, adapter.establish_initial_round()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => {
+                last_error = error.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(_) => {
+                last_error = String::from("initial census round stalled past the startup budget");
+                break;
+            }
+        }
+    }
+    Err(color_eyre::eyre::eyre!("{last_error}"))
 }
 
 /// Owner-side journal mapping for broker disconnect recovery.
@@ -833,9 +1144,8 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
             member_committed: false,
             recover_after: Duration::ZERO,
         };
-        let journal = match muxe::lifecycle::journal::read_journal(path) {
-            Ok(journal) => journal,
-            Err(_) => return inconsistent(),
+        let Ok(journal) = muxe::lifecycle::journal::read_journal(path) else {
+            return inconsistent();
         };
         let member = journal
             .members
@@ -859,14 +1169,16 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0);
-        // A Ready journal is durable, but only a live Ready target owns
-        // completion: probe the member's recorded control socket at map time
-        // so a dead target restores the old unit instead of self-completing.
-        // A completed OS-level accept matches the registry liveness probe.
-        let socket = member.target_socket.as_ref().unwrap_or(&member.old_socket);
-        let target_live = std::os::unix::net::UnixStream::connect(socket).is_ok();
+            .map_or(0, |elapsed| elapsed.as_secs());
+        // Unit-consistent liveness (DESIGN 2215): an absent or incomplete target
+        // restores the complete old unit, never a per-member split. After durable
+        // Ready, every Ready member's recorded target must be live; a single dead
+        // target makes the unit incomplete for all members, so a live sibling
+        // target never owns completion alone. Probes are local socket connects
+        // (no cross-broker RPC) at map time, matching the registry probe.
+        let unit_live = matches!(journal.state, muxe::lifecycle::journal::JournalState::Ready)
+            && unit_ready_targets_live(&journal, &wanted);
+        let target_live = unit_live;
         muxe_broker::RecoveryView {
             journal_present: true,
             inconsistent: false,
@@ -877,9 +1189,49 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
         }
     }
 }
+/// Reports whether every durable-Ready member's recorded target answers a local
+/// socket connect. A single silent Ready target makes the unit incomplete, so no
+/// member observes a live unit alone. Local connects only, never cross-broker RPC.
+fn unit_ready_targets_live(
+    journal: &muxe::lifecycle::journal::ActivationJournal,
+    wanted_handoff: &str,
+) -> bool {
+    let mut covered_any = false;
+    for member in &journal.members {
+        if !matches!(
+            member.state,
+            muxe::lifecycle::journal::MemberTransition::Ready
+        ) {
+            continue;
+        }
+        let Some(recorded) = member.handoff_id.as_deref() else {
+            return false;
+        };
+        if !recorded.eq_ignore_ascii_case(wanted_handoff) {
+            return false;
+        }
+        covered_any = true;
+        let socket = member.target_socket.as_ref().unwrap_or(&member.old_socket);
+        if std::os::unix::net::UnixStream::connect(socket).is_err() {
+            return false;
+        }
+    }
+    covered_any
+}
+
+/// Lowercase hex for one nonce-sized byte string without per-byte `format!`.
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEXDIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEXDIGITS[(byte >> 4) as usize] as char);
+        out.push(HEXDIGITS[(byte & 0xF) as usize] as char);
+    }
+    out
+}
 
 fn handoff_hex(handoff: &muxe_protocol::control::HandoffId) -> String {
-    handoff.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    hex_bytes(&handoff.0)
 }
 
 /// Deterministic old-unit journal location for one Herdr discovery key.
@@ -983,15 +1335,22 @@ async fn open_pane(open: &PaneOpen) -> Result<()> {
         }
     };
     match host {
-        HostSelector::Zellij => zellij_open_pane(&logger, open).await,
-        HostSelector::Herdr => herdr_open_pane(&logger, &paths.cache_dir, open).await,
+        HostSelector::Zellij => zellij_open_pane(&logger, open),
+        HostSelector::Herdr => {
+            herdr_open_pane(&logger, &paths.cache_dir, &paths.config_file(), open).await
+        }
         HostSelector::Auto => unreachable!("automatic host selection is resolved"),
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "launcher transaction: runtime connect, origin precedence, pane open, and failure reporting form one ordered DES1993 precedence chain; splitting would scatter the saved-over-managed-over-absent ordering"
+)]
 async fn herdr_open_pane(
     logger: &muxe::logging::Logger,
     cache_dir: &Path,
+    config_file: &Path,
     open: &PaneOpen,
 ) -> Result<()> {
     let runtime = match muxe_adapter_herdr::HerdrRuntime::connect(herdr_launch_config(
@@ -1069,8 +1428,17 @@ async fn herdr_open_pane(
     // the placed pane carries a minted launch token; the adapter revalidates
     // the canonical shape before creating anything.
     if muxe_adapter_zellij::is_ui_argv(&argv) {
-        return herdr_open_ui_pane(logger, cache_dir, &runtime, origin, destination, open, argv)
-            .await;
+        return herdr_open_ui_pane(
+            logger,
+            cache_dir,
+            config_file,
+            &runtime,
+            origin,
+            destination,
+            open,
+            argv,
+        )
+        .await;
     }
     let launch = match command_pane_launch(open, origin, destination) {
         Ok(launch) => launch,
@@ -1121,9 +1489,18 @@ const LAUNCH_TOKEN_LEASE_MILLIS: u32 = 60_000;
 /// prepare a token with the live broker, create the pane carrying it, then
 /// register and commit. Any failure after prepare aborts best-effort so no
 /// minted token lingers.
+#[expect(
+    clippy::too_many_lines,
+    reason = "gated launch transaction: token prepare, pane creation, register, and commit with best-effort abort coupling form one ordered unit; splitting would scatter the lease and abort pairing"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "gated launch threads every participant handle through one prepare/create/register/commit chain; bundling would hide the coupling the transaction exists to pin"
+)]
 async fn herdr_open_ui_pane(
     logger: &muxe::logging::Logger,
     cache_dir: &Path,
+    config_file: &Path,
     runtime: &muxe_adapter_herdr::HerdrRuntime,
     origin: muxe_adapter_herdr::FocusedPane,
     destination: muxe_adapter_herdr::FocusedPane,
@@ -1198,7 +1575,7 @@ async fn herdr_open_ui_pane(
             })?;
         Ok::<String, color_eyre::eyre::Error>(placement.ui_pane.as_str().to_owned())
     };
-    let mut client = launcher_client(cache_dir, runtime).await?;
+    let mut client = launcher_client(cache_dir, config_file, runtime).await?;
     let token = prepare_ui_launch(&mut client, cache_dir, &origin, &root).await?;
     match commit_pane(&mut client, token).await {
         Ok(pane) => {
@@ -1267,8 +1644,13 @@ async fn prepare_ui_launch(
 /// discovery key; zero or several live matches fail closed.
 async fn launcher_client(
     cache_dir: &Path,
+    config_file: &Path,
     runtime: &muxe_adapter_herdr::HerdrRuntime,
 ) -> Result<muxe_broker::BrokerClient> {
+    // Coldstart first: no live broker means one is started (or the stale one
+    // is activated) before the exactly-one selection below. A wrong identity
+    // fails closed here, never with a second broker.
+    ensure_herdr_broker(cache_dir, config_file, runtime).await?;
     let discovery = runtime.identity().discovery_key.clone();
     let registry = muxe::lifecycle::Registry::open(cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
@@ -1323,17 +1705,14 @@ fn bootstrap_env(
         "MUXE_HERDR_ORIGIN_PANE_CWD".to_owned(),
         origin.cwd.to_string_lossy().into_owned(),
     );
-    env.insert(
-        "MUXE_PENDING_LAUNCH_TOKEN".to_owned(),
-        token.0.iter().map(|byte| format!("{byte:02x}")).collect(),
-    );
+    env.insert("MUXE_PENDING_LAUNCH_TOKEN".to_owned(), hex_bytes(&token.0));
     env
 }
 
 /// Opens a pane through the pinned Zellij CLI: `zellij --session <name> run`.
 /// Placement maps onto Run flags; semantics the CLI cannot express fail
 /// closed instead of silently degrading.
-async fn zellij_open_pane(logger: &muxe::logging::Logger, open: &PaneOpen) -> Result<()> {
+fn zellij_open_pane(logger: &muxe::logging::Logger, open: &PaneOpen) -> Result<()> {
     let session = required_environment("ZELLIJ_SESSION_NAME")?;
     let program = muxe_adapter_zellij::resolve_zellij_exe().map_err(|error| {
         color_eyre::eyre::eyre!("could not resolve the pinned Zellij executable: {error}")
@@ -1467,11 +1846,24 @@ fn zellij_run_argv(session: &str, open: &PaneOpen) -> Result<Vec<OsString>> {
 async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
     let pane = required_environment("ZELLIJ_PANE_ID")?;
     let session = required_environment("ZELLIJ_SESSION_NAME")?;
-    let endpoint =
-        muxe_broker::RuntimeEndpoint::for_host(muxe_protocol::HostKind::Zellij, &session)
-            .wrap_err("could not derive the normal Zellij broker endpoint")?;
+    let paths = muxe::paths::resolve()?;
+    let zellij_exe = muxe_adapter_zellij::resolve_zellij_exe().map_err(|error| {
+        color_eyre::eyre::eyre!("could not resolve the pinned Zellij executable: {error}")
+    })?;
+    // Coldstart first: a brokerless session starts one ordinary broker,
+    // reloads the stable bridge, and awaits the fresh compatible round here,
+    // so attach below never races initial readiness. A stale record
+    // activates the invoking bridge group; a wrong identity fails closed
+    // without a second broker.
+    let socket = ensure_zellij_broker(
+        &paths.cache_dir,
+        &paths.config_file(),
+        &session,
+        &zellij_exe,
+    )
+    .await?;
     let mut client = muxe_broker::BrokerClient::connect(
-        endpoint.socket(),
+        &socket,
         muxe_protocol::PeerRole::Ui,
         env!("CARGO_PKG_VERSION"),
         muxe_protocol::LiveServerIdentity {
@@ -1855,18 +2247,22 @@ async fn run_ui(menu: UiMenuCommand) -> Result<()> {
 
 async fn run_herdr_ui(menu: UiMenuCommand) -> Result<()> {
     let paths = muxe::paths::resolve()?;
-    let runtime = muxe_adapter_herdr::HerdrRuntime::connect(herdr_launch_config(paths.cache_dir)?)
-        .await
-        .wrap_err("could not establish the exact configured Herdr runtime")?;
+    let runtime =
+        muxe_adapter_herdr::HerdrRuntime::connect(herdr_launch_config(paths.cache_dir.clone())?)
+            .await
+            .wrap_err("could not establish the exact configured Herdr runtime")?;
     let attach = ui_attach_request(&menu, &runtime).await?;
+    // Coldstart first: no live broker means one is started (or the stale one
+    // is activated) before attach. The verified socket replaces the direct
+    // endpoint connect so UI never races broker startup.
+    let socket = ensure_herdr_broker(&paths.cache_dir, &paths.config_file(), &runtime).await?;
     let live_server = LiveServerIdentity {
         host: ProtocolHostKind::Herdr,
         discovery_key: runtime.identity().discovery_key.clone(),
         server_id: muxe_protocol::ServerId::new(runtime.identity().live_server_id.clone()),
     };
-    let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Herdr, &live_server.discovery_key)?;
     let mut client = BrokerClient::connect(
-        endpoint.socket(),
+        &socket,
         PeerRole::Ui,
         env!("CARGO_PKG_VERSION"),
         live_server,
@@ -2021,6 +2417,117 @@ mod tests {
         );
         assert!(resolve_pane_cwd(Path::new("relative"), None).is_err());
     }
+    /// Consumer boundary: a successful rollback still fails the command, so
+    /// CLI callers observe the original activation failure. Pins the exit
+    /// decision, never the printed wording.
+    #[test]
+    fn rolled_back_activation_still_fails_the_command() {
+        use muxe::lifecycle::UnitOutcome as Outcome;
+        assert!(!activation_incomplete(&[]));
+        assert!(!activation_incomplete(&[
+            Outcome::Committed {
+                unit: "herdr:a".to_owned(),
+            },
+            Outcome::Unchanged {
+                unit: "zellij:/bridge".to_owned(),
+            },
+        ]));
+        assert!(activation_incomplete(&[Outcome::RolledBack {
+            unit: "zellij:/bridge".to_owned(),
+            reason: "target diverged".to_owned(),
+        }]));
+        assert!(activation_incomplete(&[
+            Outcome::Committed {
+                unit: "herdr:a".to_owned(),
+            },
+            Outcome::Failed {
+                unit: "zellij:/bridge".to_owned(),
+                reason: "spawn refused".to_owned(),
+            },
+        ]));
+    }
+    /// Production disconnect mapping is unit-consistent (DESIGN 2215): one dead
+    /// Ready target makes every member observe an incomplete unit, never a
+    /// per-member split where oldA restores while oldB stands down.
+    #[test]
+    fn journal_recovery_reports_unit_incomplete_when_one_target_is_dead() {
+        use muxe::lifecycle::journal::{
+            ActivationJournal, JournalState, MemberState, MemberTransition, UnitKind,
+        };
+        use muxe_broker::RecoveryJournal;
+        use muxe_protocol::control::{CompatibilityRecord, HandoffId};
+        let cache = tempfile::tempdir().expect("owned recovery cache");
+        let cache_dir = cache.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache exists");
+        let handoff = HandoffId([23; 16]);
+        let wanted = handoff_hex(&handoff);
+        let record = CompatibilityRecord {
+            muxe_version: "9.9.9".to_owned(),
+            target_triple: "test-triple".to_owned(),
+            application_schema_fingerprint: muxe_protocol::SchemaFingerprint([1; 32]),
+            zellij: None,
+            herdr: None,
+        };
+        let socket_a = cache.path().join("a.sock");
+        let socket_b = cache.path().join("b.sock");
+        // B lives; A is absent (no listener on its target path).
+        let _live_b = std::os::unix::net::UnixListener::bind(&socket_b).expect("bind B");
+        let members = vec![
+            MemberState {
+                host_identity: "session-a".to_owned(),
+                old_socket: socket_a.clone(),
+                target_socket: Some(socket_a.clone()),
+                handoff_id: Some(wanted.clone()),
+                state: MemberTransition::Ready,
+            },
+            MemberState {
+                host_identity: "session-b".to_owned(),
+                old_socket: socket_b.clone(),
+                target_socket: Some(socket_b),
+                handoff_id: Some(wanted),
+                state: MemberTransition::Ready,
+            },
+        ];
+        let mut journal = ActivationJournal::new(
+            UnitKind::Zellij {
+                bridge_path_hash: "unit-test".to_owned(),
+            },
+            record.clone(),
+            record,
+            members,
+        );
+        journal.state = JournalState::Ready;
+        let path = muxe::lifecycle::journal::write_journal(&cache_dir, &journal)
+            .expect("write Ready journal");
+        for discovery in ["session-a", "session-b"] {
+            let view = JournalRecovery {
+                journal_path: Some(path.clone()),
+                discovery_key: discovery.to_owned(),
+            }
+            .recovery_view(&handoff);
+            assert!(!view.inconsistent, "{discovery} maps a known handoff");
+            assert!(view.journal_present, "{discovery} observes the journal");
+            assert!(view.member_ready, "{discovery} is Ready");
+            assert!(
+                !view.target_live,
+                "{discovery} observes unit-incomplete while A is dead"
+            );
+        }
+        // Both live: the unit completes for every member.
+        let _live_a = std::os::unix::net::UnixListener::bind(&socket_a).expect("bind A");
+        for discovery in ["session-a", "session-b"] {
+            let view = JournalRecovery {
+                journal_path: Some(path.clone()),
+                discovery_key: discovery.to_owned(),
+            }
+            .recovery_view(&handoff);
+            assert!(view.member_ready, "{discovery} stays Ready");
+            assert!(
+                view.target_live,
+                "{discovery} observes unit-live when both answer"
+            );
+        }
+    }
 }
 #[cfg(test)]
 mod launcher_tests {
@@ -2093,12 +2600,11 @@ mod launcher_tests {
         );
         assert!(select_launcher_origin(&lookup(&relative)).is_err());
 
-        let mut partial = map.clone();
+        let mut partial = map;
         partial.remove("MUXE_HERDR_ORIGIN_PANE_ID");
         assert!(select_launcher_origin(&lookup(&partial)).is_err());
     }
 
-    /// Snapshot focus is paneB while the inherited ACTIVE tuple names paneA: the
     /// launcher boundary must resolve paneA with live-enriched cwd, never focus.
     fn snapshot_body() -> serde_json::Value {
         serde_json::json!({
@@ -2118,12 +2624,12 @@ mod launcher_tests {
         })
     }
 
-    async fn serve_snapshot(
-        path: std::path::PathBuf,
+    fn serve_snapshot(
+        path: &std::path::Path,
         body: serde_json::Value,
     ) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let listener = tokio::net::UnixListener::bind(&path).expect("bind owned snapshot socket");
+        let listener = tokio::net::UnixListener::bind(path).expect("bind owned snapshot socket");
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -2159,7 +2665,7 @@ mod launcher_tests {
     async fn inherited_active_origin_resolves_against_snapshot_not_focus() {
         let directory = tempfile::tempdir().expect("owned launcher boundary directory");
         let path = directory.path().join("herdr.sock");
-        let server = serve_snapshot(path.clone(), snapshot_body()).await;
+        let server = serve_snapshot(&path, snapshot_body());
         let client = muxe_adapter_herdr::HerdrSocketClient::new(&path);
         let schema = muxe_adapter_herdr::ApiSchema::parse(
             serde_json::from_str(include_str!(
@@ -2199,14 +2705,14 @@ mod launcher_tests {
     /// Failure before UI creation (the ACTIVE pane is absent from the snapshot) must
     /// still reach the audit log and attempt notification; only the launcher's own
     /// snapshot and notification requests may exist — never layout or move calls.
-    async fn serve_recording(
-        path: std::path::PathBuf,
+    fn serve_recording(
+        path: &std::path::Path,
         snapshot: serde_json::Value,
         seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     ) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let listener = tokio::net::UnixListener::bind(&path).expect("bind owned socket");
+        let listener = tokio::net::UnixListener::bind(path).expect("bind owned socket");
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -2236,18 +2742,17 @@ mod launcher_tests {
                     seen.lock()
                         .expect("method log is writable")
                         .push(method.clone());
-                    let result = match method.as_str() {
-                        "session.snapshot" => serde_json::json!({
+                    let result = if method.as_str() == "session.snapshot" {
+                        serde_json::json!({
                             "type": "session_snapshot",
                             "snapshot": snapshot,
-                        }),
-                        _ => {
-                            bodies
-                                .lock()
-                                .expect("body log is writable")
-                                .push(payload.clone());
-                            serde_json::json!({"shown": true})
-                        }
+                        })
+                    } else {
+                        bodies
+                            .lock()
+                            .expect("body log is writable")
+                            .push(payload.clone());
+                        serde_json::json!({"shown": true})
                     };
                     let response = serde_json::json!({"id": id, "result": result});
                     let _ = reader.write_all(format!("{response}\n").as_bytes()).await;
@@ -2284,12 +2789,11 @@ mod launcher_tests {
         let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let path = directory.path().join("herdr.sock");
         let server = serve_recording(
-            path.clone(),
+            &path,
             snapshot,
             std::sync::Arc::clone(&seen),
             std::sync::Arc::clone(&bodies),
-        )
-        .await;
+        );
         let client = muxe_adapter_herdr::HerdrSocketClient::new(&path);
         let schema = muxe_adapter_herdr::ApiSchema::parse(
             serde_json::from_str(include_str!(
@@ -2452,8 +2956,8 @@ mod consumer_tests {
             exe,
             config,
             cache,
-            &Some(PathBuf::from("/bin/herdr")),
-            &None,
+            Some(&PathBuf::from("/bin/herdr")),
+            None,
             &entries,
             &muxe::lifecycle::SpawnMember {
                 host_identity: "/herdr.sock".to_owned(),
@@ -2474,8 +2978,8 @@ mod consumer_tests {
             exe,
             config,
             cache,
-            &None,
-            &Some(PathBuf::from("/bin/zellij")),
+            None,
+            Some(&PathBuf::from("/bin/zellij")),
             &entries,
             &muxe::lifecycle::SpawnMember {
                 host_identity: "session-a".to_owned(),
@@ -2496,8 +3000,8 @@ mod consumer_tests {
                 exe,
                 config,
                 cache,
-                &None,
-                &None,
+                None,
+                None,
                 &std::collections::HashMap::new(),
                 &muxe::lifecycle::SpawnMember {
                     host_identity: "x".to_owned(),

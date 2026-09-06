@@ -108,19 +108,41 @@ zellij\t''
 herdr\t''"
 complete -c muxe -n "__fish_muxe_using_subcommand activate" -s h -l help -d 'Print help'
 complete -c muxe -n "__fish_muxe_using_subcommand activate" -s V -l version -d 'Print version'
-complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire help" -s h -l help -d 'Print help'
-complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire help" -s V -l version -d 'Print version'
-complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire help" -f -a "retire" -d 'Drain and retire brokers without starting replacements'
-complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire serve-herdr serve-zellij help" -s h -l help -d 'Print help'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire serve-herdr serve-zellij help" -s V -l version -d 'Print version'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire serve-herdr serve-zellij help" -f -a "retire" -d 'Drain and retire brokers without starting replacements'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire serve-herdr serve-zellij help" -f -a "serve-herdr" -d 'Start the target Herdr broker in the repository-owned upgrade runner'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire serve-herdr serve-zellij help" -f -a "serve-zellij" -d 'Start the target Zellij broker in the repository-owned upgrade runner'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and not __fish_seen_subcommand_from retire serve-herdr serve-zellij help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from retire" -l host -d 'Select live hosts to retire. The public contract intentionally has no default' -r -f -a "all\t''
 current\t''
 zellij\t''
 herdr\t''"
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from retire" -s h -l help -d 'Print help'
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from retire" -s V -l version -d 'Print version'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l socket -d 'Absolute Muxe broker endpoint socket path' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l herdr-binary -d 'Absolute path to the pinned Herdr binary' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l herdr-socket -d 'Absolute Herdr server socket path' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l config -d 'Absolute configuration path for the target broker' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l cache-dir -d 'Absolute cache directory for the target broker' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l handoff -d 'Exact 32-hex-character target activation handoff ID' -r
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l activation-journal -d 'Durable activation journal read before the target broker binds' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -s h -l help -d 'Print help'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -s V -l version -d 'Print version'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l socket -d 'Absolute Muxe broker endpoint socket path' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l zellij-exe -d 'Absolute path to the pinned Zellij binary' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l session -d 'Live Zellij session name the target broker serves' -r
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l config -d 'Absolute configuration path for the target broker' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l cache-dir -d 'Absolute cache directory for the target broker' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l handoff -d 'Exact 32-hex-character target activation handoff ID' -r
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l activation-journal -d 'Durable activation journal read before the target broker binds' -r -F
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -s h -l help -d 'Print help'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -s V -l version -d 'Print version'
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from help" -f -a "retire" -d 'Drain and retire brokers without starting replacements'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from help" -f -a "serve-herdr" -d 'Start the target Herdr broker in the repository-owned upgrade runner'
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from help" -f -a "serve-zellij" -d 'Start the target Zellij broker in the repository-owned upgrade runner'
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c muxe -n "__fish_muxe_using_subcommand compatibility" -l json -d 'Emit the stable snake_case JSON record'
+complete -c muxe -n "__fish_muxe_using_subcommand compatibility" -l json -d 'Emit the stable `snake_case` JSON record'
 complete -c muxe -n "__fish_muxe_using_subcommand compatibility" -s h -l help -d 'Print help'
 complete -c muxe -n "__fish_muxe_using_subcommand compatibility" -s V -l version -d 'Print version'
 complete -c muxe -n "__fish_muxe_using_subcommand purge" -l config -d 'Remove the complete Muxe configuration tree'
@@ -153,4 +175,6 @@ complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcomma
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from integration" -f -a "install" -d 'Install the bundled Zellij bridge and optionally configure Zellij KDL'
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from integration" -f -a "uninstall" -d 'Remove receipt-owned Zellij integration artifacts'
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from broker" -f -a "retire" -d 'Drain and retire brokers without starting replacements'
+complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from broker" -f -a "serve-herdr" -d 'Start the target Herdr broker in the repository-owned upgrade runner'
+complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from broker" -f -a "serve-zellij" -d 'Start the target Zellij broker in the repository-owned upgrade runner'
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from ui" -f -a "menu" -d 'Run the UI for one root menu'

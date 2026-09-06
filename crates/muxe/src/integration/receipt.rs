@@ -114,6 +114,11 @@ fn receipt_path(directory: &Path) -> PathBuf {
 ///
 /// A corrupt receipt or an unsupported schema version is a hard error: the
 /// installer must never guess ownership.
+///
+/// # Errors
+///
+/// Returns an error when the receipt cannot be read, is not owner-only,
+/// fails to parse as JSON, or uses an unsupported schema version.
 pub fn load(directory: &Path) -> Result<Option<Receipt>, ReceiptError> {
     let path = receipt_path(directory);
     let bytes = match fs::read(&path) {
@@ -130,8 +135,11 @@ pub fn load(directory: &Path) -> Result<Option<Receipt>, ReceiptError> {
     // Ownership decisions require the receipt to be owner-only; a
     // world-readable receipt could have been planted by another user.
     fsutil::check_owner_file(&path)?;
-    let receipt: Receipt = serde_json::from_slice(&bytes)
-        .map_err(|source| ReceiptError::Corrupt { path: path.clone(), source })?;
+    let receipt: Receipt =
+        serde_json::from_slice(&bytes).map_err(|source| ReceiptError::Corrupt {
+            path: path.clone(),
+            source,
+        })?;
     if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
         return Err(ReceiptError::UnsupportedVersion {
             path,
@@ -142,12 +150,16 @@ pub fn load(directory: &Path) -> Result<Option<Receipt>, ReceiptError> {
 }
 
 /// Stores the receipt atomically with owner-only mode.
+///
+/// # Errors
+///
+/// Returns an error when the receipt cannot be serialized or the
+/// directory setup and atomic write fail.
 pub fn store(directory: &Path, receipt: &Receipt) -> Result<(), ReceiptError> {
-    let bytes = serde_json::to_vec_pretty(receipt)
-        .map_err(|source| ReceiptError::Corrupt {
-            path: receipt_path(directory),
-            source,
-        })?;
+    let bytes = serde_json::to_vec_pretty(receipt).map_err(|source| ReceiptError::Corrupt {
+        path: receipt_path(directory),
+        source,
+    })?;
     fsutil::ensure_owner_dir(directory)?;
     fsutil::write_atomic(&receipt_path(directory), &bytes, "receipt")?;
     Ok(())
@@ -155,6 +167,11 @@ pub fn store(directory: &Path, receipt: &Receipt) -> Result<(), ReceiptError> {
 
 /// Removes the receipt file. Only called after every managed artifact is gone
 /// or every unresolved record was explicitly left to the user.
+///
+/// # Errors
+///
+/// Returns an error when the receipt cannot be removed or the parent
+/// directory cannot be synchronized.
 pub fn remove(directory: &Path) -> Result<(), ReceiptError> {
     let path = receipt_path(directory);
     match std::fs::remove_file(&path) {
@@ -202,7 +219,11 @@ mod tests {
     #[test]
     fn round_trip_preserves_owner_only_mode() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let dir = temp.path().join("zellij");
         store(&dir, &sample_receipt()).unwrap();
         crate::logging::assert_owner_only(&dir.join("receipt.json"));
@@ -212,16 +233,27 @@ mod tests {
     #[test]
     fn missing_receipt_loads_as_none() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         assert_eq!(load(temp.path()).unwrap(), None);
     }
 
     #[test]
     fn corrupt_receipt_fails_closed() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         fsutil::ensure_owner_dir(temp.path()).unwrap();
         fsutil::write_atomic(&temp.path().join("receipt.json"), b"{nope", "receipt").unwrap();
-        assert!(matches!(load(temp.path()), Err(ReceiptError::Corrupt { .. })));
+        assert!(matches!(
+            load(temp.path()),
+            Err(ReceiptError::Corrupt { .. })
+        ));
     }
 }

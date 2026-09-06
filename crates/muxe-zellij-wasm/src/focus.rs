@@ -218,7 +218,7 @@ mod tests {
     fn touching_edges_do_not_count_as_separated() {
         // Pane 2 starts exactly where pane 1 ends: separated for Right.
         // A zero-width gap is still a clean split; an overlapping edge is not.
-        let inventory = inventory();
+        let mut with_overlap = inventory();
         let overlapping = PaneGeometry {
             id: 9,
             is_plugin: false,
@@ -227,7 +227,6 @@ mod tests {
             columns: 10,
             rows: 20,
         };
-        let mut with_overlap = inventory.clone();
         with_overlap.set_manifest(BTreeMap::from([(
             0,
             vec![pane(1, 0, 0, 50, 20), overlapping],

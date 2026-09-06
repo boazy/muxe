@@ -13,8 +13,7 @@
 //! safely re-apply a journaled edit.
 
 use std::{
-    fs,
-    io,
+    fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -37,10 +36,7 @@ pub enum KdlError {
     #[error(transparent)]
     Fs(#[from] FsError),
     #[error("cannot parse Zellij configuration at {}: {detail}", path.display())]
-    Unparseable {
-        path: PathBuf,
-        detail: String,
-    },
+    Unparseable { path: PathBuf, detail: String },
     #[error("ambiguous duplicate `{node}` nodes in {}: resolve manually", path.display())]
     Ambiguous {
         path: std::path::PathBuf,
@@ -92,9 +88,7 @@ pub struct ConfigPlan {
 /// Renders the required manual snippet for `bridge_url`.
 #[must_use]
 pub fn required_snippet(bridge_url: &str) -> String {
-    format!(
-        "plugins {{\n    muxe location=\"{bridge_url}\"\n}}\n\nload_plugins {{\n    muxe\n}}\n"
-    )
+    format!("plugins {{\n    muxe location=\"{bridge_url}\"\n}}\n\nload_plugins {{\n    muxe\n}}\n")
 }
 
 /// Builds the `file:` URL for an absolute bridge path.
@@ -149,11 +143,13 @@ fn parse_original(path: &Path, text: &str) -> Result<KdlDocument, KdlError> {
 /// computing span edits the candidate is re-parsed and every managed node is
 /// snapshotted from its span, so receipt digests match what uninstallation
 /// and recovery later read back. Already-correct nodes snapshot the original.
-pub fn plan(
-    path: &Path,
-    original: &str,
-    bridge_url: &str,
-) -> Result<ConfigPlan, KdlError> {
+///
+/// # Errors
+///
+/// Returns `KdlError::Unparseable` for malformed documents,
+/// `KdlError::Ambiguous` for duplicate managed nodes, and
+/// `KdlError::CandidateRejected` when the planned candidate is invalid.
+pub fn plan(path: &Path, original: &str, bridge_url: &str) -> Result<ConfigPlan, KdlError> {
     let document = parse_original(path, original)?;
     let mut edits = Vec::new();
     let mut nodes = Vec::new();
@@ -173,11 +169,15 @@ pub fn plan(
     };
     let snapshots = snapshot_nodes(path, &basis)?;
     for node in &mut nodes {
-        let (text, semantic) = snapshots.get(&node.node).ok_or_else(|| {
-            KdlError::CandidateRejected {
-                detail: format!("managed node `{}` missing after planning", node.node.as_str()),
-            }
-        })?;
+        let (text, semantic) =
+            snapshots
+                .get(&node.node)
+                .ok_or_else(|| KdlError::CandidateRejected {
+                    detail: format!(
+                        "managed node `{}` missing after planning",
+                        node.node.as_str()
+                    ),
+                })?;
         node.text = text.clone();
         node.text_digest = crate::fsutil::sha256_hex(text.as_bytes());
         node.semantic = semantic.clone();
@@ -196,10 +196,9 @@ fn snapshot_nodes(
     path: &Path,
     text: &str,
 ) -> Result<std::collections::HashMap<ManagedNode, (String, String)>, KdlError> {
-    let document =
-        KdlDocument::parse_v1(text).map_err(|error| KdlError::CandidateRejected {
-            detail: error.to_string(),
-        })?;
+    let document = KdlDocument::parse_v1(text).map_err(|error| KdlError::CandidateRejected {
+        detail: error.to_string(),
+    })?;
     let mut snapshots = std::collections::HashMap::new();
     for (parent_name, managed) in [
         (PLUGINS_NODE, ManagedNode::PluginsAlias),
@@ -270,10 +269,12 @@ fn plan_plugins_node(
     bridge_url: &str,
 ) -> Result<NodePlan, KdlError> {
     let wanted_text = plugins_node_text(bridge_url);
-    match children_named(document, PLUGINS_NODE).map_err(|_| KdlError::Ambiguous {
-        path: path.to_path_buf(),
-        node: PLUGINS_NODE,
-    })? .as_slice()
+    match children_named(document, PLUGINS_NODE)
+        .map_err(|_| KdlError::Ambiguous {
+            path: path.to_path_buf(),
+            node: PLUGINS_NODE,
+        })?
+        .as_slice()
     {
         [] => Ok(append_block_plan(
             ManagedNode::PluginsAlias,
@@ -284,7 +285,12 @@ fn plan_plugins_node(
         [plugins] => {
             let children = plugins.children();
             let existing: Vec<&KdlNode> = children
-                .map(|doc| doc.nodes().iter().filter(|n| n.name().value() == MUXE_NODE).collect())
+                .map(|doc| {
+                    doc.nodes()
+                        .iter()
+                        .filter(|n| n.name().value() == MUXE_NODE)
+                        .collect()
+                })
                 .unwrap_or_default();
             if existing.len() > 1 {
                 return Err(KdlError::Ambiguous {
@@ -337,7 +343,12 @@ fn plan_load_plugins_node(
         [parent] => {
             let existing: Vec<&KdlNode> = parent
                 .children()
-                .map(|doc| doc.nodes().iter().filter(|n| n.name().value() == MUXE_NODE).collect())
+                .map(|doc| {
+                    doc.nodes()
+                        .iter()
+                        .filter(|n| n.name().value() == MUXE_NODE)
+                        .collect()
+                })
                 .unwrap_or_default();
             if existing.len() > 1 {
                 return Err(KdlError::Ambiguous {
@@ -433,11 +444,11 @@ fn insert_child_plan(
 /// Byte offset where a new child line goes: after the last existing child, or
 /// just inside the opening brace when the block is empty.
 fn insert_position(original: &str, parent: &KdlNode) -> usize {
-    if let Some(children) = parent.children() {
-        if let Some(last) = children.nodes().last() {
-            let span = last.span();
-            return span.offset() + span.len();
-        }
+    if let Some(children) = parent.children()
+        && let Some(last) = children.nodes().last()
+    {
+        let span = last.span();
+        return span.offset() + span.len();
     }
     let span = parent.span();
     let search_from = span.offset();
@@ -493,7 +504,7 @@ fn replace_or_keep_plan(
         semantic: wanted_semantic.unwrap_or_else(|| wanted_text.to_owned()),
         text_digest: crate::fsutil::sha256_hex(wanted_text.as_bytes()),
         text: wanted_text.to_owned(),
-        previous_text: Some(current_text.clone()),
+        previous_text: Some(current_text),
         previous_semantic: Some(current_semantic),
         edits: vec![TextEdit {
             start: span.offset(),
@@ -545,8 +556,13 @@ pub struct PlannedFile {
     /// Node plans with Created/Updated/Observed dispositions.
     pub plan: ConfigPlan,
 }
-
+///
 /// Reads the configuration and plans both managed nodes without mutation.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be read or inspected,
+/// is not valid UTF-8, or planning fails on a malformed or ambiguous document.
 pub fn read_and_plan(path: &Path, bridge_url: &str) -> Result<PlannedFile, KdlError> {
     let before = match fs::read(path) {
         Ok(bytes) => Some(bytes),
@@ -643,6 +659,13 @@ fn minimal_plan(_path: &Path, bridge_url: &str) -> Result<ConfigPlan, KdlError> 
 /// Commits a previously read plan: re-validates, checks for concurrent
 /// change, and atomically writes. The caller must have journaled the accepted
 /// plan before calling this function.
+///
+/// # Errors
+///
+/// Returns `KdlError::Unparseable` for invalid planned bytes,
+/// `KdlError::CandidateRejected` for an invalid candidate,
+/// `KdlError::ConcurrentChange` when the file changed since planning, and
+/// `KdlError::Fs` when the file cannot be read or written.
 pub fn commit_planned(
     path: &Path,
     bridge_url: &str,
@@ -659,12 +682,11 @@ pub fn commit_planned(
             nodes: planned.plan.nodes.clone(),
         });
     }
-    let original = String::from_utf8(planned.before.clone()).map_err(|_| {
-        KdlError::Unparseable {
+    let original =
+        String::from_utf8(planned.before.clone()).map_err(|_| KdlError::Unparseable {
             path: path.to_path_buf(),
             detail: "configuration is not valid UTF-8".to_owned(),
-        }
-    })?;
+        })?;
     let candidate = apply_edits(&original, &planned.plan.edits);
     parse_candidate(&candidate)?;
     // Concurrent-change check: the file must still hold the planned bytes.
@@ -686,6 +708,11 @@ pub fn commit_planned(
 /// Convenience wrapper over [`read_and_plan`] plus [`commit_planned`] for
 /// idempotent re-application during recovery. Recovery callers must keep the
 /// journaled dispositions: re-application converges bytes, never provenance.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be read, planned, or
+/// committed, or when the file changed concurrently.
 pub fn apply_config(
     path: &Path,
     bridge_url: &str,
@@ -705,7 +732,11 @@ fn parse_candidate(candidate: &str) -> Result<(), KdlError> {
     Ok(())
 }
 
-fn write_candidate(path: &Path, candidate: &str, preserve_mode: Option<u32>) -> Result<(), KdlError> {
+fn write_candidate(
+    path: &Path,
+    candidate: &str,
+    preserve_mode: Option<u32>,
+) -> Result<(), KdlError> {
     let directory = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(directory) = directory {
         fs::create_dir_all(directory).map_err(|source| {
@@ -722,8 +753,9 @@ fn write_candidate(path: &Path, candidate: &str, preserve_mode: Option<u32>) -> 
         use std::io::Write;
         file.write_all(candidate.as_bytes())
             .map_err(|source| fsutil::io_error("writing Zellij configuration", &staging, source))?;
-        file.sync_all()
-            .map_err(|source| fsutil::io_error("synchronizing Zellij configuration", &staging, source))?;
+        file.sync_all().map_err(|source| {
+            fsutil::io_error("synchronizing Zellij configuration", &staging, source)
+        })?;
         drop(file);
         fs::rename(&staging, path)
             .map_err(|source| fsutil::io_error("installing Zellij configuration", path, source))?;
@@ -732,13 +764,9 @@ fn write_candidate(path: &Path, candidate: &str, preserve_mode: Option<u32>) -> 
                 fsutil::io_error("restoring Zellij configuration permissions", path, source)
             })?;
         }
-        fsutil::sync_dir(directory)
+        fsutil::sync_external_dir(directory)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&staging);
-    } else {
-        let _ = fs::remove_file(&staging);
-    }
+    let _ = fs::remove_file(&staging);
     Ok(result?)
 }
 
@@ -746,6 +774,11 @@ fn write_candidate(path: &Path, candidate: &str, preserve_mode: Option<u32>) -> 
 ///
 /// Used by uninstallation, which validates the candidate itself before
 /// committing. Creation is never allowed here: the file must exist.
+///
+/// # Errors
+///
+/// Returns a `KdlError::Fs` error when the existing file cannot be inspected,
+/// read, or atomically replaced.
 pub fn write_raw_config(path: &Path, candidate: &str) -> Result<(), KdlError> {
     let mode = fs::symlink_metadata(path)
         .map_err(|source| fsutil::io_error("checking Zellij configuration", path, source))?
@@ -796,13 +829,10 @@ impl ConfigApplied {
         };
         match self {
             Self::Missing => Vec::new(),
-            Self::CreatedMinimal => [
-                ManagedNode::PluginsAlias,
-                ManagedNode::LoadPluginsEntry,
-            ]
-            .into_iter()
-            .filter_map(|node| record(node, Disposition::Created, None))
-            .collect(),
+            Self::CreatedMinimal => [ManagedNode::PluginsAlias, ManagedNode::LoadPluginsEntry]
+                .into_iter()
+                .filter_map(|node| record(node, Disposition::Created, None))
+                .collect(),
             Self::AlreadyCorrect { nodes } => nodes
                 .iter()
                 .filter_map(|plan| record(plan.node, Disposition::Observed, None))
@@ -839,7 +869,6 @@ pub fn plan_records(config_path: &Path, nodes: &[NodePlan]) -> Vec<NodeRecord> {
         })
         .collect()
 }
-
 /// Verifies that every owned (Created or Updated) record still matches the
 /// configuration on disk, by semantic representation and exact text digest.
 /// Observed records are informational and skipped: uninstall already leaves
@@ -847,6 +876,12 @@ pub fn plan_records(config_path: &Path, nodes: &[NodePlan]) -> Vec<NodeRecord> {
 ///
 /// Used by crash recovery before committing a receipt for journaled nodes, so
 /// a receipt never claims ownership the current bytes contradict.
+///
+/// # Errors
+///
+/// Returns a human-readable reason when the configuration cannot be read or
+/// parsed, or when an owned node is missing, duplicated, or no longer matches
+/// the recorded semantic representation and text digest.
 pub fn verify_records(config_path: &Path, records: &[NodeRecord]) -> Result<(), String> {
     let owned: Vec<&NodeRecord> = records
         .iter()
@@ -880,9 +915,9 @@ fn verify_one_record(
         .nodes()
         .iter()
         .filter(|node| node.name().value() == parent_name);
-    let block = blocks.next().ok_or_else(|| {
-        format!("`{}` is gone from {}", record.node.as_str(), parent_name)
-    })?;
+    let block = blocks
+        .next()
+        .ok_or_else(|| format!("`{}` is gone from {}", record.node.as_str(), parent_name))?;
     if blocks.next().is_some() {
         return Err(format!("ambiguous duplicate `{parent_name}` blocks"));
     }
@@ -972,7 +1007,13 @@ mod tests {
             .find(|node| node.node == ManagedNode::PluginsAlias)
             .unwrap();
         assert_eq!(plugins.disposition, Disposition::Updated);
-        assert!(plugins.previous_text.as_ref().unwrap().contains("/old/bridge.wasm"));
+        assert!(
+            plugins
+                .previous_text
+                .as_ref()
+                .unwrap()
+                .contains("/old/bridge.wasm")
+        );
         let candidate = apply_edits(original, &plan.edits);
         KdlDocument::parse_v1(&candidate).unwrap();
         assert!(!candidate.contains("/old/bridge.wasm"));
@@ -998,13 +1039,16 @@ mod tests {
     #[test]
     fn concurrent_change_aborts_before_write() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let path = temp.path().join("config.kdl");
         fs::write(&path, "plugins {\n    other location=\"x\"\n}\n").unwrap();
         // Simulate a concurrent writer by pre-seeding the candidate check path:
         // apply twice with an external mutation between plan and commit is
         // covered by holding the file open here; the direct check below uses
-        // the real filesystem race window.
         let applied = apply_config(&path, URL, false).unwrap();
         assert!(matches!(applied, ConfigApplied::Edited { .. }));
         let second = apply_config(&path, URL, false).unwrap();
@@ -1014,13 +1058,41 @@ mod tests {
     #[test]
     fn apply_is_idempotent() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let path = temp.path().join("config.kdl");
         fs::write(&path, "// keep me\n").unwrap();
         let first = apply_config(&path, URL, false).unwrap();
         assert!(matches!(first, ConfigApplied::Edited { .. }));
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("// keep me\n"));
+        let second = apply_config(&path, URL, false).unwrap();
+        assert!(matches!(second, ConfigApplied::AlreadyCorrect { .. }));
+    }
+
+    #[test]
+    fn external_parent_without_owner_mode_commits_and_preserves_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), PermissionsExt::from_mode(0o755)).unwrap();
+        let path = temp.path().join("config.kdl");
+        fs::write(&path, "plugins {\n    other location=\"x\"\n}\n").unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
+        let _applied = apply_config(&path, URL, false).unwrap();
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&path),
+            0o644,
+            "existing file permissions are preserved"
+        );
+        assert_eq!(
+            mode(temp.path()),
+            0o755,
+            "the external parent directory is never chmodded"
+        );
         let second = apply_config(&path, URL, false).unwrap();
         assert!(matches!(second, ConfigApplied::AlreadyCorrect { .. }));
     }

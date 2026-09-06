@@ -38,13 +38,13 @@ struct Args {
 }
 
 fn main() {
-    if let Err(error) = run(Args::parse()) {
+    if let Err(error) = run(&Args::parse()) {
         eprintln!("codegen-completions: {error}");
         std::process::exit(1);
     }
 }
 
-fn run(args: Args) -> Result<(), String> {
+fn run(args: &Args) -> Result<(), String> {
     let mut command = Cli::command();
     if args.check {
         verify(&args.out, &mut command)
@@ -80,7 +80,10 @@ fn verify(out: &Path, command: &mut clap::Command) -> Result<(), String> {
             let expected = fs::read(staging.join(file))
                 .map_err(|error| format!("cannot read staged {file}: {error}"))?;
             let actual = fs::read(out.join(file)).map_err(|error| {
-                format!("committed {} missing or unreadable: {error}", out.join(file).display())
+                format!(
+                    "committed {} missing or unreadable: {error}",
+                    out.join(file).display()
+                )
             })?;
             if expected != actual {
                 return Err(format!(

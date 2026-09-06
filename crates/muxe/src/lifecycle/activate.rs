@@ -240,7 +240,17 @@ pub struct TargetHandle {
 /// Starts and stops target brokers. Only owns process mechanics; the argv it
 /// executes comes from the caller-owned [`SpawnRequest`].
 pub trait BrokerSpawner {
+    /// Spawns one target broker child from a caller-owned argv.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActivateError`] when the child process cannot be spawned.
     fn spawn_target(&self, request: &SpawnRequest) -> Result<TargetHandle, ActivateError>;
+    /// Stops a spawner-owned target child and reaps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActivateError`] when the child cannot be signalled.
     fn stop_target(&self, handle: TargetHandle) -> Result<(), ActivateError>;
 }
 
@@ -272,6 +282,10 @@ impl BrokerSpawner for ProcessSpawner {
 pub trait HostReloader {
     /// Runs the per-session reload command once for every participating
     /// session. Any session failure aborts the complete Zellij group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActivateError`] when any session reload fails.
     fn reload_bridge(&self, session: &str, bridge_url: &str) -> Result<(), ActivateError>;
 }
 
@@ -827,6 +841,10 @@ struct PreparedMember<C: ControlPort> {
     old_session: C::Session,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single activation transaction with ordered phases (fast-path, journal, drain, spawn, bridge swap, reload, readiness, commit) plus coupled rollback; splitting would scatter the phase ordering and abort coupling this function exists to pin"
+)]
 async fn activate_unit_inner<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     unit: &PlannedUnit,
@@ -847,18 +865,17 @@ where
     // Fast path: every old broker already runs the target record.
     let mut all_current = true;
     for entry in &entries {
-        match inputs.control.connect(&entry.socket).await {
-            Ok(mut session) => match session.status().await {
+        if let Ok(mut session) = inputs.control.connect(&entry.socket).await {
+            match session.status().await {
                 Ok(status) if status.current == inputs.target => {}
                 _ => {
                     all_current = false;
                     break;
                 }
-            },
-            Err(_) => {
-                all_current = false;
-                break;
             }
+        } else {
+            all_current = false;
+            break;
         }
     }
     if all_current {
@@ -912,15 +929,14 @@ where
         .await;
         return Ok(UnitOutcome::RolledBack {
             unit: label,
-            reason: with_rollback(reason, rollback),
+            reason: with_rollback(reason, &rollback),
         });
     }
     // Rewrite the journal with real old records and handoff IDs.
     journal.state = JournalState::Prepared;
     journal.old_record = prepared
         .first()
-        .map(|member| member.old_record.clone())
-        .unwrap_or_else(|| inputs.target.clone());
+        .map_or_else(|| inputs.target.clone(), |member| member.old_record.clone());
     for (record, member) in journal.members.iter_mut().zip(prepared.iter()) {
         record.handoff_id = Some(member.handoff_hex.clone());
     }
@@ -985,7 +1001,7 @@ where
         .await;
         return Ok(UnitOutcome::RolledBack {
             unit: label,
-            reason: with_rollback(reason, rollback),
+            reason: with_rollback(reason, &rollback),
         });
     }
     journal::write_journal(inputs.cache_dir, &journal)?;
@@ -1017,7 +1033,7 @@ where
                 .await;
                 return Ok(UnitOutcome::RolledBack {
                     unit: label,
-                    reason: with_rollback(reason, rollback),
+                    reason: with_rollback(reason, &rollback),
                 });
             }
         };
@@ -1045,7 +1061,7 @@ where
             .await;
             return Ok(UnitOutcome::RolledBack {
                 unit: label,
-                reason: with_rollback(reason, rollback),
+                reason: with_rollback(reason, &rollback),
             });
         }
         inputs.hooks.check(ActivateStep::BridgeSwapped)?;
@@ -1066,7 +1082,7 @@ where
                 .await;
                 return Ok(UnitOutcome::RolledBack {
                     unit: label,
-                    reason: with_rollback(reason, rollback),
+                    reason: with_rollback(reason, &rollback),
                 });
             }
         }
@@ -1109,12 +1125,12 @@ where
             .await;
             return Ok(UnitOutcome::RolledBack {
                 unit: label,
-                reason: with_rollback(reason, rollback),
+                reason: with_rollback(reason, &rollback),
             });
         }
     }
     journal.state = JournalState::Ready;
-    for record in journal.members.iter_mut() {
+    for record in &mut journal.members {
         record.state = MemberTransition::Ready;
     }
     journal::write_journal(inputs.cache_dir, &journal)?;
@@ -1123,7 +1139,7 @@ where
     // Commit: old brokers over their retained sessions first, then targets
     // over fresh connections to the claimed endpoint.
     let mut commit_failures = Vec::new();
-    for member in prepared.iter_mut() {
+    for member in &mut prepared {
         if let Err(error) = member.old_session.commit(&member.handoff).await {
             commit_failures.push(format!(
                 "commit old {}: {error}",
@@ -1149,7 +1165,7 @@ where
     }
     inputs.hooks.check(ActivateStep::Committed)?;
     if commit_failures.is_empty() {
-        for record in journal.members.iter_mut() {
+        for record in &mut journal.members {
             record.state = MemberTransition::Committed;
         }
         journal::remove_journal(&journal_path)?;
@@ -1212,40 +1228,36 @@ fn activation_authority(
     directory: &Path,
     stable: &Path,
 ) -> Result<(Option<String>, Option<String>), String> {
-    match integration::receipt::load(directory).map_err(|error| error.to_string())? {
-        Some(receipt) => {
-            if receipt.bridge.canonical_path != stable {
-                return Err(format!(
-                    "receipt canonical path {} does not match {}",
-                    receipt.bridge.canonical_path.display(),
-                    stable.display()
-                ));
+    if let Some(receipt) =
+        integration::receipt::load(directory).map_err(|error| error.to_string())?
+    {
+        if receipt.bridge.canonical_path != stable {
+            return Err(format!(
+                "receipt canonical path {} does not match {}",
+                receipt.bridge.canonical_path.display(),
+                stable.display()
+            ));
+        }
+        match std::fs::read(stable) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok((None, receipt.bridge.previous_digest))
             }
-            match std::fs::read(stable) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok((None, receipt.bridge.previous_digest.clone()))
+            Err(error) => Err(format!("cannot read existing bridge: {error}")),
+            Ok(current) => {
+                let found = fsutil::sha256_hex(&current);
+                if found != receipt.bridge.installed_digest {
+                    return Err(format!(
+                        "existing bridge digest {found} does not match receipt {}; resolve the file before retrying",
+                        receipt.bridge.installed_digest
+                    ));
                 }
-                Err(error) => Err(format!("cannot read existing bridge: {error}")),
-                Ok(current) => {
-                    let found = fsutil::sha256_hex(&current);
-                    if found != receipt.bridge.installed_digest {
-                        return Err(format!(
-                            "existing bridge digest {found} does not match receipt {}; resolve the file before retrying",
-                            receipt.bridge.installed_digest
-                        ));
-                    }
-                    Ok((Some(found), receipt.bridge.previous_digest.clone()))
-                }
+                Ok((Some(found), receipt.bridge.previous_digest))
             }
         }
-        None => {
-            if stable.exists() {
-                return Err(
-                    "existing bridge has no receipt; resolve the file before retrying".to_owned(),
-                );
-            }
-            Ok((None, None))
-        }
+    } else if stable.exists() {
+        Err("existing bridge has no receipt; resolve the file before retrying".to_owned())
+    } else {
+        Ok((None, None))
     }
 }
 
@@ -1317,16 +1329,11 @@ where
     C: ControlPort,
 {
     loop {
-        match control.connect(&member.socket).await {
-            Ok(mut session) => match session.status().await {
-                Ok(status) => {
-                    if target_ready(&status, member, expected_handoff, target) {
-                        return Ok(());
-                    }
-                }
-                Err(_) => {}
-            },
-            Err(_) => {}
+        if let Ok(mut session) = control.connect(&member.socket).await
+            && let Ok(status) = session.status().await
+            && target_ready(&status, member, expected_handoff, target)
+        {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(ActivateError::ReadinessTimeout {
@@ -1339,7 +1346,7 @@ where
 
 /// Combines the triggering failure with every rollback diagnostic. Rollback
 /// failures never replace the original error; they extend it.
-fn with_rollback(reason: String, diagnostics: Vec<String>) -> String {
+fn with_rollback(reason: String, diagnostics: &[String]) -> String {
     if diagnostics.is_empty() {
         reason
     } else {
@@ -1373,37 +1380,37 @@ where
             rollback_errors.push(format!("stop target: {error}"));
         }
     }
-    if let PlannedUnit::Zellij { .. } = unit {
-        if let Some(backup) = journal.backup_path.as_ref() {
-            let stable = integration::stable_bridge_path(inputs.config_dir);
-            match std::fs::rename(backup, &stable) {
-                Ok(()) => {
-                    let _ = fsutil::sync_dir_of(&stable);
-                    let restored_ok = std::fs::read(&stable).map_or(false, |bytes| {
-                        journal
-                            .old_bridge_digest
-                            .as_ref()
-                            .is_some_and(|expected| fsutil::sha256_hex(&bytes) == *expected)
-                    });
-                    if !restored_ok {
-                        rollback_errors.push("restored bridge digest mismatch".to_owned());
-                    } else if let Some(url) = bridge_url {
-                        for record in &journal.members {
-                            let session = record.host_identity.clone();
-                            if let Err(error) = inputs.reloader.reload_bridge(&session, url) {
-                                rollback_errors.push(format!("rollback reload {session}: {error}"));
-                            }
+    if let PlannedUnit::Zellij { .. } = unit
+        && let Some(backup) = journal.backup_path.as_ref()
+    {
+        let stable = integration::stable_bridge_path(inputs.config_dir);
+        match std::fs::rename(backup, &stable) {
+            Ok(()) => {
+                let _ = fsutil::sync_dir_of(&stable);
+                let restored_ok = std::fs::read(&stable).is_ok_and(|bytes| {
+                    journal
+                        .old_bridge_digest
+                        .as_ref()
+                        .is_some_and(|expected| fsutil::sha256_hex(&bytes) == *expected)
+                });
+                if !restored_ok {
+                    rollback_errors.push("restored bridge digest mismatch".to_owned());
+                } else if let Some(url) = bridge_url {
+                    for record in &journal.members {
+                        let session = record.host_identity.clone();
+                        if let Err(error) = inputs.reloader.reload_bridge(&session, url) {
+                            rollback_errors.push(format!("rollback reload {session}: {error}"));
                         }
                     }
                 }
-                Err(error) => rollback_errors.push(format!(
-                    "restore old bridge from {}: {error}",
-                    backup.display()
-                )),
             }
+            Err(error) => rollback_errors.push(format!(
+                "restore old bridge from {}: {error}",
+                backup.display()
+            )),
         }
     }
-    for member in prepared.iter_mut() {
+    for member in &mut prepared {
         if let Err(error) = member.old_session.abort(&member.handoff).await {
             rollback_errors.push(format!("abort old {}: {error}", member.entry.discovery_key));
         }
@@ -1464,6 +1471,11 @@ pub enum RecoveryOutcome {
 /// bridge backup restored and reloaded in every recorded session, then old
 /// brokers resumed). Inconsistent identities, handoffs, digests, membership,
 /// or unrecognized journal states fail closed with artifacts preserved.
+///
+/// # Errors
+///
+/// Returns [`ActivateError`] when the journal directory cannot be scanned.
+/// Per-journal outcomes are returned inline, never as an outer error.
 pub async fn recover<C, R>(
     cache_dir: &Path,
     control: &C,
@@ -1491,6 +1503,10 @@ where
     Ok(outcomes)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "unit-fate decision tree (probe, handoff adoption, commit check, abort and bridge restore) that must stay together to keep the absent-target versus ambiguous-silence distinction auditable"
+)]
 async fn recover_one<C, R>(
     cache_dir: &Path,
     control: &C,
@@ -1503,20 +1519,22 @@ where
     C: ControlPort,
     R: HostReloader,
 {
+    enum Probe {
+        Answer { status: Box<ActivationStatus> },
+        Silent,
+    }
     let _ = logger;
     let unit = format!("{:?}", journal.unit);
     // Probe every member endpoint and adopt observed handoffs into Announced
     // journals. Whoever answers — drained old, live old, or claimed target —
     // reports exact lifecycle, record, and handoff for comparison.
-    enum Probe {
-        Answer { status: ActivationStatus },
-        Silent,
-    }
     let mut probes = Vec::new();
     for record in &journal.members {
         match control.connect(&record.old_socket).await {
             Ok(mut session) => match session.status().await {
-                Ok(status) => probes.push(Probe::Answer { status }),
+                Ok(status) => probes.push(Probe::Answer {
+                    status: Box::new(status),
+                }),
                 Err(_) => probes.push(Probe::Silent),
             },
             Err(_) => probes.push(Probe::Silent),
@@ -1525,55 +1543,46 @@ where
     // Adopt handoffs for members that lack them.
     let mut adopted = false;
     for (record, probe) in journal.members.iter_mut().zip(probes.iter()) {
-        if record.handoff_id.is_none() {
-            if let Probe::Answer { status } = probe {
-                if let Some(handoff) = status.handoff_id {
-                    record.handoff_id = Some(hex_lower(&handoff.0));
-                    adopted = true;
-                }
-            }
+        if record.handoff_id.is_none()
+            && let Probe::Answer { status } = probe
+            && let Some(handoff) = status.handoff_id
+        {
+            record.handoff_id = Some(hex_lower(&handoff.0));
+            adopted = true;
         }
     }
-    if adopted {
-        if journal::write_journal(cache_dir, &journal).is_err() {
-            return RecoveryOutcome::Preserved {
-                unit,
-                reason: "cannot persist adopted handoffs".to_owned(),
-            };
-        }
+    if adopted && journal::write_journal(cache_dir, &journal).is_err() {
+        return RecoveryOutcome::Preserved {
+            unit,
+            reason: "cannot persist adopted handoffs".to_owned(),
+        };
     }
     // Commit path: every member answers with the complete target record and
     // the recorded handoff.
     let mut all_committed = true;
     for (record, probe) in journal.members.iter().zip(probes.iter()) {
-        match (record.handoff_id.as_ref(), probe) {
-            (Some(hex), Probe::Answer { status }) => {
-                let expected = match handoff_from_hex(hex) {
-                    Ok(handoff) => handoff,
-                    Err(_) => {
-                        return RecoveryOutcome::Preserved {
-                            unit,
-                            reason: "journal handoff ID malformed".to_owned(),
-                        };
-                    }
+        if let (Some(hex), Probe::Answer { status }) = (record.handoff_id.as_ref(), probe) {
+            let Ok(expected) = handoff_from_hex(hex) else {
+                return RecoveryOutcome::Preserved {
+                    unit,
+                    reason: "journal handoff ID malformed".to_owned(),
                 };
-                if status.current != journal.target_record
-                    || status.handoff_id != Some(expected)
-                    || status.live_server.discovery_key != record.host_identity
-                {
-                    all_committed = false;
-                    break;
-                }
-            }
-            _ => {
+            };
+            if status.current != journal.target_record
+                || status.handoff_id != Some(expected)
+                || status.live_server.discovery_key != record.host_identity
+            {
                 all_committed = false;
                 break;
             }
+        } else {
+            all_committed = false;
+            break;
         }
     }
     if all_committed {
         let mut failures = Vec::new();
-        for record in journal.members.iter() {
+        for record in &journal.members {
             let hex = record.handoff_id.clone().unwrap_or_default();
             let Ok(handoff) = handoff_from_hex(&hex) else {
                 return RecoveryOutcome::Preserved {
@@ -1612,8 +1621,22 @@ where
     // zero-handoff rollback or deleting the sole transaction record.
     let mut failures = Vec::new();
     let mut contacted_any = false;
+    let mut absent: Vec<String> = Vec::new();
+    let unit_durable = matches!(journal.state, JournalState::Ready);
     for (record, probe) in journal.members.iter().zip(probes.iter()) {
         if matches!(probe, Probe::Silent) {
+            // An absent target after durable Ready is a unit fate, not an
+            // ambiguity: the member recorded Ready with its handoff, the unit
+            // never committed, so the complete old unit restores around it
+            // (its old stack resumes independently; nothing here commits).
+            // Silence without a recorded Ready handoff stays ambiguous.
+            if unit_durable
+                && matches!(record.state, MemberTransition::Ready)
+                && record.handoff_id.is_some()
+            {
+                absent.push(record.host_identity.clone());
+                continue;
+            }
             return RecoveryOutcome::Preserved {
                 unit,
                 reason: format!(
@@ -1656,7 +1679,7 @@ where
         // stable bytes are the staged ones; anything else is ambiguity.
         // The stable path is derived from the backup location inside
         // `restore_recorded_bridge`, never from the cache directory.
-        if let Err(error) = restore_recorded_bridge(cache_dir, &journal, reloader).await {
+        if let Err(error) = restore_recorded_bridge(cache_dir, &journal, reloader) {
             failures.push(error);
         }
     }
@@ -1671,7 +1694,14 @@ where
         }
         RecoveryOutcome::RolledBack {
             unit,
-            reason: "incomplete targets; complete old unit restored".to_owned(),
+            reason: if absent.is_empty() {
+                "incomplete targets; complete old unit restored".to_owned()
+            } else {
+                format!(
+                    "incomplete targets; complete old unit restored with absent members: {}",
+                    absent.join(", ")
+                )
+            },
         }
     } else if failures.is_empty() {
         // No member could even be contacted: nothing was restored and nothing
@@ -1692,7 +1722,7 @@ where
 /// Restores the recorded old bridge when the stable bytes are exactly the
 /// staged ones, then reloads every recorded session. Any other on-disk state
 /// is ambiguity, reported as an error with artifacts preserved.
-async fn restore_recorded_bridge<R>(
+fn restore_recorded_bridge<R>(
     cache_dir: &Path,
     journal: &ActivationJournal,
     reloader: &R,
@@ -1808,25 +1838,26 @@ mod tests {
         stream.flush().await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "framed fixture wire state machine mirroring production (prelude, decode, Status, Prepare, Commit, Abort, Retire) where the drain-while-stream-open ordering is the behavior under test; splitting request handling from the accept loop would hide it"
+    )]
     async fn serve_old(
         socket: PathBuf,
         script: BrokerScript,
         discovery: String,
         events: Arc<Mutex<Vec<String>>>,
     ) {
+        use tokio::io::AsyncWriteExt;
         let mut listener_slot = Some(UnixListener::bind(&socket).expect("bind old listener"));
         let mut prepared_handoff: Option<HandoffId> = None;
         // Accept connections one at a time: short-lived probes and fast-path
         // checks are each served to EOF, so they never steal the retained
         // drain stream. Draining drops the listener and unlinks the path;
         // later connections on the path belong to the claimed target.
-        loop {
-            let mut stream = match listener_slot.as_ref() {
-                Some(listener) => match listener.accept().await {
-                    Ok((stream, _)) => stream,
-                    Err(_) => break,
-                },
-                None => break,
+        while let Some(listener) = listener_slot.as_ref() {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
             };
             if send_broker_prelude(&mut stream).await.is_err() {
                 continue;
@@ -1931,11 +1962,14 @@ mod tests {
                         result,
                     });
                     let payload = serde_json::to_vec(&response).unwrap();
-                    use tokio::io::AsyncWriteExt;
                     // Polling coordinators may drop between status and read; a
                     // dead stream ends this connection, never the task.
                     if stream
-                        .write_all(&(payload.len() as u32).to_be_bytes())
+                        .write_all(
+                            &u32::try_from(payload.len())
+                                .expect("fixture frame fits u32")
+                                .to_be_bytes(),
+                        )
                         .await
                         .is_err()
                     {
@@ -1968,7 +2002,12 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "framed fixture wire state machine mirroring production where the target claims the endpoint after the old unlinks; splitting the claim-wait from the frame loop would hide the ordering under test"
+    )]
     async fn serve_target(path: PathBuf, script: TargetScript, discovery: String) {
+        use tokio::io::AsyncWriteExt;
         if script.absent {
             return;
         }
@@ -2031,9 +2070,12 @@ mod tests {
                                 )),
                             });
                             let payload = serde_json::to_vec(&response).unwrap();
-                            use tokio::io::AsyncWriteExt;
                             let _ = stream
-                                .write_all(&(payload.len() as u32).to_be_bytes())
+                                .write_all(
+                                    &u32::try_from(payload.len())
+                                        .expect("fixture frame fits u32")
+                                        .to_be_bytes(),
+                                )
                                 .await;
                             let _ = stream.write_all(&payload).await;
                             let _ = stream.flush().await;
@@ -2048,9 +2090,12 @@ mod tests {
                         result,
                     });
                     let payload = serde_json::to_vec(&response).unwrap();
-                    use tokio::io::AsyncWriteExt;
                     if stream
-                        .write_all(&(payload.len() as u32).to_be_bytes())
+                        .write_all(
+                            &u32::try_from(payload.len())
+                                .expect("fixture frame fits u32")
+                                .to_be_bytes(),
+                        )
                         .await
                         .is_err()
                     {
@@ -2191,7 +2236,6 @@ mod tests {
         }
 
         fn spawn_target_task(
-            &self,
             socket: PathBuf,
             script: TargetScript,
             discovery: &str,
@@ -2238,7 +2282,7 @@ mod tests {
         let fixture = Fixture::new();
         let (socket, old) = fixture.old_broker("server", herdr_script()).await;
         // The target claims the normal endpoint after prepare unlinks it.
-        let target = fixture.spawn_target_task(
+        let target = Fixture::spawn_target_task(
             socket.clone(),
             TargetScript {
                 target: target_record(),
@@ -2405,6 +2449,7 @@ mod tests {
         // A TempDir fixture executable stands in for the Zellij CLI: the real
         // Command path, argument vector, and failure detection run without
         // touching any live host.
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(
             temp.path(),
@@ -2421,10 +2466,9 @@ mod tests {
             ),
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let reloader = ZellijCliReloader {
-            program: Some(program.clone()),
+            program: Some(program),
         };
         reloader
             .reload_bridge("session-a", "file:/bridge.wasm")
@@ -2615,6 +2659,9 @@ mod tests {
                                         ControlOperation::Commit { .. } => {
                                             ControlResult::Committed(status.clone())
                                         }
+                                        ControlOperation::Abort { .. } => {
+                                            ControlResult::Aborted(status.clone())
+                                        }
                                         _ => ControlResult::Error {
                                             diagnostic: "unsupported fixture operation".to_owned(),
                                         },
@@ -2760,6 +2807,59 @@ mod tests {
         .await
         .expect("a full fresh census reads ready");
     }
+    /// Two actual service registrations sharing one stable bridge form a
+    /// single atomic group: real bound listener sockets registered through
+    /// the file registry prove live, and selection yields one Zellij group
+    /// of two. A bridgeless registration (the old serve default) is dropped
+    /// from selection instead of splitting the unit.
+    #[test]
+    fn bridge_sharing_registrations_form_one_atomic_group() {
+        use std::os::unix::net::UnixListener;
+        let temp = tempfile::tempdir().expect("registry dir");
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("owner-only test dir");
+        let registry = Registry::open(temp.path()).expect("owner-only registry");
+        let bridge = temp.path().join("bridge.wasm");
+        let mut bound = Vec::new();
+        for (session, socket) in [("session-a", "a.sock"), ("session-b", "b.sock")] {
+            let path = temp.path().join(socket);
+            bound.push(UnixListener::bind(&path).expect("service listener"));
+            let mut entry = BrokerEntry::now("zellij", session, path, std::process::id());
+            entry.bridge_path = Some(bridge.clone());
+            entry.live_server = Some(session.to_owned());
+            registry.register(entry).expect("service registration");
+        }
+        registry
+            .register(BrokerEntry::now(
+                "zellij",
+                "session-c",
+                temp.path().join("c.sock"),
+                std::process::id(),
+            ))
+            .expect("bridgeless registration");
+        let live = registry.probe().expect("liveness probe").live;
+        assert_eq!(live.len(), 2, "only the bound listeners prove live");
+        let units = select_units(&live, HostScope::All, None).expect("unit selection");
+        assert_eq!(
+            units.len(),
+            1,
+            "bridge-sharing brokers commit as one atomic unit, bridgeless dropped"
+        );
+        match &units[0] {
+            PlannedUnit::Zellij {
+                bridge_path,
+                entries,
+            } => {
+                assert_eq!(bridge_path, &bridge);
+                assert_eq!(entries.len(), 2);
+            }
+            unit @ PlannedUnit::Herdr { .. } => panic!("expected one Zellij group, found {unit:?}"),
+        }
+        drop(bound);
+    }
 
     #[tokio::test]
     async fn wait_ready_opens_only_on_real_regs_with_empty_valid() {
@@ -2825,9 +2925,10 @@ mod tests {
         );
         let bound = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !socket.exists() {
-            if std::time::Instant::now() >= bound {
-                panic!("readiness peer never bound its socket");
-            }
+            assert!(
+                std::time::Instant::now() < bound,
+                "readiness peer never bound its socket"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         let mut journal = ActivationJournal::new(
@@ -2856,5 +2957,96 @@ mod tests {
             outcomes[0]
         );
         peer.abort();
+    }
+
+    /// Mixed target fate after durable Ready in a two-member Zellij unit:
+    /// member A silent (its target dead, its old drained) while member B
+    /// answers from its live target. The unit decision must restore the
+    /// complete old unit — abort the live target before old-B reacquires,
+    /// restore the one old bridge across both sessions — never split (A old
+    /// plus B new) and never preserve-and-stall on the silent member.
+    #[tokio::test]
+    async fn recovery_restores_complete_old_unit_when_one_target_is_absent() {
+        let temp = tempfile::tempdir().expect("recovery cache");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(&cache).expect("cache exists");
+        std::fs::set_permissions(&cache, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("cache is owner-only");
+        let handoff = handoff(23);
+        let socket_a = temp.path().join("a.sock");
+        let socket_b = temp.path().join("b.sock");
+        // Only B answers, from its live target: A is silent after its target
+        // died with its old already drained.
+        let peer_b =
+            serve_readiness_status(socket_b.clone(), census_status(handoff, "session-b", None));
+        let bound = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !socket_b.exists() {
+            assert!(
+                std::time::Instant::now() < bound,
+                "readiness peer never bound its socket"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Bridge fixtures: stable currently holds the staged bytes, the
+        // backup holds the old bytes; recovery must put old back.
+        let directory = temp.path().join("integrations");
+        std::fs::create_dir_all(&directory).expect("integration dir exists");
+        let stable = directory.join(integration::BRIDGE_FILE_NAME);
+        let backup = directory.join("muxe-zellij.wasm.backup");
+        std::fs::write(&stable, b"staged-bridge-bytes").expect("staged bridge staged");
+        std::fs::write(&backup, b"old-bridge-bytes").expect("old bridge backed up");
+        let mut journal = ActivationJournal::new(
+            UnitKind::Zellij {
+                bridge_path_hash: unit_hash("/stable/bridge"),
+            },
+            old_record(),
+            target_record(),
+            vec![
+                MemberState {
+                    host_identity: "session-a".to_owned(),
+                    old_socket: socket_a,
+                    target_socket: None,
+                    handoff_id: Some(hex_lower(&handoff.0)),
+                    state: MemberTransition::Ready,
+                },
+                MemberState {
+                    host_identity: "session-b".to_owned(),
+                    old_socket: socket_b,
+                    target_socket: None,
+                    handoff_id: Some(hex_lower(&handoff.0)),
+                    state: MemberTransition::Ready,
+                },
+            ],
+        );
+        journal.state = JournalState::Ready;
+        journal.backup_path = Some(backup);
+        journal.staged_bridge_digest = Some(crate::fsutil::sha256_hex(b"staged-bridge-bytes"));
+        journal.old_bridge_digest = Some(crate::fsutil::sha256_hex(b"old-bridge-bytes"));
+        journal::write_journal(&cache, &journal).unwrap();
+        let reloader = FixtureReloader::default();
+        let outcomes = recover(&cache, &LiveControl, &reloader, None)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0], RecoveryOutcome::RolledBack { .. }),
+            "absent target restores the complete old unit, got {:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            std::fs::read(&stable).expect("stable bridge readable"),
+            b"old-bridge-bytes",
+            "the one old bridge is restored across switched sessions"
+        );
+        let reloads = reloader.reloaded.lock().expect("reloads readable");
+        for session in ["session-a", "session-b"] {
+            assert!(
+                reloads
+                    .iter()
+                    .any(|(reloaded_session, _)| reloaded_session == session),
+                "every recorded session reloads, missing {session}: {reloads:?}"
+            );
+        }
+        peer_b.abort();
     }
 }

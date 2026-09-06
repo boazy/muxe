@@ -16,8 +16,7 @@
 //! journal, staging file, and backup for diagnosis.
 
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -161,6 +160,11 @@ impl ActivationJournal {
 
     /// Validates internal consistency: schema version, non-empty membership,
     /// well-formed handoff IDs, and digest shapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError`] when the schema version, membership, handoff IDs,
+    /// or bridge digests are inconsistent.
     pub fn validate(&self) -> Result<(), JournalError> {
         if self.schema_version != ACTIVATION_JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedVersion {
@@ -174,8 +178,7 @@ impl ActivationJournal {
             ));
         }
         for member in &self.members {
-            if member.host_identity.is_empty()
-                || member.host_identity.chars().any(char::is_control)
+            if member.host_identity.is_empty() || member.host_identity.chars().any(char::is_control)
             {
                 return Err(JournalError::Inconsistent(
                     "journal has an invalid host identity".to_owned(),
@@ -222,21 +225,32 @@ pub fn activation_dir(cache_dir: &Path) -> PathBuf {
 /// Durably writes a journal by atomic replacement plus directory sync.
 ///
 /// Must be called before the first external mutation of the unit.
-pub fn write_journal(cache_dir: &Path, journal: &ActivationJournal) -> Result<PathBuf, JournalError> {
+///
+/// # Errors
+///
+/// Returns [`JournalError`] when validation, directory creation, serialization,
+/// or the atomic write fails.
+pub fn write_journal(
+    cache_dir: &Path,
+    journal: &ActivationJournal,
+) -> Result<PathBuf, JournalError> {
     journal.validate()?;
     let directory = activation_dir(cache_dir);
     fsutil::ensure_owner_dir(&directory)?;
     let path = directory.join(journal.unit.journal_name());
-    let bytes =
-        serde_json::to_vec_pretty(journal).map_err(|source| JournalError::Corrupt {
-            path: path.clone(),
-            source,
-        })?;
+    let bytes = serde_json::to_vec_pretty(journal).map_err(|source| JournalError::Corrupt {
+        path: path.clone(),
+        source,
+    })?;
     fsutil::write_atomic(&path, &bytes, "activation")?;
     Ok(path)
 }
 
 /// Reads and validates a journal. Unrecognized states fail closed.
+///
+/// # Errors
+///
+/// Returns [`JournalError`] when the file cannot be read, deserialized, or validated.
 pub fn read_journal(path: &Path) -> Result<ActivationJournal, JournalError> {
     let bytes = fsutil::read_owner_file(path)?;
     let journal: ActivationJournal =
@@ -250,6 +264,10 @@ pub fn read_journal(path: &Path) -> Result<ActivationJournal, JournalError> {
 
 /// Removes a journal after its unit commits. Only called once the complete
 /// target stack is durable.
+///
+/// # Errors
+///
+/// Returns [`JournalError`] when removal or directory sync fails.
 pub fn remove_journal(path: &Path) -> Result<(), JournalError> {
     match fs::remove_file(path) {
         Ok(()) => {
@@ -264,13 +282,18 @@ pub fn remove_journal(path: &Path) -> Result<(), JournalError> {
         ))),
     }
 }
+/// One unit's journal entries: paths paired with their decode outcome.
+pub type JournalEntries = Vec<(PathBuf, Result<ActivationJournal, JournalError>)>;
 
 /// Lists every journal file present. Corrupt or unrecognized journals are
-/// returned as paths with a `None` record so recovery preserves them instead
-/// of deleting what it cannot understand.
-pub fn list_journals(
-    cache_dir: &Path,
-) -> Result<Vec<(PathBuf, Result<ActivationJournal, JournalError>)>, JournalError> {
+/// returned inline so recovery preserves them instead of deleting what it
+/// cannot understand.
+///
+/// # Errors
+///
+/// Returns [`JournalError`] when the activation directory cannot be scanned.
+/// Per-file corruptions are returned inline, never as an outer error.
+pub fn list_journals(cache_dir: &Path) -> Result<JournalEntries, JournalError> {
     let directory = activation_dir(cache_dir);
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -301,8 +324,7 @@ pub fn list_journals(
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -339,7 +361,11 @@ mod tests {
     #[test]
     fn write_read_round_trip_is_owner_only() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let journal = fixture_journal();
         let path = write_journal(temp.path(), &journal).unwrap();
         assert!(
@@ -386,7 +412,11 @@ mod tests {
     #[test]
     fn corrupt_journal_is_reported_not_deleted() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let directory = activation_dir(temp.path());
         fsutil::ensure_owner_dir(&directory).unwrap();
         fsutil::write_atomic(&directory.join("herdr-x.json"), b"{corrupt", "activation").unwrap();

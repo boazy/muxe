@@ -52,11 +52,23 @@ _muxe() {
             muxe__subcmd__broker,retire)
                 cmd="muxe__subcmd__broker__subcmd__retire"
                 ;;
+            muxe__subcmd__broker,serve-herdr)
+                cmd="muxe__subcmd__broker__subcmd__serve__subcmd__herdr"
+                ;;
+            muxe__subcmd__broker,serve-zellij)
+                cmd="muxe__subcmd__broker__subcmd__serve__subcmd__zellij"
+                ;;
             muxe__subcmd__broker__subcmd__help,help)
                 cmd="muxe__subcmd__broker__subcmd__help__subcmd__help"
                 ;;
             muxe__subcmd__broker__subcmd__help,retire)
                 cmd="muxe__subcmd__broker__subcmd__help__subcmd__retire"
+                ;;
+            muxe__subcmd__broker__subcmd__help,serve-herdr)
+                cmd="muxe__subcmd__broker__subcmd__help__subcmd__serve__subcmd__herdr"
+                ;;
+            muxe__subcmd__broker__subcmd__help,serve-zellij)
+                cmd="muxe__subcmd__broker__subcmd__help__subcmd__serve__subcmd__zellij"
                 ;;
             muxe__subcmd__help,activate)
                 cmd="muxe__subcmd__help__subcmd__activate"
@@ -90,6 +102,12 @@ _muxe() {
                 ;;
             muxe__subcmd__help__subcmd__broker,retire)
                 cmd="muxe__subcmd__help__subcmd__broker__subcmd__retire"
+                ;;
+            muxe__subcmd__help__subcmd__broker,serve-herdr)
+                cmd="muxe__subcmd__help__subcmd__broker__subcmd__serve__subcmd__herdr"
+                ;;
+            muxe__subcmd__help__subcmd__broker,serve-zellij)
+                cmd="muxe__subcmd__help__subcmd__broker__subcmd__serve__subcmd__zellij"
                 ;;
             muxe__subcmd__help__subcmd__integration,install)
                 cmd="muxe__subcmd__help__subcmd__integration__subcmd__install"
@@ -235,7 +253,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__broker)
-            opts="-h -V --help --version retire help"
+            opts="-h -V --help --version retire serve-herdr serve-zellij help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -249,7 +267,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__broker__subcmd__help)
-            opts="retire help"
+            opts="retire serve-herdr serve-zellij help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -290,6 +308,34 @@ _muxe() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        muxe__subcmd__broker__subcmd__help__subcmd__serve__subcmd__herdr)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__broker__subcmd__help__subcmd__serve__subcmd__zellij)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         muxe__subcmd__broker__subcmd__retire)
             opts="-h -V --host --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -299,6 +345,90 @@ _muxe() {
             case "${prev}" in
                 --host)
                     COMPREPLY=($(compgen -W "all current zellij herdr" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__broker__subcmd__serve__subcmd__herdr)
+            opts="-h -V --socket --herdr-binary --herdr-socket --config --cache-dir --handoff --activation-journal --help --version"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --socket)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --herdr-binary)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --herdr-socket)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cache-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --handoff)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --activation-journal)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__broker__subcmd__serve__subcmd__zellij)
+            opts="-h -V --socket --zellij-exe --session --config --cache-dir --handoff --activation-journal --help --version"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --socket)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --zellij-exe)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --session)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cache-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --handoff)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --activation-journal)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 *)
@@ -351,7 +481,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__help__subcmd__broker)
-            opts="retire"
+            opts="retire serve-herdr serve-zellij"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -365,6 +495,34 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__help__subcmd__broker__subcmd__retire)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__help__subcmd__broker__subcmd__serve__subcmd__herdr)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__help__subcmd__broker__subcmd__serve__subcmd__zellij)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

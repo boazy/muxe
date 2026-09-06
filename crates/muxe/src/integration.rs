@@ -16,8 +16,7 @@ pub mod kdl;
 pub mod receipt;
 
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -54,7 +53,9 @@ pub enum IntegrationError {
     Asset(#[from] compatibility::AssetVerificationError),
     #[error("cannot resolve Zellij configuration: {0}")]
     ConfigDiscovery(String),
-    #[error("activation journal for this bridge is still live; resolve activation before uninstalling")]
+    #[error(
+        "activation journal for this bridge is still live; resolve activation before uninstalling"
+    )]
     ActivationJournalLive { journal: PathBuf },
     #[error("fault injected after {step:?} (test hook)")]
     FaultInjected { step: InstallStep },
@@ -127,8 +128,6 @@ pub struct InstallInputs<'a> {
     pub config_dir: &'a Path,
     /// Packaged `lib/muxe/muxe-zellij.wasm` bytes.
     pub packaged_wasm: &'a [u8],
-    /// Expected SHA-256 digest of the packaged bytes (release metadata).
-    pub expected_digest: &'a str,
     /// Muxe version being installed.
     pub version: &'a str,
     /// Explicit `--zellij-config` override, if any.
@@ -225,6 +224,11 @@ pub fn stable_bridge_path(config_dir: &Path) -> PathBuf {
 /// Delegates to the single native [`crate::paths`] resolver: an explicit
 /// override wins, otherwise `$ZELLIJ_CONFIG_DIR` and the standard Zellij
 /// configuration path apply. Never falls back to a relative directory.
+///
+/// # Errors
+///
+/// Returns `IntegrationError::ConfigDiscovery` when neither `XDG_CONFIG_HOME`
+/// nor `HOME` is set and no explicit override was passed.
 pub fn zellij_config_path(override_path: Option<&Path>) -> Result<PathBuf, IntegrationError> {
     crate::paths::zellij_config_path(override_path).map_err(|_| {
         IntegrationError::ConfigDiscovery(
@@ -237,7 +241,25 @@ pub fn zellij_config_path(override_path: Option<&Path>) -> Result<PathBuf, Integ
 ///
 /// A pending install journal is resumed first: a completed resume is returned
 /// directly, a rolled-back one proceeds with the fresh install.
+///
+/// # Errors
+///
+/// Returns an error when the packaged asset fails verification, the journal,
+/// bridge, configuration, or receipt cannot be read or written, or a test
+/// hook injects a fault.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "public install shape: by-value inputs match public uninstall and keep CLI call-site moves simple; the transaction only borrows"
+)]
 pub fn install(inputs: InstallInputs<'_>) -> Result<InstallOutcome, IntegrationError> {
+    let verification = compatibility::verify_packaged_asset(inputs.packaged_wasm)?;
+    install_verified(&inputs, verification)
+}
+
+fn install_verified(
+    inputs: &InstallInputs<'_>,
+    verification: compatibility::NativeAssetVerification,
+) -> Result<InstallOutcome, IntegrationError> {
     let directory = integration_dir(inputs.config_dir);
     if journal_path(&directory).exists() {
         let resumed = resume_with(&directory, &inputs.hooks, inputs.logger)?;
@@ -245,22 +267,27 @@ pub fn install(inputs: InstallInputs<'_>) -> Result<InstallOutcome, IntegrationE
             ResumeOutcome::Completed(outcome) => return Ok(*outcome),
             ResumeOutcome::RolledBack => {}
         }
-        let mut outcome = install_fresh(&inputs, &directory)?;
+        let mut outcome = install_fresh(inputs, &directory, verification)?;
         outcome.resumed = Some(ResumeOutcome::RolledBack);
         return Ok(outcome);
     }
-    install_fresh(&inputs, &directory)
+    install_fresh(inputs, &directory, verification)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the install transaction is intentionally linear: journal, stage, KDL edit, swap, receipt. Splitting it would scatter the ordering guarantees."
+)]
 fn install_fresh(
     inputs: &InstallInputs<'_>,
     directory: &Path,
+    verification: compatibility::NativeAssetVerification,
 ) -> Result<InstallOutcome, IntegrationError> {
-    let verification =
-        compatibility::verify_packaged_asset(inputs.packaged_wasm, inputs.expected_digest)?;
     let stable = directory.join(BRIDGE_FILE_NAME);
     let receipt = receipt::load(directory)?;
-    let receipt_digest = receipt.as_ref().map(|receipt| receipt.bridge.installed_digest.as_str());
+    let receipt_digest = receipt
+        .as_ref()
+        .map(|receipt| receipt.bridge.installed_digest.as_str());
     let (eligibility, _) = bridge::check_destination(&stable, receipt_digest)?;
 
     // Journal before the first external mutation. The prior receipt identity
@@ -294,43 +321,33 @@ fn install_fresh(
     // first KDL byte changes, so recovery preserves the original provenance
     // instead of recomputing it from an already-applied document.
     let bridge_url = kdl::bridge_url(&stable);
-    journal.bridge_url = bridge_url.clone();
+    journal.bridge_url.clone_from(&bridge_url);
     let policy = resolve_policy(inputs.explicit_policy, inputs.quiet, inputs.interactive);
     let config_path = zellij_config_path(inputs.zellij_config.as_deref())?;
     journal.config_path = Some(config_path.clone());
     let (planned, decision, plan_snippet) =
         plan_config(&config_path, &bridge_url, policy, inputs.asker)?;
     let mut manual_snippet = plan_snippet;
-    if decision == EditDecision::Apply {
-        match planned {
-            Some(planned) => {
-                journal.pending = kdl::plan_records(&config_path, &planned.plan.nodes);
-                journal.create_config = !planned.existed;
-                journal.apply_config = true;
-                write_journal(directory, &journal)?;
-                inputs.hooks.check(InstallStep::BeforeKdlApply)?;
-                match kdl::commit_planned(&config_path, &bridge_url, &planned) {
-                    Ok(result) => {
-                        journal.create_config = matches!(
-                            result,
-                            kdl::ConfigApplied::CreatedMinimal
-                        );
-                    }
-                    Err(error) => {
-                        // The configuration edit aborts and prints the required
-                        // snippet; the staged bridge is discarded and the
-                        // install continues without KDL ownership.
-                        journal.pending.clear();
-                        journal.apply_config = false;
-                        manual_snippet = Some(kdl_abort_snippet(
-                            &config_path,
-                            &bridge_url,
-                            error,
-                        )?);
-                    }
-                }
+    if decision == EditDecision::Apply
+        && let Some(planned) = planned
+    {
+        journal.pending = kdl::plan_records(&config_path, &planned.plan.nodes);
+        journal.create_config = !planned.existed;
+        journal.apply_config = true;
+        write_journal(directory, &journal)?;
+        inputs.hooks.check(InstallStep::BeforeKdlApply)?;
+        match kdl::commit_planned(&config_path, &bridge_url, &planned) {
+            Ok(result) => {
+                journal.create_config = matches!(result, kdl::ConfigApplied::CreatedMinimal);
             }
-            None => {}
+            Err(error) => {
+                // The configuration edit aborts and prints the required
+                // snippet; the staged bridge is discarded and the
+                // install continues without KDL ownership.
+                journal.pending.clear();
+                journal.apply_config = false;
+                manual_snippet = Some(kdl_abort_snippet(&config_path, &bridge_url, error)?);
+            }
         }
     }
     journal.phase = InstallPhase::ConfigEdited;
@@ -361,6 +378,7 @@ fn install_fresh(
     let merged = merge_records(receipt.as_ref(), &config_path, &journal.pending);
     let bridge_compat = compatibility::embedded_record()
         .map_err(|error| IntegrationError::Compat(error.to_string()))?
+        .handoff
         .zellij;
     if bridge_compat.is_none() {
         return Err(IntegrationError::Compat(
@@ -371,7 +389,7 @@ fn install_fresh(
     let next = Receipt {
         schema_version: receipt::RECEIPT_SCHEMA_VERSION,
         bridge: receipt::BridgeRecord {
-            canonical_path: stable.clone(),
+            canonical_path: stable,
             installed_version: inputs.version.to_owned(),
             installed_digest: verification.packaged_digest.clone(),
             previous_digest: previous_digest.or_else(|| {
@@ -428,14 +446,7 @@ fn plan_config(
     bridge_url: &str,
     policy: ResolvedPolicy,
     asker: Option<&dyn Fn(&str) -> bool>,
-) -> Result<
-    (
-        Option<kdl::PlannedFile>,
-        EditDecision,
-        Option<String>,
-    ),
-    IntegrationError,
-> {
+) -> Result<(Option<kdl::PlannedFile>, EditDecision, Option<String>), IntegrationError> {
     let decision = match policy {
         ResolvedPolicy::Never => EditDecision::Skip,
         ResolvedPolicy::Always => EditDecision::Apply,
@@ -445,7 +456,7 @@ fn plan_config(
                 config_path.display(),
                 kdl::required_snippet(bridge_url)
             );
-            if asker.map_or(false, |ask| ask(&prompt)) {
+            if asker.is_some_and(|ask| ask(&prompt)) {
                 EditDecision::Apply
             } else {
                 EditDecision::Skip
@@ -457,14 +468,20 @@ fn plan_config(
     }
     match kdl::read_and_plan(config_path, bridge_url) {
         Ok(planned) => Ok((Some(planned), decision, None)),
-        Err(error @ (kdl::KdlError::Unparseable { .. }
-        | kdl::KdlError::Ambiguous { .. }
-        | kdl::KdlError::ConcurrentChange { .. }
-        | kdl::KdlError::CandidateRejected { .. })) => Ok((None, decision, Some(format!(
-            "Could not edit {}: {error}\nAdd these nodes manually:\n{}",
-            config_path.display(),
-            kdl::required_snippet(bridge_url)
-        )))),
+        Err(
+            error @ (kdl::KdlError::Unparseable { .. }
+            | kdl::KdlError::Ambiguous { .. }
+            | kdl::KdlError::ConcurrentChange { .. }
+            | kdl::KdlError::CandidateRejected { .. }),
+        ) => Ok((
+            None,
+            decision,
+            Some(format!(
+                "Could not edit {}: {error}\nAdd these nodes manually:\n{}",
+                config_path.display(),
+                kdl::required_snippet(bridge_url)
+            )),
+        )),
         Err(kdl::KdlError::Fs(source)) => Err(IntegrationError::Fs(source)),
     }
 }
@@ -564,10 +581,9 @@ fn journal_path(directory: &Path) -> PathBuf {
 }
 
 fn write_journal(directory: &Path, journal: &InstallJournal) -> Result<(), IntegrationError> {
-    let bytes =
-        serde_json::to_vec_pretty(journal).map_err(|source| IntegrationError::InconsistentJournal(
-            format!("cannot encode install journal: {source}"),
-        ))?;
+    let bytes = serde_json::to_vec_pretty(journal).map_err(|source| {
+        IntegrationError::InconsistentJournal(format!("cannot encode install journal: {source}"))
+    })?;
     fsutil::ensure_owner_dir(directory)?;
     fsutil::write_atomic(&journal_path(directory), &bytes, "install-journal")?;
     Ok(())
@@ -576,10 +592,11 @@ fn write_journal(directory: &Path, journal: &InstallJournal) -> Result<(), Integ
 fn read_journal(directory: &Path) -> Result<InstallJournal, IntegrationError> {
     let path = journal_path(directory);
     let bytes = fsutil::read_owner_file(&path)?;
-    let journal: InstallJournal =
-        serde_json::from_slice(&bytes).map_err(|source| IntegrationError::InconsistentJournal(
-            format!("interrupted install journal is corrupt: {source}"),
-        ))?;
+    let journal: InstallJournal = serde_json::from_slice(&bytes).map_err(|source| {
+        IntegrationError::InconsistentJournal(format!(
+            "interrupted install journal is corrupt: {source}"
+        ))
+    })?;
     if journal.schema_version != INSTALL_JOURNAL_SCHEMA_VERSION {
         return Err(IntegrationError::InconsistentJournal(format!(
             "unsupported install journal schema {}",
@@ -620,6 +637,11 @@ fn staged_name(staged: &Path) -> Result<String, IntegrationError> {
 /// Recovery is idempotent and converges to either the fully installed state
 /// or the untouched prior state; inconsistent journals fail closed with the
 /// staging file, backup, and journal preserved for diagnosis.
+///
+/// # Errors
+///
+/// Returns an error when the journal cannot be read or validated, the prior
+/// receipt or bridge state contradicts it, or any recovery write fails.
 pub fn resume_install(
     config_dir: &Path,
     hooks: &Hooks,
@@ -644,19 +666,16 @@ fn resume_with(
         InstallPhase::Started => {
             // The journal predates staging. Adopt a matching orphan staging
             // file by digest, or clean up and roll back when none matches.
-            match adopt_or_clean_staging(directory, &journal)? {
-                Some(staged) => {
-                    let mut journal = journal;
-                    journal.staged_name = Some(staged_name(&staged)?);
-                    journal.phase = InstallPhase::Staged;
-                    write_journal(directory, &journal)?;
-                    resume_with_staged(directory, &journal, Some(staged), hooks, logger)
-                }
-                None => {
-                    verify_pre_swap_bridge_state(directory, &journal)?;
-                    remove_journal(directory)?;
-                    Ok(ResumeOutcome::RolledBack)
-                }
+            if let Some(staged) = adopt_or_clean_staging(directory, &journal)? {
+                let mut journal = journal;
+                journal.staged_name = Some(staged_name(&staged)?);
+                journal.phase = InstallPhase::Staged;
+                write_journal(directory, &journal)?;
+                resume_with_staged(directory, &journal, Some(&staged), hooks, logger)
+            } else {
+                verify_pre_swap_bridge_state(directory, &journal)?;
+                remove_journal(directory)?;
+                Ok(ResumeOutcome::RolledBack)
             }
         }
         InstallPhase::Staged | InstallPhase::ConfigEdited => {
@@ -674,12 +693,20 @@ fn resume_with(
             } else {
                 None
             };
-            resume_with_staged(directory, &journal, staged, hooks, logger)
+            resume_with_staged(directory, &journal, staged.as_deref(), hooks, logger)
         }
         InstallPhase::BridgeCommitted => {
             let staged_path = validated_staging(directory, &journal)?;
             let staged = staged_path.exists().then_some(staged_path);
-            commit_resumed(directory, &stable, staged.as_deref(), &journal, None, hooks, logger)
+            commit_resumed(
+                directory,
+                &stable,
+                staged.as_deref(),
+                &journal,
+                None,
+                hooks,
+                logger,
+            )
         }
     }
 }
@@ -758,7 +785,7 @@ fn adopt_or_clean_staging(
 fn resume_with_staged(
     directory: &Path,
     journal: &InstallJournal,
-    staged: Option<PathBuf>,
+    staged: Option<&Path>,
     hooks: &Hooks,
     logger: Option<&Logger>,
 ) -> Result<ResumeOutcome, IntegrationError> {
@@ -803,7 +830,7 @@ fn resume_with_staged(
                 // With no staged bytes forward progress is impossible: restore
                 // proven nodes when they verify, otherwise fail closed.
                 if staged.is_none() {
-                    return rollback_kdl_and_journal(directory, &journal, logger, reason);
+                    return rollback_kdl_and_journal(directory, &journal, logger, &reason);
                 }
                 return Err(IntegrationError::InconsistentJournal(format!(
                     "journaled KDL nodes do not match the configuration: {reason}"
@@ -813,7 +840,7 @@ fn resume_with_staged(
         // Re-verify after any fresh apply before the receipt may commit.
         if let Err(reason) = kdl::verify_records(&config_path, &journal.pending) {
             if staged.is_none() {
-                return rollback_kdl_and_journal(directory, &journal, logger, reason);
+                return rollback_kdl_and_journal(directory, &journal, logger, &reason);
             }
             return Err(IntegrationError::InconsistentJournal(format!(
                 "journaled KDL nodes do not match the configuration: {reason}"
@@ -828,13 +855,13 @@ fn resume_with_staged(
             directory,
             &journal,
             logger,
-            "staged bridge missing; cannot complete swap".to_owned(),
+            "staged bridge missing; cannot complete swap",
         );
     }
     commit_resumed(
         directory,
         &stable,
-        staged.as_deref(),
+        staged,
         &journal,
         manual_snippet,
         hooks,
@@ -858,12 +885,12 @@ fn check_prior_receipt(
             "receipt changed outside the transaction".to_owned(),
         ));
     }
-    if let Some(receipt) = receipt.as_ref() {
-        if receipt.bridge.canonical_path != directory.join(BRIDGE_FILE_NAME) {
-            return Err(IntegrationError::InconsistentJournal(
-                "receipt canonical path mismatch".to_owned(),
-            ));
-        }
+    if let Some(receipt) = receipt.as_ref()
+        && receipt.bridge.canonical_path != directory.join(BRIDGE_FILE_NAME)
+    {
+        return Err(IntegrationError::InconsistentJournal(
+            "receipt canonical path mismatch".to_owned(),
+        ));
     }
     Ok(receipt)
 }
@@ -881,11 +908,6 @@ fn verify_pre_swap_bridge_state(
         (None, Ok(_)) => Err(IntegrationError::InconsistentJournal(
             "unreceipted stable bridge exists while staged bridge is missing".to_owned(),
         )),
-        (None, Err(source)) => Err(IntegrationError::Fs(fsutil::io_error(
-            "reading stable bridge",
-            &stable,
-            source,
-        ))),
         (Some(receipt), Ok(bytes))
             if fsutil::sha256_hex(&bytes) == receipt.bridge.installed_digest =>
         {
@@ -899,7 +921,7 @@ fn verify_pre_swap_bridge_state(
                 "receipted stable bridge is missing while staged bridge is missing".to_owned(),
             ))
         }
-        (Some(_), Err(source)) => Err(IntegrationError::Fs(fsutil::io_error(
+        (_, Err(source)) => Err(IntegrationError::Fs(fsutil::io_error(
             "reading stable bridge",
             &stable,
             source,
@@ -915,28 +937,26 @@ enum Reapply {
     Fatal(IntegrationError),
 }
 
-fn reapply_kdl(
-    config_path: &Path,
-    journal: &InstallJournal,
-) -> Result<Vec<NodeRecord>, Reapply> {
-    let planned = kdl::read_and_plan(config_path, &journal.bridge_url).map_err(|error| match error {
-        kdl::KdlError::Fs(source) => Reapply::Fatal(IntegrationError::Fs(source)),
-        other => Reapply::Fatal(IntegrationError::InconsistentJournal(format!(
-            "cannot re-plan KDL edit: {other}"
-        ))),
-    })?;
+fn reapply_kdl(config_path: &Path, journal: &InstallJournal) -> Result<Vec<NodeRecord>, Reapply> {
+    let planned =
+        kdl::read_and_plan(config_path, &journal.bridge_url).map_err(|error| match error {
+            kdl::KdlError::Fs(source) => Reapply::Fatal(IntegrationError::Fs(source)),
+            other => Reapply::Fatal(IntegrationError::InconsistentJournal(format!(
+                "cannot re-plan KDL edit: {other}"
+            ))),
+        })?;
     match kdl::commit_planned(config_path, &journal.bridge_url, &planned) {
         Ok(applied) => Ok(applied.node_records(config_path)),
-        Err(error @ (kdl::KdlError::Unparseable { .. }
-        | kdl::KdlError::Ambiguous { .. }
-        | kdl::KdlError::ConcurrentChange { .. }
-        | kdl::KdlError::CandidateRejected { .. })) => {
-            Err(Reapply::AbortSnippet(format!(
-                "Could not edit {}: {error}\nAdd these nodes manually:\n{}",
-                config_path.display(),
-                kdl::required_snippet(&journal.bridge_url)
-            )))
-        }
+        Err(
+            error @ (kdl::KdlError::Unparseable { .. }
+            | kdl::KdlError::Ambiguous { .. }
+            | kdl::KdlError::ConcurrentChange { .. }
+            | kdl::KdlError::CandidateRejected { .. }),
+        ) => Err(Reapply::AbortSnippet(format!(
+            "Could not edit {}: {error}\nAdd these nodes manually:\n{}",
+            config_path.display(),
+            kdl::required_snippet(&journal.bridge_url)
+        ))),
         Err(kdl::KdlError::Fs(source)) => Err(Reapply::Fatal(IntegrationError::Fs(source))),
     }
 }
@@ -948,7 +968,7 @@ fn rollback_kdl_and_journal(
     directory: &Path,
     journal: &InstallJournal,
     logger: Option<&Logger>,
-    context: String,
+    context: &str,
 ) -> Result<ResumeOutcome, IntegrationError> {
     verify_pre_swap_bridge_state(directory, journal)?;
     if journal.apply_config {
@@ -967,21 +987,14 @@ fn rollback_kdl_and_journal(
         })?;
     }
     remove_journal(directory)?;
-    log(
-        logger,
-        "install-resume",
-        &format!("rolled back: {context}"),
-    )?;
+    log(logger, "install-resume", &format!("rolled back: {context}"))?;
     Ok(ResumeOutcome::RolledBack)
 }
 
 /// Removes Created nodes and restores Updated ones from journaled provenance.
 /// Every node must verify before any edit is planned; the combined candidate
 /// is re-parsed and checked for concurrent change before the atomic write.
-fn rollback_pending_nodes(
-    config_path: &Path,
-    pending: &[NodeRecord],
-) -> Result<(), String> {
+fn rollback_pending_nodes(config_path: &Path, pending: &[NodeRecord]) -> Result<(), String> {
     let bytes = std::fs::read(config_path)
         .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
     let original = String::from_utf8(bytes)
@@ -993,9 +1006,8 @@ fn rollback_pending_nodes(
         if record.disposition == Disposition::Observed {
             continue;
         }
-        match plan_uninstall_node(&document, &original, record)? {
-            Some(edit) => edits.push(edit),
-            None => {}
+        if let Some(edit) = plan_uninstall_node(&document, &original, record)? {
+            edits.push(edit);
         }
     }
     if edits.is_empty() {
@@ -1013,6 +1025,10 @@ fn rollback_pending_nodes(
         .map_err(|error| format!("cannot write rollback: {error}"))?;
     Ok(())
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "recovery re-validation is intentionally sequential: prior receipt, stable bytes, swap, receipt. Splitting it would hide the fail-closed ordering."
+)]
 fn commit_resumed(
     directory: &Path,
     stable: &Path,
@@ -1108,10 +1124,14 @@ fn commit_resumed(
         bridge::commit(staged, stable, expected.as_deref())?;
     }
     hooks.check(InstallStep::BridgeCommitted)?;
-    let config_path = journal.config_path.clone().unwrap_or_else(|| stable.to_path_buf());
+    let config_path = journal
+        .config_path
+        .clone()
+        .unwrap_or_else(|| stable.to_path_buf());
     let merged = merge_records(receipt.as_ref(), &config_path, &journal.pending);
     let bridge_compat = compatibility::embedded_record()
         .map_err(|error| IntegrationError::Compat(error.to_string()))?
+        .handoff
         .zellij;
     if bridge_compat.is_none() {
         return Err(IntegrationError::Compat(
@@ -1180,6 +1200,16 @@ fn commit_resumed(
 /// exact text digest still match the receipt. Root keybindings are user-owned
 /// and never touched. The receipt is removed only after every managed artifact
 /// is gone and no unresolved record remains.
+///
+/// # Errors
+///
+/// Returns an error when the receipt cannot be read, an activation journal
+/// for this bridge is still live, or bridge, staging, or receipt cleanup fails.
+/// KDL deviations are reported as unresolved records, not errors.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "public API takes `UninstallInputs` by value for call-site ergonomics; changing it would break external callers."
+)]
 pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, IntegrationError> {
     let directory = integration_dir(inputs.config_dir);
     let stable = directory.join(BRIDGE_FILE_NAME);
@@ -1213,10 +1243,10 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
         ResolvedPolicy::Always => true,
         ResolvedPolicy::Ask => inputs
             .asker
-            .map_or(false, |ask| ask("Remove or restore Muxe-owned Zellij KDL nodes?")),
+            .is_some_and(|ask| ask("Remove or restore Muxe-owned Zellij KDL nodes?")),
     };
     if remove_configs {
-        apply_uninstall_edits(&receipt, inputs.zellij_config.as_deref(), &mut outcome)?;
+        apply_uninstall_edits(&receipt, inputs.zellij_config.as_deref(), &mut outcome);
     } else {
         for record in &receipt.configs {
             if record.disposition != Disposition::Observed {
@@ -1248,8 +1278,7 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
         }
         None => {}
     }
-    outcome.bridge_removed =
-        bridge::remove_if_matching(&stable, &receipt.bridge.installed_digest)?;
+    outcome.bridge_removed = bridge::remove_if_matching(&stable, &receipt.bridge.installed_digest)?;
     outcome.staging_removed = remove_staging_leftovers(&directory)?;
 
     if outcome.unresolved.is_empty() && !stable.exists() {
@@ -1292,9 +1321,8 @@ fn refuse_when_activation_live(
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let bytes = fs::read(&path).map_err(|source| {
-            fsutil::io_error("reading activation journal", &path, source)
-        })?;
+        let bytes = fs::read(&path)
+            .map_err(|source| fsutil::io_error("reading activation journal", &path, source))?;
         if bytes
             .windows(installed_digest.len())
             .any(|window| window == installed_digest.as_bytes())
@@ -1319,8 +1347,9 @@ fn remove_staging_leftovers(directory: &Path) -> Result<usize, IntegrationError>
     };
     let mut removed = 0;
     for entry in entries {
-        let entry = entry
-            .map_err(|source| fsutil::io_error("scanning integration directory", directory, source))?;
+        let entry = entry.map_err(|source| {
+            fsutil::io_error("scanning integration directory", directory, source)
+        })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.ends_with(".tmp") && name.contains(BRIDGE_FILE_NAME) {
@@ -1341,7 +1370,7 @@ fn apply_uninstall_edits(
     receipt: &Receipt,
     config_override: Option<&Path>,
     outcome: &mut UninstallOutcome,
-) -> Result<(), IntegrationError> {
+) {
     use std::collections::BTreeMap;
     let mut by_file: BTreeMap<PathBuf, Vec<&NodeRecord>> = BTreeMap::new();
     for record in &receipt.configs {
@@ -1369,7 +1398,6 @@ fn apply_uninstall_edits(
             }
         }
     }
-    Ok(())
 }
 
 #[derive(Default)]
@@ -1438,8 +1466,9 @@ fn uninstall_one_file(
     KdlDocument::parse_v1(&candidate).map_err(|error| kdl::KdlError::CandidateRejected {
         detail: error.to_string(),
     })?;
-    let current = fs::read(config_path)
-        .map_err(|source| fsutil::io_error("re-reading Zellij configuration", config_path, source))?;
+    let current = fs::read(config_path).map_err(|source| {
+        fsutil::io_error("re-reading Zellij configuration", config_path, source)
+    })?;
     if current != bytes {
         return Err(kdl::KdlError::ConcurrentChange {
             path: config_path.to_path_buf(),
@@ -1478,7 +1507,9 @@ fn plan_uninstall_node(
         .filter(|node| node.name().value() == parent_name)
         .collect();
     if blocks.len() > 1 {
-        return Err(format!("ambiguous duplicate `{parent_name}` blocks; left untouched"));
+        return Err(format!(
+            "ambiguous duplicate `{parent_name}` blocks; left untouched"
+        ));
     }
     let Some(block) = blocks.first() else {
         // A created node whose parent block is gone is already gone too.
@@ -1564,15 +1595,10 @@ fn plan_uninstall_node(
 mod tests {
     use super::*;
 
-    fn install_inputs<'a>(
-        config_dir: &'a Path,
-        wasm: &'a [u8],
-        digest: &'a str,
-    ) -> InstallInputs<'a> {
+    fn install_inputs<'a>(config_dir: &'a Path, wasm: &'a [u8]) -> InstallInputs<'a> {
         InstallInputs {
             config_dir,
             packaged_wasm: wasm,
-            expected_digest: digest,
             version: "0.1.0",
             zellij_config: None,
             explicit_policy: Some(ConfigurationPolicy::Never),
@@ -1582,6 +1608,18 @@ mod tests {
             logger: None,
             hooks: Hooks::default(),
         }
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "fixture shim mirrors the public by-value install shape so transaction tests exercise identical move semantics"
+    )]
+    fn install(inputs: InstallInputs<'_>) -> Result<InstallOutcome, IntegrationError> {
+        let verification = compatibility::NativeAssetVerification {
+            packaged_digest: fsutil::sha256_hex(inputs.packaged_wasm),
+            registration: compatibility::BridgeRegistrationDigest::current(),
+        };
+        install_verified(&inputs, verification)
     }
 
     #[test]
@@ -1608,10 +1646,14 @@ mod tests {
     #[test]
     fn install_materializes_bridge_and_receipt_without_config() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let wasm = b"wasm-bytes-v1";
         let digest = fsutil::sha256_hex(wasm);
-        let outcome = install(install_inputs(temp.path(), wasm, &digest)).unwrap();
+        let outcome = install(install_inputs(temp.path(), wasm)).unwrap();
         assert_eq!(outcome.bridge_digest, digest);
         assert!(stable_bridge_path(temp.path()).exists());
         assert!(outcome.receipt_path.exists());
@@ -1619,26 +1661,20 @@ mod tests {
     }
 
     #[test]
-    fn install_refuses_packaged_digest_mismatch_unchanged() {
-        let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-        let error = install(install_inputs(temp.path(), b"wasm", &"0".repeat(64))).unwrap_err();
-        assert!(matches!(error, IntegrationError::Asset(_)));
-        assert!(!integration_dir(temp.path()).exists());
-    }
-
-    #[test]
     fn install_refuses_foreign_bytes_with_both_digests() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let wasm = b"wasm-v1";
         let digest = fsutil::sha256_hex(wasm);
-        install(install_inputs(temp.path(), wasm, &digest)).unwrap();
+        install(install_inputs(temp.path(), wasm)).unwrap();
         // Corrupt the bridge outside the transaction.
         fs::write(stable_bridge_path(temp.path()), b"intruder").unwrap();
         let wasm2 = b"wasm-v2";
-        let digest2 = fsutil::sha256_hex(wasm2);
-        let error = install(install_inputs(temp.path(), wasm2, &digest2)).unwrap_err();
+        let error = install(install_inputs(temp.path(), wasm2)).unwrap_err();
         let message = error.to_string();
         assert!(message.contains(&fsutil::sha256_hex(b"intruder")));
         assert!(message.contains(&digest));
@@ -1647,14 +1683,21 @@ mod tests {
     #[test]
     fn install_edits_config_and_records_ownership() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let conf_dir = temp.path().join("zellij-conf");
         std::fs::create_dir_all(&conf_dir).unwrap();
-        std::fs::set_permissions(&conf_dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            &conf_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let config = conf_dir.join("config.kdl");
         let wasm = b"wasm-v1";
-        let digest = fsutil::sha256_hex(wasm);
-        let mut inputs = install_inputs(temp.path(), wasm, &digest);
+        let mut inputs = install_inputs(temp.path(), wasm);
         inputs.explicit_policy = Some(ConfigurationPolicy::Always);
         inputs.zellij_config = Some(config.clone());
         let outcome = install(inputs).unwrap();
@@ -1679,24 +1722,25 @@ mod tests {
             InstallStep::BeforeReceiptCommit,
         ] {
             let temp = tempfile::TempDir::new().unwrap();
-            std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(
+                temp.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
             let config = temp.path().join("config.kdl");
             let wasm = b"wasm-v1";
             let digest = fsutil::sha256_hex(wasm);
-            let mut inputs = install_inputs(temp.path(), wasm, &digest);
+            let mut inputs = install_inputs(temp.path(), wasm);
             inputs.explicit_policy = Some(ConfigurationPolicy::Always);
             inputs.zellij_config = Some(config.clone());
             inputs.hooks.fail_after = Some(step);
             assert!(
-                matches!(
-                    install(inputs),
-                    Err(IntegrationError::FaultInjected { .. })
-                ),
+                matches!(install(inputs), Err(IntegrationError::FaultInjected { .. })),
                 "step {step:?} did not inject"
             );
             // Retry completes or rolls back, then converges to installed.
             let outcome = install({
-                let mut retry = install_inputs(temp.path(), wasm, &digest);
+                let mut retry = install_inputs(temp.path(), wasm);
                 retry.explicit_policy = Some(ConfigurationPolicy::Always);
                 retry.zellij_config = Some(config.clone());
                 retry
@@ -1716,14 +1760,18 @@ mod tests {
         // lose Created/Updated provenance: recovery keeps the journaled
         // dispositions instead of recomputing Observed from the applied file.
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let config = temp.path().join("config.kdl");
         let original =
             "plugins {\n    muxe location=\"file:/old.wasm\"\n}\nload_plugins {\n    muxe\n}\n";
         fs::write(&config, original).unwrap();
         let wasm = b"wasm-v1";
         let digest = fsutil::sha256_hex(wasm);
-        let mut inputs = install_inputs(temp.path(), wasm, &digest);
+        let mut inputs = install_inputs(temp.path(), wasm);
         inputs.explicit_policy = Some(ConfigurationPolicy::Always);
         inputs.zellij_config = Some(config.clone());
         inputs.hooks.fail_after = Some(InstallStep::BeforeBridgeSwap);
@@ -1732,9 +1780,9 @@ mod tests {
             Err(IntegrationError::FaultInjected { .. })
         ));
         let outcome = install({
-            let mut retry = install_inputs(temp.path(), wasm, &digest);
+            let mut retry = install_inputs(temp.path(), wasm);
             retry.explicit_policy = Some(ConfigurationPolicy::Always);
-            retry.zellij_config = Some(config.clone());
+            retry.zellij_config = Some(config);
             retry
         })
         .unwrap();
@@ -1748,7 +1796,13 @@ mod tests {
             .find(|record| record.node == ManagedNode::PluginsAlias)
             .unwrap();
         assert_eq!(plugins.disposition, Disposition::Updated);
-        assert!(plugins.previous_text.as_ref().unwrap().contains("/old.wasm"));
+        assert!(
+            plugins
+                .previous_text
+                .as_ref()
+                .unwrap()
+                .contains("/old.wasm")
+        );
     }
 
     #[test]
@@ -1757,13 +1811,16 @@ mod tests {
         // forward progress is impossible, so proven nodes are restored and
         // the journal is removed -- a truthful rollback, not false success.
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let config = temp.path().join("config.kdl");
         let original = "// keep\n";
         fs::write(&config, original).unwrap();
         let wasm = b"wasm-v1";
-        let digest = fsutil::sha256_hex(wasm);
-        let mut inputs = install_inputs(temp.path(), wasm, &digest);
+        let mut inputs = install_inputs(temp.path(), wasm);
         inputs.explicit_policy = Some(ConfigurationPolicy::Always);
         inputs.zellij_config = Some(config.clone());
         inputs.hooks.fail_after = Some(InstallStep::BeforeBridgeSwap);
@@ -1787,8 +1844,7 @@ mod tests {
         // Muxe itself appended stay behind empty, never user bytes.
         let rolled = fs::read_to_string(&config).unwrap();
         assert!(rolled.starts_with(original));
-        let document =
-            ::kdl::KdlDocument::parse_v1(&rolled).expect("rolled-back file parses");
+        let document = ::kdl::KdlDocument::parse_v1(&rolled).expect("rolled-back file parses");
         for block in ["plugins", "load_plugins"] {
             let count = document
                 .nodes()
@@ -1801,7 +1857,11 @@ mod tests {
             assert_eq!(count, 0, "{block} still holds a muxe node");
         }
         assert!(!stable_bridge_path(temp.path()).exists());
-        assert!(receipt::load(&integration_dir(temp.path())).unwrap().is_none());
+        assert!(
+            receipt::load(&integration_dir(temp.path()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1813,12 +1873,10 @@ mod tests {
         )
         .unwrap();
         let first = b"wasm-v1";
-        let first_digest = fsutil::sha256_hex(first);
-        install(install_inputs(temp.path(), first, &first_digest)).unwrap();
+        install(install_inputs(temp.path(), first)).unwrap();
 
         let replacement = b"wasm-v2";
-        let replacement_digest = fsutil::sha256_hex(replacement);
-        let mut interrupted = install_inputs(temp.path(), replacement, &replacement_digest);
+        let mut interrupted = install_inputs(temp.path(), replacement);
         interrupted.hooks.fail_after = Some(InstallStep::BeforeBridgeSwap);
         assert!(matches!(
             install(interrupted),
@@ -1842,12 +1900,15 @@ mod tests {
         // nodes no longer verify, so recovery preserves everything instead
         // of restoring over user bytes or claiming false success.
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let config = temp.path().join("config.kdl");
         fs::write(&config, "// keep\n").unwrap();
         let wasm = b"wasm-v1";
-        let digest = fsutil::sha256_hex(wasm);
-        let mut inputs = install_inputs(temp.path(), wasm, &digest);
+        let mut inputs = install_inputs(temp.path(), wasm);
         inputs.explicit_policy = Some(ConfigurationPolicy::Always);
         inputs.zellij_config = Some(config.clone());
         inputs.hooks.fail_after = Some(InstallStep::BeforeBridgeSwap);
@@ -1861,11 +1922,15 @@ mod tests {
                 fs::remove_file(&path).unwrap();
             }
         }
-        fs::write(&config, "# user rewrite\nplugins {\n    other location=\"x\"\n}\n").unwrap();
+        fs::write(
+            &config,
+            "# user rewrite\nplugins {\n    other location=\"x\"\n}\n",
+        )
+        .unwrap();
         let error = install({
-            let mut retry = install_inputs(temp.path(), wasm, &digest);
+            let mut retry = install_inputs(temp.path(), wasm);
             retry.explicit_policy = Some(ConfigurationPolicy::Always);
-            retry.zellij_config = Some(config.clone());
+            retry.zellij_config = Some(config);
             retry
         })
         .unwrap_err();
@@ -1881,30 +1946,35 @@ mod tests {
         // A receipt that changed outside the transaction is ambiguity, never
         // authority: recovery refuses to mutate.
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let wasm = b"wasm-v1";
-        let digest = fsutil::sha256_hex(wasm);
-        let mut inputs = install_inputs(temp.path(), wasm, &digest);
+        let mut inputs = install_inputs(temp.path(), wasm);
         inputs.hooks.fail_after = Some(InstallStep::BeforeBridgeSwap);
         assert!(matches!(
             install(inputs),
             Err(IntegrationError::FaultInjected { .. })
         ));
         let directory = integration_dir(temp.path());
-        let mut receipt = receipt::load(&directory).unwrap().unwrap_or_else(|| Receipt {
-            schema_version: receipt::RECEIPT_SCHEMA_VERSION,
-            bridge: receipt::BridgeRecord {
-                canonical_path: stable_bridge_path(temp.path()),
-                installed_version: "9.9.9".to_owned(),
-                installed_digest: "f".repeat(64),
-                previous_digest: None,
-                bridge_compat: None,
-            },
-            configs: Vec::new(),
-        });
+        let mut receipt = receipt::load(&directory)
+            .unwrap()
+            .unwrap_or_else(|| Receipt {
+                schema_version: receipt::RECEIPT_SCHEMA_VERSION,
+                bridge: receipt::BridgeRecord {
+                    canonical_path: stable_bridge_path(temp.path()),
+                    installed_version: "9.9.9".to_owned(),
+                    installed_digest: "f".repeat(64),
+                    previous_digest: None,
+                    bridge_compat: None,
+                },
+                configs: Vec::new(),
+            });
         receipt.bridge.installed_digest = "e".repeat(64);
         receipt::store(&directory, &receipt).unwrap();
-        let error = install(install_inputs(temp.path(), wasm, &digest)).unwrap_err();
+        let error = install(install_inputs(temp.path(), wasm)).unwrap_err();
         assert!(
             matches!(error, IntegrationError::InconsistentJournal(_)),
             "{error}"
@@ -1916,7 +1986,11 @@ mod tests {
         // A journal carrying a non-plain staging name never becomes a
         // mutation target.
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let directory = integration_dir(temp.path());
         fsutil::ensure_owner_dir(&directory).unwrap();
         let journal = InstallJournal {
@@ -1943,7 +2017,11 @@ mod tests {
     #[test]
     fn uninstall_restores_updated_nodes_and_removes_receipt() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let config = temp.path().join("config.kdl");
         fs::write(
             &config,
@@ -1951,8 +2029,7 @@ mod tests {
         )
         .unwrap();
         let wasm = b"wasm-v1";
-        let digest = fsutil::sha256_hex(wasm);
-        let mut inputs = install_inputs(temp.path(), wasm, &digest);
+        let mut inputs = install_inputs(temp.path(), wasm);
         inputs.explicit_policy = Some(ConfigurationPolicy::Always);
         inputs.zellij_config = Some(config.clone());
         install(inputs).unwrap();
@@ -1979,11 +2056,14 @@ mod tests {
     #[test]
     fn uninstall_leaves_user_modified_nodes() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let config = temp.path().join("config.kdl");
         let wasm = b"wasm-v1";
-        let digest = fsutil::sha256_hex(wasm);
-        let mut inputs = install_inputs(temp.path(), wasm, &digest);
+        let mut inputs = install_inputs(temp.path(), wasm);
         inputs.explicit_policy = Some(ConfigurationPolicy::Always);
         inputs.zellij_config = Some(config.clone());
         install(inputs).unwrap();
@@ -1995,7 +2075,7 @@ mod tests {
         let outcome = uninstall(UninstallInputs {
             config_dir: temp.path(),
             cache_dir: &cache,
-            zellij_config: Some(config.clone()),
+            zellij_config: Some(config),
             explicit_policy: Some(ConfigurationPolicy::Always),
             quiet: true,
             interactive: false,
