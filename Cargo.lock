@@ -1813,6 +1813,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "muxe-adapter-zellij"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "muxe-adapter-api",
+ "muxe-core",
+ "muxe-protocol",
+ "muxe-zellij-protocol",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "muxe-broker"
 version = "0.1.0"
 dependencies = [
@@ -1890,6 +1908,7 @@ dependencies = [
  "muxe-core",
  "muxe-protocol",
  "muxe-terminal-input",
+ "nix",
  "proptest",
  "ratatui",
  "rkyv",
@@ -1911,6 +1930,19 @@ dependencies = [
  "sha2 0.10.9",
  "syn 2.0.119",
  "zellij-tile",
+]
+
+[[package]]
+name = "muxe-zellij-protocol"
+version = "0.1.0"
+dependencies = [
+ "muxe-protocol",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "zellij-tile",
+ "zellij-utils",
 ]
 
 [[package]]
