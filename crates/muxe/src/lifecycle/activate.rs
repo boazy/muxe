@@ -2608,15 +2608,24 @@ mod tests {
                         decoder
                             .push(&buffer[..read], |message| {
                                 if let ControlMessage::Request(request) = message {
-                                    pending.push(request.request_id);
+                                    let result = match request.operation {
+                                        ControlOperation::Status => {
+                                            ControlResult::Status(status.clone())
+                                        }
+                                        ControlOperation::Commit { .. } => {
+                                            ControlResult::Committed(status.clone())
+                                        }
+                                        _ => ControlResult::Error {
+                                            diagnostic: "unsupported fixture operation".to_owned(),
+                                        },
+                                    };
+                                    pending.push((request.request_id, result));
                                 }
                             })
                             .expect("decode readiness frame");
-                        for request_id in pending {
-                            let response = ControlMessage::Response(ControlResponse {
-                                request_id,
-                                result: ControlResult::Status(status.clone()),
-                            });
+                        for (request_id, result) in pending {
+                            let response =
+                                ControlMessage::Response(ControlResponse { request_id, result });
                             let payload = serde_json::to_vec(&response).unwrap();
                             let length =
                                 u32::try_from(payload.len()).expect("status frame fits u32");
@@ -2792,5 +2801,60 @@ mod tests {
         )
         .await
         .expect("a genuinely queried empty snapshot reads ready");
+    }
+
+    #[tokio::test]
+    async fn recovery_honors_durable_ready_despite_census_drift() {
+        // A Ready journal is a durable decision: the census gate passed before
+        // the journal write. Later client drift must not undo the decision;
+        // recovery honors the recorded handoff, identity, and record.
+        let temp = tempfile::tempdir().expect("recovery cache");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(&cache).expect("cache exists");
+        std::fs::set_permissions(&cache, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("cache is owner-only");
+        let socket = temp.path().join("broker.sock");
+        let handoff = handoff(13);
+        let peer = serve_readiness_status(
+            socket.clone(),
+            census_status(
+                handoff,
+                "session-a",
+                Some(ready_census(&["a", "rogue"], Some(&["a", "b"]))),
+            ),
+        );
+        let bound = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !socket.exists() {
+            if std::time::Instant::now() >= bound {
+                panic!("readiness peer never bound its socket");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let mut journal = ActivationJournal::new(
+            UnitKind::Zellij {
+                bridge_path_hash: unit_hash("/stable/bridge"),
+            },
+            old_record(),
+            target_record(),
+            vec![MemberState {
+                host_identity: "session-a".to_owned(),
+                old_socket: socket,
+                target_socket: None,
+                handoff_id: Some(hex_lower(&handoff.0)),
+                state: MemberTransition::Ready,
+            }],
+        );
+        journal.state = JournalState::Ready;
+        journal::write_journal(&cache, &journal).unwrap();
+        let outcomes = recover(&cache, &LiveControl, &FixtureReloader::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0], RecoveryOutcome::Committed { .. }),
+            "durable Ready commits despite later client drift, got {:?}",
+            outcomes[0]
+        );
+        peer.abort();
     }
 }
