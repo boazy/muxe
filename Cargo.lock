@@ -1884,6 +1884,7 @@ dependencies = [
 name = "muxe-ui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "crossterm",
  "minijinja",
  "muxe-core",
@@ -1894,6 +1895,7 @@ dependencies = [
  "rkyv",
  "serde",
  "thiserror 2.0.20",
+ "tokio",
  "unicode-width 0.2.2",
 ]
 
