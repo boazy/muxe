@@ -28,11 +28,14 @@ pub const MIRROR_TYPE_SOURCES: &[(&str, &str)] = &[
     ("ClientId", "zellij-utils/src/data.rs"),
     ("Column", "zellij-utils/src/position.rs"),
     ("CommandOrPlugin", "zellij-utils/src/data.rs"),
+    ("CommandToRun", "zellij-utils/src/data.rs"),
     ("Context", "zellij-utils/src/data.rs"),
     ("Direction", "zellij-utils/src/data.rs"),
     ("FileToOpen", "zellij-utils/src/data.rs"),
     ("FloatingPaneCoordinates", "zellij-utils/src/data.rs"),
     ("FloatingPaneLayout", "zellij-utils/src/input/layout.rs"),
+    ("HighlightLayer", "zellij-utils/src/data.rs"),
+    ("HighlightStyle", "zellij-utils/src/data.rs"),
     ("InputMode", "zellij-utils/src/data.rs"),
     ("KeyModifier", "zellij-utils/src/data.rs"),
     ("KeyWithModifier", "zellij-utils/src/data.rs"),
@@ -53,7 +56,9 @@ pub const MIRROR_TYPE_SOURCES: &[(&str, &str)] = &[
     ("PluginTag", "zellij-utils/src/data.rs"),
     ("PluginUserConfiguration", "zellij-utils/src/input/layout.rs"),
     ("Position", "zellij-utils/src/position.rs"),
+    ("RegexHighlight", "zellij-utils/src/data.rs"),
     ("Resize", "zellij-utils/src/data.rs"),
+    ("ResizeStrategy", "zellij-utils/src/data.rs"),
     ("Run", "zellij-utils/src/input/layout.rs"),
     ("RunCommand", "zellij-utils/src/input/command.rs"),
     ("RunCommandAction", "zellij-utils/src/input/command.rs"),
@@ -716,10 +721,382 @@ pub const VALIDATION_RULES: &[(&str, &str)] = &[
     ("PluginUserConfiguration", "must not contain keys the pinned source constructor would silently discard"),
 ];
 
-pub mod raw {
-    use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf};
+pub const NATIVE_ZELLIJ_COMMANDS: &[(&str, &str, &str, &str)] = &[
+    ("break-panes-to-new-tab", "break_panes_to_new_tab", "Option < usize >", "source-to-validated"),
+    ("break-panes-to-tab-with-id", "break_panes_to_tab_with_id", "Option < usize >", "source-to-validated"),
+    ("break-panes-to-tab-with-index", "break_panes_to_tab_with_index", "Option < usize >", "source-to-validated"),
+    ("change-floating-panes-coordinates", "change_floating_panes_coordinates", "()", "source-to-validated"),
+    ("change-host-folder", "change_host_folder", "()", "source-to-validated"),
+    ("clear-pane-highlights", "clear_pane_highlights", "()", "source-to-validated"),
+    ("clear-screen", "clear_screen", "()", "source-to-validated"),
+    ("clear-screen-for-pane-id", "clear_screen_for_pane_id", "()", "source-to-validated"),
+    ("close-focus", "close_focus", "()", "source-to-validated"),
+    ("close-focused-tab", "close_focused_tab", "()", "source-to-validated"),
+    ("close-multiple-panes", "close_multiple_panes", "()", "source-to-validated"),
+    ("close-pane-with-id", "close_pane_with_id", "()", "source-to-validated"),
+    ("close-plugin-pane", "close_plugin_pane", "()", "source-to-validated"),
+    ("close-self", "close_self", "()", "source-to-validated"),
+    ("close-tab-with-id", "close_tab_with_id", "()", "source-to-validated"),
+    ("close-tab-with-index", "close_tab_with_index", "()", "source-to-validated"),
+    ("close-terminal-pane", "close_terminal_pane", "()", "source-to-validated"),
+    ("copy-to-clipboard", "copy_to_clipboard", "()", "source-to-validated"),
+    ("delete-all-dead-sessions", "delete_all_dead_sessions", "Result < (), String >", "source-to-validated"),
+    ("delete-dead-session", "delete_dead_session", "Result < (), String >", "source-to-validated"),
+    ("delete-layout", "delete_layout", "Result < (), String >", "source-to-validated"),
+    ("detach", "detach", "()", "source-to-validated"),
+    ("disconnect-other-clients", "disconnect_other_clients", "()", "source-to-validated"),
+    ("edit-layout", "edit_layout", "Result < (), String >", "source-to-validated"),
+    ("edit-scrollback", "edit_scrollback", "()", "source-to-validated"),
+    ("edit-scrollback-for-pane-with-id", "edit_scrollback_for_pane_with_id", "()", "source-to-validated"),
+    ("embed-multiple-panes", "embed_multiple_panes", "()", "source-to-validated"),
+    ("float-multiple-panes", "float_multiple_panes", "()", "source-to-validated"),
+    ("focus-host-session", "focus_host_session", "()", "source-to-validated"),
+    ("focus-last-pane", "focus_last_pane", "()", "source-to-validated"),
+    ("focus-next-pane", "focus_next_pane", "()", "source-to-validated"),
+    ("focus-or-create-tab", "focus_or_create_tab", "Option < usize >", "source-to-validated"),
+    ("focus-pane-with-id", "focus_pane_with_id", "()", "source-to-validated"),
+    ("focus-plugin-pane", "focus_plugin_pane", "()", "source-to-validated"),
+    ("focus-previous-pane", "focus_previous_pane", "()", "source-to-validated"),
+    ("focus-terminal-pane", "focus_terminal_pane", "()", "source-to-validated"),
+    ("go-to-next-tab", "go_to_next_tab", "()", "source-to-validated"),
+    ("go-to-previous-tab", "go_to_previous_tab", "()", "source-to-validated"),
+    ("go-to-tab", "go_to_tab", "()", "source-to-validated"),
+    ("go-to-tab-name", "go_to_tab_name", "()", "source-to-validated"),
+    ("group-and-ungroup-panes", "group_and_ungroup_panes", "()", "source-to-validated"),
+    ("hide-floating-panes", "hide_floating_panes", "Result < bool, String >", "source-to-validated"),
+    ("hide-pane-with-id", "hide_pane_with_id", "()", "source-to-validated"),
+    ("hide-self", "hide_self", "()", "source-to-validated"),
+    ("highlight-and-unhighlight-panes", "highlight_and_unhighlight_panes", "()", "source-to-validated"),
+    ("kill-sessions", "kill_sessions", "Result < (), String >", "source-to-validated"),
+    ("move-focus", "move_focus", "()", "source-to-validated"),
+    ("move-focus-or-tab", "move_focus_or_tab", "()", "source-to-validated"),
+    ("move-pane", "move_pane", "()", "source-to-validated"),
+    ("move-pane-with-direction", "move_pane_with_direction", "()", "source-to-validated"),
+    ("move-pane-with-pane-id", "move_pane_with_pane_id", "()", "source-to-validated"),
+    ("move-pane-with-pane-id-in-direction", "move_pane_with_pane_id_in_direction", "()", "source-to-validated"),
+    ("new-pane", "new_pane", "()", "source-to-validated"),
+    ("new-tab", "new_tab", "Option < usize >", "source-to-validated"),
+    ("new-tab-unfocused", "new_tab_unfocused", "Option < usize >", "source-to-validated"),
+    ("new-tabs-with-layout", "new_tabs_with_layout", "Vec < usize >", "source-to-validated"),
+    ("new-tabs-with-layout-info", "new_tabs_with_layout_info", "Vec < usize >", "source-to-validated"),
+    ("new-tiled-pane-in-tab", "new_tiled_pane_in_tab", "Option < validated::PaneId >", "source-to-validated"),
+    ("next-swap-layout", "next_swap_layout", "()", "source-to-validated"),
+    ("open-command-pane", "open_command_pane", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-command-pane-background", "open_command_pane_background", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-command-pane-floating", "open_command_pane_floating", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-command-pane-floating-near-plugin", "open_command_pane_floating_near_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-command-pane-in-new-tab", "open_command_pane_in_new_tab", "(Option < usize >, Option < validated::PaneId >)", "source-to-validated"),
+    ("open-command-pane-in-place", "open_command_pane_in_place", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-command-pane-in-place-of-pane-id", "open_command_pane_in_place_of_pane_id", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-command-pane-in-place-of-plugin", "open_command_pane_in_place_of_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-command-pane-near-plugin", "open_command_pane_near_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-edit-pane-in-place-of-pane-id", "open_edit_pane_in_place_of_pane_id", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-editor-pane-in-new-tab", "open_editor_pane_in_new_tab", "(Option < usize >, Option < validated::PaneId >)", "source-to-validated"),
+    ("open-file", "open_file", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-file-floating", "open_file_floating", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-file-floating-near-plugin", "open_file_floating_near_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-file-in-place", "open_file_in_place", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-file-in-place-of-plugin", "open_file_in_place_of_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-file-near-plugin", "open_file_near_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-plugin-pane-floating", "open_plugin_pane_floating", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-plugin-pane-in-new-tab", "open_plugin_pane_in_new_tab", "(Option < usize >, Option < validated::PaneId >)", "source-to-validated"),
+    ("open-terminal", "open_terminal", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-terminal-floating", "open_terminal_floating", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-terminal-floating-near-plugin", "open_terminal_floating_near_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-terminal-in-place", "open_terminal_in_place", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-terminal-in-place-of-plugin", "open_terminal_in_place_of_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-terminal-near-plugin", "open_terminal_near_plugin", "Option < validated::PaneId >", "source-to-validated"),
+    ("open-terminal-pane-in-place-of-pane-id", "open_terminal_pane_in_place_of_pane_id", "Option < validated::PaneId >", "source-to-validated"),
+    ("override-layout", "override_layout", "()", "source-to-validated"),
+    ("page-scroll-down", "page_scroll_down", "()", "source-to-validated"),
+    ("page-scroll-down-in-pane-id", "page_scroll_down_in_pane_id", "()", "source-to-validated"),
+    ("page-scroll-up", "page_scroll_up", "()", "source-to-validated"),
+    ("page-scroll-up-in-pane-id", "page_scroll_up_in_pane_id", "()", "source-to-validated"),
+    ("previous-swap-layout", "previous_swap_layout", "()", "source-to-validated"),
+    ("quit-zellij", "quit_zellij", "()", "source-to-validated"),
+    ("rebind-keys", "rebind_keys", "()", "source-to-validated"),
+    ("reconfigure", "reconfigure", "()", "source-to-validated"),
+    ("rename-layout", "rename_layout", "Result < (), String >", "source-to-validated"),
+    ("rename-pane-with-id", "rename_pane_with_id", "()", "source-to-validated"),
+    ("rename-plugin-pane", "rename_plugin_pane", "()", "source-to-validated"),
+    ("rename-session", "rename_session", "()", "source-to-validated"),
+    ("rename-tab", "rename_tab", "()", "source-to-validated"),
+    ("rename-tab-with-id", "rename_tab_with_id", "()", "source-to-validated"),
+    ("rename-terminal-pane", "rename_terminal_pane", "()", "source-to-validated"),
+    ("replace-pane-with-existing-pane", "replace_pane_with_existing_pane", "()", "source-to-validated"),
+    ("rerun-command-pane", "rerun_command_pane", "()", "source-to-validated"),
+    ("resize-focused-pane", "resize_focused_pane", "()", "source-to-validated"),
+    ("resize-focused-pane-with-direction", "resize_focused_pane_with_direction", "()", "source-to-validated"),
+    ("resize-pane-with-id", "resize_pane_with_id", "()", "source-to-validated"),
+    ("run-action", "run_action", "()", "source-to-validated"),
+    ("save-layout", "save_layout", "Result < (), String >", "source-to-validated"),
+    ("save-session", "save_session", "Result < (), String >", "source-to-validated"),
+    ("scroll-down", "scroll_down", "()", "source-to-validated"),
+    ("scroll-down-in-pane-id", "scroll_down_in_pane_id", "()", "source-to-validated"),
+    ("scroll-to-bottom", "scroll_to_bottom", "()", "source-to-validated"),
+    ("scroll-to-bottom-in-pane-id", "scroll_to_bottom_in_pane_id", "()", "source-to-validated"),
+    ("scroll-to-top", "scroll_to_top", "()", "source-to-validated"),
+    ("scroll-to-top-in-pane-id", "scroll_to_top_in_pane_id", "()", "source-to-validated"),
+    ("scroll-up", "scroll_up", "()", "source-to-validated"),
+    ("scroll-up-in-pane-id", "scroll_up_in_pane_id", "()", "source-to-validated"),
+    ("send-sigint-to-pane-id", "send_sigint_to_pane_id", "()", "source-to-validated"),
+    ("send-sigkill-to-pane-id", "send_sigkill_to_pane_id", "()", "source-to-validated"),
+    ("set-floating-pane-pinned", "set_floating_pane_pinned", "()", "source-to-validated"),
+    ("set-pane-borderless", "set_pane_borderless", "()", "source-to-validated"),
+    ("set-pane-color", "set_pane_color", "()", "source-to-validated"),
+    ("set-pane-frame-style", "set_pane_frame_style", "()", "source-to-validated"),
+    ("set-pane-regex-highlights", "set_pane_regex_highlights", "()", "source-to-validated"),
+    ("set-selectable", "set_selectable", "()", "source-to-validated"),
+    ("set-self-mouse-selection-support", "set_self_mouse_selection_support", "()", "source-to-validated"),
+    ("set-soft-keyboard", "set_soft_keyboard", "()", "source-to-validated"),
+    ("show-cursor", "show_cursor", "()", "source-to-validated"),
+    ("show-floating-panes", "show_floating_panes", "Result < bool, String >", "source-to-validated"),
+    ("show-pane-with-id", "show_pane_with_id", "()", "source-to-validated"),
+    ("show-self", "show_self", "()", "source-to-validated"),
+    ("stack-panes", "stack_panes", "()", "source-to-validated"),
+    ("switch-session", "switch_session", "()", "source-to-validated"),
+    ("switch-session-with-cwd", "switch_session_with_cwd", "()", "source-to-validated"),
+    ("switch-session-with-focus", "switch_session_with_focus", "()", "source-to-validated"),
+    ("switch-session-with-layout", "switch_session_with_layout", "()", "source-to-validated"),
+    ("switch-tab-to", "switch_tab_to", "()", "source-to-validated"),
+    ("toggle-active-tab-sync", "toggle_active_tab_sync", "()", "source-to-validated"),
+    ("toggle-floating-panes", "toggle_floating_panes", "()", "source-to-validated"),
+    ("toggle-focus-fullscreen", "toggle_focus_fullscreen", "()", "source-to-validated"),
+    ("toggle-focus-no-ui-fullscreen", "toggle_focus_no_ui_fullscreen", "()", "source-to-validated"),
+    ("toggle-pane-borderless", "toggle_pane_borderless", "()", "source-to-validated"),
+    ("toggle-pane-embed-or-eject", "toggle_pane_embed_or_eject", "()", "source-to-validated"),
+    ("toggle-pane-embed-or-eject-for-pane-id", "toggle_pane_embed_or_eject_for_pane_id", "()", "source-to-validated"),
+    ("toggle-pane-frames", "toggle_pane_frames", "()", "source-to-validated"),
+    ("toggle-pane-id-fullscreen", "toggle_pane_id_fullscreen", "()", "source-to-validated"),
+    ("toggle-tab", "toggle_tab", "()", "source-to-validated"),
+    ("undo-rename-pane", "undo_rename_pane", "()", "source-to-validated"),
+    ("undo-rename-tab", "undo_rename_tab", "()", "source-to-validated"),
+    ("write", "write", "()", "source-to-validated"),
+    ("write-chars", "write_chars", "()", "source-to-validated"),
+    ("write-chars-to-pane-id", "write_chars_to_pane_id", "()", "source-to-validated"),
+    ("write-to-pane-id", "write_to_pane_id", "()", "source-to-validated"),
+];
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub const NATIVE_ZELLIJ_COMMAND_ARGUMENTS: &[(&str, &str, &str, &str)] = &[
+    ("break-panes-to-new-tab", "pane-ids", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("break-panes-to-new-tab", "new-tab-name", "Option < String >", "raw-to-validated"),
+    ("break-panes-to-new-tab", "should-change-focus-to-new-tab", "bool", "raw-to-validated"),
+    ("break-panes-to-tab-with-id", "pane-ids", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("break-panes-to-tab-with-id", "tab-id", "usize", "raw-to-validated"),
+    ("break-panes-to-tab-with-id", "should-change-focus-to-target-tab", "bool", "raw-to-validated"),
+    ("break-panes-to-tab-with-index", "pane-ids", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("break-panes-to-tab-with-index", "tab-index", "usize", "raw-to-validated"),
+    ("break-panes-to-tab-with-index", "should-change-focus-to-new-tab", "bool", "raw-to-validated"),
+    ("change-floating-panes-coordinates", "pane-ids-and-coordinates", "Vec < (raw::PaneId, raw::FloatingPaneCoordinates) >", "raw-to-validated"),
+    ("change-host-folder", "new-host-folder", "std::path::PathBuf", "raw-to-validated"),
+    ("clear-pane-highlights", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("clear-screen-for-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("close-multiple-panes", "pane-ids", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("close-pane-with-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("close-plugin-pane", "plugin-pane-id", "u32", "raw-to-validated"),
+    ("close-tab-with-id", "tab-id", "u64", "raw-to-validated"),
+    ("close-tab-with-index", "tab-index", "usize", "raw-to-validated"),
+    ("close-terminal-pane", "terminal-pane-id", "u32", "raw-to-validated"),
+    ("copy-to-clipboard", "text", "String", "raw-to-validated"),
+    ("delete-dead-session", "name", "String", "raw-to-validated"),
+    ("delete-layout", "layout-name", "String", "raw-to-validated"),
+    ("edit-layout", "layout-name", "String", "raw-to-validated"),
+    ("edit-layout", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("edit-scrollback-for-pane-with-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("embed-multiple-panes", "pane-ids", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("float-multiple-panes", "pane-ids", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("focus-or-create-tab", "tab-name", "String", "raw-to-validated"),
+    ("focus-pane-with-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("focus-pane-with-id", "should-float-if-hidden", "bool", "raw-to-validated"),
+    ("focus-pane-with-id", "should-be-in-place-if-hidden", "bool", "raw-to-validated"),
+    ("focus-plugin-pane", "plugin-pane-id", "u32", "raw-to-validated"),
+    ("focus-plugin-pane", "should-float-if-hidden", "bool", "raw-to-validated"),
+    ("focus-plugin-pane", "should-be-in-place-if-hidden", "bool", "raw-to-validated"),
+    ("focus-terminal-pane", "terminal-pane-id", "u32", "raw-to-validated"),
+    ("focus-terminal-pane", "should-float-if-hidden", "bool", "raw-to-validated"),
+    ("focus-terminal-pane", "should-be-in-place-if-hidden", "bool", "raw-to-validated"),
+    ("go-to-tab", "tab-index", "u32", "raw-to-validated"),
+    ("go-to-tab-name", "tab-name", "String", "raw-to-validated"),
+    ("group-and-ungroup-panes", "pane-ids-to-group", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("group-and-ungroup-panes", "pane-ids-to-ungroup", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("group-and-ungroup-panes", "for-all-clients", "bool", "raw-to-validated"),
+    ("hide-floating-panes", "tab-id", "Option < usize >", "raw-to-validated"),
+    ("hide-pane-with-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("highlight-and-unhighlight-panes", "pane-ids-to-highlight", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("highlight-and-unhighlight-panes", "pane-ids-to-unhighlight", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("kill-sessions", "session-names", "Vec < String >", "raw-to-validated"),
+    ("move-focus", "direction", "raw::Direction", "raw-to-validated"),
+    ("move-focus-or-tab", "direction", "raw::Direction", "raw-to-validated"),
+    ("move-pane-with-direction", "direction", "raw::Direction", "raw-to-validated"),
+    ("move-pane-with-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("move-pane-with-pane-id-in-direction", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("move-pane-with-pane-id-in-direction", "direction", "raw::Direction", "raw-to-validated"),
+    ("new-tab", "name", "Option < String >", "raw-to-validated"),
+    ("new-tab", "cwd", "Option < String >", "raw-to-validated"),
+    ("new-tab-unfocused", "name", "Option < String >", "raw-to-validated"),
+    ("new-tab-unfocused", "cwd", "Option < String >", "raw-to-validated"),
+    ("new-tabs-with-layout", "layout", "String", "raw-to-validated"),
+    ("new-tabs-with-layout-info", "layout-info", "raw::LayoutInfo", "raw-to-validated"),
+    ("new-tiled-pane-in-tab", "tab-position", "usize", "raw-to-validated"),
+    ("open-command-pane", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-command-pane-background", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane-background", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-command-pane-floating", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane-floating", "coordinates", "Option < raw::FloatingPaneCoordinates >", "raw-to-validated"),
+    ("open-command-pane-floating", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-command-pane-floating-near-plugin", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane-floating-near-plugin", "coordinates", "Option < raw::FloatingPaneCoordinates >", "raw-to-validated"),
+    ("open-command-pane-floating-near-plugin", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-command-pane-in-new-tab", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane-in-new-tab", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-command-pane-in-place", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane-in-place", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-command-pane-in-place-of-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("open-command-pane-in-place-of-pane-id", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane-in-place-of-pane-id", "close-replaced-pane", "bool", "raw-to-validated"),
+    ("open-command-pane-in-place-of-pane-id", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-command-pane-in-place-of-plugin", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane-in-place-of-plugin", "close-plugin-after-replace", "bool", "raw-to-validated"),
+    ("open-command-pane-in-place-of-plugin", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-command-pane-near-plugin", "command-to-run", "raw::CommandToRun", "raw-to-validated"),
+    ("open-command-pane-near-plugin", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-edit-pane-in-place-of-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("open-edit-pane-in-place-of-pane-id", "file-to-open", "raw::FileToOpen", "raw-to-validated"),
+    ("open-edit-pane-in-place-of-pane-id", "close-replaced-pane", "bool", "raw-to-validated"),
+    ("open-edit-pane-in-place-of-pane-id", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-editor-pane-in-new-tab", "file-to-open", "raw::FileToOpen", "raw-to-validated"),
+    ("open-editor-pane-in-new-tab", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-file", "file-to-open", "raw::FileToOpen", "raw-to-validated"),
+    ("open-file", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-file-floating", "file-to-open", "raw::FileToOpen", "raw-to-validated"),
+    ("open-file-floating", "coordinates", "Option < raw::FloatingPaneCoordinates >", "raw-to-validated"),
+    ("open-file-floating", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-file-floating-near-plugin", "file-to-open", "raw::FileToOpen", "raw-to-validated"),
+    ("open-file-floating-near-plugin", "coordinates", "Option < raw::FloatingPaneCoordinates >", "raw-to-validated"),
+    ("open-file-floating-near-plugin", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-file-in-place", "file-to-open", "raw::FileToOpen", "raw-to-validated"),
+    ("open-file-in-place", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-file-in-place-of-plugin", "file-to-open", "raw::FileToOpen", "raw-to-validated"),
+    ("open-file-in-place-of-plugin", "close-plugin-after-replace", "bool", "raw-to-validated"),
+    ("open-file-in-place-of-plugin", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-file-near-plugin", "file-to-open", "raw::FileToOpen", "raw-to-validated"),
+    ("open-file-near-plugin", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-plugin-pane-floating", "plugin-url", "String", "raw-to-validated"),
+    ("open-plugin-pane-floating", "configuration", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-plugin-pane-floating", "coordinates", "Option < raw::FloatingPaneCoordinates >", "raw-to-validated"),
+    ("open-plugin-pane-floating", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-plugin-pane-in-new-tab", "plugin-url", "String", "raw-to-validated"),
+    ("open-plugin-pane-in-new-tab", "configuration", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-plugin-pane-in-new-tab", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("open-terminal", "path", "std::path::PathBuf", "raw-to-validated"),
+    ("open-terminal-floating", "path", "std::path::PathBuf", "raw-to-validated"),
+    ("open-terminal-floating", "coordinates", "Option < raw::FloatingPaneCoordinates >", "raw-to-validated"),
+    ("open-terminal-floating-near-plugin", "path", "std::path::PathBuf", "raw-to-validated"),
+    ("open-terminal-floating-near-plugin", "coordinates", "Option < raw::FloatingPaneCoordinates >", "raw-to-validated"),
+    ("open-terminal-in-place", "path", "std::path::PathBuf", "raw-to-validated"),
+    ("open-terminal-in-place-of-plugin", "path", "std::path::PathBuf", "raw-to-validated"),
+    ("open-terminal-in-place-of-plugin", "close-plugin-after-replace", "bool", "raw-to-validated"),
+    ("open-terminal-near-plugin", "path", "std::path::PathBuf", "raw-to-validated"),
+    ("open-terminal-pane-in-place-of-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("open-terminal-pane-in-place-of-pane-id", "cwd", "std::path::PathBuf", "raw-to-validated"),
+    ("open-terminal-pane-in-place-of-pane-id", "close-replaced-pane", "bool", "raw-to-validated"),
+    ("override-layout", "layout-info", "raw::LayoutInfo", "raw-to-validated"),
+    ("override-layout", "retain-existing-terminal-panes", "bool", "raw-to-validated"),
+    ("override-layout", "retain-existing-plugin-panes", "bool", "raw-to-validated"),
+    ("override-layout", "apply-only-to-active-tab", "bool", "raw-to-validated"),
+    ("override-layout", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("page-scroll-down-in-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("page-scroll-up-in-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("rebind-keys", "keys-to-unbind", "Vec < (raw::InputMode, raw::KeyWithModifier) >", "raw-to-validated"),
+    ("rebind-keys", "keys-to-rebind", "Vec < (raw::InputMode, raw::KeyWithModifier, Vec < raw::Action >) >", "raw-to-validated"),
+    ("rebind-keys", "write-config-to-disk", "bool", "raw-to-validated"),
+    ("reconfigure", "new-config", "String", "raw-to-validated"),
+    ("reconfigure", "save-configuration-file", "bool", "raw-to-validated"),
+    ("rename-layout", "old-layout-name", "String", "raw-to-validated"),
+    ("rename-layout", "new-layout-name", "String", "raw-to-validated"),
+    ("rename-pane-with-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("rename-pane-with-id", "new-name", "String", "raw-to-validated"),
+    ("rename-plugin-pane", "plugin-pane-id", "u32", "raw-to-validated"),
+    ("rename-plugin-pane", "new-name", "String", "raw-to-validated"),
+    ("rename-session", "name", "String", "raw-to-validated"),
+    ("rename-tab", "tab-position", "u32", "raw-to-validated"),
+    ("rename-tab", "new-name", "String", "raw-to-validated"),
+    ("rename-tab-with-id", "tab-id", "u64", "raw-to-validated"),
+    ("rename-tab-with-id", "new-name", "String", "raw-to-validated"),
+    ("rename-terminal-pane", "terminal-pane-id", "u32", "raw-to-validated"),
+    ("rename-terminal-pane", "new-name", "String", "raw-to-validated"),
+    ("replace-pane-with-existing-pane", "pane-id-to-replace", "raw::PaneId", "raw-to-validated"),
+    ("replace-pane-with-existing-pane", "existing-pane-id", "raw::PaneId", "raw-to-validated"),
+    ("replace-pane-with-existing-pane", "suppress-replaced-pane", "bool", "raw-to-validated"),
+    ("rerun-command-pane", "terminal-pane-id", "u32", "raw-to-validated"),
+    ("resize-focused-pane", "resize", "raw::Resize", "raw-to-validated"),
+    ("resize-focused-pane-with-direction", "resize", "raw::Resize", "raw-to-validated"),
+    ("resize-focused-pane-with-direction", "direction", "raw::Direction", "raw-to-validated"),
+    ("resize-pane-with-id", "resize-strategy", "raw::ResizeStrategy", "raw-to-validated"),
+    ("resize-pane-with-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("run-action", "action", "raw::Action", "raw-to-validated"),
+    ("run-action", "context", "Vec < raw::MapEntry < String, String > >", "raw-to-validated"),
+    ("save-layout", "layout-name", "String", "raw-to-validated"),
+    ("save-layout", "layout-kdl", "String", "raw-to-validated"),
+    ("save-layout", "overwrite", "bool", "raw-to-validated"),
+    ("scroll-down-in-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("scroll-to-bottom-in-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("scroll-to-top-in-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("scroll-up-in-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("send-sigint-to-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("send-sigkill-to-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("set-floating-pane-pinned", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("set-floating-pane-pinned", "should-be-pinned", "bool", "raw-to-validated"),
+    ("set-pane-borderless", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("set-pane-borderless", "borderless", "bool", "raw-to-validated"),
+    ("set-pane-color", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("set-pane-color", "fg", "Option < String >", "raw-to-validated"),
+    ("set-pane-color", "bg", "Option < String >", "raw-to-validated"),
+    ("set-pane-frame-style", "pane-frame-style", "raw::PaneFrameStyle", "raw-to-validated"),
+    ("set-pane-regex-highlights", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("set-pane-regex-highlights", "highlights", "Vec < raw::RegexHighlight >", "raw-to-validated"),
+    ("set-selectable", "selectable", "bool", "raw-to-validated"),
+    ("set-self-mouse-selection-support", "selection-support", "bool", "raw-to-validated"),
+    ("set-soft-keyboard", "on", "bool", "raw-to-validated"),
+    ("show-cursor", "cursor-position", "Option < (usize, usize) >", "raw-to-validated"),
+    ("show-floating-panes", "tab-id", "Option < usize >", "raw-to-validated"),
+    ("show-pane-with-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("show-pane-with-id", "should-float-if-hidden", "bool", "raw-to-validated"),
+    ("show-pane-with-id", "should-focus-pane", "bool", "raw-to-validated"),
+    ("show-self", "should-float-if-hidden", "bool", "raw-to-validated"),
+    ("stack-panes", "pane-ids", "Vec < raw::PaneId >", "raw-to-validated"),
+    ("switch-session", "name", "Option < String >", "raw-to-validated"),
+    ("switch-session-with-cwd", "name", "Option < String >", "raw-to-validated"),
+    ("switch-session-with-cwd", "cwd", "Option < std::path::PathBuf >", "raw-to-validated"),
+    ("switch-session-with-focus", "name", "String", "raw-to-validated"),
+    ("switch-session-with-focus", "tab-position", "Option < usize >", "raw-to-validated"),
+    ("switch-session-with-focus", "pane-id", "Option < (u32, bool) >", "raw-to-validated"),
+    ("switch-session-with-layout", "name", "Option < String >", "raw-to-validated"),
+    ("switch-session-with-layout", "layout", "raw::LayoutInfo", "raw-to-validated"),
+    ("switch-session-with-layout", "cwd", "Option < std::path::PathBuf >", "raw-to-validated"),
+    ("switch-tab-to", "tab-idx", "u32", "raw-to-validated"),
+    ("toggle-floating-panes", "tab-id", "Option < u64 >", "raw-to-validated"),
+    ("toggle-pane-borderless", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("toggle-pane-embed-or-eject-for-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("toggle-pane-id-fullscreen", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("write", "bytes", "Vec < u8 >", "raw-to-validated"),
+    ("write-chars", "chars", "String", "raw-to-validated"),
+    ("write-chars-to-pane-id", "chars", "String", "raw-to-validated"),
+    ("write-chars-to-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("write-to-pane-id", "bytes", "Vec < u8 >", "raw-to-validated"),
+    ("write-to-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
+];
+
+pub const NATIVE_ZELLIJ_COMMAND_CONVERTER_HOLES: &[(&str, &str, &str)] = &[];
+
+pub mod raw {
+    use std::{collections::BTreeSet, path::PathBuf};
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MapEntry<K, V> { pub key: K, pub value: V }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum Action {
         Quit,
         Write {
@@ -923,7 +1300,7 @@ pub mod raw {
         SwitchSession {
             name: String,
             tab_position: Option < usize >,
-            pane_id: Option < (u32 , bool) >,
+            pane_id: Option < (u32, bool) >,
             layout: Option < LayoutInfo >,
             cwd: Option < PathBuf >,
         },
@@ -1053,9 +1430,9 @@ pub mod raw {
             pipe_id: String,
             name: Option < String >,
             payload: Option < String >,
-            args: Option < BTreeMap < String , String > >,
+            args: Option < Vec < MapEntry < String, String > > >,
             plugin: Option < String >,
-            configuration: Option < BTreeMap < String , String > >,
+            configuration: Option < Vec < MapEntry < String, String > > >,
             launch_new: bool,
             skip_cache: bool,
             floating: Option < bool >,
@@ -1066,10 +1443,10 @@ pub mod raw {
         KeybindPipe {
             name: Option < String >,
             payload: Option < String >,
-            args: Option < BTreeMap < String , String > >,
+            args: Option < Vec < MapEntry < String, String > > >,
             plugin: Option < String >,
             plugin_id: Option < u32 >,
-            configuration: Option < BTreeMap < String , String > >,
+            configuration: Option < Vec < MapEntry < String, String > > >,
             launch_new: bool,
             skip_cache: bool,
             floating: Option < bool >,
@@ -1203,7 +1580,7 @@ pub mod raw {
         },
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, PartialOrd, Ord)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
     pub enum BareKey {
         PageDown,
         PageUp,
@@ -1231,19 +1608,26 @@ pub mod raw {
 
     pub type ClientId = u16;
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Column(pub usize, );
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum CommandOrPlugin {
         Command(RunCommandAction, ),
         Plugin(RunPluginOrAlias, ),
         File(FileToOpen, ),
     }
 
-    pub type Context = BTreeMap < String , String >;
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CommandToRun {
+        pub path: PathBuf,
+        pub args: Vec < String >,
+        pub cwd: Option < PathBuf >,
+    }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, PartialOrd, Ord)]
+    pub type Context = Vec < MapEntry < String, String > >;
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
     pub enum Direction {
         Left,
         Right,
@@ -1251,14 +1635,14 @@ pub mod raw {
         Down,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct FileToOpen {
         pub path: PathBuf,
         pub line_number: Option < usize >,
         pub cwd: Option < PathBuf >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct FloatingPaneCoordinates {
         pub x: Option < PercentOrFixed >,
         pub y: Option < PercentOrFixed >,
@@ -1268,7 +1652,7 @@ pub mod raw {
         pub borderless: Option < bool >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct FloatingPaneLayout {
         pub name: Option < String >,
         pub height: Option < PercentOrFixed >,
@@ -1286,7 +1670,35 @@ pub mod raw {
         pub default_bg: Option < String >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, PartialOrd, Ord)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
+    pub enum HighlightLayer {
+        Hint,
+        Tool,
+        ActionFeedback,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum HighlightStyle {
+        None,
+        Emphasis0,
+        Emphasis1,
+        Emphasis2,
+        Emphasis3,
+        BackgroundEmphasis0,
+        BackgroundEmphasis1,
+        BackgroundEmphasis2,
+        BackgroundEmphasis3,
+        CustomRgb {
+            fg: Option < (u8, u8, u8) >,
+            bg: Option < (u8, u8, u8) >,
+        },
+        CustomIndex {
+            fg: Option < u8 >,
+            bg: Option < u8 >,
+        },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
     pub enum InputMode {
         # [serde (alias = "normal")]
         Normal,
@@ -1318,7 +1730,7 @@ pub mod raw {
         Tmux,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, PartialOrd, Ord)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
     pub enum KeyModifier {
         Ctrl,
         Alt,
@@ -1326,13 +1738,13 @@ pub mod raw {
         Super,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, PartialOrd, Ord)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
     pub struct KeyWithModifier {
         pub bare_key: BareKey,
         pub key_modifiers: BTreeSet < KeyModifier >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, PartialOrd, Ord)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
     pub enum LayoutConstraint {
         MaxPanes(usize, ),
         MinPanes(usize, ),
@@ -1340,7 +1752,7 @@ pub mod raw {
         NoConstraint,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum LayoutInfo {
         BuiltIn(String, ),
         File(String, LayoutMetadata, ),
@@ -1348,17 +1760,17 @@ pub mod raw {
         Stringified(String, ),
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct LayoutMetadata {
         pub tabs: Vec < TabMetadata >,
         pub creation_time: String,
         pub update_time: String,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Line(pub isize, );
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct MouseEvent {
         pub event_type: MouseEventType,
         pub left: bool,
@@ -1376,14 +1788,14 @@ pub mod raw {
         pub position: Position,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum MouseEventType {
         Press,
         Release,
         Motion,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum NewPanePlacement {
         NoPreference {
             borderless: Option < bool >,
@@ -1404,7 +1816,7 @@ pub mod raw {
         },
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct OpenFilePayload {
         pub path: PathBuf,
         pub line_number: Option < usize >,
@@ -1412,14 +1824,14 @@ pub mod raw {
         pub originating_plugin: Option < OriginatingPlugin >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct OriginatingPlugin {
         pub plugin_id: u32,
         pub client_id: ClientId,
         pub context: Context,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     # [serde (rename_all = "lowercase")]
     pub enum PaneFrameStyle {
         Full,
@@ -1427,26 +1839,26 @@ pub mod raw {
         None,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, PartialOrd, Ord)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
     pub enum PaneId {
         Terminal(u32, ),
         Plugin(u32, ),
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PaneMetadata {
         pub name: Option < String >,
         pub is_plugin: bool,
         pub is_builtin_plugin: bool,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum PercentOrFixed {
         Percent(usize, ),
         Fixed(usize, ),
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PluginAlias {
         pub name: String,
         pub configuration: Option < PluginUserConfiguration >,
@@ -1454,25 +1866,45 @@ pub mod raw {
         pub run_plugin: Option < RunPlugin >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, PartialOrd, Ord)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
     pub struct PluginTag(pub String, );
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-    pub struct PluginUserConfiguration(pub BTreeMap < String , String >, );
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PluginUserConfiguration(pub Vec < MapEntry < String, String > >, );
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Position {
         pub line: Line,
         pub column: Column,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RegexHighlight {
+        pub pattern: String,
+        pub style: HighlightStyle,
+        pub layer: HighlightLayer,
+        pub context: Vec < MapEntry < String, String > >,
+        pub on_hover: bool,
+        pub bold: bool,
+        pub italic: bool,
+        pub underline: bool,
+        pub tooltip_text: Option < String >,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum Resize {
         Increase,
         Decrease,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResizeStrategy {
+        pub resize: Resize,
+        pub direction: Option < Direction >,
+        pub invert_on_boundaries: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum Run {
         # [serde (rename = "plugin")]
         Plugin(RunPluginOrAlias, ),
@@ -1482,7 +1914,7 @@ pub mod raw {
         Cwd(PathBuf, ),
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RunCommand {
         # [serde (alias = "cmd")]
         pub command: PathBuf,
@@ -1500,7 +1932,7 @@ pub mod raw {
         pub use_terminal_title: bool,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RunCommandAction {
         # [serde (rename = "cmd")]
         pub command: PathBuf,
@@ -1520,7 +1952,7 @@ pub mod raw {
         pub use_terminal_title: bool,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RunPlugin {
         # [serde (default)]
         pub _allow_exec_host_cmd: bool,
@@ -1529,39 +1961,39 @@ pub mod raw {
         pub initial_cwd: Option < PathBuf >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum RunPluginLocation {
         File(PathBuf, ),
         Zellij(PluginTag, ),
         Remote(String, ),
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum RunPluginOrAlias {
         RunPlugin(RunPlugin, ),
         Alias(PluginAlias, ),
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum SearchDirection {
         Down,
         Up,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum SearchOption {
         CaseSensitivity,
         WholeWord,
         Wrap,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum SplitDirection {
         Horizontal,
         Vertical,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum SplitSize {
         # [serde (alias = "percent")]
         Percent(usize, ),
@@ -1569,11 +2001,11 @@ pub mod raw {
         Fixed(usize, ),
     }
 
-    pub type SwapFloatingLayout = (BTreeMap < LayoutConstraint , Vec < FloatingPaneLayout > > , Option < String > ,);
+    pub type SwapFloatingLayout = (Vec < MapEntry < LayoutConstraint, Vec < FloatingPaneLayout > > >, Option < String >);
 
-    pub type SwapTiledLayout = (BTreeMap < LayoutConstraint , TiledPaneLayout > , Option < String >);
+    pub type SwapTiledLayout = (Vec < MapEntry < LayoutConstraint, TiledPaneLayout > >, Option < String >);
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct TabLayoutInfo {
         pub tab_index: usize,
         pub tab_name: Option < String >,
@@ -1583,13 +2015,13 @@ pub mod raw {
         pub swap_floating_layouts: Option < Vec < SwapFloatingLayout > >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct TabMetadata {
         pub panes: Vec < PaneMetadata >,
         pub name: Option < String >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct TiledPaneLayout {
         pub children_split_direction: SplitDirection,
         pub name: Option < String >,
@@ -1609,7 +2041,7 @@ pub mod raw {
         pub default_bg: Option < String >,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum UnblockCondition {
         OnExitSuccess,
         OnExitFailure,
@@ -1825,7 +2257,7 @@ pub mod validated {
         SwitchSession {
             name: String,
             tab_position: Option < usize >,
-            pane_id: Option < (u32 , bool) >,
+            pane_id: Option < (u32, bool) >,
             layout: Option < LayoutInfo >,
             cwd: Option < PathBuf >,
         },
@@ -1955,9 +2387,9 @@ pub mod validated {
             pipe_id: String,
             name: Option < String >,
             payload: Option < String >,
-            args: Option < BTreeMap < String , String > >,
+            args: Option < BTreeMap < String, String > >,
             plugin: Option < String >,
-            configuration: Option < BTreeMap < String , String > >,
+            configuration: Option < BTreeMap < String, String > >,
             launch_new: bool,
             skip_cache: bool,
             floating: Option < bool >,
@@ -1968,10 +2400,10 @@ pub mod validated {
         KeybindPipe {
             name: Option < String >,
             payload: Option < String >,
-            args: Option < BTreeMap < String , String > >,
+            args: Option < BTreeMap < String, String > >,
             plugin: Option < String >,
             plugin_id: Option < u32 >,
-            configuration: Option < BTreeMap < String , String > >,
+            configuration: Option < BTreeMap < String, String > >,
             launch_new: bool,
             skip_cache: bool,
             floating: Option < bool >,
@@ -2143,7 +2575,14 @@ pub mod validated {
         File(FileToOpen, ),
     }
 
-    pub type Context = BTreeMap < String , String >;
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+    pub struct CommandToRun {
+        pub path: PathBuf,
+        pub args: Vec < String >,
+        pub cwd: Option < PathBuf >,
+    }
+
+    pub type Context = BTreeMap < String, String >;
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, PartialOrd, Ord)]
     pub enum Direction {
@@ -2186,6 +2625,34 @@ pub mod validated {
         pub logical_position: Option < usize >,
         pub default_fg: Option < String >,
         pub default_bg: Option < String >,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, PartialOrd, Ord)]
+    pub enum HighlightLayer {
+        Hint,
+        Tool,
+        ActionFeedback,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+    pub enum HighlightStyle {
+        None,
+        Emphasis0,
+        Emphasis1,
+        Emphasis2,
+        Emphasis3,
+        BackgroundEmphasis0,
+        BackgroundEmphasis1,
+        BackgroundEmphasis2,
+        BackgroundEmphasis3,
+        CustomRgb {
+            fg: Option < (u8, u8, u8) >,
+            bg: Option < (u8, u8, u8) >,
+        },
+        CustomIndex {
+            fg: Option < u8 >,
+            bg: Option < u8 >,
+        },
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, PartialOrd, Ord)]
@@ -2360,7 +2827,7 @@ pub mod validated {
     pub struct PluginTag(pub String, );
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-    pub struct PluginUserConfiguration(pub BTreeMap < String , String >, );
+    pub struct PluginUserConfiguration(pub BTreeMap < String, String >, );
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
     pub struct Position {
@@ -2369,9 +2836,29 @@ pub mod validated {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+    pub struct RegexHighlight {
+        pub pattern: String,
+        pub style: HighlightStyle,
+        pub layer: HighlightLayer,
+        pub context: BTreeMap < String, String >,
+        pub on_hover: bool,
+        pub bold: bool,
+        pub italic: bool,
+        pub underline: bool,
+        pub tooltip_text: Option < String >,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
     pub enum Resize {
         Increase,
         Decrease,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+    pub struct ResizeStrategy {
+        pub resize: Resize,
+        pub direction: Option < Direction >,
+        pub invert_on_boundaries: bool,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -2471,9 +2958,9 @@ pub mod validated {
         Fixed(usize, ),
     }
 
-    pub type SwapFloatingLayout = (BTreeMap < LayoutConstraint , Vec < FloatingPaneLayout > > , Option < String > ,);
+    pub type SwapFloatingLayout = (BTreeMap < LayoutConstraint, Vec < FloatingPaneLayout > >, Option < String >);
 
-    pub type SwapTiledLayout = (BTreeMap < LayoutConstraint , TiledPaneLayout > , Option < String >);
+    pub type SwapTiledLayout = (BTreeMap < LayoutConstraint, TiledPaneLayout >, Option < String >);
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
     pub struct TabLayoutInfo {
@@ -2527,6 +3014,2260 @@ pub struct ValidationError { pub type_name: &'static str, pub field: &'static st
 impl ValidationError { fn new(type_name: &'static str, field: &'static str, message: impl Into<String>) -> Self { Self { type_name, field, message: message.into() } } }
 impl std::fmt::Display for ValidationError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}::{}: {}", self.type_name, self.field, self.message) } }
 impl std::error::Error for ValidationError {}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "command", content = "arguments", rename_all = "kebab-case", rename_all_fields = "kebab-case")]
+pub enum RawNativeCommand {
+    BreakPanesToNewTab {
+        pane_ids: Vec < raw::PaneId >,
+        new_tab_name: Option < String >,
+        should_change_focus_to_new_tab: bool,
+    },
+    BreakPanesToTabWithId {
+        pane_ids: Vec < raw::PaneId >,
+        tab_id: usize,
+        should_change_focus_to_target_tab: bool,
+    },
+    BreakPanesToTabWithIndex {
+        pane_ids: Vec < raw::PaneId >,
+        tab_index: usize,
+        should_change_focus_to_new_tab: bool,
+    },
+    ChangeFloatingPanesCoordinates {
+        pane_ids_and_coordinates: Vec < (raw::PaneId, raw::FloatingPaneCoordinates) >,
+    },
+    ChangeHostFolder {
+        new_host_folder: std::path::PathBuf,
+    },
+    ClearPaneHighlights {
+        pane_id: raw::PaneId,
+    },
+    ClearScreen,
+    ClearScreenForPaneId {
+        pane_id: raw::PaneId,
+    },
+    CloseFocus,
+    CloseFocusedTab,
+    CloseMultiplePanes {
+        pane_ids: Vec < raw::PaneId >,
+    },
+    ClosePaneWithId {
+        pane_id: raw::PaneId,
+    },
+    ClosePluginPane {
+        plugin_pane_id: u32,
+    },
+    CloseSelf,
+    CloseTabWithId {
+        tab_id: u64,
+    },
+    CloseTabWithIndex {
+        tab_index: usize,
+    },
+    CloseTerminalPane {
+        terminal_pane_id: u32,
+    },
+    CopyToClipboard {
+        text: String,
+    },
+    DeleteAllDeadSessions,
+    DeleteDeadSession {
+        name: String,
+    },
+    DeleteLayout {
+        layout_name: String,
+    },
+    Detach,
+    DisconnectOtherClients,
+    EditLayout {
+        layout_name: String,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    EditScrollback,
+    EditScrollbackForPaneWithId {
+        pane_id: raw::PaneId,
+    },
+    EmbedMultiplePanes {
+        pane_ids: Vec < raw::PaneId >,
+    },
+    FloatMultiplePanes {
+        pane_ids: Vec < raw::PaneId >,
+    },
+    FocusHostSession,
+    FocusLastPane,
+    FocusNextPane,
+    FocusOrCreateTab {
+        tab_name: String,
+    },
+    FocusPaneWithId {
+        pane_id: raw::PaneId,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    FocusPluginPane {
+        plugin_pane_id: u32,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    FocusPreviousPane,
+    FocusTerminalPane {
+        terminal_pane_id: u32,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    GoToNextTab,
+    GoToPreviousTab,
+    GoToTab {
+        tab_index: u32,
+    },
+    GoToTabName {
+        tab_name: String,
+    },
+    GroupAndUngroupPanes {
+        pane_ids_to_group: Vec < raw::PaneId >,
+        pane_ids_to_ungroup: Vec < raw::PaneId >,
+        for_all_clients: bool,
+    },
+    HideFloatingPanes {
+        tab_id: Option < usize >,
+    },
+    HidePaneWithId {
+        pane_id: raw::PaneId,
+    },
+    HideSelf,
+    HighlightAndUnhighlightPanes {
+        pane_ids_to_highlight: Vec < raw::PaneId >,
+        pane_ids_to_unhighlight: Vec < raw::PaneId >,
+    },
+    KillSessions {
+        session_names: Vec < String >,
+    },
+    MoveFocus {
+        direction: raw::Direction,
+    },
+    MoveFocusOrTab {
+        direction: raw::Direction,
+    },
+    MovePane,
+    MovePaneWithDirection {
+        direction: raw::Direction,
+    },
+    MovePaneWithPaneId {
+        pane_id: raw::PaneId,
+    },
+    MovePaneWithPaneIdInDirection {
+        pane_id: raw::PaneId,
+        direction: raw::Direction,
+    },
+    NewPane,
+    NewTab {
+        name: Option < String >,
+        cwd: Option < String >,
+    },
+    NewTabUnfocused {
+        name: Option < String >,
+        cwd: Option < String >,
+    },
+    NewTabsWithLayout {
+        layout: String,
+    },
+    NewTabsWithLayoutInfo {
+        layout_info: raw::LayoutInfo,
+    },
+    NewTiledPaneInTab {
+        tab_position: usize,
+    },
+    NextSwapLayout,
+    OpenCommandPane {
+        command_to_run: raw::CommandToRun,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenCommandPaneBackground {
+        command_to_run: raw::CommandToRun,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenCommandPaneFloating {
+        command_to_run: raw::CommandToRun,
+        coordinates: Option < raw::FloatingPaneCoordinates >,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenCommandPaneFloatingNearPlugin {
+        command_to_run: raw::CommandToRun,
+        coordinates: Option < raw::FloatingPaneCoordinates >,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenCommandPaneInNewTab {
+        command_to_run: raw::CommandToRun,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenCommandPaneInPlace {
+        command_to_run: raw::CommandToRun,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenCommandPaneInPlaceOfPaneId {
+        pane_id: raw::PaneId,
+        command_to_run: raw::CommandToRun,
+        close_replaced_pane: bool,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenCommandPaneInPlaceOfPlugin {
+        command_to_run: raw::CommandToRun,
+        close_plugin_after_replace: bool,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenCommandPaneNearPlugin {
+        command_to_run: raw::CommandToRun,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenEditPaneInPlaceOfPaneId {
+        pane_id: raw::PaneId,
+        file_to_open: raw::FileToOpen,
+        close_replaced_pane: bool,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenEditorPaneInNewTab {
+        file_to_open: raw::FileToOpen,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenFile {
+        file_to_open: raw::FileToOpen,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenFileFloating {
+        file_to_open: raw::FileToOpen,
+        coordinates: Option < raw::FloatingPaneCoordinates >,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenFileFloatingNearPlugin {
+        file_to_open: raw::FileToOpen,
+        coordinates: Option < raw::FloatingPaneCoordinates >,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenFileInPlace {
+        file_to_open: raw::FileToOpen,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenFileInPlaceOfPlugin {
+        file_to_open: raw::FileToOpen,
+        close_plugin_after_replace: bool,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenFileNearPlugin {
+        file_to_open: raw::FileToOpen,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenPluginPaneFloating {
+        plugin_url: String,
+        configuration: Vec < raw::MapEntry < String, String > >,
+        coordinates: Option < raw::FloatingPaneCoordinates >,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenPluginPaneInNewTab {
+        plugin_url: String,
+        configuration: Vec < raw::MapEntry < String, String > >,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    OpenTerminal {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalFloating {
+        path: std::path::PathBuf,
+        coordinates: Option < raw::FloatingPaneCoordinates >,
+    },
+    OpenTerminalFloatingNearPlugin {
+        path: std::path::PathBuf,
+        coordinates: Option < raw::FloatingPaneCoordinates >,
+    },
+    OpenTerminalInPlace {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalInPlaceOfPlugin {
+        path: std::path::PathBuf,
+        close_plugin_after_replace: bool,
+    },
+    OpenTerminalNearPlugin {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalPaneInPlaceOfPaneId {
+        pane_id: raw::PaneId,
+        cwd: std::path::PathBuf,
+        close_replaced_pane: bool,
+    },
+    OverrideLayout {
+        layout_info: raw::LayoutInfo,
+        retain_existing_terminal_panes: bool,
+        retain_existing_plugin_panes: bool,
+        apply_only_to_active_tab: bool,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    PageScrollDown,
+    PageScrollDownInPaneId {
+        pane_id: raw::PaneId,
+    },
+    PageScrollUp,
+    PageScrollUpInPaneId {
+        pane_id: raw::PaneId,
+    },
+    PreviousSwapLayout,
+    QuitZellij,
+    RebindKeys {
+        keys_to_unbind: Vec < (raw::InputMode, raw::KeyWithModifier) >,
+        keys_to_rebind: Vec < (raw::InputMode, raw::KeyWithModifier, Vec < raw::Action >) >,
+        write_config_to_disk: bool,
+    },
+    Reconfigure {
+        new_config: String,
+        save_configuration_file: bool,
+    },
+    RenameLayout {
+        old_layout_name: String,
+        new_layout_name: String,
+    },
+    RenamePaneWithId {
+        pane_id: raw::PaneId,
+        new_name: String,
+    },
+    RenamePluginPane {
+        plugin_pane_id: u32,
+        new_name: String,
+    },
+    RenameSession {
+        name: String,
+    },
+    RenameTab {
+        tab_position: u32,
+        new_name: String,
+    },
+    RenameTabWithId {
+        tab_id: u64,
+        new_name: String,
+    },
+    RenameTerminalPane {
+        terminal_pane_id: u32,
+        new_name: String,
+    },
+    ReplacePaneWithExistingPane {
+        pane_id_to_replace: raw::PaneId,
+        existing_pane_id: raw::PaneId,
+        suppress_replaced_pane: bool,
+    },
+    RerunCommandPane {
+        terminal_pane_id: u32,
+    },
+    ResizeFocusedPane {
+        resize: raw::Resize,
+    },
+    ResizeFocusedPaneWithDirection {
+        resize: raw::Resize,
+        direction: raw::Direction,
+    },
+    ResizePaneWithId {
+        resize_strategy: raw::ResizeStrategy,
+        pane_id: raw::PaneId,
+    },
+    RunAction {
+        action: raw::Action,
+        context: Vec < raw::MapEntry < String, String > >,
+    },
+    SaveLayout {
+        layout_name: String,
+        layout_kdl: String,
+        overwrite: bool,
+    },
+    SaveSession,
+    ScrollDown,
+    ScrollDownInPaneId {
+        pane_id: raw::PaneId,
+    },
+    ScrollToBottom,
+    ScrollToBottomInPaneId {
+        pane_id: raw::PaneId,
+    },
+    ScrollToTop,
+    ScrollToTopInPaneId {
+        pane_id: raw::PaneId,
+    },
+    ScrollUp,
+    ScrollUpInPaneId {
+        pane_id: raw::PaneId,
+    },
+    SendSigintToPaneId {
+        pane_id: raw::PaneId,
+    },
+    SendSigkillToPaneId {
+        pane_id: raw::PaneId,
+    },
+    SetFloatingPanePinned {
+        pane_id: raw::PaneId,
+        should_be_pinned: bool,
+    },
+    SetPaneBorderless {
+        pane_id: raw::PaneId,
+        borderless: bool,
+    },
+    SetPaneColor {
+        pane_id: raw::PaneId,
+        fg: Option < String >,
+        bg: Option < String >,
+    },
+    SetPaneFrameStyle {
+        pane_frame_style: raw::PaneFrameStyle,
+    },
+    SetPaneRegexHighlights {
+        pane_id: raw::PaneId,
+        highlights: Vec < raw::RegexHighlight >,
+    },
+    SetSelectable {
+        selectable: bool,
+    },
+    SetSelfMouseSelectionSupport {
+        selection_support: bool,
+    },
+    SetSoftKeyboard {
+        on: bool,
+    },
+    ShowCursor {
+        cursor_position: Option < (usize, usize) >,
+    },
+    ShowFloatingPanes {
+        tab_id: Option < usize >,
+    },
+    ShowPaneWithId {
+        pane_id: raw::PaneId,
+        should_float_if_hidden: bool,
+        should_focus_pane: bool,
+    },
+    ShowSelf {
+        should_float_if_hidden: bool,
+    },
+    StackPanes {
+        pane_ids: Vec < raw::PaneId >,
+    },
+    SwitchSession {
+        name: Option < String >,
+    },
+    SwitchSessionWithCwd {
+        name: Option < String >,
+        cwd: Option < std::path::PathBuf >,
+    },
+    SwitchSessionWithFocus {
+        name: String,
+        tab_position: Option < usize >,
+        pane_id: Option < (u32, bool) >,
+    },
+    SwitchSessionWithLayout {
+        name: Option < String >,
+        layout: raw::LayoutInfo,
+        cwd: Option < std::path::PathBuf >,
+    },
+    SwitchTabTo {
+        tab_idx: u32,
+    },
+    ToggleActiveTabSync,
+    ToggleFloatingPanes {
+        tab_id: Option < u64 >,
+    },
+    ToggleFocusFullscreen,
+    ToggleFocusNoUiFullscreen,
+    TogglePaneBorderless {
+        pane_id: raw::PaneId,
+    },
+    TogglePaneEmbedOrEject,
+    TogglePaneEmbedOrEjectForPaneId {
+        pane_id: raw::PaneId,
+    },
+    TogglePaneFrames,
+    TogglePaneIdFullscreen {
+        pane_id: raw::PaneId,
+    },
+    ToggleTab,
+    UndoRenamePane,
+    UndoRenameTab,
+    Write {
+        bytes: Vec < u8 >,
+    },
+    WriteChars {
+        chars: String,
+    },
+    WriteCharsToPaneId {
+        chars: String,
+        pane_id: raw::PaneId,
+    },
+    WriteToPaneId {
+        bytes: Vec < u8 >,
+        pane_id: raw::PaneId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ValidatedNativeCommand {
+    BreakPanesToNewTab {
+        pane_ids: Vec < validated::PaneId >,
+        new_tab_name: Option < String >,
+        should_change_focus_to_new_tab: bool,
+    },
+    BreakPanesToTabWithId {
+        pane_ids: Vec < validated::PaneId >,
+        tab_id: usize,
+        should_change_focus_to_target_tab: bool,
+    },
+    BreakPanesToTabWithIndex {
+        pane_ids: Vec < validated::PaneId >,
+        tab_index: usize,
+        should_change_focus_to_new_tab: bool,
+    },
+    ChangeFloatingPanesCoordinates {
+        pane_ids_and_coordinates: Vec < (validated::PaneId, validated::FloatingPaneCoordinates) >,
+    },
+    ChangeHostFolder {
+        new_host_folder: std::path::PathBuf,
+    },
+    ClearPaneHighlights {
+        pane_id: validated::PaneId,
+    },
+    ClearScreen,
+    ClearScreenForPaneId {
+        pane_id: validated::PaneId,
+    },
+    CloseFocus,
+    CloseFocusedTab,
+    CloseMultiplePanes {
+        pane_ids: Vec < validated::PaneId >,
+    },
+    ClosePaneWithId {
+        pane_id: validated::PaneId,
+    },
+    ClosePluginPane {
+        plugin_pane_id: u32,
+    },
+    CloseSelf,
+    CloseTabWithId {
+        tab_id: u64,
+    },
+    CloseTabWithIndex {
+        tab_index: usize,
+    },
+    CloseTerminalPane {
+        terminal_pane_id: u32,
+    },
+    CopyToClipboard {
+        text: String,
+    },
+    DeleteAllDeadSessions,
+    DeleteDeadSession {
+        name: String,
+    },
+    DeleteLayout {
+        layout_name: String,
+    },
+    Detach,
+    DisconnectOtherClients,
+    EditLayout {
+        layout_name: String,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    EditScrollback,
+    EditScrollbackForPaneWithId {
+        pane_id: validated::PaneId,
+    },
+    EmbedMultiplePanes {
+        pane_ids: Vec < validated::PaneId >,
+    },
+    FloatMultiplePanes {
+        pane_ids: Vec < validated::PaneId >,
+    },
+    FocusHostSession,
+    FocusLastPane,
+    FocusNextPane,
+    FocusOrCreateTab {
+        tab_name: String,
+    },
+    FocusPaneWithId {
+        pane_id: validated::PaneId,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    FocusPluginPane {
+        plugin_pane_id: u32,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    FocusPreviousPane,
+    FocusTerminalPane {
+        terminal_pane_id: u32,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    GoToNextTab,
+    GoToPreviousTab,
+    GoToTab {
+        tab_index: u32,
+    },
+    GoToTabName {
+        tab_name: String,
+    },
+    GroupAndUngroupPanes {
+        pane_ids_to_group: Vec < validated::PaneId >,
+        pane_ids_to_ungroup: Vec < validated::PaneId >,
+        for_all_clients: bool,
+    },
+    HideFloatingPanes {
+        tab_id: Option < usize >,
+    },
+    HidePaneWithId {
+        pane_id: validated::PaneId,
+    },
+    HideSelf,
+    HighlightAndUnhighlightPanes {
+        pane_ids_to_highlight: Vec < validated::PaneId >,
+        pane_ids_to_unhighlight: Vec < validated::PaneId >,
+    },
+    KillSessions {
+        session_names: Vec < String >,
+    },
+    MoveFocus {
+        direction: validated::Direction,
+    },
+    MoveFocusOrTab {
+        direction: validated::Direction,
+    },
+    MovePane,
+    MovePaneWithDirection {
+        direction: validated::Direction,
+    },
+    MovePaneWithPaneId {
+        pane_id: validated::PaneId,
+    },
+    MovePaneWithPaneIdInDirection {
+        pane_id: validated::PaneId,
+        direction: validated::Direction,
+    },
+    NewPane,
+    NewTab {
+        name: Option < String >,
+        cwd: Option < String >,
+    },
+    NewTabUnfocused {
+        name: Option < String >,
+        cwd: Option < String >,
+    },
+    NewTabsWithLayout {
+        layout: String,
+    },
+    NewTabsWithLayoutInfo {
+        layout_info: validated::LayoutInfo,
+    },
+    NewTiledPaneInTab {
+        tab_position: usize,
+    },
+    NextSwapLayout,
+    OpenCommandPane {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneBackground {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneFloating {
+        command_to_run: validated::CommandToRun,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneFloatingNearPlugin {
+        command_to_run: validated::CommandToRun,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneInNewTab {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneInPlace {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneInPlaceOfPaneId {
+        pane_id: validated::PaneId,
+        command_to_run: validated::CommandToRun,
+        close_replaced_pane: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneInPlaceOfPlugin {
+        command_to_run: validated::CommandToRun,
+        close_plugin_after_replace: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneNearPlugin {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenEditPaneInPlaceOfPaneId {
+        pane_id: validated::PaneId,
+        file_to_open: validated::FileToOpen,
+        close_replaced_pane: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenEditorPaneInNewTab {
+        file_to_open: validated::FileToOpen,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFile {
+        file_to_open: validated::FileToOpen,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileFloating {
+        file_to_open: validated::FileToOpen,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileFloatingNearPlugin {
+        file_to_open: validated::FileToOpen,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileInPlace {
+        file_to_open: validated::FileToOpen,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileInPlaceOfPlugin {
+        file_to_open: validated::FileToOpen,
+        close_plugin_after_replace: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileNearPlugin {
+        file_to_open: validated::FileToOpen,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenPluginPaneFloating {
+        plugin_url: String,
+        configuration: std::collections::BTreeMap < String, String >,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenPluginPaneInNewTab {
+        plugin_url: String,
+        configuration: std::collections::BTreeMap < String, String >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenTerminal {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalFloating {
+        path: std::path::PathBuf,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+    },
+    OpenTerminalFloatingNearPlugin {
+        path: std::path::PathBuf,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+    },
+    OpenTerminalInPlace {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalInPlaceOfPlugin {
+        path: std::path::PathBuf,
+        close_plugin_after_replace: bool,
+    },
+    OpenTerminalNearPlugin {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalPaneInPlaceOfPaneId {
+        pane_id: validated::PaneId,
+        cwd: std::path::PathBuf,
+        close_replaced_pane: bool,
+    },
+    OverrideLayout {
+        layout_info: validated::LayoutInfo,
+        retain_existing_terminal_panes: bool,
+        retain_existing_plugin_panes: bool,
+        apply_only_to_active_tab: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    PageScrollDown,
+    PageScrollDownInPaneId {
+        pane_id: validated::PaneId,
+    },
+    PageScrollUp,
+    PageScrollUpInPaneId {
+        pane_id: validated::PaneId,
+    },
+    PreviousSwapLayout,
+    QuitZellij,
+    RebindKeys {
+        keys_to_unbind: Vec < (validated::InputMode, validated::KeyWithModifier) >,
+        keys_to_rebind: Vec < (validated::InputMode, validated::KeyWithModifier, Vec < validated::Action >) >,
+        write_config_to_disk: bool,
+    },
+    Reconfigure {
+        new_config: String,
+        save_configuration_file: bool,
+    },
+    RenameLayout {
+        old_layout_name: String,
+        new_layout_name: String,
+    },
+    RenamePaneWithId {
+        pane_id: validated::PaneId,
+        new_name: String,
+    },
+    RenamePluginPane {
+        plugin_pane_id: u32,
+        new_name: String,
+    },
+    RenameSession {
+        name: String,
+    },
+    RenameTab {
+        tab_position: u32,
+        new_name: String,
+    },
+    RenameTabWithId {
+        tab_id: u64,
+        new_name: String,
+    },
+    RenameTerminalPane {
+        terminal_pane_id: u32,
+        new_name: String,
+    },
+    ReplacePaneWithExistingPane {
+        pane_id_to_replace: validated::PaneId,
+        existing_pane_id: validated::PaneId,
+        suppress_replaced_pane: bool,
+    },
+    RerunCommandPane {
+        terminal_pane_id: u32,
+    },
+    ResizeFocusedPane {
+        resize: validated::Resize,
+    },
+    ResizeFocusedPaneWithDirection {
+        resize: validated::Resize,
+        direction: validated::Direction,
+    },
+    ResizePaneWithId {
+        resize_strategy: validated::ResizeStrategy,
+        pane_id: validated::PaneId,
+    },
+    RunAction {
+        action: validated::Action,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    SaveLayout {
+        layout_name: String,
+        layout_kdl: String,
+        overwrite: bool,
+    },
+    SaveSession,
+    ScrollDown,
+    ScrollDownInPaneId {
+        pane_id: validated::PaneId,
+    },
+    ScrollToBottom,
+    ScrollToBottomInPaneId {
+        pane_id: validated::PaneId,
+    },
+    ScrollToTop,
+    ScrollToTopInPaneId {
+        pane_id: validated::PaneId,
+    },
+    ScrollUp,
+    ScrollUpInPaneId {
+        pane_id: validated::PaneId,
+    },
+    SendSigintToPaneId {
+        pane_id: validated::PaneId,
+    },
+    SendSigkillToPaneId {
+        pane_id: validated::PaneId,
+    },
+    SetFloatingPanePinned {
+        pane_id: validated::PaneId,
+        should_be_pinned: bool,
+    },
+    SetPaneBorderless {
+        pane_id: validated::PaneId,
+        borderless: bool,
+    },
+    SetPaneColor {
+        pane_id: validated::PaneId,
+        fg: Option < String >,
+        bg: Option < String >,
+    },
+    SetPaneFrameStyle {
+        pane_frame_style: validated::PaneFrameStyle,
+    },
+    SetPaneRegexHighlights {
+        pane_id: validated::PaneId,
+        highlights: Vec < validated::RegexHighlight >,
+    },
+    SetSelectable {
+        selectable: bool,
+    },
+    SetSelfMouseSelectionSupport {
+        selection_support: bool,
+    },
+    SetSoftKeyboard {
+        on: bool,
+    },
+    ShowCursor {
+        cursor_position: Option < (usize, usize) >,
+    },
+    ShowFloatingPanes {
+        tab_id: Option < usize >,
+    },
+    ShowPaneWithId {
+        pane_id: validated::PaneId,
+        should_float_if_hidden: bool,
+        should_focus_pane: bool,
+    },
+    ShowSelf {
+        should_float_if_hidden: bool,
+    },
+    StackPanes {
+        pane_ids: Vec < validated::PaneId >,
+    },
+    SwitchSession {
+        name: Option < String >,
+    },
+    SwitchSessionWithCwd {
+        name: Option < String >,
+        cwd: Option < std::path::PathBuf >,
+    },
+    SwitchSessionWithFocus {
+        name: String,
+        tab_position: Option < usize >,
+        pane_id: Option < (u32, bool) >,
+    },
+    SwitchSessionWithLayout {
+        name: Option < String >,
+        layout: validated::LayoutInfo,
+        cwd: Option < std::path::PathBuf >,
+    },
+    SwitchTabTo {
+        tab_idx: u32,
+    },
+    ToggleActiveTabSync,
+    ToggleFloatingPanes {
+        tab_id: Option < u64 >,
+    },
+    ToggleFocusFullscreen,
+    ToggleFocusNoUiFullscreen,
+    TogglePaneBorderless {
+        pane_id: validated::PaneId,
+    },
+    TogglePaneEmbedOrEject,
+    TogglePaneEmbedOrEjectForPaneId {
+        pane_id: validated::PaneId,
+    },
+    TogglePaneFrames,
+    TogglePaneIdFullscreen {
+        pane_id: validated::PaneId,
+    },
+    ToggleTab,
+    UndoRenamePane,
+    UndoRenameTab,
+    Write {
+        bytes: Vec < u8 >,
+    },
+    WriteChars {
+        chars: String,
+    },
+    WriteCharsToPaneId {
+        chars: String,
+        pane_id: validated::PaneId,
+    },
+    WriteToPaneId {
+        bytes: Vec < u8 >,
+        pane_id: validated::PaneId,
+    },
+}
+
+impl TryFrom<RawNativeCommand> for ValidatedNativeCommand {
+    type Error = ValidationError;
+    fn try_from(value: RawNativeCommand) -> Result<Self, Self::Error> {
+        match value {
+            RawNativeCommand::BreakPanesToNewTab { pane_ids, new_tab_name, should_change_focus_to_new_tab } => Ok(Self::BreakPanesToNewTab {
+                pane_ids: pane_ids.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+                new_tab_name: new_tab_name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+                should_change_focus_to_new_tab: should_change_focus_to_new_tab,
+            }),
+            RawNativeCommand::BreakPanesToTabWithId { pane_ids, tab_id, should_change_focus_to_target_tab } => Ok(Self::BreakPanesToTabWithId {
+                pane_ids: pane_ids.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+                tab_id: tab_id,
+                should_change_focus_to_target_tab: should_change_focus_to_target_tab,
+            }),
+            RawNativeCommand::BreakPanesToTabWithIndex { pane_ids, tab_index, should_change_focus_to_new_tab } => Ok(Self::BreakPanesToTabWithIndex {
+                pane_ids: pane_ids.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+                tab_index: tab_index,
+                should_change_focus_to_new_tab: should_change_focus_to_new_tab,
+            }),
+            RawNativeCommand::ChangeFloatingPanesCoordinates { pane_ids_and_coordinates } => Ok(Self::ChangeFloatingPanesCoordinates {
+                pane_ids_and_coordinates: pane_ids_and_coordinates.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; (tuple_0.try_into()?, tuple_1.try_into()?,) }) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::ChangeHostFolder { new_host_folder } => Ok(Self::ChangeHostFolder {
+                new_host_folder: new_host_folder,
+            }),
+            RawNativeCommand::ClearPaneHighlights { pane_id } => Ok(Self::ClearPaneHighlights {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::ClearScreen => Ok(Self::ClearScreen),
+            RawNativeCommand::ClearScreenForPaneId { pane_id } => Ok(Self::ClearScreenForPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::CloseFocus => Ok(Self::CloseFocus),
+            RawNativeCommand::CloseFocusedTab => Ok(Self::CloseFocusedTab),
+            RawNativeCommand::CloseMultiplePanes { pane_ids } => Ok(Self::CloseMultiplePanes {
+                pane_ids: pane_ids.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::ClosePaneWithId { pane_id } => Ok(Self::ClosePaneWithId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::ClosePluginPane { plugin_pane_id } => Ok(Self::ClosePluginPane {
+                plugin_pane_id: plugin_pane_id,
+            }),
+            RawNativeCommand::CloseSelf => Ok(Self::CloseSelf),
+            RawNativeCommand::CloseTabWithId { tab_id } => Ok(Self::CloseTabWithId {
+                tab_id: tab_id,
+            }),
+            RawNativeCommand::CloseTabWithIndex { tab_index } => Ok(Self::CloseTabWithIndex {
+                tab_index: tab_index,
+            }),
+            RawNativeCommand::CloseTerminalPane { terminal_pane_id } => Ok(Self::CloseTerminalPane {
+                terminal_pane_id: terminal_pane_id,
+            }),
+            RawNativeCommand::CopyToClipboard { text } => Ok(Self::CopyToClipboard {
+                text: text,
+            }),
+            RawNativeCommand::DeleteAllDeadSessions => Ok(Self::DeleteAllDeadSessions),
+            RawNativeCommand::DeleteDeadSession { name } => Ok(Self::DeleteDeadSession {
+                name: name,
+            }),
+            RawNativeCommand::DeleteLayout { layout_name } => Ok(Self::DeleteLayout {
+                layout_name: layout_name,
+            }),
+            RawNativeCommand::Detach => Ok(Self::Detach),
+            RawNativeCommand::DisconnectOtherClients => Ok(Self::DisconnectOtherClients),
+            RawNativeCommand::EditLayout { layout_name, context } => Ok(Self::EditLayout {
+                layout_name: layout_name,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::EditScrollback => Ok(Self::EditScrollback),
+            RawNativeCommand::EditScrollbackForPaneWithId { pane_id } => Ok(Self::EditScrollbackForPaneWithId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::EmbedMultiplePanes { pane_ids } => Ok(Self::EmbedMultiplePanes {
+                pane_ids: pane_ids.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::FloatMultiplePanes { pane_ids } => Ok(Self::FloatMultiplePanes {
+                pane_ids: pane_ids.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::FocusHostSession => Ok(Self::FocusHostSession),
+            RawNativeCommand::FocusLastPane => Ok(Self::FocusLastPane),
+            RawNativeCommand::FocusNextPane => Ok(Self::FocusNextPane),
+            RawNativeCommand::FocusOrCreateTab { tab_name } => Ok(Self::FocusOrCreateTab {
+                tab_name: tab_name,
+            }),
+            RawNativeCommand::FocusPaneWithId { pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => Ok(Self::FocusPaneWithId {
+                pane_id: pane_id.try_into()?,
+                should_float_if_hidden: should_float_if_hidden,
+                should_be_in_place_if_hidden: should_be_in_place_if_hidden,
+            }),
+            RawNativeCommand::FocusPluginPane { plugin_pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => Ok(Self::FocusPluginPane {
+                plugin_pane_id: plugin_pane_id,
+                should_float_if_hidden: should_float_if_hidden,
+                should_be_in_place_if_hidden: should_be_in_place_if_hidden,
+            }),
+            RawNativeCommand::FocusPreviousPane => Ok(Self::FocusPreviousPane),
+            RawNativeCommand::FocusTerminalPane { terminal_pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => Ok(Self::FocusTerminalPane {
+                terminal_pane_id: terminal_pane_id,
+                should_float_if_hidden: should_float_if_hidden,
+                should_be_in_place_if_hidden: should_be_in_place_if_hidden,
+            }),
+            RawNativeCommand::GoToNextTab => Ok(Self::GoToNextTab),
+            RawNativeCommand::GoToPreviousTab => Ok(Self::GoToPreviousTab),
+            RawNativeCommand::GoToTab { tab_index } => Ok(Self::GoToTab {
+                tab_index: tab_index,
+            }),
+            RawNativeCommand::GoToTabName { tab_name } => Ok(Self::GoToTabName {
+                tab_name: tab_name,
+            }),
+            RawNativeCommand::GroupAndUngroupPanes { pane_ids_to_group, pane_ids_to_ungroup, for_all_clients } => Ok(Self::GroupAndUngroupPanes {
+                pane_ids_to_group: pane_ids_to_group.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+                pane_ids_to_ungroup: pane_ids_to_ungroup.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+                for_all_clients: for_all_clients,
+            }),
+            RawNativeCommand::HideFloatingPanes { tab_id } => Ok(Self::HideFloatingPanes {
+                tab_id: tab_id.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::HidePaneWithId { pane_id } => Ok(Self::HidePaneWithId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::HideSelf => Ok(Self::HideSelf),
+            RawNativeCommand::HighlightAndUnhighlightPanes { pane_ids_to_highlight, pane_ids_to_unhighlight } => Ok(Self::HighlightAndUnhighlightPanes {
+                pane_ids_to_highlight: pane_ids_to_highlight.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+                pane_ids_to_unhighlight: pane_ids_to_unhighlight.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::KillSessions { session_names } => Ok(Self::KillSessions {
+                session_names: session_names.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::MoveFocus { direction } => Ok(Self::MoveFocus {
+                direction: direction.try_into()?,
+            }),
+            RawNativeCommand::MoveFocusOrTab { direction } => Ok(Self::MoveFocusOrTab {
+                direction: direction.try_into()?,
+            }),
+            RawNativeCommand::MovePane => Ok(Self::MovePane),
+            RawNativeCommand::MovePaneWithDirection { direction } => Ok(Self::MovePaneWithDirection {
+                direction: direction.try_into()?,
+            }),
+            RawNativeCommand::MovePaneWithPaneId { pane_id } => Ok(Self::MovePaneWithPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::MovePaneWithPaneIdInDirection { pane_id, direction } => Ok(Self::MovePaneWithPaneIdInDirection {
+                pane_id: pane_id.try_into()?,
+                direction: direction.try_into()?,
+            }),
+            RawNativeCommand::NewPane => Ok(Self::NewPane),
+            RawNativeCommand::NewTab { name, cwd } => Ok(Self::NewTab {
+                name: name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+                cwd: cwd.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::NewTabUnfocused { name, cwd } => Ok(Self::NewTabUnfocused {
+                name: name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+                cwd: cwd.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::NewTabsWithLayout { layout } => Ok(Self::NewTabsWithLayout {
+                layout: layout,
+            }),
+            RawNativeCommand::NewTabsWithLayoutInfo { layout_info } => Ok(Self::NewTabsWithLayoutInfo {
+                layout_info: layout_info.try_into()?,
+            }),
+            RawNativeCommand::NewTiledPaneInTab { tab_position } => Ok(Self::NewTiledPaneInTab {
+                tab_position: tab_position,
+            }),
+            RawNativeCommand::NextSwapLayout => Ok(Self::NextSwapLayout),
+            RawNativeCommand::OpenCommandPane { command_to_run, context } => Ok(Self::OpenCommandPane {
+                command_to_run: command_to_run.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenCommandPaneBackground { command_to_run, context } => Ok(Self::OpenCommandPaneBackground {
+                command_to_run: command_to_run.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenCommandPaneFloating { command_to_run, coordinates, context } => Ok(Self::OpenCommandPaneFloating {
+                command_to_run: command_to_run.try_into()?,
+                coordinates: coordinates.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenCommandPaneFloatingNearPlugin { command_to_run, coordinates, context } => Ok(Self::OpenCommandPaneFloatingNearPlugin {
+                command_to_run: command_to_run.try_into()?,
+                coordinates: coordinates.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenCommandPaneInNewTab { command_to_run, context } => Ok(Self::OpenCommandPaneInNewTab {
+                command_to_run: command_to_run.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenCommandPaneInPlace { command_to_run, context } => Ok(Self::OpenCommandPaneInPlace {
+                command_to_run: command_to_run.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenCommandPaneInPlaceOfPaneId { pane_id, command_to_run, close_replaced_pane, context } => Ok(Self::OpenCommandPaneInPlaceOfPaneId {
+                pane_id: pane_id.try_into()?,
+                command_to_run: command_to_run.try_into()?,
+                close_replaced_pane: close_replaced_pane,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenCommandPaneInPlaceOfPlugin { command_to_run, close_plugin_after_replace, context } => Ok(Self::OpenCommandPaneInPlaceOfPlugin {
+                command_to_run: command_to_run.try_into()?,
+                close_plugin_after_replace: close_plugin_after_replace,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenCommandPaneNearPlugin { command_to_run, context } => Ok(Self::OpenCommandPaneNearPlugin {
+                command_to_run: command_to_run.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenEditPaneInPlaceOfPaneId { pane_id, file_to_open, close_replaced_pane, context } => Ok(Self::OpenEditPaneInPlaceOfPaneId {
+                pane_id: pane_id.try_into()?,
+                file_to_open: file_to_open.try_into()?,
+                close_replaced_pane: close_replaced_pane,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenEditorPaneInNewTab { file_to_open, context } => Ok(Self::OpenEditorPaneInNewTab {
+                file_to_open: file_to_open.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenFile { file_to_open, context } => Ok(Self::OpenFile {
+                file_to_open: file_to_open.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenFileFloating { file_to_open, coordinates, context } => Ok(Self::OpenFileFloating {
+                file_to_open: file_to_open.try_into()?,
+                coordinates: coordinates.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenFileFloatingNearPlugin { file_to_open, coordinates, context } => Ok(Self::OpenFileFloatingNearPlugin {
+                file_to_open: file_to_open.try_into()?,
+                coordinates: coordinates.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenFileInPlace { file_to_open, context } => Ok(Self::OpenFileInPlace {
+                file_to_open: file_to_open.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenFileInPlaceOfPlugin { file_to_open, close_plugin_after_replace, context } => Ok(Self::OpenFileInPlaceOfPlugin {
+                file_to_open: file_to_open.try_into()?,
+                close_plugin_after_replace: close_plugin_after_replace,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenFileNearPlugin { file_to_open, context } => Ok(Self::OpenFileNearPlugin {
+                file_to_open: file_to_open.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenPluginPaneFloating { plugin_url, configuration, coordinates, context } => Ok(Self::OpenPluginPaneFloating {
+                plugin_url: plugin_url,
+                configuration: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in configuration { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+                coordinates: coordinates.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenPluginPaneInNewTab { plugin_url, configuration, context } => Ok(Self::OpenPluginPaneInNewTab {
+                plugin_url: plugin_url,
+                configuration: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in configuration { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::OpenTerminal { path } => Ok(Self::OpenTerminal {
+                path: path,
+            }),
+            RawNativeCommand::OpenTerminalFloating { path, coordinates } => Ok(Self::OpenTerminalFloating {
+                path: path,
+                coordinates: coordinates.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+            }),
+            RawNativeCommand::OpenTerminalFloatingNearPlugin { path, coordinates } => Ok(Self::OpenTerminalFloatingNearPlugin {
+                path: path,
+                coordinates: coordinates.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+            }),
+            RawNativeCommand::OpenTerminalInPlace { path } => Ok(Self::OpenTerminalInPlace {
+                path: path,
+            }),
+            RawNativeCommand::OpenTerminalInPlaceOfPlugin { path, close_plugin_after_replace } => Ok(Self::OpenTerminalInPlaceOfPlugin {
+                path: path,
+                close_plugin_after_replace: close_plugin_after_replace,
+            }),
+            RawNativeCommand::OpenTerminalNearPlugin { path } => Ok(Self::OpenTerminalNearPlugin {
+                path: path,
+            }),
+            RawNativeCommand::OpenTerminalPaneInPlaceOfPaneId { pane_id, cwd, close_replaced_pane } => Ok(Self::OpenTerminalPaneInPlaceOfPaneId {
+                pane_id: pane_id.try_into()?,
+                cwd: cwd,
+                close_replaced_pane: close_replaced_pane,
+            }),
+            RawNativeCommand::OverrideLayout { layout_info, retain_existing_terminal_panes, retain_existing_plugin_panes, apply_only_to_active_tab, context } => Ok(Self::OverrideLayout {
+                layout_info: layout_info.try_into()?,
+                retain_existing_terminal_panes: retain_existing_terminal_panes,
+                retain_existing_plugin_panes: retain_existing_plugin_panes,
+                apply_only_to_active_tab: apply_only_to_active_tab,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::PageScrollDown => Ok(Self::PageScrollDown),
+            RawNativeCommand::PageScrollDownInPaneId { pane_id } => Ok(Self::PageScrollDownInPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::PageScrollUp => Ok(Self::PageScrollUp),
+            RawNativeCommand::PageScrollUpInPaneId { pane_id } => Ok(Self::PageScrollUpInPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::PreviousSwapLayout => Ok(Self::PreviousSwapLayout),
+            RawNativeCommand::QuitZellij => Ok(Self::QuitZellij),
+            RawNativeCommand::RebindKeys { keys_to_unbind, keys_to_rebind, write_config_to_disk } => Ok(Self::RebindKeys {
+                keys_to_unbind: keys_to_unbind.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; (tuple_0.try_into()?, tuple_1.try_into()?,) }) }).collect::<Result<_, ValidationError>>()?,
+                keys_to_rebind: keys_to_rebind.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1, tuple_2,) = item; (tuple_0.try_into()?, tuple_1.try_into()?, tuple_2.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,) }) }).collect::<Result<_, ValidationError>>()?,
+                write_config_to_disk: write_config_to_disk,
+            }),
+            RawNativeCommand::Reconfigure { new_config, save_configuration_file } => Ok(Self::Reconfigure {
+                new_config: new_config,
+                save_configuration_file: save_configuration_file,
+            }),
+            RawNativeCommand::RenameLayout { old_layout_name, new_layout_name } => Ok(Self::RenameLayout {
+                old_layout_name: old_layout_name,
+                new_layout_name: new_layout_name,
+            }),
+            RawNativeCommand::RenamePaneWithId { pane_id, new_name } => Ok(Self::RenamePaneWithId {
+                pane_id: pane_id.try_into()?,
+                new_name: new_name,
+            }),
+            RawNativeCommand::RenamePluginPane { plugin_pane_id, new_name } => Ok(Self::RenamePluginPane {
+                plugin_pane_id: plugin_pane_id,
+                new_name: new_name,
+            }),
+            RawNativeCommand::RenameSession { name } => Ok(Self::RenameSession {
+                name: name,
+            }),
+            RawNativeCommand::RenameTab { tab_position, new_name } => Ok(Self::RenameTab {
+                tab_position: tab_position,
+                new_name: new_name,
+            }),
+            RawNativeCommand::RenameTabWithId { tab_id, new_name } => Ok(Self::RenameTabWithId {
+                tab_id: tab_id,
+                new_name: new_name,
+            }),
+            RawNativeCommand::RenameTerminalPane { terminal_pane_id, new_name } => Ok(Self::RenameTerminalPane {
+                terminal_pane_id: terminal_pane_id,
+                new_name: new_name,
+            }),
+            RawNativeCommand::ReplacePaneWithExistingPane { pane_id_to_replace, existing_pane_id, suppress_replaced_pane } => Ok(Self::ReplacePaneWithExistingPane {
+                pane_id_to_replace: pane_id_to_replace.try_into()?,
+                existing_pane_id: existing_pane_id.try_into()?,
+                suppress_replaced_pane: suppress_replaced_pane,
+            }),
+            RawNativeCommand::RerunCommandPane { terminal_pane_id } => Ok(Self::RerunCommandPane {
+                terminal_pane_id: terminal_pane_id,
+            }),
+            RawNativeCommand::ResizeFocusedPane { resize } => Ok(Self::ResizeFocusedPane {
+                resize: resize.try_into()?,
+            }),
+            RawNativeCommand::ResizeFocusedPaneWithDirection { resize, direction } => Ok(Self::ResizeFocusedPaneWithDirection {
+                resize: resize.try_into()?,
+                direction: direction.try_into()?,
+            }),
+            RawNativeCommand::ResizePaneWithId { resize_strategy, pane_id } => Ok(Self::ResizePaneWithId {
+                resize_strategy: resize_strategy.try_into()?,
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::RunAction { action, context } => Ok(Self::RunAction {
+                action: action.try_into()?,
+                context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            }),
+            RawNativeCommand::SaveLayout { layout_name, layout_kdl, overwrite } => Ok(Self::SaveLayout {
+                layout_name: layout_name,
+                layout_kdl: layout_kdl,
+                overwrite: overwrite,
+            }),
+            RawNativeCommand::SaveSession => Ok(Self::SaveSession),
+            RawNativeCommand::ScrollDown => Ok(Self::ScrollDown),
+            RawNativeCommand::ScrollDownInPaneId { pane_id } => Ok(Self::ScrollDownInPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::ScrollToBottom => Ok(Self::ScrollToBottom),
+            RawNativeCommand::ScrollToBottomInPaneId { pane_id } => Ok(Self::ScrollToBottomInPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::ScrollToTop => Ok(Self::ScrollToTop),
+            RawNativeCommand::ScrollToTopInPaneId { pane_id } => Ok(Self::ScrollToTopInPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::ScrollUp => Ok(Self::ScrollUp),
+            RawNativeCommand::ScrollUpInPaneId { pane_id } => Ok(Self::ScrollUpInPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::SendSigintToPaneId { pane_id } => Ok(Self::SendSigintToPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::SendSigkillToPaneId { pane_id } => Ok(Self::SendSigkillToPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::SetFloatingPanePinned { pane_id, should_be_pinned } => Ok(Self::SetFloatingPanePinned {
+                pane_id: pane_id.try_into()?,
+                should_be_pinned: should_be_pinned,
+            }),
+            RawNativeCommand::SetPaneBorderless { pane_id, borderless } => Ok(Self::SetPaneBorderless {
+                pane_id: pane_id.try_into()?,
+                borderless: borderless,
+            }),
+            RawNativeCommand::SetPaneColor { pane_id, fg, bg } => Ok(Self::SetPaneColor {
+                pane_id: pane_id.try_into()?,
+                fg: fg.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+                bg: bg.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::SetPaneFrameStyle { pane_frame_style } => Ok(Self::SetPaneFrameStyle {
+                pane_frame_style: pane_frame_style.try_into()?,
+            }),
+            RawNativeCommand::SetPaneRegexHighlights { pane_id, highlights } => Ok(Self::SetPaneRegexHighlights {
+                pane_id: pane_id.try_into()?,
+                highlights: highlights.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::SetSelectable { selectable } => Ok(Self::SetSelectable {
+                selectable: selectable,
+            }),
+            RawNativeCommand::SetSelfMouseSelectionSupport { selection_support } => Ok(Self::SetSelfMouseSelectionSupport {
+                selection_support: selection_support,
+            }),
+            RawNativeCommand::SetSoftKeyboard { on } => Ok(Self::SetSoftKeyboard {
+                on: on,
+            }),
+            RawNativeCommand::ShowCursor { cursor_position } => Ok(Self::ShowCursor {
+                cursor_position: cursor_position.map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; (tuple_0, tuple_1,) }) }).transpose()?,
+            }),
+            RawNativeCommand::ShowFloatingPanes { tab_id } => Ok(Self::ShowFloatingPanes {
+                tab_id: tab_id.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::ShowPaneWithId { pane_id, should_float_if_hidden, should_focus_pane } => Ok(Self::ShowPaneWithId {
+                pane_id: pane_id.try_into()?,
+                should_float_if_hidden: should_float_if_hidden,
+                should_focus_pane: should_focus_pane,
+            }),
+            RawNativeCommand::ShowSelf { should_float_if_hidden } => Ok(Self::ShowSelf {
+                should_float_if_hidden: should_float_if_hidden,
+            }),
+            RawNativeCommand::StackPanes { pane_ids } => Ok(Self::StackPanes {
+                pane_ids: pane_ids.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::SwitchSession { name } => Ok(Self::SwitchSession {
+                name: name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::SwitchSessionWithCwd { name, cwd } => Ok(Self::SwitchSessionWithCwd {
+                name: name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+                cwd: cwd.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::SwitchSessionWithFocus { name, tab_position, pane_id } => Ok(Self::SwitchSessionWithFocus {
+                name: name,
+                tab_position: tab_position.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+                pane_id: pane_id.map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; (tuple_0, tuple_1,) }) }).transpose()?,
+            }),
+            RawNativeCommand::SwitchSessionWithLayout { name, layout, cwd } => Ok(Self::SwitchSessionWithLayout {
+                name: name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+                layout: layout.try_into()?,
+                cwd: cwd.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::SwitchTabTo { tab_idx } => Ok(Self::SwitchTabTo {
+                tab_idx: tab_idx,
+            }),
+            RawNativeCommand::ToggleActiveTabSync => Ok(Self::ToggleActiveTabSync),
+            RawNativeCommand::ToggleFloatingPanes { tab_id } => Ok(Self::ToggleFloatingPanes {
+                tab_id: tab_id.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+            RawNativeCommand::ToggleFocusFullscreen => Ok(Self::ToggleFocusFullscreen),
+            RawNativeCommand::ToggleFocusNoUiFullscreen => Ok(Self::ToggleFocusNoUiFullscreen),
+            RawNativeCommand::TogglePaneBorderless { pane_id } => Ok(Self::TogglePaneBorderless {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::TogglePaneEmbedOrEject => Ok(Self::TogglePaneEmbedOrEject),
+            RawNativeCommand::TogglePaneEmbedOrEjectForPaneId { pane_id } => Ok(Self::TogglePaneEmbedOrEjectForPaneId {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::TogglePaneFrames => Ok(Self::TogglePaneFrames),
+            RawNativeCommand::TogglePaneIdFullscreen { pane_id } => Ok(Self::TogglePaneIdFullscreen {
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::ToggleTab => Ok(Self::ToggleTab),
+            RawNativeCommand::UndoRenamePane => Ok(Self::UndoRenamePane),
+            RawNativeCommand::UndoRenameTab => Ok(Self::UndoRenameTab),
+            RawNativeCommand::Write { bytes } => Ok(Self::Write {
+                bytes: bytes.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item) }).collect::<Result<_, ValidationError>>()?,
+            }),
+            RawNativeCommand::WriteChars { chars } => Ok(Self::WriteChars {
+                chars: chars,
+            }),
+            RawNativeCommand::WriteCharsToPaneId { chars, pane_id } => Ok(Self::WriteCharsToPaneId {
+                chars: chars,
+                pane_id: pane_id.try_into()?,
+            }),
+            RawNativeCommand::WriteToPaneId { bytes, pane_id } => Ok(Self::WriteToPaneId {
+                bytes: bytes.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item) }).collect::<Result<_, ValidationError>>()?,
+                pane_id: pane_id.try_into()?,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeCommandDispatch {
+    BreakPanesToNewTab {
+        pane_ids: Vec < validated::PaneId >,
+        new_tab_name: Option < String >,
+        should_change_focus_to_new_tab: bool,
+    },
+    BreakPanesToTabWithId {
+        pane_ids: Vec < validated::PaneId >,
+        tab_id: usize,
+        should_change_focus_to_target_tab: bool,
+    },
+    BreakPanesToTabWithIndex {
+        pane_ids: Vec < validated::PaneId >,
+        tab_index: usize,
+        should_change_focus_to_new_tab: bool,
+    },
+    ChangeFloatingPanesCoordinates {
+        pane_ids_and_coordinates: Vec < (validated::PaneId, validated::FloatingPaneCoordinates) >,
+    },
+    ChangeHostFolder {
+        new_host_folder: std::path::PathBuf,
+    },
+    ClearPaneHighlights {
+        pane_id: validated::PaneId,
+    },
+    ClearScreen,
+    ClearScreenForPaneId {
+        pane_id: validated::PaneId,
+    },
+    CloseFocus,
+    CloseFocusedTab,
+    CloseMultiplePanes {
+        pane_ids: Vec < validated::PaneId >,
+    },
+    ClosePaneWithId {
+        pane_id: validated::PaneId,
+    },
+    ClosePluginPane {
+        plugin_pane_id: u32,
+    },
+    CloseSelf,
+    CloseTabWithId {
+        tab_id: u64,
+    },
+    CloseTabWithIndex {
+        tab_index: usize,
+    },
+    CloseTerminalPane {
+        terminal_pane_id: u32,
+    },
+    CopyToClipboard {
+        text: String,
+    },
+    DeleteAllDeadSessions,
+    DeleteDeadSession {
+        name: String,
+    },
+    DeleteLayout {
+        layout_name: String,
+    },
+    Detach,
+    DisconnectOtherClients,
+    EditLayout {
+        layout_name: String,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    EditScrollback,
+    EditScrollbackForPaneWithId {
+        pane_id: validated::PaneId,
+    },
+    EmbedMultiplePanes {
+        pane_ids: Vec < validated::PaneId >,
+    },
+    FloatMultiplePanes {
+        pane_ids: Vec < validated::PaneId >,
+    },
+    FocusHostSession,
+    FocusLastPane,
+    FocusNextPane,
+    FocusOrCreateTab {
+        tab_name: String,
+    },
+    FocusPaneWithId {
+        pane_id: validated::PaneId,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    FocusPluginPane {
+        plugin_pane_id: u32,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    FocusPreviousPane,
+    FocusTerminalPane {
+        terminal_pane_id: u32,
+        should_float_if_hidden: bool,
+        should_be_in_place_if_hidden: bool,
+    },
+    GoToNextTab,
+    GoToPreviousTab,
+    GoToTab {
+        tab_index: u32,
+    },
+    GoToTabName {
+        tab_name: String,
+    },
+    GroupAndUngroupPanes {
+        pane_ids_to_group: Vec < validated::PaneId >,
+        pane_ids_to_ungroup: Vec < validated::PaneId >,
+        for_all_clients: bool,
+    },
+    HideFloatingPanes {
+        tab_id: Option < usize >,
+    },
+    HidePaneWithId {
+        pane_id: validated::PaneId,
+    },
+    HideSelf,
+    HighlightAndUnhighlightPanes {
+        pane_ids_to_highlight: Vec < validated::PaneId >,
+        pane_ids_to_unhighlight: Vec < validated::PaneId >,
+    },
+    KillSessions {
+        session_names: Vec < String >,
+    },
+    MoveFocus {
+        direction: validated::Direction,
+    },
+    MoveFocusOrTab {
+        direction: validated::Direction,
+    },
+    MovePane,
+    MovePaneWithDirection {
+        direction: validated::Direction,
+    },
+    MovePaneWithPaneId {
+        pane_id: validated::PaneId,
+    },
+    MovePaneWithPaneIdInDirection {
+        pane_id: validated::PaneId,
+        direction: validated::Direction,
+    },
+    NewPane,
+    NewTab {
+        name: Option < String >,
+        cwd: Option < String >,
+    },
+    NewTabUnfocused {
+        name: Option < String >,
+        cwd: Option < String >,
+    },
+    NewTabsWithLayout {
+        layout: String,
+    },
+    NewTabsWithLayoutInfo {
+        layout_info: validated::LayoutInfo,
+    },
+    NewTiledPaneInTab {
+        tab_position: usize,
+    },
+    NextSwapLayout,
+    OpenCommandPane {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneBackground {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneFloating {
+        command_to_run: validated::CommandToRun,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneFloatingNearPlugin {
+        command_to_run: validated::CommandToRun,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneInNewTab {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneInPlace {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneInPlaceOfPaneId {
+        pane_id: validated::PaneId,
+        command_to_run: validated::CommandToRun,
+        close_replaced_pane: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneInPlaceOfPlugin {
+        command_to_run: validated::CommandToRun,
+        close_plugin_after_replace: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenCommandPaneNearPlugin {
+        command_to_run: validated::CommandToRun,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenEditPaneInPlaceOfPaneId {
+        pane_id: validated::PaneId,
+        file_to_open: validated::FileToOpen,
+        close_replaced_pane: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenEditorPaneInNewTab {
+        file_to_open: validated::FileToOpen,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFile {
+        file_to_open: validated::FileToOpen,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileFloating {
+        file_to_open: validated::FileToOpen,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileFloatingNearPlugin {
+        file_to_open: validated::FileToOpen,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileInPlace {
+        file_to_open: validated::FileToOpen,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileInPlaceOfPlugin {
+        file_to_open: validated::FileToOpen,
+        close_plugin_after_replace: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenFileNearPlugin {
+        file_to_open: validated::FileToOpen,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenPluginPaneFloating {
+        plugin_url: String,
+        configuration: std::collections::BTreeMap < String, String >,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenPluginPaneInNewTab {
+        plugin_url: String,
+        configuration: std::collections::BTreeMap < String, String >,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    OpenTerminal {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalFloating {
+        path: std::path::PathBuf,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+    },
+    OpenTerminalFloatingNearPlugin {
+        path: std::path::PathBuf,
+        coordinates: Option < validated::FloatingPaneCoordinates >,
+    },
+    OpenTerminalInPlace {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalInPlaceOfPlugin {
+        path: std::path::PathBuf,
+        close_plugin_after_replace: bool,
+    },
+    OpenTerminalNearPlugin {
+        path: std::path::PathBuf,
+    },
+    OpenTerminalPaneInPlaceOfPaneId {
+        pane_id: validated::PaneId,
+        cwd: std::path::PathBuf,
+        close_replaced_pane: bool,
+    },
+    OverrideLayout {
+        layout_info: validated::LayoutInfo,
+        retain_existing_terminal_panes: bool,
+        retain_existing_plugin_panes: bool,
+        apply_only_to_active_tab: bool,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    PageScrollDown,
+    PageScrollDownInPaneId {
+        pane_id: validated::PaneId,
+    },
+    PageScrollUp,
+    PageScrollUpInPaneId {
+        pane_id: validated::PaneId,
+    },
+    PreviousSwapLayout,
+    QuitZellij,
+    RebindKeys {
+        keys_to_unbind: Vec < (validated::InputMode, validated::KeyWithModifier) >,
+        keys_to_rebind: Vec < (validated::InputMode, validated::KeyWithModifier, Vec < validated::Action >) >,
+        write_config_to_disk: bool,
+    },
+    Reconfigure {
+        new_config: String,
+        save_configuration_file: bool,
+    },
+    RenameLayout {
+        old_layout_name: String,
+        new_layout_name: String,
+    },
+    RenamePaneWithId {
+        pane_id: validated::PaneId,
+        new_name: String,
+    },
+    RenamePluginPane {
+        plugin_pane_id: u32,
+        new_name: String,
+    },
+    RenameSession {
+        name: String,
+    },
+    RenameTab {
+        tab_position: u32,
+        new_name: String,
+    },
+    RenameTabWithId {
+        tab_id: u64,
+        new_name: String,
+    },
+    RenameTerminalPane {
+        terminal_pane_id: u32,
+        new_name: String,
+    },
+    ReplacePaneWithExistingPane {
+        pane_id_to_replace: validated::PaneId,
+        existing_pane_id: validated::PaneId,
+        suppress_replaced_pane: bool,
+    },
+    RerunCommandPane {
+        terminal_pane_id: u32,
+    },
+    ResizeFocusedPane {
+        resize: validated::Resize,
+    },
+    ResizeFocusedPaneWithDirection {
+        resize: validated::Resize,
+        direction: validated::Direction,
+    },
+    ResizePaneWithId {
+        resize_strategy: validated::ResizeStrategy,
+        pane_id: validated::PaneId,
+    },
+    RunAction {
+        action: validated::Action,
+        context: std::collections::BTreeMap < String, String >,
+    },
+    SaveLayout {
+        layout_name: String,
+        layout_kdl: String,
+        overwrite: bool,
+    },
+    SaveSession,
+    ScrollDown,
+    ScrollDownInPaneId {
+        pane_id: validated::PaneId,
+    },
+    ScrollToBottom,
+    ScrollToBottomInPaneId {
+        pane_id: validated::PaneId,
+    },
+    ScrollToTop,
+    ScrollToTopInPaneId {
+        pane_id: validated::PaneId,
+    },
+    ScrollUp,
+    ScrollUpInPaneId {
+        pane_id: validated::PaneId,
+    },
+    SendSigintToPaneId {
+        pane_id: validated::PaneId,
+    },
+    SendSigkillToPaneId {
+        pane_id: validated::PaneId,
+    },
+    SetFloatingPanePinned {
+        pane_id: validated::PaneId,
+        should_be_pinned: bool,
+    },
+    SetPaneBorderless {
+        pane_id: validated::PaneId,
+        borderless: bool,
+    },
+    SetPaneColor {
+        pane_id: validated::PaneId,
+        fg: Option < String >,
+        bg: Option < String >,
+    },
+    SetPaneFrameStyle {
+        pane_frame_style: validated::PaneFrameStyle,
+    },
+    SetPaneRegexHighlights {
+        pane_id: validated::PaneId,
+        highlights: Vec < validated::RegexHighlight >,
+    },
+    SetSelectable {
+        selectable: bool,
+    },
+    SetSelfMouseSelectionSupport {
+        selection_support: bool,
+    },
+    SetSoftKeyboard {
+        on: bool,
+    },
+    ShowCursor {
+        cursor_position: Option < (usize, usize) >,
+    },
+    ShowFloatingPanes {
+        tab_id: Option < usize >,
+    },
+    ShowPaneWithId {
+        pane_id: validated::PaneId,
+        should_float_if_hidden: bool,
+        should_focus_pane: bool,
+    },
+    ShowSelf {
+        should_float_if_hidden: bool,
+    },
+    StackPanes {
+        pane_ids: Vec < validated::PaneId >,
+    },
+    SwitchSession {
+        name: Option < String >,
+    },
+    SwitchSessionWithCwd {
+        name: Option < String >,
+        cwd: Option < std::path::PathBuf >,
+    },
+    SwitchSessionWithFocus {
+        name: String,
+        tab_position: Option < usize >,
+        pane_id: Option < (u32, bool) >,
+    },
+    SwitchSessionWithLayout {
+        name: Option < String >,
+        layout: validated::LayoutInfo,
+        cwd: Option < std::path::PathBuf >,
+    },
+    SwitchTabTo {
+        tab_idx: u32,
+    },
+    ToggleActiveTabSync,
+    ToggleFloatingPanes {
+        tab_id: Option < u64 >,
+    },
+    ToggleFocusFullscreen,
+    ToggleFocusNoUiFullscreen,
+    TogglePaneBorderless {
+        pane_id: validated::PaneId,
+    },
+    TogglePaneEmbedOrEject,
+    TogglePaneEmbedOrEjectForPaneId {
+        pane_id: validated::PaneId,
+    },
+    TogglePaneFrames,
+    TogglePaneIdFullscreen {
+        pane_id: validated::PaneId,
+    },
+    ToggleTab,
+    UndoRenamePane,
+    UndoRenameTab,
+    Write {
+        bytes: Vec < u8 >,
+    },
+    WriteChars {
+        chars: String,
+    },
+    WriteCharsToPaneId {
+        chars: String,
+        pane_id: validated::PaneId,
+    },
+    WriteToPaneId {
+        bytes: Vec < u8 >,
+        pane_id: validated::PaneId,
+    },
+}
+
+impl From<ValidatedNativeCommand> for NativeCommandDispatch {
+    fn from(value: ValidatedNativeCommand) -> Self {
+        match value {
+            ValidatedNativeCommand::BreakPanesToNewTab { pane_ids, new_tab_name, should_change_focus_to_new_tab } => Self::BreakPanesToNewTab { pane_ids, new_tab_name, should_change_focus_to_new_tab },
+            ValidatedNativeCommand::BreakPanesToTabWithId { pane_ids, tab_id, should_change_focus_to_target_tab } => Self::BreakPanesToTabWithId { pane_ids, tab_id, should_change_focus_to_target_tab },
+            ValidatedNativeCommand::BreakPanesToTabWithIndex { pane_ids, tab_index, should_change_focus_to_new_tab } => Self::BreakPanesToTabWithIndex { pane_ids, tab_index, should_change_focus_to_new_tab },
+            ValidatedNativeCommand::ChangeFloatingPanesCoordinates { pane_ids_and_coordinates } => Self::ChangeFloatingPanesCoordinates { pane_ids_and_coordinates },
+            ValidatedNativeCommand::ChangeHostFolder { new_host_folder } => Self::ChangeHostFolder { new_host_folder },
+            ValidatedNativeCommand::ClearPaneHighlights { pane_id } => Self::ClearPaneHighlights { pane_id },
+            ValidatedNativeCommand::ClearScreen => Self::ClearScreen,
+            ValidatedNativeCommand::ClearScreenForPaneId { pane_id } => Self::ClearScreenForPaneId { pane_id },
+            ValidatedNativeCommand::CloseFocus => Self::CloseFocus,
+            ValidatedNativeCommand::CloseFocusedTab => Self::CloseFocusedTab,
+            ValidatedNativeCommand::CloseMultiplePanes { pane_ids } => Self::CloseMultiplePanes { pane_ids },
+            ValidatedNativeCommand::ClosePaneWithId { pane_id } => Self::ClosePaneWithId { pane_id },
+            ValidatedNativeCommand::ClosePluginPane { plugin_pane_id } => Self::ClosePluginPane { plugin_pane_id },
+            ValidatedNativeCommand::CloseSelf => Self::CloseSelf,
+            ValidatedNativeCommand::CloseTabWithId { tab_id } => Self::CloseTabWithId { tab_id },
+            ValidatedNativeCommand::CloseTabWithIndex { tab_index } => Self::CloseTabWithIndex { tab_index },
+            ValidatedNativeCommand::CloseTerminalPane { terminal_pane_id } => Self::CloseTerminalPane { terminal_pane_id },
+            ValidatedNativeCommand::CopyToClipboard { text } => Self::CopyToClipboard { text },
+            ValidatedNativeCommand::DeleteAllDeadSessions => Self::DeleteAllDeadSessions,
+            ValidatedNativeCommand::DeleteDeadSession { name } => Self::DeleteDeadSession { name },
+            ValidatedNativeCommand::DeleteLayout { layout_name } => Self::DeleteLayout { layout_name },
+            ValidatedNativeCommand::Detach => Self::Detach,
+            ValidatedNativeCommand::DisconnectOtherClients => Self::DisconnectOtherClients,
+            ValidatedNativeCommand::EditLayout { layout_name, context } => Self::EditLayout { layout_name, context },
+            ValidatedNativeCommand::EditScrollback => Self::EditScrollback,
+            ValidatedNativeCommand::EditScrollbackForPaneWithId { pane_id } => Self::EditScrollbackForPaneWithId { pane_id },
+            ValidatedNativeCommand::EmbedMultiplePanes { pane_ids } => Self::EmbedMultiplePanes { pane_ids },
+            ValidatedNativeCommand::FloatMultiplePanes { pane_ids } => Self::FloatMultiplePanes { pane_ids },
+            ValidatedNativeCommand::FocusHostSession => Self::FocusHostSession,
+            ValidatedNativeCommand::FocusLastPane => Self::FocusLastPane,
+            ValidatedNativeCommand::FocusNextPane => Self::FocusNextPane,
+            ValidatedNativeCommand::FocusOrCreateTab { tab_name } => Self::FocusOrCreateTab { tab_name },
+            ValidatedNativeCommand::FocusPaneWithId { pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => Self::FocusPaneWithId { pane_id, should_float_if_hidden, should_be_in_place_if_hidden },
+            ValidatedNativeCommand::FocusPluginPane { plugin_pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => Self::FocusPluginPane { plugin_pane_id, should_float_if_hidden, should_be_in_place_if_hidden },
+            ValidatedNativeCommand::FocusPreviousPane => Self::FocusPreviousPane,
+            ValidatedNativeCommand::FocusTerminalPane { terminal_pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => Self::FocusTerminalPane { terminal_pane_id, should_float_if_hidden, should_be_in_place_if_hidden },
+            ValidatedNativeCommand::GoToNextTab => Self::GoToNextTab,
+            ValidatedNativeCommand::GoToPreviousTab => Self::GoToPreviousTab,
+            ValidatedNativeCommand::GoToTab { tab_index } => Self::GoToTab { tab_index },
+            ValidatedNativeCommand::GoToTabName { tab_name } => Self::GoToTabName { tab_name },
+            ValidatedNativeCommand::GroupAndUngroupPanes { pane_ids_to_group, pane_ids_to_ungroup, for_all_clients } => Self::GroupAndUngroupPanes { pane_ids_to_group, pane_ids_to_ungroup, for_all_clients },
+            ValidatedNativeCommand::HideFloatingPanes { tab_id } => Self::HideFloatingPanes { tab_id },
+            ValidatedNativeCommand::HidePaneWithId { pane_id } => Self::HidePaneWithId { pane_id },
+            ValidatedNativeCommand::HideSelf => Self::HideSelf,
+            ValidatedNativeCommand::HighlightAndUnhighlightPanes { pane_ids_to_highlight, pane_ids_to_unhighlight } => Self::HighlightAndUnhighlightPanes { pane_ids_to_highlight, pane_ids_to_unhighlight },
+            ValidatedNativeCommand::KillSessions { session_names } => Self::KillSessions { session_names },
+            ValidatedNativeCommand::MoveFocus { direction } => Self::MoveFocus { direction },
+            ValidatedNativeCommand::MoveFocusOrTab { direction } => Self::MoveFocusOrTab { direction },
+            ValidatedNativeCommand::MovePane => Self::MovePane,
+            ValidatedNativeCommand::MovePaneWithDirection { direction } => Self::MovePaneWithDirection { direction },
+            ValidatedNativeCommand::MovePaneWithPaneId { pane_id } => Self::MovePaneWithPaneId { pane_id },
+            ValidatedNativeCommand::MovePaneWithPaneIdInDirection { pane_id, direction } => Self::MovePaneWithPaneIdInDirection { pane_id, direction },
+            ValidatedNativeCommand::NewPane => Self::NewPane,
+            ValidatedNativeCommand::NewTab { name, cwd } => Self::NewTab { name, cwd },
+            ValidatedNativeCommand::NewTabUnfocused { name, cwd } => Self::NewTabUnfocused { name, cwd },
+            ValidatedNativeCommand::NewTabsWithLayout { layout } => Self::NewTabsWithLayout { layout },
+            ValidatedNativeCommand::NewTabsWithLayoutInfo { layout_info } => Self::NewTabsWithLayoutInfo { layout_info },
+            ValidatedNativeCommand::NewTiledPaneInTab { tab_position } => Self::NewTiledPaneInTab { tab_position },
+            ValidatedNativeCommand::NextSwapLayout => Self::NextSwapLayout,
+            ValidatedNativeCommand::OpenCommandPane { command_to_run, context } => Self::OpenCommandPane { command_to_run, context },
+            ValidatedNativeCommand::OpenCommandPaneBackground { command_to_run, context } => Self::OpenCommandPaneBackground { command_to_run, context },
+            ValidatedNativeCommand::OpenCommandPaneFloating { command_to_run, coordinates, context } => Self::OpenCommandPaneFloating { command_to_run, coordinates, context },
+            ValidatedNativeCommand::OpenCommandPaneFloatingNearPlugin { command_to_run, coordinates, context } => Self::OpenCommandPaneFloatingNearPlugin { command_to_run, coordinates, context },
+            ValidatedNativeCommand::OpenCommandPaneInNewTab { command_to_run, context } => Self::OpenCommandPaneInNewTab { command_to_run, context },
+            ValidatedNativeCommand::OpenCommandPaneInPlace { command_to_run, context } => Self::OpenCommandPaneInPlace { command_to_run, context },
+            ValidatedNativeCommand::OpenCommandPaneInPlaceOfPaneId { pane_id, command_to_run, close_replaced_pane, context } => Self::OpenCommandPaneInPlaceOfPaneId { pane_id, command_to_run, close_replaced_pane, context },
+            ValidatedNativeCommand::OpenCommandPaneInPlaceOfPlugin { command_to_run, close_plugin_after_replace, context } => Self::OpenCommandPaneInPlaceOfPlugin { command_to_run, close_plugin_after_replace, context },
+            ValidatedNativeCommand::OpenCommandPaneNearPlugin { command_to_run, context } => Self::OpenCommandPaneNearPlugin { command_to_run, context },
+            ValidatedNativeCommand::OpenEditPaneInPlaceOfPaneId { pane_id, file_to_open, close_replaced_pane, context } => Self::OpenEditPaneInPlaceOfPaneId { pane_id, file_to_open, close_replaced_pane, context },
+            ValidatedNativeCommand::OpenEditorPaneInNewTab { file_to_open, context } => Self::OpenEditorPaneInNewTab { file_to_open, context },
+            ValidatedNativeCommand::OpenFile { file_to_open, context } => Self::OpenFile { file_to_open, context },
+            ValidatedNativeCommand::OpenFileFloating { file_to_open, coordinates, context } => Self::OpenFileFloating { file_to_open, coordinates, context },
+            ValidatedNativeCommand::OpenFileFloatingNearPlugin { file_to_open, coordinates, context } => Self::OpenFileFloatingNearPlugin { file_to_open, coordinates, context },
+            ValidatedNativeCommand::OpenFileInPlace { file_to_open, context } => Self::OpenFileInPlace { file_to_open, context },
+            ValidatedNativeCommand::OpenFileInPlaceOfPlugin { file_to_open, close_plugin_after_replace, context } => Self::OpenFileInPlaceOfPlugin { file_to_open, close_plugin_after_replace, context },
+            ValidatedNativeCommand::OpenFileNearPlugin { file_to_open, context } => Self::OpenFileNearPlugin { file_to_open, context },
+            ValidatedNativeCommand::OpenPluginPaneFloating { plugin_url, configuration, coordinates, context } => Self::OpenPluginPaneFloating { plugin_url, configuration, coordinates, context },
+            ValidatedNativeCommand::OpenPluginPaneInNewTab { plugin_url, configuration, context } => Self::OpenPluginPaneInNewTab { plugin_url, configuration, context },
+            ValidatedNativeCommand::OpenTerminal { path } => Self::OpenTerminal { path },
+            ValidatedNativeCommand::OpenTerminalFloating { path, coordinates } => Self::OpenTerminalFloating { path, coordinates },
+            ValidatedNativeCommand::OpenTerminalFloatingNearPlugin { path, coordinates } => Self::OpenTerminalFloatingNearPlugin { path, coordinates },
+            ValidatedNativeCommand::OpenTerminalInPlace { path } => Self::OpenTerminalInPlace { path },
+            ValidatedNativeCommand::OpenTerminalInPlaceOfPlugin { path, close_plugin_after_replace } => Self::OpenTerminalInPlaceOfPlugin { path, close_plugin_after_replace },
+            ValidatedNativeCommand::OpenTerminalNearPlugin { path } => Self::OpenTerminalNearPlugin { path },
+            ValidatedNativeCommand::OpenTerminalPaneInPlaceOfPaneId { pane_id, cwd, close_replaced_pane } => Self::OpenTerminalPaneInPlaceOfPaneId { pane_id, cwd, close_replaced_pane },
+            ValidatedNativeCommand::OverrideLayout { layout_info, retain_existing_terminal_panes, retain_existing_plugin_panes, apply_only_to_active_tab, context } => Self::OverrideLayout { layout_info, retain_existing_terminal_panes, retain_existing_plugin_panes, apply_only_to_active_tab, context },
+            ValidatedNativeCommand::PageScrollDown => Self::PageScrollDown,
+            ValidatedNativeCommand::PageScrollDownInPaneId { pane_id } => Self::PageScrollDownInPaneId { pane_id },
+            ValidatedNativeCommand::PageScrollUp => Self::PageScrollUp,
+            ValidatedNativeCommand::PageScrollUpInPaneId { pane_id } => Self::PageScrollUpInPaneId { pane_id },
+            ValidatedNativeCommand::PreviousSwapLayout => Self::PreviousSwapLayout,
+            ValidatedNativeCommand::QuitZellij => Self::QuitZellij,
+            ValidatedNativeCommand::RebindKeys { keys_to_unbind, keys_to_rebind, write_config_to_disk } => Self::RebindKeys { keys_to_unbind, keys_to_rebind, write_config_to_disk },
+            ValidatedNativeCommand::Reconfigure { new_config, save_configuration_file } => Self::Reconfigure { new_config, save_configuration_file },
+            ValidatedNativeCommand::RenameLayout { old_layout_name, new_layout_name } => Self::RenameLayout { old_layout_name, new_layout_name },
+            ValidatedNativeCommand::RenamePaneWithId { pane_id, new_name } => Self::RenamePaneWithId { pane_id, new_name },
+            ValidatedNativeCommand::RenamePluginPane { plugin_pane_id, new_name } => Self::RenamePluginPane { plugin_pane_id, new_name },
+            ValidatedNativeCommand::RenameSession { name } => Self::RenameSession { name },
+            ValidatedNativeCommand::RenameTab { tab_position, new_name } => Self::RenameTab { tab_position, new_name },
+            ValidatedNativeCommand::RenameTabWithId { tab_id, new_name } => Self::RenameTabWithId { tab_id, new_name },
+            ValidatedNativeCommand::RenameTerminalPane { terminal_pane_id, new_name } => Self::RenameTerminalPane { terminal_pane_id, new_name },
+            ValidatedNativeCommand::ReplacePaneWithExistingPane { pane_id_to_replace, existing_pane_id, suppress_replaced_pane } => Self::ReplacePaneWithExistingPane { pane_id_to_replace, existing_pane_id, suppress_replaced_pane },
+            ValidatedNativeCommand::RerunCommandPane { terminal_pane_id } => Self::RerunCommandPane { terminal_pane_id },
+            ValidatedNativeCommand::ResizeFocusedPane { resize } => Self::ResizeFocusedPane { resize },
+            ValidatedNativeCommand::ResizeFocusedPaneWithDirection { resize, direction } => Self::ResizeFocusedPaneWithDirection { resize, direction },
+            ValidatedNativeCommand::ResizePaneWithId { resize_strategy, pane_id } => Self::ResizePaneWithId { resize_strategy, pane_id },
+            ValidatedNativeCommand::RunAction { action, context } => Self::RunAction { action, context },
+            ValidatedNativeCommand::SaveLayout { layout_name, layout_kdl, overwrite } => Self::SaveLayout { layout_name, layout_kdl, overwrite },
+            ValidatedNativeCommand::SaveSession => Self::SaveSession,
+            ValidatedNativeCommand::ScrollDown => Self::ScrollDown,
+            ValidatedNativeCommand::ScrollDownInPaneId { pane_id } => Self::ScrollDownInPaneId { pane_id },
+            ValidatedNativeCommand::ScrollToBottom => Self::ScrollToBottom,
+            ValidatedNativeCommand::ScrollToBottomInPaneId { pane_id } => Self::ScrollToBottomInPaneId { pane_id },
+            ValidatedNativeCommand::ScrollToTop => Self::ScrollToTop,
+            ValidatedNativeCommand::ScrollToTopInPaneId { pane_id } => Self::ScrollToTopInPaneId { pane_id },
+            ValidatedNativeCommand::ScrollUp => Self::ScrollUp,
+            ValidatedNativeCommand::ScrollUpInPaneId { pane_id } => Self::ScrollUpInPaneId { pane_id },
+            ValidatedNativeCommand::SendSigintToPaneId { pane_id } => Self::SendSigintToPaneId { pane_id },
+            ValidatedNativeCommand::SendSigkillToPaneId { pane_id } => Self::SendSigkillToPaneId { pane_id },
+            ValidatedNativeCommand::SetFloatingPanePinned { pane_id, should_be_pinned } => Self::SetFloatingPanePinned { pane_id, should_be_pinned },
+            ValidatedNativeCommand::SetPaneBorderless { pane_id, borderless } => Self::SetPaneBorderless { pane_id, borderless },
+            ValidatedNativeCommand::SetPaneColor { pane_id, fg, bg } => Self::SetPaneColor { pane_id, fg, bg },
+            ValidatedNativeCommand::SetPaneFrameStyle { pane_frame_style } => Self::SetPaneFrameStyle { pane_frame_style },
+            ValidatedNativeCommand::SetPaneRegexHighlights { pane_id, highlights } => Self::SetPaneRegexHighlights { pane_id, highlights },
+            ValidatedNativeCommand::SetSelectable { selectable } => Self::SetSelectable { selectable },
+            ValidatedNativeCommand::SetSelfMouseSelectionSupport { selection_support } => Self::SetSelfMouseSelectionSupport { selection_support },
+            ValidatedNativeCommand::SetSoftKeyboard { on } => Self::SetSoftKeyboard { on },
+            ValidatedNativeCommand::ShowCursor { cursor_position } => Self::ShowCursor { cursor_position },
+            ValidatedNativeCommand::ShowFloatingPanes { tab_id } => Self::ShowFloatingPanes { tab_id },
+            ValidatedNativeCommand::ShowPaneWithId { pane_id, should_float_if_hidden, should_focus_pane } => Self::ShowPaneWithId { pane_id, should_float_if_hidden, should_focus_pane },
+            ValidatedNativeCommand::ShowSelf { should_float_if_hidden } => Self::ShowSelf { should_float_if_hidden },
+            ValidatedNativeCommand::StackPanes { pane_ids } => Self::StackPanes { pane_ids },
+            ValidatedNativeCommand::SwitchSession { name } => Self::SwitchSession { name },
+            ValidatedNativeCommand::SwitchSessionWithCwd { name, cwd } => Self::SwitchSessionWithCwd { name, cwd },
+            ValidatedNativeCommand::SwitchSessionWithFocus { name, tab_position, pane_id } => Self::SwitchSessionWithFocus { name, tab_position, pane_id },
+            ValidatedNativeCommand::SwitchSessionWithLayout { name, layout, cwd } => Self::SwitchSessionWithLayout { name, layout, cwd },
+            ValidatedNativeCommand::SwitchTabTo { tab_idx } => Self::SwitchTabTo { tab_idx },
+            ValidatedNativeCommand::ToggleActiveTabSync => Self::ToggleActiveTabSync,
+            ValidatedNativeCommand::ToggleFloatingPanes { tab_id } => Self::ToggleFloatingPanes { tab_id },
+            ValidatedNativeCommand::ToggleFocusFullscreen => Self::ToggleFocusFullscreen,
+            ValidatedNativeCommand::ToggleFocusNoUiFullscreen => Self::ToggleFocusNoUiFullscreen,
+            ValidatedNativeCommand::TogglePaneBorderless { pane_id } => Self::TogglePaneBorderless { pane_id },
+            ValidatedNativeCommand::TogglePaneEmbedOrEject => Self::TogglePaneEmbedOrEject,
+            ValidatedNativeCommand::TogglePaneEmbedOrEjectForPaneId { pane_id } => Self::TogglePaneEmbedOrEjectForPaneId { pane_id },
+            ValidatedNativeCommand::TogglePaneFrames => Self::TogglePaneFrames,
+            ValidatedNativeCommand::TogglePaneIdFullscreen { pane_id } => Self::TogglePaneIdFullscreen { pane_id },
+            ValidatedNativeCommand::ToggleTab => Self::ToggleTab,
+            ValidatedNativeCommand::UndoRenamePane => Self::UndoRenamePane,
+            ValidatedNativeCommand::UndoRenameTab => Self::UndoRenameTab,
+            ValidatedNativeCommand::Write { bytes } => Self::Write { bytes },
+            ValidatedNativeCommand::WriteChars { chars } => Self::WriteChars { chars },
+            ValidatedNativeCommand::WriteCharsToPaneId { chars, pane_id } => Self::WriteCharsToPaneId { chars, pane_id },
+            ValidatedNativeCommand::WriteToPaneId { bytes, pane_id } => Self::WriteToPaneId { bytes, pane_id },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeCommandReturn {
+    BreakPanesToNewTab(Option < usize >),
+    BreakPanesToTabWithId(Option < usize >),
+    BreakPanesToTabWithIndex(Option < usize >),
+    ChangeFloatingPanesCoordinates(()),
+    ChangeHostFolder(()),
+    ClearPaneHighlights(()),
+    ClearScreen(()),
+    ClearScreenForPaneId(()),
+    CloseFocus(()),
+    CloseFocusedTab(()),
+    CloseMultiplePanes(()),
+    ClosePaneWithId(()),
+    ClosePluginPane(()),
+    CloseSelf(()),
+    CloseTabWithId(()),
+    CloseTabWithIndex(()),
+    CloseTerminalPane(()),
+    CopyToClipboard(()),
+    DeleteAllDeadSessions(Result < (), String >),
+    DeleteDeadSession(Result < (), String >),
+    DeleteLayout(Result < (), String >),
+    Detach(()),
+    DisconnectOtherClients(()),
+    EditLayout(Result < (), String >),
+    EditScrollback(()),
+    EditScrollbackForPaneWithId(()),
+    EmbedMultiplePanes(()),
+    FloatMultiplePanes(()),
+    FocusHostSession(()),
+    FocusLastPane(()),
+    FocusNextPane(()),
+    FocusOrCreateTab(Option < usize >),
+    FocusPaneWithId(()),
+    FocusPluginPane(()),
+    FocusPreviousPane(()),
+    FocusTerminalPane(()),
+    GoToNextTab(()),
+    GoToPreviousTab(()),
+    GoToTab(()),
+    GoToTabName(()),
+    GroupAndUngroupPanes(()),
+    HideFloatingPanes(Result < bool, String >),
+    HidePaneWithId(()),
+    HideSelf(()),
+    HighlightAndUnhighlightPanes(()),
+    KillSessions(Result < (), String >),
+    MoveFocus(()),
+    MoveFocusOrTab(()),
+    MovePane(()),
+    MovePaneWithDirection(()),
+    MovePaneWithPaneId(()),
+    MovePaneWithPaneIdInDirection(()),
+    NewPane(()),
+    NewTab(Option < usize >),
+    NewTabUnfocused(Option < usize >),
+    NewTabsWithLayout(Vec < usize >),
+    NewTabsWithLayoutInfo(Vec < usize >),
+    NewTiledPaneInTab(Option < validated::PaneId >),
+    NextSwapLayout(()),
+    OpenCommandPane(Option < validated::PaneId >),
+    OpenCommandPaneBackground(Option < validated::PaneId >),
+    OpenCommandPaneFloating(Option < validated::PaneId >),
+    OpenCommandPaneFloatingNearPlugin(Option < validated::PaneId >),
+    OpenCommandPaneInNewTab((Option < usize >, Option < validated::PaneId >)),
+    OpenCommandPaneInPlace(Option < validated::PaneId >),
+    OpenCommandPaneInPlaceOfPaneId(Option < validated::PaneId >),
+    OpenCommandPaneInPlaceOfPlugin(Option < validated::PaneId >),
+    OpenCommandPaneNearPlugin(Option < validated::PaneId >),
+    OpenEditPaneInPlaceOfPaneId(Option < validated::PaneId >),
+    OpenEditorPaneInNewTab((Option < usize >, Option < validated::PaneId >)),
+    OpenFile(Option < validated::PaneId >),
+    OpenFileFloating(Option < validated::PaneId >),
+    OpenFileFloatingNearPlugin(Option < validated::PaneId >),
+    OpenFileInPlace(Option < validated::PaneId >),
+    OpenFileInPlaceOfPlugin(Option < validated::PaneId >),
+    OpenFileNearPlugin(Option < validated::PaneId >),
+    OpenPluginPaneFloating(Option < validated::PaneId >),
+    OpenPluginPaneInNewTab((Option < usize >, Option < validated::PaneId >)),
+    OpenTerminal(Option < validated::PaneId >),
+    OpenTerminalFloating(Option < validated::PaneId >),
+    OpenTerminalFloatingNearPlugin(Option < validated::PaneId >),
+    OpenTerminalInPlace(Option < validated::PaneId >),
+    OpenTerminalInPlaceOfPlugin(Option < validated::PaneId >),
+    OpenTerminalNearPlugin(Option < validated::PaneId >),
+    OpenTerminalPaneInPlaceOfPaneId(Option < validated::PaneId >),
+    OverrideLayout(()),
+    PageScrollDown(()),
+    PageScrollDownInPaneId(()),
+    PageScrollUp(()),
+    PageScrollUpInPaneId(()),
+    PreviousSwapLayout(()),
+    QuitZellij(()),
+    RebindKeys(()),
+    Reconfigure(()),
+    RenameLayout(Result < (), String >),
+    RenamePaneWithId(()),
+    RenamePluginPane(()),
+    RenameSession(()),
+    RenameTab(()),
+    RenameTabWithId(()),
+    RenameTerminalPane(()),
+    ReplacePaneWithExistingPane(()),
+    RerunCommandPane(()),
+    ResizeFocusedPane(()),
+    ResizeFocusedPaneWithDirection(()),
+    ResizePaneWithId(()),
+    RunAction(()),
+    SaveLayout(Result < (), String >),
+    SaveSession(Result < (), String >),
+    ScrollDown(()),
+    ScrollDownInPaneId(()),
+    ScrollToBottom(()),
+    ScrollToBottomInPaneId(()),
+    ScrollToTop(()),
+    ScrollToTopInPaneId(()),
+    ScrollUp(()),
+    ScrollUpInPaneId(()),
+    SendSigintToPaneId(()),
+    SendSigkillToPaneId(()),
+    SetFloatingPanePinned(()),
+    SetPaneBorderless(()),
+    SetPaneColor(()),
+    SetPaneFrameStyle(()),
+    SetPaneRegexHighlights(()),
+    SetSelectable(()),
+    SetSelfMouseSelectionSupport(()),
+    SetSoftKeyboard(()),
+    ShowCursor(()),
+    ShowFloatingPanes(Result < bool, String >),
+    ShowPaneWithId(()),
+    ShowSelf(()),
+    StackPanes(()),
+    SwitchSession(()),
+    SwitchSessionWithCwd(()),
+    SwitchSessionWithFocus(()),
+    SwitchSessionWithLayout(()),
+    SwitchTabTo(()),
+    ToggleActiveTabSync(()),
+    ToggleFloatingPanes(()),
+    ToggleFocusFullscreen(()),
+    ToggleFocusNoUiFullscreen(()),
+    TogglePaneBorderless(()),
+    TogglePaneEmbedOrEject(()),
+    TogglePaneEmbedOrEjectForPaneId(()),
+    TogglePaneFrames(()),
+    TogglePaneIdFullscreen(()),
+    ToggleTab(()),
+    UndoRenamePane(()),
+    UndoRenameTab(()),
+    Write(()),
+    WriteChars(()),
+    WriteCharsToPaneId(()),
+    WriteToPaneId(()),
+}
 
 impl TryFrom<raw::Action> for validated::Action {
     type Error = ValidationError;
@@ -2692,8 +5433,8 @@ impl TryFrom<raw::Action> for validated::Action {
             raw::Action::NewTab { tiled_layout, floating_layouts, swap_tiled_layouts, swap_floating_layouts, tab_name, should_change_focus_to_new_tab, cwd, initial_panes, first_pane_unblock_condition } => Ok(Self::NewTab {
                 tiled_layout: tiled_layout.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
                 floating_layouts: floating_layouts.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
-                swap_tiled_layouts: swap_tiled_layouts.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; (tuple_0.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key.try_into()?, item.try_into()?)) }).collect::<Result<_, ValidationError>>()?, tuple_1.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,) }) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
-                swap_floating_layouts: swap_floating_layouts.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; (tuple_0.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key.try_into()?, item.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?)) }).collect::<Result<_, ValidationError>>()?, tuple_1.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,) }) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
+                swap_tiled_layouts: swap_tiled_layouts.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; ({ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in tuple_0 { let key = key.try_into()?; let map_value = map_value.try_into()?; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted }, tuple_1.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,) }) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
+                swap_floating_layouts: swap_floating_layouts.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; ({ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in tuple_0 { let key = key.try_into()?; let map_value = map_value.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted }, tuple_1.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,) }) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
                 tab_name: tab_name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
                 should_change_focus_to_new_tab: should_change_focus_to_new_tab,
                 cwd: cwd.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
@@ -2866,9 +5607,9 @@ impl TryFrom<raw::Action> for validated::Action {
                 pipe_id: pipe_id,
                 name: name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
                 payload: payload.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
-                args: args.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key, item)) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
+                args: args.map(|item| -> Result<_, ValidationError> { Ok({ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in item { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted }) }).transpose()?,
                 plugin: plugin.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
-                configuration: configuration.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key, item)) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
+                configuration: configuration.map(|item| -> Result<_, ValidationError> { Ok({ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in item { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted }) }).transpose()?,
                 launch_new: launch_new,
                 skip_cache: skip_cache,
                 floating: floating.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
@@ -2879,10 +5620,10 @@ impl TryFrom<raw::Action> for validated::Action {
             raw::Action::KeybindPipe { name, payload, args, plugin, plugin_id, configuration, launch_new, skip_cache, floating, in_place, cwd, pane_title } => Ok(Self::KeybindPipe {
                 name: name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
                 payload: payload.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
-                args: args.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key, item)) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
+                args: args.map(|item| -> Result<_, ValidationError> { Ok({ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in item { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted }) }).transpose()?,
                 plugin: plugin.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
                 plugin_id: plugin_id.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
-                configuration: configuration.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key, item)) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
+                configuration: configuration.map(|item| -> Result<_, ValidationError> { Ok({ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in item { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted }) }).transpose()?,
                 launch_new: launch_new,
                 skip_cache: skip_cache,
                 floating: floating.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
@@ -3077,6 +5818,18 @@ impl TryFrom<raw::CommandOrPlugin> for validated::CommandOrPlugin {
     }
 }
 
+impl TryFrom<raw::CommandToRun> for validated::CommandToRun {
+    type Error = ValidationError;
+    fn try_from(value: raw::CommandToRun) -> Result<Self, Self::Error> {
+        let raw::CommandToRun { path, args, cwd } = value;
+        Ok(Self {
+            path: path,
+            args: args.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item) }).collect::<Result<_, ValidationError>>()?,
+            cwd: cwd.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+        })
+    }
+}
+
 impl TryFrom<raw::Direction> for validated::Direction {
     type Error = ValidationError;
     fn try_from(value: raw::Direction) -> Result<Self, Self::Error> {
@@ -3136,6 +5889,42 @@ impl TryFrom<raw::FloatingPaneLayout> for validated::FloatingPaneLayout {
             default_fg: default_fg.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
             default_bg: default_bg.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
         })
+    }
+}
+
+impl TryFrom<raw::HighlightLayer> for validated::HighlightLayer {
+    type Error = ValidationError;
+    fn try_from(value: raw::HighlightLayer) -> Result<Self, Self::Error> {
+        match value {
+            raw::HighlightLayer::Hint => Ok(Self::Hint),
+            raw::HighlightLayer::Tool => Ok(Self::Tool),
+            raw::HighlightLayer::ActionFeedback => Ok(Self::ActionFeedback),
+        }
+    }
+}
+
+impl TryFrom<raw::HighlightStyle> for validated::HighlightStyle {
+    type Error = ValidationError;
+    fn try_from(value: raw::HighlightStyle) -> Result<Self, Self::Error> {
+        match value {
+            raw::HighlightStyle::None => Ok(Self::None),
+            raw::HighlightStyle::Emphasis0 => Ok(Self::Emphasis0),
+            raw::HighlightStyle::Emphasis1 => Ok(Self::Emphasis1),
+            raw::HighlightStyle::Emphasis2 => Ok(Self::Emphasis2),
+            raw::HighlightStyle::Emphasis3 => Ok(Self::Emphasis3),
+            raw::HighlightStyle::BackgroundEmphasis0 => Ok(Self::BackgroundEmphasis0),
+            raw::HighlightStyle::BackgroundEmphasis1 => Ok(Self::BackgroundEmphasis1),
+            raw::HighlightStyle::BackgroundEmphasis2 => Ok(Self::BackgroundEmphasis2),
+            raw::HighlightStyle::BackgroundEmphasis3 => Ok(Self::BackgroundEmphasis3),
+            raw::HighlightStyle::CustomRgb { fg, bg } => Ok(Self::CustomRgb {
+                fg: fg.map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1, tuple_2,) = item; (tuple_0, tuple_1, tuple_2,) }) }).transpose()?,
+                bg: bg.map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1, tuple_2,) = item; (tuple_0, tuple_1, tuple_2,) }) }).transpose()?,
+            }),
+            raw::HighlightStyle::CustomIndex { fg, bg } => Ok(Self::CustomIndex {
+                fg: fg.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+                bg: bg.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+            }),
+        }
     }
 }
 
@@ -3322,7 +6111,7 @@ impl TryFrom<raw::OriginatingPlugin> for validated::OriginatingPlugin {
         Ok(Self {
             plugin_id: plugin_id,
             client_id: client_id,
-            context: context.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key, item)) }).collect::<Result<_, ValidationError>>()?,
+            context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
         })
     }
 }
@@ -3400,10 +6189,16 @@ impl TryFrom<raw::PluginUserConfiguration> for validated::PluginUserConfiguratio
     type Error = ValidationError;
     fn try_from(raw::PluginUserConfiguration(configuration): raw::PluginUserConfiguration) -> Result<Self, Self::Error> {
         const RESERVED: &[&str] = &["hold_on_close", "hold_on_start", "cwd", "name", "direction", "floating", "move_to_focused_tab", "launch_new", "payload", "skip_cache", "title", "in_place", "skip_plugin_cache"];
-        if let Some(key) = configuration.keys().find(|key| RESERVED.contains(&key.as_str())) {
-            return Err(ValidationError::new("PluginUserConfiguration", "configuration", format!("reserved key {key:?} would be discarded by the pinned Zellij constructor")));
+        let mut converted = std::collections::BTreeMap::new();
+        for raw::MapEntry { key, value } in configuration {
+            if RESERVED.contains(&key.as_str()) {
+                return Err(ValidationError::new("PluginUserConfiguration", "configuration", format!("reserved key {key:?} would be discarded by the pinned Zellij constructor")));
+            }
+            if converted.insert(key, value).is_some() {
+                return Err(ValidationError::new("PluginUserConfiguration", "configuration", "duplicate semantic key"));
+            }
         }
-        Ok(Self(configuration))
+        Ok(Self(converted))
     }
 }
 
@@ -3418,6 +6213,24 @@ impl TryFrom<raw::Position> for validated::Position {
     }
 }
 
+impl TryFrom<raw::RegexHighlight> for validated::RegexHighlight {
+    type Error = ValidationError;
+    fn try_from(value: raw::RegexHighlight) -> Result<Self, Self::Error> {
+        let raw::RegexHighlight { pattern, style, layer, context, on_hover, bold, italic, underline, tooltip_text } = value;
+        Ok(Self {
+            pattern: pattern,
+            style: style.try_into()?,
+            layer: layer.try_into()?,
+            context: { let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in context { let key = key; let map_value = map_value; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted },
+            on_hover: on_hover,
+            bold: bold,
+            italic: italic,
+            underline: underline,
+            tooltip_text: tooltip_text.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
+        })
+    }
+}
+
 impl TryFrom<raw::Resize> for validated::Resize {
     type Error = ValidationError;
     fn try_from(value: raw::Resize) -> Result<Self, Self::Error> {
@@ -3425,6 +6238,18 @@ impl TryFrom<raw::Resize> for validated::Resize {
             raw::Resize::Increase => Ok(Self::Increase),
             raw::Resize::Decrease => Ok(Self::Decrease),
         }
+    }
+}
+
+impl TryFrom<raw::ResizeStrategy> for validated::ResizeStrategy {
+    type Error = ValidationError;
+    fn try_from(value: raw::ResizeStrategy) -> Result<Self, Self::Error> {
+        let raw::ResizeStrategy { resize, direction, invert_on_boundaries } = value;
+        Ok(Self {
+            resize: resize.try_into()?,
+            direction: direction.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+            invert_on_boundaries: invert_on_boundaries,
+        })
     }
 }
 
@@ -3581,8 +6406,8 @@ impl TryFrom<raw::TabLayoutInfo> for validated::TabLayoutInfo {
             tab_name: tab_name.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,
             tiled_layout: tiled_layout.try_into()?,
             floating_layouts: floating_layouts.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
-            swap_tiled_layouts: swap_tiled_layouts.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; (tuple_0.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key.try_into()?, item.try_into()?)) }).collect::<Result<_, ValidationError>>()?, tuple_1.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,) }) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
-            swap_floating_layouts: swap_floating_layouts.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; (tuple_0.into_iter().map(|(key, item)| -> Result<_, ValidationError> { Ok((key.try_into()?, item.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?)) }).collect::<Result<_, ValidationError>>()?, tuple_1.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,) }) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
+            swap_tiled_layouts: swap_tiled_layouts.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; ({ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in tuple_0 { let key = key.try_into()?; let map_value = map_value.try_into()?; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted }, tuple_1.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,) }) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
+            swap_floating_layouts: swap_floating_layouts.map(|item| -> Result<_, ValidationError> { Ok(item.into_iter().map(|item| -> Result<_, ValidationError> { Ok({ let (tuple_0, tuple_1,) = item; ({ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry { key, value: map_value } in tuple_0 { let key = key.try_into()?; let map_value = map_value.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?; if converted.insert(key, map_value).is_some() { return Err(ValidationError::new("BTreeMap", "key", "duplicate semantic key")); } } converted }, tuple_1.map(|item| -> Result<_, ValidationError> { Ok(item) }).transpose()?,) }) }).collect::<Result<_, ValidationError>>()?) }).transpose()?,
         })
     }
 }
@@ -3634,6 +6459,7 @@ impl TryFrom<raw::UnblockCondition> for validated::UnblockCondition {
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_action(value: validated::Action) -> zellij_utils::input::actions::Action {
     match value {
         validated::Action::Quit => zellij_utils::input::actions::Action::Quit,
@@ -4121,6 +6947,7 @@ fn into_zellij_action(value: validated::Action) -> zellij_utils::input::actions:
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_bare_key(value: validated::BareKey) -> zellij_utils::data::BareKey {
     match value {
         validated::BareKey::PageDown => zellij_utils::data::BareKey::PageDown,
@@ -4152,11 +6979,13 @@ fn into_zellij_bare_key(value: validated::BareKey) -> zellij_utils::data::BareKe
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_column(value: validated::Column) -> zellij_utils::position::Column {
     let validated::Column(field_0) = value;
     zellij_utils::position::Column(field_0, )
 }
 
+#[allow(dead_code)]
 fn into_zellij_command_or_plugin(value: validated::CommandOrPlugin) -> zellij_utils::data::CommandOrPlugin {
     match value {
         validated::CommandOrPlugin::Command(field_0) => zellij_utils::data::CommandOrPlugin::Command(
@@ -4171,6 +7000,17 @@ fn into_zellij_command_or_plugin(value: validated::CommandOrPlugin) -> zellij_ut
     }
 }
 
+#[allow(dead_code)]
+fn into_zellij_command_to_run(value: validated::CommandToRun) -> zellij_utils::data::CommandToRun {
+    let validated::CommandToRun { path, args, cwd } = value;
+    zellij_utils::data::CommandToRun {
+        path: path,
+        args: args.into_iter().map(|item| item).collect(),
+        cwd: cwd.map(|item| item),
+    }
+}
+
+#[allow(dead_code)]
 fn into_zellij_direction(value: validated::Direction) -> zellij_utils::data::Direction {
     match value {
         validated::Direction::Left => zellij_utils::data::Direction::Left,
@@ -4180,6 +7020,7 @@ fn into_zellij_direction(value: validated::Direction) -> zellij_utils::data::Dir
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_file_to_open(value: validated::FileToOpen) -> zellij_utils::data::FileToOpen {
     let validated::FileToOpen { path, line_number, cwd } = value;
     zellij_utils::data::FileToOpen {
@@ -4189,6 +7030,7 @@ fn into_zellij_file_to_open(value: validated::FileToOpen) -> zellij_utils::data:
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_floating_pane_coordinates(value: validated::FloatingPaneCoordinates) -> zellij_utils::data::FloatingPaneCoordinates {
     let validated::FloatingPaneCoordinates { x, y, width, height, pinned, borderless } = value;
     zellij_utils::data::FloatingPaneCoordinates {
@@ -4201,6 +7043,7 @@ fn into_zellij_floating_pane_coordinates(value: validated::FloatingPaneCoordinat
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_floating_pane_layout(value: validated::FloatingPaneLayout) -> zellij_utils::input::layout::FloatingPaneLayout {
     let validated::FloatingPaneLayout { name, height, width, x, y, pinned, borderless, run, focus, already_running, pane_initial_contents, logical_position, default_fg, default_bg } = value;
     zellij_utils::input::layout::FloatingPaneLayout {
@@ -4221,6 +7064,39 @@ fn into_zellij_floating_pane_layout(value: validated::FloatingPaneLayout) -> zel
     }
 }
 
+#[allow(dead_code)]
+fn into_zellij_highlight_layer(value: validated::HighlightLayer) -> zellij_utils::data::HighlightLayer {
+    match value {
+        validated::HighlightLayer::Hint => zellij_utils::data::HighlightLayer::Hint,
+        validated::HighlightLayer::Tool => zellij_utils::data::HighlightLayer::Tool,
+        validated::HighlightLayer::ActionFeedback => zellij_utils::data::HighlightLayer::ActionFeedback,
+    }
+}
+
+#[allow(dead_code)]
+fn into_zellij_highlight_style(value: validated::HighlightStyle) -> zellij_utils::data::HighlightStyle {
+    match value {
+        validated::HighlightStyle::None => zellij_utils::data::HighlightStyle::None,
+        validated::HighlightStyle::Emphasis0 => zellij_utils::data::HighlightStyle::Emphasis0,
+        validated::HighlightStyle::Emphasis1 => zellij_utils::data::HighlightStyle::Emphasis1,
+        validated::HighlightStyle::Emphasis2 => zellij_utils::data::HighlightStyle::Emphasis2,
+        validated::HighlightStyle::Emphasis3 => zellij_utils::data::HighlightStyle::Emphasis3,
+        validated::HighlightStyle::BackgroundEmphasis0 => zellij_utils::data::HighlightStyle::BackgroundEmphasis0,
+        validated::HighlightStyle::BackgroundEmphasis1 => zellij_utils::data::HighlightStyle::BackgroundEmphasis1,
+        validated::HighlightStyle::BackgroundEmphasis2 => zellij_utils::data::HighlightStyle::BackgroundEmphasis2,
+        validated::HighlightStyle::BackgroundEmphasis3 => zellij_utils::data::HighlightStyle::BackgroundEmphasis3,
+        validated::HighlightStyle::CustomRgb { fg, bg } => zellij_utils::data::HighlightStyle::CustomRgb {
+            fg: fg.map(|item| { let (tuple_0, tuple_1, tuple_2,) = item; (tuple_0, tuple_1, tuple_2,) }),
+            bg: bg.map(|item| { let (tuple_0, tuple_1, tuple_2,) = item; (tuple_0, tuple_1, tuple_2,) }),
+        },
+        validated::HighlightStyle::CustomIndex { fg, bg } => zellij_utils::data::HighlightStyle::CustomIndex {
+            fg: fg.map(|item| item),
+            bg: bg.map(|item| item),
+        },
+    }
+}
+
+#[allow(dead_code)]
 fn into_zellij_input_mode(value: validated::InputMode) -> zellij_utils::data::InputMode {
     match value {
         validated::InputMode::Normal => zellij_utils::data::InputMode::Normal,
@@ -4240,6 +7116,7 @@ fn into_zellij_input_mode(value: validated::InputMode) -> zellij_utils::data::In
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_key_modifier(value: validated::KeyModifier) -> zellij_utils::data::KeyModifier {
     match value {
         validated::KeyModifier::Ctrl => zellij_utils::data::KeyModifier::Ctrl,
@@ -4249,6 +7126,7 @@ fn into_zellij_key_modifier(value: validated::KeyModifier) -> zellij_utils::data
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_key_with_modifier(value: validated::KeyWithModifier) -> zellij_utils::data::KeyWithModifier {
     let validated::KeyWithModifier { bare_key, key_modifiers } = value;
     zellij_utils::data::KeyWithModifier {
@@ -4257,6 +7135,7 @@ fn into_zellij_key_with_modifier(value: validated::KeyWithModifier) -> zellij_ut
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_layout_constraint(value: validated::LayoutConstraint) -> zellij_utils::input::layout::LayoutConstraint {
     match value {
         validated::LayoutConstraint::MaxPanes(field_0) => zellij_utils::input::layout::LayoutConstraint::MaxPanes(
@@ -4272,6 +7151,7 @@ fn into_zellij_layout_constraint(value: validated::LayoutConstraint) -> zellij_u
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_layout_info(value: validated::LayoutInfo) -> zellij_utils::data::LayoutInfo {
     match value {
         validated::LayoutInfo::BuiltIn(field_0) => zellij_utils::data::LayoutInfo::BuiltIn(
@@ -4290,6 +7170,7 @@ fn into_zellij_layout_info(value: validated::LayoutInfo) -> zellij_utils::data::
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_layout_metadata(value: validated::LayoutMetadata) -> zellij_utils::data::LayoutMetadata {
     let validated::LayoutMetadata { tabs, creation_time, update_time } = value;
     zellij_utils::data::LayoutMetadata {
@@ -4299,11 +7180,13 @@ fn into_zellij_layout_metadata(value: validated::LayoutMetadata) -> zellij_utils
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_line(value: validated::Line) -> zellij_utils::position::Line {
     let validated::Line(field_0) = value;
     zellij_utils::position::Line(field_0, )
 }
 
+#[allow(dead_code)]
 fn into_zellij_mouse_event(value: validated::MouseEvent) -> zellij_utils::input::mouse::MouseEvent {
     let validated::MouseEvent { event_type, left, right, middle, wheel_up, wheel_down, wheel_left, wheel_right, shift, alt, ctrl, position } = value;
     zellij_utils::input::mouse::MouseEvent {
@@ -4322,6 +7205,7 @@ fn into_zellij_mouse_event(value: validated::MouseEvent) -> zellij_utils::input:
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_mouse_event_type(value: validated::MouseEventType) -> zellij_utils::input::mouse::MouseEventType {
     match value {
         validated::MouseEventType::Press => zellij_utils::input::mouse::MouseEventType::Press,
@@ -4330,6 +7214,7 @@ fn into_zellij_mouse_event_type(value: validated::MouseEventType) -> zellij_util
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_new_pane_placement(value: validated::NewPanePlacement) -> zellij_utils::data::NewPanePlacement {
     match value {
         validated::NewPanePlacement::NoPreference { borderless } => zellij_utils::data::NewPanePlacement::NoPreference {
@@ -4354,6 +7239,7 @@ fn into_zellij_new_pane_placement(value: validated::NewPanePlacement) -> zellij_
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_open_file_payload(value: validated::OpenFilePayload) -> zellij_utils::input::command::OpenFilePayload {
     let validated::OpenFilePayload { path, line_number, cwd, originating_plugin } = value;
     zellij_utils::input::command::OpenFilePayload {
@@ -4364,6 +7250,7 @@ fn into_zellij_open_file_payload(value: validated::OpenFilePayload) -> zellij_ut
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_originating_plugin(value: validated::OriginatingPlugin) -> zellij_utils::data::OriginatingPlugin {
     let validated::OriginatingPlugin { plugin_id, client_id, context } = value;
     zellij_utils::data::OriginatingPlugin {
@@ -4373,6 +7260,7 @@ fn into_zellij_originating_plugin(value: validated::OriginatingPlugin) -> zellij
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_pane_frame_style(value: validated::PaneFrameStyle) -> zellij_utils::input::options::PaneFrameStyle {
     match value {
         validated::PaneFrameStyle::Full => zellij_utils::input::options::PaneFrameStyle::Full,
@@ -4381,6 +7269,7 @@ fn into_zellij_pane_frame_style(value: validated::PaneFrameStyle) -> zellij_util
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_pane_id(value: validated::PaneId) -> zellij_utils::data::PaneId {
     match value {
         validated::PaneId::Terminal(field_0) => zellij_utils::data::PaneId::Terminal(
@@ -4392,6 +7281,7 @@ fn into_zellij_pane_id(value: validated::PaneId) -> zellij_utils::data::PaneId {
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_pane_metadata(value: validated::PaneMetadata) -> zellij_utils::data::PaneMetadata {
     let validated::PaneMetadata { name, is_plugin, is_builtin_plugin } = value;
     zellij_utils::data::PaneMetadata {
@@ -4401,6 +7291,7 @@ fn into_zellij_pane_metadata(value: validated::PaneMetadata) -> zellij_utils::da
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_percent_or_fixed(value: validated::PercentOrFixed) -> zellij_utils::input::layout::PercentOrFixed {
     match value {
         validated::PercentOrFixed::Percent(field_0) => zellij_utils::input::layout::PercentOrFixed::Percent(
@@ -4412,6 +7303,7 @@ fn into_zellij_percent_or_fixed(value: validated::PercentOrFixed) -> zellij_util
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_plugin_alias(value: validated::PluginAlias) -> zellij_utils::input::layout::PluginAlias {
     let validated::PluginAlias { name, configuration, initial_cwd, run_plugin } = value;
     zellij_utils::input::layout::PluginAlias {
@@ -4422,14 +7314,17 @@ fn into_zellij_plugin_alias(value: validated::PluginAlias) -> zellij_utils::inpu
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_plugin_tag(value: validated::PluginTag) -> zellij_utils::data::PluginTag {
     zellij_utils::data::PluginTag::new(value.0)
 }
 
+#[allow(dead_code)]
 fn into_zellij_plugin_user_configuration(value: validated::PluginUserConfiguration) -> zellij_utils::input::layout::PluginUserConfiguration {
     zellij_utils::input::layout::PluginUserConfiguration::new(value.0)
 }
 
+#[allow(dead_code)]
 fn into_zellij_position(value: validated::Position) -> zellij_utils::position::Position {
     let validated::Position { line, column } = value;
     zellij_utils::position::Position {
@@ -4438,6 +7333,23 @@ fn into_zellij_position(value: validated::Position) -> zellij_utils::position::P
     }
 }
 
+#[allow(dead_code)]
+fn into_zellij_regex_highlight(value: validated::RegexHighlight) -> zellij_utils::data::RegexHighlight {
+    let validated::RegexHighlight { pattern, style, layer, context, on_hover, bold, italic, underline, tooltip_text } = value;
+    zellij_utils::data::RegexHighlight {
+        pattern: pattern,
+        style: into_zellij_highlight_style(style),
+        layer: into_zellij_highlight_layer(layer),
+        context: context.into_iter().map(|(key, item)| (key, item)).collect(),
+        on_hover: on_hover,
+        bold: bold,
+        italic: italic,
+        underline: underline,
+        tooltip_text: tooltip_text.map(|item| item),
+    }
+}
+
+#[allow(dead_code)]
 fn into_zellij_resize(value: validated::Resize) -> zellij_utils::data::Resize {
     match value {
         validated::Resize::Increase => zellij_utils::data::Resize::Increase,
@@ -4445,6 +7357,17 @@ fn into_zellij_resize(value: validated::Resize) -> zellij_utils::data::Resize {
     }
 }
 
+#[allow(dead_code)]
+fn into_zellij_resize_strategy(value: validated::ResizeStrategy) -> zellij_utils::data::ResizeStrategy {
+    let validated::ResizeStrategy { resize, direction, invert_on_boundaries } = value;
+    zellij_utils::data::ResizeStrategy {
+        resize: into_zellij_resize(resize),
+        direction: direction.map(|item| into_zellij_direction(item)),
+        invert_on_boundaries: invert_on_boundaries,
+    }
+}
+
+#[allow(dead_code)]
 fn into_zellij_run(value: validated::Run) -> zellij_utils::input::layout::Run {
     match value {
         validated::Run::Plugin(field_0) => zellij_utils::input::layout::Run::Plugin(
@@ -4464,6 +7387,7 @@ fn into_zellij_run(value: validated::Run) -> zellij_utils::input::layout::Run {
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_run_command(value: validated::RunCommand) -> zellij_utils::input::command::RunCommand {
     let validated::RunCommand { command, args, cwd, hold_on_close, hold_on_start, originating_plugin, use_terminal_title } = value;
     zellij_utils::input::command::RunCommand {
@@ -4477,6 +7401,7 @@ fn into_zellij_run_command(value: validated::RunCommand) -> zellij_utils::input:
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_run_command_action(value: validated::RunCommandAction) -> zellij_utils::input::command::RunCommandAction {
     let validated::RunCommandAction { command, args, cwd, direction, hold_on_close, hold_on_start, originating_plugin, use_terminal_title } = value;
     zellij_utils::input::command::RunCommandAction {
@@ -4491,6 +7416,7 @@ fn into_zellij_run_command_action(value: validated::RunCommandAction) -> zellij_
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_run_plugin(value: validated::RunPlugin) -> zellij_utils::input::layout::RunPlugin {
     let validated::RunPlugin { _allow_exec_host_cmd, location, configuration, initial_cwd } = value;
     zellij_utils::input::layout::RunPlugin {
@@ -4501,6 +7427,7 @@ fn into_zellij_run_plugin(value: validated::RunPlugin) -> zellij_utils::input::l
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_run_plugin_location(value: validated::RunPluginLocation) -> zellij_utils::input::layout::RunPluginLocation {
     match value {
         validated::RunPluginLocation::File(field_0) => zellij_utils::input::layout::RunPluginLocation::File(
@@ -4515,6 +7442,7 @@ fn into_zellij_run_plugin_location(value: validated::RunPluginLocation) -> zelli
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_run_plugin_or_alias(value: validated::RunPluginOrAlias) -> zellij_utils::input::layout::RunPluginOrAlias {
     match value {
         validated::RunPluginOrAlias::RunPlugin(field_0) => zellij_utils::input::layout::RunPluginOrAlias::RunPlugin(
@@ -4526,6 +7454,7 @@ fn into_zellij_run_plugin_or_alias(value: validated::RunPluginOrAlias) -> zellij
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_search_direction(value: validated::SearchDirection) -> zellij_utils::input::actions::SearchDirection {
     match value {
         validated::SearchDirection::Down => zellij_utils::input::actions::SearchDirection::Down,
@@ -4533,6 +7462,7 @@ fn into_zellij_search_direction(value: validated::SearchDirection) -> zellij_uti
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_search_option(value: validated::SearchOption) -> zellij_utils::input::actions::SearchOption {
     match value {
         validated::SearchOption::CaseSensitivity => zellij_utils::input::actions::SearchOption::CaseSensitivity,
@@ -4541,6 +7471,7 @@ fn into_zellij_search_option(value: validated::SearchOption) -> zellij_utils::in
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_split_direction(value: validated::SplitDirection) -> zellij_utils::input::layout::SplitDirection {
     match value {
         validated::SplitDirection::Horizontal => zellij_utils::input::layout::SplitDirection::Horizontal,
@@ -4548,6 +7479,7 @@ fn into_zellij_split_direction(value: validated::SplitDirection) -> zellij_utils
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_split_size(value: validated::SplitSize) -> zellij_utils::input::layout::SplitSize {
     match value {
         validated::SplitSize::Percent(field_0) => zellij_utils::input::layout::SplitSize::Percent(
@@ -4559,6 +7491,7 @@ fn into_zellij_split_size(value: validated::SplitSize) -> zellij_utils::input::l
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_tab_layout_info(value: validated::TabLayoutInfo) -> zellij_utils::input::layout::TabLayoutInfo {
     let validated::TabLayoutInfo { tab_index, tab_name, tiled_layout, floating_layouts, swap_tiled_layouts, swap_floating_layouts } = value;
     zellij_utils::input::layout::TabLayoutInfo {
@@ -4571,6 +7504,7 @@ fn into_zellij_tab_layout_info(value: validated::TabLayoutInfo) -> zellij_utils:
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_tab_metadata(value: validated::TabMetadata) -> zellij_utils::data::TabMetadata {
     let validated::TabMetadata { panes, name } = value;
     zellij_utils::data::TabMetadata {
@@ -4579,6 +7513,7 @@ fn into_zellij_tab_metadata(value: validated::TabMetadata) -> zellij_utils::data
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_tiled_pane_layout(value: validated::TiledPaneLayout) -> zellij_utils::input::layout::TiledPaneLayout {
     let validated::TiledPaneLayout { children_split_direction, name, children, split_size, run, borderless, focus, external_children_index, children_are_stacked, is_expanded_in_stack, exclude_from_sync, run_instructions_to_ignore, hide_floating_panes, pane_initial_contents, default_fg, default_bg } = value;
     zellij_utils::input::layout::TiledPaneLayout {
@@ -4601,6 +7536,7 @@ fn into_zellij_tiled_pane_layout(value: validated::TiledPaneLayout) -> zellij_ut
     }
 }
 
+#[allow(dead_code)]
 fn into_zellij_unblock_condition(value: validated::UnblockCondition) -> zellij_utils::data::UnblockCondition {
     match value {
         validated::UnblockCondition::OnExitSuccess => zellij_utils::data::UnblockCondition::OnExitSuccess,
@@ -4612,3 +7548,934 @@ fn into_zellij_unblock_condition(value: validated::UnblockCondition) -> zellij_u
 impl From<ValidatedAction> for zellij_utils::input::actions::Action {
     fn from(value: ValidatedAction) -> Self { into_zellij_action(value) }
 }
+#[allow(dead_code)]
+fn from_zellij_pane_id(value: zellij_utils::data::PaneId) -> validated::PaneId {
+    match value {
+        zellij_utils::data::PaneId::Terminal(id) => validated::PaneId::Terminal(id),
+        zellij_utils::data::PaneId::Plugin(id) => validated::PaneId::Plugin(id),
+    }
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_break_panes_to_new_tab(value: Option < usize >) -> NativeCommandReturn {
+    NativeCommandReturn::BreakPanesToNewTab(value.map(|item| item))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_break_panes_to_tab_with_id(value: Option < usize >) -> NativeCommandReturn {
+    NativeCommandReturn::BreakPanesToTabWithId(value.map(|item| item))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_break_panes_to_tab_with_index(value: Option < usize >) -> NativeCommandReturn {
+    NativeCommandReturn::BreakPanesToTabWithIndex(value.map(|item| item))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_change_floating_panes_coordinates(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ChangeFloatingPanesCoordinates(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_change_host_folder(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ChangeHostFolder(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_clear_pane_highlights(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ClearPaneHighlights(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_clear_screen(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ClearScreen(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_clear_screen_for_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ClearScreenForPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_focus(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::CloseFocus(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_focused_tab(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::CloseFocusedTab(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_multiple_panes(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::CloseMultiplePanes(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_pane_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ClosePaneWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_plugin_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ClosePluginPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_self(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::CloseSelf(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_tab_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::CloseTabWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_tab_with_index(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::CloseTabWithIndex(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_close_terminal_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::CloseTerminalPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_copy_to_clipboard(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::CopyToClipboard(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_delete_all_dead_sessions(value: Result < (), String >) -> NativeCommandReturn {
+    NativeCommandReturn::DeleteAllDeadSessions(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_delete_dead_session(value: Result < (), String >) -> NativeCommandReturn {
+    NativeCommandReturn::DeleteDeadSession(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_delete_layout(value: Result < (), String >) -> NativeCommandReturn {
+    NativeCommandReturn::DeleteLayout(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_detach(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::Detach(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_disconnect_other_clients(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::DisconnectOtherClients(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_edit_layout(value: Result < (), String >) -> NativeCommandReturn {
+    NativeCommandReturn::EditLayout(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_edit_scrollback(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::EditScrollback(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_edit_scrollback_for_pane_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::EditScrollbackForPaneWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_embed_multiple_panes(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::EmbedMultiplePanes(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_float_multiple_panes(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::FloatMultiplePanes(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_focus_host_session(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::FocusHostSession(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_focus_last_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::FocusLastPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_focus_next_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::FocusNextPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_focus_or_create_tab(value: Option < usize >) -> NativeCommandReturn {
+    NativeCommandReturn::FocusOrCreateTab(value.map(|item| item))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_focus_pane_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::FocusPaneWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_focus_plugin_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::FocusPluginPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_focus_previous_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::FocusPreviousPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_focus_terminal_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::FocusTerminalPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_go_to_next_tab(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::GoToNextTab(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_go_to_previous_tab(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::GoToPreviousTab(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_go_to_tab(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::GoToTab(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_go_to_tab_name(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::GoToTabName(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_group_and_ungroup_panes(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::GroupAndUngroupPanes(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_hide_floating_panes(value: Result < bool, String >) -> NativeCommandReturn {
+    NativeCommandReturn::HideFloatingPanes(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_hide_pane_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::HidePaneWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_hide_self(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::HideSelf(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_highlight_and_unhighlight_panes(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::HighlightAndUnhighlightPanes(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_kill_sessions(value: Result < (), String >) -> NativeCommandReturn {
+    NativeCommandReturn::KillSessions(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_move_focus(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::MoveFocus(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_move_focus_or_tab(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::MoveFocusOrTab(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_move_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::MovePane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_move_pane_with_direction(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::MovePaneWithDirection(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_move_pane_with_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::MovePaneWithPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_move_pane_with_pane_id_in_direction(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::MovePaneWithPaneIdInDirection(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_new_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::NewPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_new_tab(value: Option < usize >) -> NativeCommandReturn {
+    NativeCommandReturn::NewTab(value.map(|item| item))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_new_tab_unfocused(value: Option < usize >) -> NativeCommandReturn {
+    NativeCommandReturn::NewTabUnfocused(value.map(|item| item))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_new_tabs_with_layout(value: Vec < usize >) -> NativeCommandReturn {
+    NativeCommandReturn::NewTabsWithLayout(value.into_iter().map(|item| item).collect())
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_new_tabs_with_layout_info(value: Vec < usize >) -> NativeCommandReturn {
+    NativeCommandReturn::NewTabsWithLayoutInfo(value.into_iter().map(|item| item).collect())
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_new_tiled_pane_in_tab(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::NewTiledPaneInTab(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_next_swap_layout(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::NextSwapLayout(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPane(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane_background(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPaneBackground(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane_floating(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPaneFloating(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane_floating_near_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPaneFloatingNearPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane_in_new_tab(value: (Option < usize >, Option < zellij_utils::data::PaneId >)) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPaneInNewTab({ let (tuple_0, tuple_1,) = value; (tuple_0.map(|item| item), tuple_1.map(|item| from_zellij_pane_id(item)),) })
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane_in_place(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPaneInPlace(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane_in_place_of_pane_id(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPaneInPlaceOfPaneId(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane_in_place_of_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPaneInPlaceOfPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_command_pane_near_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenCommandPaneNearPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_edit_pane_in_place_of_pane_id(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenEditPaneInPlaceOfPaneId(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_editor_pane_in_new_tab(value: (Option < usize >, Option < zellij_utils::data::PaneId >)) -> NativeCommandReturn {
+    NativeCommandReturn::OpenEditorPaneInNewTab({ let (tuple_0, tuple_1,) = value; (tuple_0.map(|item| item), tuple_1.map(|item| from_zellij_pane_id(item)),) })
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_file(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenFile(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_file_floating(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenFileFloating(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_file_floating_near_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenFileFloatingNearPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_file_in_place(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenFileInPlace(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_file_in_place_of_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenFileInPlaceOfPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_file_near_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenFileNearPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_plugin_pane_floating(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenPluginPaneFloating(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_plugin_pane_in_new_tab(value: (Option < usize >, Option < zellij_utils::data::PaneId >)) -> NativeCommandReturn {
+    NativeCommandReturn::OpenPluginPaneInNewTab({ let (tuple_0, tuple_1,) = value; (tuple_0.map(|item| item), tuple_1.map(|item| from_zellij_pane_id(item)),) })
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_terminal(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenTerminal(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_terminal_floating(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenTerminalFloating(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_terminal_floating_near_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenTerminalFloatingNearPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_terminal_in_place(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenTerminalInPlace(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_terminal_in_place_of_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenTerminalInPlaceOfPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_terminal_near_plugin(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenTerminalNearPlugin(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_open_terminal_pane_in_place_of_pane_id(value: Option < zellij_utils::data::PaneId >) -> NativeCommandReturn {
+    NativeCommandReturn::OpenTerminalPaneInPlaceOfPaneId(value.map(|item| from_zellij_pane_id(item)))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_override_layout(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::OverrideLayout(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_page_scroll_down(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::PageScrollDown(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_page_scroll_down_in_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::PageScrollDownInPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_page_scroll_up(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::PageScrollUp(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_page_scroll_up_in_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::PageScrollUpInPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_previous_swap_layout(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::PreviousSwapLayout(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_quit_zellij(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::QuitZellij(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rebind_keys(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RebindKeys(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_reconfigure(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::Reconfigure(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rename_layout(value: Result < (), String >) -> NativeCommandReturn {
+    NativeCommandReturn::RenameLayout(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rename_pane_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RenamePaneWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rename_plugin_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RenamePluginPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rename_session(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RenameSession(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rename_tab(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RenameTab(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rename_tab_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RenameTabWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rename_terminal_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RenameTerminalPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_replace_pane_with_existing_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ReplacePaneWithExistingPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_rerun_command_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RerunCommandPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_resize_focused_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ResizeFocusedPane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_resize_focused_pane_with_direction(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ResizeFocusedPaneWithDirection(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_resize_pane_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ResizePaneWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_run_action(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::RunAction(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_save_layout(value: Result < (), String >) -> NativeCommandReturn {
+    NativeCommandReturn::SaveLayout(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_save_session(value: Result < (), String >) -> NativeCommandReturn {
+    NativeCommandReturn::SaveSession(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_scroll_down(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ScrollDown(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_scroll_down_in_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ScrollDownInPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_scroll_to_bottom(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ScrollToBottom(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_scroll_to_bottom_in_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ScrollToBottomInPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_scroll_to_top(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ScrollToTop(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_scroll_to_top_in_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ScrollToTopInPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_scroll_up(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ScrollUp(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_scroll_up_in_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ScrollUpInPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_send_sigint_to_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SendSigintToPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_send_sigkill_to_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SendSigkillToPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_set_floating_pane_pinned(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetFloatingPanePinned(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_set_pane_borderless(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetPaneBorderless(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_set_pane_color(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetPaneColor(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_set_pane_frame_style(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetPaneFrameStyle(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_set_pane_regex_highlights(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetPaneRegexHighlights(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_set_selectable(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetSelectable(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_set_self_mouse_selection_support(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetSelfMouseSelectionSupport(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_set_soft_keyboard(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetSoftKeyboard(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_show_cursor(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ShowCursor(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_show_floating_panes(value: Result < bool, String >) -> NativeCommandReturn {
+    NativeCommandReturn::ShowFloatingPanes(value.map(|item| item).map_err(|error| error))
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_show_pane_with_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ShowPaneWithId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_show_self(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ShowSelf(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_stack_panes(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::StackPanes(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_switch_session(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SwitchSession(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_switch_session_with_cwd(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SwitchSessionWithCwd(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_switch_session_with_focus(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SwitchSessionWithFocus(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_switch_session_with_layout(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SwitchSessionWithLayout(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_switch_tab_to(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SwitchTabTo(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_active_tab_sync(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ToggleActiveTabSync(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_floating_panes(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ToggleFloatingPanes(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_focus_fullscreen(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ToggleFocusFullscreen(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_focus_no_ui_fullscreen(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ToggleFocusNoUiFullscreen(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_pane_borderless(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::TogglePaneBorderless(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_pane_embed_or_eject(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::TogglePaneEmbedOrEject(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_pane_embed_or_eject_for_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::TogglePaneEmbedOrEjectForPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_pane_frames(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::TogglePaneFrames(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_pane_id_fullscreen(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::TogglePaneIdFullscreen(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_toggle_tab(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ToggleTab(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_undo_rename_pane(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::UndoRenamePane(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_undo_rename_tab(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::UndoRenameTab(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_write(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::Write(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_write_chars(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::WriteChars(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_write_chars_to_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::WriteCharsToPaneId(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_write_to_pane_id(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::WriteToPaneId(value)
+}
+
+pub fn dispatch_native_command(value: NativeCommandDispatch) -> NativeCommandReturn {
+    match value {
+        NativeCommandDispatch::BreakPanesToNewTab { pane_ids, new_tab_name, should_change_focus_to_new_tab } => native_command_return_break_panes_to_new_tab(zellij_tile::shim::break_panes_to_new_tab(&pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect::<Vec<_>>(), new_tab_name.map(|item| item), should_change_focus_to_new_tab)),
+        NativeCommandDispatch::BreakPanesToTabWithId { pane_ids, tab_id, should_change_focus_to_target_tab } => native_command_return_break_panes_to_tab_with_id(zellij_tile::shim::break_panes_to_tab_with_id(&pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect::<Vec<_>>(), tab_id, should_change_focus_to_target_tab)),
+        NativeCommandDispatch::BreakPanesToTabWithIndex { pane_ids, tab_index, should_change_focus_to_new_tab } => native_command_return_break_panes_to_tab_with_index(zellij_tile::shim::break_panes_to_tab_with_index(&pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect::<Vec<_>>(), tab_index, should_change_focus_to_new_tab)),
+        NativeCommandDispatch::ChangeFloatingPanesCoordinates { pane_ids_and_coordinates } => native_command_return_change_floating_panes_coordinates(zellij_tile::shim::change_floating_panes_coordinates(pane_ids_and_coordinates.into_iter().map(|item| { let (tuple_0, tuple_1,) = item; (into_zellij_pane_id(tuple_0), into_zellij_floating_pane_coordinates(tuple_1),) }).collect())),
+        NativeCommandDispatch::ChangeHostFolder { new_host_folder } => native_command_return_change_host_folder(zellij_tile::shim::change_host_folder(new_host_folder)),
+        NativeCommandDispatch::ClearPaneHighlights { pane_id } => native_command_return_clear_pane_highlights(zellij_tile::shim::clear_pane_highlights(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::ClearScreen => native_command_return_clear_screen(zellij_tile::shim::clear_screen()),
+        NativeCommandDispatch::ClearScreenForPaneId { pane_id } => native_command_return_clear_screen_for_pane_id(zellij_tile::shim::clear_screen_for_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::CloseFocus => native_command_return_close_focus(zellij_tile::shim::close_focus()),
+        NativeCommandDispatch::CloseFocusedTab => native_command_return_close_focused_tab(zellij_tile::shim::close_focused_tab()),
+        NativeCommandDispatch::CloseMultiplePanes { pane_ids } => native_command_return_close_multiple_panes(zellij_tile::shim::close_multiple_panes(pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect())),
+        NativeCommandDispatch::ClosePaneWithId { pane_id } => native_command_return_close_pane_with_id(zellij_tile::shim::close_pane_with_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::ClosePluginPane { plugin_pane_id } => native_command_return_close_plugin_pane(zellij_tile::shim::close_plugin_pane(plugin_pane_id)),
+        NativeCommandDispatch::CloseSelf => native_command_return_close_self(zellij_tile::shim::close_self()),
+        NativeCommandDispatch::CloseTabWithId { tab_id } => native_command_return_close_tab_with_id(zellij_tile::shim::close_tab_with_id(tab_id)),
+        NativeCommandDispatch::CloseTabWithIndex { tab_index } => native_command_return_close_tab_with_index(zellij_tile::shim::close_tab_with_index(tab_index)),
+        NativeCommandDispatch::CloseTerminalPane { terminal_pane_id } => native_command_return_close_terminal_pane(zellij_tile::shim::close_terminal_pane(terminal_pane_id)),
+        NativeCommandDispatch::CopyToClipboard { text } => native_command_return_copy_to_clipboard(zellij_tile::shim::copy_to_clipboard(text)),
+        NativeCommandDispatch::DeleteAllDeadSessions => native_command_return_delete_all_dead_sessions(zellij_tile::shim::delete_all_dead_sessions()),
+        NativeCommandDispatch::DeleteDeadSession { name } => native_command_return_delete_dead_session(zellij_tile::shim::delete_dead_session(&name)),
+        NativeCommandDispatch::DeleteLayout { layout_name } => native_command_return_delete_layout(zellij_tile::shim::delete_layout(layout_name)),
+        NativeCommandDispatch::Detach => native_command_return_detach(zellij_tile::shim::detach()),
+        NativeCommandDispatch::DisconnectOtherClients => native_command_return_disconnect_other_clients(zellij_tile::shim::disconnect_other_clients()),
+        NativeCommandDispatch::EditLayout { layout_name, context } => native_command_return_edit_layout(zellij_tile::shim::edit_layout(layout_name, context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::EditScrollback => native_command_return_edit_scrollback(zellij_tile::shim::edit_scrollback()),
+        NativeCommandDispatch::EditScrollbackForPaneWithId { pane_id } => native_command_return_edit_scrollback_for_pane_with_id(zellij_tile::shim::edit_scrollback_for_pane_with_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::EmbedMultiplePanes { pane_ids } => native_command_return_embed_multiple_panes(zellij_tile::shim::embed_multiple_panes(pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect())),
+        NativeCommandDispatch::FloatMultiplePanes { pane_ids } => native_command_return_float_multiple_panes(zellij_tile::shim::float_multiple_panes(pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect())),
+        NativeCommandDispatch::FocusHostSession => native_command_return_focus_host_session(zellij_tile::shim::focus_host_session()),
+        NativeCommandDispatch::FocusLastPane => native_command_return_focus_last_pane(zellij_tile::shim::focus_last_pane()),
+        NativeCommandDispatch::FocusNextPane => native_command_return_focus_next_pane(zellij_tile::shim::focus_next_pane()),
+        NativeCommandDispatch::FocusOrCreateTab { tab_name } => native_command_return_focus_or_create_tab(zellij_tile::shim::focus_or_create_tab(&tab_name)),
+        NativeCommandDispatch::FocusPaneWithId { pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => native_command_return_focus_pane_with_id(zellij_tile::shim::focus_pane_with_id(into_zellij_pane_id(pane_id), should_float_if_hidden, should_be_in_place_if_hidden)),
+        NativeCommandDispatch::FocusPluginPane { plugin_pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => native_command_return_focus_plugin_pane(zellij_tile::shim::focus_plugin_pane(plugin_pane_id, should_float_if_hidden, should_be_in_place_if_hidden)),
+        NativeCommandDispatch::FocusPreviousPane => native_command_return_focus_previous_pane(zellij_tile::shim::focus_previous_pane()),
+        NativeCommandDispatch::FocusTerminalPane { terminal_pane_id, should_float_if_hidden, should_be_in_place_if_hidden } => native_command_return_focus_terminal_pane(zellij_tile::shim::focus_terminal_pane(terminal_pane_id, should_float_if_hidden, should_be_in_place_if_hidden)),
+        NativeCommandDispatch::GoToNextTab => native_command_return_go_to_next_tab(zellij_tile::shim::go_to_next_tab()),
+        NativeCommandDispatch::GoToPreviousTab => native_command_return_go_to_previous_tab(zellij_tile::shim::go_to_previous_tab()),
+        NativeCommandDispatch::GoToTab { tab_index } => native_command_return_go_to_tab(zellij_tile::shim::go_to_tab(tab_index)),
+        NativeCommandDispatch::GoToTabName { tab_name } => native_command_return_go_to_tab_name(zellij_tile::shim::go_to_tab_name(&tab_name)),
+        NativeCommandDispatch::GroupAndUngroupPanes { pane_ids_to_group, pane_ids_to_ungroup, for_all_clients } => native_command_return_group_and_ungroup_panes(zellij_tile::shim::group_and_ungroup_panes(pane_ids_to_group.into_iter().map(|item| into_zellij_pane_id(item)).collect(), pane_ids_to_ungroup.into_iter().map(|item| into_zellij_pane_id(item)).collect(), for_all_clients)),
+        NativeCommandDispatch::HideFloatingPanes { tab_id } => native_command_return_hide_floating_panes(zellij_tile::shim::hide_floating_panes(tab_id.map(|item| item))),
+        NativeCommandDispatch::HidePaneWithId { pane_id } => native_command_return_hide_pane_with_id(zellij_tile::shim::hide_pane_with_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::HideSelf => native_command_return_hide_self(zellij_tile::shim::hide_self()),
+        NativeCommandDispatch::HighlightAndUnhighlightPanes { pane_ids_to_highlight, pane_ids_to_unhighlight } => native_command_return_highlight_and_unhighlight_panes(zellij_tile::shim::highlight_and_unhighlight_panes(pane_ids_to_highlight.into_iter().map(|item| into_zellij_pane_id(item)).collect(), pane_ids_to_unhighlight.into_iter().map(|item| into_zellij_pane_id(item)).collect())),
+        NativeCommandDispatch::KillSessions { session_names } => native_command_return_kill_sessions(zellij_tile::shim::kill_sessions(&session_names.into_iter().map(|item| item).collect::<Vec<_>>())),
+        NativeCommandDispatch::MoveFocus { direction } => native_command_return_move_focus(zellij_tile::shim::move_focus(into_zellij_direction(direction))),
+        NativeCommandDispatch::MoveFocusOrTab { direction } => native_command_return_move_focus_or_tab(zellij_tile::shim::move_focus_or_tab(into_zellij_direction(direction))),
+        NativeCommandDispatch::MovePane => native_command_return_move_pane(zellij_tile::shim::move_pane()),
+        NativeCommandDispatch::MovePaneWithDirection { direction } => native_command_return_move_pane_with_direction(zellij_tile::shim::move_pane_with_direction(into_zellij_direction(direction))),
+        NativeCommandDispatch::MovePaneWithPaneId { pane_id } => native_command_return_move_pane_with_pane_id(zellij_tile::shim::move_pane_with_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::MovePaneWithPaneIdInDirection { pane_id, direction } => native_command_return_move_pane_with_pane_id_in_direction(zellij_tile::shim::move_pane_with_pane_id_in_direction(into_zellij_pane_id(pane_id), into_zellij_direction(direction))),
+        NativeCommandDispatch::NewPane => native_command_return_new_pane(zellij_tile::shim::new_pane()),
+        NativeCommandDispatch::NewTab { name, cwd } => native_command_return_new_tab(zellij_tile::shim::new_tab(name.map(|item| item), cwd.map(|item| item))),
+        NativeCommandDispatch::NewTabUnfocused { name, cwd } => native_command_return_new_tab_unfocused(zellij_tile::shim::new_tab_unfocused(name.map(|item| item), cwd.map(|item| item))),
+        NativeCommandDispatch::NewTabsWithLayout { layout } => native_command_return_new_tabs_with_layout(zellij_tile::shim::new_tabs_with_layout(&layout)),
+        NativeCommandDispatch::NewTabsWithLayoutInfo { layout_info } => native_command_return_new_tabs_with_layout_info(zellij_tile::shim::new_tabs_with_layout_info(into_zellij_layout_info(layout_info))),
+        NativeCommandDispatch::NewTiledPaneInTab { tab_position } => native_command_return_new_tiled_pane_in_tab(zellij_tile::shim::new_tiled_pane_in_tab(tab_position)),
+        NativeCommandDispatch::NextSwapLayout => native_command_return_next_swap_layout(zellij_tile::shim::next_swap_layout()),
+        NativeCommandDispatch::OpenCommandPane { command_to_run, context } => native_command_return_open_command_pane(zellij_tile::shim::open_command_pane(into_zellij_command_to_run(command_to_run), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenCommandPaneBackground { command_to_run, context } => native_command_return_open_command_pane_background(zellij_tile::shim::open_command_pane_background(into_zellij_command_to_run(command_to_run), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenCommandPaneFloating { command_to_run, coordinates, context } => native_command_return_open_command_pane_floating(zellij_tile::shim::open_command_pane_floating(into_zellij_command_to_run(command_to_run), coordinates.map(|item| into_zellij_floating_pane_coordinates(item)), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenCommandPaneFloatingNearPlugin { command_to_run, coordinates, context } => native_command_return_open_command_pane_floating_near_plugin(zellij_tile::shim::open_command_pane_floating_near_plugin(into_zellij_command_to_run(command_to_run), coordinates.map(|item| into_zellij_floating_pane_coordinates(item)), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenCommandPaneInNewTab { command_to_run, context } => native_command_return_open_command_pane_in_new_tab(zellij_tile::shim::open_command_pane_in_new_tab(into_zellij_command_to_run(command_to_run), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenCommandPaneInPlace { command_to_run, context } => native_command_return_open_command_pane_in_place(zellij_tile::shim::open_command_pane_in_place(into_zellij_command_to_run(command_to_run), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenCommandPaneInPlaceOfPaneId { pane_id, command_to_run, close_replaced_pane, context } => native_command_return_open_command_pane_in_place_of_pane_id(zellij_tile::shim::open_command_pane_in_place_of_pane_id(into_zellij_pane_id(pane_id), into_zellij_command_to_run(command_to_run), close_replaced_pane, context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenCommandPaneInPlaceOfPlugin { command_to_run, close_plugin_after_replace, context } => native_command_return_open_command_pane_in_place_of_plugin(zellij_tile::shim::open_command_pane_in_place_of_plugin(into_zellij_command_to_run(command_to_run), close_plugin_after_replace, context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenCommandPaneNearPlugin { command_to_run, context } => native_command_return_open_command_pane_near_plugin(zellij_tile::shim::open_command_pane_near_plugin(into_zellij_command_to_run(command_to_run), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenEditPaneInPlaceOfPaneId { pane_id, file_to_open, close_replaced_pane, context } => native_command_return_open_edit_pane_in_place_of_pane_id(zellij_tile::shim::open_edit_pane_in_place_of_pane_id(into_zellij_pane_id(pane_id), into_zellij_file_to_open(file_to_open), close_replaced_pane, context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenEditorPaneInNewTab { file_to_open, context } => native_command_return_open_editor_pane_in_new_tab(zellij_tile::shim::open_editor_pane_in_new_tab(into_zellij_file_to_open(file_to_open), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenFile { file_to_open, context } => native_command_return_open_file(zellij_tile::shim::open_file(into_zellij_file_to_open(file_to_open), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenFileFloating { file_to_open, coordinates, context } => native_command_return_open_file_floating(zellij_tile::shim::open_file_floating(into_zellij_file_to_open(file_to_open), coordinates.map(|item| into_zellij_floating_pane_coordinates(item)), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenFileFloatingNearPlugin { file_to_open, coordinates, context } => native_command_return_open_file_floating_near_plugin(zellij_tile::shim::open_file_floating_near_plugin(into_zellij_file_to_open(file_to_open), coordinates.map(|item| into_zellij_floating_pane_coordinates(item)), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenFileInPlace { file_to_open, context } => native_command_return_open_file_in_place(zellij_tile::shim::open_file_in_place(into_zellij_file_to_open(file_to_open), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenFileInPlaceOfPlugin { file_to_open, close_plugin_after_replace, context } => native_command_return_open_file_in_place_of_plugin(zellij_tile::shim::open_file_in_place_of_plugin(into_zellij_file_to_open(file_to_open), close_plugin_after_replace, context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenFileNearPlugin { file_to_open, context } => native_command_return_open_file_near_plugin(zellij_tile::shim::open_file_near_plugin(into_zellij_file_to_open(file_to_open), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenPluginPaneFloating { plugin_url, configuration, coordinates, context } => native_command_return_open_plugin_pane_floating(zellij_tile::shim::open_plugin_pane_floating(&plugin_url, configuration.into_iter().map(|(key, item)| (key, item)).collect(), coordinates.map(|item| into_zellij_floating_pane_coordinates(item)), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenPluginPaneInNewTab { plugin_url, configuration, context } => native_command_return_open_plugin_pane_in_new_tab(zellij_tile::shim::open_plugin_pane_in_new_tab(plugin_url, configuration.into_iter().map(|(key, item)| (key, item)).collect(), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::OpenTerminal { path } => native_command_return_open_terminal(zellij_tile::shim::open_terminal(path)),
+        NativeCommandDispatch::OpenTerminalFloating { path, coordinates } => native_command_return_open_terminal_floating(zellij_tile::shim::open_terminal_floating(path, coordinates.map(|item| into_zellij_floating_pane_coordinates(item)))),
+        NativeCommandDispatch::OpenTerminalFloatingNearPlugin { path, coordinates } => native_command_return_open_terminal_floating_near_plugin(zellij_tile::shim::open_terminal_floating_near_plugin(path, coordinates.map(|item| into_zellij_floating_pane_coordinates(item)))),
+        NativeCommandDispatch::OpenTerminalInPlace { path } => native_command_return_open_terminal_in_place(zellij_tile::shim::open_terminal_in_place(path)),
+        NativeCommandDispatch::OpenTerminalInPlaceOfPlugin { path, close_plugin_after_replace } => native_command_return_open_terminal_in_place_of_plugin(zellij_tile::shim::open_terminal_in_place_of_plugin(path, close_plugin_after_replace)),
+        NativeCommandDispatch::OpenTerminalNearPlugin { path } => native_command_return_open_terminal_near_plugin(zellij_tile::shim::open_terminal_near_plugin(path)),
+        NativeCommandDispatch::OpenTerminalPaneInPlaceOfPaneId { pane_id, cwd, close_replaced_pane } => native_command_return_open_terminal_pane_in_place_of_pane_id(zellij_tile::shim::open_terminal_pane_in_place_of_pane_id(into_zellij_pane_id(pane_id), cwd, close_replaced_pane)),
+        NativeCommandDispatch::OverrideLayout { layout_info, retain_existing_terminal_panes, retain_existing_plugin_panes, apply_only_to_active_tab, context } => native_command_return_override_layout(zellij_tile::shim::override_layout(into_zellij_layout_info(layout_info), retain_existing_terminal_panes, retain_existing_plugin_panes, apply_only_to_active_tab, context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::PageScrollDown => native_command_return_page_scroll_down(zellij_tile::shim::page_scroll_down()),
+        NativeCommandDispatch::PageScrollDownInPaneId { pane_id } => native_command_return_page_scroll_down_in_pane_id(zellij_tile::shim::page_scroll_down_in_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::PageScrollUp => native_command_return_page_scroll_up(zellij_tile::shim::page_scroll_up()),
+        NativeCommandDispatch::PageScrollUpInPaneId { pane_id } => native_command_return_page_scroll_up_in_pane_id(zellij_tile::shim::page_scroll_up_in_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::PreviousSwapLayout => native_command_return_previous_swap_layout(zellij_tile::shim::previous_swap_layout()),
+        NativeCommandDispatch::QuitZellij => native_command_return_quit_zellij(zellij_tile::shim::quit_zellij()),
+        NativeCommandDispatch::RebindKeys { keys_to_unbind, keys_to_rebind, write_config_to_disk } => native_command_return_rebind_keys(zellij_tile::shim::rebind_keys(keys_to_unbind.into_iter().map(|item| { let (tuple_0, tuple_1,) = item; (into_zellij_input_mode(tuple_0), into_zellij_key_with_modifier(tuple_1),) }).collect(), keys_to_rebind.into_iter().map(|item| { let (tuple_0, tuple_1, tuple_2,) = item; (into_zellij_input_mode(tuple_0), into_zellij_key_with_modifier(tuple_1), tuple_2.into_iter().map(|item| into_zellij_action(item)).collect(),) }).collect(), write_config_to_disk)),
+        NativeCommandDispatch::Reconfigure { new_config, save_configuration_file } => native_command_return_reconfigure(zellij_tile::shim::reconfigure(new_config, save_configuration_file)),
+        NativeCommandDispatch::RenameLayout { old_layout_name, new_layout_name } => native_command_return_rename_layout(zellij_tile::shim::rename_layout(old_layout_name, new_layout_name)),
+        NativeCommandDispatch::RenamePaneWithId { pane_id, new_name } => native_command_return_rename_pane_with_id(zellij_tile::shim::rename_pane_with_id(into_zellij_pane_id(pane_id), new_name)),
+        NativeCommandDispatch::RenamePluginPane { plugin_pane_id, new_name } => native_command_return_rename_plugin_pane(zellij_tile::shim::rename_plugin_pane(plugin_pane_id, new_name)),
+        NativeCommandDispatch::RenameSession { name } => native_command_return_rename_session(zellij_tile::shim::rename_session(&name)),
+        NativeCommandDispatch::RenameTab { tab_position, new_name } => native_command_return_rename_tab(zellij_tile::shim::rename_tab(tab_position, new_name)),
+        NativeCommandDispatch::RenameTabWithId { tab_id, new_name } => native_command_return_rename_tab_with_id(zellij_tile::shim::rename_tab_with_id(tab_id, new_name)),
+        NativeCommandDispatch::RenameTerminalPane { terminal_pane_id, new_name } => native_command_return_rename_terminal_pane(zellij_tile::shim::rename_terminal_pane(terminal_pane_id, new_name)),
+        NativeCommandDispatch::ReplacePaneWithExistingPane { pane_id_to_replace, existing_pane_id, suppress_replaced_pane } => native_command_return_replace_pane_with_existing_pane(zellij_tile::shim::replace_pane_with_existing_pane(into_zellij_pane_id(pane_id_to_replace), into_zellij_pane_id(existing_pane_id), suppress_replaced_pane)),
+        NativeCommandDispatch::RerunCommandPane { terminal_pane_id } => native_command_return_rerun_command_pane(zellij_tile::shim::rerun_command_pane(terminal_pane_id)),
+        NativeCommandDispatch::ResizeFocusedPane { resize } => native_command_return_resize_focused_pane(zellij_tile::shim::resize_focused_pane(into_zellij_resize(resize))),
+        NativeCommandDispatch::ResizeFocusedPaneWithDirection { resize, direction } => native_command_return_resize_focused_pane_with_direction(zellij_tile::shim::resize_focused_pane_with_direction(into_zellij_resize(resize), into_zellij_direction(direction))),
+        NativeCommandDispatch::ResizePaneWithId { resize_strategy, pane_id } => native_command_return_resize_pane_with_id(zellij_tile::shim::resize_pane_with_id(into_zellij_resize_strategy(resize_strategy), into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::RunAction { action, context } => native_command_return_run_action(zellij_tile::shim::run_action(into_zellij_action(action), context.into_iter().map(|(key, item)| (key, item)).collect())),
+        NativeCommandDispatch::SaveLayout { layout_name, layout_kdl, overwrite } => native_command_return_save_layout(zellij_tile::shim::save_layout(layout_name, layout_kdl, overwrite)),
+        NativeCommandDispatch::SaveSession => native_command_return_save_session(zellij_tile::shim::save_session()),
+        NativeCommandDispatch::ScrollDown => native_command_return_scroll_down(zellij_tile::shim::scroll_down()),
+        NativeCommandDispatch::ScrollDownInPaneId { pane_id } => native_command_return_scroll_down_in_pane_id(zellij_tile::shim::scroll_down_in_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::ScrollToBottom => native_command_return_scroll_to_bottom(zellij_tile::shim::scroll_to_bottom()),
+        NativeCommandDispatch::ScrollToBottomInPaneId { pane_id } => native_command_return_scroll_to_bottom_in_pane_id(zellij_tile::shim::scroll_to_bottom_in_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::ScrollToTop => native_command_return_scroll_to_top(zellij_tile::shim::scroll_to_top()),
+        NativeCommandDispatch::ScrollToTopInPaneId { pane_id } => native_command_return_scroll_to_top_in_pane_id(zellij_tile::shim::scroll_to_top_in_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::ScrollUp => native_command_return_scroll_up(zellij_tile::shim::scroll_up()),
+        NativeCommandDispatch::ScrollUpInPaneId { pane_id } => native_command_return_scroll_up_in_pane_id(zellij_tile::shim::scroll_up_in_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::SendSigintToPaneId { pane_id } => native_command_return_send_sigint_to_pane_id(zellij_tile::shim::send_sigint_to_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::SendSigkillToPaneId { pane_id } => native_command_return_send_sigkill_to_pane_id(zellij_tile::shim::send_sigkill_to_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::SetFloatingPanePinned { pane_id, should_be_pinned } => native_command_return_set_floating_pane_pinned(zellij_tile::shim::set_floating_pane_pinned(into_zellij_pane_id(pane_id), should_be_pinned)),
+        NativeCommandDispatch::SetPaneBorderless { pane_id, borderless } => native_command_return_set_pane_borderless(zellij_tile::shim::set_pane_borderless(into_zellij_pane_id(pane_id), borderless)),
+        NativeCommandDispatch::SetPaneColor { pane_id, fg, bg } => native_command_return_set_pane_color(zellij_tile::shim::set_pane_color(into_zellij_pane_id(pane_id), fg.map(|item| item), bg.map(|item| item))),
+        NativeCommandDispatch::SetPaneFrameStyle { pane_frame_style } => native_command_return_set_pane_frame_style(zellij_tile::shim::set_pane_frame_style(into_zellij_pane_frame_style(pane_frame_style))),
+        NativeCommandDispatch::SetPaneRegexHighlights { pane_id, highlights } => native_command_return_set_pane_regex_highlights(zellij_tile::shim::set_pane_regex_highlights(into_zellij_pane_id(pane_id), highlights.into_iter().map(|item| into_zellij_regex_highlight(item)).collect())),
+        NativeCommandDispatch::SetSelectable { selectable } => native_command_return_set_selectable(zellij_tile::shim::set_selectable(selectable)),
+        NativeCommandDispatch::SetSelfMouseSelectionSupport { selection_support } => native_command_return_set_self_mouse_selection_support(zellij_tile::shim::set_self_mouse_selection_support(selection_support)),
+        NativeCommandDispatch::SetSoftKeyboard { on } => native_command_return_set_soft_keyboard(zellij_tile::shim::set_soft_keyboard(on)),
+        NativeCommandDispatch::ShowCursor { cursor_position } => native_command_return_show_cursor(zellij_tile::shim::show_cursor(cursor_position.map(|item| { let (tuple_0, tuple_1,) = item; (tuple_0, tuple_1,) }))),
+        NativeCommandDispatch::ShowFloatingPanes { tab_id } => native_command_return_show_floating_panes(zellij_tile::shim::show_floating_panes(tab_id.map(|item| item))),
+        NativeCommandDispatch::ShowPaneWithId { pane_id, should_float_if_hidden, should_focus_pane } => native_command_return_show_pane_with_id(zellij_tile::shim::show_pane_with_id(into_zellij_pane_id(pane_id), should_float_if_hidden, should_focus_pane)),
+        NativeCommandDispatch::ShowSelf { should_float_if_hidden } => native_command_return_show_self(zellij_tile::shim::show_self(should_float_if_hidden)),
+        NativeCommandDispatch::StackPanes { pane_ids } => native_command_return_stack_panes(zellij_tile::shim::stack_panes(pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect())),
+        NativeCommandDispatch::SwitchSession { name } => native_command_return_switch_session(zellij_tile::shim::switch_session(name.as_deref())),
+        NativeCommandDispatch::SwitchSessionWithCwd { name, cwd } => native_command_return_switch_session_with_cwd(zellij_tile::shim::switch_session_with_cwd(name.as_deref(), cwd.map(|item| item))),
+        NativeCommandDispatch::SwitchSessionWithFocus { name, tab_position, pane_id } => native_command_return_switch_session_with_focus(zellij_tile::shim::switch_session_with_focus(&name, tab_position.map(|item| item), pane_id.map(|item| { let (tuple_0, tuple_1,) = item; (tuple_0, tuple_1,) }))),
+        NativeCommandDispatch::SwitchSessionWithLayout { name, layout, cwd } => native_command_return_switch_session_with_layout(zellij_tile::shim::switch_session_with_layout(name.as_deref(), into_zellij_layout_info(layout), cwd.map(|item| item))),
+        NativeCommandDispatch::SwitchTabTo { tab_idx } => native_command_return_switch_tab_to(zellij_tile::shim::switch_tab_to(tab_idx)),
+        NativeCommandDispatch::ToggleActiveTabSync => native_command_return_toggle_active_tab_sync(zellij_tile::shim::toggle_active_tab_sync()),
+        NativeCommandDispatch::ToggleFloatingPanes { tab_id } => native_command_return_toggle_floating_panes(zellij_tile::shim::toggle_floating_panes(tab_id.map(|item| item))),
+        NativeCommandDispatch::ToggleFocusFullscreen => native_command_return_toggle_focus_fullscreen(zellij_tile::shim::toggle_focus_fullscreen()),
+        NativeCommandDispatch::ToggleFocusNoUiFullscreen => native_command_return_toggle_focus_no_ui_fullscreen(zellij_tile::shim::toggle_focus_no_ui_fullscreen()),
+        NativeCommandDispatch::TogglePaneBorderless { pane_id } => native_command_return_toggle_pane_borderless(zellij_tile::shim::toggle_pane_borderless(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::TogglePaneEmbedOrEject => native_command_return_toggle_pane_embed_or_eject(zellij_tile::shim::toggle_pane_embed_or_eject()),
+        NativeCommandDispatch::TogglePaneEmbedOrEjectForPaneId { pane_id } => native_command_return_toggle_pane_embed_or_eject_for_pane_id(zellij_tile::shim::toggle_pane_embed_or_eject_for_pane_id(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::TogglePaneFrames => native_command_return_toggle_pane_frames(zellij_tile::shim::toggle_pane_frames()),
+        NativeCommandDispatch::TogglePaneIdFullscreen { pane_id } => native_command_return_toggle_pane_id_fullscreen(zellij_tile::shim::toggle_pane_id_fullscreen(into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::ToggleTab => native_command_return_toggle_tab(zellij_tile::shim::toggle_tab()),
+        NativeCommandDispatch::UndoRenamePane => native_command_return_undo_rename_pane(zellij_tile::shim::undo_rename_pane()),
+        NativeCommandDispatch::UndoRenameTab => native_command_return_undo_rename_tab(zellij_tile::shim::undo_rename_tab()),
+        NativeCommandDispatch::Write { bytes } => native_command_return_write(zellij_tile::shim::write(bytes.into_iter().map(|item| item).collect())),
+        NativeCommandDispatch::WriteChars { chars } => native_command_return_write_chars(zellij_tile::shim::write_chars(&chars)),
+        NativeCommandDispatch::WriteCharsToPaneId { chars, pane_id } => native_command_return_write_chars_to_pane_id(zellij_tile::shim::write_chars_to_pane_id(&chars, into_zellij_pane_id(pane_id))),
+        NativeCommandDispatch::WriteToPaneId { bytes, pane_id } => native_command_return_write_to_pane_id(zellij_tile::shim::write_to_pane_id(bytes.into_iter().map(|item| item).collect(), into_zellij_pane_id(pane_id))),
+    }
+}
+

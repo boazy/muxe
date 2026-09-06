@@ -19,7 +19,7 @@ use std::{
 use eyre::{bail, Result, WrapErr};
 use quote::ToTokens;
 use sha2::{Digest, Sha256};
-use syn::{Attribute, Fields, Item, ItemEnum, ItemFn, ItemStruct, ItemType, Type, Variant, Visibility};
+use syn::{Attribute, Fields, FnArg, Item, ItemEnum, ItemFn, ItemStruct, ItemType, Pat, ReturnType, Type, Variant, Visibility};
 
 use crate::classification::{ConverterClass, FunctionClass};
 
@@ -93,6 +93,18 @@ struct ActionVariant {
     fields: Vec<String>,
 }
 
+struct ShimArgument {
+    name: String,
+    ty: Type,
+}
+
+struct ShimFunction {
+    name: String,
+    arguments: Vec<ShimArgument>,
+    return_type: Option<Type>,
+    generic_types: BTreeMap<String, Type>,
+}
+
 enum ParsedType {
     Struct(ItemStruct),
     Enum(ItemEnum),
@@ -107,6 +119,12 @@ struct TypeDefinition {
 struct MirrorSchema {
     definitions: BTreeMap<String, TypeDefinition>,
     selected: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ModelFlavor {
+    Raw,
+    Validated,
 }
 
 fn main() -> ExitCode {
@@ -133,7 +151,8 @@ fn run() -> Result<()> {
     let shim_source = read(&shim_path)?;
     let action_variants = parse_action_variants(&actions_source)?;
     let direct_types = direct_action_types(&actions_source)?;
-    let public_functions = public_functions(&shim_source)?;
+    let shim_functions = public_function_specs(&shim_source)?;
+    let public_functions = shim_functions.keys().cloned().collect::<BTreeSet<_>>();
 
     if arguments.write_function_template {
         write_policy_template(
@@ -155,8 +174,10 @@ fn run() -> Result<()> {
     validate_exact_policy("public function", &public_functions, &function_policy)?;
     validate_exact_policy("Action field type", &direct_types, &converter_policy)?;
     reject_unsupported_converters(&converter_policy)?;
+    let mut mirror_roots = direct_types.clone();
+    mirror_roots.extend(command_type_roots(&shim_functions, &function_policy));
+    let mirror_schema = mirror_schema(&arguments.source_root, &mirror_roots)?;
     validate_unsupported_function_policy(&function_policy)?;
-    let mirror_schema = mirror_schema(&arguments.source_root, &direct_types)?;
 
 
     let source_hashes = source_hashes(&arguments.source_root, &pin.source_inputs)?;
@@ -164,6 +185,7 @@ fn run() -> Result<()> {
         &pin,
         &mirror_schema,
         &source_hashes,
+        &shim_functions,
         &action_variants,
         &direct_types,
         &public_functions,
@@ -499,6 +521,7 @@ fn intrinsic_type(name: &str) -> bool {
             | "Vec"
             | "Option"
             | "Box"
+            | "Result"
             | "Arc"
             | "Rc"
             | "HashMap"
@@ -508,18 +531,115 @@ fn intrinsic_type(name: &str) -> bool {
     )
 }
 
-fn public_functions(source: &str) -> Result<BTreeSet<String>> {
+fn public_function_specs(source: &str) -> Result<BTreeMap<String, ShimFunction>> {
     let file = syn::parse_file(source).wrap_err("could not parse pinned shim.rs with syn")?;
-    let mut functions = BTreeSet::new();
+    let mut functions = BTreeMap::new();
     for item in file.items {
-        if let Item::Fn(ItemFn { vis: Visibility::Public(_), sig, .. }) = item {
-            functions.insert(sig.ident.to_string());
+        let Item::Fn(ItemFn { vis: Visibility::Public(_), sig, .. }) = item else {
+            continue;
+        };
+        let name = sig.ident.to_string();
+        let generic_types = shim_generic_types(&sig.generics);
+        let arguments = sig
+            .inputs
+            .iter()
+            .map(|argument| match argument {
+                FnArg::Typed(argument) => {
+                    let name = match &*argument.pat {
+                        Pat::Ident(identifier) => identifier.ident.to_string(),
+                        pattern => pattern.to_token_stream().to_string(),
+                    };
+                    Ok(ShimArgument {
+                        name,
+                        ty: (*argument.ty).clone(),
+                    })
+                }
+                FnArg::Receiver(_) => bail!("public shim function {name:?} has an unexpected receiver"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let return_type = match &sig.output {
+            ReturnType::Default => None,
+            ReturnType::Type(_, ty) => Some((**ty).clone()),
+        };
+        if functions
+            .insert(
+                name.clone(),
+                ShimFunction {
+                    name: name.clone(),
+                    arguments,
+                    return_type,
+                    generic_types,
+                },
+            )
+            .is_some()
+        {
+            bail!("pinned shim.rs has duplicate public function {name:?}");
         }
     }
     if functions.is_empty() {
         bail!("pinned shim.rs has no public functions");
     }
     Ok(functions)
+}
+
+fn shim_generic_types(generics: &syn::Generics) -> BTreeMap<String, Type> {
+    let mut types = BTreeMap::new();
+    for parameter in &generics.params {
+        let syn::GenericParam::Type(parameter) = parameter else {
+            continue;
+        };
+        if let Some(ty) = normalized_trait_bounds(&parameter.bounds) {
+            types.insert(parameter.ident.to_string(), ty);
+        }
+    }
+    types
+}
+
+fn normalized_trait_bounds(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::token::Plus>,
+) -> Option<Type> {
+    for bound in bounds {
+        let syn::TypeParamBound::Trait(bound) = bound else {
+            continue;
+        };
+        let segment = bound.path.segments.last()?;
+        match segment.ident.to_string().as_str() {
+            "AsRef" | "Into" => {
+                let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                    continue;
+                };
+                if let Some(syn::GenericArgument::Type(ty)) = arguments.args.first() {
+                    return Some(ty.clone());
+                }
+            }
+            "ToString" => return syn::parse_str::<Type>("String").ok(),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn command_type_roots(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+) -> BTreeSet<String> {
+    let mut roots = BTreeSet::new();
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        for argument in &function.arguments {
+            collect_type_names(&argument.ty, &mut roots);
+        }
+        if let Some(return_type) = &function.return_type {
+            collect_type_names(return_type, &mut roots);
+        }
+        for generic in function.generic_types.keys() {
+            roots.remove(generic);
+        }
+    }
+    roots.retain(|name| !builtin_type(name));
+    roots
 }
 
 fn read_policy<T>(path: &Path) -> Result<BTreeMap<String, T>>
@@ -628,6 +748,7 @@ fn generate(
     pin: &Pin,
     mirror_schema: &MirrorSchema,
     source_hashes: &BTreeMap<String, String>,
+    shim_functions: &BTreeMap<String, ShimFunction>,
     variants: &[ActionVariant],
     direct_types: &BTreeSet<String>,
     public_functions: &BTreeSet<String>,
@@ -703,12 +824,15 @@ fn generate(
     output.push_str("    (\"PercentOrFixed::Percent\", \"must not exceed 100, matching the pinned source parser\"),\n");
     output.push_str("    (\"PluginUserConfiguration\", \"must not contain keys the pinned source constructor would silently discard\"),\n");
     output.push_str("];\n\n");
-    render_model_module("raw", "Clone, Debug, PartialEq, Eq, serde::Deserialize", mirror_schema, &mut output)?;
-    render_model_module("validated", "Clone, Debug, PartialEq, Eq, serde::Serialize", mirror_schema, &mut output)?;
+    render_native_command_metadata(shim_functions, function_policy, mirror_schema, &mut output)?;
+    render_model_module("raw", "Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize", ModelFlavor::Raw, mirror_schema, &mut output)?;
+    render_model_module("validated", "Clone, Debug, PartialEq, Eq, serde::Serialize", ModelFlavor::Validated, mirror_schema, &mut output)?;
     output.push_str("pub use validated::Action as ValidatedAction;\n\n");
     render_validation_error(&mut output)?;
+    render_native_command_models(shim_functions, function_policy, mirror_schema, &mut output)?;
     render_raw_to_validated_converters(mirror_schema, &mut output)?;
     render_upstream_converters(mirror_schema, &mut output)?;
+    render_native_command_return_converters(shim_functions, function_policy, mirror_schema, &mut output)?;
     Ok(output)
 }
 
@@ -721,20 +845,688 @@ fn function_policy_reason(class: FunctionClass) -> &'static str {
     }
 }
 
+fn render_native_command_metadata(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
+    output.push_str("pub const NATIVE_ZELLIJ_COMMANDS: &[(&str, &str, &str, &str)] = &[\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        let return_type = function
+            .return_type
+            .as_ref()
+            .map(|ty| command_model_type_text(ty, &function.generic_types, ModelFlavor::Validated, mirror_schema))
+            .transpose()?
+            .unwrap_or_else(|| "()".to_owned());
+        writeln!(
+            output,
+            "    ({:?}, {:?}, {:?}, \"source-to-validated\"),",
+            yaml_kebab(&function.name),
+            function.name,
+            return_type,
+        )?;
+    }
+    output.push_str("];\n\n");
+    output.push_str("pub const NATIVE_ZELLIJ_COMMAND_ARGUMENTS: &[(&str, &str, &str, &str)] = &[\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        for argument in &function.arguments {
+            let rust_type = command_model_type_text(
+                &argument.ty,
+                &function.generic_types,
+                ModelFlavor::Raw,
+                mirror_schema,
+            )?;
+            writeln!(
+                output,
+                "    ({:?}, {:?}, {:?}, \"raw-to-validated\"),",
+                yaml_kebab(&function.name),
+                yaml_kebab(&argument.name),
+                rust_type,
+            )?;
+        }
+    }
+    output.push_str("];\n\n");
+    output.push_str("pub const NATIVE_ZELLIJ_COMMAND_CONVERTER_HOLES: &[(&str, &str, &str)] = &[];\n\n");
+    Ok(())
+}
+
+fn yaml_kebab(name: &str) -> String {
+    name.replace('_', "-")
+}
+
+
+fn render_native_command_models(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
+    output.push_str("#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]\n");
+    output.push_str("#[serde(tag = \"command\", content = \"arguments\", rename_all = \"kebab-case\", rename_all_fields = \"kebab-case\")]\n");
+    output.push_str("pub enum RawNativeCommand {\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        render_command_variant(function, ModelFlavor::Raw, mirror_schema, output)?;
+    }
+    output.push_str("}\n\n");
+
+    output.push_str("#[derive(Clone, Debug, PartialEq)]\n");
+    output.push_str("pub enum ValidatedNativeCommand {\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        render_command_variant(function, ModelFlavor::Validated, mirror_schema, output)?;
+    }
+    output.push_str("}\n\n");
+
+    output.push_str("impl TryFrom<RawNativeCommand> for ValidatedNativeCommand {\n");
+    output.push_str("    type Error = ValidationError;\n");
+    output.push_str("    fn try_from(value: RawNativeCommand) -> Result<Self, Self::Error> {\n");
+    output.push_str("        match value {\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        let variant = command_variant_name(&function.name);
+        if function.arguments.is_empty() {
+            writeln!(output, "            RawNativeCommand::{variant} => Ok(Self::{variant}),")?;
+            continue;
+        }
+        let names = function
+            .arguments
+            .iter()
+            .map(|argument| argument.name.as_str())
+            .collect::<Vec<_>>();
+        writeln!(output, "            RawNativeCommand::{variant} {{ {} }} => Ok(Self::{variant} {{", names.join(", "))?;
+        for argument in &function.arguments {
+            writeln!(
+                output,
+                "                {}: {},",
+                argument.name,
+                command_raw_to_validated_expression(
+                    &argument.ty,
+                    &argument.name,
+                    &function.generic_types,
+                    mirror_schema,
+                )?
+            )?;
+        }
+        output.push_str("            }),\n");
+    }
+    output.push_str("        }\n    }\n}\n\n");
+
+    output.push_str("#[derive(Clone, Debug, PartialEq)]\n");
+    output.push_str("pub enum NativeCommandDispatch {\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        render_command_variant(function, ModelFlavor::Validated, mirror_schema, output)?;
+    }
+    output.push_str("}\n\n");
+    output.push_str("impl From<ValidatedNativeCommand> for NativeCommandDispatch {\n");
+    output.push_str("    fn from(value: ValidatedNativeCommand) -> Self {\n");
+    output.push_str("        match value {\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        let variant = command_variant_name(&function.name);
+        if function.arguments.is_empty() {
+            writeln!(output, "            ValidatedNativeCommand::{variant} => Self::{variant},")?;
+        } else {
+            let names = function
+                .arguments
+                .iter()
+                .map(|argument| argument.name.as_str())
+                .collect::<Vec<_>>();
+            writeln!(output, "            ValidatedNativeCommand::{variant} {{ {} }} => Self::{variant} {{ {} }},", names.join(", "), names.join(", "))?;
+        }
+    }
+    output.push_str("        }\n    }\n}\n\n");
+    output.push_str("#[derive(Clone, Debug, PartialEq)]\n");
+    output.push_str("pub enum NativeCommandReturn {\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        let variant = command_variant_name(&function.name);
+        let return_type = function
+            .return_type
+            .as_ref()
+            .map(|ty| command_model_type_text(ty, &function.generic_types, ModelFlavor::Validated, mirror_schema))
+            .transpose()?
+            .unwrap_or_else(|| "()".to_owned());
+        writeln!(output, "    {variant}({return_type}),")?;
+    }
+    output.push_str("}\n\n");
+    Ok(())
+}
+
+fn render_native_command_return_converters(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
+    let return_roots = command_return_type_roots(shim_functions, function_policy);
+    if return_roots.contains("PaneId") {
+        output.push_str("#[allow(dead_code)]\n");
+        output.push_str("fn from_zellij_pane_id(value: zellij_utils::data::PaneId) -> validated::PaneId {\n");
+        output.push_str("    match value {\n");
+        output.push_str("        zellij_utils::data::PaneId::Terminal(id) => validated::PaneId::Terminal(id),\n");
+        output.push_str("        zellij_utils::data::PaneId::Plugin(id) => validated::PaneId::Plugin(id),\n");
+        output.push_str("    }\n}\n\n");
+    }
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        let source_return_type = function
+            .return_type
+            .as_ref()
+            .map(|ty| source_command_type_text(ty, &function.generic_types, mirror_schema))
+            .transpose()?
+            .unwrap_or_else(|| "()".to_owned());
+        let expression = function
+            .return_type
+            .as_ref()
+            .map(|ty| source_return_to_validated_expression(ty, "value", &function.generic_types, mirror_schema))
+            .transpose()?
+            .unwrap_or_else(|| "value".to_owned());
+        let variant = command_variant_name(&function.name);
+        writeln!(
+            output,
+            "#[allow(dead_code)]\npub fn native_command_return_{}(value: {source_return_type}) -> NativeCommandReturn {{\n    NativeCommandReturn::{variant}({expression})\n}}\n",
+            function.name,
+        )?;
+    }
+    output.push_str("pub fn dispatch_native_command(value: NativeCommandDispatch) -> NativeCommandReturn {\n");
+    output.push_str("    match value {\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        let variant = command_variant_name(&function.name);
+        let arguments = function
+            .arguments
+            .iter()
+            .map(|argument| {
+                command_validated_to_source_expression(
+                    &argument.ty,
+                    &argument.name,
+                    &function.generic_types,
+                    mirror_schema,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let pattern = if function.arguments.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {{ {} }}",
+                function
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        writeln!(
+            output,
+            "        NativeCommandDispatch::{variant}{pattern} => native_command_return_{}(zellij_tile::shim::{}({})),",
+            function.name,
+            function.name,
+            arguments.join(", "),
+        )?;
+    }
+    output.push_str("    }\n}\n\n");
+    Ok(())
+}
+
+fn command_validated_to_source_expression(
+    ty: &Type,
+    value: &str,
+    generic_types: &BTreeMap<String, Type>,
+    mirror_schema: &MirrorSchema,
+) -> Result<String> {
+    match ty {
+        Type::Reference(reference) if matches!(reference.elem.as_ref(), Type::Slice(_)) => {
+            command_validated_to_source_expression(&reference.elem, value, generic_types, mirror_schema)
+        }
+        Type::Reference(reference) => Ok(format!(
+            "&{}",
+            command_validated_to_source_expression(&reference.elem, value, generic_types, mirror_schema)?
+        )),
+        Type::Slice(slice) => {
+            let item = command_validated_to_source_expression(&slice.elem, "item", generic_types, mirror_schema)?;
+            Ok(format!("&{value}.into_iter().map(|item| {item}).collect::<Vec<_>>()"))
+        }
+        Type::ImplTrait(impl_trait) => {
+            let normalized = normalized_trait_bounds(&impl_trait.bounds)
+                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command parameter {}", type_text(ty)))?;
+            command_validated_to_source_expression(&normalized, value, generic_types, mirror_schema)
+        }
+        Type::Path(path) => {
+            let segment = path.path.segments.last().expect("path has a segment");
+            let name = segment.ident.to_string();
+            if let Some(normalized) = generic_types.get(&name) {
+                return command_validated_to_source_expression(normalized, value, generic_types, mirror_schema);
+            }
+            let arguments = type_arguments(segment)?;
+            if name == "Option"
+                && arguments.len() == 1
+                && matches!(
+                    arguments[0],
+                    Type::Reference(reference)
+                        if matches!(
+                            reference.elem.as_ref(),
+                            Type::Path(path) if path.path.is_ident("str")
+                        )
+                )
+            {
+                return Ok(format!("{value}.as_deref()"));
+            }
+            into_source_expression(ty, value, mirror_schema)
+        }
+        Type::Tuple(tuple) => {
+            let names = (0..tuple.elems.len())
+                .map(|index| format!("tuple_{index}"))
+                .collect::<Vec<_>>();
+            let values = tuple
+                .elems
+                .iter()
+                .zip(&names)
+                .map(|(element, name)| command_validated_to_source_expression(element, name, generic_types, mirror_schema))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!(
+                "{{ let ({},) = {value}; ({},) }}",
+                names.join(", "),
+                values.join(", ")
+            ))
+        }
+        Type::Group(group) => command_validated_to_source_expression(&group.elem, value, generic_types, mirror_schema),
+        Type::Paren(paren) => command_validated_to_source_expression(&paren.elem, value, generic_types, mirror_schema),
+        _ => into_source_expression(ty, value, mirror_schema),
+    }
+}
+
+
+fn command_return_type_roots(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+) -> BTreeSet<String> {
+    let mut roots = BTreeSet::new();
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        if let Some(return_type) = &function.return_type {
+            collect_type_names(return_type, &mut roots);
+        }
+        for generic in function.generic_types.keys() {
+            roots.remove(generic);
+        }
+    }
+    roots.retain(|name| !builtin_type(name));
+    roots
+}
+
+fn source_command_type_text(
+    ty: &Type,
+    generic_types: &BTreeMap<String, Type>,
+    mirror_schema: &MirrorSchema,
+) -> Result<String> {
+    match ty {
+        Type::Reference(reference) => source_command_type_text(&reference.elem, generic_types, mirror_schema),
+        Type::Slice(slice) => Ok(format!(
+            "Vec < {} >",
+            source_command_type_text(&slice.elem, generic_types, mirror_schema)?
+        )),
+        Type::ImplTrait(impl_trait) => {
+            let normalized = normalized_trait_bounds(&impl_trait.bounds)
+                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command return {}", type_text(ty)))?;
+            source_command_type_text(&normalized, generic_types, mirror_schema)
+        }
+        Type::Path(path) => {
+            let segment = path.path.segments.last().expect("path has a segment");
+            let name = segment.ident.to_string();
+            if let Some(normalized) = generic_types.get(&name) {
+                return source_command_type_text(normalized, generic_types, mirror_schema);
+            }
+            let arguments = type_arguments(segment)?;
+            if let Some(definition) = selected_definition(&name, mirror_schema) {
+                return source_type_path(definition, &name);
+            }
+            match name.as_str() {
+                "Option" | "Vec" | "Box" | "Result" | "BTreeSet" | "HashSet" | "BTreeMap" | "HashMap" => Ok(format!(
+                    "{} < {} >",
+                    name,
+                    arguments
+                        .iter()
+                        .map(|argument| source_command_type_text(argument, generic_types, mirror_schema))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ")
+                )),
+                "Path" | "PathBuf" => Ok("std::path::PathBuf".to_owned()),
+                "String" | "bool" | "char" | "usize" | "u8" | "u16" | "u32" | "u64" | "i32" | "i64" | "f64" => Ok(name),
+                _ => bail!("no typed source return converter for {}", type_text(ty)),
+            }
+        }
+        Type::Tuple(tuple) => {
+            if tuple.elems.is_empty() {
+                return Ok("()".to_owned());
+            }
+            let elements = tuple
+                .elems
+                .iter()
+                .map(|element| source_command_type_text(element, generic_types, mirror_schema))
+                .collect::<Result<Vec<_>>>()?
+                .join(", ");
+            Ok(format!("({elements}{})", if tuple.elems.len() == 1 { "," } else { "" }))
+        }
+        Type::Group(group) => source_command_type_text(&group.elem, generic_types, mirror_schema),
+        Type::Paren(paren) => source_command_type_text(&paren.elem, generic_types, mirror_schema),
+        _ => bail!("no typed source return converter for {}", type_text(ty)),
+    }
+}
+
+fn source_return_to_validated_expression(
+    ty: &Type,
+    value: &str,
+    generic_types: &BTreeMap<String, Type>,
+    mirror_schema: &MirrorSchema,
+) -> Result<String> {
+    match ty {
+        Type::Reference(reference) => source_return_to_validated_expression(&reference.elem, value, generic_types, mirror_schema),
+        Type::Slice(slice) => {
+            let item = source_return_to_validated_expression(&slice.elem, "item", generic_types, mirror_schema)?;
+            Ok(format!("{value}.into_iter().map(|item| {item}).collect()"))
+        }
+        Type::ImplTrait(impl_trait) => {
+            let normalized = normalized_trait_bounds(&impl_trait.bounds)
+                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command return {}", type_text(ty)))?;
+            source_return_to_validated_expression(&normalized, value, generic_types, mirror_schema)
+        }
+        Type::Path(path) => {
+            let segment = path.path.segments.last().expect("path has a segment");
+            let name = segment.ident.to_string();
+            if let Some(normalized) = generic_types.get(&name) {
+                return source_return_to_validated_expression(normalized, value, generic_types, mirror_schema);
+            }
+            if selected_definition(&name, mirror_schema).is_some() {
+                return match name.as_str() {
+                    "PaneId" => Ok(format!("from_zellij_pane_id({value})")),
+                    _ => bail!("no source-to-validated command return converter for {name}"),
+                };
+            }
+            let arguments = type_arguments(segment)?;
+            match name.as_str() {
+                "Option" => {
+                    let item = source_return_to_validated_expression(arguments[0], "item", generic_types, mirror_schema)?;
+                    Ok(format!("{value}.map(|item| {item})"))
+                }
+                "Vec" | "BTreeSet" | "HashSet" => {
+                    let item = source_return_to_validated_expression(arguments[0], "item", generic_types, mirror_schema)?;
+                    Ok(format!("{value}.into_iter().map(|item| {item}).collect()"))
+                }
+                "Result" => {
+                    let ok = source_return_to_validated_expression(arguments[0], "item", generic_types, mirror_schema)?;
+                    let error = source_return_to_validated_expression(arguments[1], "error", generic_types, mirror_schema)?;
+                    Ok(format!("{value}.map(|item| {ok}).map_err(|error| {error})"))
+                }
+                "BTreeMap" | "HashMap" => {
+                    let key = source_return_to_validated_expression(arguments[0], "key", generic_types, mirror_schema)?;
+                    let item = source_return_to_validated_expression(arguments[1], "item", generic_types, mirror_schema)?;
+                    Ok(format!("{value}.into_iter().map(|(key, item)| ({key}, {item})).collect()"))
+                }
+                "Box" => {
+                    let item = source_return_to_validated_expression(arguments[0], &format!("*{value}"), generic_types, mirror_schema)?;
+                    Ok(format!("Box::new({item})"))
+                }
+                _ => Ok(value.to_owned()),
+            }
+        }
+        Type::Tuple(tuple) => {
+            if tuple.elems.is_empty() {
+                return Ok(value.to_owned());
+            }
+            let names = (0..tuple.elems.len())
+                .map(|index| format!("tuple_{index}"))
+                .collect::<Vec<_>>();
+            let values = tuple
+                .elems
+                .iter()
+                .zip(&names)
+                .map(|(element, name)| source_return_to_validated_expression(element, name, generic_types, mirror_schema))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!(
+                "{{ let ({},) = {value}; ({},) }}",
+                names.join(", "),
+                values.join(", ")
+            ))
+        }
+        Type::Group(group) => source_return_to_validated_expression(&group.elem, value, generic_types, mirror_schema),
+        Type::Paren(paren) => source_return_to_validated_expression(&paren.elem, value, generic_types, mirror_schema),
+        _ => Ok(value.to_owned()),
+    }
+}
+
+fn render_command_variant(
+    function: &ShimFunction,
+    flavor: ModelFlavor,
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
+    let variant = command_variant_name(&function.name);
+    if function.arguments.is_empty() {
+        writeln!(output, "    {variant},")?;
+        return Ok(());
+    }
+    writeln!(output, "    {variant} {{")?;
+    for argument in &function.arguments {
+        writeln!(
+            output,
+            "        {}: {},",
+            argument.name,
+            command_model_type_text(
+                &argument.ty,
+                &function.generic_types,
+                flavor,
+                mirror_schema,
+            )?
+        )?;
+    }
+    output.push_str("    },\n");
+    Ok(())
+}
+
+fn command_model_type_text(
+    ty: &Type,
+    generic_types: &BTreeMap<String, Type>,
+    flavor: ModelFlavor,
+    mirror_schema: &MirrorSchema,
+) -> Result<String> {
+    match ty {
+        Type::Reference(reference) => command_model_type_text(&reference.elem, generic_types, flavor, mirror_schema),
+        Type::Slice(slice) => Ok(format!(
+            "Vec < {} >",
+            command_model_type_text(&slice.elem, generic_types, flavor, mirror_schema)?
+        )),
+        Type::ImplTrait(impl_trait) => {
+            let normalized = normalized_trait_bounds(&impl_trait.bounds)
+                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command parameter {}", type_text(ty)))?;
+            command_model_type_text(&normalized, generic_types, flavor, mirror_schema)
+        }
+        Type::Path(path) => {
+            let segment = path.path.segments.last().expect("path has a segment");
+            let name = segment.ident.to_string();
+            if let Some(normalized) = generic_types.get(&name) {
+                return command_model_type_text(normalized, generic_types, flavor, mirror_schema);
+            }
+            let arguments = type_arguments(segment)?;
+            if name == "str" {
+                return Ok("String".to_owned());
+            }
+            if selected_definition(&name, mirror_schema).is_some() {
+                return Ok(format!(
+                    "{}::{}",
+                    match flavor {
+                        ModelFlavor::Raw => "raw",
+                        ModelFlavor::Validated => "validated",
+                    },
+                    name
+                ));
+            }
+            match name.as_str() {
+                "Option" | "Vec" | "Box" | "Result" => Ok(format!(
+                    "{} < {} >",
+                    name,
+                    arguments
+                        .iter()
+                        .map(|argument| command_model_type_text(argument, generic_types, flavor, mirror_schema))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ")
+                )),
+                "BTreeSet" | "HashSet" => Ok(format!(
+                    "std::collections::{} < {} >",
+                    name,
+                    arguments
+                        .iter()
+                        .map(|argument| command_model_type_text(argument, generic_types, flavor, mirror_schema))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ")
+                )),
+                "BTreeMap" | "HashMap" if matches!(flavor, ModelFlavor::Raw) => {
+                    if arguments.len() != 2 {
+                        bail!("{name} command parameter needs key and value types");
+                    }
+                    Ok(format!(
+                        "Vec < raw::MapEntry < {}, {} > >",
+                        command_model_type_text(arguments[0], generic_types, flavor, mirror_schema)?,
+                        command_model_type_text(arguments[1], generic_types, flavor, mirror_schema)?,
+                    ))
+                }
+                "BTreeMap" | "HashMap" => Ok(format!(
+                    "std::collections::{} < {} >",
+                    name,
+                    arguments
+                        .iter()
+                        .map(|argument| command_model_type_text(argument, generic_types, flavor, mirror_schema))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ")
+                )),
+                "Path" | "PathBuf" => Ok("std::path::PathBuf".to_owned()),
+                "String" | "bool" | "usize" | "u8" | "u16" | "u32" | "u64" | "i32" | "i64" | "f64" => Ok(name),
+                _ => bail!("no typed command converter for {}", type_text(ty)),
+            }
+        }
+        Type::Tuple(tuple) => {
+            if tuple.elems.is_empty() {
+                return Ok("()".to_owned());
+            }
+            let elements = tuple
+                .elems
+                .iter()
+                .map(|element| command_model_type_text(element, generic_types, flavor, mirror_schema))
+                .collect::<Result<Vec<_>>>()?
+                .join(", ");
+            Ok(format!("({elements}{})", if tuple.elems.len() == 1 { "," } else { "" }))
+        }
+        Type::Group(group) => command_model_type_text(&group.elem, generic_types, flavor, mirror_schema),
+        Type::Paren(paren) => command_model_type_text(&paren.elem, generic_types, flavor, mirror_schema),
+        _ => bail!("no typed command converter for {}", type_text(ty)),
+    }
+}
+
+fn command_raw_to_validated_expression(
+    ty: &Type,
+    value: &str,
+    generic_types: &BTreeMap<String, Type>,
+    mirror_schema: &MirrorSchema,
+) -> Result<String> {
+    match ty {
+        Type::Reference(reference) => command_raw_to_validated_expression(&reference.elem, value, generic_types, mirror_schema),
+        Type::Slice(slice) => {
+            let item = command_raw_to_validated_expression(&slice.elem, "item", generic_types, mirror_schema)?;
+            Ok(format!("{value}.into_iter().map(|item| -> Result<_, ValidationError> {{ Ok({item}) }}).collect::<Result<_, ValidationError>>()?"))
+        }
+        Type::ImplTrait(impl_trait) => {
+            let normalized = normalized_trait_bounds(&impl_trait.bounds)
+                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command parameter {}", type_text(ty)))?;
+            command_raw_to_validated_expression(&normalized, value, generic_types, mirror_schema)
+        }
+        Type::Path(path) => {
+            let name = path.path.segments.last().expect("path has a segment").ident.to_string();
+            if let Some(normalized) = generic_types.get(&name) {
+                return command_raw_to_validated_expression(normalized, value, generic_types, mirror_schema);
+            }
+            raw_to_validated_expression(ty, value, mirror_schema)
+        }
+        Type::Tuple(tuple) => {
+            let names = (0..tuple.elems.len())
+                .map(|index| format!("tuple_{index}"))
+                .collect::<Vec<_>>();
+            let values = tuple
+                .elems
+                .iter()
+                .zip(&names)
+                .map(|(element, name)| command_raw_to_validated_expression(element, name, generic_types, mirror_schema))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!(
+                "{{ let ({},) = {value}; ({},) }}",
+                names.join(", "),
+                values.join(", ")
+            ))
+        }
+        Type::Group(group) => command_raw_to_validated_expression(&group.elem, value, generic_types, mirror_schema),
+        Type::Paren(paren) => command_raw_to_validated_expression(&paren.elem, value, generic_types, mirror_schema),
+        _ => raw_to_validated_expression(ty, value, mirror_schema),
+    }
+}
+
+fn command_variant_name(name: &str) -> String {
+    name.split('_')
+        .map(|part| {
+            let mut characters = part.chars();
+            let first = characters.next().expect("function name segments are non-empty");
+            format!("{}{}", first.to_ascii_uppercase(), characters.as_str())
+        })
+        .collect()
+}
 fn render_model_module(
     name: &str,
     base_derives: &str,
+    flavor: ModelFlavor,
     mirror_schema: &MirrorSchema,
     output: &mut String,
 ) -> Result<()> {
     writeln!(output, "pub mod {name} {{")?;
-    output.push_str("    use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf};\n\n");
+    output.push_str(match flavor {
+        ModelFlavor::Raw => "    use std::{collections::BTreeSet, path::PathBuf};\n\n",
+        ModelFlavor::Validated => "    use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf};\n\n",
+    });
+    if matches!(flavor, ModelFlavor::Raw) {
+        output.push_str("    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n");
+        output.push_str("    pub struct MapEntry<K, V> { pub key: K, pub value: V }\n\n");
+    }
     for type_name in &mirror_schema.selected {
         let definition = mirror_schema
             .definitions
             .get(type_name)
             .expect("selected mirror types have declarations");
-        render_model_type(definition, base_derives, output)?;
+        render_model_type(definition, base_derives, flavor, output)?;
         output.push('\n');
     }
     output.push_str("}\n\n");
@@ -744,6 +1536,7 @@ fn render_model_module(
 fn render_model_type(
     definition: &TypeDefinition,
     base_derives: &str,
+    flavor: ModelFlavor,
     output: &mut String,
 ) -> Result<()> {
     match &definition.item {
@@ -751,19 +1544,19 @@ fn render_model_type(
             writeln!(output, "    #[derive({})]", model_derives(base_derives, &item.attrs))?;
             render_serde_attributes(&item.attrs, "    ", output)?;
             write!(output, "    pub struct {}", item.ident)?;
-            render_struct_fields(&item.fields, output)?;
+            render_struct_fields(&item.fields, flavor, output)?;
         }
         ParsedType::Enum(item) => {
             writeln!(output, "    #[derive({})]", model_derives(base_derives, &item.attrs))?;
             render_serde_attributes(&item.attrs, "    ", output)?;
             writeln!(output, "    pub enum {} {{", item.ident)?;
             for variant in &item.variants {
-                render_enum_variant(variant, output)?;
+                render_enum_variant(variant, flavor, output)?;
             }
             output.push_str("    }\n");
         }
         ParsedType::Alias(item) => {
-            writeln!(output, "    pub type {} = {};", item.ident, type_text(&item.ty))?;
+            writeln!(output, "    pub type {} = {};", item.ident, model_type_text(&item.ty, flavor)?)?;
         }
     }
     Ok(())
@@ -788,7 +1581,7 @@ fn has_derive(attributes: &[Attribute], expected: &str) -> bool {
     })
 }
 
-fn render_struct_fields(fields: &Fields, output: &mut String) -> Result<()> {
+fn render_struct_fields(fields: &Fields, flavor: ModelFlavor, output: &mut String) -> Result<()> {
     match fields {
         Fields::Unit => output.push_str(";\n"),
         Fields::Named(fields) => {
@@ -796,14 +1589,14 @@ fn render_struct_fields(fields: &Fields, output: &mut String) -> Result<()> {
             for field in &fields.named {
                 render_serde_attributes(&field.attrs, "        ", output)?;
                 let name = field.ident.as_ref().expect("named syn field has ident");
-                writeln!(output, "        pub {name}: {},", type_text(&field.ty))?;
+                writeln!(output, "        pub {name}: {},", model_type_text(&field.ty, flavor)?)?;
             }
             output.push_str("    }\n");
         }
         Fields::Unnamed(fields) => {
             output.push('(');
             for field in &fields.unnamed {
-                write!(output, "pub {}, ", type_text(&field.ty))?;
+                write!(output, "pub {}, ", model_type_text(&field.ty, flavor)?)?;
             }
             output.push_str(");\n");
         }
@@ -811,7 +1604,7 @@ fn render_struct_fields(fields: &Fields, output: &mut String) -> Result<()> {
     Ok(())
 }
 
-fn render_enum_variant(variant: &Variant, output: &mut String) -> Result<()> {
+fn render_enum_variant(variant: &Variant, flavor: ModelFlavor, output: &mut String) -> Result<()> {
     render_serde_attributes(&variant.attrs, "        ", output)?;
     match &variant.fields {
         Fields::Unit => writeln!(output, "        {},", variant.ident)?,
@@ -820,19 +1613,66 @@ fn render_enum_variant(variant: &Variant, output: &mut String) -> Result<()> {
             for field in &fields.named {
                 render_serde_attributes(&field.attrs, "            ", output)?;
                 let name = field.ident.as_ref().expect("named syn field has ident");
-                writeln!(output, "            {name}: {},", type_text(&field.ty))?;
+                writeln!(output, "            {name}: {},", model_type_text(&field.ty, flavor)?)?;
             }
             output.push_str("        },\n");
         }
         Fields::Unnamed(fields) => {
             write!(output, "        {}(", variant.ident)?;
             for field in &fields.unnamed {
-                write!(output, "{}, ", type_text(&field.ty))?;
+                write!(output, "{}, ", model_type_text(&field.ty, flavor)?)?;
             }
             output.push_str("),\n");
         }
     }
     Ok(())
+}
+
+fn model_type_text(ty: &Type, flavor: ModelFlavor) -> Result<String> {
+    match ty {
+        Type::Path(path) => {
+            let segment = path.path.segments.last().expect("path has a segment");
+            let name = segment.ident.to_string();
+            let arguments = type_arguments(segment)?;
+            if matches!(flavor, ModelFlavor::Raw) && matches!(name.as_str(), "BTreeMap" | "HashMap") {
+                if arguments.len() != 2 {
+                    bail!("{name} must have key and value types");
+                }
+                return Ok(format!(
+                    "Vec < MapEntry < {}, {} > >",
+                    model_type_text(arguments[0], flavor)?,
+                    model_type_text(arguments[1], flavor)?
+                ));
+            }
+            if arguments.is_empty() {
+                return Ok(type_text(ty));
+            }
+            Ok(format!(
+                "{} < {} >",
+                name,
+                arguments
+                    .iter()
+                    .map(|argument| model_type_text(argument, flavor))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(", ")
+            ))
+        }
+        Type::Tuple(tuple) => {
+            if tuple.elems.is_empty() {
+                return Ok("()".to_owned());
+            }
+            let elements = tuple
+                .elems
+                .iter()
+                .map(|element| model_type_text(element, flavor))
+                .collect::<Result<Vec<_>>>()?
+                .join(", ");
+            Ok(format!("({elements}{})", if tuple.elems.len() == 1 { "," } else { "" }))
+        }
+        Type::Group(group) => model_type_text(&group.elem, flavor),
+        Type::Paren(paren) => model_type_text(&paren.elem, flavor),
+        _ => Ok(type_text(ty)),
+    }
 }
 
 fn render_serde_attributes(attributes: &[Attribute], indent: &str, output: &mut String) -> Result<()> {
@@ -882,10 +1722,16 @@ fn render_plugin_user_configuration_validation(output: &mut String) -> Result<()
     output.push_str("    type Error = ValidationError;\n");
     output.push_str("    fn try_from(raw::PluginUserConfiguration(configuration): raw::PluginUserConfiguration) -> Result<Self, Self::Error> {\n");
     output.push_str("        const RESERVED: &[&str] = &[\"hold_on_close\", \"hold_on_start\", \"cwd\", \"name\", \"direction\", \"floating\", \"move_to_focused_tab\", \"launch_new\", \"payload\", \"skip_cache\", \"title\", \"in_place\", \"skip_plugin_cache\"];\n");
-    output.push_str("        if let Some(key) = configuration.keys().find(|key| RESERVED.contains(&key.as_str())) {\n");
-    output.push_str("            return Err(ValidationError::new(\"PluginUserConfiguration\", \"configuration\", format!(\"reserved key {key:?} would be discarded by the pinned Zellij constructor\")));\n");
+    output.push_str("        let mut converted = std::collections::BTreeMap::new();\n");
+    output.push_str("        for raw::MapEntry { key, value } in configuration {\n");
+    output.push_str("            if RESERVED.contains(&key.as_str()) {\n");
+    output.push_str("                return Err(ValidationError::new(\"PluginUserConfiguration\", \"configuration\", format!(\"reserved key {key:?} would be discarded by the pinned Zellij constructor\")));\n");
+    output.push_str("            }\n");
+    output.push_str("            if converted.insert(key, value).is_some() {\n");
+    output.push_str("                return Err(ValidationError::new(\"PluginUserConfiguration\", \"configuration\", \"duplicate semantic key\"));\n");
+    output.push_str("            }\n");
     output.push_str("        }\n");
-    output.push_str("        Ok(Self(configuration))\n");
+    output.push_str("        Ok(Self(converted))\n");
     output.push_str("    }\n");
     output.push_str("}\n");
     Ok(())
@@ -1039,10 +1885,19 @@ fn raw_to_validated_expression(
                     let item = raw_to_validated_expression(arguments[0], "item", mirror_schema)?;
                     Ok(format!("{value}.into_iter().map(|item| -> Result<_, ValidationError> {{ Ok({item}) }}).collect::<Result<_, ValidationError>>()?"))
                 }
-                "BTreeMap" | "HashMap" => {
+                "BTreeMap" => {
                     let key = raw_to_validated_expression(arguments[0], "key", mirror_schema)?;
-                    let item = raw_to_validated_expression(arguments[1], "item", mirror_schema)?;
-                    Ok(format!("{value}.into_iter().map(|(key, item)| -> Result<_, ValidationError> {{ Ok(({key}, {item})) }}).collect::<Result<_, ValidationError>>()?"))
+                    let map_value = raw_to_validated_expression(arguments[1], "map_value", mirror_schema)?;
+                    Ok(format!(
+                        "{{ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry {{ key, value: map_value }} in {value} {{ let key = {key}; let map_value = {map_value}; if converted.insert(key, map_value).is_some() {{ return Err(ValidationError::new(\"BTreeMap\", \"key\", \"duplicate semantic key\")); }} }} converted }}"
+                    ))
+                }
+                "HashMap" => {
+                    let key = raw_to_validated_expression(arguments[0], "key", mirror_schema)?;
+                    let map_value = raw_to_validated_expression(arguments[1], "map_value", mirror_schema)?;
+                    Ok(format!(
+                        "{{ let mut converted = std::collections::HashMap::new(); for raw::MapEntry {{ key, value: map_value }} in {value} {{ let key = {key}; let map_value = {map_value}; if converted.insert(key, map_value).is_some() {{ return Err(ValidationError::new(\"HashMap\", \"key\", \"duplicate semantic key\")); }} }} converted }}"
+                    ))
                 }
                 "Box" => {
                     let item = raw_to_validated_expression(
@@ -1106,6 +1961,7 @@ fn render_upstream_struct_converter(
     output: &mut String,
 ) -> Result<()> {
     let source_type = source_type_path(definition, type_name)?;
+    output.push_str("#[allow(dead_code)]\n");
     writeln!(
         output,
         "fn into_zellij_{}(value: validated::{type_name}) -> {source_type} {{",
@@ -1163,6 +2019,7 @@ fn render_upstream_enum_converter(
     output: &mut String,
 ) -> Result<()> {
     let source_type = source_type_path(definition, type_name)?;
+    output.push_str("#[allow(dead_code)]\n");
     writeln!(
         output,
         "fn into_zellij_{}(value: validated::{type_name}) -> {source_type} {{",
