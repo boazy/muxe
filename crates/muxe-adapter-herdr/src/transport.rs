@@ -284,7 +284,8 @@ pub(crate) async fn write_line(stream: &mut UnixStream, line: &[u8]) -> Result<(
 
 /// Credentials the OS reports for the peer of one Herdr connection. They are advisory
 /// defense-in-depth beside the socket-file device/inode boundary: a replacement server
-/// rebound to the same path already compares unequal through its fresh inode.
+/// rebound to the same path normally compares unequal through its fresh inode, but
+/// inode numbers may be recycled, so peer evidence is never continuity proof alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerIdentity {
     pub uid: u32,
@@ -294,11 +295,12 @@ pub struct PeerIdentity {
 
 /// The OS-visible identity of one Herdr server incarnation behind a socket path.
 ///
-/// Equality is the continuity proof: a new server rebound to the same canonical path
-/// carries a fresh socket-file inode, so it never compares equal to the old incarnation
-/// even when it reports the same protocol and version. [`EndpointIdentity::recheck`]
-/// is only a cheap stat gate; full comparison against the retained value is the proof
-/// the broker must require before host-bound dispatch.
+/// Comparison semantics follow the continuity rule: inequality is sound proof of
+/// replacement (the live socket file or its peer changed), while equality is
+/// observation only and never continuity proof, because POSIX may recycle inode
+/// numbers after unlink. The continuity authority is the retained subscription
+/// stream staying alive plus a new local epoch after any loss; this record only
+/// ever proves change, never sameness. See [`EndpointIdentity::proven_replacement`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndpointIdentity {
     socket: PathBuf,
@@ -360,10 +362,22 @@ impl EndpointIdentity {
     }
 
     /// Whether OS peer credentials were available at capture. Without them the
-    /// device/inode boundary still distinguishes a rebound server, but broker policy
-    /// may require this evidence before treating continuity as proved.
+    /// device/inode boundary still observes replacement, but broker policy may
+    /// require this evidence before trusting even the observation.
     pub fn has_peer_evidence(&self) -> bool {
         self.peer.is_some()
+    }
+
+    /// Reports whether `other` provably identifies a different server incarnation.
+    /// Inequality is sound proof of replacement: the live socket file or its peer
+    /// changed. Equality is explicitly NOT proof of continuity: POSIX may recycle
+    /// inode numbers after unlink, so a rebound server can in theory present the
+    /// same device, inode, and peer. The continuity authority is the retained
+    /// subscription stream staying alive plus a new local epoch after any loss;
+    /// callers must never treat `!proven_replacement(a, b)` as proof that `a`
+    /// and `b` are the same live server.
+    pub fn proven_replacement(&self, other: &Self) -> bool {
+        self != other
     }
 
     /// Re-stats the captured socket path and reports whether its device and inode still
@@ -385,7 +399,9 @@ impl EndpointIdentity {
 
     /// Renders the opaque server-incarnation identifier carried in `HostIdentity`.
     /// The value is only equality-compared; no consumer may parse or persist structure
-    /// from it.
+    /// from it. Equality is necessary but never sufficient for continuity: a changed
+    /// value proves replacement, an unchanged value proves nothing (see
+    /// [`EndpointIdentity::proven_replacement`]).
     pub fn live_server_id(&self, protocol: u64, version: &str) -> String {
         let peer = match self.peer {
             Some(peer) => match peer.pid {
@@ -673,6 +689,14 @@ mod tests {
         assert_ne!(
             first.live_server_id(20, "0.8.2"),
             second.live_server_id(20, "0.8.2")
+        );
+        assert!(
+            first.proven_replacement(&second),
+            "endpoint inequality is sound proof of replacement"
+        );
+        assert!(
+            !second.proven_replacement(&second),
+            "equality never proves continuity on its own"
         );
     }
 }

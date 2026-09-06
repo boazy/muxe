@@ -14,8 +14,11 @@ use crate::{
 };
 
 /// Wall-clock bound for one `herdr api schema --json` invocation. Exceeding it fails
-/// closed; the owned child is killed through `kill_on_drop` and reaped on drop.
+/// closed; the owned child is explicitly killed and reaped (see `runtime_schema`).
 const SCHEMA_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for reaping the owned schema child after killing it on timeout. SIGKILL
+/// cannot be caught, so this only guards against a wedged reaper, not the child.
+const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Absolute cap on accepted schema stdout. Anything larger is rejected before parsing.
 const MAX_SCHEMA_BYTES: u64 = 8 * 1024 * 1024;
 /// Retained stderr bytes for failure diagnostics; the remainder is discarded.
@@ -85,9 +88,12 @@ impl HerdrRuntime {
     }
 
     /// The retained OS-visible incarnation of the server this runtime connected to.
-    /// The broker compares fresh probes against this value; any inequality proves
-    /// replacement and must fail closed host-bound dispatch, never silently reuse
-    /// stale origins, leases, or pending cleanups against coincident IDs.
+    /// The broker compares fresh probes with [`EndpointIdentity::proven_replacement`]:
+    /// a proved change fails closed host-bound dispatch and never reuses stale
+    /// origins, leases, or pending cleanups against coincident IDs. An unchanged
+    /// record proves nothing on its own (inode numbers may be recycled); the
+    /// continuity authority is the retained subscription stream plus a new local
+    /// epoch after any loss.
     pub fn endpoint(&self) -> &EndpointIdentity {
         &self.endpoint
     }
@@ -101,9 +107,8 @@ async fn runtime_schema(binary: &PathBuf) -> Result<Value, AdapterError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Only the exact owned child spawned here is ever killed: on timeout the
-        // collection future is dropped, then this function returns and drops `child`,
-        // which kills and reaps exactly this process. No other process is signaled.
+        // `kill_on_drop` is only a backstop: the timeout path below explicitly
+        // kills and reaps exactly this owned child.
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| {
@@ -115,20 +120,27 @@ async fn runtime_schema(binary: &PathBuf) -> Result<Value, AdapterError> {
                 ),
             )
         })?;
-    let (status, stdout, diagnostics) = tokio::time::timeout(SCHEMA_TIMEOUT, async {
-        collect_schema_output(&mut child).await
-    })
-    .await
-    .map_err(|_| {
-        AdapterError::new(
-            AdapterErrorKind::Unavailable,
-            format!(
-                "{} api schema --json timed out after {}s",
-                binary.display(),
-                SCHEMA_TIMEOUT.as_secs()
-            ),
-        )
-    })??;
+    let outcome = tokio::time::timeout(SCHEMA_TIMEOUT, collect_schema_output(&mut child)).await;
+    let (status, stdout, diagnostics) = match outcome {
+        Ok(collected) => collected?,
+        Err(_) => {
+            // Explicitly kill and reap exactly the owned child spawned above.
+            // `start_kill` signals only this retained handle and `wait` reaps it,
+            // so no zombie remains and no other process can be affected: there is
+            // no name or PID search, no process-group signal, and no global
+            // cleanup. `kill_on_drop` remains only as a backstop.
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                format!(
+                    "{} api schema --json timed out after {}s",
+                    binary.display(),
+                    SCHEMA_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+    };
     if !status.success() {
         return Err(AdapterError::new(
             AdapterErrorKind::Unavailable,
