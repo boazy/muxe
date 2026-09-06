@@ -178,6 +178,10 @@ mod tests {
     };
 
     use tempfile::TempDir;
+    use muxe_core::{
+        ActionSpec, CompiledGeneration, KeyCapabilities, MenuAction, MenuId, PortableAction,
+        SourceId, compile_yaml,
+    };
 
     use super::*;
 
@@ -204,6 +208,27 @@ mod tests {
                     .to_string_lossy()
                     .contains(".tmp"))
         );
+    }
+
+    #[test]
+    fn starter_compiles_with_the_builtin_escape_exit() {
+        let compiled = compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<starter config>"),
+            starter_config(),
+            KeyCapabilities::default(),
+            None,
+        )
+        .expect("starter config compiles with default built-in bindings");
+        let main = compiled.menu(&MenuId::new("main")).expect("starter main menu exists");
+
+        assert!(main.bindings.iter().any(|binding| {
+            binding.key.canonical_string() == "esc"
+                && matches!(
+                    binding.action,
+                    ActionSpec::Portable(PortableAction::Menu(MenuAction::Quit))
+                )
+        }));
     }
 
     #[test]
