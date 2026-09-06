@@ -57,6 +57,12 @@ pub struct RetireInputs<'a, C> {
 }
 
 /// Retires every selected broker without starting a replacement.
+///
+/// # Errors
+///
+/// Fails when the registry or audit log is unusable, `--host current` has no
+/// detectable invoking host, or a unit retirement fails; per-unit outcomes
+/// otherwise report through the returned report.
 pub async fn retire<C>(inputs: RetireInputs<'_, C>) -> Result<RetireReport, RetireError>
 where
     C: ControlPort,

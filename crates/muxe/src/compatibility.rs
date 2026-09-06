@@ -145,6 +145,12 @@ fn packaged_wasm_artifact() -> Result<PackagedWasmArtifact, CompatibilityError> 
 ///
 /// The handoff fields come from versioned sources. The packaged bridge digest
 /// is producer-provided at build time, never derived from install input.
+///
+/// # Errors
+///
+/// Fails when the embedded producer digest is malformed, a bundled protocol
+/// or schema version overflows its handoff field, or the schema fingerprint
+/// cannot be derived from the generated constants.
 pub fn embedded_record() -> Result<NativeCompatibilityRecord, CompatibilityError> {
     let protocol = muxe_adapter_herdr::generated::BUNDLED_PROTOCOL;
     let schema_version = muxe_adapter_herdr::generated::BUNDLED_SCHEMA_VERSION;
@@ -286,7 +292,7 @@ pub fn render_human(record: &NativeCompatibilityRecord) -> String {
     lines.join("\n") + "\n"
 }
 
-/// Renders the stable snake_case JSON compatibility report.
+/// Renders the stable `snake_case` JSON compatibility report.
 ///
 /// `packaged_wasm.sha256` is the producer-provided identity of local bridge
 /// bytes. `bridge_registration_digest` remains null because it would claim
