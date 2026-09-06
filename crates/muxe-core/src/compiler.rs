@@ -76,11 +76,18 @@ pub(crate) fn compile_effective(
     input: CompileInput,
     action_validator: Option<&dyn ActionValidator>,
 ) -> Result<CompiledConfig, Vec<ConfigDiagnostic>> {
+    let CompileInput {
+        generation,
+        base,
+        host_override,
+        key_capabilities,
+        theme_assets,
+    } = input;
     let builtin = ConfigDocument::parse(SourceId::new("<muxe built-in>"), Arc::<str>::from(BUILTINS))
         .map_err(|diagnostic| vec![diagnostic])?;
     let mut root = builtin.root;
-    merge_values(&mut root, input.base.root.clone());
-    if let Some(override_document) = &input.host_override {
+    merge_values(&mut root, base.root);
+    if let Some(override_document) = host_override {
         if let Some(version) = override_document.root.field("version") {
             return Err(vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidVersion,
@@ -88,7 +95,7 @@ pub(crate) fn compile_effective(
                 version.name_span.clone(),
             )]);
         }
-        merge_values(&mut root, override_document.root.clone());
+        merge_values(&mut root, override_document.root);
     }
 
     validate_fields(
@@ -97,7 +104,7 @@ pub(crate) fn compile_effective(
     )?;
     validate_version(&root)?;
     apply_injections(&mut root)?;
-    let keyboard = compile_keyboard(root.field("keyboard").map(|field| &field.value), input.key_capabilities)?;
+    let keyboard = compile_keyboard(root.field("keyboard").map(|field| &field.value), key_capabilities)?;
     let global_settings = compile_settings(
         root.field("settings").map(|field| &field.value),
         EffectiveSettings::default(),
@@ -106,7 +113,7 @@ pub(crate) fn compile_effective(
     let inactivity_timeout = global_settings.timeout;
     let reload = global_settings.reload;
     let host = global_settings.host;
-    let (theme_selection, theme) = compile_theme_pair(&root, &input.theme_assets)?;
+    let (theme_selection, theme) = compile_theme_pair(&root, &theme_assets)?;
     let global_layout = compile_layout(root.field("layout").map(|field| &field.value), LayoutSettings::default())?;
 
     let menus_value = required_field(&root, "menus")?;
@@ -127,7 +134,7 @@ pub(crate) fn compile_effective(
     let known_menus = raw_menus.iter().map(|field| field.name.clone()).collect::<BTreeSet<_>>();
 
     let mut compiler = MenuCompiler {
-        generation: input.generation,
+        generation,
         keyboard: &keyboard,
         global_settings,
         global_layout,
@@ -145,10 +152,11 @@ pub(crate) fn compile_effective(
     if !compiler.diagnostics.is_empty() {
         return Err(compiler.diagnostics);
     }
+    validate_native_actions(&mut menus, action_validator)?;
     validate_menu_cycles(&menus)?;
     let bindings = binding_index(&menus);
     Ok(CompiledConfig {
-        generation: input.generation,
+        generation,
         keyboard,
         inactivity_timeout,
         reload,
@@ -160,6 +168,53 @@ pub(crate) fn compile_effective(
     })
 }
 
+fn validate_native_actions(
+    menus: &mut [CompiledMenu],
+    action_validator: Option<&dyn ActionValidator>,
+) -> Result<(), Vec<ConfigDiagnostic>> {
+    let candidates: Vec<_> = menus
+        .iter()
+        .flat_map(|menu| &menu.bindings)
+        .filter_map(|binding| match &binding.action {
+            ActionSpec::Native(candidate) => Some(candidate),
+            ActionSpec::Portable(_) => None,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let Some(action_validator) = action_validator else {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::NativeActionRejected,
+            "native actions require an active adapter validator",
+            candidates[0].type_span.clone(),
+        )]);
+    };
+    let validations = action_validator.validate_native_batch(&candidates)?;
+    if validations.len() != candidates.len() {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::NativeActionRejected,
+            "adapter returned an incomplete native-action validation batch",
+            candidates[0].type_span.clone(),
+        )]);
+    }
+
+    let mut validations = validations.into_iter();
+    for binding in menus.iter_mut().flat_map(|menu| &mut menu.bindings) {
+        let ActionSpec::Native(candidate) = &binding.action else {
+            continue;
+        };
+        let validation = validations
+            .next()
+            .expect("validated native batch has the checked candidate count");
+        validate_execution(
+            &binding.settings.execution,
+            validation.execution,
+            candidate.type_span.clone(),
+        )?;
+    }
+    Ok(())
+}
 fn validate_version(root: &ConfigValue) -> Result<(), Vec<ConfigDiagnostic>> {
     let version = required_field(root, "version")?;
     match version.value.kind {
@@ -565,26 +620,31 @@ fn flatten_scalar_mapping(
         } else {
             format!("{prefix}.{}", field.name)
         };
-        match &field.value.kind {
-            ConfigValueKind::Mapping(_) => flatten_scalar_mapping(&field.value, &name, output, subject)?,
-            _ => {
-                let text = expect_string(&field.value, format!("{subject} values must be strings"))?;
-                output.insert(name, text.to_owned());
-            }
+        if let ConfigValueKind::Mapping(_) = &field.value.kind {
+            flatten_scalar_mapping(&field.value, &name, output, subject)?;
+        } else {
+            let text = expect_string(&field.value, format!("{subject} values must be strings"))?;
+            output.insert(name, text.to_owned());
         }
     }
     Ok(())
 }
 
 fn nonnegative_u16(value: &ConfigValue, name: &str) -> Result<u16, Vec<ConfigDiagnostic>> {
-    match value.kind {
-        ConfigValueKind::Integer(value) if (0..=u16::MAX as i64).contains(&value) => Ok(value as u16),
-        _ => Err(vec![ConfigDiagnostic::error(
+    let ConfigValueKind::Integer(integer) = value.kind else {
+        return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
             format!("`{name}` must be a non-negative integer no greater than {}", u16::MAX),
             value.span.clone(),
-        )]),
-    }
+        )]);
+    };
+    u16::try_from(integer).map_err(|_| {
+        vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            format!("`{name}` must be a non-negative integer no greater than {}", u16::MAX),
+            value.span.clone(),
+        )]
+    })
 }
 struct MenuCompiler<'a> {
     generation: CompiledGeneration,
@@ -597,7 +657,7 @@ struct MenuCompiler<'a> {
     diagnostics: Vec<ConfigDiagnostic>,
 }
 
-impl<'a> MenuCompiler<'a> {
+impl MenuCompiler<'_> {
     fn compile_menu(&mut self, field: &ConfigField) -> Option<CompiledMenu> {
         let mapping = match mapping_fields(&field.value, "a menu must be a mapping") {
             Ok(mapping) => mapping,
@@ -642,12 +702,13 @@ impl<'a> MenuCompiler<'a> {
                 return None;
             }
         };
-        let bindings_value = match field.value.field("bindings") {
-            Some(binding) => &binding.value,
-            None => {
-                self.diagnostics.push(ConfigDiagnostic::error(DiagnosticCode::MissingField, "menu requires `bindings`", field.value.span.clone()));
-                return None;
-            }
+        let Some(bindings_value) = field.value.field("bindings").map(|binding| &binding.value) else {
+            self.diagnostics.push(ConfigDiagnostic::error(
+                DiagnosticCode::MissingField,
+                "menu requires `bindings`",
+                field.value.span.clone(),
+            ));
+            return None;
         };
         let bindings = match mapping_fields(bindings_value, "`bindings` must be an ordered mapping") {
             Ok(bindings) => bindings,
@@ -725,7 +786,9 @@ impl<'a> MenuCompiler<'a> {
         {
             settings.execution.mode = ExecutionMode::Detach;
         }
-        validate_execution(&settings.execution, execution, action_value.value.span.clone())?;
+        if let Some(execution) = execution {
+            validate_execution(&settings.execution, execution, action_value.value.span.clone())?;
+        }
         let profile = match self.keyboard {
             KeyboardProfile::Vt100 { .. } => KeyCapabilities::default(),
             KeyboardProfile::Kitty(capabilities) => *capabilities,
@@ -756,7 +819,7 @@ impl<'a> MenuCompiler<'a> {
     fn parse_action(
         &self,
         value: &ConfigValue,
-    ) -> Result<(ActionSpec, ExecutionCapabilities), Vec<ConfigDiagnostic>> {
+    ) -> Result<(ActionSpec, Option<ExecutionCapabilities>), Vec<ConfigDiagnostic>> {
         let (type_name, type_span, fields) = action_fields(value)?;
         let kind = ActionKind::parse(&type_name).ok_or_else(|| {
             vec![ConfigDiagnostic::error(
@@ -771,18 +834,17 @@ impl<'a> MenuCompiler<'a> {
                     validate_context_references(&field.value)?;
                 }
                 let candidate = NativeActionCandidate { type_name, type_span, fields };
-                let Some(validator) = self.action_validator else {
+                if self.action_validator.is_none() {
                     return Err(vec![ConfigDiagnostic::error(
                         DiagnosticCode::NativeActionRejected,
                         "native actions require an active adapter validator",
                         value.span.clone(),
                     )]);
-                };
-                let validated = validator.validate_native(&candidate).map_err(|diagnostic| vec![diagnostic])?;
-                Ok((ActionSpec::Native(candidate), validated.execution))
+                }
+                Ok((ActionSpec::Native(candidate), None))
             }
             ActionKind::Portable(kind) => {
-                let (spec, baseline) = self.parse_portable(kind, fields, type_span.clone())?;
+                let (spec, baseline) = self.parse_portable(kind, &fields, type_span.clone())?;
                 let ActionSpec::Portable(action) = &spec else {
                     unreachable!("portable parser returns a portable action");
                 };
@@ -792,25 +854,29 @@ impl<'a> MenuCompiler<'a> {
                     .transpose()
                     .map_err(|diagnostic| vec![diagnostic])?
                     .map_or(baseline, |validated| validated.execution);
-                Ok((spec, capabilities))
+                Ok((spec, Some(capabilities)))
             }
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the closed portable action grammar stays co-located with its field validation"
+    )]
     fn parse_portable(
         &self,
         kind: PortableActionKind,
-        fields: Vec<ConfigField>,
+        fields: &[ConfigField],
         span: SourceSpan,
     ) -> Result<(ActionSpec, ExecutionCapabilities), Vec<ConfigDiagnostic>> {
         let action = match kind {
             PortableActionKind::MenuOpen => {
-                let menu = field_named(&fields, "menu");
-                let submenu = field_named(&fields, "submenu");
+                let menu = field_named(fields, "menu");
+                let submenu = field_named(fields, "submenu");
                 if menu.is_some() == submenu.is_some() {
                     return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "menu:open requires exactly one of `menu` or `submenu`", span)]);
                 }
-                ensure_action_fields(&fields, &["menu", "submenu"])?;
+                ensure_action_fields(fields, &["menu", "submenu"])?;
                 let target = if let Some(menu) = menu {
                     let target = expect_string(&menu.value, "`menu` must be a menu ID")?.to_owned();
                     if !self.known_menus.contains(&target) {
@@ -825,84 +891,84 @@ impl<'a> MenuCompiler<'a> {
                 };
                 PortableAction::Menu(MenuAction::Open(target))
             }
-            PortableActionKind::MenuReturn => { ensure_action_fields(&fields, &[])?; PortableAction::Menu(MenuAction::Return) }
-            PortableActionKind::MenuQuit => { ensure_action_fields(&fields, &[])?; PortableAction::Menu(MenuAction::Quit) }
-            PortableActionKind::MenuPagePrev => { ensure_action_fields(&fields, &[])?; PortableAction::Menu(MenuAction::PagePrev) }
-            PortableActionKind::MenuPageNext => { ensure_action_fields(&fields, &[])?; PortableAction::Menu(MenuAction::PageNext) }
-            PortableActionKind::ConfigReload => { ensure_action_fields(&fields, &[])?; PortableAction::Config(ConfigAction::Reload) }
+            PortableActionKind::MenuReturn => { ensure_action_fields(fields, &[])?; PortableAction::Menu(MenuAction::Return) }
+            PortableActionKind::MenuQuit => { ensure_action_fields(fields, &[])?; PortableAction::Menu(MenuAction::Quit) }
+            PortableActionKind::MenuPagePrev => { ensure_action_fields(fields, &[])?; PortableAction::Menu(MenuAction::PagePrev) }
+            PortableActionKind::MenuPageNext => { ensure_action_fields(fields, &[])?; PortableAction::Menu(MenuAction::PageNext) }
+            PortableActionKind::ConfigReload => { ensure_action_fields(fields, &[])?; PortableAction::Config(ConfigAction::Reload) }
             PortableActionKind::KeyboardSend => {
-                if field_named(&fields, "sequence").is_some() {
-                    return Err(vec![ConfigDiagnostic::error(DiagnosticCode::UnsupportedFeature, "keyboard:send `sequence` is not supported in schema version 1", field_named(&fields, "sequence").expect("checked").value.span.clone())]);
+                if field_named(fields, "sequence").is_some() {
+                    return Err(vec![ConfigDiagnostic::error(DiagnosticCode::UnsupportedFeature, "keyboard:send `sequence` is not supported in schema version 1", field_named(fields, "sequence").expect("checked").value.span.clone())]);
                 }
-                ensure_action_fields(&fields, &["keys", "text", "sequence"])?;
-                match (field_named(&fields, "keys"), field_named(&fields, "text")) {
+                ensure_action_fields(fields, &["keys", "text", "sequence"])?;
+                match (field_named(fields, "keys"), field_named(fields, "text")) {
                     (Some(keys), None) => PortableAction::Keyboard(KeyboardAction::SendKeys(action_key_sequence(&keys.value)?)),
                     (None, Some(text)) => PortableAction::Keyboard(KeyboardAction::SendText(action_string_scalar(&text.value, "keyboard text", ContextAllowance::StringOnly)?)),
                     _ => return Err(vec![ConfigDiagnostic::error(DiagnosticCode::InvalidActionArguments, "keyboard:send requires exactly one of `keys` or `text`", span)]),
                 }
             }
             PortableActionKind::CommandExecute => {
-                ensure_action_fields(&fields, &["program", "args", "cwd", "env"])?;
-                let program = action_string_scalar(&required_action_field(&fields, "program")?.value, "command program", ContextAllowance::Textual)?;
-                let args = action_string_sequence(field_named(&fields, "args").map(|field| &field.value), "command args", ContextAllowance::Textual)?;
-                let cwd = field_named(&fields, "cwd").map(|field| action_string_scalar(&field.value, "command cwd", ContextAllowance::AbsolutePath)).transpose()?;
-                let env = action_string_mapping(field_named(&fields, "env").map(|field| &field.value), "command env", ContextAllowance::Textual)?;
+                ensure_action_fields(fields, &["program", "args", "cwd", "env"])?;
+                let program = action_string_scalar(&required_action_field(fields, "program")?.value, "command program", ContextAllowance::Textual)?;
+                let args = action_string_sequence(field_named(fields, "args").map(|field| &field.value), "command args", ContextAllowance::Textual)?;
+                let cwd = field_named(fields, "cwd").map(|field| action_string_scalar(&field.value, "command cwd", ContextAllowance::AbsolutePath)).transpose()?;
+                let env = action_string_mapping(field_named(fields, "env").map(|field| &field.value), "command env", ContextAllowance::Textual)?;
                 PortableAction::Command(CommandAction { program, args, cwd, env })
             }
             PortableActionKind::TabCreate => {
-                ensure_action_fields(&fields, &["workspace-id"])?;
-                let workspace_id = field_named(&fields, "workspace-id")
+                ensure_action_fields(fields, &["workspace-id"])?;
+                let workspace_id = field_named(fields, "workspace-id")
                     .map(|field| action_string_scalar(&field.value, "tab workspace-id", ContextAllowance::WorkspaceId))
                     .transpose()?;
                 PortableAction::Tab(TabAction::Create { workspace_id })
             }
-            PortableActionKind::TabClose => { ensure_action_fields(&fields, &[])?; PortableAction::Tab(TabAction::Close) }
+            PortableActionKind::TabClose => { ensure_action_fields(fields, &[])?; PortableAction::Tab(TabAction::Close) }
             PortableActionKind::TabRename => {
-                ensure_action_fields(&fields, &["name"])?;
+                ensure_action_fields(fields, &["name"])?;
                 PortableAction::Tab(TabAction::Rename {
-                    name: field_named(&fields, "name")
+                    name: field_named(fields, "name")
                         .map(|field| action_string_scalar(&field.value, "tab name", ContextAllowance::Textual))
                         .transpose()?,
                 })
             }
-            PortableActionKind::TabFocus => PortableAction::Tab(TabAction::Focus(index_or_direction(&fields)?)),
-            PortableActionKind::TabMove => PortableAction::Tab(TabAction::Move(index_or_direction(&fields)?)),
-            PortableActionKind::TabSwap => PortableAction::Tab(TabAction::Swap(index_or_direction(&fields)?)),
-            PortableActionKind::PaneCreate => { ensure_action_fields(&fields, &[])?; PortableAction::Pane(PaneAction::Create) }
+            PortableActionKind::TabFocus => PortableAction::Tab(TabAction::Focus(index_or_direction(fields)?)),
+            PortableActionKind::TabMove => PortableAction::Tab(TabAction::Move(index_or_direction(fields)?)),
+            PortableActionKind::TabSwap => PortableAction::Tab(TabAction::Swap(index_or_direction(fields)?)),
+            PortableActionKind::PaneCreate => { ensure_action_fields(fields, &[])?; PortableAction::Pane(PaneAction::Create) }
             PortableActionKind::PaneSplit => {
-                ensure_action_fields(&fields, &["direction"])?;
+                ensure_action_fields(fields, &["direction"])?;
                 PortableAction::Pane(PaneAction::Split {
-                    direction: field_named(&fields, "direction")
+                    direction: field_named(fields, "direction")
                         .map(|field| action_direction_scalar(&field.value, "pane direction"))
                         .transpose()?,
                 })
             }
-            PortableActionKind::PaneClose => { ensure_action_fields(&fields, &[])?; PortableAction::Pane(PaneAction::Close) }
-            PortableActionKind::PaneFocus => PortableAction::Pane(PaneAction::Focus(index_or_direction(&fields)?)),
-            PortableActionKind::PaneMove => PortableAction::Pane(PaneAction::Move(index_or_direction(&fields)?)),
-            PortableActionKind::PaneSwap => PortableAction::Pane(PaneAction::Swap(index_or_direction(&fields)?)),
+            PortableActionKind::PaneClose => { ensure_action_fields(fields, &[])?; PortableAction::Pane(PaneAction::Close) }
+            PortableActionKind::PaneFocus => PortableAction::Pane(PaneAction::Focus(index_or_direction(fields)?)),
+            PortableActionKind::PaneMove => PortableAction::Pane(PaneAction::Move(index_or_direction(fields)?)),
+            PortableActionKind::PaneSwap => PortableAction::Pane(PaneAction::Swap(index_or_direction(fields)?)),
             PortableActionKind::PaneResize => {
-                ensure_action_fields(&fields, &["direction", "amount"])?;
-                let direction = action_direction_scalar(&required_action_field(&fields, "direction")?.value, "pane direction")?;
-                let amount = field_named(&fields, "amount").map(|field| action_scalar(&field.value, "pane amount")).transpose()?;
+                ensure_action_fields(fields, &["direction", "amount"])?;
+                let direction = action_direction_scalar(&required_action_field(fields, "direction")?.value, "pane direction")?;
+                let amount = field_named(fields, "amount").map(|field| action_scalar(&field.value, "pane amount")).transpose()?;
                 PortableAction::Pane(PaneAction::Resize { direction, amount })
             }
-            PortableActionKind::PaneZoom => PortableAction::Pane(PaneAction::Zoom { enabled: optional_action_bool_field(&fields, "enabled")? }),
-            PortableActionKind::PaneFullscreen => PortableAction::Pane(PaneAction::Fullscreen { enabled: optional_action_bool_field(&fields, "enabled")? }),
-            PortableActionKind::PaneFloating => PortableAction::Pane(PaneAction::Floating { enabled: optional_action_bool_field(&fields, "enabled")? }),
+            PortableActionKind::PaneZoom => PortableAction::Pane(PaneAction::Zoom { enabled: optional_action_bool_field(fields, "enabled")? }),
+            PortableActionKind::PaneFullscreen => PortableAction::Pane(PaneAction::Fullscreen { enabled: optional_action_bool_field(fields, "enabled")? }),
+            PortableActionKind::PaneFloating => PortableAction::Pane(PaneAction::Floating { enabled: optional_action_bool_field(fields, "enabled")? }),
             PortableActionKind::PaneFrame => {
-                ensure_action_fields(&fields, &["visible"])?;
+                ensure_action_fields(fields, &["visible"])?;
                 PortableAction::Pane(PaneAction::Frame {
-                    visible: field_named(&fields, "visible").map(|field| action_bool_scalar(&field.value, "pane visible")).transpose()?,
+                    visible: field_named(fields, "visible").map(|field| action_bool_scalar(&field.value, "pane visible")).transpose()?,
                 })
             }
-            PortableActionKind::SessionCreate => { ensure_action_fields(&fields, &[])?; PortableAction::Session(SessionAction::Create) }
-            PortableActionKind::SessionAttach => PortableAction::Session(SessionAction::Attach { name: required_string_action_field(&fields, "name", "session name")? }),
-            PortableActionKind::SessionSwitch => PortableAction::Session(SessionAction::Switch { name: required_string_action_field(&fields, "name", "session name")? }),
-            PortableActionKind::SessionRename => PortableAction::Session(SessionAction::Rename { name: required_string_action_field(&fields, "name", "session name")? }),
-            PortableActionKind::SessionDetach => { ensure_action_fields(&fields, &[])?; PortableAction::Session(SessionAction::Detach) }
-            PortableActionKind::SessionQuit => { ensure_action_fields(&fields, &[])?; PortableAction::Session(SessionAction::Quit) }
-            PortableActionKind::SessionKill => { ensure_action_fields(&fields, &[])?; PortableAction::Session(SessionAction::Kill) }
+            PortableActionKind::SessionCreate => { ensure_action_fields(fields, &[])?; PortableAction::Session(SessionAction::Create) }
+            PortableActionKind::SessionAttach => PortableAction::Session(SessionAction::Attach { name: required_string_action_field(fields, "name", "session name")? }),
+            PortableActionKind::SessionSwitch => PortableAction::Session(SessionAction::Switch { name: required_string_action_field(fields, "name", "session name")? }),
+            PortableActionKind::SessionRename => PortableAction::Session(SessionAction::Rename { name: required_string_action_field(fields, "name", "session name")? }),
+            PortableActionKind::SessionDetach => { ensure_action_fields(fields, &[])?; PortableAction::Session(SessionAction::Detach) }
+            PortableActionKind::SessionQuit => { ensure_action_fields(fields, &[])?; PortableAction::Session(SessionAction::Quit) }
+            PortableActionKind::SessionKill => { ensure_action_fields(fields, &[])?; PortableAction::Session(SessionAction::Kill) }
         };
         let capabilities = kind.descriptor().capabilities;
         Ok((ActionSpec::Portable(action), capabilities))
@@ -911,14 +977,15 @@ impl<'a> MenuCompiler<'a> {
 fn positional_fields(kind: &ActionKind) -> &'static [&'static str] {
     match kind {
         ActionKind::Portable(PortableActionKind::MenuOpen) => &["menu"],
-        ActionKind::Portable(PortableActionKind::PaneSplit) => &["direction"],
+        ActionKind::Portable(
+            PortableActionKind::PaneSplit | PortableActionKind::TabMove | PortableActionKind::PaneMove,
+        ) => &["direction"],
         ActionKind::Portable(
             PortableActionKind::TabFocus
             | PortableActionKind::TabSwap
             | PortableActionKind::PaneFocus
             | PortableActionKind::PaneSwap,
         ) => &["index"],
-        ActionKind::Portable(PortableActionKind::TabMove | PortableActionKind::PaneMove) => &["direction"],
         ActionKind::Portable(
             PortableActionKind::SessionAttach
             | PortableActionKind::SessionSwitch
@@ -1331,14 +1398,14 @@ fn apply_injection_to_menu(menu: &mut ConfigValue, id: Option<&str>, injection: 
             merge_values(menu, injection.patch.clone());
         }
     }
-    if let Some(bindings) = menu.field_mut("bindings") {
-        if let Some(bindings) = bindings.value.as_mapping_mut() {
-            for binding in bindings {
-                if let Some(action) = binding.value.field_mut("action") {
-                    if let Some(submenu) = action.value.field_mut("submenu") {
-                        apply_injection_to_menu(&mut submenu.value, None, injection)?;
-                    }
-                }
+    if let Some(bindings) = menu.field_mut("bindings")
+        && let Some(bindings) = bindings.value.as_mapping_mut()
+    {
+        for binding in bindings {
+            if let Some(action) = binding.value.field_mut("action")
+                && let Some(submenu) = action.value.field_mut("submenu")
+            {
+                apply_injection_to_menu(&mut submenu.value, None, injection)?;
             }
         }
     }
@@ -1499,14 +1566,17 @@ fn action_string_scalar(
 
 fn action_direction_scalar(value: &ConfigValue, parameter: &str) -> Result<ActionScalar, Vec<ConfigDiagnostic>> {
     let scalar = action_string_scalar(value, parameter, ContextAllowance::StringOnly)?;
-    if let ConfigValueKind::String(value) = &scalar.value.kind {
-        if !matches!(value.as_str(), "left" | "right" | "up" | "down" | "next" | "previous") {
-            return Err(vec![ConfigDiagnostic::error(
-                DiagnosticCode::InvalidActionArguments,
-                "direction must be left, right, up, down, next, or previous",
-                scalar.value.span.clone(),
-            )]);
-        }
+    if let ConfigValueKind::String(value) = &scalar.value.kind
+        && !matches!(
+            value.as_str(),
+            "left" | "right" | "up" | "down" | "next" | "previous"
+        )
+    {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidActionArguments,
+            "direction must be left, right, up, down, next, or previous",
+            scalar.value.span.clone(),
+        )]);
     }
     Ok(scalar)
 }
@@ -1672,7 +1742,7 @@ fn field_named<'a>(fields: &'a [ConfigField], name: &str) -> Option<&'a ConfigFi
     fields.iter().find(|field| field.name == name)
 }
 
-fn expect_string<'a>(value: &'a ConfigValue, message: impl Into<String>) -> Result<&'a str, Vec<ConfigDiagnostic>> {
+fn expect_string(value: &ConfigValue, message: impl Into<String>) -> Result<&str, Vec<ConfigDiagnostic>> {
     value.as_str().ok_or_else(|| vec![ConfigDiagnostic::error(DiagnosticCode::InvalidValue, message.into(), value.span.clone())])
 }
 

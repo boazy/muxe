@@ -27,9 +27,9 @@ use muxe_core::{
 };
 use muxe_protocol::{
     AbortUiLaunch, AttachUi, BrokerEvent, BrokerResponse, ClientRequest, DiagnosticCode, EventId,
-    ExecutionId, ExecutionOutcome, HostKind, HostPaneId, InvokeBinding, LiveServerIdentity,
-    MenuControl, ModalScopeId, PendingLaunchToken, ProtocolDiagnostic, RegisterPendingPane,
-    UiMenuControl, UiSessionId, WireMessage,
+    ExecutionId, ExecutionOutcome, HostKind, HostPaneId, InvocationDisposition, InvokeBinding,
+    LiveServerIdentity, MenuControl, ModalScopeId, PendingLaunchToken, ProtocolDiagnostic,
+    RegisterPendingPane, UiMenuControl, UiSessionId, WireMessage,
 };
 use thiserror::Error;
 use tokio::{
@@ -95,6 +95,7 @@ struct ExecutionRecord {
     cancellable: bool,
     on_menu_control: muxe_core::MenuControlAction,
     owner: ExecutionOwner,
+    pending_control: Option<MenuControl>,
 }
 
 #[derive(Default)]
@@ -221,6 +222,8 @@ impl Broker {
         Ok(self.live_identity().await? == *claimed)
     }
 
+
+
     pub async fn handle(
         &self,
         role: muxe_protocol::PeerRole,
@@ -301,8 +304,8 @@ impl Broker {
     }
 
     /// Translates adapter lifecycle and dispatch completions into session-scoped broker events.
-    /// A reconnection with a new live identity invalidates all captured origins rather than
-    /// allowing later actions to target a different host server.
+    /// Adapter implementations gate host-bound dispatch against their continuity epoch; a health
+    /// transition keeps the session's immutable menu/configuration alive for local interaction.
     pub async fn monitor(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         loop {
             tokio::select! {
@@ -327,41 +330,10 @@ impl Broker {
             AdapterHealthEvent::Healthy { .. } | AdapterHealthEvent::CaptureReady { .. } => {
                 self.broadcast_health(true, None).await;
             }
-            AdapterHealthEvent::Unhealthy { modal_scope, error } => {
-                let targets = {
-                    let sessions = self.sessions.lock().await;
-                    sessions
-                        .iter()
-                        .filter(|(_, session)| {
-                            modal_scope
-                                .as_ref()
-                                .is_none_or(|scope| scope == &session.scope)
-                        })
-                        .map(|(session, _)| session.clone())
-                        .collect::<Vec<_>>()
-                };
-                for session in targets {
-                    let _ = self
-                        .detach(&session, CaptureReleaseReason::AdapterShutdown)
-                        .await;
-                }
+            AdapterHealthEvent::Unhealthy { error, .. } => {
                 self.broadcast_health(false, Some(error)).await;
             }
-            AdapterHealthEvent::Reconnected { previous, current } => {
-                if previous.live_server_id != current.live_server_id {
-                    let sessions = self
-                        .sessions
-                        .lock()
-                        .await
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for session in sessions {
-                        let _ = self
-                            .detach(&session, CaptureReleaseReason::AdapterShutdown)
-                            .await;
-                    }
-                }
+            AdapterHealthEvent::Reconnected { .. } => {
                 self.broadcast_health(true, None).await;
             }
             AdapterHealthEvent::CaptureLost { lease, reason } => {
@@ -425,6 +397,9 @@ impl Broker {
             let record = state.executions.remove(&session).expect("entry was found");
             (session, record)
         };
+        if record.pending_control.is_some() {
+            return;
+        }
         let events = {
             let sessions = self.sessions.lock().await;
             sessions.get(&session).map(|record| record.events.clone())
@@ -436,6 +411,32 @@ impl Broker {
                     event: BrokerEvent::ExecutionCompleted {
                         session,
                         execution: record.wire,
+                        outcome,
+                        diagnostic,
+                    },
+                })
+                .await;
+        }
+    }
+
+    async fn emit_execution_completed(
+        &self,
+        session: UiSessionId,
+        execution: ExecutionId,
+        outcome: ExecutionOutcome,
+        diagnostic: Option<ProtocolDiagnostic>,
+    ) {
+        let events = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session).map(|record| record.events.clone())
+        };
+        if let Some(events) = events {
+            let _ = events
+                .send(WireMessage::Event {
+                    event_id: self.new_event_id(),
+                    event: BrokerEvent::ExecutionCompleted {
+                        session,
+                        execution,
                         outcome,
                         diagnostic,
                     },
@@ -766,7 +767,24 @@ impl Broker {
         let accepted_capabilities = match binding.action {
             ActionSpec::Portable(muxe_core::PortableAction::Config(ConfigAction::Reload)) => {
                 self.reload().await?;
-                None
+                let disposition = if awaitable {
+                    self.emit_execution_completed(
+                        request.session.clone(),
+                        execution,
+                        ExecutionOutcome::Succeeded,
+                        None,
+                    )
+                    .await;
+                    InvocationDisposition::Awaited
+                } else {
+                    InvocationDisposition::Detached
+                };
+                return Ok(RequestResult::Immediate(
+                    BrokerResponse::InvocationAccepted {
+                        execution,
+                        disposition,
+                    },
+                ));
             }
             ActionSpec::Portable(muxe_core::PortableAction::Menu(MenuAction::Quit)) => {
                 self.detach(&request.session, CaptureReleaseReason::UiDismissed)
@@ -811,7 +829,16 @@ impl Broker {
                         )
                         .await?;
                         return Ok(RequestResult::Immediate(
-                            BrokerResponse::InvocationAccepted { execution },
+                            BrokerResponse::InvocationAccepted {
+                                execution,
+                                disposition: if binding.settings.execution.mode
+                                    == muxe_core::ExecutionMode::Await
+                                {
+                                    InvocationDisposition::Awaited
+                                } else {
+                                    InvocationDisposition::Detached
+                                },
+                            },
                         ));
                     }
                     action => {
@@ -849,8 +876,16 @@ impl Broker {
                 Some(accepted.capabilities)
             }
         };
+        let disposition = if accepted_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| awaitable && capabilities.awaitable)
+        {
+            InvocationDisposition::Awaited
+        } else {
+            InvocationDisposition::Detached
+        };
         if let Some(capabilities) =
-            accepted_capabilities.filter(|capabilities| awaitable && capabilities.awaitable)
+            accepted_capabilities.filter(|_| disposition == InvocationDisposition::Awaited)
         {
             self.state.lock().await.executions.insert(
                 request.session.clone(),
@@ -860,11 +895,15 @@ impl Broker {
                     cancellable: capabilities.cancellable,
                     on_menu_control,
                     owner: ExecutionOwner::Adapter,
+                    pending_control: None,
                 },
             );
         }
         Ok(RequestResult::Immediate(
-            BrokerResponse::InvocationAccepted { execution },
+            BrokerResponse::InvocationAccepted {
+                execution,
+                disposition,
+            },
         ))
     }
 
@@ -924,6 +963,7 @@ impl Broker {
                     cancellable: true,
                     on_menu_control: policy.on_menu_control,
                     owner: ExecutionOwner::GenericProcess,
+                    pending_control: None,
                 },
             );
         }
@@ -942,7 +982,6 @@ impl Broker {
         ));
         Ok(())
     }
-
     async fn cancel_generic(&self, execution: CoreExecutionId) -> Result<(), BrokerError> {
         let cancellation = self
             .generic
@@ -963,44 +1002,61 @@ impl Broker {
     }
 
     async fn control(&self, request: UiMenuControl) -> Result<RequestResult, BrokerError> {
-        let pending = self
-            .state
-            .lock()
-            .await
-            .executions
-            .get(&request.session)
-            .cloned();
-        let Some(pending) = pending else {
-            return match request.control {
-                MenuControl::Quit => {
-                    self.detach(&request.session, CaptureReleaseReason::UiDismissed)
-                        .await?;
-                    Ok(RequestResult::Immediate(BrokerResponse::Detached))
-                }
-                MenuControl::Return => Ok(RequestResult::Immediate(BrokerResponse::Acknowledged)),
+        let pending = {
+            let mut state = self.state.lock().await;
+            let Some(record) = state.executions.get_mut(&request.session) else {
+                return Ok(RequestResult::Immediate(BrokerResponse::Acknowledged));
             };
+            if record.pending_control.is_some() {
+                return Err(BrokerError::PendingControlInFlight);
+            }
+            record.pending_control = Some(request.control);
+            record.clone()
         };
-        match pending.on_menu_control {
-            muxe_core::MenuControlAction::Detach => {
-                self.detach(&request.session, CaptureReleaseReason::UiDismissed)
-                    .await?;
-                Ok(RequestResult::Immediate(BrokerResponse::Detached))
-            }
-            muxe_core::MenuControlAction::Cancel if pending.cancellable => {
-                match pending.owner {
-                    ExecutionOwner::Adapter => self
-                        .adapter
-                        .cancel(pending.core)
-                        .await
-                        .map_err(BrokerError::Adapter)?,
-                    ExecutionOwner::GenericProcess => self.cancel_generic(pending.core).await?,
-                }
-                Ok(RequestResult::Immediate(BrokerResponse::Acknowledged))
-            }
+        let accepted = match pending.on_menu_control {
+            muxe_core::MenuControlAction::Detach => Ok(()),
+            muxe_core::MenuControlAction::Cancel if pending.cancellable => match pending.owner {
+                ExecutionOwner::Adapter => self
+                    .adapter
+                    .cancel(pending.core)
+                    .await
+                    .map_err(BrokerError::Adapter),
+                ExecutionOwner::GenericProcess => self.cancel_generic(pending.core).await,
+            },
             muxe_core::MenuControlAction::Cancel => Err(BrokerError::CancelUnsupported),
+        };
+        if let Err(error) = accepted {
+            if self
+                .clear_pending_control(&request.session, pending.core, request.control)
+                .await
+            {
+                return Err(error);
+            }
         }
+        Ok(RequestResult::Immediate(
+            BrokerResponse::PendingControlCompleted {
+                execution: pending.wire,
+                control: request.control,
+            },
+        ))
     }
 
+    async fn clear_pending_control(
+        &self,
+        session: &UiSessionId,
+        core: CoreExecutionId,
+        control: MenuControl,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(record) = state.executions.get_mut(session) else {
+            return false;
+        };
+        if record.core != core || record.pending_control != Some(control) {
+            return false;
+        }
+        record.pending_control = None;
+        true
+    }
     async fn detach(
         &self,
         session: &UiSessionId,
@@ -1013,7 +1069,8 @@ impl Broker {
             state.executions.remove(session)
         };
         if let Some(pending) = pending {
-            if pending.on_menu_control == muxe_core::MenuControlAction::Cancel
+            if pending.pending_control.is_none()
+                && pending.on_menu_control == muxe_core::MenuControlAction::Cancel
                 && pending.cancellable
             {
                 match pending.owner {
@@ -1341,6 +1398,9 @@ async fn finish_generic(
     let Some(record) = record else {
         return;
     };
+    if record.pending_control.is_some() {
+        return;
+    }
     let events = sessions
         .lock()
         .await
@@ -1469,13 +1529,16 @@ mod tests {
             })
         }
 
-        fn validate_native(
+        fn validate_native_batch(
             &self,
-            _candidate: &muxe_core::NativeActionCandidate,
-        ) -> Result<ActionValidation, ConfigDiagnostic> {
-            Ok(ActionValidation {
-                execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
-            })
+            candidates: &[&muxe_core::NativeActionCandidate],
+        ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+            Ok(vec![
+                ActionValidation {
+                    execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                };
+                candidates.len()
+            ])
         }
     }
 
@@ -1625,6 +1688,8 @@ menus:
                     pending_launch: None,
                     origin: None,
                     caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
                 }),
                 events.clone(),
             )
@@ -1650,6 +1715,164 @@ menus:
 
         assert!(matches!(result, Err(BrokerError::ContextUnavailable)));
         assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn awaited_config_reload_emits_a_terminal_completion() {
+        let adapter = Arc::new(CountingAdapter {
+            portable_dispatches: AtomicUsize::new(0),
+        });
+        let yaml = r#"
+version: 1
+menus:
+  main:
+    bindings:
+      r:
+        label: reload
+        action: config:reload
+        settings:
+          execution:
+            mode: await
+"#;
+        let directory = tempfile::tempdir().expect("owned configuration directory");
+        let config_path = directory.path().join("config.yml");
+        std::fs::write(&config_path, yaml).expect("write reloadable configuration");
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<awaited reload regression>"),
+            yaml,
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("test configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("reload binding is visible");
+        let broker = Broker::from_compiled(adapter, &config_path, config);
+        let (events, mut events_rx) = mpsc::channel(2);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("muxe-pane"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("expected immediate attachment");
+        };
+
+        let response = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events,
+            )
+            .await
+            .expect("awaited reload is accepted");
+        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+            execution,
+            disposition: InvocationDisposition::Awaited,
+        }) = response
+        else {
+            panic!("expected an awaited invocation acceptance");
+        };
+        let Some(WireMessage::Event {
+            event:
+                BrokerEvent::ExecutionCompleted {
+                    session: completed_session,
+                    execution: completed_execution,
+                    outcome: ExecutionOutcome::Succeeded,
+                    diagnostic: None,
+                },
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("expected awaited reload terminal completion");
+        };
+        assert_eq!(completed_session, session);
+        assert_eq!(completed_execution, execution);
+    }
+
+    #[tokio::test]
+    async fn host_continuity_loss_keeps_the_pinned_ui_session_attached() {
+        let adapter = Arc::new(CountingAdapter {
+            portable_dispatches: AtomicUsize::new(0),
+        });
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<continuity regression>"),
+            r#"
+version: 1
+menus:
+  main:
+    bindings:
+      r:
+        label: reload
+        action: config:reload
+"#,
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("test configuration compiles");
+        let directory = tempfile::tempdir().expect("owned configuration directory");
+        let broker = Broker::from_compiled(adapter, directory.path().join("config.yml"), config);
+        let (events, _events_rx) = mpsc::channel(1);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("muxe-pane"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events,
+            )
+            .await
+            .expect("UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("expected immediate attachment");
+        };
+
+        broker
+            .handle_health_event(AdapterHealthEvent::Unhealthy {
+                modal_scope: None,
+                error: AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "subscription lost",
+                ),
+            })
+            .await;
+
+        assert!(
+            broker.sessions.lock().await.contains_key(&session),
+            "continuity loss must preserve the immutable session menu while the adapter blocks stale host dispatch"
+        );
     }
 
     #[test]
@@ -1856,4 +2079,6 @@ pub enum BrokerError {
     GenericProcess(String),
     #[error("the active host cannot cancel this pending execution")]
     CancelUnsupported,
+    #[error("a menu control is already pending for this execution")]
+    PendingControlInFlight,
 }

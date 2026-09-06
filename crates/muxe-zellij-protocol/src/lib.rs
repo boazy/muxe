@@ -20,8 +20,8 @@ pub use compat::{
     pinned_source_revision, pinned_zellij_version,
 };
 pub use pipe::{
-    BRIDGE_PROTOCOL_VERSION, MAX_DETAIL_LEN, MAX_PIPE_LINE_LEN, BridgeArtifact, BridgeIdentity,
-    BridgeRequest, BridgeTarget, CaptureEndReason, CaptureLostReason, CommandOutcome, CommandStatus,
-    NeighborDirection, PipeError, PipeEvent, PipeEventKind, PipeRequest, ZellijOrigin,
-    decode_event_line, decode_request_line, encode_event_line, encode_request_line,
+    BRIDGE_PROTOCOL_VERSION, BridgeArtifact, BridgeIdentity, BridgeRequest, BridgeTarget,
+    CaptureEndReason, CaptureLostReason, CommandOutcome, CommandStatus, MAX_DETAIL_LEN,
+    MAX_PIPE_LINE_LEN, NeighborDirection, PipeError, PipeEvent, PipeEventKind, PipeRequest,
+    ZellijOrigin, decode_event_line, decode_request_line, encode_event_line, encode_request_line,
 };

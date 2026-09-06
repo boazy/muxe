@@ -1160,11 +1160,11 @@ impl ActionValidator for ZellijAdapter {
         self.inner.validator.validate_portable(action, action_span)
     }
 
-    fn validate_native(
+    fn validate_native_batch(
         &self,
-        candidate: &NativeActionCandidate,
-    ) -> Result<ActionValidation, ConfigDiagnostic> {
-        self.inner.validator.validate_native_candidate(candidate)
+        candidates: &[&NativeActionCandidate],
+    ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+        self.inner.validator.validate_native_batch(candidates)
     }
 }
 

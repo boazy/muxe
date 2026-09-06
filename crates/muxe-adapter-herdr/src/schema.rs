@@ -102,17 +102,21 @@ impl fmt::Display for ValidationCode {
 
 impl ApiSchema {
     pub fn parse(raw: Value) -> Result<Self, ValidationError> {
-        let protocol = raw
-            .get("protocol")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| malformed("#", "top-level protocol must be an unsigned integer"))?;
-        let schema_version = raw
-            .get("schema_version")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| malformed("#", "top-level schema_version must be an unsigned integer"))?;
         let request = raw
             .pointer("/schemas/request")
+            .cloned()
             .ok_or_else(|| malformed("#", "schema has no schemas.request object"))?;
+        Self::parse_with_request(raw, &request)
+    }
+
+    /// Parses a live schema document while taking its cache-verified normalized request
+    /// representation as the authoritative request surface. `$ref` resolution still consults
+    /// the exact live raw document retained by the schema.
+    pub(crate) fn parse_with_request(
+        raw: Value,
+        request: &Value,
+    ) -> Result<Self, ValidationError> {
+        let (protocol, schema_version) = Self::metadata(&raw)?;
         let branches = request
             .get("oneOf")
             .and_then(Value::as_array)
@@ -159,6 +163,22 @@ impl ApiSchema {
         })
     }
 
+    pub(crate) fn metadata(raw: &Value) -> Result<(u64, u64), ValidationError> {
+        let protocol = raw
+            .get("protocol")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| malformed("#", "top-level protocol must be an unsigned integer"))?;
+        let schema_version = raw
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                malformed("#", "top-level schema_version must be an unsigned integer")
+            })?;
+        raw.pointer("/schemas/request")
+            .ok_or_else(|| malformed("#", "schema has no schemas.request object"))?;
+        Ok((protocol, schema_version))
+    }
+
     pub fn protocol(&self) -> u64 {
         self.protocol
     }
@@ -172,10 +192,12 @@ impl ApiSchema {
     }
 
     pub fn method(&self, name: &str) -> Option<&MethodSchema> {
-        self.methods.get(name).and_then(|methods| match methods.as_slice() {
-            [method] => Some(method),
-            _ => None,
-        })
+        self.methods
+            .get(name)
+            .and_then(|methods| match methods.as_slice() {
+                [method] => Some(method),
+                _ => None,
+            })
     }
 
     pub fn methods(&self) -> impl Iterator<Item = &MethodSchema> {
@@ -202,7 +224,10 @@ impl ApiSchema {
             ParameterSchema::Reference(reference) => {
                 (self.resolve_reference(reference, "#")?, reference.as_str())
             }
-            ParameterSchema::Inline { schema, schema_path } => (schema, schema_path.as_str()),
+            ParameterSchema::Inline {
+                schema,
+                schema_path,
+            } => (schema, schema_path.as_str()),
         };
         self.validate(root, params, "#", schema_path, 0)
     }
@@ -237,13 +262,15 @@ impl ApiSchema {
 
         if let Some(reference) = string_keyword(object, "$ref", schema_path)? {
             let resolved = self.resolve_reference(reference, schema_path)?;
-            self.validate(
+            // The bundled generated schemas use $ref as a complete node. Returning here avoids
+            // applying the wrapper's no-properties rule after validating the referenced shape.
+            return self.validate(
                 resolved,
                 value,
                 instance_path,
                 reference,
                 reference_depth + 1,
-            )?;
+            );
         }
         if let Some(constant) = object.get("const") {
             if value != constant {
@@ -276,8 +303,20 @@ impl ApiSchema {
         }
         self.validate_number_constraints(object, value, instance_path, schema_path)?;
         self.validate_string_constraints(object, value, instance_path, schema_path)?;
-        self.validate_array_constraints(object, value, instance_path, schema_path, reference_depth)?;
-        self.validate_object_constraints(object, value, instance_path, schema_path, reference_depth)?;
+        self.validate_array_constraints(
+            object,
+            value,
+            instance_path,
+            schema_path,
+            reference_depth,
+        )?;
+        self.validate_object_constraints(
+            object,
+            value,
+            instance_path,
+            schema_path,
+            reference_depth,
+        )?;
         self.validate_alternatives(object, value, instance_path, schema_path, reference_depth)
     }
 
@@ -339,12 +378,19 @@ impl ApiSchema {
     ) -> Result<(), ValidationError> {
         let accepted = match types {
             Value::String(kind) => value_has_type(value, kind),
-            Value::Array(kinds) => kinds.iter().all(Value::is_string)
-                && kinds
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .any(|kind| value_has_type(value, kind)),
-            _ => return Err(malformed(schema_path, "type must be a string or a string array")),
+            Value::Array(kinds) => {
+                kinds.iter().all(Value::is_string)
+                    && kinds
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|kind| value_has_type(value, kind))
+            }
+            _ => {
+                return Err(malformed(
+                    schema_path,
+                    "type must be a string or a string array",
+                ));
+            }
         };
         if accepted {
             return Ok(());
@@ -365,18 +411,26 @@ impl ApiSchema {
         schema_path: &str,
     ) -> Result<(), ValidationError> {
         let valid = match format {
-            "float" => value.as_number().is_none_or(|number| number.as_f64().is_some()),
+            "float" => value
+                .as_number()
+                .is_none_or(|number| number.as_f64().is_some()),
             "int32" => value.as_number().is_none_or(|number| {
                 number
                     .as_i64()
                     .is_some_and(|number| (i32::MIN as i64..=i32::MAX as i64).contains(&number))
             }),
-            "uint" | "uint64" => value.as_number().is_none_or(|number| number.as_u64().is_some()),
+            "uint" | "uint64" => value
+                .as_number()
+                .is_none_or(|number| number.as_u64().is_some()),
             "uint16" => value.as_number().is_none_or(|number| {
-                number.as_u64().is_some_and(|number| u16::try_from(number).is_ok())
+                number
+                    .as_u64()
+                    .is_some_and(|number| u16::try_from(number).is_ok())
             }),
             "uint32" => value.as_number().is_none_or(|number| {
-                number.as_u64().is_some_and(|number| u32::try_from(number).is_ok())
+                number
+                    .as_u64()
+                    .is_some_and(|number| u32::try_from(number).is_ok())
             }),
             _ => {
                 return Err(error(
@@ -637,6 +691,16 @@ impl ApiSchema {
             }
         }
         let additional = schema.get("additionalProperties");
+        // A combinator wrapper such as LayoutNode declares its object shape only in oneOf
+        // alternatives. Applying this crate's closed-object rule before those alternatives
+        // would reject every branch's properties at the wrapper. Each selected branch remains
+        // validated as a closed object below through validate_alternatives.
+        if declared.is_none()
+            && additional.is_none()
+            && (schema.contains_key("oneOf") || schema.contains_key("anyOf"))
+        {
+            return Ok(());
+        }
         for (name, value) in properties {
             if let Some(property_schema) = declared.and_then(|declared| declared.get(name)) {
                 self.validate(
@@ -728,7 +792,9 @@ impl ApiSchema {
                     instance_path,
                     schema_path,
                     if exactly_one {
-                        format!("value must match exactly one {keyword} alternative; matched {matching}")
+                        format!(
+                            "value must match exactly one {keyword} alternative; matched {matching}"
+                        )
                     } else {
                         format!("value must match at least one {keyword} alternative")
                     },
@@ -759,12 +825,19 @@ impl ApiSchema {
         if let Some(types) = object.get("type") {
             let matches_type = match types {
                 Value::String(kind) => value_has_type(value, kind),
-                Value::Array(kinds) => kinds.iter().all(Value::is_string)
-                    && kinds
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|kind| value_has_type(value, kind)),
-                _ => return Err(malformed(schema_path, "type must be a string or a string array")),
+                Value::Array(kinds) => {
+                    kinds.iter().all(Value::is_string)
+                        && kinds
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|kind| value_has_type(value, kind))
+                }
+                _ => {
+                    return Err(malformed(
+                        schema_path,
+                        "type must be a string or a string array",
+                    ));
+                }
             };
             if !matches_type {
                 return Ok(false);
@@ -877,7 +950,10 @@ fn compare_json_numbers(
     right: &Number,
     schema_path: &str,
 ) -> Result<Ordering, ValidationError> {
-    match (ExactInteger::from_number(left), ExactInteger::from_number(right)) {
+    match (
+        ExactInteger::from_number(left),
+        ExactInteger::from_number(right),
+    ) {
         (Some(left), Some(right)) => Ok(left.cmp(right)),
         _ => left
             .as_f64()
@@ -925,7 +1001,12 @@ fn usize_keyword(
             value
                 .as_u64()
                 .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| malformed(schema_path, &format!("{keyword} must be a nonnegative integer")))
+                .ok_or_else(|| {
+                    malformed(
+                        schema_path,
+                        &format!("{keyword} must be a nonnegative integer"),
+                    )
+                })
         })
         .transpose()
 }
@@ -1024,7 +1105,6 @@ mod tests {
         .unwrap()
     }
 
-
     #[test]
     fn rejects_missing_required_parameter() {
         let error = schema()
@@ -1086,12 +1166,14 @@ mod tests {
                 },
             }));
         let schema = ApiSchema::parse(raw).unwrap();
-        assert!(schema
-            .validate_method(
-                "pane.resize",
-                &serde_json::json!({"direction": "right", "amount": 0.1}),
-            )
-            .is_ok());
+        assert!(
+            schema
+                .validate_method(
+                    "pane.resize",
+                    &serde_json::json!({"direction": "right", "amount": 0.1}),
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1116,9 +1198,11 @@ mod tests {
                 {"type": "string", "unevaluatedProperties": false},
             ],
         }));
-        assert!(schema
-            .validate_method("test.method", &serde_json::json!(1))
-            .is_ok());
+        assert!(
+            schema
+                .validate_method("test.method", &serde_json::json!(1))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1140,9 +1224,11 @@ mod tests {
             "pattern": "^[a-z]+$",
         }));
         for value in ["alpha", "beta"] {
-            assert!(schema
-                .validate_method("test.method", &serde_json::json!(value))
-                .is_ok());
+            assert!(
+                schema
+                    .validate_method("test.method", &serde_json::json!(value))
+                    .is_ok()
+            );
         }
         let pattern_count = match schema.patterns.lock() {
             Ok(patterns) => patterns.len(),

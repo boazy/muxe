@@ -150,20 +150,30 @@ impl ActionValidator for RecordedContractAdapter {
         })
     }
 
-    fn validate_native(
+    fn validate_native_batch(
         &self,
-        candidate: &NativeActionCandidate,
-    ) -> Result<ActionValidation, ConfigDiagnostic> {
-        if candidate.type_name == "native.recorded:complete" {
-            return Ok(ActionValidation {
-                execution: ExecutionCapabilities::ASYNCHRONOUS,
-            });
+        candidates: &[&NativeActionCandidate],
+    ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+        let mut accepted = Vec::with_capacity(candidates.len());
+        let mut diagnostics = Vec::new();
+        for candidate in candidates {
+            if candidate.type_name == "native.recorded:complete" {
+                accepted.push(ActionValidation {
+                    execution: ExecutionCapabilities::ASYNCHRONOUS,
+                });
+            } else {
+                diagnostics.push(ConfigDiagnostic::error(
+                    DiagnosticCode::InvalidAction,
+                    "the recorded contract accepts only native.recorded:complete",
+                    candidate.type_span.clone(),
+                ));
+            }
         }
-        Err(ConfigDiagnostic::error(
-            DiagnosticCode::InvalidAction,
-            "the recorded contract accepts only native.recorded:complete",
-            candidate.type_span.clone(),
-        ))
+        if diagnostics.is_empty() {
+            Ok(accepted)
+        } else {
+            Err(diagnostics)
+        }
     }
 }
 

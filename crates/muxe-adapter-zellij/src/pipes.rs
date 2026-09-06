@@ -453,10 +453,6 @@ fn bounded(reason: String) -> String {
 ///
 /// Plain `cargo check` builds report no in-crate caller; the module serves the
 /// external contract suite through the injected `PipeChannel` boundary.
-#[allow(
-    dead_code,
-    reason = "no in-crate caller in non-test builds; used by tests and the external contract suite"
-)]
 pub mod testing {
     use super::*;
     use std::sync::Mutex as StdMutex;

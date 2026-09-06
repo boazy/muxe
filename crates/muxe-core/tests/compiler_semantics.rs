@@ -2,6 +2,7 @@ use muxe_core::{
     CompileInput, CompiledGeneration, Compiler, ConfigDocument, KeyCapabilities, SourceId,
     ThemeAssets,
 };
+use std::sync::Mutex;
 
 fn document(name: &str, yaml: &str) -> ConfigDocument {
     ConfigDocument::parse(SourceId::new(name), yaml).unwrap()
@@ -23,7 +24,7 @@ fn compile(base: &str, host: Option<&str>, capabilities: KeyCapabilities) -> Res
 #[test]
 fn ordered_host_merge_removes_injected_binding_and_replaces_settings() {
     let config = compile(
-        r#"
+        r"
 version: 1
 settings:
   after_action: stay
@@ -40,9 +41,9 @@ menus:
   remove-me:
     bindings:
       x: { label: gone, action: config:reload }
-"#,
+",
         Some(
-            r#"
+            r"
 menus:
   remove-me: { _remove: true }
   main:
@@ -57,7 +58,7 @@ inject:
       type: override
       bindings:
         backspace: { _remove: true }
-"#,
+",
         ),
         KeyCapabilities::default(),
     )
@@ -74,14 +75,14 @@ inject:
 #[test]
 fn cycles_and_invalid_context_types_are_rejected_with_semantic_codes() {
     let cycle = compile(
-        r#"
+        r"
 version: 1
 menus:
   a:
     bindings: { a: { label: to-b, action: menu:open b } }
   b:
     bindings: { b: { label: to-a, action: menu:open a } }
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
@@ -89,7 +90,7 @@ menus:
     assert!(cycle.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::MenuCycle));
 
     let mismatch = compile(
-        r#"
+        r"
 version: 1
 menus:
   main:
@@ -100,7 +101,7 @@ menus:
           type: command:execute
           program: cargo
           cwd: { $context: origin.pane.id }
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
@@ -112,7 +113,7 @@ menus:
 fn kitty_capability_validation_keeps_documented_ctrl_l_repeat_path() {
     let host = KeyCapabilities { event_types: true, alternate_keys: true, all_keys_as_escape_codes: false };
     let valid = compile(
-        r#"
+        r"
 version: 1
 keyboard:
   mode: kitty
@@ -124,14 +125,14 @@ menus:
         label: resize
         settings: { repeat: true }
         action: pane:resize direction=right amount=0.1
-"#,
+",
         None,
         host,
     );
     assert!(valid.is_ok(), "the documented Herdr ctrl+l repeat case is valid");
 
     let invalid = compile(
-        r#"
+        r"
 version: 1
 keyboard:
   mode: kitty
@@ -143,7 +144,7 @@ menus:
         label: text repeat
         settings: { repeat: true }
         action: config:reload
-"#,
+",
         None,
         host,
     )
@@ -154,7 +155,7 @@ menus:
 #[test]
 fn command_execution_defaults_to_detach_unless_an_inherited_mode_overrides_it() {
     let detached = compile(
-        r#"
+        r"
 version: 1
 menus:
   main:
@@ -162,7 +163,7 @@ menus:
       c:
         label: command
         action: command:execute program=echo
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
@@ -182,7 +183,7 @@ menus:
     );
 
     let inherited = compile(
-        r#"
+        r"
 version: 1
 settings:
   execution: { mode: await }
@@ -192,7 +193,7 @@ menus:
       c:
         label: command
         action: command:execute program=echo
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
@@ -275,7 +276,7 @@ fn source_aware_yaml_and_unknown_field_errors_keep_the_candidate_inactive() {
 #[test]
 fn reload_and_host_version_settings_are_typed_retained_and_strictly_validated() {
     let config = compile(
-        r#"
+        r"
 version: 1
 settings:
   reload: { watch: false, debounce: 350ms }
@@ -285,7 +286,7 @@ menus:
   main:
     bindings:
       r: { label: reload, action: config:reload }
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
@@ -300,7 +301,7 @@ menus:
     assert_eq!(config.host.version_check, muxe_core::HostVersionCheck::Strict);
 
     let invalid = compile(
-        r#"
+        r"
 version: 1
 settings:
   reload: { watch: true, unexpected: value }
@@ -308,7 +309,7 @@ menus:
   main:
     bindings:
       r: { label: reload, action: config:reload }
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
@@ -316,7 +317,7 @@ menus:
     assert!(invalid.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::UnknownField));
 
     let nested = compile(
-        r#"
+        r"
 version: 1
 menus:
   main:
@@ -324,7 +325,7 @@ menus:
       reload: { watch: false }
     bindings:
       r: { label: reload, action: config:reload }
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
@@ -408,7 +409,7 @@ menus:
 }
 
 #[test]
-fn theme_and_color_scheme_assets_are_selected_validated_and_carried_to_attachment() {
+fn selected_theme_and_color_scheme_are_carried_to_attachment() {
     let assets = ThemeAssets {
         themes: std::collections::BTreeMap::from([(
             "custom".to_owned(),
@@ -442,12 +443,13 @@ colors:
             ),
         )]),
     };
-    let config = Compiler.compile(
-        CompileInput {
-            generation: CompiledGeneration(10),
-            base: document(
-                "config.yml",
-                r#"
+    let config = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(10),
+                base: document(
+                    "config.yml",
+                    r"
 version: 1
 theme: custom
 color-scheme: ink
@@ -455,49 +457,59 @@ menus:
   main:
     bindings:
       r: { label: reload, action: config:reload }
-"#,
-            ),
-            host_override: None,
-            key_capabilities: KeyCapabilities::default(),
-            theme_assets: assets,
-        },
-        None,
-    )
-    .expect("selected source-tracked assets should compile and pair");
+",
+                ),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: assets,
+            },
+            None,
+        )
+        .expect("selected source-tracked assets should compile and pair");
     assert_eq!(config.theme_selection.theme, "custom");
     assert_eq!(config.theme_selection.color_scheme, "ink");
-    let attachment = config.attachment_view(&muxe_core::MenuId::new("main")).unwrap();
+    let attachment = config
+        .attachment_view(&muxe_core::MenuId::new("main"))
+        .expect("compiled main menu has an attachment");
     assert_eq!(attachment.theme_selection, config.theme_selection);
     assert_eq!(attachment.theme, config.theme);
+}
 
-    let unknown = Compiler.compile(
-        CompileInput {
-            generation: CompiledGeneration(11),
-            base: document(
-                "config.yml",
-                r#"
+#[test]
+fn unknown_or_invalid_theme_assets_are_rejected() {
+    let unknown = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(11),
+                base: document(
+                    "config.yml",
+                    r"
 version: 1
 theme: absent
 menus:
   main:
     bindings:
       r: { label: reload, action: config:reload }
-"#,
-            ),
-            host_override: None,
-            key_capabilities: KeyCapabilities::default(),
-            theme_assets: ThemeAssets::default(),
-        },
-        None,
-    )
-    .unwrap_err();
-    assert!(unknown.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme));
-    let invalid_pair = Compiler.compile(
-        CompileInput {
-            generation: CompiledGeneration(12),
-            base: document(
-                "config.yml",
-                r#"
+",
+                ),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: ThemeAssets::default(),
+            },
+            None,
+        )
+        .expect_err("an absent selected theme must not compile");
+    assert!(unknown
+        .iter()
+        .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme));
+
+    let invalid_pair = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(12),
+                base: document(
+                    "config.yml",
+                    r"
 version: 1
 theme: broken
 color-scheme: ink
@@ -505,40 +517,41 @@ menus:
   main:
     bindings:
       r: { label: reload, action: config:reload }
-"#,
-            ),
-            host_override: None,
-            key_capabilities: KeyCapabilities::default(),
-            theme_assets: ThemeAssets {
-                themes: std::collections::BTreeMap::from([(
-                    "broken".to_owned(),
-                    document(
-                        "themes/broken.yml",
-                        r#"
+",
+                ),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: ThemeAssets {
+                    themes: std::collections::BTreeMap::from([(
+                        "broken".to_owned(),
+                        document(
+                            "themes/broken.yml",
+                            r"
 common:
   styles:
     default: { foreground: absent.color }
-"#,
-                    ),
-                )]),
-                color_schemes: std::collections::BTreeMap::from([(
-                    "ink".to_owned(),
-                    document(
-                        "color-schemes/ink.yml",
-                        r##"
+",
+                        ),
+                    )]),
+                    color_schemes: std::collections::BTreeMap::from([(
+                        "ink".to_owned(),
+                        document(
+                            "color-schemes/ink.yml",
+                            r##"
 title: Ink
 palette: { foreground: "#ddeeff" }
 colors: { base: { text: foreground } }
 "##,
-                    ),
-                )]),
+                        ),
+                    )]),
+                },
             },
-        },
-        None,
-    )
-    .unwrap_err();
-    assert!(invalid_pair.iter().any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme));
-
+            None,
+        )
+        .expect_err("an invalid selected theme pair must not compile");
+    assert!(invalid_pair
+        .iter()
+        .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme));
 }
 
 
@@ -553,26 +566,136 @@ impl muxe_core::ActionValidator for DirectionalHostValidator {
         if let muxe_core::PortableAction::Pane(muxe_core::PaneAction::Split {
             direction: Some(direction),
         }) = action
+            && direction.value.as_str() == Some("right")
         {
-            if direction.value.as_str() == Some("right") {
-                return Err(muxe_core::ConfigDiagnostic::error(
-                    muxe_core::DiagnosticCode::InvalidActionArguments,
-                    "the active host does not support rightward splits",
-                    action_span.clone(),
-                ));
-            }
+            return Err(muxe_core::ConfigDiagnostic::error(
+                muxe_core::DiagnosticCode::InvalidActionArguments,
+                "the active host does not support rightward splits",
+                action_span.clone(),
+            ));
         }
         Ok(muxe_core::ActionValidation {
             execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
         })
     }
 
-    fn validate_native(
+    fn validate_native_batch(
         &self,
-        _candidate: &muxe_core::NativeActionCandidate,
-    ) -> Result<muxe_core::ActionValidation, muxe_core::ConfigDiagnostic> {
+        _candidates: &[&muxe_core::NativeActionCandidate],
+    ) -> Result<Vec<muxe_core::ActionValidation>, Vec<muxe_core::ConfigDiagnostic>> {
         unreachable!("the test config contains no native action")
     }
+}
+
+#[derive(Default)]
+struct BatchHostValidator {
+    batches: Mutex<Vec<Vec<String>>>,
+    omit_last_validation: bool,
+}
+
+impl muxe_core::ActionValidator for BatchHostValidator {
+    fn validate_portable(
+        &self,
+        _action: &muxe_core::PortableAction,
+        _action_span: &muxe_core::SourceSpan,
+    ) -> Result<muxe_core::ActionValidation, muxe_core::ConfigDiagnostic> {
+        Ok(muxe_core::ActionValidation {
+            execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+        })
+    }
+
+    fn validate_native_batch(
+        &self,
+        candidates: &[&muxe_core::NativeActionCandidate],
+    ) -> Result<Vec<muxe_core::ActionValidation>, Vec<muxe_core::ConfigDiagnostic>> {
+        self.batches
+            .lock()
+            .expect("batch observations are not poisoned")
+            .push(candidates.iter().map(|candidate| candidate.type_name.clone()).collect());
+        let validation_count = candidates
+            .len()
+            .saturating_sub(usize::from(self.omit_last_validation));
+        Ok(vec![
+            muxe_core::ActionValidation {
+                execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+            };
+            validation_count
+        ])
+    }
+}
+
+#[test]
+fn native_actions_are_validated_once_as_an_ordered_effective_batch() {
+    let validator = BatchHostValidator::default();
+    Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(12),
+                base: document(
+                    "config.yml",
+                    r"
+version: 1
+menus:
+  first:
+    bindings:
+      a: { label: first, action: native.test:first }
+  second:
+    bindings:
+      b: { label: second, action: native.test:second }
+",
+                ),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: ThemeAssets::default(),
+            },
+            Some(&validator),
+        )
+        .expect("native actions validate as one batch");
+    assert_eq!(
+        *validator
+            .batches
+            .lock()
+            .expect("batch observations are not poisoned"),
+        vec![vec![
+            "native.test:first".to_owned(),
+            "native.test:second".to_owned(),
+        ]]
+    );
+}
+
+#[test]
+fn native_validation_batch_must_cover_every_effective_candidate() {
+    let validator = BatchHostValidator {
+        batches: Mutex::default(),
+        omit_last_validation: true,
+    };
+    let diagnostics = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(12),
+                base: document(
+                    "config.yml",
+                    r"
+version: 1
+menus:
+  first:
+    bindings:
+      a: { label: first, action: native.test:first }
+  second:
+    bindings:
+      b: { label: second, action: native.test:second }
+",
+                ),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: ThemeAssets::default(),
+            },
+            Some(&validator),
+        )
+        .expect_err("incomplete native validation results must reject the config");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::NativeActionRejected));
 }
 
 #[test]
@@ -583,13 +706,13 @@ fn active_host_portable_validation_rejects_an_incompatible_candidate_before_acti
             generation: CompiledGeneration(12),
             base: document(
                 "config.yml",
-                r#"
+                r"
 version: 1
 menus:
   main:
     bindings:
       s: { label: split, action: pane:split right }
-"#,
+",
             ),
             host_override: None,
             key_capabilities: KeyCapabilities::default(),
@@ -626,10 +749,9 @@ fn origin_with_context_values() -> muxe_core::OriginContext {
     }
 }
 
-#[test]
-fn portable_scalar_contexts_are_typed_resolved_and_revalidated_before_dispatch() {
-    let config = compile(
-        r#"
+fn portable_context_config() -> muxe_core::CompiledConfig {
+    compile(
+        r"
 version: 1
 menus:
   main:
@@ -663,7 +785,6 @@ menus:
         action:
           type: session:attach
           name: { $context: origin.selection.text }
-
       t:
         label: focus origin tab
         action:
@@ -672,39 +793,46 @@ menus:
       w:
         label: create workspace tab
         action: tab:create workspace-id=$origin.workspace.id
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
-    .expect("typed portable context values should compile");
+    .expect("typed portable context values should compile")
+}
+
+fn portable_main_action<'a>(
+    config: &'a muxe_core::CompiledConfig,
+    key: &str,
+) -> &'a muxe_core::PortableAction {
+    let binding = config
+        .menu(&muxe_core::MenuId::new("main"))
+        .and_then(|menu| {
+            menu.bindings
+                .iter()
+                .find(|binding| binding.key.canonical_string() == key)
+        })
+        .expect("compiled main menu has the requested binding");
+    let muxe_core::ActionSpec::Portable(action) = &binding.action else {
+        panic!("expected portable action");
+    };
+    action
+}
+
+#[test]
+fn available_portable_context_values_resolve_for_each_action_kind() {
+    let config = portable_context_config();
     let origin = origin_with_context_values();
     for key in ["c", "k", "p", "s", "t", "w"] {
-        let binding = config
-            .menu(&muxe_core::MenuId::new("main"))
-            .unwrap()
-            .bindings
-            .iter()
-            .find(|binding| binding.key.canonical_string() == key)
-            .unwrap();
-        let muxe_core::ActionSpec::Portable(action) = &binding.action else {
-            panic!("expected portable action");
-        };
-        action
+        portable_main_action(&config, key)
             .resolve_context(&origin)
             .expect("available context must resolve and pass concrete validation");
     }
+}
 
-
-    let command = config
-        .menu(&muxe_core::MenuId::new("main"))
-        .unwrap()
-        .bindings
-        .iter()
-        .find(|binding| binding.key.canonical_string() == "c")
-        .unwrap();
-    let muxe_core::ActionSpec::Portable(action) = &command.action else {
-        panic!("expected command");
-    };
+#[test]
+fn command_context_values_preserve_source_and_revalidate_cwd() {
+    let config = portable_context_config();
+    let action = portable_main_action(&config, "c");
     let muxe_core::PortableAction::Command(unresolved) = action else {
         panic!("expected command");
     };
@@ -714,17 +842,20 @@ menus:
     ));
     assert_eq!(unresolved.program.value.span.source.as_str(), "config.yml");
 
-    let muxe_core::PortableAction::Command(command) = action.resolve_context(&origin).unwrap() else {
+    let origin = origin_with_context_values();
+    let muxe_core::PortableAction::Command(command) = action
+        .resolve_context(&origin)
+        .expect("command context should resolve") else {
         panic!("expected resolved command");
     };
     assert_eq!(command.program.value.as_str(), Some("selected text"));
     assert_eq!(command.args[0].value.as_str(), Some("selected text"));
-    assert_eq!(command.cwd.unwrap().value.as_str(), Some("/tmp/project"));
+    assert_eq!(command.cwd.expect("configured cwd").value.as_str(), Some("/tmp/project"));
     assert_eq!(command.env["SELECTED"].value.as_str(), Some("selected text"));
 
     let relative_cwd_origin = muxe_core::OriginContext {
         pane_cwd: Some(std::path::PathBuf::from("relative/project")),
-        ..origin.clone()
+        ..origin
     };
     assert!(matches!(
         action.resolve_context(&relative_cwd_origin),
@@ -733,73 +864,57 @@ menus:
             ..
         })
     ));
+}
 
-    let tab_binding = config
-        .menu(&muxe_core::MenuId::new("main"))
-        .unwrap()
-        .bindings
-        .iter()
-        .find(|binding| binding.key.canonical_string() == "t")
-        .unwrap();
-    let muxe_core::ActionSpec::Portable(tab_action) = &tab_binding.action else {
-        panic!("expected tab action");
-    };
+#[test]
+fn tab_and_keyboard_context_values_revalidate_to_their_declared_types() {
+    let config = portable_context_config();
+    let origin = origin_with_context_values();
+    let tab_action = portable_main_action(&config, "t");
     let muxe_core::PortableAction::Tab(muxe_core::TabAction::Focus(
         muxe_core::IndexOrDirection::Index(index),
-    )) = tab_action.resolve_context(&origin).unwrap() else {
+    )) = tab_action.resolve_context(&origin).expect("tab index context resolves") else {
         panic!("expected resolved tab index");
     };
     assert!(matches!(index.value.kind, muxe_core::ConfigValueKind::Integer(4)));
 
-    let create_binding = config
-        .menu(&muxe_core::MenuId::new("main"))
-        .unwrap()
-        .bindings
-        .iter()
-        .find(|binding| binding.key.canonical_string() == "w")
-        .unwrap();
-    let muxe_core::ActionSpec::Portable(create_action) = &create_binding.action else {
-        panic!("expected tab create");
-    };
+    let create_action = portable_main_action(&config, "w");
     let muxe_core::PortableAction::Tab(muxe_core::TabAction::Create {
         workspace_id: Some(workspace_id),
-    }) = create_action.resolve_context(&origin).unwrap() else {
+    }) = create_action
+        .resolve_context(&origin)
+        .expect("workspace context resolves") else {
         panic!("expected resolved workspace-targeted tab create");
     };
     assert_eq!(workspace_id.value.as_str(), Some("workspace"));
 
-    let key_binding = config
-        .menu(&muxe_core::MenuId::new("main"))
-
-        .unwrap()
-        .bindings
-        .iter()
-        .find(|binding| binding.key.canonical_string() == "q")
-        .unwrap();
-    let muxe_core::ActionSpec::Portable(key_action) = &key_binding.action else {
-        panic!("expected keyboard action");
-    };
+    let key_action = portable_main_action(&config, "q");
     let key_origin = muxe_core::OriginContext {
         selection_text: Some("ctrl+c".to_owned()),
         ..origin.clone()
     };
-    key_action.resolve_context(&key_origin).expect("resolved keyboard key must revalidate");
+    key_action
+        .resolve_context(&key_origin)
+        .expect("resolved keyboard key must revalidate");
     let invalid_key_origin = muxe_core::OriginContext {
         selection_text: Some("not-a-canonical-key".to_owned()),
-        ..origin.clone()
+        ..origin
     };
     assert!(matches!(
         key_action.resolve_context(&invalid_key_origin),
         Err(muxe_core::PortableActionResolutionError::InvalidValue { .. })
     ));
+}
 
-
+#[test]
+fn missing_context_value_fails_resolution() {
+    let config = portable_context_config();
     let unavailable = muxe_core::OriginContext {
         selection_text: None,
-        ..origin
+        ..origin_with_context_values()
     };
     assert!(matches!(
-        action.resolve_context(&unavailable),
+        portable_main_action(&config, "c").resolve_context(&unavailable),
         Err(muxe_core::PortableActionResolutionError::Context(_))
     ));
 }
@@ -911,7 +1026,7 @@ menus:
 #[test]
 fn command_cwd_allows_literal_relative_paths() {
     let config = compile(
-        r#"
+        r"
 version: 1
 menus:
   main:
@@ -922,7 +1037,7 @@ menus:
           type: command:execute
           program: echo
           cwd: relative/project
-"#,
+",
         None,
         KeyCapabilities::default(),
     )
@@ -945,13 +1060,13 @@ menus:
 #[test]
 fn binding_lookup_indexes_the_authoritative_menu_payload_without_duplication() {
     let config = compile(
-        r#"
+        r"
 version: 1
 menus:
   main:
     bindings:
       r: { label: reload, action: config:reload }
-"#,
+",
         None,
         KeyCapabilities::default(),
     )

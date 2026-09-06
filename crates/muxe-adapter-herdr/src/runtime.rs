@@ -37,39 +37,47 @@ pub struct HerdrAdapterConfig {
 pub struct HerdrRuntime {
     client: Arc<HerdrSocketClient>,
     schema: Arc<ApiSchema>,
+    schema_cache_hit: bool,
     identity: HostIdentity,
     endpoint: EndpointIdentity,
 }
 impl HerdrRuntime {
     /// Acquires one runtime schema from the configured executable, verifies protocol compatibility,
-    /// records its normalized cache key, and then probes the exact server behind `socket_path`,
-    /// retaining its endpoint incarnation as the continuity boundary.
+    /// records its normalized cache key, and probes the exact server currently accepting at
+    /// `socket_path`. The resulting OS observation is not continuity authority.
     pub async fn connect(config: HerdrAdapterConfig) -> Result<Self, AdapterError> {
         let raw_schema = runtime_schema(&config.herdr_binary).await?;
-        let schema = ApiSchema::parse(raw_schema.clone()).map_err(|error| {
+        let (protocol, schema_version) = ApiSchema::metadata(&raw_schema).map_err(|error| {
             incompatible(format!("installed Herdr API schema is invalid: {error}"))
         })?;
-        if schema.protocol() != BUNDLED_PROTOCOL {
+        if protocol != BUNDLED_PROTOCOL {
             return Err(incompatible(format!(
-                "Herdr protocol {} is incompatible with required protocol {}",
-                schema.protocol(),
-                BUNDLED_PROTOCOL
+                "Herdr protocol {protocol} is incompatible with required protocol {BUNDLED_PROTOCOL}"
             )));
         }
-        HerdrCache::new(&config.cache_dir)
-            .normalized_schema(schema.protocol(), schema.schema_version(), &raw_schema)
+        let (normalized_request, schema_cache_hit) = HerdrCache::new(&config.cache_dir)
+            .normalized_schema(protocol, schema_version, &raw_schema)
             .map_err(|error| {
                 AdapterError::new(
                     AdapterErrorKind::Unavailable,
                     format!("could not update Herdr runtime-schema cache: {error}"),
                 )
             })?;
+        let normalized_request = serde_json::from_slice(&normalized_request).map_err(|error| {
+            incompatible(format!(
+                "Herdr runtime-schema cache returned an invalid normalized request representation: {error}"
+            ))
+        })?;
+        let schema = ApiSchema::parse_with_request(raw_schema, &normalized_request).map_err(
+            |error| incompatible(format!("installed Herdr API schema is invalid: {error}")),
+        )?;
 
         let client = Arc::new(HerdrSocketClient::new(config.socket_path.clone()));
         let (identity, endpoint) = probe_endpoint_identity(&client).await?;
         Ok(Self {
             client,
             schema: Arc::new(schema),
+            schema_cache_hit,
             identity,
             endpoint,
         })
@@ -81,6 +89,12 @@ impl HerdrRuntime {
 
     pub fn schema(&self) -> &Arc<ApiSchema> {
         &self.schema
+    }
+
+    /// Whether this connection parsed the cache-verified normalized request representation rather
+    /// than freshly canonicalizing the same request surface.
+    pub fn used_cached_schema_representation(&self) -> bool {
+        self.schema_cache_hit
     }
 
     pub fn identity(&self) -> &HostIdentity {
@@ -100,6 +114,14 @@ impl HerdrRuntime {
 }
 
 async fn runtime_schema(binary: &PathBuf) -> Result<Value, AdapterError> {
+    runtime_schema_with_timeouts(binary, SCHEMA_TIMEOUT, REAP_TIMEOUT).await
+}
+
+async fn runtime_schema_with_timeouts(
+    binary: &PathBuf,
+    schema_timeout: Duration,
+    reap_timeout: Duration,
+) -> Result<Value, AdapterError> {
     let mut child = Command::new(binary)
         .arg("api")
         .arg("schema")
@@ -120,23 +142,44 @@ async fn runtime_schema(binary: &PathBuf) -> Result<Value, AdapterError> {
                 ),
             )
         })?;
-    let outcome = tokio::time::timeout(SCHEMA_TIMEOUT, collect_schema_output(&mut child)).await;
+    let outcome = tokio::time::timeout(schema_timeout, collect_schema_output(&mut child)).await;
     let (status, stdout, diagnostics) = match outcome {
         Ok(collected) => collected?,
         Err(_) => {
-            // Explicitly kill and reap exactly the owned child spawned above.
-            // `start_kill` signals only this retained handle and `wait` reaps it,
-            // so no zombie remains and no other process can be affected: there is
-            // no name or PID search, no process-group signal, and no global
-            // cleanup. `kill_on_drop` remains only as a backstop.
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
+            // Explicitly signal and then reap exactly this retained child handle. There is no
+            // name or PID search, no process-group signal, and no global cleanup.
+            // `kill_on_drop` remains only as a backstop. A failed kill or reap is surfaced
+            // instead of pretending the owned child is gone.
+            child.start_kill().map_err(|error| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    format!("could not kill timed-out Herdr schema child: {error}"),
+                )
+            })?;
+            match tokio::time::timeout(reap_timeout, child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Unavailable,
+                        format!("could not reap timed-out Herdr schema child: {error}"),
+                    ));
+                }
+                Err(_) => {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Unavailable,
+                        format!(
+                            "timed out after {}s while reaping the owned Herdr schema child",
+                            reap_timeout.as_secs()
+                        ),
+                    ));
+                }
+            }
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
                 format!(
                     "{} api schema --json timed out after {}s",
                     binary.display(),
-                    SCHEMA_TIMEOUT.as_secs()
+                    schema_timeout.as_secs()
                 ),
             ));
         }
@@ -218,10 +261,10 @@ pub async fn probe_live_identity(client: &HerdrSocketClient) -> Result<HostIdent
     probe_endpoint_identity(client).await.map(|(identity, _)| identity)
 }
 
-/// Probes the live server and returns its opaque identity together with the OS-visible
-/// endpoint incarnation the identity is bound to. The broker retains the endpoint and
-/// compares it on every health check: inequality proves server replacement, even when
-/// the replacement reports the same protocol and version on the same socket path.
+/// Probes the live server and returns its opaque host identity together with an OS-visible
+/// endpoint observation. An observed inequality can prove replacement even when the
+/// replacement reports the same protocol and version on the same socket path. Equality
+/// never proves continuity; the retained subscription stream and local epoch do.
 pub async fn probe_endpoint_identity(
     client: &HerdrSocketClient,
 ) -> Result<(HostIdentity, EndpointIdentity), AdapterError> {
@@ -275,11 +318,10 @@ fn identity_from_ping_result(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| incompatible("Herdr ping result lacks nonempty version"))?;
     // Protocol 20 exposes no per-server identifier in a pong: only type, protocol,
-    // and version. The server-selection boundary stays the explicitly configured
-    // socket, but the identity is bound to the OS-visible endpoint incarnation
-    // (socket-file device/inode plus best-effort peer credentials), so a replacement
-    // server rebound to the same path never compares equal to the old one. The
-    // resulting string is opaque: consumers only equality-compare it.
+    // and version. The configured socket identifies the selected host, while the
+    // OS-visible endpoint observation contributes an opaque shared host identity.
+    // Its equality cannot establish continuity because POSIX can recycle inode and
+    // process identifiers; consumers must not use it as a continuity token.
     Ok(HostIdentity {
         kind: HostKind::Herdr,
         discovery_key,
@@ -319,90 +361,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebound_server_never_matches_old_incarnation() {
+    async fn identical_endpoint_observation_is_not_a_continuity_claim() {
         let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("herdr.sock");
-        let first = capture_at(&path).await;
-        std::fs::remove_file(&path).unwrap();
-        let second = capture_at(&path).await;
-        assert_ne!(
-            first.live_server_id(BUNDLED_PROTOCOL, "0.8.2"),
-            second.live_server_id(BUNDLED_PROTOCOL, "0.8.2"),
-            "a replacement server on the same path must never reuse the old identity \
-             even when it reports the same protocol and version"
+        let endpoint = capture_at(&temp.path().join("herdr.sock")).await;
+
+        assert!(
+            !endpoint.proven_replacement(&endpoint),
+            "an equal observation is deliberately inconclusive, not continuity proof"
         );
     }
 
-    /// Exercises the production `HerdrRuntime::connect` path with only injected
-    /// fixtures: a throwaway schema-command executable standing in for the exact
-    /// installed Herdr binary, and a fake socket server answering `ping`. No real
-    /// host binary, socket, or endpoint is ever touched.
+    /// The timeout path owns one concrete nonterminating schema child, kills it, and reaps it
+    /// before returning. The short injected bounds exercise the production algorithm without a
+    /// ten-second wall-clock test.
     #[cfg(unix)]
     #[tokio::test]
-    async fn connect_uses_injected_schema_child_and_fake_server() {
+    async fn schema_timeout_kills_and_reaps_the_owned_child() {
+        use nix::{
+            errno::Errno,
+            sys::wait::{WaitPidFlag, waitpid},
+            unistd::Pid,
+        };
         use std::os::unix::fs::PermissionsExt;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let temp = tempfile::TempDir::new().unwrap();
         let script = temp.path().join("herdr");
+        let pid_file = temp.path().join("pid");
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '%s' '{\"protocol\":20,\"schema_version\":1,\"schemas\":{\"request\":{\"oneOf\":[{\"properties\":{\"method\":{\"const\":\"ping\"},\"params\":{}}}]}}}'",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/pid\"\nexec sleep 3600\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        let socket = temp.path().join("herdr.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            // The unary ping: read exactly one request line, answer it, then close
-            // so the client observes the required end-of-stream.
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = tokio::io::BufReader::new(stream);
-            let mut line = Vec::new();
-            reader.read_until(b'\n', &mut line).await.unwrap();
-            let id = serde_json::from_slice::<Value>(&line).unwrap()["id"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            reader
-                .write_all(
-                    format!(
-                        "{{\"id\":\"{id}\",\"result\":{{\"type\":\"pong\",\"protocol\":20,\"version\":\"0.8.2\"}}}}\n"
-                    )
-                    .as_bytes(),
+        let worker = tokio::spawn({
+            let script = script.clone();
+            async move {
+                runtime_schema_with_timeouts(
+                    &script,
+                    Duration::from_millis(50),
+                    Duration::from_secs(1),
                 )
                 .await
-                .unwrap();
-            drop(reader);
-            // The endpoint probe opens a second connection only for OS peer
-            // credentials; accepting and closing it is the complete service.
-            let (peer, _) = listener.accept().await.unwrap();
-            drop(peer);
+            }
         });
-
-        let cache_dir = temp.path().join("cache");
-        let runtime = HerdrRuntime::connect(HerdrAdapterConfig {
-            socket_path: socket.clone(),
-            herdr_binary: script,
-            cache_dir,
-        })
-        .await
-        .expect("injected fixtures must satisfy the production connect path");
-        server.await.unwrap();
-
-        assert_eq!(runtime.identity().discovery_key, socket.display().to_string());
-        assert_eq!(
-            runtime.identity().live_server_id,
-            runtime.endpoint().live_server_id(20, "0.8.2"),
-            "identity must be bound to the retained endpoint incarnation"
+        let mut child_pid = None;
+        for _ in 0..100 {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = pid.trim().parse::<i32>()
+            {
+                child_pid = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let pid = Pid::from_raw(
+            child_pid.expect("schema child writes its PID marker before its timeout"),
         );
-        assert_eq!(runtime.schema().protocol(), BUNDLED_PROTOCOL);
+
+        let error = worker
+            .await
+            .expect("schema worker task does not panic")
+            .expect_err("a nonterminating schema child must time out");
+        assert_eq!(error.kind, AdapterErrorKind::Unavailable);
         assert!(
-            runtime.endpoint().recheck(),
-            "the fake server outlives connect, so the stat gate must hold"
+            error.message.contains("api schema --json timed out"),
+            "the timeout must only return after the owned child is reaped"
+        );
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(Errno::ECHILD),
+            "the owned schema child must be reaped rather than left as a zombie"
         );
     }
+
 }
 
 fn socket_error(error: SocketError) -> AdapterError {

@@ -1,0 +1,15 @@
+[package]
+name = "muxe-zellij-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+muxe-protocol = { path = "../muxe-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zellij-tile.workspace = true
+zellij-utils.workspace = true

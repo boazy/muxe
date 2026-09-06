@@ -217,12 +217,23 @@ impl ComparisonKey {
     }
 }
 
-/// Canonical hash of one configured native-request set: method names, wire
-/// field names (kebab-case YAML becomes snake_case wire names), literal JSON
-/// values, and typed context references, all in canonical order.
+/// Canonical hash of the effective native-request sequence: method names, wire field names
+/// (kebab-case YAML becomes snake_case wire names), literal JSON values, and typed context
+/// references. The compiler supplies deterministic binding order, which is retained because
+/// cached outcomes are positional and must never be applied to a reordered configuration.
 pub fn hash_configured_requests(candidates: &[NativeActionCandidate]) -> String {
-    let mut normalized: Vec<Value> = candidates
-        .iter()
+    hash_configured_candidate_iter(candidates.iter())
+}
+
+/// Equivalent whole-effective-set hash without cloning borrowed compiler candidates.
+pub fn hash_configured_request_refs(candidates: &[&NativeActionCandidate]) -> String {
+    hash_configured_candidate_iter(candidates.iter().copied())
+}
+
+fn hash_configured_candidate_iter<'a>(
+    candidates: impl Iterator<Item = &'a NativeActionCandidate>,
+) -> String {
+    let normalized: Vec<Value> = candidates
         .map(|candidate| {
             let mut fields = BTreeMap::new();
             for field in &candidate.fields {
@@ -237,7 +248,6 @@ pub fn hash_configured_requests(candidates: &[NativeActionCandidate]) -> String 
             })
         })
         .collect();
-    normalized.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
     sha256_hex(&canonical_bytes(Value::Array(normalized)))
 }
 
@@ -609,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_request_hash_is_order_and_case_stable() {
+    fn configured_request_hash_is_case_stable_and_position_sensitive() {
         let candidate = |type_name: &str, field: &str| NativeActionCandidate {
             type_name: type_name.to_owned(),
             type_span: muxe_core::SourceSpan::new(muxe_core::SourceId::new("test"), 0, 1),
@@ -629,21 +639,19 @@ mod tests {
                 value: ConfigValue::string("w1:p3"),
             }],
         }];
-        // The request schema receives snake_case field names, so equivalent YAML spelling must
-        // canonicalize to one cache key.
         assert_eq!(
             hash_configured_requests(&kebab),
             hash_configured_requests(&snake_direct)
         );
-        // Candidate order must not affect the set hash.
         let pair = vec![
             candidate("native.herdr.pane:resize", "pane-id"),
             candidate("native.herdr.server:reload-config", "pane-id"),
         ];
         let swapped = vec![pair[1].clone(), pair[0].clone()];
-        assert_eq!(
+        assert_ne!(
             hash_configured_requests(&pair),
-            hash_configured_requests(&swapped)
+            hash_configured_requests(&swapped),
+            "whole-set outcomes are positional in compiler binding order"
         );
     }
 }

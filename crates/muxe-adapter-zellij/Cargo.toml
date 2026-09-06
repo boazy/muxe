@@ -1,0 +1,23 @@
+[package]
+name = "muxe-adapter-zellij"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+muxe-adapter-api = { path = "../muxe-adapter-api" }
+muxe-core = { path = "../muxe-core" }
+muxe-protocol = { path = "../muxe-protocol" }
+muxe-zellij-protocol = { path = "../muxe-zellij-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

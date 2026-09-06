@@ -49,7 +49,7 @@ use std::{
 
 use muxe_adapter_api::{AdapterError, AdapterErrorKind};
 use muxe_core::PaneId;
-use muxe_zellij_protocol::generated::{raw, RawNativeCommand};
+use muxe_zellij_protocol::generated::{RawNativeCommand, raw};
 use thiserror::Error;
 
 /// Split direction. Zellij supports all four, unlike Herdr's right/down pair.
@@ -229,26 +229,32 @@ impl ZellijPaneLaunch {
                 borderless: None,
                 tab_id: None,
             },
-            ZellijPlacement::Floating { x, y, width, height } => {
-                raw::Action::NewFloatingPane {
-                    command: Some(command),
-                    pane_name: None,
-                    coordinates: Some(raw::FloatingPaneCoordinates {
-                        x: x.map(|cells| raw::PercentOrFixed::Fixed(cells as usize)),
-                        y: y.map(|cells| raw::PercentOrFixed::Fixed(cells as usize)),
-                        width: width.map(SizeSpec::into_mirror),
-                        height: height.map(SizeSpec::into_mirror),
-                        pinned: None,
-                        borderless: None,
-                    }),
-                    near_current_pane: true,
-                    no_focus: !self.focus,
-                    tab_id: None,
-                }
-            }
+            ZellijPlacement::Floating {
+                x,
+                y,
+                width,
+                height,
+            } => raw::Action::NewFloatingPane {
+                command: Some(command),
+                pane_name: None,
+                coordinates: Some(raw::FloatingPaneCoordinates {
+                    x: x.map(|cells| raw::PercentOrFixed::Fixed(cells as usize)),
+                    y: y.map(|cells| raw::PercentOrFixed::Fixed(cells as usize)),
+                    width: width.map(SizeSpec::into_mirror),
+                    height: height.map(SizeSpec::into_mirror),
+                    pinned: None,
+                    borderless: None,
+                }),
+                near_current_pane: true,
+                no_focus: !self.focus,
+                tab_id: None,
+            },
         };
         Ok((
-            RawNativeCommand::RunAction { action, context: Vec::new() },
+            RawNativeCommand::RunAction {
+                action,
+                context: Vec::new(),
+            },
             self.target,
         ))
     }
@@ -364,7 +370,12 @@ pub fn normalize_placement(
         check_dimension(height)?;
     }
     let (x, y) = position.unwrap_or((0, 0));
-    Ok(ZellijPlacement::Floating { x: Some(x), y: Some(y), width, height })
+    Ok(ZellijPlacement::Floating {
+        x: Some(x),
+        y: Some(y),
+        width,
+        height,
+    })
 }
 
 fn check_dimension(size: SizeSpec) -> Result<(), LaunchError> {
@@ -435,7 +446,6 @@ pub fn split_argv(argv: Vec<OsString>) -> Result<(PathBuf, Vec<String>), LaunchE
     Ok((PathBuf::from(program_text), args))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,7 +457,9 @@ mod tests {
             cwd: Some(PathBuf::from("/work")),
             program: PathBuf::from("muxe"),
             args: vec!["ui".to_owned(), "menu".to_owned(), "main".to_owned()],
-            placement: ZellijPlacement::Split { direction: ZellijSplitDirection::Down },
+            placement: ZellijPlacement::Split {
+                direction: ZellijSplitDirection::Down,
+            },
             focus: true,
         }
     }
@@ -462,7 +474,12 @@ mod tests {
             panic!("expected run-action wrap");
         };
         match action {
-            raw::Action::NewTiledPane { direction, command, no_focus, .. } => {
+            raw::Action::NewTiledPane {
+                direction,
+                command,
+                no_focus,
+                ..
+            } => {
                 assert_eq!(direction, Some(raw::Direction::Down));
                 assert!(!no_focus);
                 let command = command.expect("command");
@@ -495,13 +512,15 @@ mod tests {
             panic!("expected run-action wrap");
         };
         match action {
-            raw::Action::NewFloatingPane { coordinates, no_focus, command, .. } => {
+            raw::Action::NewFloatingPane {
+                coordinates,
+                no_focus,
+                command,
+                ..
+            } => {
                 assert!(no_focus);
                 let coordinates = coordinates.expect("coordinates");
-                assert_eq!(
-                    coordinates.width,
-                    Some(raw::PercentOrFixed::Percent(100))
-                );
+                assert_eq!(coordinates.width, Some(raw::PercentOrFixed::Percent(100)));
                 assert_eq!(coordinates.y, Some(raw::PercentOrFixed::Fixed(7)));
                 assert_eq!(command.expect("command").command, PathBuf::from("htop"));
             }
@@ -519,7 +538,10 @@ mod tests {
         ));
         let mut launch = menu_launch();
         launch.cwd = None;
-        assert!(matches!(launch.into_command(), Err(LaunchError::MissingCwd)));
+        assert!(matches!(
+            launch.into_command(),
+            Err(LaunchError::MissingCwd)
+        ));
     }
 
     #[test]
@@ -532,7 +554,10 @@ mod tests {
                 None,
                 None,
             ),
-            Err(LaunchError::UnsupportedPlacement { option: "--width", .. })
+            Err(LaunchError::UnsupportedPlacement {
+                option: "--width",
+                ..
+            })
         ));
         assert!(matches!(
             normalize_placement(
@@ -542,7 +567,10 @@ mod tests {
                 Some(SizeSpec::Percent(30)),
                 None,
             ),
-            Err(LaunchError::UnsupportedPlacement { option: "--height", .. })
+            Err(LaunchError::UnsupportedPlacement {
+                option: "--height",
+                ..
+            })
         ));
         assert!(matches!(
             normalize_placement(
@@ -552,7 +580,10 @@ mod tests {
                 None,
                 Some((10, 10)),
             ),
-            Err(LaunchError::UnsupportedPlacement { option: "--position", .. })
+            Err(LaunchError::UnsupportedPlacement {
+                option: "--position",
+                ..
+            })
         ));
         let placement = normalize_placement(
             ZellijPaneKind::Split,
@@ -564,7 +595,9 @@ mod tests {
         .expect("bare split normalizes");
         assert_eq!(
             placement,
-            ZellijPlacement::Split { direction: ZellijSplitDirection::Left }
+            ZellijPlacement::Split {
+                direction: ZellijSplitDirection::Left
+            }
         );
     }
 
@@ -656,7 +689,10 @@ mod tests {
         .expect("splits");
         assert_eq!(program, PathBuf::from("muxe"));
         assert_eq!(args, vec!["ui".to_owned(), "menu main".to_owned()]);
-        assert!(matches!(split_argv(Vec::new()), Err(LaunchError::EmptyArgv)));
+        assert!(matches!(
+            split_argv(Vec::new()),
+            Err(LaunchError::EmptyArgv)
+        ));
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
@@ -672,10 +708,16 @@ mod tests {
     fn empty_program_and_relative_cwd_fail() {
         let mut launch = menu_launch();
         launch.program = PathBuf::new();
-        assert!(matches!(launch.into_command(), Err(LaunchError::EmptyProgram)));
+        assert!(matches!(
+            launch.into_command(),
+            Err(LaunchError::EmptyProgram)
+        ));
         let mut launch = menu_launch();
         launch.cwd = Some(PathBuf::from("relative/path"));
-        assert!(matches!(launch.into_command(), Err(LaunchError::RelativeCwd)));
+        assert!(matches!(
+            launch.into_command(),
+            Err(LaunchError::RelativeCwd)
+        ));
     }
 
     #[test]

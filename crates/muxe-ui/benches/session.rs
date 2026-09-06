@@ -117,7 +117,7 @@ fn frame_bytes(message: &WireMessage) -> Vec<u8> {
     bytes
 }
 
-fn benchmark_frame() -> muxe_protocol::ArchivedFrame {
+fn checked_benchmark_frame() -> muxe_protocol::ArchivedFrame {
     let bindings = MENU_BINDINGS
         .iter()
         .enumerate()
@@ -209,27 +209,36 @@ fn key_a() -> muxe_ui::ConvertedInput {
 
 #[divan::bench]
 fn attach_and_prepare_menu(bencher: divan::Bencher<'_, '_>) {
-    bencher.bench(|| {
-        let mut runtime = UiRuntime::attach(benchmark_frame()).expect("finite attachment attaches");
-        black_box(
-            runtime
-                .prepare(Rect::new(0, 0, 80, 24))
-                .expect("finite menu prepares"),
-        );
-    });
+    bencher
+        .with_inputs(checked_benchmark_frame)
+        .bench_values(|frame| {
+            let mut runtime = UiRuntime::attach(frame).expect("checked attachment attaches");
+            black_box(
+                runtime
+                    .prepare(Rect::new(0, 0, 80, 24))
+                    .expect("finite menu prepares"),
+            );
+        });
+}
+
+fn prepared_binding_input() -> (UiRuntime, muxe_ui::ConvertedInput) {
+    let mut runtime =
+        UiRuntime::attach(checked_benchmark_frame()).expect("checked attachment attaches");
+    runtime
+        .prepare(Rect::new(0, 0, 80, 24))
+        .expect("finite menu prepares");
+    (runtime, key_a())
 }
 
 #[divan::bench]
 fn match_menu_binding(bencher: divan::Bencher<'_, '_>) {
-    bencher.bench(|| {
-        let mut runtime = UiRuntime::attach(benchmark_frame()).expect("finite attachment attaches");
-        runtime
-            .prepare(Rect::new(0, 0, 80, 24))
-            .expect("finite menu prepares");
-        black_box(
-            runtime
-                .handle_input_at(&key_a(), SessionInstant(Duration::from_millis(1)))
-                .expect("finite binding matches"),
-        );
-    });
+    bencher
+        .with_inputs(prepared_binding_input)
+        .bench_refs(|(runtime, key)| {
+            black_box(
+                runtime
+                    .handle_input_at(key, SessionInstant(Duration::from_millis(1)))
+                    .expect("finite binding matches"),
+            );
+        });
 }

@@ -19,6 +19,7 @@ use tokio::{
 
 use crate::{Broker, BrokerError, RequestResult, RuntimeEndpoint, RuntimeError};
 
+
 pub struct BrokerServer {
     broker: Arc<Broker>,
     endpoint: RuntimeEndpoint,
@@ -541,13 +542,16 @@ mod tests {
             })
         }
 
-        fn validate_native(
+        fn validate_native_batch(
             &self,
-            _candidate: &muxe_core::NativeActionCandidate,
-        ) -> Result<ActionValidation, ConfigDiagnostic> {
-            Ok(ActionValidation {
-                execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
-            })
+            candidates: &[&muxe_core::NativeActionCandidate],
+        ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+            Ok(vec![
+                ActionValidation {
+                    execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                };
+                candidates.len()
+            ])
         }
     }
 
@@ -717,6 +721,8 @@ mod tests {
                 pending_launch: None,
                 origin: None,
                 caller_identity: None,
+                theme: None,
+                color_scheme: None,
             }))
             .await
             .expect("attach fake-host UI over broker IPC");

@@ -43,8 +43,7 @@ use muxe_zellij_protocol::{
     BRIDGE_PROTOCOL_VERSION, BridgeArtifact, BridgeIdentity, BridgeRequest, CaptureEndReason,
     CaptureLostReason, CommandOutcome, PipeEvent, PipeEventKind, ZellijOrigin,
     bridge_protocol_fingerprint, decode_request_line, encode_event_line,
-    generated::{RawNativeCommand},
-    generated_action_fingerprint, pinned_source_revision,
+    generated::RawNativeCommand, generated_action_fingerprint, pinned_source_revision,
 };
 use zellij_tile::prelude::*;
 
@@ -253,7 +252,12 @@ impl Bridge {
     /// Pipe message pump. The CLI source UUID addresses the sending child;
     /// the semantic name only selects the channel role.
     pub fn pipe(&mut self, message: PipeMessage, effects: &mut dyn HostEffects) {
-        let PipeMessage { source, name, payload, .. } = message;
+        let PipeMessage {
+            source,
+            name,
+            payload,
+            ..
+        } = message;
         match source {
             PipeSource::Cli(cli_id) => {
                 if name.starts_with(EVENT_PREFIX) {
@@ -280,7 +284,10 @@ impl Bridge {
     /// Test-visible capture state: pending lease, active lease, or none.
     #[cfg(test)]
     pub fn capture_state(&self) -> (Option<[u8; 16]>, Option<[u8; 16]>) {
-        (self.pending.as_ref().map(|p| p.lease), self.active.as_ref().map(|a| a.lease))
+        (
+            self.pending.as_ref().map(|p| p.lease),
+            self.active.as_ref().map(|a| a.lease),
+        )
     }
 
     fn on_list_clients(&mut self, clients: Vec<ClientInfo>, effects: &mut dyn HostEffects) {
@@ -399,16 +406,16 @@ impl Bridge {
     fn on_timer(&mut self, effects: &mut dyn HostEffects) {
         // Heartbeats renew the broker-side heartbeat lease; without them an
         // idle healthy bridge would be expired by the registry.
-        if self.registration != [0; 16] {
-            if let Some(client_id) = self.client_id.clone() {
-                self.emit(
-                    PipeEventKind::Heartbeat {
-                        registration: self.registration,
-                        client_id,
-                    },
-                    effects,
-                );
-            }
+        if self.registration != [0; 16]
+            && let Some(client_id) = self.client_id.clone()
+        {
+            self.emit(
+                PipeEventKind::Heartbeat {
+                    registration: self.registration,
+                    client_id,
+                },
+                effects,
+            );
         }
         effects.arm_timer(HEARTBEAT_SECS);
     }
@@ -429,8 +436,9 @@ impl Bridge {
             );
         }
         self.pending = None;
-        let pending: Vec<(String, [u8; 16])> =
-            std::mem::take(&mut self.pending_actions).into_iter().collect();
+        let pending: Vec<(String, [u8; 16])> = std::mem::take(&mut self.pending_actions)
+            .into_iter()
+            .collect();
         for (execution, request_id) in pending {
             self.emit(
                 PipeEventKind::DispatchCompleted {
@@ -525,9 +533,7 @@ impl Bridge {
             let execution = match &request.payload {
                 BridgeRequest::Dispatch { execution, .. }
                 | BridgeRequest::FocusPaneByIndex { execution, .. }
-                | BridgeRequest::FocusPaneNeighbor { execution, .. } => {
-                    Some(execution.clone())
-                }
+                | BridgeRequest::FocusPaneNeighbor { execution, .. } => Some(execution.clone()),
                 _ => None,
             };
             self.fail(
@@ -552,20 +558,23 @@ impl Bridge {
             BridgeRequest::EndCapture { lease, reason } => {
                 self.end_capture(&cli_id, request_id, generation, lease, reason, effects);
             }
-            BridgeRequest::RequestOrigin { ui_session, ui_pane } => {
-                self.request_origin(&cli_id, request_id, generation, ui_session, ui_pane, effects);
+            BridgeRequest::RequestOrigin {
+                ui_session,
+                ui_pane,
+            } => {
+                self.request_origin(
+                    &cli_id, request_id, generation, ui_session, ui_pane, effects,
+                );
             }
             BridgeRequest::FocusPaneByIndex { execution, index } => {
                 self.focus_by_index(&cli_id, request_id, generation, execution, index, effects);
             }
-            BridgeRequest::FocusPaneNeighbor { execution, direction } => {
+            BridgeRequest::FocusPaneNeighbor {
+                execution,
+                direction,
+            } => {
                 self.focus_neighbor(
-                    &cli_id,
-                    request_id,
-                    generation,
-                    execution,
-                    direction,
-                    effects,
+                    &cli_id, request_id, generation, execution, direction, effects,
                 );
             }
             BridgeRequest::RetireBridge => {
@@ -625,7 +634,10 @@ impl Bridge {
                     effects,
                 );
             }
-            ReadyDispatch::Async { dispatch, execution: correlated } => {
+            ReadyDispatch::Async {
+                dispatch,
+                execution: correlated,
+            } => {
                 self.pending_actions.insert(correlated, request_id);
                 // run_action queues host dispatch on another thread and
                 // returns immediately; the ActionComplete echo completes it.
@@ -656,7 +668,10 @@ impl Bridge {
         // The pipe releases immediately either way so the broker can queue
         // further work while capture establishes.
         if self.current_mode == Some(InputMode::Locked) {
-            self.active = Some(ActiveCapture { lease, prior: InputMode::Locked });
+            self.active = Some(ActiveCapture {
+                lease,
+                prior: InputMode::Locked,
+            });
             self.release(cli_id, request_id, generation, effects);
             self.emit(
                 PipeEventKind::CaptureReady {
@@ -780,7 +795,11 @@ impl Bridge {
             effects,
         );
         self.emit(
-            PipeEventKind::DispatchCompleted { request_id, execution, outcome },
+            PipeEventKind::DispatchCompleted {
+                request_id,
+                execution,
+                outcome,
+            },
             effects,
         );
     }
@@ -815,7 +834,11 @@ impl Bridge {
             effects,
         );
         self.emit(
-            PipeEventKind::DispatchCompleted { request_id, execution, outcome },
+            PipeEventKind::DispatchCompleted {
+                request_id,
+                execution,
+                outcome,
+            },
             effects,
         );
     }
@@ -835,8 +858,9 @@ impl Bridge {
             effects.switch_mode(&active.prior);
         }
         self.pending = None;
-        let pending: Vec<(String, [u8; 16])> =
-            std::mem::take(&mut self.pending_actions).into_iter().collect();
+        let pending: Vec<(String, [u8; 16])> = std::mem::take(&mut self.pending_actions)
+            .into_iter()
+            .collect();
         self.release(cli_id, request_id, generation, effects);
         for (execution, pending_id) in pending {
             self.emit(
@@ -886,7 +910,10 @@ impl Bridge {
         };
         self.release(cli_id, request_id, generation, effects);
         self.emit(
-            PipeEventKind::DispatchAccepted { request_id, execution: execution.clone() },
+            PipeEventKind::DispatchAccepted {
+                request_id,
+                execution: execution.clone(),
+            },
             effects,
         );
         self.emit(
@@ -904,7 +931,10 @@ impl Bridge {
             return;
         };
         self.sequence += 1;
-        let frame = PipeEvent { sequence: self.sequence, event };
+        let frame = PipeEvent {
+            sequence: self.sequence,
+            event,
+        };
         if let Ok(line) = encode_event_line(&frame) {
             effects.pipe_output(&event_cli_id, line.trim_end());
         }
@@ -1004,7 +1034,7 @@ mod tests {
             self.unblocks.push(cli_id.to_owned());
         }
         fn switch_mode(&mut self, mode: &InputMode) {
-            self.modes.push(mode.clone());
+            self.modes.push(*mode);
         }
         fn focus_pane(&mut self, pane: PaneId) {
             self.focused.push(pane);
@@ -1085,7 +1115,10 @@ mod tests {
         let mut bridge = Bridge::default();
         let mut host = FakeHost::new();
         bridge.load(&mut host);
-        bridge.update(Event::ListClients(clients_current(PaneId::Terminal(2))), &mut host);
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
         bridge.pipe(subscribe_msg(), &mut host);
         assert_eq!(bridge.client_identity(), Some("5"));
         assert_eq!(bridge.active_registration(), Some([7; 16]));
@@ -1103,7 +1136,10 @@ mod tests {
         assert!(host.outputs.is_empty());
         // Identity without randomness still emits nothing.
         host.random.clear();
-        bridge.update(Event::ListClients(clients_current(PaneId::Terminal(2))), &mut host);
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
         assert_eq!(bridge.active_registration(), None);
         assert!(host.outputs.is_empty());
     }
@@ -1240,7 +1276,10 @@ mod tests {
         let (mut bridge, mut host) = boot();
         // Menu pane takes focus while no capture is active... it must NOT
         // become origin: the claim below still snapshots terminal_2.
-        bridge.update(Event::ListClients(clients_current(PaneId::Terminal(2))), &mut host);
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
         host.cwd.insert("terminal_2".to_owned(), "/work".to_owned());
         bridge.pipe(
             PipeMessage {
@@ -1291,10 +1330,7 @@ mod tests {
             &mut host,
         );
         host.modes.clear();
-        bridge.pipe(
-            request_msg(BridgeRequest::RetireBridge),
-            &mut host,
-        );
+        bridge.pipe(request_msg(BridgeRequest::RetireBridge), &mut host);
         // Guarded restore ran (still Locked, owned lease) and the pending
         // async completion failed instead of dangling.
         assert_eq!(host.modes.as_slice(), [InputMode::Normal]);

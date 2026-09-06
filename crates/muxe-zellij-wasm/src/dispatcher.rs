@@ -39,14 +39,13 @@ pub enum ReadyDispatch {
 /// # Errors
 ///
 /// Returns the generated validation error text when the raw mirror is invalid.
-pub fn prepare(
-    command: RawNativeCommand,
-    execution: &str,
-) -> Result<ReadyDispatch, String> {
-    let validated =
-        ValidatedNativeCommand::try_from(command).map_err(|error| error.to_string())?;
+pub fn prepare(command: RawNativeCommand, execution: &str) -> Result<ReadyDispatch, String> {
+    let validated = ValidatedNativeCommand::try_from(command).map_err(|error| error.to_string())?;
     match validated {
-        ValidatedNativeCommand::RunAction { action, mut context } => {
+        ValidatedNativeCommand::RunAction {
+            action,
+            mut context,
+        } => {
             context.insert(EXECUTION_CONTEXT_KEY.to_owned(), execution.to_owned());
             Ok(ReadyDispatch::Async {
                 dispatch: NativeCommandDispatch::RunAction { action, context },
@@ -88,7 +87,10 @@ mod tests {
             context: Vec::new(),
         };
         match prepare(command, "exec-1").expect("prepares") {
-            ReadyDispatch::Async { execution, dispatch } => {
+            ReadyDispatch::Async {
+                execution,
+                dispatch,
+            } => {
                 assert_eq!(execution, "exec-1");
                 assert!(matches!(dispatch, NativeCommandDispatch::RunAction { .. }));
                 if let NativeCommandDispatch::RunAction { context, .. } = dispatch {
@@ -116,8 +118,14 @@ mod tests {
         let command = RawNativeCommand::EditLayout {
             layout_name: "dev".to_owned(),
             context: vec![
-                raw::MapEntry { key: "a".to_owned(), value: "1".to_owned() },
-                raw::MapEntry { key: "a".to_owned(), value: "2".to_owned() },
+                raw::MapEntry {
+                    key: "a".to_owned(),
+                    value: "1".to_owned(),
+                },
+                raw::MapEntry {
+                    key: "a".to_owned(),
+                    value: "2".to_owned(),
+                },
             ],
         };
         assert!(prepare(command, "exec-3").is_err());

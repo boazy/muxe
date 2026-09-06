@@ -192,7 +192,9 @@ pub enum PortableError {
         reason: &'static str,
     },
     /// A context marker survived to concrete mapping time.
-    #[error("portable {action} parameter '{parameter}' still carries an unresolved context reference")]
+    #[error(
+        "portable {action} parameter '{parameter}' still carries an unresolved context reference"
+    )]
     UnresolvedContext {
         /// Portable action discriminator.
         action: &'static str,
@@ -223,13 +225,13 @@ fn scalar_index_u32(
     scalar: &ActionScalar,
 ) -> Result<u32, PortableError> {
     match &scalar.value.kind {
-        ConfigValueKind::Integer(number) => u32::try_from(*number).map_err(|_| {
-            PortableError::InvalidScalar {
+        ConfigValueKind::Integer(number) => {
+            u32::try_from(*number).map_err(|_| PortableError::InvalidScalar {
                 action,
                 parameter,
                 reason: "index must be a non-negative integer fitting in u32",
-            }
-        }),
+            })
+        }
         ConfigValueKind::Context(_) => Err(PortableError::UnresolvedContext { action, parameter }),
         _ => Err(PortableError::InvalidScalar {
             action,
@@ -300,18 +302,24 @@ fn origin_pane(action: &'static str, origin: &OriginContext) -> Result<raw::Pane
 
 fn wrap(action: raw::Action) -> PortableMapping {
     PortableMapping::HostAction {
-        commands: vec![RawNativeCommand::RunAction { action, context: Vec::new() }],
+        commands: vec![RawNativeCommand::RunAction {
+            action,
+            context: Vec::new(),
+        }],
     }
 }
 
 fn keyboard_error(action: &'static str, error: KeyboardError) -> PortableError {
     match error {
-        KeyboardError::UnresolvedContext => {
-            PortableError::UnresolvedContext { action, parameter: "keys" }
-        }
-        KeyboardError::Unsupported { reason, .. } => {
-            PortableError::InvalidScalar { action, parameter: "keys", reason }
-        }
+        KeyboardError::UnresolvedContext => PortableError::UnresolvedContext {
+            action,
+            parameter: "keys",
+        },
+        KeyboardError::Unsupported { reason, .. } => PortableError::InvalidScalar {
+            action,
+            parameter: "keys",
+            reason,
+        },
     }
 }
 
@@ -338,7 +346,8 @@ pub fn validate_portable_structure(action: &PortableAction) -> Result<(), Portab
                 check_marker("keyboard:send", "keys", key, &[ContextType::String], true)?;
                 if !is_marker(key) {
                     let text = scalar_string("keyboard:send", "keys", key)?;
-                    map_canonical_key(&text).map_err(|error| keyboard_error("keyboard:send", error))?;
+                    map_canonical_key(&text)
+                        .map_err(|error| keyboard_error("keyboard:send", error))?;
                 }
             }
             Ok(())
@@ -369,7 +378,13 @@ pub fn validate_portable_structure(action: &PortableAction) -> Result<(), Portab
         }
         PortableAction::Tab(TabAction::Focus(target)) => match target {
             muxe_core::IndexOrDirection::Index(index) => {
-                check_marker("tab:focus", "index", index, &[ContextType::UnsignedInteger], true)?;
+                check_marker(
+                    "tab:focus",
+                    "index",
+                    index,
+                    &[ContextType::UnsignedInteger],
+                    true,
+                )?;
                 if !is_marker(index) {
                     scalar_index_u32("tab:focus", "index", index).map(|_| ())
                 } else {
@@ -406,7 +421,13 @@ pub fn validate_portable_structure(action: &PortableAction) -> Result<(), Portab
                 Cardinal::parse("pane:focus", direction).map(|_| ())
             }
             muxe_core::IndexOrDirection::Index(index) => {
-                check_marker("pane:focus", "index", index, &[ContextType::UnsignedInteger], true)?;
+                check_marker(
+                    "pane:focus",
+                    "index",
+                    index,
+                    &[ContextType::UnsignedInteger],
+                    true,
+                )?;
                 if !is_marker(index) {
                     scalar_index_u32("pane:focus", "index", index).map(|_| ())
                 } else {
@@ -437,9 +458,7 @@ pub fn validate_portable_structure(action: &PortableAction) -> Result<(), Portab
             }
             Cardinal::parse("pane:resize", direction).map(|_| ())
         }
-        PortableAction::Pane(PaneAction::Zoom { enabled }) => {
-            check_toggle("pane:zoom", enabled)
-        }
+        PortableAction::Pane(PaneAction::Zoom { enabled }) => check_toggle("pane:zoom", enabled),
         PortableAction::Pane(PaneAction::Fullscreen { enabled }) => {
             check_toggle("pane:fullscreen", enabled)
         }
@@ -488,7 +507,10 @@ fn check_toggle(action: &'static str, enabled: &Option<ActionScalar>) -> Result<
     if let Some(scalar) = enabled {
         // No boolean-typed context path exists, so any marker here is unresolvable.
         if is_marker(scalar) {
-            return Err(PortableError::UnresolvedContext { action, parameter: "enabled" });
+            return Err(PortableError::UnresolvedContext {
+                action,
+                parameter: "enabled",
+            });
         }
         scalar_bool(action, "enabled", scalar)?;
         return Err(PortableError::Incompatible {
@@ -541,7 +563,10 @@ pub fn map_portable(
         PortableAction::Keyboard(KeyboardAction::SendText(text)) => {
             let chars = scalar_string("keyboard:send", "text", text)?;
             let pane = origin_pane("keyboard:send", origin)?;
-            Ok(wrap(raw::Action::WriteCharsToPaneId { chars, pane_id: pane }))
+            Ok(wrap(raw::Action::WriteCharsToPaneId {
+                chars,
+                pane_id: pane,
+            }))
         }
         PortableAction::Keyboard(KeyboardAction::SendKeys(keys)) => {
             let pane = origin_pane("keyboard:send", origin)?;
@@ -627,7 +652,9 @@ pub fn map_portable(
         PortableAction::Tab(TabAction::Move(target)) => match target {
             muxe_core::IndexOrDirection::Direction(direction) => {
                 let cardinal = Cardinal::parse("tab:move", direction)?;
-                Ok(wrap(raw::Action::MoveTab { direction: cardinal.into_mirror() }))
+                Ok(wrap(raw::Action::MoveTab {
+                    direction: cardinal.into_mirror(),
+                }))
             }
             muxe_core::IndexOrDirection::Index(_) => Err(PortableError::Incompatible {
                 action: "tab:move",
@@ -670,7 +697,9 @@ pub fn map_portable(
             muxe_core::IndexOrDirection::Direction(direction) => {
                 let cardinal = Cardinal::parse("pane:focus", direction)?;
                 Ok(PortableMapping::BridgeFocus {
-                    request: FocusRequest::Neighbor { direction: cardinal },
+                    request: FocusRequest::Neighbor {
+                        direction: cardinal,
+                    },
                 })
             }
             muxe_core::IndexOrDirection::Index(index) => {
@@ -713,24 +742,21 @@ pub fn map_portable(
                 direction: Some(cardinal.into_mirror()),
             }))
         }
-        PortableAction::Pane(PaneAction::Zoom { enabled }) => map_toggle(
-            "pane:zoom",
-            enabled,
-            origin,
-            |pane| raw::Action::ToggleFocusFullscreenByPaneId { pane_id: pane },
-        ),
-        PortableAction::Pane(PaneAction::Fullscreen { enabled }) => map_toggle(
-            "pane:fullscreen",
-            enabled,
-            origin,
-            |pane| raw::Action::ToggleFocusNoUiFullscreenByPaneId { pane_id: pane },
-        ),
-        PortableAction::Pane(PaneAction::Floating { enabled }) => map_toggle(
-            "pane:floating",
-            enabled,
-            origin,
-            |pane| raw::Action::TogglePaneEmbedOrFloatingByPaneId { pane_id: pane },
-        ),
+        PortableAction::Pane(PaneAction::Zoom { enabled }) => {
+            map_toggle("pane:zoom", enabled, origin, |pane| {
+                raw::Action::ToggleFocusFullscreenByPaneId { pane_id: pane }
+            })
+        }
+        PortableAction::Pane(PaneAction::Fullscreen { enabled }) => {
+            map_toggle("pane:fullscreen", enabled, origin, |pane| {
+                raw::Action::ToggleFocusNoUiFullscreenByPaneId { pane_id: pane }
+            })
+        }
+        PortableAction::Pane(PaneAction::Floating { enabled }) => {
+            map_toggle("pane:floating", enabled, origin, |pane| {
+                raw::Action::TogglePaneEmbedOrFloatingByPaneId { pane_id: pane }
+            })
+        }
         PortableAction::Pane(PaneAction::Frame { .. }) => Err(PortableError::Incompatible {
             action: "pane:frame",
             reason: "no pane-targeted frame primitive exists; TogglePaneFrames acts on the focused menu pane",
@@ -739,15 +765,20 @@ pub fn map_portable(
         | PortableAction::Session(SessionAction::Switch { name }) => {
             switch_session(scalar_string("session:switch", "name", name)?)
         }
-        PortableAction::Session(SessionAction::Rename { name }) => Ok(wrap(
-            raw::Action::RenameSession { name: scalar_string("session:rename", "name", name)? },
-        )),
+        PortableAction::Session(SessionAction::Rename { name }) => {
+            Ok(wrap(raw::Action::RenameSession {
+                name: scalar_string("session:rename", "name", name)?,
+            }))
+        }
         PortableAction::Session(SessionAction::Detach) => Ok(wrap(raw::Action::Detach)),
         PortableAction::Session(SessionAction::Kill) => {
-            let session = origin.session_id.as_ref().ok_or(PortableError::Incompatible {
-                action: "session:kill",
-                reason: "origin carries no session; the target is context_unavailable",
-            })?;
+            let session = origin
+                .session_id
+                .as_ref()
+                .ok_or(PortableError::Incompatible {
+                    action: "session:kill",
+                    reason: "origin carries no session; the target is context_unavailable",
+                })?;
             Ok(PortableMapping::HostAction {
                 commands: vec![RawNativeCommand::KillSessions {
                     session_names: vec![session.as_str().to_owned()],
@@ -808,7 +839,10 @@ fn map_toggle(
 ) -> Result<PortableMapping, PortableError> {
     if let Some(scalar) = enabled {
         if is_marker(scalar) {
-            return Err(PortableError::UnresolvedContext { action, parameter: "enabled" });
+            return Err(PortableError::UnresolvedContext {
+                action,
+                parameter: "enabled",
+            });
         }
         scalar_bool(action, "enabled", scalar)?;
         return Err(PortableError::Incompatible {
@@ -913,7 +947,9 @@ mod tests {
             })),
             Ok(PortableMapping::BrokerOwned)
         );
-        assert!(validate_portable_structure(&PortableAction::Menu(muxe_core::MenuAction::Quit)).is_ok());
+        assert!(
+            validate_portable_structure(&PortableAction::Menu(muxe_core::MenuAction::Quit)).is_ok()
+        );
     }
 
     #[test]
@@ -921,7 +957,9 @@ mod tests {
         let action = single_host(&PortableAction::Pane(PaneAction::Close));
         assert!(matches!(
             action,
-            raw::Action::CloseFocusByPaneId { pane_id: raw::PaneId::Terminal(4) }
+            raw::Action::CloseFocusByPaneId {
+                pane_id: raw::PaneId::Terminal(4)
+            }
         ));
 
         let action = single_host(&PortableAction::Pane(PaneAction::Resize {
@@ -951,13 +989,19 @@ mod tests {
         ))));
         assert!(matches!(
             action,
-            raw::Action::WriteCharsToPaneId { pane_id: raw::PaneId::Terminal(4), .. }
+            raw::Action::WriteCharsToPaneId {
+                pane_id: raw::PaneId::Terminal(4),
+                ..
+            }
         ));
 
-        let PortableMapping::HostAction { commands } = map(&PortableAction::Keyboard(
-            KeyboardAction::SendKeys(vec![text("a"), text("ctrl+c")]),
-        ))
-        .expect("key sequence maps") else {
+        let PortableMapping::HostAction { commands } =
+            map(&PortableAction::Keyboard(KeyboardAction::SendKeys(vec![
+                text("a"),
+                text("ctrl+c"),
+            ])))
+            .expect("key sequence maps")
+        else {
             panic!("expected host action");
         };
         assert_eq!(commands.len(), 2);
@@ -968,29 +1012,41 @@ mod tests {
 
     #[test]
     fn unmappable_keys_fail_precisely() {
-        let error = map(&PortableAction::Keyboard(KeyboardAction::SendKeys(vec![text(
-            "super+a",
-        )])))
+        let error = map(&PortableAction::Keyboard(KeyboardAction::SendKeys(vec![
+            text("super+a"),
+        ])))
         .expect_err("super has no byte encoding");
         assert!(matches!(error, PortableError::InvalidScalar { .. }));
-        assert!(validate_portable_structure(&PortableAction::Keyboard(
-            KeyboardAction::SendKeys(vec![text("super+a")])
-        ))
-        .is_err());
+        assert!(
+            validate_portable_structure(&PortableAction::Keyboard(KeyboardAction::SendKeys(vec![
+                text("super+a")
+            ])))
+            .is_err()
+        );
     }
 
     #[test]
     fn tab_create_without_workspace_uses_host_new_tab() {
-        let action = single_host(&PortableAction::Tab(TabAction::Create { workspace_id: None }));
+        let action = single_host(&PortableAction::Tab(TabAction::Create {
+            workspace_id: None,
+        }));
         assert!(matches!(action, raw::Action::NewTab { .. }));
         for action in [
-            PortableAction::Tab(TabAction::Create { workspace_id: Some(text("ws")) }),
+            PortableAction::Tab(TabAction::Create {
+                workspace_id: Some(text("ws")),
+            }),
             PortableAction::Tab(TabAction::Create {
                 workspace_id: Some(marker("origin.workspace.id")),
             }),
         ] {
             let error = map_portable(&action, &test_origin()).expect_err("no workspaces");
-            assert!(matches!(error, PortableError::Incompatible { action: "tab:create", .. }));
+            assert!(matches!(
+                error,
+                PortableError::Incompatible {
+                    action: "tab:create",
+                    ..
+                }
+            ));
             assert!(validate_portable_structure(&action).is_err());
         }
     }
@@ -999,23 +1055,41 @@ mod tests {
     fn rename_uses_origin_index_or_fails() {
         let error = map(&PortableAction::Tab(TabAction::Rename { name: None }))
             .expect_err("bare rename has no prompt mapping");
-        assert!(matches!(error, PortableError::Incompatible { action: "tab:rename", .. }));
+        assert!(matches!(
+            error,
+            PortableError::Incompatible {
+                action: "tab:rename",
+                ..
+            }
+        ));
 
         let action = single_host(&PortableAction::Tab(TabAction::Rename {
             name: Some(text("logs")),
         }));
-        let validated: validated::Action =
-            action.try_into().expect("generated conversion accepts rename");
-        assert!(matches!(validated, validated::Action::RenameTab { tab_index: 3, .. }));
+        let validated: validated::Action = action
+            .try_into()
+            .expect("generated conversion accepts rename");
+        assert!(matches!(
+            validated,
+            validated::Action::RenameTab { tab_index: 3, .. }
+        ));
 
         let mut origin = test_origin();
         origin.tab_index = None;
         let error = map_portable(
-            &PortableAction::Tab(TabAction::Rename { name: Some(text("logs")) }),
+            &PortableAction::Tab(TabAction::Rename {
+                name: Some(text("logs")),
+            }),
             &origin,
         )
         .expect_err("missing origin index fails");
-        assert!(matches!(error, PortableError::Incompatible { action: "tab:rename", .. }));
+        assert!(matches!(
+            error,
+            PortableError::Incompatible {
+                action: "tab:rename",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1033,16 +1107,18 @@ mod tests {
                 muxe_core::IndexOrDirection::Direction(text("left"))
             ))),
             Ok(PortableMapping::BridgeFocus {
-                request: FocusRequest::Neighbor { direction: Cardinal::Left }
+                request: FocusRequest::Neighbor {
+                    direction: Cardinal::Left
+                }
             })
         );
     }
 
     #[test]
     fn literal_ranges_are_checked_at_validation() {
-        let oversized = PortableAction::Tab(TabAction::Focus(
-            muxe_core::IndexOrDirection::Index(integer(i64::from(u32::MAX) + 1)),
-        ));
+        let oversized = PortableAction::Tab(TabAction::Focus(muxe_core::IndexOrDirection::Index(
+            integer(i64::from(u32::MAX) + 1),
+        )));
         assert!(matches!(
             validate_portable_structure(&oversized),
             Err(PortableError::InvalidScalar { .. })
@@ -1055,9 +1131,9 @@ mod tests {
         assert!(validate_portable_structure(&bad_direction).is_err());
 
         // Fitting markers pass validation but fail concrete mapping.
-        let marked = PortableAction::Tab(TabAction::Focus(
-            muxe_core::IndexOrDirection::Index(marker("origin.tab.index")),
-        ));
+        let marked = PortableAction::Tab(TabAction::Focus(muxe_core::IndexOrDirection::Index(
+            marker("origin.tab.index"),
+        )));
         assert!(validate_portable_structure(&marked).is_ok());
         assert!(matches!(
             map_portable(&marked, &test_origin()),
@@ -1065,9 +1141,9 @@ mod tests {
         ));
 
         // Mismatched marker types fail validation without guessing.
-        let mismatched = PortableAction::Tab(TabAction::Focus(
-            muxe_core::IndexOrDirection::Index(marker("origin.pane.id")),
-        ));
+        let mismatched = PortableAction::Tab(TabAction::Focus(muxe_core::IndexOrDirection::Index(
+            marker("origin.pane.id"),
+        )));
         assert!(matches!(
             validate_portable_structure(&mismatched),
             Err(PortableError::UnresolvedContext { .. })
@@ -1083,25 +1159,37 @@ mod tests {
         .expect_err("explicit zoom boolean is incompatible");
         assert!(matches!(error, PortableError::Incompatible { .. }));
 
-        let error = map(&PortableAction::Pane(PaneAction::Frame {
-            visible: None,
-        }))
-        .expect_err("frame has no pane-targeted primitive");
-        assert!(matches!(error, PortableError::Incompatible { action: "pane:frame", .. }));
+        let error = map(&PortableAction::Pane(PaneAction::Frame { visible: None }))
+            .expect_err("frame has no pane-targeted primitive");
+        assert!(matches!(
+            error,
+            PortableError::Incompatible {
+                action: "pane:frame",
+                ..
+            }
+        ));
 
         let error = map(&PortableAction::Pane(PaneAction::Move(
             muxe_core::IndexOrDirection::Index(integer(2)),
         )))
         .expect_err("indexed move has no primitive");
-        assert!(matches!(error, PortableError::Incompatible { action: "pane:move", .. }));
+        assert!(matches!(
+            error,
+            PortableError::Incompatible {
+                action: "pane:move",
+                ..
+            }
+        ));
     }
 
     #[test]
     fn session_lifecycle_maps_with_distinctions() {
-        assert!(map(&PortableAction::Session(SessionAction::Switch {
-            name: text("dev"),
-        }))
-        .is_ok());
+        assert!(
+            map(&PortableAction::Session(SessionAction::Switch {
+                name: text("dev"),
+            }))
+            .is_ok()
+        );
         assert!(map(&PortableAction::Session(SessionAction::Detach)).is_ok());
 
         let PortableMapping::HostAction { commands } =
@@ -1115,7 +1203,10 @@ mod tests {
         ));
 
         for (action, name) in [
-            (PortableAction::Session(SessionAction::Create), "session:create"),
+            (
+                PortableAction::Session(SessionAction::Create),
+                "session:create",
+            ),
             (PortableAction::Session(SessionAction::Quit), "session:quit"),
         ] {
             let error = map(&action).expect_err("genuine gap fails");

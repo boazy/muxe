@@ -225,7 +225,7 @@ mod tests {
             CommandStatus::Succeeded
         );
         let outcome = outcome_of(&NativeCommandReturn::DeleteDeadSession(Err(
-            "gone".to_owned(),
+            "gone".to_owned()
         )));
         assert_eq!(outcome.status, CommandStatus::Failed);
         assert_eq!(outcome.detail, "gone");

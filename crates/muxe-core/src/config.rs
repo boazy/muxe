@@ -49,6 +49,7 @@ pub struct ContextResolutionError {
     pub reference: ContextReference,
 }
 impl ConfigValue {
+    #[must_use]
     pub fn synthetic(kind: ConfigValueKind) -> Self {
         let source = SourceId::new("<muxe built-in>");
         Self {
@@ -61,6 +62,7 @@ impl ConfigValue {
         Self::synthetic(ConfigValueKind::String(value.into()))
     }
 
+    #[must_use]
     pub fn boolean(value: bool) -> Self {
         Self::synthetic(ConfigValueKind::Boolean(value))
     }
@@ -78,6 +80,7 @@ impl ConfigValue {
         Self::synthetic(ConfigValueKind::Mapping(mapping))
     }
 
+    #[must_use]
     pub fn as_mapping(&self) -> Option<&[ConfigField]> {
         match &self.kind {
             ConfigValueKind::Mapping(mapping) => Some(mapping),
@@ -92,6 +95,7 @@ impl ConfigValue {
         }
     }
 
+    #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match &self.kind {
             ConfigValueKind::String(value) => Some(value),
@@ -99,6 +103,7 @@ impl ConfigValue {
         }
     }
 
+    #[must_use]
     pub fn as_bool(&self) -> Option<bool> {
         match self.kind {
             ConfigValueKind::Boolean(value) => Some(value),
@@ -106,6 +111,7 @@ impl ConfigValue {
         }
     }
 
+    #[must_use]
     pub fn field(&self, name: &str) -> Option<&ConfigField> {
         self.as_mapping()?.iter().find(|field| field.name == name)
     }
@@ -120,12 +126,17 @@ impl ConfigValue {
         Some(mapping.remove(position))
     }
 
+    #[must_use]
     pub fn contains_marker(&self, marker: &str) -> bool {
         self.field(marker).is_some_and(|field| field.value.as_bool() == Some(true))
     }
 
     /// Resolves every typed context marker from the attach-time immutable origin. A missing known
     /// path is an error; Muxe never drops the parameter or substitutes current focus.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextResolutionError`] when a required origin value is absent.
     pub fn resolve_context(&self, origin: &OriginContext) -> Result<Self, ContextResolutionError> {
         let kind = match &self.kind {
             ConfigValueKind::Context(reference) => {
@@ -187,9 +198,16 @@ pub struct ConfigDocument {
 pub type RawConfig = ConfigDocument;
 
 impl ConfigDocument {
+    /// Parses one YAML configuration document while retaining every source span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigDiagnostic`] when YAML parsing fails or the input contains
+    /// anything other than exactly one document.
     pub fn parse(source: SourceId, text: impl Into<Arc<str>>) -> Result<Self, ConfigDiagnostic> {
         let text = text.into();
-        let documents = MarkedYamlOwned::load_from_str(&text).map_err(|error| yaml_error(source.clone(), &text, error))?;
+        let mut documents = MarkedYamlOwned::load_from_str(&text)
+            .map_err(|error| yaml_error(source.clone(), &text, &error))?;
         if documents.len() != 1 {
             return Err(ConfigDiagnostic::error(
                 DiagnosticCode::YamlSyntax,
@@ -197,12 +215,19 @@ impl ConfigDocument {
                 SourceSpan::whole(source, &text),
             ));
         }
-        let root = config_value_from_yaml(documents.into_iter().next().expect("length checked"), &source)?;
+        let document = documents.pop().ok_or_else(|| {
+            ConfigDiagnostic::error(
+                DiagnosticCode::YamlSyntax,
+                "a Muxe configuration must contain exactly one YAML document",
+                SourceSpan::whole(source.clone(), &text),
+            )
+        })?;
+        let root = config_value_from_yaml(document, &source)?;
         Ok(Self { source, text, root })
     }
 }
 
-fn yaml_error(source: SourceId, text: &str, error: ScanError) -> ConfigDiagnostic {
+fn yaml_error(source: SourceId, text: &str, error: &ScanError) -> ConfigDiagnostic {
     let offset = error.marker().index().min(text.len());
     ConfigDiagnostic::error(
         DiagnosticCode::YamlSyntax,
@@ -235,15 +260,12 @@ fn config_value_from_yaml(
             let mut fields = Vec::with_capacity(mapping.len());
             for (key, value) in mapping {
                 let key_span = SourceSpan::new(source.clone(), key.span.start.index(), key.span.end.index());
-                let name = match key.data {
-                    YamlDataOwned::Value(ScalarOwned::String(value)) => value,
-                    _ => {
-                        return Err(ConfigDiagnostic::error(
-                            DiagnosticCode::InvalidValue,
-                            "mapping keys must be strings",
-                            key_span,
-                        ));
-                    }
+                let YamlDataOwned::Value(ScalarOwned::String(name)) = key.data else {
+                    return Err(ConfigDiagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        "mapping keys must be strings",
+                        key_span,
+                    ));
                 };
                 if !names.insert(name.clone()) {
                     return Err(ConfigDiagnostic::error(
@@ -345,6 +367,7 @@ impl KeyboardProfile {
     ///
     /// VT100 matching recognizes only the legacy control-byte aliases that the terminal cannot
     /// distinguish. Kitty matching preserves the supplied identities and modifiers.
+    #[must_use]
     pub fn matches_binding(&self, binding: &CanonicalKey, event: &KeyEvent) -> bool {
         match self {
             Self::Vt100 { .. } => binding.matches_vt100(event),
@@ -368,17 +391,12 @@ impl Default for ReloadSettings {
 }
 
 /// Host version gate independent from schema and action-capability validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HostVersionCheck {
+    #[default]
     Min,
     Strict,
     Off,
-}
-
-impl Default for HostVersionCheck {
-    fn default() -> Self {
-        Self::Min
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -414,16 +432,31 @@ impl Default for ThemeSelection {
 /// exact action discriminator. They must validate again immediately before dispatch; load-time
 /// acceptance never replaces that check.
 pub trait ActionValidator: Send + Sync {
+    /// Validates one parsed portable action for this active host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source-aware diagnostic when this host cannot represent the action.
     fn validate_portable(
         &self,
         action: &PortableAction,
         action_span: &SourceSpan,
     ) -> Result<ActionValidation, ConfigDiagnostic>;
 
-    fn validate_native(
+    /// Validates every effective native candidate for this active host.
+    ///
+    /// The compiler supplies candidates in deterministic binding order. A
+    /// successful result MUST have the same length and positional order as
+    /// `candidates`; errors MUST retain their source spans. Adapters must
+    /// validate again immediately before dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns all source-aware diagnostics found while validating the batch.
+    fn validate_native_batch(
         &self,
-        candidate: &NativeActionCandidate,
-    ) -> Result<ActionValidation, ConfigDiagnostic>;
+        candidates: &[&NativeActionCandidate],
+    ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,10 +481,12 @@ pub struct CompiledConfig {
 }
 
 impl CompiledConfig {
+    #[must_use]
     pub fn menu(&self, id: &MenuId) -> Option<&CompiledMenu> {
         self.menus.iter().find(|menu| &menu.id == id)
     }
 
+    #[must_use]
     pub fn attachment_view(&self, root: &MenuId) -> Option<UiAttachmentView> {
         Some(UiAttachmentView {
             menu: menu_view(self.generation, root, &self.menus)?,
@@ -462,6 +497,7 @@ impl CompiledConfig {
         })
     }
 
+    #[must_use]
     pub fn binding(&self, generation: CompiledGeneration, id: BindingId) -> Option<&CompiledBinding> {
         (generation == self.generation && id.generation() == generation)
             .then(|| self.bindings.get(&id))
@@ -475,6 +511,11 @@ impl CompiledConfig {
 pub struct Compiler;
 
 impl Compiler {
+    /// Compiles a merged host configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns source-aware diagnostics when the configuration is invalid.
     pub fn compile(
         &self,
         input: CompileInput,
@@ -485,6 +526,10 @@ impl Compiler {
 }
 
 /// Convenience compiler entrypoint for a base YAML document without a host override.
+///
+/// # Errors
+///
+/// Returns source-aware diagnostics when parsing or compilation fails.
 pub fn compile_yaml(
     generation: CompiledGeneration,
     source: SourceId,

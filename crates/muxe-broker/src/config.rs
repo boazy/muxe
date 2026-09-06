@@ -353,13 +353,16 @@ mod tests {
             })
         }
 
-        fn validate_native(
+        fn validate_native_batch(
             &self,
-            _candidate: &muxe_core::NativeActionCandidate,
-        ) -> Result<ActionValidation, ConfigDiagnostic> {
-            Ok(ActionValidation {
-                execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
-            })
+            candidates: &[&muxe_core::NativeActionCandidate],
+        ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+            Ok(vec![
+                ActionValidation {
+                    execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                };
+                candidates.len()
+            ])
         }
     }
 
@@ -530,11 +533,11 @@ impl ActionValidator for AdapterValidator<'_> {
         self.0.validate_portable(action, action_span)
     }
 
-    fn validate_native(
+    fn validate_native_batch(
         &self,
-        candidate: &muxe_core::NativeActionCandidate,
-    ) -> Result<ActionValidation, ConfigDiagnostic> {
-        self.0.validate_native(candidate)
+        candidates: &[&muxe_core::NativeActionCandidate],
+    ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+        self.0.validate_native_batch(candidates)
     }
 }
 

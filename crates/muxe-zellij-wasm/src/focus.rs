@@ -58,8 +58,14 @@ impl PaneGeometry {
 
     /// Squared center distance, for tie-breaking.
     fn distance2(self, other: Self) -> usize {
-        let dx = self.x.saturating_add(self.columns / 2).abs_diff(other.x + other.columns / 2);
-        let dy = self.y.saturating_add(self.rows / 2).abs_diff(other.y + other.rows / 2);
+        let dx = self
+            .x
+            .saturating_add(self.columns / 2)
+            .abs_diff(other.x + other.columns / 2);
+        let dy = self
+            .y
+            .saturating_add(self.rows / 2)
+            .abs_diff(other.y + other.rows / 2);
         dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
     }
 }
@@ -89,7 +95,9 @@ impl PaneInventory {
 
     /// Panes of the active tab in manifest order, if known.
     pub fn active_panes(&self) -> Option<&[PaneGeometry]> {
-        self.active_tab.and_then(|tab| self.panes.get(&tab)).map(Vec::as_slice)
+        self.active_tab
+            .and_then(|tab| self.panes.get(&tab))
+            .map(Vec::as_slice)
     }
 
     /// Resolves a manifest-order index of the active tab.
@@ -100,7 +108,11 @@ impl PaneInventory {
 
     /// Finds a tracked pane by numeric ID and kind.
     pub fn find(&self, id: u32, is_plugin: bool) -> Option<PaneGeometry> {
-        self.panes.values().flatten().find(|pane| pane.id == id && pane.is_plugin == is_plugin).copied()
+        self.panes
+            .values()
+            .flatten()
+            .find(|pane| pane.id == id && pane.is_plugin == is_plugin)
+            .copied()
     }
 
     /// Computes the nearest neighbor of a base pane in one direction.
@@ -108,7 +120,11 @@ impl PaneInventory {
     /// Candidates must lie strictly beyond the base edge in that direction;
     /// ranking prefers edge overlap, then center distance. Returns `None` when
     /// no tracked pane qualifies.
-    pub fn neighbor(&self, base: PaneGeometry, direction: NeighborDirection) -> Option<PaneGeometry> {
+    pub fn neighbor(
+        &self,
+        base: PaneGeometry,
+        direction: NeighborDirection,
+    ) -> Option<PaneGeometry> {
         let mut best: Option<(usize, usize, PaneGeometry)> = None;
         for candidate in self.panes.values().flatten() {
             if candidate.id == base.id && candidate.is_plugin == base.is_plugin {
@@ -129,7 +145,9 @@ impl PaneInventory {
             };
             let distance = base.distance2(*candidate);
             let rank = (overlap, usize::MAX - distance);
-            if best.is_none_or(|(best_overlap, best_inverse, _)| rank > (best_overlap, best_inverse)) {
+            if best
+                .is_none_or(|(best_overlap, best_inverse, _)| rank > (best_overlap, best_inverse))
+            {
                 best = Some((overlap, usize::MAX - distance, *candidate));
             }
         }
@@ -142,7 +160,14 @@ mod tests {
     use super::*;
 
     fn pane(id: u32, x: usize, y: usize, columns: usize, rows: usize) -> PaneGeometry {
-        PaneGeometry { id, is_plugin: false, x, y, columns, rows }
+        PaneGeometry {
+            id,
+            is_plugin: false,
+            x,
+            y,
+            columns,
+            rows,
+        }
     }
 
     fn inventory() -> PaneInventory {
@@ -172,11 +197,17 @@ mod tests {
         let inventory = inventory();
         let base = pane(1, 0, 0, 50, 20);
         assert_eq!(
-            inventory.neighbor(base, NeighborDirection::Right).expect("right").id,
+            inventory
+                .neighbor(base, NeighborDirection::Right)
+                .expect("right")
+                .id,
             2
         );
         assert_eq!(
-            inventory.neighbor(base, NeighborDirection::Down).expect("down").id,
+            inventory
+                .neighbor(base, NeighborDirection::Down)
+                .expect("down")
+                .id,
             3
         );
         assert!(inventory.neighbor(base, NeighborDirection::Left).is_none());
@@ -188,9 +219,23 @@ mod tests {
         // Pane 2 starts exactly where pane 1 ends: separated for Right.
         // A zero-width gap is still a clean split; an overlapping edge is not.
         let inventory = inventory();
-        let overlapping = PaneGeometry { id: 9, is_plugin: false, x: 49, y: 0, columns: 10, rows: 20 };
+        let overlapping = PaneGeometry {
+            id: 9,
+            is_plugin: false,
+            x: 49,
+            y: 0,
+            columns: 10,
+            rows: 20,
+        };
         let mut with_overlap = inventory.clone();
-        with_overlap.set_manifest(BTreeMap::from([(0, vec![pane(1, 0, 0, 50, 20), overlapping])]));
-        assert!(with_overlap.neighbor(pane(1, 0, 0, 50, 20), NeighborDirection::Right).is_none());
+        with_overlap.set_manifest(BTreeMap::from([(
+            0,
+            vec![pane(1, 0, 0, 50, 20), overlapping],
+        )]));
+        assert!(
+            with_overlap
+                .neighbor(pane(1, 0, 0, 50, 20), NeighborDirection::Right)
+                .is_none()
+        );
     }
 }

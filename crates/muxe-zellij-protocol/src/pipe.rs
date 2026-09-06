@@ -51,6 +51,10 @@ pub struct PipeRequest {
 /// Typed broker-to-bridge payloads. Dispatch payloads carry generated raw mirrors
 /// so the bridge performs the same `Raw -> Validated -> upstream` conversion the
 /// native adapter used at configuration load.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "dispatch carries its typed raw command inline to avoid a heap allocation on every broker-to-bridge request"
+)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BridgeRequest {
     /// Dispatch one validated-at-load native command through the target bridge.
@@ -262,8 +266,12 @@ pub enum CommandStatus {
 
 impl CommandOutcome {
     /// Successful host dispatch with no detail.
+    #[must_use]
     pub fn succeeded() -> Self {
-        Self { status: CommandStatus::Succeeded, detail: String::new() }
+        Self {
+            status: CommandStatus::Succeeded,
+            detail: String::new(),
+        }
     }
 
     /// Failed host dispatch with a bounded message.
@@ -272,7 +280,10 @@ impl CommandOutcome {
         if text.len() > MAX_DETAIL_LEN {
             text.truncate(MAX_DETAIL_LEN);
         }
-        Self { status: CommandStatus::Failed, detail: text }
+        Self {
+            status: CommandStatus::Failed,
+            detail: text,
+        }
     }
 }
 
@@ -375,7 +386,9 @@ fn bounded_reason(message: impl Into<String>) -> String {
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), PipeError> {
     if value.is_empty() {
-        return Err(PipeError::Validation { reason: format!("{field} must not be empty") });
+        return Err(PipeError::Validation {
+            reason: format!("{field} must not be empty"),
+        });
     }
     if value.len() > MAX_DETAIL_LEN {
         return Err(PipeError::Validation {
@@ -440,14 +453,15 @@ impl BridgeRequest {
                 }
                 Ok(())
             }
-            Self::RequestOrigin { ui_session, ui_pane } => {
+            Self::RequestOrigin {
+                ui_session,
+                ui_pane,
+            } => {
                 require_non_empty("UI session", ui_session)?;
                 require_non_empty("UI pane", ui_pane)
             }
-            Self::FocusPaneByIndex { execution, .. } => {
-                require_non_empty("execution ID", execution)
-            }
-            Self::FocusPaneNeighbor { execution, .. } => {
+            Self::FocusPaneByIndex { execution, .. }
+            | Self::FocusPaneNeighbor { execution, .. } => {
                 require_non_empty("execution ID", execution)
             }
             Self::RetireBridge => Ok(()),
@@ -477,9 +491,18 @@ impl PipeEventKind {
     /// # Errors
     ///
     /// Returns [`PipeError::Validation`] when IDs, fingerprints, or details are invalid.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive event wire contract remains co-located so every variant is reviewed together"
+    )]
     pub fn validate(&self) -> Result<(), PipeError> {
         match self {
-            Self::Register { client_id, registration, identity, .. } => {
+            Self::Register {
+                client_id,
+                registration,
+                identity,
+                ..
+            } => {
                 require_non_empty("client ID", client_id)?;
                 if registration == &[0; 16] {
                     return Err(PipeError::Validation {
@@ -488,7 +511,11 @@ impl PipeEventKind {
                 }
                 identity.validate()
             }
-            Self::RequestReleased { request_id, registration, .. } => {
+            Self::RequestReleased {
+                request_id,
+                registration,
+                ..
+            } => {
                 if request_id == &[0; 16] || registration == &[0; 16] {
                     return Err(PipeError::Validation {
                         reason: "release acknowledgement IDs must not be zero".to_owned(),
@@ -496,7 +523,10 @@ impl PipeEventKind {
                 }
                 Ok(())
             }
-            Self::DispatchAccepted { request_id, execution } => {
+            Self::DispatchAccepted {
+                request_id,
+                execution,
+            } => {
                 if request_id == &[0; 16] {
                     return Err(PipeError::Validation {
                         reason: "request ID must not be zero".to_owned(),
@@ -504,7 +534,11 @@ impl PipeEventKind {
                 }
                 require_non_empty("execution ID", execution)
             }
-            Self::DispatchCompleted { request_id, execution, outcome } => {
+            Self::DispatchCompleted {
+                request_id,
+                execution,
+                outcome,
+            } => {
                 if request_id == &[0; 16] {
                     return Err(PipeError::Validation {
                         reason: "request ID must not be zero".to_owned(),
@@ -522,7 +556,11 @@ impl PipeEventKind {
                 require_non_empty("UI session", ui_session)?;
                 origin.validate()
             }
-            Self::OriginDeclined { ui_session, request_id, registration } => {
+            Self::OriginDeclined {
+                ui_session,
+                request_id,
+                registration,
+            } => {
                 require_non_empty("UI session", ui_session)?;
                 if request_id == &[0; 16] || registration == &[0; 16] {
                     return Err(PipeError::Validation {
@@ -547,7 +585,10 @@ impl PipeEventKind {
                 }
                 Ok(())
             }
-            Self::Heartbeat { registration, client_id } => {
+            Self::Heartbeat {
+                registration,
+                client_id,
+            } => {
                 if registration == &[0; 16] {
                     return Err(PipeError::Validation {
                         reason: "registration ID must not be zero".to_owned(),
@@ -619,10 +660,9 @@ pub fn encode_event_line(event: &PipeEvent) -> Result<String, PipeError> {
 }
 
 fn encode_line<T: Serialize>(frame: &T) -> Result<String, PipeError> {
-    let mut line =
-        serde_json::to_string(frame).map_err(|error| PipeError::Encode {
-            reason: bounded_reason(error.to_string()),
-        })?;
+    let mut line = serde_json::to_string(frame).map_err(|error| PipeError::Encode {
+        reason: bounded_reason(error.to_string()),
+    })?;
     line.push('\n');
     if line.len() > MAX_PIPE_LINE_LEN {
         return Err(PipeError::Encode {
@@ -661,10 +701,9 @@ pub fn decode_request_line(line: &str) -> Result<PipeRequest, PipeError> {
 /// Returns [`PipeError`] when the line is oversized, unparsable, or invalid.
 pub fn decode_event_line(line: &str) -> Result<PipeEvent, PipeError> {
     check_line_bound(line)?;
-    let event: PipeEvent =
-        serde_json::from_str(line).map_err(|error| PipeError::InvalidFrame {
-            reason: bounded_reason(error.to_string()),
-        })?;
+    let event: PipeEvent = serde_json::from_str(line).map_err(|error| PipeError::InvalidFrame {
+        reason: bounded_reason(error.to_string()),
+    })?;
     event.validate()?;
     Ok(event)
 }
@@ -674,7 +713,10 @@ mod tests {
     use super::*;
 
     fn sample_target() -> BridgeTarget {
-        BridgeTarget { client_id: "client-1".to_owned(), registration: [7; 16] }
+        BridgeTarget {
+            client_id: "client-1".to_owned(),
+            registration: [7; 16],
+        }
     }
 
     #[test]
@@ -732,7 +774,10 @@ mod tests {
             },
         };
         assert!(event.validate().is_err());
-        let lost = PipeEventKind::CaptureLost { lease: [0; 16], reason: CaptureLostReason::UserModeChanged };
+        let lost = PipeEventKind::CaptureLost {
+            lease: [0; 16],
+            reason: CaptureLostReason::UserModeChanged,
+        };
         assert!(lost.validate().is_err());
     }
 
