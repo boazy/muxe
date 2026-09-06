@@ -182,7 +182,7 @@ impl ConfigInputs {
             self.directory.join("themes"),
             self.directory.join("color-schemes"),
         ];
-        if let Some(host_override) = self.host_override.as_ref().filter(|path| path.is_file()) {
+        if let Some(host_override) = &self.host_override {
             inputs.push(host_override.clone());
         }
         ConfigWatchSpec {
@@ -475,10 +475,10 @@ mod tests {
             debounce: Duration::from_millis(200),
         };
         let before = inputs.watch_spec(settings);
-        assert!(!before.inputs.contains(&override_path));
+        assert!(before.inputs.contains(&override_path));
         fs::write(&override_path, "version: 1\nmenus: {}\n").unwrap();
         let after = inputs.watch_spec(settings);
-        assert!(after.inputs.contains(&override_path));
+        assert_eq!(after.inputs, before.inputs);
         assert_eq!(after.root, directory.path());
         assert_eq!(after.settings, settings);
     }
