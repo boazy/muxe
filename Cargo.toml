@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 # Runtime members are added only when their source owners have real crate roots.
-members = ["crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "tools/muxe-herdr-gen"]
+members = ["crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "crates/muxe-ui", "tools/muxe-herdr-gen"]
 
 [workspace.package]
 edition = "2024"
@@ -29,7 +29,7 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 unicode-width = "0.2.1"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync", "time", "process", "net", "io-util"] }
 tokio-util = { version = "0.7.17", features = ["codec"] }
-nix = { version = "0.30.1", features = ["signal", "process"] }
+nix = { version = "0.30.1", features = ["signal", "process", "user"] }
 notify = "8.2.0"
 regress = "0.12.0"
 regex = "1.12.2"
