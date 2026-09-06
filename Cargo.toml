@@ -5,9 +5,7 @@ members = ["crates/muxe-core", "crates/muxe-terminal-input", "tools/muxe-herdr-g
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.97.1"
 license = "MIT"
-license-file = "LICENSE"
 version = "0.1.0"
 
 [workspace.dependencies]
@@ -15,7 +13,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde-saphyr = "1.2.0"
 saphyr = "0.0.6"
 serde_json = "1.0.145"
-rkyv = { version = "0.8.10", features = ["bytecheck"] }
+rkyv = { version = "0.8.10", default-features = false, features = ["std", "alloc", "bytecheck", "little_endian", "aligned", "pointer_width_32"] }
 bytecheck = "0.8.2"
 thiserror = "2.0.17"
 ariadne = "0.5.1"

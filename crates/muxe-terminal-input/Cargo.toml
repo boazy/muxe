@@ -1,0 +1,8 @@
+[package]
+name = "muxe-terminal-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
