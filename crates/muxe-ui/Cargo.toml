@@ -23,3 +23,7 @@ unicode-width.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 divan.workspace = true
+
+[[bench]]
+name = "session"
+harness = false

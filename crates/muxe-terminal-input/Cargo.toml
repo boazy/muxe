@@ -7,3 +7,7 @@ license.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 divan.workspace = true
+
+[[bench]]
+name = "parser"
+harness = false
