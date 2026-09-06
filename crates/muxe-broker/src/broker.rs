@@ -38,7 +38,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{ConfigError, ConfigStore},
+    config::{ConfigError, ConfigStore, ConfigWatchSpec},
     gate::{
         AttachDisposition, GateError, LaunchGate, OsTokenSource, PendingLaunch, RegisteredPane,
         ScopeOwner,
@@ -186,6 +186,11 @@ impl Broker {
     pub async fn generation(&self) -> CompiledGeneration {
         self.config.snapshot().await.config.generation
     }
+
+    pub(crate) async fn config_watch_spec(&self) -> ConfigWatchSpec {
+        self.config.watch_spec().await
+    }
+
 
     /// Keeps the previous immutable generation active if parsing, compilation, or active-host
     /// validation fails.
