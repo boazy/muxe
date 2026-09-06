@@ -1851,6 +1851,7 @@ dependencies = [
  "kdl 6.7.1",
  "muxe-adapter-api",
  "muxe-adapter-herdr",
+ "muxe-adapter-zellij",
  "muxe-broker",
  "muxe-core",
  "muxe-protocol",
