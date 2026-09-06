@@ -2,6 +2,9 @@
 resolver = "2"
 # Runtime members are added only when their source owners have real crate roots.
 members = ["crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "crates/muxe-ui", "crates/muxe-broker", "crates/muxe", "tools/muxe-herdr-gen", "tools/muxe-zellij-gen", "crates/muxe-zellij-protocol", "crates/muxe-adapter-zellij", "tools/codegen-completions", "crates/muxe-zellij-wasm"]
+# Test-only foreground Zellij server: independent lockfile, never in the
+# main build or release archives. Release owns its sources; core owns pins.
+exclude = ["tools/muxe-zellij-foreground"]
 
 [workspace.package]
 edition = "2024"

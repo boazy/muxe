@@ -1,0 +1,13 @@
+[package]
+name = "muxe-zellij-foreground"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "muxe-zellij-foreground"
+path = "src/main.rs"
+
+[dependencies]
+zellij-server = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f" }
+zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f" }
