@@ -8,3 +8,4 @@ target/
 
 # External pinned-source archives and generated tool caches
 .local/
+dist-wasm/
