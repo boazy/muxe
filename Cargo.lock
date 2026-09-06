@@ -953,6 +953,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "muxe-zellij-gen"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "quote",
+ "sha2",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
