@@ -4,14 +4,28 @@ name: release
 # `v{major}.{minor}.{patch}`. Every target archive is a complete installation:
 #   muxe
 #   lib/muxe/muxe-zellij.wasm
-#   share/muxe/completions/
+#   share/muxe/completions/ (muxe.bash, _muxe, muxe.fish)
 #   LICENSE
 #
+# Gate order is load-bearing: wasm producer -> per-arch assets -> verify
+# (checksums, byte-identity, layout, attestations) -> live gates ->
+# publish. Nothing becomes public before every required gate passes.
+# In particular there is no first-release waiver: with no predecessor
+# artifact the live upgrade gate fails naming the missing predecessor.
+#
+# Toolchain rule: the Rust pin lives only in mise.toml. Workflows install it
+# with jdx/mise-action and assert `cargo --version` against
+# `mise current rust`; no workflow repeats the version literal, and no
+# rust-toolchain action is used. Every `run` block sets pipefail so a
+# failing producer can never hide behind a pipe.
+#
 # Linux archives target musl for static distribution. If either Linux
-# architecture cannot pass the host integration matrix with musl, the release
-# is blocked and the target decision is reopened: a differently linked
-# artifact must never be silently published under the same name. The
-# verify-static steps below enforce that as a failing gate.
+# architecture cannot pass the static-linkage gate below, the release is
+# blocked and the target decision is reopened: a differently linked
+# artifact must never be silently published under the same name. The gate
+# checks for the absence of an interpreter and dynamic dependencies
+# directly instead of grepping `file` output for "statically linked",
+# which rejects valid static-PIE binaries.
 #
 # Owner/repository names are taken from the github context, never hardcoded,
 # so the workflow cannot silently target a fork.
@@ -30,78 +44,172 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  wasm:
+    name: wasm bridge producer (single source of bytes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - name: pinned toolchain assert (single source is mise.toml)
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$pin"
+          cargo --version | grep -F "cargo $pin"
+      - name: wasm target
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN rustup target add \
+            --toolchain "$(mise current rust)" wasm32-wasip1
+      - name: build bridge (release)
+        # The task definition (flags, profile, stage path) is owned by the
+        # mise coordinator; this job only asserts its output.
+        run: |
+          set -euo pipefail
+          mise trust
+          mise run wasm-build
+      - name: stage digest
+        run: |
+          set -euo pipefail
+          test -f dist-wasm/muxe-zellij.wasm
+          file dist-wasm/muxe-zellij.wasm | tee wasm-file.out
+          grep -Fi "WebAssembly" wasm-file.out
+          sha256sum dist-wasm/muxe-zellij.wasm | tee wasm.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-wasm
+          path: |
+            dist-wasm/muxe-zellij.wasm
+            wasm.sha256
+
   assets:
     name: build ${{ matrix.asset }}
+    needs: [wasm]
     strategy:
       fail-fast: true
       matrix:
         include:
           - asset: linux-x64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            zigbuild: false
+            uname_arch: x86_64
+            file_arch: x86-64
+            static: true
           - asset: linux-arm64
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            zigbuild: true
+            uname_arch: aarch64
+            file_arch: aarch64
+            static: true
           - asset: macos-x64
-            os: macos-13
+            os: macos-15
             target: x86_64-apple-darwin
-            zigbuild: false
+            uname_arch: arm64
+            file_arch: x86_64
+            static: false
           - asset: macos-arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
-            zigbuild: false
+            uname_arch: arm64
+            file_arch: arm64
+            static: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: jdx/mise-action@v2
         with:
-          toolchain: "1.97.1"
-          targets: ${{ matrix.target }}
-      - name: musl toolchain (linux x64)
-        if: matrix.asset == 'linux-x64'
+          install: true
+      - name: pinned toolchain assert (single source is mise.toml)
         run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$pin"
+          cargo --version | grep -F "cargo $pin"
+      - name: runner architecture assert
+        # macOS x64 is cross-compiled from the arm64 runner; the binary-arch
+        # assert below covers the artifact. The runner itself must still be
+        # the pinned image, never an implicit latest.
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.uname_arch }}"
+      - name: producer bytes (exact bridge identity)
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-wasm
+          path: bridge-stage
+      - name: verify producer bytes before packaging
+        run: |
+          set -euo pipefail
+          wasm_path="$(find bridge-stage -name muxe-zellij.wasm -print -quit)"
+          test -n "$wasm_path"
+          digest_path="$(find bridge-stage -name wasm.sha256 -print -quit)"
+          test -n "$digest_path"
+          file "$wasm_path" | tee bridge-file.out
+          grep -Fi "WebAssembly" bridge-file.out
+          (cd "$(dirname "$wasm_path")" && sha256sum -c "$(basename "$digest_path")")
+          echo "WASM_PATH=$wasm_path" >> "$GITHUB_ENV"
+      - name: musl toolchain (linux only)
+        if: matrix.static
+        run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      - name: musl cross toolchain (linux arm64)
-        if: matrix.asset == 'linux-arm64'
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.13.0
-      - name: cargo-zigbuild (linux arm64)
-        if: matrix.zigbuild
-        run: cargo install cargo-zigbuild --locked
+      - name: rust target
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN rustup target add \
+            --toolchain "$(mise current rust)" "${{ matrix.target }}"
       - name: build native binary
         run: |
-          if [ "${{ matrix.zigbuild }}" = "true" ]; then
-            cargo zigbuild --locked --release -p muxe --target ${{ matrix.target }}
-          else
-            cargo build --locked --release -p muxe --target ${{ matrix.target }}
-          fi
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo build --locked --release \
+            -p muxe --target "${{ matrix.target }}"
       - name: verify static linkage (linux musl only)
-        if: startsWith(matrix.asset, 'linux')
+        if: matrix.static
         run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/muxe"
           # A dynamically linked binary under a musl asset name is a release
-          # failure, never a silent mislabel.
-          file "target/${{ matrix.target }}/release/muxe" | tee file.out
-          grep -i "statically linked" file.out
-      - name: bridge artifact (runtime owner build output)
+          # failure, never a silent mislabel. Static-PIE has no interpreter
+          # and no dynamic dependencies, so assert exactly that.
+          if readelf -l "$bin" | grep -q "INTERP"; then
+            echo "release failure: $bin carries an ELF interpreter"
+            exit 1
+          fi
+          if readelf -d "$bin" 2>/dev/null | grep -q "NEEDED"; then
+            echo "release failure: $bin carries dynamic dependencies"
+            exit 1
+          fi
+      - name: binary architecture and version assert
         run: |
-          # The WASM bridge is built by its owning crate; packaging requires
-          # the exact bytes and fails closed when they are absent.
-          test -f dist-wasm/muxe-zellij.wasm
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/muxe"
+          file "$bin" | tee bin-file.out
+          grep -F "${{ matrix.file_arch }}" bin-file.out
+          version="${GITHUB_REF_NAME#v}"
+          test "$("$bin" --version | cut -d' ' -f2)" = "$version"
+          echo "BIN=$bin" >> "$GITHUB_ENV"
       - name: completions byte-clean
-        run: cargo run --locked -p codegen-completions -- --check
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo run --locked \
+            -p codegen-completions -- --check
       - name: assemble archive
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           root="muxe-v${version}-${{ matrix.asset }}"
-          rm -rf "$root"
+          rm -rf "$root" "${root}.tar.gz"
           mkdir -p "$root/lib/muxe" "$root/share/muxe/completions"
-          cp "target/${{ matrix.target }}/release/muxe" "$root/muxe"
-          cp dist-wasm/muxe-zellij.wasm "$root/lib/muxe/muxe-zellij.wasm"
-          cp share/muxe/completions/muxe.bash share/muxe/completions/muxe.zsh share/muxe/completions/muxe.fish "$root/share/muxe/completions/"
+          cp "$BIN" "$root/muxe"
+          chmod 755 "$root/muxe"
+          cp "$WASM_PATH" "$root/lib/muxe/muxe-zellij.wasm"
+          cp share/muxe/completions/muxe.bash \
+            share/muxe/completions/_muxe \
+            share/muxe/completions/muxe.fish \
+            "$root/share/muxe/completions/"
           cp LICENSE "$root/LICENSE"
           tar -czf "${root}.tar.gz" "$root"
           echo "ARCHIVE=${root}.tar.gz" >> "$GITHUB_ENV"
@@ -110,69 +218,189 @@ jobs:
           name: ${{ env.ARCHIVE }}
           path: ${{ env.ARCHIVE }}
 
-  publish:
-    name: publish release
-    needs: assets
-    runs-on: ubuntu-latest
+  verify:
+    name: checksums, identity, layout, attestations (pre-publish)
+    needs: [assets]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: checksums
+      - name: all four archives present
         run: |
-          cd dist
-          sha256sum muxe-v*.tar.gz > SHA256SUMS
-          sha256sum -c SHA256SUMS
-          cp SHA256SUMS ..
-      - name: create release (checksums required)
+          set -euo pipefail
+          archives=(dist/muxe-v*.tar.gz)
+          test "${#archives[@]}" -eq 4
+          printf '%s\n' "${archives[@]}"
+      - name: checksums (missing checksum fails the release)
         run: |
-          # A missing checksum is a failed release, not an optional step.
-          test -f SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" dist/muxe-v*.tar.gz SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: attest archives
+          set -euo pipefail
+          (cd dist && sha256sum muxe-v*.tar.gz > SHA256SUMS)
+          (cd dist && sha256sum -c SHA256SUMS)
+          cp dist/SHA256SUMS .
+      - name: layout and identical WASM bytes
+        run: |
+          set -euo pipefail
+          rm -rf verify-tmp
+          mkdir verify-tmp
+          first_digest=""
+          for archive in dist/muxe-v*.tar.gz; do
+            name="$(basename "$archive" .tar.gz)"
+            tar -xzf "$archive" -C verify-tmp
+            test -x "verify-tmp/$name/muxe"
+            test -f "verify-tmp/$name/lib/muxe/muxe-zellij.wasm"
+            test -f "verify-tmp/$name/share/muxe/completions/muxe.bash"
+            test -f "verify-tmp/$name/share/muxe/completions/_muxe"
+            test -f "verify-tmp/$name/share/muxe/completions/muxe.fish"
+            test -f "verify-tmp/$name/LICENSE"
+            digest="$(sha256sum "verify-tmp/$name/lib/muxe/muxe-zellij.wasm" | cut -d' ' -f1)"
+            if [ -z "$first_digest" ]; then
+              first_digest="$digest"
+            elif [ "$digest" != "$first_digest" ]; then
+              echo "release failure: WASM bytes differ in $name"
+              exit 1
+            fi
+          done
+          echo "$first_digest" > WASM_SHA256
+          echo "WASM bytes identical in all archives: $first_digest"
+      - name: runnable native smoke (linux-x64 on its own arch)
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bin="verify-tmp/muxe-v${version}-linux-x64/muxe"
+          test -x "$bin"
+          report="$("$bin" compatibility --json)"
+          test "$(printf '%s' "$report" | grep -o '"muxe_version":"[^"]*"' | cut -d'"' -f4)" = "$version"
+      - name: attest archives (before any publication)
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: "dist/muxe-v*.tar.gz, SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-meta
+          path: |
+            SHA256SUMS
+            WASM_SHA256
 
   live-matrix:
-    name: live upgrade/rollback matrix
-    needs: publish
-    runs-on: ubuntu-latest
+    name: fixture matrix (${{ matrix.os }})
+    needs: [verify]
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: predecessor check
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - name: pinned toolchain assert (single source is mise.toml)
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$pin"
+          cargo --version | grep -F "cargo $pin"
+      - name: activation old/target fixtures (no live host)
+        # Owned TempDir framed-control transaction fixtures; any missing
+        # runner fails here by name instead of passing silently.
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo test --locked -p muxe \
+            --lib lifecycle::activate::tests
+      - name: Herdr recorded-socket smoke (no live host)
+        # Production adapter against recorded socket fixtures, including the
+        # exact pane argv/cwd exchange.
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN cargo test --locked \
+            -p muxe-adapter-herdr --test recorded_socket
+
+  live-upgrade:
+    name: predecessor upgrade/rollback gate
+    needs: [verify, live-matrix]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: predecessor check (no waiver)
         id: predecessor
         run: |
-          set +e
-          count=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName \
-            --jq '[.[] | select(.tagName != "'"$GITHUB_REF_NAME"'")] | length')
-          echo "count=$count"
-          if [ "$count" = "0" ]; then
-            if [ "$GITHUB_REF_NAME" = "v0.1.0" ]; then
-              echo "FIRST RELEASE: no predecessor artifact exists; the live" \
-                "previous-to-target matrix is explicitly waived and recorded" \
-                "here, not silently skipped." >> "$GITHUB_STEP_SUMMARY"
-              echo "waived=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "No predecessor release found for $GITHUB_REF_NAME:" \
-                "the live upgrade/rollback matrix is BLOCKED." >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
+          set -euo pipefail
+          prev="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+            --json tagName \
+            --jq '[.[].tagName] | map(select(. != env.GITHUB_REF_NAME)) | sort | last // empty')"
+          if [ -z "$prev" ]; then
+            echo "BLOCKED: no predecessor release exists for $GITHUB_REF_NAME." \
+              "The previous-to-target live upgrade/rollback matrix cannot run" \
+              "on a first release and is a failing gate, not a waiver." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
+          echo "PREVIOUS=$prev" >> "$GITHUB_ENV"
+          echo "previous=$prev" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: upgrade and rollback (Zellij + Herdr)
-        if: steps.predecessor.outputs.waived != 'true'
+      - name: pinned host presence and versions
         run: |
-          # Requires Zellij 0.46.0 (two sessions sharing the stable bridge,
-          # two clients in one session) and Herdr 0.8.2 on this runner.
-          # Any missing capability fails the gate explicitly.
-          command -v zellij || { echo "MISSING: zellij 0.46.0"; exit 1; }
-          command -v herdr || { echo "MISSING: herdr 0.8.2"; exit 1; }
+          set -euo pipefail
+          command -v zellij || { echo "MISSING: zellij 0.46.0 on this runner"; exit 1; }
+          command -v herdr || { echo "MISSING: herdr 0.8.2 on this runner"; exit 1; }
           zellij --version | grep -F "0.46.0"
-          echo "live matrix against predecessor: manual runbook in README"
+          herdr --version | grep -F "0.8.2"
+      - name: live-host approval opt-in
+        # The isolated Zellij probe permissions and the bridge-digest design
+        # decision are user approvals, not CI autodetects. The gate fails
+        # closed naming them until the release owner records approval by
+        # setting this repository variable to "true".
+        run: |
+          set -euo pipefail
+          test "${ALLOW_LIVE_HOST_MATRIX:-}" = "true" || {
+            echo "BLOCKED: live-host upgrade requires recorded user approval" \
+              "of the isolated Zellij probe permissions and the bridge" \
+              "embedded-report design decision (DESIGN 2074). Set the" \
+              "ALLOW_LIVE_HOST_MATRIX repository variable to \"true\" only" \
+              "after those approvals exist."
+            exit 1
+          }
+      - name: session handoff scenario
+        # All prerequisites above passed. The multi-session bridge-sharing
+        # upgrade/rollback scenario (two Zellij sessions, two clients in one
+        # session, Herdr subscription move) runs from a checked-in runner so
+        # this gate exercises production paths instead of echoing a runbook.
+        run: |
+          set -euo pipefail
+          test -f tools/release/live-upgrade.sh || {
+            echo "BLOCKED: all live prerequisites pass but" \
+              "tools/release/live-upgrade.sh is not yet wired; the scenario" \
+              "runner is the missing prerequisite."
+            exit 1
+          }
+          test -n "${PREVIOUS:-}" || { echo "BLOCKED: no predecessor recorded"; exit 1; }
+          bash tools/release/live-upgrade.sh "$PREVIOUS" "$GITHUB_REF_NAME"
+
+  publish:
+    name: publish release (all gates green)
+    needs: [verify, live-matrix, live-upgrade]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: pre-publish checksum gate (fail on anything missing)
+        run: |
+          set -euo pipefail
+          archives=(dist/muxe-v*.tar.gz)
+          test "${#archives[@]}" -eq 4
+          test -f dist/SHA256SUMS
+          (cd dist && sha256sum -c SHA256SUMS)
+      - name: create release (archives plus checksums, attestations already made)
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/muxe-v*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

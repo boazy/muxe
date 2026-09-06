@@ -95,9 +95,20 @@ jobs:
       - name: pinned version check
         run: |
           zellij --version | grep -F "0.46.0"
+      - name: activation old/target fixtures (no live host)
+        run: |
+          # Owned TempDir framed-control transaction fixtures from the native
+          # library; a missing runner fails here by name, never silently.
+          cargo test --locked -p muxe --lib lifecycle::activate::tests
+      - name: Herdr recorded-socket smoke (no live host)
+        run: |
+          # Production adapter against recorded socket fixtures, including
+          # the exact pane argv/cwd exchange.
+          cargo test --locked -p muxe-adapter-herdr --test recorded_socket
       - name: temp-scoped smoke
         run: |
           # All smoke state lives under a fresh TempDir; never the default host.
-          export SMOKE_DIR="$(mktemp -d)"
+          SMOKE_DIR="$(mktemp -d)"
+          export SMOKE_DIR
           trap 'rm -rf "$SMOKE_DIR"' EXIT
           cargo run --locked -p muxe -- compatibility --json | tee "$SMOKE_DIR/compat.json"

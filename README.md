@@ -31,21 +31,42 @@ Preserve the extracted layout. Copying only `muxe` is not a complete Zellij
 installation: the native binary locates packaged assets relative to its
 installation root.
 
-For direct-archive installations, extract each release into its own versioned
-directory, atomically retarget a stable `muxe` symlink, run `muxe activate`,
-and retain the previous directory until activation commits.
+For direct-archive installations, keep each release in its own versioned
+directory, verify before extracting, and retarget a stable symlink:
+
+```sh
+version=0.1.0
+asset=linux-x64
+tar -xzf "muxe-v${version}-${asset}.tar.gz"
+mkdir -p ~/.local/muxe
+mv "muxe-v${version}-${asset}" ~/.local/muxe/
+ln -sfn ~/.local/muxe/"muxe-v${version}-${asset}" ~/.local/muxe/current
+export PATH="$HOME/.local/muxe/current:$PATH"
+```
+
+Run `muxe activate` after retargeting, and retain the previous versioned
+directory until activation commits. After successful activation, remove the
+prior directory. The same retention rule applies to mise: prune the prior
+tool version only after activation commits.
 
 ## Verification
 
 Every release publishes `SHA256SUMS` covering all target archives and GitHub
-artifact attestations covering each archive. Verify both before installing:
+artifact attestations covering each archive. The attestations are created
+before publication; a missing checksum or attestation is a failed release,
+not an optional step. Verify both before installing:
 
 ```sh
 shasum -a 256 -c SHA256SUMS
 gh attestation verify muxe-v0.1.0-linux-x64.tar.gz --repo boazy/muxe
 ```
 
-A missing checksum or attestation is a failed release, not an optional step.
+Release state is currently blocked, not complete. No predecessor release
+artifact exists yet, so the previous-to-target live upgrade and rollback
+gate cannot run and fails closed. The bridge registration digest is
+reported as blocked for the same reason the automation refuses to invent
+one (see Compatibility). Do not treat installation as release-proven
+until those gates pass.
 
 ## Setup
 
@@ -209,14 +230,15 @@ muxe compatibility --json
 ```
 
 The first release supports Zellij 0.46.0 and Herdr 0.8.2 as both the
-minimum-supported and latest-verified versions. The JSON form reports the
-embedded record with stable snake_case field names.
+minimum-supported and latest-verified versions.
 
 The bridge registration digest is reported as blocked, not as a hash. The
 host channel gives the running bridge no way to attest its own bytes, so the
 native side verifies packaged and installed digests while the registration
 half awaits a design decision. Release metadata is not claimed complete
-while that decision is pending.
+while that decision is pending. The JSON report shape is also still moving
+to its owning module, so treat field names as provisional until that
+cutover lands.
 
 ## Uninstall and purge
 
@@ -242,6 +264,7 @@ never edits Zellij or Herdr keybindings.
 ## Completions
 
 Bash, Zsh, and Fish files ship under `share/muxe/completions/` in every
-archive. They are generated from the command definition by
-`tools/codegen-completions` and committed. There is no runtime
-`muxe completions` command in V1.
+archive as `muxe.bash`, `_muxe`, and `muxe.fish`. The Zsh file uses the
+conventional fpath name. They are generated from the command definition by
+`tools/codegen-completions` and committed. CI fails on any byte-for-byte
+difference. There is no runtime `muxe completions` command in V1.

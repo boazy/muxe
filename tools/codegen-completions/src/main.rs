@@ -17,9 +17,11 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate_to};
 use muxe::cli::Cli;
 
+/// File names are the exact `clap_complete::generate_to` outputs: Zsh uses
+/// the conventional `_muxe` fpath name, not `muxe.zsh`.
 const FILES: [(Shell, &str); 3] = [
     (Shell::Bash, "muxe.bash"),
-    (Shell::Zsh, "muxe.zsh"),
+    (Shell::Zsh, "_muxe"),
     (Shell::Fish, "muxe.fish"),
 ];
 
