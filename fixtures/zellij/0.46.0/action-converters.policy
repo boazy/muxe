@@ -1,0 +1,26 @@
+# Generated from the pinned Zellij source. Review every entry before use.
+Action	mirror
+CommandOrPlugin	mirror
+Direction	mirror
+FloatingPaneCoordinates	mirror
+FloatingPaneLayout	mirror
+InputMode	mirror
+KeyWithModifier	mirror
+LayoutInfo	mirror
+MouseEvent	mirror
+NewPanePlacement	mirror
+OpenFilePayload	mirror
+PaneFrameStyle	mirror
+PaneId	mirror
+PathBuf	builtin
+Position	mirror
+Resize	mirror
+RunCommandAction	mirror
+RunPluginOrAlias	mirror
+SearchDirection	mirror
+SearchOption	mirror
+SwapFloatingLayout	mirror
+SwapTiledLayout	mirror
+TabLayoutInfo	mirror
+TiledPaneLayout	mirror
+UnblockCondition	mirror
