@@ -4,12 +4,25 @@
 
 mod input;
 mod layout;
+mod runtime;
 mod snapshot;
 mod template;
+mod terminal;
 mod widget;
 
-pub use input::{ConvertedInput, ConvertedKeyEvent, convert_input};
-pub use layout::{Cell, GridPlan, GridRect, GridSlot, arrange_cells, sanitize_single_line};
+pub use input::{convert_input, ConvertedInput, ConvertedKeyEvent};
+pub use layout::{
+    arrange_cells, ellipsize, sanitize_single_line, Cell, GridColumn, GridPage, GridPlan, GridRect,
+    GridSlot,
+};
+pub use runtime::{PreparedMenu, UiCommand, UiError, UiRuntime};
 pub use snapshot::{ArchivedUiSnapshot, SnapshotError};
-pub use template::{CellTemplate, TemplateError, escape_markup_text, render_cell_template};
-pub use widget::{MenuGrid, MenuGridCell, MenuStatus};
+pub use template::{
+    escape_markup_text, BreadcrumbTemplate, CellTemplate, PaginationTemplate, RenderedSpan,
+    RenderedText, StatusTemplate, TemplateError, TemplateRenderer,
+};
+pub use terminal::{
+    kitty_flags, InputDriver, KittyNegotiation, KittyNegotiationError, NegotiationUpdate,
+    SurfaceFrame, SurfacePadding, TerminalSurface,
+};
+pub use widget::{MenuGrid, MenuStatus};

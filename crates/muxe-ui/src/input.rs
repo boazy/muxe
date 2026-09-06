@@ -1,13 +1,14 @@
 use muxe_core::{EventKind, KeyEvent, KeyIdentity, LockModifiers, Modifiers, NamedKey};
 use muxe_terminal_input::{
     EventKind as RawEventKind, FunctionalKey, InputEvent, KeyIdentity as RawKeyIdentity, KeypadKey,
-    MediaKey, ModifierKey, Modifiers as RawModifiers, RawKeyEvent,
+    MediaKey, ModifierKey, Modifiers as RawModifiers, ProtocolResponse, RawKeyEvent,
 };
 
 /// A parsed input result after its representable identities have been converted for core matching.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConvertedInput {
     Key(ConvertedKeyEvent),
+    ProtocolResponse(ProtocolResponse),
     Unknown,
 }
 
@@ -49,6 +50,7 @@ pub fn convert_input(input: InputEvent) -> ConvertedInput {
             },
             raw,
         }),
+        InputEvent::ProtocolResponse(response) => ConvertedInput::ProtocolResponse(response),
         InputEvent::Unknown(_) | InputEvent::Malformed(_) => ConvertedInput::Unknown,
     }
 }

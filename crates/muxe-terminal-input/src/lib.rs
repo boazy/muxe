@@ -1,14 +1,18 @@
 #![forbid(unsafe_code)]
 
-//! Pure, bounded decoding of legacy terminal and Kitty keyboard input.
+//! Pure, fixed-bound decoding of legacy terminal and Kitty keyboard input.
+//!
+//! The parser retains at most [`MAX_CSI_SEQUENCE_BYTES`] CSI bytes, three
+//! semicolon-delimited CSI fields, and [`MAX_ASSOCIATED_TEXT_SCALARS`] associated-text
+//! scalars. It never reads terminal I/O, advances a clock, or allocates while decoding.
 
 use core::fmt;
 
-/// Maximum bytes retained for a CSI sequence, excluding `ESC [` and its final byte.
+/// Maximum bytes retained between the CSI introducer and final byte.
 pub const MAX_CSI_SEQUENCE_BYTES: usize = 96;
-/// Maximum semicolon-delimited fields accepted in a CSI sequence.
+/// Maximum semicolon-delimited CSI fields.
 pub const MAX_CSI_PARAMETERS: usize = 3;
-/// Maximum colon-delimited associated-text scalars accepted by Kitty.
+/// Maximum colon-delimited scalars in Kitty's associated-text field.
 pub const MAX_ASSOCIATED_TEXT_SCALARS: usize = 16;
 
 /// A lossless terminal input result.
@@ -16,10 +20,28 @@ pub const MAX_ASSOCIATED_TEXT_SCALARS: usize = 16;
 pub enum InputEvent {
     /// A decoded key event.
     Key(RawKeyEvent),
-    /// A syntactically complete control sequence which is not a supported key.
+    /// A bounded terminal-protocol response.
+    ///
+    /// These responses retain their parsed data instead of becoming [`Self::Unknown`], so the UI
+    /// can confirm negotiated terminal state without consuming interleaved key input.
+    ProtocolResponse(ProtocolResponse),
+    /// A syntactically complete control sequence that is not a key event or supported response.
+    ///
+    /// A complete Kitty key with an unassigned functional code is emitted as
+    /// [`Self::Key`] with [`KeyIdentity::UnknownFunctional`], so its raw fields remain available.
     Unknown(UnknownSequence),
-    /// Malformed input. The parser has reached its documented recovery boundary.
+    /// Malformed input after the parser reaches a bounded recovery boundary.
+    ///
+    /// An overlong CSI sequence is discarded through its final byte. Other malformed complete
+    /// units reset immediately, so following input can be decoded.
     Malformed(MalformedInput),
+}
+
+/// A terminal response that affects the UI's input protocol state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtocolResponse {
+    /// The terminal's current Kitty progressive-enhancement flag mask from `CSI ? flags u`.
+    KittyKeyboardFlags(u32),
 }
 
 /// A raw key event before configuration matching or host normalization.
@@ -76,7 +98,8 @@ pub enum KeyIdentity {
     Functional(FunctionalKey),
     /// A valid Kitty functional-key code not assigned by the canonical protocol table.
     ///
-    /// It remains a raw identity but never claims to be a supported named key.
+    /// The code is retained for diagnostics and framing. UI matching must treat it as
+    /// non-matching instead of assigning it a named-key alias.
     UnknownFunctional(u32),
     /// Kitty's `0` key code: text exists, but no physical key is known.
     Unidentified,
@@ -278,9 +301,13 @@ pub enum MalformedReason {
 
 /// A pure streaming terminal input parser.
 ///
-/// `push` accepts arbitrary byte chunks. It does not use a clock or allocate.
-/// The caller resolves a pending bare Escape by calling [`Self::flush_pending_escape`]
-/// at its profile-specific deadline, and calls [`Self::finish`] at end of input.
+/// [`Self::push`] accepts arbitrary byte chunks. It has no clock and does not allocate. The
+/// caller resolves a pending bare Escape at its profile-specific deadline with
+/// [`Self::flush_pending_escape`]. Call [`Self::finish`] at end of input: it emits a pending
+/// Escape and reports every other incomplete unit as [`MalformedReason::IncompleteAtEof`].
+///
+/// Malformed complete units emit one [`InputEvent::Malformed`]. Overlong CSI input then remains
+/// discarded through the CSI final byte; all other recovery returns directly to the ground state.
 pub struct Parser {
     state: State,
     csi: [u8; MAX_CSI_SEQUENCE_BYTES],
@@ -631,7 +658,11 @@ impl CsiParameter {
     };
 
     fn first(self) -> Option<u32> {
-        if self.len == 0 { None } else { self.values[0] }
+        if self.len == 0 {
+            None
+        } else {
+            self.values[0]
+        }
     }
 }
 
@@ -656,6 +687,9 @@ fn decode_csi(bytes: &[u8], final_byte: u8) -> InputEvent {
         Err(reason) => return malformed(SequenceClass::Csi, reason, saturating_u8(bytes.len())),
     };
 
+    if let Some(response) = decode_protocol_response(parameters, final_byte) {
+        return InputEvent::ProtocolResponse(response);
+    }
     if parameters.prefix.is_some() || bytes.iter().any(|byte| (0x20..=0x2f).contains(byte)) {
         return unknown_csi(final_byte, bytes.len());
     }
@@ -708,6 +742,19 @@ fn decode_csi(bytes: &[u8], final_byte: u8) -> InputEvent {
         b'Z' => decode_shift_tab(parameters, final_byte, bytes.len()),
         _ => unknown_csi(final_byte, bytes.len()),
     }
+}
+
+fn decode_protocol_response(parameters: CsiParameters, final_byte: u8) -> Option<ProtocolResponse> {
+    if parameters.prefix != Some(b'?')
+        || final_byte != b'u'
+        || parameters.len != 1
+        || parameters.values[0].len != 1
+    {
+        return None;
+    }
+    parameters.values[0]
+        .first()
+        .map(ProtocolResponse::KittyKeyboardFlags)
 }
 
 fn parse_csi_parameters(bytes: &[u8]) -> Result<CsiParameters, MalformedReason> {
@@ -1409,6 +1456,49 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_kitty_response_preserves_interleaved_key_framing() {
+        let events = parse_chunks(&[b"\x1b[?13", b"u\x1b[97;1u"], true);
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::ProtocolResponse(ProtocolResponse::KittyKeyboardFlags(13)),
+                InputEvent::Key(RawKeyEvent::plain(KeyIdentity::Unicode('a'))),
+            ]
+        );
+    }
+
+    #[test]
+    fn vt100_alias_bytes_emit_one_unmodified_consumer_event() {
+        let events = parse_chunks(&[b"\t\r\x08\x1b"], true);
+
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::Key(RawKeyEvent::plain(KeyIdentity::Functional(
+                    FunctionalKey::Tab
+                ))),
+                InputEvent::Key(RawKeyEvent::plain(KeyIdentity::Functional(
+                    FunctionalKey::Enter
+                ))),
+                InputEvent::Key(RawKeyEvent::plain(KeyIdentity::Functional(
+                    FunctionalKey::Backspace
+                ))),
+                InputEvent::Key(RawKeyEvent::plain(KeyIdentity::Functional(
+                    FunctionalKey::Escape
+                ))),
+            ]
+        );
+
+        let control = parse_chunks(&[b"\x01"], true);
+        assert_eq!(
+            control,
+            vec![InputEvent::Key(RawKeyEvent::plain(KeyIdentity::Unicode(
+                '\u{1}'
+            )))]
+        );
+    }
+
+    #[test]
     fn legacy_escape_is_explicitly_flushed_and_alt_prefixes_are_not_lost() {
         let mut parser = Parser::new();
         let mut events = Vec::new();
@@ -1573,7 +1663,7 @@ mod tests {
 
     #[test]
     fn parameter_limits_and_unknown_well_formed_sequences_are_distinct() {
-        let events = parse_chunks(&[b"\x1b[1;1;1;1ux\x1b[?1uy"], true);
+        let events = parse_chunks(&[b"\x1b[1;1;1;1ux\x1b[>1uy"], true);
         assert!(matches!(
             events.as_slice(),
             [
