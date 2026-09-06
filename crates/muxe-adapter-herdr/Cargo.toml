@@ -1,0 +1,20 @@
+[package]
+name = "muxe-adapter-herdr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+muxe-adapter-api = { path = "../muxe-adapter-api" }
+muxe-core = { path = "../muxe-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
