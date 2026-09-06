@@ -12,6 +12,7 @@ muxe-core = { path = "../muxe-core" }
 muxe-protocol = { path = "../muxe-protocol" }
 muxe-terminal-input = { path = "../muxe-terminal-input" }
 ratatui.workspace = true
+serde.workspace = true
 rkyv.workspace = true
 thiserror.workspace = true
 unicode-width.workspace = true
