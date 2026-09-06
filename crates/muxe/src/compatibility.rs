@@ -99,7 +99,6 @@ pub enum PackagedWasmArtifact {
     Unavailable { reason: &'static str },
 }
 
-
 /// Complete compatibility material embedded in the native executable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeCompatibilityRecord {
@@ -164,6 +163,10 @@ pub fn embedded_record() -> Result<NativeCompatibilityRecord, CompatibilityError
                 schema_version: u32::try_from(schema_version)
                     .map_err(|_| CompatibilityError::HerdrSchemaOutOfRange(schema_version))?,
                 schema_fingerprint,
+                verified_methods: muxe_adapter_herdr::VERIFIED_HERDR_METHODS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
             }),
         },
         packaged_wasm: packaged_wasm_artifact()?,
@@ -240,6 +243,24 @@ pub fn render_human(record: &NativeCompatibilityRecord) -> String {
         format!("Zellij: {ZELLIJ_MINIMUM} minimum / {ZELLIJ_LATEST_VERIFIED} latest verified",),
         format!("Herdr: {HERDR_MINIMUM} minimum / {HERDR_LATEST_VERIFIED} latest verified",),
     ];
+    match &handoff.herdr {
+        Some(herdr) => {
+            lines.push(format!(
+                "Herdr protocol {} schema {} (fingerprint {})",
+                herdr.protocol_version,
+                herdr.schema_version,
+                hex_lower(&herdr.schema_fingerprint.0)
+            ));
+            lines.push(format!(
+                "Herdr verified methods ({}): {}",
+                herdr.verified_methods.len(),
+                herdr.verified_methods.join(", ")
+            ));
+        }
+        None => lines.push(
+            "Herdr fingerprints: unavailable (no verified adapter source in this build)".to_owned(),
+        ),
+    }
     match &handoff.zellij {
         Some(zellij) => lines.push(format!(
             "Zellij source revision {} (fingerprints embedded)",
@@ -252,7 +273,10 @@ pub fn render_human(record: &NativeCompatibilityRecord) -> String {
     }
     match &record.packaged_wasm {
         PackagedWasmArtifact::Verified { sha256 } => {
-            lines.push(format!("Packaged Zellij bridge SHA-256 {}", hex_lower(sha256)));
+            lines.push(format!(
+                "Packaged Zellij bridge SHA-256 {}",
+                hex_lower(sha256)
+            ));
         }
         PackagedWasmArtifact::Unavailable { reason } => {
             lines.push(format!("Packaged Zellij bridge unavailable: {reason}"));
@@ -266,6 +290,9 @@ pub fn render_human(record: &NativeCompatibilityRecord) -> String {
 /// `packaged_wasm.sha256` is the producer-provided identity of local bridge
 /// bytes. `bridge_registration_digest` remains null because it would claim
 /// host-loaded-byte evidence that the protocol cannot obtain.
+/// `hosts.herdr.verified_methods` carries the adapter's authoritative
+/// exercised-method set in stable constant order, next to the normalized
+/// schema fingerprint.
 #[must_use]
 pub fn render_json(record: &NativeCompatibilityRecord) -> Value {
     let handoff = &record.handoff;
@@ -277,6 +304,18 @@ pub fn render_json(record: &NativeCompatibilityRecord) -> Value {
             "source_revision": zellij.source_revision,
             "generated_action_fingerprint": hex_lower(&zellij.generated_action_fingerprint.0),
             "bridge_protocol_fingerprint": hex_lower(&zellij.bridge_protocol_fingerprint.0),
+        })
+    });
+    let herdr = handoff.herdr.as_ref().map(|herdr| {
+        json!({
+            "minimum": HERDR_MINIMUM,
+            "latest_verified": HERDR_LATEST_VERIFIED,
+            "protocol": herdr.protocol_version,
+            "schema_version": herdr.schema_version,
+            "schema_fingerprint": hex_lower(&herdr.schema_fingerprint.0),
+            "raw_schema_sha256": muxe_adapter_herdr::generated::BUNDLED_RAW_SCHEMA_SHA256,
+            "request_schema_sha256": muxe_adapter_herdr::generated::BUNDLED_REQUEST_SCHEMA_SHA256,
+            "verified_methods": herdr.verified_methods,
         })
     });
     let packaged_wasm = match &record.packaged_wasm {
@@ -296,14 +335,7 @@ pub fn render_json(record: &NativeCompatibilityRecord) -> Value {
         "application_schema_fingerprint": fingerprint_hex,
         "hosts": {
             "zellij": zellij,
-            "herdr": {
-                "minimum": HERDR_MINIMUM,
-                "latest_verified": HERDR_LATEST_VERIFIED,
-                "protocol": muxe_adapter_herdr::generated::BUNDLED_PROTOCOL,
-                "schema_version": muxe_adapter_herdr::generated::BUNDLED_SCHEMA_VERSION,
-                "raw_schema_sha256": muxe_adapter_herdr::generated::BUNDLED_RAW_SCHEMA_SHA256,
-                "request_schema_sha256": muxe_adapter_herdr::generated::BUNDLED_REQUEST_SCHEMA_SHA256,
-            }
+            "herdr": herdr,
         },
         "packaged_wasm": packaged_wasm,
         "bridge_registration_digest": null,
@@ -342,7 +374,9 @@ mod tests {
     fn packaged_wasm_matches_producer_bytes_and_rejects_tampering() {
         let record = embedded_record().expect("digest-embedded compatibility record is valid");
         let PackagedWasmArtifact::Verified { sha256 } = record.packaged_wasm else {
-            panic!("artifact proof requires MUXE_WASM_SHA256 at compile time; use mise run verify-packaged-wasm");
+            panic!(
+                "artifact proof requires MUXE_WASM_SHA256 at compile time; use mise run verify-packaged-wasm"
+            );
         };
         let wasm_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../dist-wasm/muxe-zellij.wasm");
@@ -351,7 +385,10 @@ mod tests {
         let verified = verify_packaged_asset(&bytes).expect("producer bytes verify");
         assert_eq!(verified.packaged_digest, hex_lower(&sha256));
         let rendered = render_json(&record);
-        assert_eq!(rendered["packaged_wasm"]["sha256"], json!(verified.packaged_digest));
+        assert_eq!(
+            rendered["packaged_wasm"]["sha256"],
+            json!(verified.packaged_digest)
+        );
         assert!(rendered["packaged_wasm"]["unavailable_reason"].is_null());
         assert!(rendered["bridge_registration_digest"].is_null());
         let mut tampered = bytes;
