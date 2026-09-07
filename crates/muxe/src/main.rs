@@ -3829,15 +3829,25 @@ mod mixed_recovery_production_tests {
         shutdown_gate.release.notify_one();
         wait_for_socket(endpoint_target_b.socket(), false).await;
         drop(target_control);
-        if tokio::time::timeout(Duration::from_mins(1), resume_gate_a.entered.notified())
-            .await
-            .is_err()
-        {
-            panic!(
-                "old A resume barrier entered: {:?}",
+        // Either old member may win the unit-lock race and block on its resume gate
+        // while holding the exclusive lock; the loser cannot resume until the winner
+        // ACKs. `notify_one` retains a permit, so `select!` observes whichever barrier
+        // enters first even if entry precedes the wait. Release that winner first so
+        // the test never deadlocks itself against the other gate.
+        let first = tokio::time::timeout(Duration::from_mins(1), async {
+            tokio::select! {
+                _ = resume_gate_a.entered.notified() => true,
+                _ = resume_gate_b.entered.notified() => false,
+            }
+        })
+        .await;
+        let a_first = match first {
+            Ok(a_first) => a_first,
+            Err(_) => panic!(
+                "old resume barrier entered: {:?}",
                 muxe::lifecycle::journal::read_journal(&journal_path)
-            );
-        }
+            ),
+        };
         assert!(
             muxe::lifecycle::journal::acquire_unit_lock(
                 &cache_dir,
@@ -3848,14 +3858,25 @@ mod mixed_recovery_production_tests {
             .is_err(),
             "unit lock remains held through local resume ACK barrier"
         );
-        resume_gate_a.release.notify_one();
-        wait_for_old_status(endpoint_old_a.socket(), "old-a", &old_record).await;
-        tokio::time::timeout(Duration::from_secs(5), resume_gate_b.entered.notified())
-            .await
-            .expect("old B resume barrier entered");
-        assert!(journal_path.exists(), "journal remains until old B ACK");
-        resume_gate_b.release.notify_one();
-        wait_for_old_status(endpoint_old_b.socket(), "old-b", &old_record).await;
+        if a_first {
+            resume_gate_a.release.notify_one();
+            wait_for_old_status(endpoint_old_a.socket(), "old-a", &old_record).await;
+            tokio::time::timeout(Duration::from_secs(5), resume_gate_b.entered.notified())
+                .await
+                .expect("old B resume barrier entered");
+            assert!(journal_path.exists(), "journal remains until old B ACK");
+            resume_gate_b.release.notify_one();
+            wait_for_old_status(endpoint_old_b.socket(), "old-b", &old_record).await;
+        } else {
+            resume_gate_b.release.notify_one();
+            wait_for_old_status(endpoint_old_b.socket(), "old-b", &old_record).await;
+            tokio::time::timeout(Duration::from_secs(5), resume_gate_a.entered.notified())
+                .await
+                .expect("old A resume barrier entered");
+            assert!(journal_path.exists(), "journal remains until old A ACK");
+            resume_gate_a.release.notify_one();
+            wait_for_old_status(endpoint_old_a.socket(), "old-a", &old_record).await;
+        }
         wait_for_journal_removed(&journal_path).await;
         assert_eq!(
             fs::read(&stable).expect("restored bridge"),
