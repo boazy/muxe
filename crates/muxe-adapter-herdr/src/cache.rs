@@ -45,6 +45,7 @@ pub struct HerdrCache {
 }
 
 impl HerdrCache {
+    #[must_use]
     pub fn new(cache_dir: &Path) -> Self {
         Self {
             root: cache_dir.join("herdr"),
@@ -55,16 +56,13 @@ impl HerdrCache {
         // The configured cache directory itself must not be a symlink: otherwise the
         // owner-only root below it would be created inside an attacker-chosen
         // directory while validation only inspects the resolved path.
-        if let Ok(parent) = fs::symlink_metadata(self.root.parent().unwrap_or(&self.root)) {
-            if parent.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Herdr cache parent is a symlink: {}",
-                        self.root.display()
-                    ),
-                ));
-            }
+        if let Ok(parent) = fs::symlink_metadata(self.root.parent().unwrap_or(&self.root))
+            && parent.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("Herdr cache parent is a symlink: {}", self.root.display()),
+            ));
         }
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -90,6 +88,11 @@ impl HerdrCache {
     /// directly, so readers reuse validated bytes instead of trusting recomputed
     /// output. Entries written before the representation was stored have no
     /// `normalized_request` field and are treated as misses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the cache root cannot be created or validated,
+    /// or when the fresh entry cannot be written and synced.
     pub fn normalized_schema(
         &self,
         protocol: u64,
@@ -111,12 +114,10 @@ impl HerdrCache {
                 && hit.get("request_sha256").and_then(Value::as_str) == Some(&request_hash)
                 && hit.get("validator_format_version").and_then(Value::as_u64)
                     == Some(u64::from(VALIDATOR_FORMAT_VERSION));
-            if matches {
-                if let Some(stored) = hit.get("normalized_request") {
-                    let stored_bytes = canonical_bytes(stored.clone());
-                    if sha256_hex(&stored_bytes) == request_hash {
-                        return Ok((stored_bytes, true));
-                    }
+            if matches && let Some(stored) = hit.get("normalized_request") {
+                let stored_bytes = canonical_bytes(stored.clone());
+                if sha256_hex(&stored_bytes) == request_hash {
+                    return Ok((stored_bytes, true));
                 }
             }
         }
@@ -149,6 +150,11 @@ impl HerdrCache {
     }
 
     /// Stores whole-set compatibility outcomes atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the cache root cannot be created or validated,
+    /// or when the entry cannot be written and synced.
     pub fn comparison_store(&self, key: &ComparisonKey, outcomes: &[bool]) -> std::io::Result<()> {
         self.ensure_root()?;
         let path = self.entry_path(COMPARISON_PREFIX, &key.hash());
@@ -170,6 +176,7 @@ pub struct ComparisonKey {
 }
 
 impl ComparisonKey {
+    #[must_use]
     pub fn hash(&self) -> String {
         sha256_hex(
             format!(
@@ -218,14 +225,16 @@ impl ComparisonKey {
 }
 
 /// Canonical hash of the effective native-request sequence: method names, wire field names
-/// (kebab-case YAML becomes snake_case wire names), literal JSON values, and typed context
+/// (kebab-case YAML becomes `snake_case` wire names), literal JSON values, and typed context
 /// references. The compiler supplies deterministic binding order, which is retained because
 /// cached outcomes are positional and must never be applied to a reordered configuration.
+#[must_use]
 pub fn hash_configured_requests(candidates: &[NativeActionCandidate]) -> String {
     hash_configured_candidate_iter(candidates.iter())
 }
 
 /// Equivalent whole-effective-set hash without cloning borrowed compiler candidates.
+#[must_use]
 pub fn hash_configured_request_refs(candidates: &[&NativeActionCandidate]) -> String {
     hash_configured_candidate_iter(candidates.iter().copied())
 }
@@ -256,9 +265,9 @@ fn canonical_config_value(value: &ConfigValue) -> Value {
         ConfigValueKind::Null => Value::Null,
         ConfigValueKind::Boolean(value) => Value::Bool(*value),
         ConfigValueKind::Integer(value) => Value::from(*value),
-        ConfigValueKind::Float(value) => serde_json::Number::from_f64(*value)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        ConfigValueKind::Float(value) => {
+            serde_json::Number::from_f64(*value).map_or(Value::Null, Value::Number)
+        }
         ConfigValueKind::String(value) => Value::String(value.clone()),
         ConfigValueKind::Context(reference) => serde_json::json!({
             "$context": reference.path.as_str(),
@@ -322,12 +331,11 @@ fn read_entry(path: &Path) -> Option<Value> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let metadata = fs::metadata(path).ok()?;
         if metadata.uid() != Uid::current().as_raw() {
             return None;
         }
-        use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
             return None;
         }
@@ -381,7 +389,10 @@ fn validate_owner_directory(path: &Path) -> std::io::Result<()> {
         if metadata.uid() != Uid::current().as_raw() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("Herdr cache root is not owned by the current user: {}", path.display()),
+                format!(
+                    "Herdr cache root is not owned by the current user: {}",
+                    path.display()
+                ),
             ));
         }
         // Exact owner-only enforcement: the root must be 0700, not merely closed to
@@ -389,7 +400,10 @@ fn validate_owner_directory(path: &Path) -> std::io::Result<()> {
         if metadata.permissions().mode() & 0o777 != 0o700 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("Herdr cache root is not owner-only (0700): {}", path.display()),
+                format!(
+                    "Herdr cache root is not owner-only (0700): {}",
+                    path.display()
+                ),
             ));
         }
     }
@@ -468,7 +482,10 @@ mod tests {
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| {
-                        name.starts_with(NORMALIZED_PREFIX) && name.ends_with(".json")
+                        name.starts_with(NORMALIZED_PREFIX)
+                            && std::path::Path::new(name)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
                     })
             })
             .unwrap();
@@ -496,7 +513,10 @@ mod tests {
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| {
-                        name.starts_with(NORMALIZED_PREFIX) && name.ends_with(".json")
+                        name.starts_with(NORMALIZED_PREFIX)
+                            && std::path::Path::new(name)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
                     })
             })
             .unwrap()
@@ -508,8 +528,7 @@ mod tests {
         let document = raw_document(20, 1, "same");
         let (first, _) = cache.normalized_schema(20, 1, &document).unwrap();
         let path = normalized_entry_path(&cache);
-        let mut entry: Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut entry: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         // Keep every key field but swap the stored representation: the next load
         // must detect the hash mismatch, recompute, and heal the entry.
         entry["normalized_request"] = serde_json::json!({"marker": "forged"});
@@ -528,12 +547,14 @@ mod tests {
         let document = raw_document(20, 1, "same");
         let (first, _) = cache.normalized_schema(20, 1, &document).unwrap();
         let path = normalized_entry_path(&cache);
-        let mut entry: Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut entry: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         entry.as_object_mut().unwrap().remove("normalized_request");
         fs::write(&path, entry.to_string().as_bytes()).unwrap();
         let (bytes, hit) = cache.normalized_schema(20, 1, &document).unwrap();
-        assert!(!hit, "entries without a stored representation must recompute");
+        assert!(
+            !hit,
+            "entries without a stored representation must recompute"
+        );
         assert_eq!(bytes, first);
         let (_, hit) = cache.normalized_schema(20, 1, &document).unwrap();
         assert!(hit);
@@ -553,7 +574,7 @@ mod tests {
         assert!(!hit, "symlinked entries must recompute, never be trusted");
         assert_eq!(bytes, first);
         assert!(
-            !fs::symlink_metadata(&normalized_entry_path(&cache))
+            !fs::symlink_metadata(normalized_entry_path(&cache))
                 .unwrap()
                 .file_type()
                 .is_symlink(),
@@ -583,14 +604,20 @@ mod tests {
         let link = temp.path().join("linked-root");
         std::os::unix::fs::symlink(temp.path(), &link).unwrap();
         assert!(
-            HerdrCache::new(&link).normalized_schema(20, 1, &raw_document(20, 1, "x")).is_err(),
+            HerdrCache::new(&link)
+                .normalized_schema(20, 1, &raw_document(20, 1, "x"))
+                .is_err(),
             "a symlinked cache root must fail closed"
         );
         let (_held, cache) = cache();
-        let _ = cache.normalized_schema(20, 1, &raw_document(20, 1, "x")).unwrap();
+        let _ = cache
+            .normalized_schema(20, 1, &raw_document(20, 1, "x"))
+            .unwrap();
         fs::set_permissions(&cache.root, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            cache.normalized_schema(20, 1, &raw_document(20, 1, "x")).is_err(),
+            cache
+                .normalized_schema(20, 1, &raw_document(20, 1, "x"))
+                .is_err(),
             "a non-0700 cache root must fail closed"
         );
     }

@@ -3,7 +3,7 @@ use std::{
     io::{self, Write},
 };
 
-use minijinja::{context, Environment, Error as MiniError, ErrorKind, UndefinedBehavior};
+use minijinja::{Environment, Error as MiniError, ErrorKind, UndefinedBehavior, context};
 use muxe_core::{Color, CompiledTheme, Style};
 use muxe_protocol::{ArchivedCompiledThemeWire, ArchivedStyleWire};
 use ratatui::style::{Color as RatatuiColor, Modifier, Style as RatatuiStyle};
@@ -83,12 +83,24 @@ pub struct TemplateRenderer {
 
 impl TemplateRenderer {
     /// Compiles a core theme once for the lifetime of its UI attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::MissingTemplate`] when a required component template is absent,
+    /// [`TemplateError::ForbiddenLoaderBackedConstruct`] when a template uses a loader-backed
+    /// construct, or [`TemplateError::Render`] when `MiniJinja` rejects a template.
     pub fn new(theme: &CompiledTheme) -> Result<Self, TemplateError> {
         Self::from_sources(|name| template_source(theme, name), resolve_styles(theme)?)
     }
 
     /// Compiles the resolved, checked theme embedded in a broker attachment without
     /// deserializing the attachment's menu graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::MissingTemplate`] when a required component template is absent,
+    /// [`TemplateError::ForbiddenLoaderBackedConstruct`] when a template uses a loader-backed
+    /// construct, or [`TemplateError::Render`] when `MiniJinja` rejects a template.
     pub fn from_archived(theme: &ArchivedCompiledThemeWire) -> Result<Self, TemplateError> {
         Self::from_sources(
             |name| archived_template_source(theme, name),
@@ -130,6 +142,12 @@ impl TemplateRenderer {
     }
 
     /// Renders a sanitized, title-limited cell before layout measures its visible text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::OutputTooLarge`] when the escaped input or rendered component
+    /// exceeds the component byte limit, or [`TemplateError::Render`] when `MiniJinja` rendering
+    /// fails.
     pub fn render_cell(&self, cell: CellTemplate<'_>) -> Result<RenderedText, TemplateError> {
         self.render(
             "cell",
@@ -142,6 +160,13 @@ impl TemplateRenderer {
         )
     }
 
+    /// Renders the breadcrumb trail for the current menu stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::OutputTooLarge`] when the escaped crumbs or rendered component
+    /// exceeds the component byte limit, or [`TemplateError::Render`] when `MiniJinja` rendering
+    /// fails.
     pub fn render_breadcrumbs(
         &self,
         breadcrumbs: BreadcrumbTemplate<'_>,
@@ -154,6 +179,13 @@ impl TemplateRenderer {
         self.render("breadcrumbs", context! { crumbs => crumbs })
     }
 
+    /// Renders the full pagination component for a multi-page menu.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::OutputTooLarge`] when the escaped keys or rendered component
+    /// exceeds the component byte limit, or [`TemplateError::Render`] when `MiniJinja` rendering
+    /// fails.
     pub fn render_pagination_full(
         &self,
         pagination: PaginationTemplate<'_>,
@@ -161,6 +193,13 @@ impl TemplateRenderer {
         self.render_pagination("pagination.full", pagination)
     }
 
+    /// Renders the short pagination component when the full one does not fit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::OutputTooLarge`] when the escaped keys or rendered component
+    /// exceeds the component byte limit, or [`TemplateError::Render`] when `MiniJinja` rendering
+    /// fails.
     pub fn render_pagination_short(
         &self,
         pagination: PaginationTemplate<'_>,
@@ -168,6 +207,13 @@ impl TemplateRenderer {
         self.render_pagination("pagination.short", pagination)
     }
 
+    /// Renders the status line for a recoverable broker diagnostic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::OutputTooLarge`] when the escaped status or rendered component
+    /// exceeds the component byte limit, or [`TemplateError::Render`] when `MiniJinja` rendering
+    /// fails.
     pub fn render_status(&self, status: StatusTemplate<'_>) -> Result<RenderedText, TemplateError> {
         self.render(
             "status",
@@ -222,11 +268,16 @@ impl TemplateRenderer {
         render_result.map_err(|error| TemplateError::Render(error.to_string()))?;
         let rendered = String::from_utf8(writer.bytes)
             .map_err(|error| TemplateError::Render(error.to_string()))?;
-        parse_style_markup(&rendered, &self.styles)
+        Ok(parse_style_markup(&rendered, &self.styles))
     }
 }
 
 /// Escapes text that could otherwise be interpreted as style markup or a control character.
+///
+/// # Errors
+///
+/// Returns [`TemplateError::OutputTooLarge`] when the escaped text exceeds the component byte
+/// limit, or [`TemplateError::Render`] when the escaped bytes are not valid UTF-8.
 pub fn escape_markup_text(value: &str) -> Result<String, TemplateError> {
     let mut output = BoundedWriter::new();
 
@@ -432,10 +483,7 @@ fn resolve_archived_color_inner(
     resolve_archived_color_inner(theme, value.value.as_str(), seen)
 }
 
-fn parse_style_markup(
-    rendered: &str,
-    styles: &BTreeMap<String, RatatuiStyle>,
-) -> Result<RenderedText, TemplateError> {
+fn parse_style_markup(rendered: &str, styles: &BTreeMap<String, RatatuiStyle>) -> RenderedText {
     let mut spans = Vec::new();
     let mut plain = String::new();
     let mut stack: Vec<(String, RatatuiStyle)> = Vec::new();
@@ -486,7 +534,7 @@ fn parse_style_markup(
         &mut text,
         stack.last().map(|(_, style)| *style),
     );
-    Ok(RenderedText { plain, spans })
+    RenderedText { plain, spans }
 }
 
 fn flush_span(
@@ -512,16 +560,16 @@ fn flush_span(
     text.clear();
 }
 
-fn rpad_filter(value: String, width: usize, pad: Option<String>) -> Result<String, MiniError> {
+fn rpad_filter(value: &str, width: usize, pad: Option<String>) -> Result<String, MiniError> {
     pad_filter(value, width, pad, false)
 }
 
-fn lpad_filter(value: String, width: usize, pad: Option<String>) -> Result<String, MiniError> {
+fn lpad_filter(value: &str, width: usize, pad: Option<String>) -> Result<String, MiniError> {
     pad_filter(value, width, pad, true)
 }
 
 fn pad_filter(
-    value: String,
+    value: &str,
     width: usize,
     pad: Option<String>,
     left: bool,
@@ -534,7 +582,7 @@ fn pad_filter(
     if pad_width == 0 {
         return Err(filter_error("padding string has zero display width"));
     }
-    let value = truncate_to_width(&value, width);
+    let value = truncate_to_width(value, width);
     let missing = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
     let padding = repeat_to_width(&pad, missing)?;
     let mut output = String::with_capacity(value.len() + padding.len());
@@ -551,18 +599,18 @@ fn pad_filter(
     Ok(output)
 }
 
-fn ellipsis_filter(value: String, width: usize) -> Result<String, MiniError> {
+fn ellipsis_filter(value: &str, width: usize) -> Result<String, MiniError> {
     if width > MAX_COMPONENT_BYTES {
         return Err(filter_error("ellipsis width exceeds the component limit"));
     }
-    let output = ellipsize(&value, width);
+    let output = ellipsize(value, width);
     if output.len() > MAX_COMPONENT_BYTES {
         return Err(filter_error("ellipsis output exceeds the component limit"));
     }
     Ok(output)
 }
 
-fn style_filter(value: String, name: String) -> Result<String, MiniError> {
+fn style_filter(value: &str, name: &str) -> Result<String, MiniError> {
     let output = format!("[{name}]{value}[/{name}]");
     if output.len() > MAX_COMPONENT_BYTES {
         return Err(filter_error("style output exceeds the component limit"));
@@ -713,7 +761,7 @@ mod tests {
     fn cell_values_cannot_create_style_markup() {
         let renderer = TemplateRenderer::new(&theme_with_templates("{{ key }} {{ title }}"))
             .expect("theme compiles");
-        let rendered = renderer
+        let cell = renderer
             .render_cell(CellTemplate {
                 key: "[hotkey]x[/hotkey]",
                 title: "line\u{0007} one",
@@ -722,7 +770,7 @@ mod tests {
                 max_title_width: 24,
             })
             .expect("cell renders");
-        assert_eq!(rendered.plain, "[hotkey]x[/hotkey] line one");
+        assert_eq!(cell.plain, "[hotkey]x[/hotkey] line one");
     }
 
     #[test]
@@ -739,12 +787,11 @@ mod tests {
                 ("pagination.short", "{{ pages.current }}/{{ pages.count }}"),
                 ("status", "registered component"),
             ]);
-            let error = match TemplateRenderer::from_sources(
+            let Err(error) = TemplateRenderer::from_sources(
                 |name| templates.get(name).copied(),
                 BTreeMap::new(),
-            ) {
-                Ok(_) => panic!("loader-backed `{source}` must be rejected"),
-                Err(error) => error,
+            ) else {
+                panic!("loader-backed `{source}` must be rejected")
             };
             assert!(matches!(
                 error,

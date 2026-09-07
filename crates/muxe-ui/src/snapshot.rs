@@ -20,6 +20,11 @@ pub enum SnapshotError {
 
 impl ArchivedUiSnapshot {
     /// Retains a checked `UiAttached` archive for borrowed menu traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::Decode`] when the frame bytes fail to decode, or
+    /// [`SnapshotError::NotUiAttached`] when the frame is not a UI attachment response.
     pub fn new(frame: ArchivedFrame) -> Result<Self, SnapshotError> {
         let archived = frame.archived()?;
         match archived {
@@ -32,6 +37,11 @@ impl ArchivedUiSnapshot {
     }
     /// Calls `visit` with the checked attachment archive. The menu graph remains borrowed from
     /// the retained frame for its entire use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::Decode`] when the retained frame fails to decode, or
+    /// [`SnapshotError::NotUiAttached`] when the retained frame is not a UI attachment response.
     pub fn with_attachment<T>(
         &self,
         visit: impl FnOnce(&ArchivedUiAttachmentWire) -> T,
@@ -47,6 +57,11 @@ impl ArchivedUiSnapshot {
     }
 
     /// Returns the checked attachment archive for one borrowed traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::Decode`] when the retained frame fails to decode, or
+    /// [`SnapshotError::NotUiAttached`] when the retained frame is not a UI attachment response.
     pub fn attachment(&self) -> Result<&ArchivedUiAttachmentWire, SnapshotError> {
         let archived = self.frame.archived()?;
         match archived {
@@ -59,6 +74,11 @@ impl ArchivedUiSnapshot {
     }
 
     /// Returns the attached UI session ID without deserializing the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::Decode`] when the retained frame fails to decode, or
+    /// [`SnapshotError::NotUiAttached`] when the retained frame is not a UI attachment response.
     pub fn session_id(&self) -> Result<&str, SnapshotError> {
         let archived = self.frame.archived()?;
         match archived {
@@ -71,6 +91,7 @@ impl ArchivedUiSnapshot {
     }
 
     /// Returns the retained transport frame for callers that need its bytes for diagnostics.
+    #[must_use]
     pub fn frame(&self) -> &ArchivedFrame {
         &self.frame
     }

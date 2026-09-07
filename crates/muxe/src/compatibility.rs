@@ -1,25 +1,9 @@
-//! Embedded compatibility record and native asset verification.
+//! Embedded compatibility record and native WASM asset verification.
 //!
-//! Takes over the partial `compatibility` behavior previously inline in
-//! `main.rs`: the target triple now comes from the build environment
-//! (`MUXE_TARGET_TRIPLE`, derived from `TARGET` by `crates/muxe/build.rs`),
-//! and the record is the typed `muxe_protocol::control::CompatibilityRecord`
-//! shared with the activation handshake.
-//!
-//! # Blocked bridge digest
-//!
-//! The typed record intentionally carries no loaded-artifact digest: the host
-//! API cannot attest the bytes it loaded, so a bridge self-reported artifact
-//! hash is unavailable. That design decision is still awaiting the user
-//! (DESIGN 2074 conflict) and this module finalizes no alternative schema.
-//!
-//! What *is* implemented here is one-sided native verification: the SHA-256
-//! digest of the packaged `lib/muxe/muxe-zellij.wasm` bytes is checked at
-//! install/activation time and recorded in the integration receipt and the
-//! activation journal. The missing piece — a bridge-registration digest
-//! reported back through the host channel — is represented explicitly as
-//! [`BridgeRegistrationDigest::Blocked`], never as a fabricated value, and
-//! release metadata must not be claimed complete while it is blocked.
+//! The native record carries the shared pre-link bridge build identity for
+//! registration compatibility. The separately producer-provided
+//! `wasm_sha256` remains the trusted local package identity; the pinned host
+//! API cannot attest the bytes it loaded.
 
 use muxe_protocol::control::{CompatibilityRecord, HerdrCompatibility, ZellijCompatibility};
 use serde_json::{Value, json};
@@ -68,31 +52,10 @@ fn herdr_schema_fingerprint() -> Result<muxe_protocol::SchemaFingerprint, Compat
     Ok(fingerprint)
 }
 
-/// The state of the bridge-registration digest.
-///
-/// `Blocked` names the missing prerequisite: the host channel has no way for
-/// the running bridge to attest its own bytes, so no complete release
-/// metadata can be claimed until the DESIGN 2074 decision lands.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BridgeRegistrationDigest {
-    Blocked { reason: &'static str },
-}
-
-impl BridgeRegistrationDigest {
-    /// The current state: blocked on the user-approved digest design.
-    #[must_use]
-    pub const fn current() -> Self {
-        Self::Blocked {
-            reason: "bridge cannot self-report its artifact hash through the host API; awaiting digest design decision",
-        }
-    }
-}
-
 /// Native package identity for the bridge bytes distributed with this binary.
 ///
-/// This proves only the local package-to-install relationship. It is distinct
-/// from [`BridgeRegistrationDigest`], which remains blocked until a host can
-/// attest what it actually loaded.
+/// This proves only the local package-to-install relationship. The separate
+/// `bridge_build_id` identifies expected bridge registration compatibility.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PackagedWasmArtifact {
     Verified { sha256: [u8; 32] },
@@ -110,8 +73,6 @@ pub struct NativeCompatibilityRecord {
     pub herdr_verified_methods: &'static [&'static str],
     /// Producer-attested identity of the bridge package distributed beside us.
     pub packaged_wasm: PackagedWasmArtifact,
-    /// Still-blocked evidence for the bytes a live host loaded.
-    pub bridge_registration: BridgeRegistrationDigest,
 }
 
 fn packaged_wasm_artifact() -> Result<PackagedWasmArtifact, CompatibilityError> {
@@ -166,6 +127,7 @@ pub fn embedded_record() -> Result<NativeCompatibilityRecord, CompatibilityError
                     muxe_zellij_protocol::compat::generated_action_fingerprint(),
                 bridge_protocol_fingerprint:
                     muxe_zellij_protocol::compat::bridge_protocol_fingerprint(),
+                bridge_build_id: Some(muxe_zellij_protocol::compat::bridge_build_id()),
             }),
             herdr: Some(HerdrCompatibility {
                 protocol_version: u32::try_from(protocol)
@@ -177,21 +139,14 @@ pub fn embedded_record() -> Result<NativeCompatibilityRecord, CompatibilityError
         },
         herdr_verified_methods: muxe_adapter_herdr::VERIFIED_HERDR_METHODS,
         packaged_wasm: packaged_wasm_artifact()?,
-        bridge_registration: BridgeRegistrationDigest::current(),
     })
 }
 
-/// Native-side verification of the packaged bridge bytes.
-///
-/// This is one half of the digest story: it proves the bytes being installed
-/// match the release's recorded digest. It says nothing about which bytes a
-/// live host actually loaded; that half remains [`BridgeRegistrationDigest::Blocked`].
+/// Native-side verification of the packaged WASM bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeAssetVerification {
     /// SHA-256 of the packaged `lib/muxe/muxe-zellij.wasm` bytes.
     pub packaged_digest: String,
-    /// Registration half: always blocked, never fabricated.
-    pub registration: BridgeRegistrationDigest,
 }
 
 #[derive(Debug, Error)]
@@ -236,7 +191,6 @@ pub fn verify_packaged_asset(
     }
     Ok(NativeAssetVerification {
         packaged_digest: found,
-        registration: BridgeRegistrationDigest::current(),
     })
 }
 
@@ -295,11 +249,8 @@ pub fn render_human(record: &NativeCompatibilityRecord) -> String {
 /// Renders the stable `snake_case` JSON compatibility report.
 ///
 /// `packaged_wasm.sha256` is the producer-provided identity of local bridge
-/// bytes. `bridge_registration_digest` remains null because it would claim
-/// host-loaded-byte evidence that the protocol cannot obtain.
-/// `hosts.herdr.verified_methods` carries the adapter's authoritative
-/// exercised-method set in stable constant order, next to the normalized
-/// schema fingerprint.
+/// bytes. `hosts.zellij.bridge_build_id` is the shared pre-link compatibility
+/// identity; it is not a loaded-byte attestation.
 #[must_use]
 pub fn render_json(record: &NativeCompatibilityRecord) -> Value {
     let handoff = &record.handoff;
@@ -311,6 +262,7 @@ pub fn render_json(record: &NativeCompatibilityRecord) -> Value {
             "source_revision": zellij.source_revision,
             "generated_action_fingerprint": hex_lower(&zellij.generated_action_fingerprint.0),
             "bridge_protocol_fingerprint": hex_lower(&zellij.bridge_protocol_fingerprint.0),
+            "bridge_build_id": zellij.bridge_build_id.map(|id| hex_lower(&id.0)),
         })
     });
     let herdr = handoff.herdr.as_ref().map(|herdr| {
@@ -345,10 +297,6 @@ pub fn render_json(record: &NativeCompatibilityRecord) -> Value {
             "herdr": herdr,
         },
         "packaged_wasm": packaged_wasm,
-        "bridge_registration_digest": null,
-        "bridge_registration_blocked_reason": match &record.bridge_registration {
-            BridgeRegistrationDigest::Blocked { reason } => reason,
-        },
     })
 }
 
@@ -396,8 +344,10 @@ mod tests {
             rendered["packaged_wasm"]["sha256"],
             json!(verified.packaged_digest)
         );
-        assert!(rendered["packaged_wasm"]["unavailable_reason"].is_null());
-        assert!(rendered["bridge_registration_digest"].is_null());
+        assert_eq!(
+            rendered["hosts"]["zellij"]["bridge_build_id"],
+            muxe_zellij_protocol::compat::bridge_build_id_hex(),
+        );
         let mut tampered = bytes;
         tampered[64] ^= 0x01;
         assert!(matches!(

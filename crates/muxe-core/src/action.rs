@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::config::{ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError};
 use crate::context::OriginContext;
 use crate::diagnostic::SourceSpan;
-use crate::key::CanonicalKey;
 use crate::execution::{ExecutionCapabilities, ExecutionMode};
+use crate::key::CanonicalKey;
 
 /// Flat action discriminator accepted by the v1 compiler.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -17,9 +17,14 @@ impl ActionKind {
     pub fn parse(value: &str) -> Option<Self> {
         PortableActionKind::parse(value)
             .map(Self::Portable)
-            .or_else(|| value.starts_with("native.").then(|| Self::Native(value.to_owned())))
+            .or_else(|| {
+                value
+                    .starts_with("native.")
+                    .then(|| Self::Native(value.to_owned()))
+            })
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
             Self::Portable(kind) => kind.as_str(),
@@ -102,6 +107,7 @@ impl PortableActionKind {
         Self::SessionKill,
     ];
 
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MenuOpen => "menu:open",
@@ -140,8 +146,12 @@ impl PortableActionKind {
         }
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|kind| kind.as_str() == value)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.as_str() == value)
     }
 }
 
@@ -156,12 +166,19 @@ pub struct PortableActionDescriptor {
 }
 
 impl PortableActionKind {
+    #[must_use]
     pub const fn descriptor(self) -> PortableActionDescriptor {
         let (parameter_syntax, default_execution, capabilities) = match self {
-            Self::MenuOpen => ("menu=<id> or submenu=<menu>", None, ExecutionCapabilities::SYNCHRONOUS),
-            Self::MenuReturn | Self::MenuQuit | Self::MenuPagePrev | Self::MenuPageNext | Self::ConfigReload => {
-                ("none", None, ExecutionCapabilities::SYNCHRONOUS)
-            }
+            Self::MenuOpen => (
+                "menu=<id> or submenu=<menu>",
+                None,
+                ExecutionCapabilities::SYNCHRONOUS,
+            ),
+            Self::MenuReturn
+            | Self::MenuQuit
+            | Self::MenuPagePrev
+            | Self::MenuPageNext
+            | Self::ConfigReload => ("none", None, ExecutionCapabilities::SYNCHRONOUS),
             Self::KeyboardSend => (
                 "exactly one of keys=[<canonical-key or $context>, …] or text=<string or $context>",
                 Some(ExecutionMode::Await),
@@ -170,27 +187,75 @@ impl PortableActionKind {
             Self::CommandExecute => (
                 "program=<string or $context>; args=[<string or $context>, …]?; cwd=<path or $context>?; env={<string>: <string or $context>}?",
                 Some(ExecutionMode::Detach),
-                ExecutionCapabilities { awaitable: true, detachable: true, cancellable: true },
+                ExecutionCapabilities {
+                    awaitable: true,
+                    detachable: true,
+                    cancellable: true,
+                },
             ),
-            Self::TabClose | Self::PaneCreate | Self::PaneClose | Self::SessionCreate | Self::SessionDetach | Self::SessionQuit | Self::SessionKill => {
-                ("none", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS)
-            }
-            Self::TabCreate => ("workspace-id=<string or $context>?", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS),
-            Self::TabRename => ("name=<string or $context>?", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS),
-            Self::TabFocus | Self::TabMove | Self::TabSwap | Self::PaneFocus | Self::PaneMove | Self::PaneSwap => {
-                ("exactly one of index=<non-negative integer or $context> or direction=<direction or $context>", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS)
-            }
-            Self::PaneSplit => ("direction=<direction or $context>?", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS),
-            Self::PaneResize => ("direction=<direction or $context>; amount=<scalar or $context>?", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS),
-            Self::PaneZoom | Self::PaneFullscreen | Self::PaneFloating => {
-                ("enabled=<boolean>?", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS)
-            }
-            Self::PaneFrame => ("visible=<boolean>?", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS),
-            Self::SessionAttach | Self::SessionSwitch | Self::SessionRename => {
-                ("name=<string or $context>", Some(ExecutionMode::Await), ExecutionCapabilities::ASYNCHRONOUS)
-            }
+            Self::TabClose
+            | Self::PaneCreate
+            | Self::PaneClose
+            | Self::SessionCreate
+            | Self::SessionDetach
+            | Self::SessionQuit
+            | Self::SessionKill => (
+                "none",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
+            Self::TabCreate => (
+                "workspace-id=<string or $context>?",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
+            Self::TabRename => (
+                "name=<string or $context>?",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
+            Self::TabFocus
+            | Self::TabMove
+            | Self::TabSwap
+            | Self::PaneFocus
+            | Self::PaneMove
+            | Self::PaneSwap => (
+                "exactly one of index=<non-negative integer or $context> or direction=<direction or $context>",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
+            Self::PaneSplit => (
+                "direction=<direction or $context>?",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
+            Self::PaneResize => (
+                "direction=<direction or $context>; amount=<scalar or $context>?",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
+            Self::PaneZoom | Self::PaneFullscreen | Self::PaneFloating => (
+                "enabled=<boolean>?",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
+            Self::PaneFrame => (
+                "visible=<boolean>?",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
+            Self::SessionAttach | Self::SessionSwitch | Self::SessionRename => (
+                "name=<string or $context>",
+                Some(ExecutionMode::Await),
+                ExecutionCapabilities::ASYNCHRONOUS,
+            ),
         };
-        PortableActionDescriptor { kind: self, parameter_syntax, default_execution, capabilities }
+        PortableActionDescriptor {
+            kind: self,
+            parameter_syntax,
+            default_execution,
+            capabilities,
+        }
     }
 }
 
@@ -212,10 +277,16 @@ pub struct ActionScalar {
 }
 
 impl ActionScalar {
+    #[must_use]
     pub fn new(value: ConfigValue) -> Self {
         Self { value }
     }
 
+    /// Resolves a context scalar or reports the unavailable origin field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the referenced origin context is unavailable.
     pub fn resolve_context(&self, origin: &OriginContext) -> Result<Self, ContextResolutionError> {
         Ok(Self {
             value: self.value.resolve_context(origin)?,
@@ -277,16 +348,29 @@ pub enum TabAction {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaneAction {
     Create,
-    Split { direction: Option<ActionScalar> },
+    Split {
+        direction: Option<ActionScalar>,
+    },
     Close,
     Focus(IndexOrDirection),
     Move(IndexOrDirection),
     Swap(IndexOrDirection),
-    Resize { direction: ActionScalar, amount: Option<ActionScalar> },
-    Zoom { enabled: Option<ActionScalar> },
-    Fullscreen { enabled: Option<ActionScalar> },
-    Floating { enabled: Option<ActionScalar> },
-    Frame { visible: Option<ActionScalar> },
+    Resize {
+        direction: ActionScalar,
+        amount: Option<ActionScalar>,
+    },
+    Zoom {
+        enabled: Option<ActionScalar>,
+    },
+    Fullscreen {
+        enabled: Option<ActionScalar>,
+    },
+    Floating {
+        enabled: Option<ActionScalar>,
+    },
+    Frame {
+        visible: Option<ActionScalar>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -312,6 +396,7 @@ pub enum PortableAction {
 }
 
 impl PortableAction {
+    #[must_use]
     pub const fn kind(&self) -> PortableActionKind {
         match self {
             Self::Menu(MenuAction::Open(_)) => PortableActionKind::MenuOpen,
@@ -363,6 +448,14 @@ pub enum PortableActionResolutionError {
 impl PortableAction {
     /// Resolves every portable scalar against the immutable attach-time origin and validates the
     /// resulting concrete values before an adapter can observe or dispatch the action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required origin field is unavailable or a resolved scalar is invalid.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the closed portable action registry stays co-located with its context validation"
+    )]
     pub fn resolve_context(
         &self,
         origin: &OriginContext,
@@ -421,7 +514,12 @@ impl PortableAction {
                         Ok((name.clone(), value))
                     })
                     .collect::<Result<_, PortableActionResolutionError>>()?;
-                Self::Command(CommandAction { program, args, cwd, env })
+                Self::Command(CommandAction {
+                    program,
+                    args,
+                    cwd,
+                    env,
+                })
             }
             Self::Tab(TabAction::Create { workspace_id }) => {
                 let workspace_id = workspace_id
@@ -439,18 +537,31 @@ impl PortableAction {
                 let name = resolve_optional_string(name.as_ref(), origin, "tab.name")?;
                 Self::Tab(TabAction::Rename { name })
             }
-            Self::Tab(TabAction::Focus(target)) => Self::Tab(TabAction::Focus(resolve_target(target, origin)?)),
-            Self::Tab(TabAction::Move(target)) => Self::Tab(TabAction::Move(resolve_target(target, origin)?)),
-            Self::Tab(TabAction::Swap(target)) => Self::Tab(TabAction::Swap(resolve_target(target, origin)?)),
+            Self::Tab(TabAction::Focus(target)) => {
+                Self::Tab(TabAction::Focus(resolve_target(target, origin)?))
+            }
+            Self::Tab(TabAction::Move(target)) => {
+                Self::Tab(TabAction::Move(resolve_target(target, origin)?))
+            }
+            Self::Tab(TabAction::Swap(target)) => {
+                Self::Tab(TabAction::Swap(resolve_target(target, origin)?))
+            }
             Self::Pane(PaneAction::Create) => Self::Pane(PaneAction::Create),
             Self::Pane(PaneAction::Split { direction }) => {
-                let direction = resolve_optional_direction(direction.as_ref(), origin, "pane.direction")?;
+                let direction =
+                    resolve_optional_direction(direction.as_ref(), origin, "pane.direction")?;
                 Self::Pane(PaneAction::Split { direction })
             }
             Self::Pane(PaneAction::Close) => Self::Pane(PaneAction::Close),
-            Self::Pane(PaneAction::Focus(target)) => Self::Pane(PaneAction::Focus(resolve_target(target, origin)?)),
-            Self::Pane(PaneAction::Move(target)) => Self::Pane(PaneAction::Move(resolve_target(target, origin)?)),
-            Self::Pane(PaneAction::Swap(target)) => Self::Pane(PaneAction::Swap(resolve_target(target, origin)?)),
+            Self::Pane(PaneAction::Focus(target)) => {
+                Self::Pane(PaneAction::Focus(resolve_target(target, origin)?))
+            }
+            Self::Pane(PaneAction::Move(target)) => {
+                Self::Pane(PaneAction::Move(resolve_target(target, origin)?))
+            }
+            Self::Pane(PaneAction::Swap(target)) => {
+                Self::Pane(PaneAction::Swap(resolve_target(target, origin)?))
+            }
             Self::Pane(PaneAction::Resize { direction, amount }) => {
                 let direction = resolve_scalar(direction, origin)?;
                 ensure_direction(&direction, "pane.direction")?;
@@ -574,11 +685,13 @@ fn resolve_optional_bool(
 
 fn ensure_key(scalar: &ActionScalar) -> Result<(), PortableActionResolutionError> {
     let value = ensure_string(scalar, "keyboard.keys")?;
-    CanonicalKey::parse(value).map(|_| ()).map_err(|error| invalid_value(
-        scalar,
-        "keyboard.keys",
-        format!("invalid canonical key: {error}"),
-    ))
+    CanonicalKey::parse(value).map(|_| ()).map_err(|error| {
+        invalid_value(
+            scalar,
+            "keyboard.keys",
+            format!("invalid canonical key: {error}"),
+        )
+    })
 }
 
 fn ensure_direction(
@@ -640,7 +753,10 @@ fn ensure_non_null_scalar(
 ) -> Result<(), PortableActionResolutionError> {
     (!matches!(
         scalar.value.kind,
-        ConfigValueKind::Null | ConfigValueKind::Mapping(_) | ConfigValueKind::Sequence(_) | ConfigValueKind::Context(_)
+        ConfigValueKind::Null
+            | ConfigValueKind::Mapping(_)
+            | ConfigValueKind::Sequence(_)
+            | ConfigValueKind::Context(_)
     ))
     .then_some(())
     .ok_or_else(|| invalid_value(scalar, parameter, "value must be a non-null scalar"))
@@ -668,16 +784,20 @@ pub struct NativeActionCandidate {
     pub fields: Vec<ConfigField>,
 }
 impl NativeActionCandidate {
+    #[must_use]
     pub fn field(&self, name: &str) -> Option<&ConfigValue> {
-        self.fields.iter().find_map(|field| (field.name == name).then_some(&field.value))
+        self.fields
+            .iter()
+            .find_map(|field| (field.name == name).then_some(&field.value))
     }
 
     /// Resolves typed `$context` markers against the immutable attach-time origin immediately
     /// before native dispatch. The returned candidate contains no context marker.
-    pub fn resolve_context(
-        &self,
-        origin: &OriginContext,
-    ) -> Result<Self, ContextResolutionError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a referenced origin context field is unavailable.
+    pub fn resolve_context(&self, origin: &OriginContext) -> Result<Self, ContextResolutionError> {
         Ok(Self {
             type_name: self.type_name.clone(),
             type_span: self.type_span.clone(),
@@ -703,6 +823,7 @@ pub enum ActionSpec {
 }
 
 impl ActionSpec {
+    #[must_use]
     pub fn kind(&self) -> ActionKind {
         match self {
             Self::Portable(action) => ActionKind::Portable(action.kind()),

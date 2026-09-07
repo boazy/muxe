@@ -21,8 +21,7 @@
 //! reports both digests and requires the user to resolve the file.
 
 use std::{
-    fs,
-    io,
+    fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -95,6 +94,10 @@ pub enum Eligibility {
 ///
 /// Symlinks are never followed: eligibility requires a regular file or an
 /// absent path. Ownership and digest are re-validated at commit time.
+///
+/// # Errors
+///
+/// Returns [`BridgeError`] when the destination is unsafe, foreign, untracked, or unreadable.
 pub fn check_destination(
     stable: &Path,
     receipt_digest: Option<&str>,
@@ -106,9 +109,8 @@ pub fn check_destination(
                     path: stable.to_path_buf(),
                 });
             }
-            let current = fs::read(stable).map_err(|source| {
-                fsutil::io_error("reading installed bridge", stable, source)
-            })?;
+            let current = fs::read(stable)
+                .map_err(|source| fsutil::io_error("reading installed bridge", stable, source))?;
             let found = fsutil::sha256_hex(&current);
             match receipt_digest {
                 Some(expected) if found == expected => Ok((
@@ -128,9 +130,7 @@ pub fn check_destination(
                 }),
             }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok((Eligibility::Absent, None))
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((Eligibility::Absent, None)),
         Err(source) => Err(BridgeError::Fs(fsutil::io_error(
             "reading installed bridge",
             stable,
@@ -141,6 +141,10 @@ pub fn check_destination(
 
 /// Stages `bytes` beside `stable` through owner-only creation and verifies the
 /// staged digest before returning the staging path.
+///
+/// # Errors
+///
+/// Returns [`BridgeError`] when the staging directory, file creation, digest verification, or sync fails.
 pub fn stage(stable: &Path, bytes: &[u8]) -> Result<PathBuf, BridgeError> {
     let directory = stable.parent().filter(|p| !p.as_os_str().is_empty());
     let directory = directory.ok_or_else(|| {
@@ -167,16 +171,15 @@ pub fn stage(stable: &Path, bytes: &[u8]) -> Result<PathBuf, BridgeError> {
         if found != expected {
             return Err(BridgeError::StagedDigestChanged { expected, found });
         }
-        fs::set_permissions(&staging, fs::Permissions::from_mode(BRIDGE_FILE_MODE)).map_err(
-            |source| fsutil::io_error("locking staged bridge mode", &staging, source),
-        )?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(BRIDGE_FILE_MODE))
+            .map_err(|source| fsutil::io_error("locking staged bridge mode", &staging, source))?;
         fsutil::sync_dir(directory)?;
         Ok(staging.clone())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&staging);
     }
-    Ok(result?)
+    result
 }
 
 /// Owner-verified backup record.
@@ -194,8 +197,11 @@ pub struct Backup {
 /// copy is replaced only under receipt-and-journal authority: `authority`
 /// must be `Some` recorded digest matching the copy on disk, otherwise the
 /// prior rollback copy survives untouched and this call fails.
+///
+/// # Errors
+///
+/// Returns [`BridgeError`] when the destination is unsafe, the prior copy is protected, or the backup cannot be verified.
 pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeError> {
-
     let previous = previous_path(stable);
     if let Ok(metadata) = fs::symlink_metadata(&previous) {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -219,7 +225,7 @@ pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeEr
             }
             None => {
                 return Err(BridgeError::PreviousProtected {
-                    path: previous.clone(),
+                    path: previous,
                     recorded: "<no recorded digest>".to_owned(),
                     found,
                 });
@@ -229,31 +235,30 @@ pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeEr
     let stable_bytes = fs::read(stable)
         .map_err(|source| fsutil::io_error("reading old bridge", stable, source))?;
     let digest = fsutil::sha256_hex(&stable_bytes);
-    match fs::hard_link(stable, &previous) {
-        Ok(()) => {}
-        Err(_) => {
-            // Cross-device or unsupported: fall back to a synced byte copy.
-            let (staging, mut file) =
-                fsutil::create_staging_file(previous_parent(&previous), "muxe-zellij.wasm.previous", "backup")?;
-            let result = (|| {
-                use std::io::Write;
-                file.write_all(&stable_bytes).map_err(|source| {
-                    fsutil::io_error("writing rollback copy", &staging, source)
-                })?;
-                file.sync_all().map_err(|source| {
-                    fsutil::io_error("synchronizing rollback copy", &staging, source)
-                })?;
-                drop(file);
-                fs::rename(&staging, &previous).map_err(|source| {
-                    fsutil::io_error("installing rollback copy", &previous, source)
-                })?;
-                fsutil::sync_dir_of(&previous)
-            })();
-            if result.is_err() {
-                let _ = fs::remove_file(&staging);
-            }
-            result?;
+    if fs::hard_link(stable, &previous).is_err() {
+        // Cross-device or unsupported: fall back to a synced byte copy.
+        let (staging, mut file) = fsutil::create_staging_file(
+            previous_parent(&previous),
+            "muxe-zellij.wasm.previous",
+            "backup",
+        )?;
+        let result = (|| {
+            use std::io::Write;
+            file.write_all(&stable_bytes)
+                .map_err(|source| fsutil::io_error("writing rollback copy", &staging, source))?;
+            file.sync_all().map_err(|source| {
+                fsutil::io_error("synchronizing rollback copy", &staging, source)
+            })?;
+            drop(file);
+            fs::rename(&staging, &previous).map_err(|source| {
+                fsutil::io_error("installing rollback copy", &previous, source)
+            })?;
+            fsutil::sync_dir_of(&previous)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&staging);
         }
+        result?;
     }
     // Owner-verified: the backup must digest identically, however it was made.
     let backed = fs::read(&previous)
@@ -271,23 +276,72 @@ pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeEr
         digest,
     })
 }
+/// Verifies an existing rollback copy without mutating it.
+///
+/// A present `.previous` is usable only when the integration receipt records
+/// its exact digest. Global activation preflight calls this before preparing
+/// any broker, so a foreign rollback artifact cannot trigger host mutation.
+///
+/// # Errors
+///
+/// Returns [`BridgeError`] when the rollback path is unsafe, unreadable, or
+/// does not match the receipt-authorized digest.
+pub fn check_previous(stable: &Path, authority: Option<&str>) -> Result<(), BridgeError> {
+    let previous = previous_path(stable);
+    let metadata = match fs::symlink_metadata(&previous) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(BridgeError::Fs(fsutil::io_error(
+                "reading rollback copy metadata",
+                &previous,
+                source,
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(BridgeError::UnsafeDestination { path: previous });
+    }
+    let bytes = fs::read(&previous)
+        .map_err(|source| fsutil::io_error("reading rollback copy", &previous, source))?;
+    let found = fsutil::sha256_hex(&bytes);
+    match authority {
+        Some(recorded) if recorded == found => Ok(()),
+        Some(recorded) => Err(BridgeError::PreviousProtected {
+            path: previous,
+            recorded: recorded.to_owned(),
+            found,
+        }),
+        None => Err(BridgeError::PreviousProtected {
+            path: previous,
+            recorded: "<no recorded digest>".to_owned(),
+            found,
+        }),
+    }
+}
 
 /// Idempotent backup: reuses the existing rollback copy when it already
 /// preserves the current stable bytes (a retried transaction), otherwise
 /// creates one under receipt-and-journal authority.
+///
+/// # Errors
+///
+/// Returns [`BridgeError`] when the stable bytes cannot be read or the backup cannot be created.
 pub fn ensure_backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeError> {
-    let stable_bytes =
-        fs::read(stable).map_err(|source| fsutil::io_error("reading old bridge", stable, source))?;
+    let stable_bytes = fs::read(stable)
+        .map_err(|source| fsutil::io_error("reading old bridge", stable, source))?;
     let digest = fsutil::sha256_hex(&stable_bytes);
     let previous = previous_path(stable);
-    if let Ok(metadata) = fs::symlink_metadata(&previous) {
-        if metadata.is_file() && !metadata.file_type().is_symlink() {
-            if let Ok(existing) = fs::read(&previous) {
-                if fsutil::sha256_hex(&existing) == digest {
-                    return Ok(Backup { path: previous, digest });
-                }
-            }
-        }
+    if let Ok(metadata) = fs::symlink_metadata(&previous)
+        && metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && let Ok(existing) = fs::read(&previous)
+        && fsutil::sha256_hex(&existing) == digest
+    {
+        return Ok(Backup {
+            path: previous,
+            digest,
+        });
     }
     backup(stable, authority)
 }
@@ -302,6 +356,10 @@ fn previous_parent(previous: &Path) -> &Path {
 /// regular owner-owned file (never a symlink) whose current digest still
 /// matches `expected_current`, or be absent when `expected_current` is `None`.
 /// Any deviation fails closed and leaves the destination untouched.
+///
+/// # Errors
+///
+/// Returns [`BridgeError`] when the destination is unsafe, foreign, or the commit IO fails.
 pub fn commit(
     staged: &Path,
     stable: &Path,
@@ -391,6 +449,10 @@ pub fn previous_path(stable: &Path) -> PathBuf {
 /// Returns `true` when the file was removed, `false` when it was already
 /// absent. A digest mismatch is a hard error: user-modified bytes stay put.
 /// Symlinks and non-regular files are never removed.
+///
+/// # Errors
+///
+/// Returns [`BridgeError`] when the file is unsafe, foreign, or removal IO fails.
 pub fn remove_if_matching(path: &Path, expected: &str) -> Result<bool, BridgeError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -408,9 +470,8 @@ pub fn remove_if_matching(path: &Path, expected: &str) -> Result<bool, BridgeErr
             path: path.to_path_buf(),
         });
     }
-    let current = fs::read(path).map_err(|source| {
-        fsutil::io_error("reading bridge artifact", path, source)
-    })?;
+    let current = fs::read(path)
+        .map_err(|source| fsutil::io_error("reading bridge artifact", path, source))?;
     let found = fsutil::sha256_hex(&current);
     if found != expected {
         return Err(BridgeError::ForeignBytes {
@@ -441,7 +502,11 @@ mod tests {
     #[test]
     fn absent_destination_stages_and_commits() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let stable = stable(temp.path());
         assert_eq!(
             check_destination(&stable, None).unwrap().0,
@@ -456,7 +521,11 @@ mod tests {
     #[test]
     fn eligible_bridge_is_backed_up_before_commit() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let stable = stable(temp.path());
         install_bytes(temp.path(), b"wasm-v1");
         let digest_v1 = fsutil::sha256_hex(b"wasm-v1");
@@ -468,14 +537,18 @@ mod tests {
         assert_eq!(fs::read(&stable).unwrap(), b"wasm-v1");
         let staged = stage(&stable, b"wasm-v2").unwrap();
         commit(&staged, &stable, Some(&digest_v1)).unwrap();
-        assert_eq!(fs::read(&previous_path(&stable)).unwrap(), b"wasm-v1");
+        assert_eq!(fs::read(previous_path(&stable)).unwrap(), b"wasm-v1");
         assert_eq!(fs::read(&stable).unwrap(), b"wasm-v2");
     }
 
     #[test]
     fn existing_rollback_copy_is_protected_without_authority() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let stable = stable(temp.path());
         install_bytes(temp.path(), b"wasm-v1");
         backup(&stable, None).unwrap();
@@ -497,7 +570,11 @@ mod tests {
     #[test]
     fn commit_revalidates_concurrent_change() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let stable = stable(temp.path());
         install_bytes(temp.path(), b"wasm-v1");
         let digest_v1 = fsutil::sha256_hex(b"wasm-v1");
@@ -513,7 +590,11 @@ mod tests {
     #[test]
     fn commit_refuses_symlink_destination() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let stable = stable(temp.path());
         let target = temp.path().join("real.wasm");
         fs::write(&target, b"wasm").unwrap();
@@ -532,7 +613,11 @@ mod tests {
     #[test]
     fn foreign_bytes_are_never_overwritten() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let stable = stable(temp.path());
         fs::write(&stable, b"someone-elses-wasm").unwrap();
         let error = check_destination(&stable, Some(&"a".repeat(64))).unwrap_err();
@@ -546,7 +631,11 @@ mod tests {
     #[test]
     fn remove_requires_matching_digest() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let stable = stable(temp.path());
         fs::write(&stable, b"wasm-v1").unwrap();
         let digest = fsutil::sha256_hex(b"wasm-v1");

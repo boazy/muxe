@@ -1021,7 +1021,10 @@ fn missing_context_value_fails_resolution() {
     ));
 }
 
-#[expect(clippy::too_many_lines, reason = "single exhaustive alias-collision table; splitting would scatter the collision matrix")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single exhaustive alias-collision table; splitting would scatter the collision matrix"
+)]
 #[test]
 fn vt100_aliases_collide_at_compile_time_and_match_their_single_legacy_event() {
     let aliases = compile(

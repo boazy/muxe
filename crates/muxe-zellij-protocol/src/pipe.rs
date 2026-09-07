@@ -11,6 +11,7 @@
 //! This module supplies the Zellij-specific payloads: they are plain typed
 //! structs with no `serde_json::Value` anywhere on the path between crates.
 
+use muxe_protocol::SchemaFingerprint;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -322,28 +323,12 @@ pub struct BridgeIdentity {
     pub action_fingerprint: [u8; 32],
     /// Fingerprint of this pipe protocol schema.
     pub protocol_fingerprint: [u8; 32],
-    /// Loaded-artifact attestation. The Zellij plugin SDK exposes no digest of
-    /// its own loaded bytes, so a bridge honestly reports [`BridgeArtifact::Unattested`].
-    /// A separately computed native-verified hash is never labeled bridge-attested.
-    pub artifact: BridgeArtifact,
-}
-
-/// Loaded-artifact attestation state.
-///
-/// DESIGN Defect 2074 asks for an embedded full-artifact SHA-256, but the pinned
-/// SDK supplies no digest of its own loaded bytes. This type keeps the two
-/// available facts distinct instead of faking the missing one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BridgeArtifact {
-    /// Honest bridge report: the SDK cannot attest its own loaded bytes.
-    Unattested,
-    /// SHA-256 of staged bridge bytes computed natively during activation
-    /// preflight. This is a native-verified measurement, never a
-    /// bridge-attested full-bytes digest; it must not be presented as one.
-    NativeVerified {
-        /// SHA-256 of the staged `muxe-zellij.wasm` bytes.
-        sha256: [u8; 32],
-    },
+    /// Shared deterministic pre-link bridge/protocol build identity.
+    ///
+    /// `None` decodes legacy control/pipe data but never qualifies a
+    /// registration as compatible.
+    #[serde(default)]
+    pub bridge_build_id: Option<SchemaFingerprint>,
 }
 
 /// Typed pipe framing and validation errors. Oversized or non-protocol output
@@ -601,19 +586,26 @@ impl PipeEventKind {
 }
 
 impl BridgeIdentity {
-    /// Handshake validation: versions and revisions are non-empty and the
-    /// fingerprints are non-zero. Compatibility comparison itself happens in the
-    /// adapter against the compiled compatibility record.
+    /// Handshake validation: required text fields are non-empty and required
+    /// fingerprints are non-zero. The optional build ID may be absent for
+    /// legacy control/pipe decoding; registration compatibility rejects that
+    /// legacy form, while a supplied zero build ID is invalid here.
     ///
     /// # Errors
     ///
-    /// Returns [`PipeError::Validation`] when any handshake field is missing.
+    /// Returns [`PipeError::Validation`] when required fields are missing or a
+    /// supplied fingerprint/build ID is zero.
     pub fn validate(&self) -> Result<(), PipeError> {
         require_non_empty("Muxe version", &self.muxe_version)?;
         require_non_empty("Zellij source revision", &self.source_revision)?;
         if self.action_fingerprint == [0; 32] || self.protocol_fingerprint == [0; 32] {
             return Err(PipeError::Validation {
                 reason: "bridge fingerprints must not be zero".to_owned(),
+            });
+        }
+        if self.bridge_build_id.is_some_and(SchemaFingerprint::is_zero) {
+            return Err(PipeError::Validation {
+                reason: "bridge build ID must not be zero".to_owned(),
             });
         }
         Ok(())
@@ -807,8 +799,20 @@ mod tests {
             muxe_version: "0.1.0".to_owned(),
             source_revision: "rev".to_owned(),
             action_fingerprint: [0; 32],
+            protocol_fingerprint: [0; 32],
+            bridge_build_id: None,
+        };
+        assert!(identity.validate().is_err());
+    }
+
+    #[test]
+    fn bridge_identity_rejects_zero_build_id() {
+        let identity = BridgeIdentity {
+            muxe_version: "0.1.0".to_owned(),
+            source_revision: "rev".to_owned(),
+            action_fingerprint: [1; 32],
             protocol_fingerprint: [1; 32],
-            artifact: BridgeArtifact::Unattested,
+            bridge_build_id: Some(SchemaFingerprint([0; 32])),
         };
         assert!(identity.validate().is_err());
     }

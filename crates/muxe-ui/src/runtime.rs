@@ -9,7 +9,7 @@ use muxe_protocol::{
     ArchivedKeyboardProfileWire, ArchivedLocalMenuActionWire, ArchivedMenuControl,
     ArchivedMenuViewMenuWire, BindingAvailability, BindingId, BrokerEvent,
     ConditionEvaluationErrorWire, ExecutionId as WireExecutionId, ExecutionOutcome, MenuControl,
-    PagesContextWire, evaluate_archived_binding_state,
+    PagesContextWire, ProtocolDiagnostic, evaluate_archived_binding_state,
 };
 use ratatui::layout::Rect;
 use thiserror::Error;
@@ -58,6 +58,7 @@ pub struct PreparedMenu {
 
 impl PreparedMenu {
     /// Borrows this prepared page as content for a terminal surface redraw.
+    #[must_use]
     pub fn surface_frame(&self) -> SurfaceFrame<'_> {
         SurfaceFrame {
             title: &self.title,
@@ -139,11 +140,21 @@ pub struct UiRuntime {
 
 impl UiRuntime {
     /// Attaches a checked broker response and compiles its supplied templates once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the frame cannot be decoded, is not a UI attachment response,
+    /// carries an invalid binding key, or supplies templates that fail to compile.
     pub fn attach(frame: muxe_protocol::ArchivedFrame) -> Result<Self, UiError> {
         Self::attach_at(frame, SessionInstant(Duration::ZERO))
     }
 
     /// Attaches a checked broker response at the caller-supplied monotonic session time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the frame cannot be decoded, is not a UI attachment response,
+    /// carries an invalid binding key, or supplies templates that fail to compile.
     pub fn attach_at(
         frame: muxe_protocol::ArchivedFrame,
         now: SessionInstant,
@@ -178,11 +189,21 @@ impl UiRuntime {
     }
 
     /// Returns the checked broker session ID associated with this runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the retained frame fails to decode or is not a UI attachment
+    /// response.
     pub fn session_id(&self) -> Result<&str, UiError> {
         Ok(self.snapshot.session_id()?)
     }
 
     /// Returns the parser profile exactly supplied by the attached broker snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the attached keyboard profile cannot be read. The profile is
+    /// cloned from the checked attachment, so a valid attachment always succeeds.
     pub fn keyboard_profile(&self) -> Result<KeyboardProfile, UiError> {
         Ok(self.keyboard_profile.clone())
     }
@@ -193,6 +214,11 @@ impl UiRuntime {
     }
 
     /// Applies one converted terminal input at a caller-supplied monotonic session time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the current menu cannot be resolved, a binding key is
+    /// invalid, or a binding condition fails to evaluate.
     pub fn handle_input_at(
         &mut self,
         input: &ConvertedInput,
@@ -206,11 +232,84 @@ impl UiRuntime {
                 at,
                 input: MenuSessionInput::Unknown,
             });
-            return Ok(self.menu_output(output));
+            return Ok(self.menu_output(output.as_ref()));
         }
 
+        let selection = self.select_current_binding(input)?;
+        let active = matches!(self.menu_session.state(), MenuSessionState::Active);
+        match selection {
+            Selection::Unavailable(message) => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                if active {
+                    self.status = Some(StatusMessage {
+                        level: "blocked".into(),
+                        message,
+                    });
+                    return Ok(UiCommand::Redraw);
+                }
+                Ok(self.menu_output(output.as_ref()))
+            }
+            Selection::Open(target) if active => {
+                let output = self.menu_session.handle(MenuSessionEvent::OpenSubmenu {
+                    at,
+                    menu: CoreMenuId::new(target),
+                });
+                Ok(self.menu_output(output.as_ref()))
+            }
+            Selection::Control(control) => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Control(wire_to_core_control(control)),
+                });
+                Ok(self.menu_output(output.as_ref()))
+            }
+            Selection::PagePrevious | Selection::PageNext if active => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                if !matches!(output, Some(MenuSessionOutput::UnknownKeySwallowed)) {
+                    return Ok(self.menu_output(output.as_ref()));
+                }
+                let previous = matches!(selection, Selection::PagePrevious);
+                if self.turn_page(previous) {
+                    self.status = None;
+                    Ok(UiCommand::Redraw)
+                } else {
+                    Ok(UiCommand::Ignored)
+                }
+            }
+            Selection::Binding(binding) => {
+                self.status = None;
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Binding(core_binding_id(binding)),
+                });
+                Ok(self.menu_output(output.as_ref()))
+            }
+            Selection::Ignored
+            | Selection::Open(_)
+            | Selection::PagePrevious
+            | Selection::PageNext => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                Ok(self.menu_output(output.as_ref()))
+            }
+        }
+    }
+
+    /// Resolves the visible binding selected by one key input on the current page.
+    fn select_current_binding(
+        &self,
+        input: &crate::ConvertedKeyEvent,
+    ) -> Result<Selection, UiError> {
         let current_menu = self.current_menu_id()?;
-        let selection = self.snapshot.with_attachment(|attachment| {
+        self.snapshot.with_attachment(|attachment| {
             let menu = attachment
                 .menu
                 .menus
@@ -225,105 +324,38 @@ impl UiRuntime {
                 self.last_page_count,
                 &self.availability,
             )
-        })??;
-        let active = matches!(self.menu_session.state(), MenuSessionState::Active);
-        match selection {
-            Selection::Ignored => {
-                let output = self.menu_session.handle(MenuSessionEvent::Key {
-                    at,
-                    input: MenuSessionInput::Unknown,
-                });
-                Ok(self.menu_output(output))
+        })?
+    }
+
+    /// Moves the pager one page, reporting whether the visible page changed.
+    fn turn_page(&mut self, previous: bool) -> bool {
+        if previous {
+            if self.current_page > 0 {
+                self.current_page -= 1;
+                true
+            } else {
+                false
             }
-            Selection::Unavailable(message) => {
-                let output = self.menu_session.handle(MenuSessionEvent::Key {
-                    at,
-                    input: MenuSessionInput::Unknown,
-                });
-                if active {
-                    self.status = Some(StatusMessage {
-                        level: "blocked".into(),
-                        message,
-                    });
-                    return Ok(UiCommand::Redraw);
-                }
-                Ok(self.menu_output(output))
-            }
-            Selection::Open(target) if active => {
-                let output = self.menu_session.handle(MenuSessionEvent::OpenSubmenu {
-                    at,
-                    menu: CoreMenuId::new(target),
-                });
-                Ok(self.menu_output(output))
-            }
-            Selection::Open(_) => {
-                let output = self.menu_session.handle(MenuSessionEvent::Key {
-                    at,
-                    input: MenuSessionInput::Unknown,
-                });
-                Ok(self.menu_output(output))
-            }
-            Selection::Control(control) => {
-                let output = self.menu_session.handle(MenuSessionEvent::Key {
-                    at,
-                    input: MenuSessionInput::Control(wire_to_core_control(control)),
-                });
-                Ok(self.menu_output(output))
-            }
-            Selection::PagePrevious | Selection::PageNext if active => {
-                let output = self.menu_session.handle(MenuSessionEvent::Key {
-                    at,
-                    input: MenuSessionInput::Unknown,
-                });
-                if !matches!(output, Some(MenuSessionOutput::UnknownKeySwallowed)) {
-                    return Ok(self.menu_output(output));
-                }
-                let previous = matches!(selection, Selection::PagePrevious);
-                let moved = if previous {
-                    if self.current_page > 0 {
-                        self.current_page -= 1;
-                        true
-                    } else {
-                        false
-                    }
-                } else if self.current_page.saturating_add(1) < self.last_page_count {
-                    self.current_page += 1;
-                    true
-                } else {
-                    false
-                };
-                if moved {
-                    self.status = None;
-                    Ok(UiCommand::Redraw)
-                } else {
-                    Ok(UiCommand::Ignored)
-                }
-            }
-            Selection::PagePrevious | Selection::PageNext => {
-                let output = self.menu_session.handle(MenuSessionEvent::Key {
-                    at,
-                    input: MenuSessionInput::Unknown,
-                });
-                Ok(self.menu_output(output))
-            }
-            Selection::Binding(binding) => {
-                self.status = None;
-                let output = self.menu_session.handle(MenuSessionEvent::Key {
-                    at,
-                    input: MenuSessionInput::Binding(core_binding_id(binding)),
-                });
-                Ok(self.menu_output(output))
-            }
+        } else if self.current_page.saturating_add(1) < self.last_page_count {
+            self.current_page += 1;
+            true
+        } else {
+            false
         }
     }
 
     /// Advances the pure session clock to its next caller-owned deadline.
     pub fn tick(&mut self, at: SessionInstant) -> UiCommand {
         let output = self.menu_session.handle(MenuSessionEvent::Tick { at });
-        self.menu_output(output)
+        self.menu_output(output.as_ref())
     }
 
     /// Records the broker's authoritative acceptance disposition for a selected binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::MissingBinding`] when the binding is not part of the pinned attachment,
+    /// or [`UiError::ExecutionSequenceExhausted`] when no local execution ID remains.
     pub fn invocation_accepted(
         &mut self,
         binding: BindingId,
@@ -352,7 +384,7 @@ impl UiRuntime {
                 at,
                 execution: core,
             });
-            Ok(self.menu_output(output))
+            Ok(self.menu_output(output.as_ref()))
         } else {
             let output = self
                 .menu_session
@@ -361,7 +393,7 @@ impl UiRuntime {
                     execution: CoreExecutionId(0),
                     after_action: policy.after_action,
                 });
-            Ok(self.menu_output(output))
+            Ok(self.menu_output(output.as_ref()))
         }
     }
 
@@ -395,10 +427,15 @@ impl UiRuntime {
         ) {
             self.pending = None;
         }
-        self.menu_output(output)
+        self.menu_output(output.as_ref())
     }
 
     /// Applies one asynchronous broker event without replacing the pinned attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the attached session ID or attachment cannot be read, or when a
+    /// binding condition fails to evaluate.
     pub fn handle_broker_event(
         &mut self,
         event: &BrokerEvent,
@@ -411,45 +448,7 @@ impl UiRuntime {
                 outcome,
                 diagnostic,
             } if session.as_str() == self.session_id()? => {
-                let Some(pending) = self.pending.as_ref() else {
-                    return Ok(UiCommand::Ignored);
-                };
-                if pending.wire != *execution {
-                    return Ok(UiCommand::Ignored);
-                }
-                let core = pending.core;
-                let after_action = pending.after_action;
-                let output = self.menu_session.handle(MenuSessionEvent::ActionCompleted {
-                    at,
-                    execution: core,
-                    success: matches!(outcome, ExecutionOutcome::Succeeded),
-                    after_action,
-                });
-                let still_pending = matches!(
-                    self.menu_session.state(),
-                    MenuSessionState::Pending {
-                        execution,
-                        ..
-                    } if *execution == core
-                );
-                if !still_pending {
-                    self.pending = None;
-                }
-                if output.is_some() {
-                    return Ok(self.menu_output(output));
-                }
-                if !still_pending {
-                    let (level, fallback) = execution_status(*outcome);
-                    self.status = Some(StatusMessage {
-                        level: level.into(),
-                        message: diagnostic
-                            .as_ref()
-                            .map(|diagnostic| diagnostic.message.clone())
-                            .unwrap_or_else(|| fallback.into()),
-                    });
-                    return Ok(UiCommand::Redraw);
-                }
-                Ok(UiCommand::Ignored)
+                Ok(self.on_execution_completed(execution, *outcome, diagnostic.as_ref(), at))
             }
             BrokerEvent::BindingAvailabilityChanged {
                 session,
@@ -499,22 +498,69 @@ impl UiRuntime {
             } => {
                 self.status = Some(StatusMessage {
                     level: if *healthy { "ready" } else { "blocked" }.into(),
-                    message: diagnostic
-                        .as_ref()
-                        .map(|diagnostic| diagnostic.message.clone())
-                        .unwrap_or_else(|| {
+                    message: diagnostic.as_ref().map_or_else(
+                        || {
                             if *healthy {
                                 "Host adapter is available".into()
                             } else {
                                 "Host adapter is unavailable".into()
                             }
-                        }),
+                        },
+                        |diagnostic| diagnostic.message.clone(),
+                    ),
                 });
                 Ok(UiCommand::Redraw)
             }
             BrokerEvent::BrokerRetiring | BrokerEvent::Fatal(_) => Ok(UiCommand::Detach),
             _ => Ok(UiCommand::Ignored),
         }
+    }
+
+    /// Applies a broker execution completion to the pending invocation.
+    fn on_execution_completed(
+        &mut self,
+        execution: &WireExecutionId,
+        outcome: ExecutionOutcome,
+        diagnostic: Option<&ProtocolDiagnostic>,
+        at: SessionInstant,
+    ) -> UiCommand {
+        let Some(pending) = self.pending.as_ref() else {
+            return UiCommand::Ignored;
+        };
+        if pending.wire != *execution {
+            return UiCommand::Ignored;
+        }
+        let core = pending.core;
+        let after_action = pending.after_action;
+        let output = self.menu_session.handle(MenuSessionEvent::ActionCompleted {
+            at,
+            execution: core,
+            success: matches!(outcome, ExecutionOutcome::Succeeded),
+            after_action,
+        });
+        let still_pending = matches!(
+            self.menu_session.state(),
+            MenuSessionState::Pending {
+                execution,
+                ..
+            } if *execution == core
+        );
+        if !still_pending {
+            self.pending = None;
+        }
+        if output.is_some() {
+            return self.menu_output(output.as_ref());
+        }
+        if !still_pending {
+            let (level, fallback) = execution_status(outcome);
+            self.status = Some(StatusMessage {
+                level: level.into(),
+                message: diagnostic
+                    .map_or_else(|| fallback.into(), |diagnostic| diagnostic.message.clone()),
+            });
+            return UiCommand::Redraw;
+        }
+        UiCommand::Ignored
     }
 
     /// Shows a recoverable broker diagnostic without replacing the pinned attachment.
@@ -526,6 +572,11 @@ impl UiRuntime {
     }
 
     /// Renders the current menu against the exact terminal rectangle before a surface redraw.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the current menu is missing, a template fails to render, or the
+    /// page conditions never stabilize on a page count.
     pub fn prepare(&mut self, area: Rect) -> Result<PreparedMenu, UiError> {
         if self
             .last_area
@@ -587,7 +638,7 @@ impl UiRuntime {
                 let next_page = page.min(next_count.saturating_sub(1));
                 if next_count == count && next_page == page {
                     let breadcrumbs = render_breadcrumbs(&self.renderer, attachment, stack)?;
-                    let pager =
+                    let pager_text =
                         render_pager(&self.renderer, menu, &plan, page, grid.width as usize)?;
                     let status = status
                         .map(|status| {
@@ -609,7 +660,7 @@ impl UiRuntime {
                             plan,
                             cells,
                             page,
-                            pager,
+                            pager: pager_text,
                             status,
                         },
                         page,
@@ -653,7 +704,7 @@ impl UiRuntime {
         })?
     }
 
-    fn menu_output(&mut self, output: Option<MenuSessionOutput>) -> UiCommand {
+    fn menu_output(&mut self, output: Option<&MenuSessionOutput>) -> UiCommand {
         match output {
             Some(MenuSessionOutput::InvokeBinding(binding)) => UiCommand::Invoke {
                 generation: binding.generation().0,
@@ -663,17 +714,18 @@ impl UiRuntime {
                 },
             },
             Some(MenuSessionOutput::RequestPendingControl { control, .. }) => {
-                UiCommand::MenuControl(core_to_wire_control(control))
+                UiCommand::MenuControl(core_to_wire_control(*control))
             }
-            Some(MenuSessionOutput::NavigatedTo(_)) | Some(MenuSessionOutput::ReturnedTo(_)) => {
+            Some(MenuSessionOutput::NavigatedTo(_) | MenuSessionOutput::ReturnedTo(_)) => {
                 self.current_page = 0;
                 self.last_page_count = 1;
                 self.status = None;
                 UiCommand::Redraw
             }
             Some(MenuSessionOutput::Dismissed) => UiCommand::Detach,
-            Some(MenuSessionOutput::UnknownKeySwallowed)
-            | Some(MenuSessionOutput::PendingInputSwallowed)
+            Some(
+                MenuSessionOutput::UnknownKeySwallowed | MenuSessionOutput::PendingInputSwallowed,
+            )
             | None => UiCommand::Ignored,
         }
     }
@@ -775,15 +827,16 @@ fn render_visible_cells(
         let blocked = availability
             .iter()
             .find(|current| current.binding == binding_id)
-            .map(|current| current.availability == BindingAvailability::Blocked)
-            .unwrap_or(state.blocked);
+            .map_or(state.blocked, |current| {
+                current.availability == BindingAvailability::Blocked
+            });
         cells.push(
             renderer.render_cell(CellTemplate {
                 key: binding.key.as_str(),
                 title: binding
                     .label
                     .as_ref()
-                    .map(|label| label.as_str())
+                    .map(rkyv::string::ArchivedString::as_str)
                     .unwrap_or_default(),
                 disabled: !state.enabled || blocked,
                 blocked,
@@ -808,7 +861,11 @@ fn render_breadcrumbs(
                 .iter()
                 .find(|menu| menu.id.0.as_str() == id.as_str())
         })
-        .filter_map(|menu| menu.title.as_ref().map(|title| title.as_str()))
+        .filter_map(|menu| {
+            menu.title
+                .as_ref()
+                .map(rkyv::string::ArchivedString::as_str)
+        })
         .collect::<Vec<_>>();
     renderer
         .render_breadcrumbs(BreadcrumbTemplate { crumbs: &crumbs })
@@ -918,9 +975,9 @@ fn select_binding(
         let availability = availability
             .iter()
             .find(|current| current.binding == binding_id);
-        let blocked = availability
-            .map(|current| current.availability == BindingAvailability::Blocked)
-            .unwrap_or(state.blocked);
+        let blocked = availability.map_or(state.blocked, |current| {
+            current.availability == BindingAvailability::Blocked
+        });
         if !state.enabled || blocked {
             return Ok(Selection::Unavailable(
                 availability

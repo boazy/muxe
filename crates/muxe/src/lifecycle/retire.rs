@@ -102,7 +102,7 @@ where
         // that rebound the same socket is never deleted.
         let outcome = match control.connect(&entry.socket).await {
             Ok(mut session) => session.retire().await.map(|_| ()),
-            Err(ControlError::Connect { .. }) | Err(ControlError::Closed) => {
+            Err(ControlError::Connect { .. } | ControlError::Closed) => {
                 let _ = registry.unregister_entry(entry);
                 continue;
             }

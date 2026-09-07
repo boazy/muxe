@@ -51,6 +51,10 @@ impl AppPaths {
 }
 
 /// Resolves the single native path set from the process environment.
+///
+/// # Errors
+///
+/// Returns [`PathError::NoValidatedBase`] when no validated home directory exists.
 pub fn resolve() -> Result<AppPaths, PathError> {
     let dirs = platform_dirs::AppDirs::new(Some("muxe"), true).ok_or(PathError::NoValidatedBase)?;
     Ok(AppPaths {
@@ -64,16 +68,21 @@ pub fn resolve() -> Result<AppPaths, PathError> {
 /// Uses `--zellij-config` when supplied, otherwise `$ZELLIJ_CONFIG_DIR/config.kdl`,
 /// then the standard Zellij config path under the same XDG base. Fails without
 /// a validated base instead of guessing a relative path.
+///
+/// # Errors
+///
+/// Returns [`PathError::NoValidatedBase`] when no validated base exists and no override is supplied.
 pub fn zellij_config_path(override_path: Option<&Path>) -> Result<PathBuf, PathError> {
     if let Some(path) = override_path {
         return Ok(path.to_path_buf());
     }
-    if let Some(dir) = std::env::var_os("ZELLIJ_CONFIG_DIR") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir).join("config.kdl"));
-        }
+    if let Some(dir) = std::env::var_os("ZELLIJ_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir).join("config.kdl"));
     }
-    let dirs = platform_dirs::AppDirs::new(Some("zellij"), true).ok_or(PathError::NoValidatedBase)?;
+    let dirs =
+        platform_dirs::AppDirs::new(Some("zellij"), true).ok_or(PathError::NoValidatedBase)?;
     // platform-dirs appends the application name; Zellij's own file is
     // `config.kdl` directly under its configuration directory.
     Ok(dirs.config_dir.join("config.kdl"))
@@ -82,7 +91,6 @@ pub fn zellij_config_path(override_path: Option<&Path>) -> Result<PathBuf, PathE
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn explicit_override_wins() {

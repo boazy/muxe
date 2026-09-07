@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -9,6 +9,11 @@ use thiserror::Error;
 
 const STARTER_CONFIG: &str = include_str!("../assets/starter.yml");
 const OWNER_FILE_MODE: u32 = 0o600;
+/// Owner-only directory mode for Muxe internal state, matching `fsutil::OWNER_DIR_MODE`.
+/// The boundary starts at the Muxe configuration directory itself: ancestors
+/// above it keep whatever modes the OS or user gave them and are never
+/// chmodded or enforced here. Preexisting directories are preserved untouched.
+const OWNER_DIR_MODE: u32 = 0o700;
 
 /// The paths created or retained by a successful initialization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +47,12 @@ pub const fn starter_config() -> &'static str {
 
 /// Installs the starter configuration and its companion directories.
 ///
+/// Newly created Muxe-owned directories (`config_directory`, `themes`,
+/// `color-schemes`) are locked to owner-only `0700`, umask-proof, and the
+/// starter file to `0600`, so the integration and broker pipelines accept the
+/// tree without permission repairs. Ancestors above the configuration
+/// directory keep OS-default modes; preexisting entries are never chmodded.
+///
 /// An existing `config.yml`, including a dangling symlink, always fails without mutation.
 pub fn install(config_path: &Path) -> Result<InitResult, InitError> {
     let config_directory = config_path
@@ -52,9 +63,9 @@ pub fn install(config_path: &Path) -> Result<InitResult, InitError> {
     let color_schemes_directory = config_directory.join("color-schemes");
 
     ensure_missing(config_path)?;
-    ensure_directory(config_directory)?;
-    ensure_directory(&themes_directory)?;
-    ensure_directory(&color_schemes_directory)?;
+    ensure_owned_directory(config_directory)?;
+    ensure_owned_directory(&themes_directory)?;
+    ensure_owned_directory(&color_schemes_directory)?;
     install_starter(config_path, config_directory)?;
     Ok(InitResult {
         config_path: config_path.to_path_buf(),
@@ -88,6 +99,54 @@ fn ensure_directory(path: &Path) -> Result<(), InitError> {
                 }
                 Err(source) => Err(io_error("creating directory", path, source)),
             }
+        }
+        Err(source) => Err(io_error("checking", path, source)),
+    }
+}
+
+/// Creates a Muxe-owned directory at `OWNER_DIR_MODE`, umask-proof.
+///
+/// Missing ancestors above `path` use [`ensure_directory`] (OS-default modes,
+/// never chmodded); only `path` itself is locked owner-only, matching
+/// `fsutil::ensure_owner_dir` for freshly created entries. A preexisting
+/// directory is preserved untouched and never repaired: wrong modes fail
+/// closed downstream instead of being chmodded here.
+fn ensure_owned_directory(path: &Path) -> Result<(), InitError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(InitError::NotDirectory(path.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .ok_or_else(|| InitError::MissingParent(path.to_path_buf()))?;
+            ensure_directory(parent)?;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(OWNER_DIR_MODE);
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return ensure_owned_directory(path);
+                }
+                Err(source) => return Err(io_error("creating directory", path, source)),
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(OWNER_DIR_MODE))
+                .map_err(|source| io_error("locking directory mode", path, source))?;
+            let actual = fs::symlink_metadata(path)
+                .map_err(|source| io_error("checking directory", path, source))?
+                .permissions()
+                .mode()
+                & 0o777;
+            if actual != OWNER_DIR_MODE {
+                return Err(io_error(
+                    "locking directory mode",
+                    path,
+                    io::Error::other(format!(
+                        "directory mode {actual:o} is not owner-only {OWNER_DIR_MODE:o}"
+                    )),
+                ));
+            }
+            Ok(())
         }
         Err(source) => Err(io_error("checking", path, source)),
     }
@@ -139,8 +198,14 @@ fn create_staging_file(directory: &Path, config_path: &Path) -> Result<(PathBuf,
         let mut options = OpenOptions::new();
         options.write(true).create_new(true).mode(OWNER_FILE_MODE);
         match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Ok(file) => {
+                // The creation mode can only remove bits under an odd umask;
+                // lock the exact owner-only mode like `fsutil` staging does.
+                file.set_permissions(fs::Permissions::from_mode(OWNER_FILE_MODE))
+                    .map_err(|source| io_error("locking staging file mode", &path, source))?;
+                return Ok((path, file));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(source) => return Err(io_error("creating staging file", &path, source)),
         }
     }
@@ -153,7 +218,7 @@ fn create_staging_file(directory: &Path, config_path: &Path) -> Result<(PathBuf,
 
 fn write_starter(file: &mut File, path: &Path) -> Result<(), InitError> {
     file.write_all(starter_config().as_bytes())
-        .and_then(|_| file.sync_all())
+        .and_then(|()| file.sync_all())
         .map_err(|source| io_error("writing starter configuration", path, source))
 }
 
@@ -177,11 +242,11 @@ mod tests {
         thread,
     };
 
-    use tempfile::TempDir;
     use muxe_core::{
         ActionSpec, CompiledGeneration, KeyCapabilities, MenuAction, MenuId, PortableAction,
         SourceId, compile_yaml,
     };
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -211,6 +276,57 @@ mod tests {
     }
 
     #[test]
+    fn fresh_install_locks_owner_only_modes_and_stays_consumable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = TempDir::new().expect("unique temporary directory");
+        let config_path = temporary.path().join("fresh-xdg/config/muxe/config.yml");
+
+        let result = install(&config_path).expect("initialization succeeds");
+
+        // The source bug: fresh directories shipped OS-default 0755, which the
+        // integration and broker pipelines refuse as insecure internal state.
+        for directory in [
+            config_path.parent().expect("config parent"),
+            &result.themes_directory,
+            &result.color_schemes_directory,
+        ] {
+            let mode = fs::symlink_metadata(directory)
+                .expect("owned directory exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "fresh {}", directory.display());
+        }
+        let file_mode = fs::symlink_metadata(&result.config_path)
+            .expect("starter exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+
+        // Immediate consumer use, not field copies: the committed starter reads
+        // back byte-identical and compiles, and an owned companion directory
+        // accepts a fresh staging file.
+        let bytes = fs::read(&result.config_path).expect("starter is readable");
+        assert_eq!(bytes, starter_config().as_bytes());
+        compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<fresh starter config>"),
+            starter_config(),
+            KeyCapabilities::default(),
+            None,
+        )
+        .expect("fresh starter compiles");
+        let probe = result
+            .themes_directory
+            .join(".probe.muxe-init-regression.tmp");
+        fs::write(&probe, b"probe").expect("owned directory is writable");
+        assert_eq!(fs::read(&probe).expect("probe reads back"), b"probe");
+        fs::remove_file(&probe).expect("probe cleans up");
+    }
+
+    #[test]
     fn starter_compiles_with_the_builtin_escape_exit() {
         let compiled = compile_yaml(
             CompiledGeneration(1),
@@ -220,7 +336,9 @@ mod tests {
             None,
         )
         .expect("starter config compiles with default built-in bindings");
-        let main = compiled.menu(&MenuId::new("main")).expect("starter main menu exists");
+        let main = compiled
+            .menu(&MenuId::new("main"))
+            .expect("starter main menu exists");
 
         assert!(main.bindings.iter().any(|binding| {
             binding.key.canonical_string() == "esc"

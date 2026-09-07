@@ -13,8 +13,7 @@
 //! schemas and logs. The command never edits Zellij or Herdr keybindings.
 
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -27,6 +26,7 @@ use crate::{
         self,
         receipt::{ReceiptError, load as load_receipt},
     },
+    lifecycle::journal::{self, JournalError},
     logging::{LogError, LogEvent, Logger},
 };
 
@@ -48,11 +48,19 @@ pub enum PurgeError {
     Declined,
     #[error("refusing --cache while activation journal {journal} is live or needs recovery")]
     ActivationJournalLive { journal: PathBuf },
+    #[error("refusing --cache while activation owns cache lifetime lock {path}")]
+    CacheLeaseActive { path: PathBuf },
+    #[error(transparent)]
+    Journal(#[from] JournalError),
     #[error("refusing to purge non-directory target {}", path.display())]
     NotDirectory { path: PathBuf },
 }
 
 /// Inputs for `muxe purge`. Paths are injected absolute directories.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the four flags are the CLI-selected purge targets confirmed as one destructive scope; splitting them would change the public constructor shape without any safety gain"
+)]
 pub struct PurgeInputs<'a> {
     pub config_dir: &'a Path,
     pub cache_dir: &'a Path,
@@ -100,6 +108,14 @@ pub struct PurgeReport {
 /// Refusals happen before any removal: a missing target flag, a
 /// non-interactive run without `--yes`, and a live activation journal under
 /// `--cache` all fail with nothing removed.
+///
+/// # Errors
+///
+/// Returns [`PurgeError`] when authorization fails, a live journal blocks the run, or removal IO fails.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "by-value keeps the single CLI-dispatch call ergonomic for this cheap borrowed bundle; a reference would ripple into the retained dispatch signature without benefit"
+)]
 pub fn purge(inputs: PurgeInputs<'_>) -> Result<PurgeReport, PurgeError> {
     if !inputs.config && !inputs.cache {
         return Err(PurgeError::NoTarget);
@@ -136,11 +152,26 @@ pub fn purge(inputs: PurgeInputs<'_>) -> Result<PurgeReport, PurgeError> {
         if !inputs.interactive {
             return Err(PurgeError::NonInteractiveWithoutYes);
         }
-        let confirmed = inputs.confirmer.map_or(false, |confirm| confirm(&preview));
+        let confirmed = inputs.confirmer.is_some_and(|confirm| confirm(&preview));
         if !confirmed {
             return Err(PurgeError::Declined);
         }
     }
+    let _cache_lease = if inputs.cache {
+        let lease = match journal::acquire_cache_purge_lock(inputs.cache_dir) {
+            Ok(lease) => lease,
+            Err(JournalError::CacheActive { path }) => {
+                return Err(PurgeError::CacheLeaseActive { path });
+            }
+            Err(error) => return Err(PurgeError::Journal(error)),
+        };
+        if let Some(journal) = live_activation_journal(inputs.cache_dir)? {
+            return Err(PurgeError::ActivationJournalLive { journal });
+        }
+        Some(lease)
+    } else {
+        None
+    };
 
     log_intent(inputs.logger, &preview)?;
     let mut report = PurgeReport {
@@ -226,7 +257,13 @@ fn receipt_listed_node_exists(
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => return Err(PurgeError::Fs(fsutil::io_error("reading Zellij configuration", path, source))),
+        Err(source) => {
+            return Err(PurgeError::Fs(fsutil::io_error(
+                "reading Zellij configuration",
+                path,
+                source,
+            )));
+        }
     };
     let document = KdlDocument::parse_v1(&source).map_err(|error| PurgeError::ReferenceScan {
         path: path.to_path_buf(),
@@ -274,7 +311,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-
+    use crate::integration::receipt::{
+        BridgeRecord, Disposition, NodeRecord, RECEIPT_SCHEMA_VERSION, Receipt, store,
+    };
     fn secure_test_root(path: &Path) {
         let root = path.parent().expect("test path has TempDir parent");
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))
@@ -313,6 +352,49 @@ mod tests {
     }
 
     #[test]
+    fn cache_lock_owner_blocks_purge_even_without_a_journal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = temp.path().join("config");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        secure_test_root(&config);
+        let unit = crate::lifecycle::journal::UnitKind::Herdr {
+            host_hash: "purge-lock".to_owned(),
+        };
+        let lock = crate::lifecycle::journal::acquire_unit_lock(&cache, &unit).unwrap();
+        let error = purge(inputs(&config, &cache, false, true)).unwrap_err();
+        assert!(matches!(error, PurgeError::CacheLeaseActive { .. }));
+        assert!(cache.exists());
+        drop(lock);
+        let report = purge(inputs(&config, &cache, false, true)).unwrap();
+        assert_eq!(report.removed.len(), 1);
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn cache_purge_rechecks_journal_after_confirmation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = temp.path().join("config");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let confirm = |_: &PurgePreview| {
+            let activation = cache.join(crate::lifecycle::journal::ACTIVATION_DIR_NAME);
+            fs::create_dir_all(&activation).unwrap();
+            fs::write(activation.join("herdr-race.json"), b"{}").unwrap();
+            true
+        };
+        let error = purge(PurgeInputs {
+            yes: false,
+            interactive: true,
+            confirmer: Some(&confirm),
+            ..inputs(&config, &cache, false, true)
+        })
+        .unwrap_err();
+        assert!(matches!(error, PurgeError::ActivationJournalLive { .. }));
+        assert!(cache.exists());
+    }
+
+    #[test]
     fn refuses_cache_while_journal_live() {
         let temp = tempfile::TempDir::new().unwrap();
         let config = temp.path().join("config");
@@ -320,12 +402,9 @@ mod tests {
         let activation = cache.join("activation");
         fs::create_dir_all(&activation).unwrap();
         fs::write(activation.join("herdr-x.json"), b"{}").unwrap();
-        fs::create_dir_all(&cache.join("logs")).unwrap();
+        fs::create_dir_all(cache.join("logs")).unwrap();
         let error = purge(inputs(&config, &cache, false, true)).unwrap_err();
-        assert!(matches!(
-            error,
-            PurgeError::ActivationJournalLive { .. }
-        ));
+        assert!(matches!(error, PurgeError::ActivationJournalLive { .. }));
         assert!(cache.exists());
     }
 
@@ -362,10 +441,7 @@ mod tests {
             interactive: false,
             ..inputs(&config, &cache, true, false)
         });
-        assert!(matches!(
-            result,
-            Err(PurgeError::NonInteractiveWithoutYes)
-        ));
+        assert!(matches!(result, Err(PurgeError::NonInteractiveWithoutYes)));
         assert!(config.exists());
     }
 
@@ -385,16 +461,20 @@ mod tests {
                 *presented.borrow_mut() = Some(preview.clone());
             }),
             confirmer: Some(&|preview| {
-                assert!(preview
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.contains("load_plugins.muxe")));
+                assert!(
+                    preview
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("load_plugins.muxe"))
+                );
                 false
             }),
             ..inputs(&config, &cache, true, false)
         });
         assert!(matches!(result, Err(PurgeError::Declined)));
-        let preview = presented.into_inner().expect("scope is presented before confirmation");
+        let preview = presented
+            .into_inner()
+            .expect("scope is presented before confirmation");
         assert_eq!(preview.targets.len(), 1);
         assert_eq!(preview.targets[0].path, config);
         assert!(config.exists());
@@ -415,11 +495,16 @@ mod tests {
             ..inputs(&config, &cache, false, true)
         })
         .unwrap();
-        let preview = presented.into_inner().expect("--yes still receives a visible scope");
-        assert_eq!(preview.targets, vec![PurgeTarget {
-            path: cache.clone(),
-            kind: "cache",
-        }]);
+        let preview = presented
+            .into_inner()
+            .expect("--yes still receives a visible scope");
+        assert_eq!(
+            preview.targets,
+            vec![PurgeTarget {
+                path: cache.clone(),
+                kind: "cache",
+            }]
+        );
         assert_eq!(report.removed, preview.targets);
         assert!(!cache.exists());
     }
@@ -483,12 +568,8 @@ mod tests {
         assert!(!cache.exists());
     }
 
-
     fn store_receipt(config: &Path, zellij_config: &Path) {
         secure_test_root(config);
-        use crate::integration::receipt::{
-            BridgeRecord, Disposition, NodeRecord, RECEIPT_SCHEMA_VERSION, Receipt, store,
-        };
 
         let receipt = Receipt {
             schema_version: RECEIPT_SCHEMA_VERSION,

@@ -10,27 +10,48 @@ pub enum Color {
 }
 
 impl Color {
+    /// Parses `#rgb` or `#rrggbb` color syntax.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ThemePairError`] when the value is not a valid hexadecimal color.
     pub fn parse(value: &str) -> Result<Self, ThemePairError> {
-        let value = value.strip_prefix('#').ok_or_else(|| ThemePairError::new("color must begin with `#`"))?;
+        let value = value
+            .strip_prefix('#')
+            .ok_or_else(|| ThemePairError::new("color must begin with `#`"))?;
         let expand = |character: char| -> Result<u8, ThemePairError> {
             let digit = character
                 .to_digit(16)
-                .ok_or_else(|| ThemePairError::new("color contains a non-hex digit"))? as u8;
-            Ok(digit * 17)
+                .ok_or_else(|| ThemePairError::new("color contains a non-hex digit"))?;
+            u8::try_from(digit)
+                .map_err(|_| ThemePairError::new("color contains a non-hex digit"))
+                .map(|digit| digit * 17)
         };
         match value.len() {
             3 => {
                 let mut chars = value.chars();
+                let red = chars
+                    .next()
+                    .ok_or_else(|| ThemePairError::new("color must use `#rgb` or `#rrggbb`"))?;
+                let green = chars
+                    .next()
+                    .ok_or_else(|| ThemePairError::new("color must use `#rgb` or `#rrggbb`"))?;
+                let blue = chars
+                    .next()
+                    .ok_or_else(|| ThemePairError::new("color must use `#rgb` or `#rrggbb`"))?;
                 Ok(Self::Rgb {
-                    red: expand(chars.next().expect("length checked"))?,
-                    green: expand(chars.next().expect("length checked"))?,
-                    blue: expand(chars.next().expect("length checked"))?,
+                    red: expand(red)?,
+                    green: expand(green)?,
+                    blue: expand(blue)?,
                 })
             }
             6 => Ok(Self::Rgb {
-                red: u8::from_str_radix(&value[0..2], 16).map_err(|_| ThemePairError::new("invalid red channel"))?,
-                green: u8::from_str_radix(&value[2..4], 16).map_err(|_| ThemePairError::new("invalid green channel"))?,
-                blue: u8::from_str_radix(&value[4..6], 16).map_err(|_| ThemePairError::new("invalid blue channel"))?,
+                red: u8::from_str_radix(&value[0..2], 16)
+                    .map_err(|_| ThemePairError::new("invalid red channel"))?,
+                green: u8::from_str_radix(&value[2..4], 16)
+                    .map_err(|_| ThemePairError::new("invalid green channel"))?,
+                blue: u8::from_str_radix(&value[4..6], 16)
+                    .map_err(|_| ThemePairError::new("invalid blue channel"))?,
             }),
             _ => Err(ThemePairError::new("color must use `#rgb` or `#rrggbb`")),
         }
@@ -46,20 +67,33 @@ pub struct ColorScheme {
 }
 
 impl ColorScheme {
+    /// Resolves one semantic or palette alias to a concrete color.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ThemePairError`] for missing aliases, alias cycles, or invalid colors.
     pub fn resolve(&self, name: &str) -> Result<Color, ThemePairError> {
         let mut seen = HashSet::new();
         self.resolve_inner(name, &mut seen)
     }
 
-    fn resolve_inner(&self, name: &str, seen: &mut HashSet<String>) -> Result<Color, ThemePairError> {
+    fn resolve_inner(
+        &self,
+        name: &str,
+        seen: &mut HashSet<String>,
+    ) -> Result<Color, ThemePairError> {
         if !seen.insert(name.to_owned()) {
-            return Err(ThemePairError::new(format!("color alias cycle at `{name}`")));
+            return Err(ThemePairError::new(format!(
+                "color alias cycle at `{name}`"
+            )));
         }
         let value = self
             .colors
             .get(name)
             .or_else(|| self.palette.get(name))
-            .ok_or_else(|| ThemePairError::new(format!("unknown palette or semantic color `{name}`")))?;
+            .ok_or_else(|| {
+                ThemePairError::new(format!("unknown palette or semantic color `{name}`"))
+            })?;
         if value == "inherit" {
             Ok(Color::Inherit)
         } else if value.starts_with('#') {
@@ -70,6 +104,10 @@ impl ColorScheme {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the independently serializable terminal style flags are part of the theme schema"
+)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Style {
     pub foreground: Option<String>,
@@ -121,10 +159,17 @@ impl std::error::Error for ThemePairError {}
 impl CompiledTheme {
     /// Validates a pure theme/scheme pair. It parses templates without filesystem loaders and
     /// verifies every declared foreground/background path before a UI can select the pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ThemePairError`] for invalid templates or unresolved style colors.
     pub fn compile(theme: Theme, scheme: ColorScheme) -> Result<Self, ThemePairError> {
         for (section, fallback) in [(&theme.common, None), (&theme.menu, Some(&theme.common))] {
             for style in section.styles.values() {
-                for color in [style.foreground.as_deref(), style.background.as_deref()].into_iter().flatten() {
+                for color in [style.foreground.as_deref(), style.background.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
                     if color.starts_with('#') {
                         Color::parse(color)?;
                     } else {
@@ -133,8 +178,13 @@ impl CompiledTheme {
                 }
             }
             for template in section.templates.values() {
-                if template.contains("{% extends") || template.contains("{% include") || template.contains("{% import") {
-                    return Err(ThemePairError::new("theme templates cannot use loader-backed tags"));
+                if template.contains("{% extends")
+                    || template.contains("{% include")
+                    || template.contains("{% import")
+                {
+                    return Err(ThemePairError::new(
+                        "theme templates cannot use loader-backed tags",
+                    ));
                 }
                 minijinja::Environment::new()
                     .template_from_str(template)
@@ -154,8 +204,13 @@ impl CompiledTheme {
         Ok(Self { theme, scheme })
     }
 
+    #[must_use]
     pub fn style(&self, name: &str) -> Option<&Style> {
-        self.theme.menu.styles.get(name).or_else(|| self.theme.common.styles.get(name))
+        self.theme
+            .menu
+            .styles
+            .get(name)
+            .or_else(|| self.theme.common.styles.get(name))
     }
 }
 
@@ -164,15 +219,20 @@ fn literal_style_tags(template: &str) -> impl Iterator<Item = &str> {
         let tag = remainder.split_once(']')?.0;
         let tag = tag.strip_prefix('/').unwrap_or(tag);
         (!tag.is_empty()
-            && tag
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')))
+            && tag.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+            }))
         .then_some(tag)
     })
 }
 
 /// Built-in `default` theme. It uses only semantic style paths, so it can pair with a user
 /// scheme or the built-in host-inheriting scheme.
+#[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the embedded default theme remains a single auditable style registry"
+)]
 pub fn default_theme() -> Theme {
     Theme {
         common: ThemeSection {
@@ -309,6 +369,7 @@ pub fn default_theme() -> Theme {
 }
 
 /// Built-in `default` color scheme. Every semantic path inherits the host terminal color.
+#[must_use]
 pub fn default_color_scheme() -> ColorScheme {
     ColorScheme {
         title: "default".to_owned(),
@@ -330,6 +391,11 @@ pub fn default_color_scheme() -> ColorScheme {
 
 /// Compiles the built-in host-inheriting pair. Its construction is infallible because both
 /// values above are embedded, validated constants.
+///
+/// # Panics
+///
+/// Panics if an embedded theme constant violates the validation contract.
+#[must_use]
 pub fn compiled_default_theme() -> CompiledTheme {
     CompiledTheme::compile(default_theme(), default_color_scheme())
         .expect("the embedded default theme and scheme are valid")
@@ -348,7 +414,11 @@ mod tests {
         };
         assert_eq!(
             scheme.resolve("menu.hotkey").unwrap(),
-            Color::Rgb { red: 17, green: 34, blue: 51 }
+            Color::Rgb {
+                red: 17,
+                green: 34,
+                blue: 51
+            }
         );
     }
 
@@ -359,7 +429,10 @@ mod tests {
                 common: ThemeSection::default(),
                 menu: ThemeSection {
                     styles: BTreeMap::new(),
-                    templates: BTreeMap::from([("cell".to_owned(), "[missing]text[/missing]".to_owned())]),
+                    templates: BTreeMap::from([(
+                        "cell".to_owned(),
+                        "[missing]text[/missing]".to_owned(),
+                    )]),
                 },
                 settings: BTreeMap::new(),
             },

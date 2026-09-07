@@ -12,6 +12,7 @@ impl SessionInstant {
         self.0.checked_add(duration).map(Self)
     }
 
+    #[must_use]
     pub fn saturating_duration_since(self, earlier: Self) -> Duration {
         self.0.saturating_sub(earlier.0)
     }
@@ -70,10 +71,7 @@ pub enum MenuSessionEvent {
         control: MenuControl,
     },
     /// Broker resolved a `menu:open` action and supplied its target menu.
-    OpenSubmenu {
-        at: SessionInstant,
-        menu: MenuId,
-    },
+    OpenSubmenu { at: SessionInstant, menu: MenuId },
     /// Explicit clock advance; the caller supplies this rather than the state machine reading time.
     Tick { at: SessionInstant },
 }
@@ -83,7 +81,10 @@ pub enum MenuSessionOutput {
     InvokeBinding(BindingId),
     UnknownKeySwallowed,
     PendingInputSwallowed,
-    RequestPendingControl { execution: ExecutionId, control: MenuControl },
+    RequestPendingControl {
+        execution: ExecutionId,
+        control: MenuControl,
+    },
     NavigatedTo(MenuId),
     ReturnedTo(MenuId),
     Dismissed,
@@ -101,6 +102,7 @@ pub struct MenuSession {
 }
 
 impl MenuSession {
+    #[must_use]
     pub fn new(root: MenuId, timeout: Option<Duration>, now: SessionInstant) -> Self {
         let deadline = timeout.and_then(|duration| now.checked_add(duration));
         Self {
@@ -112,18 +114,22 @@ impl MenuSession {
         }
     }
 
+    #[must_use]
     pub fn state(&self) -> &MenuSessionState {
         &self.state
     }
 
+    #[must_use]
     pub fn current_menu(&self) -> Option<&MenuId> {
         self.stack.last()
     }
 
+    #[must_use]
     pub fn stack(&self) -> &[MenuId] {
         &self.stack
     }
 
+    #[must_use]
     pub fn deadline(&self) -> Option<SessionInstant> {
         self.deadline
     }
@@ -132,15 +138,24 @@ impl MenuSession {
         match event {
             MenuSessionEvent::Key { at, input } => self.key(at, input),
             MenuSessionEvent::ActionPending { at, execution } => self.action_pending(at, execution),
-            MenuSessionEvent::DetachedAccepted { at: _, execution: _, after_action } => {
-                matches!(self.state, MenuSessionState::Active).then(|| self.apply_after_action(after_action)).flatten()
-            }
-            MenuSessionEvent::ActionCompleted { at, execution, success, after_action } => {
-                self.action_completed(at, execution, success, after_action)
-            }
-            MenuSessionEvent::PendingControlCompleted { at, execution, control } => {
-                self.pending_control_completed(at, execution, control)
-            }
+            MenuSessionEvent::DetachedAccepted {
+                at: _,
+                execution: _,
+                after_action,
+            } => matches!(self.state, MenuSessionState::Active)
+                .then(|| self.apply_after_action(after_action))
+                .flatten(),
+            MenuSessionEvent::ActionCompleted {
+                at,
+                execution,
+                success,
+                after_action,
+            } => self.action_completed(at, execution, success, after_action),
+            MenuSessionEvent::PendingControlCompleted {
+                at,
+                execution,
+                control,
+            } => self.pending_control_completed(at, execution, control),
             MenuSessionEvent::OpenSubmenu { at, menu } => self.open_submenu(at, menu),
             MenuSessionEvent::Tick { at } => self.tick(at),
         }
@@ -149,7 +164,10 @@ impl MenuSession {
     fn key(&mut self, at: SessionInstant, input: MenuSessionInput) -> Option<MenuSessionOutput> {
         match self.state {
             MenuSessionState::Dismissed => None,
-            MenuSessionState::Pending { execution, requested_control } => {
+            MenuSessionState::Pending {
+                execution,
+                requested_control,
+            } => {
                 // A received key always resets inactivity, even while its deadline is paused.
                 self.reset_paused_timeout();
                 match input {
@@ -166,21 +184,32 @@ impl MenuSession {
             MenuSessionState::Active => {
                 self.reset_deadline(at);
                 match input {
-                    MenuSessionInput::Binding(binding) => Some(MenuSessionOutput::InvokeBinding(binding)),
+                    MenuSessionInput::Binding(binding) => {
+                        Some(MenuSessionOutput::InvokeBinding(binding))
+                    }
                     MenuSessionInput::Unknown => Some(MenuSessionOutput::UnknownKeySwallowed),
-                    MenuSessionInput::Control(control) => self.apply_control(control),
+                    MenuSessionInput::Control(control) => Some(self.apply_control(control)),
                 }
             }
         }
     }
 
-    fn action_pending(&mut self, at: SessionInstant, execution: ExecutionId) -> Option<MenuSessionOutput> {
+    fn action_pending(
+        &mut self,
+        at: SessionInstant,
+        execution: ExecutionId,
+    ) -> Option<MenuSessionOutput> {
         if !matches!(self.state, MenuSessionState::Active) {
             return None;
         }
-        self.paused_remaining = self.deadline.map(|deadline| deadline.saturating_duration_since(at));
+        self.paused_remaining = self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(at));
         self.deadline = None;
-        self.state = MenuSessionState::Pending { execution, requested_control: None };
+        self.state = MenuSessionState::Pending {
+            execution,
+            requested_control: None,
+        };
         None
     }
 
@@ -191,7 +220,11 @@ impl MenuSession {
         success: bool,
         after_action: AfterAction,
     ) -> Option<MenuSessionOutput> {
-        let MenuSessionState::Pending { execution: current, requested_control } = self.state else {
+        let MenuSessionState::Pending {
+            execution: current,
+            requested_control,
+        } = self.state
+        else {
             return None;
         };
         if current != execution {
@@ -220,7 +253,11 @@ impl MenuSession {
         execution: ExecutionId,
         control: MenuControl,
     ) -> Option<MenuSessionOutput> {
-        let MenuSessionState::Pending { execution: current, requested_control: Some(requested) } = self.state else {
+        let MenuSessionState::Pending {
+            execution: current,
+            requested_control: Some(requested),
+        } = self.state
+        else {
             return None;
         };
         if current != execution || requested != control {
@@ -228,7 +265,7 @@ impl MenuSession {
         }
         self.resume_deadline(at);
         self.state = MenuSessionState::Active;
-        self.apply_control(control)
+        Some(self.apply_control(control))
     }
 
     fn open_submenu(&mut self, at: SessionInstant, menu: MenuId) -> Option<MenuSessionOutput> {
@@ -244,7 +281,7 @@ impl MenuSession {
         if matches!(self.state, MenuSessionState::Active)
             && self.deadline.is_some_and(|deadline| at >= deadline)
         {
-            self.dismiss()
+            Some(self.dismiss())
         } else {
             None
         }
@@ -252,30 +289,33 @@ impl MenuSession {
 
     fn apply_after_action(&mut self, after_action: AfterAction) -> Option<MenuSessionOutput> {
         match after_action {
-            AfterAction::Quit => self.dismiss(),
-            AfterAction::Return => self.apply_control(MenuControl::Return),
+            AfterAction::Quit => Some(self.dismiss()),
+            AfterAction::Return => Some(self.apply_control(MenuControl::Return)),
             AfterAction::Stay => None,
         }
     }
 
-    fn apply_control(&mut self, control: MenuControl) -> Option<MenuSessionOutput> {
+    fn apply_control(&mut self, control: MenuControl) -> MenuSessionOutput {
         match control {
             MenuControl::Quit => self.dismiss(),
             MenuControl::Return if self.stack.len() == 1 => self.dismiss(),
             MenuControl::Return => {
                 self.stack.pop();
-                Some(MenuSessionOutput::ReturnedTo(
-                    self.stack.last().expect("non-root return retains caller").clone(),
-                ))
+                MenuSessionOutput::ReturnedTo(
+                    self.stack
+                        .last()
+                        .expect("non-root return retains caller")
+                        .clone(),
+                )
             }
         }
     }
 
-    fn dismiss(&mut self) -> Option<MenuSessionOutput> {
+    fn dismiss(&mut self) -> MenuSessionOutput {
         self.deadline = None;
         self.paused_remaining = None;
         self.state = MenuSessionState::Dismissed;
-        Some(MenuSessionOutput::Dismissed)
+        MenuSessionOutput::Dismissed
     }
 
     fn reset_deadline(&mut self, at: SessionInstant) {
@@ -287,7 +327,10 @@ impl MenuSession {
     }
 
     fn resume_deadline(&mut self, at: SessionInstant) {
-        self.deadline = self.paused_remaining.take().and_then(|remaining| at.checked_add(remaining));
+        self.deadline = self
+            .paused_remaining
+            .take()
+            .and_then(|remaining| at.checked_add(remaining));
     }
 }
 
@@ -304,10 +347,16 @@ mod tests {
         let root = MenuId::new("main");
         let mut session = MenuSession::new(root.clone(), Some(Duration::from_secs(10)), at(0));
         assert_eq!(
-            session.handle(MenuSessionEvent::Key { at: at(9_999), input: MenuSessionInput::Unknown }),
+            session.handle(MenuSessionEvent::Key {
+                at: at(9_999),
+                input: MenuSessionInput::Unknown
+            }),
             Some(MenuSessionOutput::UnknownKeySwallowed)
         );
-        assert_eq!(session.handle(MenuSessionEvent::Tick { at: at(10_000) }), None);
+        assert_eq!(
+            session.handle(MenuSessionEvent::Tick { at: at(10_000) }),
+            None
+        );
         assert_eq!(session.current_menu(), Some(&root));
     }
 
@@ -316,7 +365,10 @@ mod tests {
         let root = MenuId::new("root");
         let mut session = MenuSession::new(root.clone(), None, at(0));
         assert!(matches!(
-            session.handle(MenuSessionEvent::OpenSubmenu { at: at(1), menu: MenuId::new("child") }),
+            session.handle(MenuSessionEvent::OpenSubmenu {
+                at: at(1),
+                menu: MenuId::new("child")
+            }),
             Some(MenuSessionOutput::NavigatedTo(_))
         ));
         assert_eq!(
@@ -330,8 +382,12 @@ mod tests {
 
     #[test]
     fn stale_completion_cannot_finish_later_execution() {
-        let mut session = MenuSession::new(MenuId::new("root"), Some(Duration::from_secs(10)), at(0));
-        session.handle(MenuSessionEvent::ActionPending { at: at(1), execution: ExecutionId(2) });
+        let mut session =
+            MenuSession::new(MenuId::new("root"), Some(Duration::from_secs(10)), at(0));
+        session.handle(MenuSessionEvent::ActionPending {
+            at: at(1),
+            execution: ExecutionId(2),
+        });
         assert_eq!(
             session.handle(MenuSessionEvent::ActionCompleted {
                 at: at(2),
@@ -341,7 +397,13 @@ mod tests {
             }),
             None
         );
-        assert!(matches!(session.state(), MenuSessionState::Pending { execution: ExecutionId(2), .. }));
+        assert!(matches!(
+            session.state(),
+            MenuSessionState::Pending {
+                execution: ExecutionId(2),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -359,8 +421,12 @@ mod tests {
 
     #[test]
     fn pending_control_wins_completion_race_and_resets_paused_timer() {
-        let mut session = MenuSession::new(MenuId::new("root"), Some(Duration::from_secs(10)), at(0));
-        session.handle(MenuSessionEvent::ActionPending { at: at(1), execution: ExecutionId(4) });
+        let mut session =
+            MenuSession::new(MenuId::new("root"), Some(Duration::from_secs(10)), at(0));
+        session.handle(MenuSessionEvent::ActionPending {
+            at: at(1),
+            execution: ExecutionId(4),
+        });
         session.handle(MenuSessionEvent::Key {
             at: at(2),
             input: MenuSessionInput::Unknown,

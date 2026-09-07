@@ -5,9 +5,10 @@ mod init;
 use std::{
     env,
     ffi::OsString,
+    future::Future,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -33,7 +34,7 @@ use muxe::cli::{
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    dispatch(Cli::parse()).await
+    Box::pin(dispatch(Cli::parse())).await
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
@@ -49,10 +50,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Compatibility(command) => compatibility(&command),
         Command::Purge(command) => purge(&command),
         Command::Menu(menu) => match menu.command {
-            MenuSubcommand::Open(open) => launch_menu(open).await,
+            MenuSubcommand::Open(open) => Box::pin(launch_menu(open)).await,
         },
         Command::Pane(pane) => match pane.command {
-            PaneSubcommand::Open(open) => launch_pane(open).await,
+            PaneSubcommand::Open(open) => Box::pin(launch_pane(open)).await,
         },
         Command::Ui(ui) => match ui.command {
             UiSubcommand::Menu(menu) => run_ui(menu).await,
@@ -772,6 +773,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     let recovery = Arc::new(JournalRecovery {
         journal_path: recovery_path,
         discovery_key: live_server.discovery_key.clone(),
+        zellij_exe: None,
     });
     let endpoint_path = endpoint.socket().display().to_string();
     // The held startup guard is consumed here, exactly like the Zellij path:
@@ -900,6 +902,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     let recovery = Arc::new(JournalRecovery {
         journal_path: recovery_path,
         discovery_key: live_server.discovery_key.clone(),
+        zellij_exe: Some(command.zellij_exe.clone()),
     });
     let bootstrap = match (command.handoff, command.activation_journal) {
         (None, None) => muxe_broker::ActivationBootstrap::Running { current },
@@ -1119,83 +1122,326 @@ async fn establish_initial_round_until(
     Err(color_eyre::eyre::eyre!("{last_error}"))
 }
 
+struct JournalRecoveryPermit {
+    path: PathBuf,
+    discovery_key: String,
+    lock: Mutex<Option<muxe::lifecycle::journal::UnitLock>>,
+}
+
+impl muxe_broker::RecoveryPermit for JournalRecoveryPermit {
+    fn acknowledge<'a>(
+        &'a self,
+        handoff: &'a muxe_protocol::control::HandoffId,
+        ack: muxe_broker::RecoveryAck,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut lock = self
+                .lock
+                .lock()
+                .map_err(|_| "recovery permit lock poisoned".to_owned())?;
+            let mut journal = muxe::lifecycle::journal::read_journal(&self.path)
+                .map_err(|error| format!("cannot read recovery journal for ack: {error}"))?;
+            let wanted = handoff_hex(handoff);
+            match ack {
+                muxe_broker::RecoveryAck::TargetRetired => {
+                    let target = journal
+                        .target_members
+                        .iter_mut()
+                        .find(|target| target.handoff_id.eq_ignore_ascii_case(&wanted))
+                        .ok_or_else(|| {
+                            "target handoff disappeared before retirement ACK".to_owned()
+                        })?;
+                    target.state = muxe::lifecycle::journal::TargetTransition::Retired;
+                }
+                muxe_broker::RecoveryAck::Resumed => {
+                    let member = journal
+                        .members
+                        .iter_mut()
+                        .find(|member| {
+                            member.host_identity == self.discovery_key
+                                && member
+                                    .handoff_id
+                                    .as_deref()
+                                    .is_some_and(|id| id.eq_ignore_ascii_case(&wanted))
+                        })
+                        .ok_or_else(|| "old handoff disappeared before resume ACK".to_owned())?;
+                    member.state = muxe::lifecycle::journal::MemberTransition::Resumed;
+                }
+                muxe_broker::RecoveryAck::Committed => {
+                    let member = journal
+                        .members
+                        .iter_mut()
+                        .find(|member| {
+                            member.host_identity == self.discovery_key
+                                && member
+                                    .handoff_id
+                                    .as_deref()
+                                    .is_some_and(|id| id.eq_ignore_ascii_case(&wanted))
+                        })
+                        .ok_or_else(|| "member disappeared before commit ACK".to_owned())?;
+                    member.state = muxe::lifecycle::journal::MemberTransition::Committed;
+                }
+            }
+            let complete = matches!(
+                journal.recovery,
+                muxe::lifecycle::journal::RecoveryPhase::RestoringOld
+            ) && journal.bridge_restored
+                && journal.members.iter().all(|member| {
+                    matches!(
+                        member.state,
+                        muxe::lifecycle::journal::MemberTransition::Resumed
+                    )
+                })
+                && journal.target_members.iter().all(|target| {
+                    matches!(
+                        target.state,
+                        muxe::lifecycle::journal::TargetTransition::Retired
+                    )
+                });
+            let cache_dir = self
+                .path
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| "recovery journal cache directory is missing".to_owned())?;
+            muxe::lifecycle::journal::write_journal(cache_dir, &journal)
+                .map_err(|error| format!("cannot persist recovery ack: {error}"))?;
+            if complete {
+                muxe::lifecycle::journal::remove_journal(&self.path).map_err(|error| {
+                    format!("cannot remove completed recovery journal: {error}")
+                })?;
+            }
+            lock.take();
+            Ok(())
+        })
+    }
+}
+
 /// Owner-side journal mapping for broker disconnect recovery.
 struct JournalRecovery {
     journal_path: Option<PathBuf>,
     discovery_key: String,
+    zellij_exe: Option<PathBuf>,
 }
 
 impl muxe_broker::RecoveryJournal for JournalRecovery {
-    fn recovery_view(
-        &self,
-        handoff: &muxe_protocol::control::HandoffId,
-    ) -> muxe_broker::RecoveryView {
-        let Some(path) = &self.journal_path else {
-            return muxe_broker::RecoveryView::absent();
-        };
-        if !path.exists() {
-            return muxe_broker::RecoveryView::absent();
-        }
-        let inconsistent = || muxe_broker::RecoveryView {
-            journal_present: true,
-            inconsistent: true,
-            member_ready: false,
-            target_live: false,
-            member_committed: false,
-            recover_after: Duration::ZERO,
-        };
-        let Ok(journal) = muxe::lifecycle::journal::read_journal(path) else {
-            return inconsistent();
-        };
-        let member = journal
-            .members
-            .iter()
-            .find(|member| member.host_identity == self.discovery_key);
-        let Some(member) = member else {
-            return inconsistent();
-        };
-        let wanted = handoff_hex(handoff);
-        if member
-            .handoff_id
-            .as_deref()
-            .is_none_or(|recorded| !recorded.eq_ignore_ascii_case(&wanted))
-        {
-            return inconsistent();
-        }
-        let (member_ready, member_committed) = match member.state {
-            muxe::lifecycle::journal::MemberTransition::Ready => (true, false),
-            muxe::lifecycle::journal::MemberTransition::Committed => (false, true),
-            _ => (false, false),
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        // Unit-consistent liveness (DESIGN 2215): an absent or incomplete target
-        // restores the complete old unit, never a per-member split. After durable
-        // Ready, every Ready member's recorded target must be live; a single dead
-        // target makes the unit incomplete for all members, so a live sibling
-        // target never owns completion alone. Probes are local socket connects
-        // (no cross-broker RPC) at map time, matching the registry probe.
-        let unit_live = matches!(journal.state, muxe::lifecycle::journal::JournalState::Ready)
-            && unit_ready_targets_live(&journal, &wanted);
-        let target_live = unit_live;
-        muxe_broker::RecoveryView {
-            journal_present: true,
-            inconsistent: false,
-            member_ready,
-            target_live,
-            member_committed,
-            recover_after: Duration::from_secs(journal.recovery_deadline.saturating_sub(now)),
-        }
+    #[expect(
+        clippy::too_many_lines,
+        reason = "journal recovery keeps lock acquisition, member census, artifact restoration, and permit publication in one auditable decision"
+    )]
+    fn recovery_decision<'a>(
+        &'a self,
+        handoff: &'a muxe_protocol::control::HandoffId,
+    ) -> std::pin::Pin<Box<dyn Future<Output = muxe_broker::RecoveryDecision> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(path) = &self.journal_path else {
+                return muxe_broker::RecoveryDecision::NoJournal;
+            };
+            if !path.exists() {
+                return muxe_broker::RecoveryDecision::NoJournal;
+            }
+            let lock_path = path.clone();
+            let lock = match tokio::task::spawn_blocking(move || {
+                muxe::lifecycle::journal::acquire_journal_lock_blocking(&lock_path)
+            })
+            .await
+            {
+                Ok(Ok(lock)) => lock,
+                Ok(Err(error)) => {
+                    return muxe_broker::RecoveryDecision::Preserve {
+                        reason: format!("recovery unit lock acquisition failed: {error}"),
+                    };
+                }
+                Err(error) => {
+                    return muxe_broker::RecoveryDecision::Preserve {
+                        reason: format!("recovery unit lock task failed: {error}"),
+                    };
+                }
+            };
+            let preserve = |reason: &str| muxe_broker::RecoveryDecision::Preserve {
+                reason: reason.to_owned(),
+            };
+            let Ok(mut journal) = muxe::lifecycle::journal::read_journal(path) else {
+                return preserve("activation journal is corrupt or inconsistent");
+            };
+            journal.refresh_target_members();
+            let Some(member) = journal
+                .members
+                .iter()
+                .find(|member| member.host_identity == self.discovery_key)
+            else {
+                return preserve("activation journal does not name this member");
+            };
+            let wanted = handoff_hex(handoff);
+            if member
+                .handoff_id
+                .as_deref()
+                .is_none_or(|recorded| !recorded.eq_ignore_ascii_case(&wanted))
+            {
+                return preserve("activation handoff does not match the recorded member");
+            }
+            let member_committed = matches!(
+                member.state,
+                muxe::lifecycle::journal::MemberTransition::Committed
+            );
+            let target_live =
+                matches!(journal.state, muxe::lifecycle::journal::JournalState::Ready)
+                    && unit_ready_targets_live(&journal).await;
+            if !target_live && !member_committed {
+                let targets = journal
+                    .members
+                    .iter()
+                    .filter_map(|member| {
+                        matches!(
+                            member.state,
+                            muxe::lifecycle::journal::MemberTransition::Ready
+                        )
+                        .then(|| member.target_socket.clone().zip(member.handoff_id.clone()))
+                        .flatten()
+                    })
+                    .collect::<Vec<_>>();
+                for (target_socket, target_handoff_hex) in targets {
+                    let Ok(target_handoff) =
+                        muxe::lifecycle::control::handoff_from_hex(&target_handoff_hex)
+                    else {
+                        return preserve("target handoff is malformed");
+                    };
+                    let Ok(mut control) =
+                        muxe::lifecycle::control::ControlClient::connect(&target_socket).await
+                    else {
+                        if target_socket.exists() {
+                            return preserve("recorded live target rejected control connection");
+                        }
+                        if let Some(target) = journal.target_members.iter_mut().find(|target| {
+                            target.handoff_id.eq_ignore_ascii_case(&target_handoff_hex)
+                        }) {
+                            target.state = muxe::lifecycle::journal::TargetTransition::Retired;
+                        }
+                        let cache_dir = path
+                            .parent()
+                            .and_then(Path::parent)
+                            .unwrap_or_else(|| Path::new("."));
+                        if let Err(error) =
+                            muxe::lifecycle::journal::write_journal(cache_dir, &journal)
+                        {
+                            return preserve(&format!(
+                                "absent target acknowledgement could not be persisted: {error}"
+                            ));
+                        }
+                        continue;
+                    };
+                    if let Err(error) = control.abort(target_handoff).await {
+                        return preserve(&format!("target retirement failed: {error}"));
+                    }
+                    if let Some(target) = journal
+                        .target_members
+                        .iter_mut()
+                        .find(|target| target.handoff_id.eq_ignore_ascii_case(&target_handoff_hex))
+                    {
+                        target.state = muxe::lifecycle::journal::TargetTransition::Retired;
+                    }
+                    let cache_dir = path
+                        .parent()
+                        .and_then(Path::parent)
+                        .unwrap_or_else(|| Path::new("."));
+                    if let Err(error) = muxe::lifecycle::journal::write_journal(cache_dir, &journal)
+                    {
+                        return preserve(&format!(
+                            "target retirement acknowledgement could not be persisted: {error}"
+                        ));
+                    }
+                }
+            }
+            if !target_live
+                && !member_committed
+                && matches!(
+                    journal.unit,
+                    muxe::lifecycle::journal::UnitKind::Zellij { .. }
+                )
+                && journal.backup_path.is_some()
+            {
+                journal.recovery = muxe::lifecycle::journal::RecoveryPhase::RestoringOld;
+                let restore = if let Some(program) = &self.zellij_exe {
+                    let reloader = muxe::lifecycle::ZellijCliReloader {
+                        program: Some(program.clone()),
+                    };
+                    muxe::lifecycle::activate::restore_recorded_bridge_and_reload(
+                        &mut journal,
+                        &reloader,
+                    )
+                } else {
+                    muxe::lifecycle::activate::restore_recorded_bridge_artifact(&mut journal)
+                };
+                if let Err(error) = restore {
+                    return preserve(&format!("bridge restore/reload failed: {error}"));
+                }
+                if let Err(error) =
+                    muxe::lifecycle::activate::restore_recorded_rollback_receipt(&journal)
+                {
+                    return preserve(&format!("receipt restore failed: {error}"));
+                }
+                let cache_dir = path
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or_else(|| Path::new("."));
+                if let Err(error) = muxe::lifecycle::journal::write_journal(cache_dir, &journal) {
+                    return preserve(&format!(
+                        "recovery artifact decision could not be persisted: {error}"
+                    ));
+                }
+            }
+            let permit = Arc::new(JournalRecoveryPermit {
+                path: path.clone(),
+                discovery_key: self.discovery_key.clone(),
+                lock: Mutex::new(Some(lock)),
+            });
+            if member_committed {
+                journal.recovery = muxe::lifecycle::journal::RecoveryPhase::Committed;
+                let cache_dir = path
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or_else(|| Path::new("."));
+                if let Err(error) = muxe::lifecycle::journal::write_journal(cache_dir, &journal) {
+                    return preserve(&format!("commit decision could not be persisted: {error}"));
+                }
+                return muxe_broker::RecoveryDecision::Committed {
+                    permit: Some(permit),
+                };
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let recover_after =
+                std::time::Duration::from_secs(journal.recovery_deadline.saturating_sub(now));
+            let target_live =
+                matches!(journal.state, muxe::lifecycle::journal::JournalState::Ready)
+                    && unit_ready_targets_live(&journal).await;
+            if target_live {
+                journal.recovery = muxe::lifecycle::journal::RecoveryPhase::TargetOwns;
+                let cache_dir = path
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or_else(|| Path::new("."));
+                if let Err(error) = muxe::lifecycle::journal::write_journal(cache_dir, &journal) {
+                    return preserve(&format!("target decision could not be persisted: {error}"));
+                }
+                muxe_broker::RecoveryDecision::TargetOwns {
+                    recover_after,
+                    permit: Some(permit),
+                }
+            } else {
+                muxe_broker::RecoveryDecision::RestoreOld {
+                    recover_after,
+                    permit: Some(permit),
+                }
+            }
+        })
     }
 }
-/// Reports whether every durable-Ready member's recorded target answers a local
-/// socket connect. A single silent Ready target makes the unit incomplete, so no
-/// member observes a live unit alone. Local connects only, never cross-broker RPC.
-fn unit_ready_targets_live(
-    journal: &muxe::lifecycle::journal::ActivationJournal,
-    wanted_handoff: &str,
-) -> bool {
+
+/// Probes every Ready member through its recorded target control socket. A
+/// durable Ready unit is complete only when every member answers with the
+/// recorded handoff, target record, live identity, and Running lifecycle.
+async fn unit_ready_targets_live(journal: &muxe::lifecycle::journal::ActivationJournal) -> bool {
     let mut covered_any = false;
     for member in &journal.members {
         if !matches!(
@@ -1204,21 +1450,31 @@ fn unit_ready_targets_live(
         ) {
             continue;
         }
-        let Some(recorded) = member.handoff_id.as_deref() else {
+        let (Some(socket), Some(handoff)) =
+            (member.target_socket.as_ref(), member.handoff_id.as_deref())
+        else {
             return false;
         };
-        if !recorded.eq_ignore_ascii_case(wanted_handoff) {
+        let Ok(expected_handoff) = muxe::lifecycle::control::handoff_from_hex(handoff) else {
+            return false;
+        };
+        let Ok(mut control) = muxe::lifecycle::control::ControlClient::connect(socket).await else {
+            return false;
+        };
+        let Ok(status) = control.status().await else {
+            return false;
+        };
+        if status.lifecycle != muxe_protocol::control::LifecycleState::Running
+            || status.current != journal.target_record
+            || status.handoff_id != Some(expected_handoff)
+            || status.live_server.discovery_key != member.host_identity
+        {
             return false;
         }
         covered_any = true;
-        let socket = member.target_socket.as_ref().unwrap_or(&member.old_socket);
-        if std::os::unix::net::UnixStream::connect(socket).is_err() {
-            return false;
-        }
     }
     covered_any
 }
-
 /// Lowercase hex for one nonce-sized byte string without per-byte `format!`.
 fn hex_bytes(bytes: &[u8]) -> String {
     const HEXDIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -1485,14 +1741,90 @@ async fn herdr_open_pane(
 /// move complete in seconds; the broker expires the token afterwards.
 const LAUNCH_TOKEN_LEASE_MILLIS: u32 = 60_000;
 
+async fn commit_herdr_ui_pane(
+    client: &mut muxe_broker::BrokerClient,
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
+    launch: muxe_adapter_herdr::UiPaneLaunch,
+    token: muxe_protocol::PendingLaunchToken,
+) -> Result<String> {
+    let prepared = muxe_adapter_herdr::prepare_ui_pane(runtime.client(), runtime.schema(), &launch)
+        .await
+        .map_err(|error| {
+            color_eyre::eyre::eyre!("could not prepare the requested Herdr UI pane: {error}")
+        })?;
+    let pane = muxe_protocol::HostPaneId::new(prepared.ui_pane.as_str());
+    let registration = client
+        .request(muxe_protocol::ClientRequest::RegisterPendingPane(
+            muxe_protocol::RegisterPendingPane {
+                token,
+                pane: pane.clone(),
+                temporary_tab: Some(muxe_protocol::HostTabId::new(
+                    prepared.temporary_tab.as_str(),
+                )),
+            },
+        ))
+        .await;
+    let registration_error = match registration {
+        Ok(muxe_protocol::BrokerResponse::PendingPaneRegistered) => None,
+        Ok(muxe_protocol::BrokerResponse::Error(diagnostic)) => {
+            Some(format!("broker rejected pane registration: {diagnostic:?}"))
+        }
+        Ok(response) => Some(format!(
+            "broker returned unexpected pane-registration response: {response:?}"
+        )),
+        Err(error) => Some(format!("could not register the placed UI pane: {error}")),
+    };
+    if let Some(error) = registration_error {
+        let cleanup = muxe_adapter_herdr::close_transient_tab(
+            runtime.client(),
+            runtime.schema(),
+            &prepared.temporary_tab,
+        )
+        .await;
+        return Err(match cleanup {
+            Ok(()) => color_eyre::eyre::eyre!("{error}"),
+            Err(cleanup_error) => color_eyre::eyre::eyre!(
+                "{error}; closing the temporary tab also failed: {cleanup_error}"
+            ),
+        });
+    }
+    let placement = muxe_adapter_herdr::move_prepared_ui_pane(
+        runtime.client(),
+        runtime.schema(),
+        &launch,
+        prepared,
+    )
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!("could not move the placed Herdr UI pane: {error}"))?;
+    match client
+        .request(muxe_protocol::ClientRequest::CommitUiLaunch(
+            muxe_protocol::CommitUiLaunch {
+                token,
+                pane: muxe_protocol::HostPaneId::new(placement.ui_pane.as_str()),
+            },
+        ))
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("could not commit the placed UI pane: {error}"))?
+    {
+        muxe_protocol::BrokerResponse::Acknowledged => {}
+        muxe_protocol::BrokerResponse::Error(diagnostic) => {
+            return Err(color_eyre::eyre::eyre!(
+                "broker rejected the placed UI pane commit: {diagnostic:?}"
+            ));
+        }
+        response => {
+            return Err(color_eyre::eyre::eyre!(
+                "broker returned unexpected UI pane commit response: {response:?}"
+            ));
+        }
+    }
+    Ok(placement.ui_pane.as_str().to_owned())
+}
+
 /// Opens a canonical UI pane through the broker-gated launch transaction:
 /// prepare a token with the live broker, create the pane carrying it, then
 /// register and commit. Any failure after prepare aborts best-effort so no
 /// minted token lingers.
-#[expect(
-    clippy::too_many_lines,
-    reason = "gated launch transaction: token prepare, pane creation, register, and commit with best-effort abort coupling form one ordered unit; splitting would scatter the lease and abort pairing"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "gated launch threads every participant handle through one prepare/create/register/commit chain; bundling would hide the coupling the transaction exists to pin"
@@ -1529,55 +1861,20 @@ async fn herdr_open_ui_pane(
         .last()
         .cloned()
         .ok_or_else(|| color_eyre::eyre::eyre!("Herdr UI launch requires a root argument"))?;
-    let commit_pane = async |client: &mut muxe_broker::BrokerClient,
-                             token: muxe_protocol::PendingLaunchToken| {
-        let placement = muxe_adapter_herdr::open_ui_pane(
-            runtime.client(),
-            runtime.schema(),
-            muxe_adapter_herdr::UiPaneLaunch {
-                origin_workspace: origin.workspace.clone(),
-                origin_tab: origin.tab.clone(),
-                origin_pane: origin.pane.clone(),
-                cwd,
-                argv,
-                bootstrap_env: bootstrap_env(&origin, token),
-                direction,
-                ratio,
-                focus: true,
-            },
-        )
-        .await
-        .map_err(|error| {
-            color_eyre::eyre::eyre!("could not open the requested Herdr UI pane: {error}")
-        })?;
-        let pane = muxe_protocol::HostPaneId::new(placement.ui_pane.as_str());
-        client
-            .request(muxe_protocol::ClientRequest::RegisterPendingPane(
-                muxe_protocol::RegisterPendingPane {
-                    token,
-                    pane: pane.clone(),
-                    temporary_tab: Some(muxe_protocol::HostTabId::new(
-                        placement.temporary_tab.as_str(),
-                    )),
-                },
-            ))
-            .await
-            .map_err(|error| {
-                color_eyre::eyre::eyre!("could not register the placed UI pane: {error}")
-            })?;
-        client
-            .request(muxe_protocol::ClientRequest::CommitUiLaunch(
-                muxe_protocol::CommitUiLaunch { token, pane },
-            ))
-            .await
-            .map_err(|error| {
-                color_eyre::eyre::eyre!("could not commit the placed UI pane: {error}")
-            })?;
-        Ok::<String, color_eyre::eyre::Error>(placement.ui_pane.as_str().to_owned())
-    };
     let mut client = launcher_client(cache_dir, config_file, runtime).await?;
     let token = prepare_ui_launch(&mut client, cache_dir, &origin, &root).await?;
-    match commit_pane(&mut client, token).await {
+    let launch = muxe_adapter_herdr::UiPaneLaunch {
+        origin_workspace: origin.workspace.clone(),
+        origin_tab: origin.tab.clone(),
+        origin_pane: origin.pane.clone(),
+        cwd,
+        argv,
+        bootstrap_env: bootstrap_env(&origin, token),
+        direction,
+        ratio,
+        focus: true,
+    };
+    match commit_herdr_ui_pane(&mut client, runtime, launch, token).await {
         Ok(pane) => {
             if let Ok(event) = muxe::logging::LogEvent::new(
                 env!("CARGO_PKG_VERSION"),
@@ -2449,18 +2746,20 @@ mod tests {
     /// Production disconnect mapping is unit-consistent (DESIGN 2215): one dead
     /// Ready target makes every member observe an incomplete unit, never a
     /// per-member split where oldA restores while oldB stands down.
-    #[test]
-    fn journal_recovery_reports_unit_incomplete_when_one_target_is_dead() {
+    #[tokio::test]
+    async fn journal_recovery_reports_unit_incomplete_when_one_target_is_dead() {
         use muxe::lifecycle::journal::{
             ActivationJournal, JournalState, MemberState, MemberTransition, UnitKind,
         };
-        use muxe_broker::RecoveryJournal;
+        use muxe_broker::{RecoveryDecision, RecoveryJournal};
         use muxe_protocol::control::{CompatibilityRecord, HandoffId};
         let cache = tempfile::tempdir().expect("owned recovery cache");
         let cache_dir = cache.path().join("cache");
         std::fs::create_dir_all(&cache_dir).expect("cache exists");
         let handoff = HandoffId([23; 16]);
         let wanted = handoff_hex(&handoff);
+        let handoff_b = HandoffId([24; 16]);
+        let wanted_b = handoff_hex(&handoff_b);
         let record = CompatibilityRecord {
             muxe_version: "9.9.9".to_owned(),
             target_triple: "test-triple".to_owned(),
@@ -2470,8 +2769,7 @@ mod tests {
         };
         let socket_a = cache.path().join("a.sock");
         let socket_b = cache.path().join("b.sock");
-        // B lives; A is absent (no listener on its target path).
-        let _live_b = std::os::unix::net::UnixListener::bind(&socket_b).expect("bind B");
+        std::fs::write(&socket_b, b"foreign socket").expect("write foreign B endpoint");
         let members = vec![
             MemberState {
                 host_identity: "session-a".to_owned(),
@@ -2484,7 +2782,7 @@ mod tests {
                 host_identity: "session-b".to_owned(),
                 old_socket: socket_b.clone(),
                 target_socket: Some(socket_b),
-                handoff_id: Some(wanted),
+                handoff_id: Some(wanted_b),
                 state: MemberTransition::Ready,
             },
         ];
@@ -2499,34 +2797,15 @@ mod tests {
         journal.state = JournalState::Ready;
         let path = muxe::lifecycle::journal::write_journal(&cache_dir, &journal)
             .expect("write Ready journal");
-        for discovery in ["session-a", "session-b"] {
-            let view = JournalRecovery {
-                journal_path: Some(path.clone()),
-                discovery_key: discovery.to_owned(),
-            }
-            .recovery_view(&handoff);
-            assert!(!view.inconsistent, "{discovery} maps a known handoff");
-            assert!(view.journal_present, "{discovery} observes the journal");
-            assert!(view.member_ready, "{discovery} is Ready");
-            assert!(
-                !view.target_live,
-                "{discovery} observes unit-incomplete while A is dead"
-            );
+        let decision = JournalRecovery {
+            journal_path: Some(path.clone()),
+            discovery_key: "session-a".to_owned(),
+            zellij_exe: None,
         }
-        // Both live: the unit completes for every member.
-        let _live_a = std::os::unix::net::UnixListener::bind(&socket_a).expect("bind A");
-        for discovery in ["session-a", "session-b"] {
-            let view = JournalRecovery {
-                journal_path: Some(path.clone()),
-                discovery_key: discovery.to_owned(),
-            }
-            .recovery_view(&handoff);
-            assert!(view.member_ready, "{discovery} stays Ready");
-            assert!(
-                view.target_live,
-                "{discovery} observes unit-live when both answer"
-            );
-        }
+        .recovery_decision(&handoff)
+        .await;
+        assert!(matches!(decision, RecoveryDecision::Preserve { .. }));
+        drop(decision);
     }
 }
 #[cfg(test)]
@@ -3011,5 +3290,598 @@ mod consumer_tests {
             )
             .is_err()
         );
+    }
+}
+#[cfg(test)]
+mod mixed_recovery_production_tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, path::Path, sync::Arc, time::Duration};
+
+    use async_trait::async_trait;
+    use muxe_adapter_api::{
+        AdapterCapabilities, AdapterError, AdapterHealthEvent, CaptureLease, CaptureReleaseReason,
+        CaptureRequest, DispatchAccepted, HostAdapter, HostIdentity, KeyboardCapabilities,
+        ModalScopeId, NativeDispatchRequest, OriginCaptureRequest, PendingPaneLease,
+        PendingPaneRegistration, PortableDispatchRequest,
+    };
+    use muxe_core::{
+        ActionValidation, ActionValidator, CompiledConfig, CompiledGeneration, ConfigDiagnostic,
+        KeyCapabilities, OriginContext, SourceId,
+    };
+    use muxe_protocol::{
+        control::{CompatibilityRecord, ZellijCompatibility},
+        wire::{HostKind, LiveServerIdentity, SchemaFingerprint, ServerId},
+    };
+    use sha2::{Digest, Sha256};
+    use tokio::sync::watch;
+
+    use super::{JournalRecovery, handoff_hex};
+
+    struct ShutdownGate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct RecoveryAdapter {
+        discovery_key: String,
+        shutdown_gate: Option<Arc<ShutdownGate>>,
+        resume_gate: Option<Arc<ShutdownGate>>,
+    }
+
+    impl ActionValidator for RecoveryAdapter {
+        fn validate_portable(
+            &self,
+            _action: &muxe_core::PortableAction,
+            _span: &muxe_core::SourceSpan,
+        ) -> Result<ActionValidation, ConfigDiagnostic> {
+            Ok(ActionValidation {
+                execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+            })
+        }
+
+        fn validate_native_batch(
+            &self,
+            candidates: &[&muxe_core::NativeActionCandidate],
+        ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+            Ok(vec![
+                ActionValidation {
+                    execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                };
+                candidates.len()
+            ])
+        }
+    }
+
+    #[async_trait]
+    impl HostAdapter for RecoveryAdapter {
+        async fn identity(&self) -> Result<HostIdentity, AdapterError> {
+            Ok(HostIdentity {
+                kind: muxe_adapter_api::HostKind::Zellij,
+                discovery_key: self.discovery_key.clone(),
+                live_server_id: format!("server-{}", self.discovery_key),
+            })
+        }
+
+        async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
+            Ok(AdapterCapabilities {
+                keyboard: KeyboardCapabilities {
+                    kitty_baseline: false,
+                    kitty_event_types: false,
+                    kitty_alternate_keys: false,
+                    kitty_all_keys_as_escape_codes: false,
+                },
+                supports_capture: false,
+                supports_notifications: false,
+                supports_native_cancellation: false,
+            })
+        }
+
+        async fn modal_scope(
+            &self,
+            _pane: &muxe_core::PaneId,
+        ) -> Result<ModalScopeId, AdapterError> {
+            Ok(ModalScopeId::new("recovery-scope"))
+        }
+
+        async fn register_pending_pane(
+            &self,
+            registration: PendingPaneRegistration,
+        ) -> Result<PendingPaneLease, AdapterError> {
+            Ok(PendingPaneLease {
+                id: muxe_adapter_api::PendingPaneLeaseId::new(registration.ui_session.as_str()),
+                ui_session: registration.ui_session,
+            })
+        }
+
+        async fn close_pending_pane(
+            &self,
+            _registration: PendingPaneRegistration,
+            _lease: PendingPaneLease,
+        ) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn release_pending_pane(&self, _lease: PendingPaneLease) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn end_capture(
+            &self,
+            _lease: CaptureLease,
+            _reason: CaptureReleaseReason,
+        ) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn begin_capture(
+            &self,
+            _request: CaptureRequest,
+        ) -> Result<CaptureLease, AdapterError> {
+            Err(AdapterError::new(
+                muxe_adapter_api::AdapterErrorKind::Unsupported,
+                "recovery test does not attach UI",
+            ))
+        }
+
+        async fn capture_origin(
+            &self,
+            _request: OriginCaptureRequest,
+        ) -> Result<OriginContext, AdapterError> {
+            Err(AdapterError::new(
+                muxe_adapter_api::AdapterErrorKind::Unsupported,
+                "recovery test does not capture UI origin",
+            ))
+        }
+
+        async fn dispatch_portable(
+            &self,
+            _request: PortableDispatchRequest,
+        ) -> Result<DispatchAccepted, AdapterError> {
+            Err(AdapterError::new(
+                muxe_adapter_api::AdapterErrorKind::Unsupported,
+                "recovery test does not dispatch",
+            ))
+        }
+
+        async fn dispatch_native(
+            &self,
+            _request: NativeDispatchRequest,
+        ) -> Result<DispatchAccepted, AdapterError> {
+            Err(AdapterError::new(
+                muxe_adapter_api::AdapterErrorKind::Unsupported,
+                "recovery test does not dispatch",
+            ))
+        }
+
+        async fn cancel(&self, _execution: muxe_core::ExecutionId) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn next_health_event(&self) -> Result<AdapterHealthEvent, AdapterError> {
+            std::future::pending().await
+        }
+
+        async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
+            if let Some(gate) = &self.resume_gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), AdapterError> {
+            if let Some(gate) = &self.shutdown_gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    fn compiled_config() -> CompiledConfig {
+        muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("recovery-test.yml"),
+            "version: 1\nsettings:\n  reload:\n    watch: false\nmenus:\n  main:\n    bindings:\n      q:\n        label: quit\n        action: config:reload\n",
+            KeyCapabilities::default(),
+            None,
+        )
+        .expect("minimal recovery config compiles")
+    }
+
+    fn record(version: &str) -> CompatibilityRecord {
+        CompatibilityRecord {
+            muxe_version: version.to_owned(),
+            target_triple: "test-triple".to_owned(),
+            application_schema_fingerprint: SchemaFingerprint([1; 32]),
+            zellij: Some(ZellijCompatibility {
+                source_revision: "fixture".to_owned(),
+                generated_action_fingerprint: SchemaFingerprint([2; 32]),
+                bridge_protocol_fingerprint: SchemaFingerprint([3; 32]),
+                bridge_build_id: Some(SchemaFingerprint([4; 32])),
+            }),
+            herdr: None,
+        }
+    }
+    fn digest(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn identity(key: &str) -> LiveServerIdentity {
+        LiveServerIdentity {
+            host: HostKind::Zellij,
+            discovery_key: key.to_owned(),
+            server_id: ServerId::new(format!("server-{key}")),
+        }
+    }
+    async fn wait_for_journal_removed(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !path.exists() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "journal was not removed after all observable old resumes: {:?}",
+                muxe::lifecycle::journal::read_journal(path)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_socket(path: &Path, expected: bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if path.exists() == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "socket {} did not reach expected presence={expected}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    async fn wait_for_old_status(
+        socket: &Path,
+        discovery_key: &str,
+        expected_record: &CompatibilityRecord,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut last: String;
+        loop {
+            match muxe::lifecycle::control::ControlClient::connect(socket).await {
+                Ok(mut control) => match control.status().await {
+                    Ok(status) => {
+                        last = format!(
+                            "lifecycle={:?} discovery={} current={:?}",
+                            status.lifecycle, status.live_server.discovery_key, status.current
+                        );
+                        if status.lifecycle == muxe_protocol::control::LifecycleState::Running
+                            && status.live_server.discovery_key == discovery_key
+                            && status.current == *expected_record
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => last = format!("status error: {error}"),
+                },
+                Err(error) => last = format!("connect error: {error}"),
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "old broker {discovery_key} did not report Running with its recorded old identity: {last}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "host-free mixed recovery proof keeps child lifecycle, retained sessions, journal permits, and artifact witnesses in one auditable scenario"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_journal_recovery_restores_mixed_ready_unit_after_disconnect() {
+        let root = tempfile::tempdir().expect("owned recovery root");
+        let cache_dir = root.path().join("cache");
+        let runtime_dir = root.path().join("runtime");
+        let config_path = root.path().join("config.yml");
+        fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure recovery root");
+        fs::create_dir_all(&cache_dir).expect("cache directory");
+        fs::write(
+            &config_path,
+            "version: 1\nsettings:\n  reload:\n    watch: false\nmenus: {}\n",
+        )
+        .expect("config file");
+        let fake_zellij = root.path().join("zellij-reloader");
+        let reload_log = root.path().join("reload.log");
+        fs::write(
+            &fake_zellij,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                reload_log.display()
+            ),
+        )
+        .expect("write owned fake Zellij reloader");
+        fs::set_permissions(&fake_zellij, std::fs::Permissions::from_mode(0o700))
+            .expect("make owned fake reloader executable");
+
+        let stable = root.path().join("muxe-zellij.wasm");
+        let previous = root.path().join("muxe-zellij.wasm.previous");
+        let old_bridge = b"old bridge bytes";
+        let target_bridge = b"target bridge bytes";
+        fs::write(&stable, target_bridge).expect("target bridge installed");
+        fs::write(&previous, old_bridge).expect("old bridge backup");
+        muxe::integration::receipt::store(
+            root.path(),
+            &muxe::integration::receipt::Receipt {
+                schema_version: muxe::integration::receipt::RECEIPT_SCHEMA_VERSION,
+                bridge: muxe::integration::receipt::BridgeRecord {
+                    canonical_path: stable.clone(),
+                    installed_version: "target".to_owned(),
+                    installed_digest: digest(target_bridge),
+                    previous_digest: Some(digest(old_bridge)),
+                    bridge_compat: record("target").zellij,
+                },
+                configs: Vec::new(),
+            },
+        )
+        .expect("target receipt");
+
+        let old_record = record("old");
+        let target_record = record("target");
+        let endpoint_old_a =
+            muxe_broker::RuntimeEndpoint::in_runtime_dir(&runtime_dir, HostKind::Zellij, "old-a")
+                .expect("old A endpoint");
+        let endpoint_old_b =
+            muxe_broker::RuntimeEndpoint::in_runtime_dir(&runtime_dir, HostKind::Zellij, "old-b")
+                .expect("old B endpoint");
+        let endpoint_target_a = muxe_broker::RuntimeEndpoint::in_runtime_dir(
+            &runtime_dir,
+            HostKind::Zellij,
+            "target-a",
+        )
+        .expect("target A endpoint");
+        let endpoint_target_b = muxe_broker::RuntimeEndpoint::in_runtime_dir(
+            &runtime_dir,
+            HostKind::Zellij,
+            "target-b",
+        )
+        .expect("target B endpoint");
+
+        let resume_gate_a = Arc::new(ShutdownGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let resume_gate_b = Arc::new(ShutdownGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let adapter_a = Arc::new(RecoveryAdapter {
+            discovery_key: "old-a".to_owned(),
+            shutdown_gate: None,
+            resume_gate: Some(Arc::clone(&resume_gate_a)),
+        });
+        let adapter_b = Arc::new(RecoveryAdapter {
+            discovery_key: "old-b".to_owned(),
+            shutdown_gate: None,
+            resume_gate: Some(Arc::clone(&resume_gate_b)),
+        });
+        let old_a = muxe_broker::Broker::from_compiled(adapter_a, &config_path, compiled_config());
+        let old_b = muxe_broker::Broker::from_compiled(adapter_b, &config_path, compiled_config());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let journal_path = muxe::lifecycle::journal::activation_dir(&cache_dir)
+            .join("zellij-mixed-production.json");
+        let server_a = muxe_broker::BrokerServer::start_activation(
+            Arc::clone(&old_a),
+            endpoint_old_a.clone(),
+            muxe_broker::ActivationBootstrap::Running {
+                current: old_record.clone(),
+            },
+            Some(Arc::new(JournalRecovery {
+                journal_path: Some(journal_path.clone()),
+                discovery_key: "old-a".to_owned(),
+                zellij_exe: Some(fake_zellij.clone()),
+            })),
+        )
+        .await
+        .expect("old A production server");
+        let server_b = muxe_broker::BrokerServer::start_activation(
+            Arc::clone(&old_b),
+            endpoint_old_b.clone(),
+            muxe_broker::ActivationBootstrap::Running {
+                current: old_record.clone(),
+            },
+            Some(Arc::new(JournalRecovery {
+                journal_path: Some(journal_path.clone()),
+                discovery_key: "old-b".to_owned(),
+                zellij_exe: Some(fake_zellij.clone()),
+            })),
+        )
+        .await
+        .expect("old B production server");
+        let task_a = tokio::spawn(server_a.run(shutdown_rx.clone()));
+        let task_b = tokio::spawn(server_b.run(shutdown_rx.clone()));
+
+        let mut control_a =
+            muxe::lifecycle::control::ControlClient::connect(endpoint_old_a.socket())
+                .await
+                .expect("old A coordinator stream");
+        let mut control_b =
+            muxe::lifecycle::control::ControlClient::connect(endpoint_old_b.socket())
+                .await
+                .expect("old B coordinator stream");
+        let status_a = control_a
+            .prepare(target_record.clone())
+            .await
+            .expect("old A prepared");
+        let status_b = control_b
+            .prepare(target_record.clone())
+            .await
+            .expect("old B prepared");
+        let handoff_a = status_a.handoff_id.expect("old A handoff");
+        let handoff_b = status_b.handoff_id.expect("old B handoff");
+
+        let members = vec![
+            muxe::lifecycle::journal::MemberState {
+                host_identity: "old-a".to_owned(),
+                old_socket: endpoint_old_a.socket().to_path_buf(),
+                target_socket: Some(endpoint_target_a.socket().to_path_buf()),
+                handoff_id: Some(handoff_hex(&handoff_a)),
+                state: muxe::lifecycle::journal::MemberTransition::Ready,
+            },
+            muxe::lifecycle::journal::MemberState {
+                host_identity: "old-b".to_owned(),
+                old_socket: endpoint_old_b.socket().to_path_buf(),
+                target_socket: Some(endpoint_target_b.socket().to_path_buf()),
+                handoff_id: Some(handoff_hex(&handoff_b)),
+                state: muxe::lifecycle::journal::MemberTransition::Ready,
+            },
+        ];
+        let mut journal = muxe::lifecycle::journal::ActivationJournal::new(
+            muxe::lifecycle::journal::UnitKind::Zellij {
+                bridge_path_hash: "mixed-production".to_owned(),
+            },
+            old_record.clone(),
+            target_record.clone(),
+            members,
+        );
+        journal.state = muxe::lifecycle::journal::JournalState::Ready;
+        journal.old_bridge_digest = Some(digest(old_bridge));
+        journal.staged_bridge_digest = Some(digest(target_bridge));
+        journal.backup_path = Some(previous.clone());
+        journal.recovery_deadline = 0;
+        let written_path =
+            muxe::lifecycle::journal::write_journal(&cache_dir, &journal).expect("Ready journal");
+        assert_eq!(written_path, journal_path);
+
+        let shutdown_gate = Arc::new(ShutdownGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let target_b = muxe_broker::Broker::from_compiled(
+            Arc::new(RecoveryAdapter {
+                discovery_key: "old-b".to_owned(),
+                shutdown_gate: Some(Arc::clone(&shutdown_gate)),
+                resume_gate: None,
+            }),
+            &config_path,
+            compiled_config(),
+        );
+        let target_server_b = muxe_broker::BrokerServer::start_activation(
+            Arc::clone(&target_b),
+            endpoint_target_b.clone(),
+            muxe_broker::ActivationBootstrap::Target {
+                current: target_record,
+                handoff: handoff_b,
+                live_server: identity("old-b"),
+            },
+            Some(Arc::new(JournalRecovery {
+                journal_path: Some(journal_path.clone()),
+                discovery_key: "old-b".to_owned(),
+                zellij_exe: Some(fake_zellij.clone()),
+            })),
+        )
+        .await
+        .expect("target B production server");
+        let target_task = tokio::spawn(target_server_b.run(shutdown_rx.clone()));
+
+        let mut target_control =
+            muxe::lifecycle::control::ControlClient::connect(endpoint_target_b.socket())
+                .await
+                .expect("target B coordinator stream");
+        target_control.status().await.expect("target B status");
+
+        drop(control_a);
+        drop(control_b);
+        tokio::time::timeout(Duration::from_secs(5), shutdown_gate.entered.notified())
+            .await
+            .expect("owner must issue target B stop before old resume");
+        assert!(
+            !endpoint_old_a.socket().exists(),
+            "old A remains drained at stop barrier"
+        );
+        assert!(
+            !endpoint_old_b.socket().exists(),
+            "old B remains drained at stop barrier"
+        );
+        assert!(
+            muxe::lifecycle::journal::acquire_unit_lock(
+                &cache_dir,
+                &muxe::lifecycle::journal::UnitKind::Zellij {
+                    bridge_path_hash: "mixed-production".to_owned(),
+                },
+            )
+            .is_err(),
+            "unit lock must remain held through target retirement barrier"
+        );
+        assert!(
+            journal_path.exists(),
+            "journal remains present while old resume ACKs are pending"
+        );
+        shutdown_gate.release.notify_one();
+        wait_for_socket(endpoint_target_b.socket(), false).await;
+        drop(target_control);
+        if tokio::time::timeout(Duration::from_mins(1), resume_gate_a.entered.notified())
+            .await
+            .is_err()
+        {
+            panic!(
+                "old A resume barrier entered: {:?}",
+                muxe::lifecycle::journal::read_journal(&journal_path)
+            );
+        }
+        assert!(
+            muxe::lifecycle::journal::acquire_unit_lock(
+                &cache_dir,
+                &muxe::lifecycle::journal::UnitKind::Zellij {
+                    bridge_path_hash: "mixed-production".to_owned(),
+                },
+            )
+            .is_err(),
+            "unit lock remains held through local resume ACK barrier"
+        );
+        resume_gate_a.release.notify_one();
+        wait_for_old_status(endpoint_old_a.socket(), "old-a", &old_record).await;
+        tokio::time::timeout(Duration::from_secs(5), resume_gate_b.entered.notified())
+            .await
+            .expect("old B resume barrier entered");
+        assert!(journal_path.exists(), "journal remains until old B ACK");
+        resume_gate_b.release.notify_one();
+        wait_for_old_status(endpoint_old_b.socket(), "old-b", &old_record).await;
+        wait_for_journal_removed(&journal_path).await;
+        assert_eq!(
+            fs::read(&stable).expect("restored bridge"),
+            old_bridge,
+            "recorded backup must restore the shared bridge"
+        );
+        let receipt = muxe::integration::receipt::load(root.path())
+            .expect("restored receipt readable")
+            .expect("restored receipt present");
+        assert_eq!(receipt.bridge.canonical_path, stable);
+        assert_eq!(receipt.bridge.installed_digest, digest(old_bridge));
+        assert_eq!(
+            receipt.bridge.previous_digest,
+            Some(digest(target_bridge)),
+            "receipt retains rotated target authority after rollback"
+        );
+        let reloads = fs::read_to_string(&reload_log).expect("owned reloader recorded sessions");
+        assert_eq!(
+            reloads.lines().count(),
+            2,
+            "every recorded session must be reloaded exactly once"
+        );
+        assert!(reloads.lines().any(|line| line.contains("--session old-a")));
+        assert!(reloads.lines().any(|line| line.contains("--session old-b")));
+
+        shutdown_tx.send(true).expect("shutdown servers");
+        let _ = tokio::join!(task_a, task_b, target_task);
     }
 }

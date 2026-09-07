@@ -45,6 +45,12 @@ impl HerdrRuntime {
     /// Acquires one runtime schema from the configured executable, verifies protocol compatibility,
     /// records its normalized cache key, and probes the exact server currently accepting at
     /// `socket_path`. The resulting OS observation is not continuity authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdapterError` when the schema binary cannot be executed, the live
+    /// schema is incompatible, the cache cannot be updated, or the server cannot
+    /// be probed.
     pub async fn connect(config: HerdrAdapterConfig) -> Result<Self, AdapterError> {
         let raw_schema = runtime_schema(&config.herdr_binary).await?;
         let (protocol, schema_version) = ApiSchema::metadata(&raw_schema).map_err(|error| {
@@ -68,9 +74,10 @@ impl HerdrRuntime {
                 "Herdr runtime-schema cache returned an invalid normalized request representation: {error}"
             ))
         })?;
-        let schema = ApiSchema::parse_with_request(raw_schema, &normalized_request).map_err(
-            |error| incompatible(format!("installed Herdr API schema is invalid: {error}")),
-        )?;
+        let schema =
+            ApiSchema::parse_with_request(raw_schema, &normalized_request).map_err(|error| {
+                incompatible(format!("installed Herdr API schema is invalid: {error}"))
+            })?;
 
         let client = Arc::new(HerdrSocketClient::new(config.socket_path.clone()));
         let (identity, endpoint) = probe_endpoint_identity(&client).await?;
@@ -83,20 +90,24 @@ impl HerdrRuntime {
         })
     }
 
+    #[must_use]
     pub fn client(&self) -> &Arc<HerdrSocketClient> {
         &self.client
     }
 
+    #[must_use]
     pub fn schema(&self) -> &Arc<ApiSchema> {
         &self.schema
     }
 
     /// Whether this connection parsed the cache-verified normalized request representation rather
     /// than freshly canonicalizing the same request surface.
+    #[must_use]
     pub fn used_cached_schema_representation(&self) -> bool {
         self.schema_cache_hit
     }
 
+    #[must_use]
     pub fn identity(&self) -> &HostIdentity {
         &self.identity
     }
@@ -108,6 +119,7 @@ impl HerdrRuntime {
     /// record proves nothing on its own (inode numbers may be recycled); the
     /// continuity authority is the retained subscription stream plus a new local
     /// epoch after any loss.
+    #[must_use]
     pub fn endpoint(&self) -> &EndpointIdentity {
         &self.endpoint
     }
@@ -143,46 +155,45 @@ async fn runtime_schema_with_timeouts(
             )
         })?;
     let outcome = tokio::time::timeout(schema_timeout, collect_schema_output(&mut child)).await;
-    let (status, stdout, diagnostics) = match outcome {
-        Ok(collected) => collected?,
-        Err(_) => {
-            // Explicitly signal and then reap exactly this retained child handle. There is no
-            // name or PID search, no process-group signal, and no global cleanup.
-            // `kill_on_drop` remains only as a backstop. A failed kill or reap is surfaced
-            // instead of pretending the owned child is gone.
-            child.start_kill().map_err(|error| {
-                AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    format!("could not kill timed-out Herdr schema child: {error}"),
-                )
-            })?;
-            match tokio::time::timeout(reap_timeout, child.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return Err(AdapterError::new(
-                        AdapterErrorKind::Unavailable,
-                        format!("could not reap timed-out Herdr schema child: {error}"),
-                    ));
-                }
-                Err(_) => {
-                    return Err(AdapterError::new(
-                        AdapterErrorKind::Unavailable,
-                        format!(
-                            "timed out after {}s while reaping the owned Herdr schema child",
-                            reap_timeout.as_secs()
-                        ),
-                    ));
-                }
-            }
-            return Err(AdapterError::new(
+    let (status, stdout, diagnostics) = if let Ok(collected) = outcome {
+        collected?
+    } else {
+        // Explicitly signal and then reap exactly this retained child handle. There is no
+        // name or PID search, no process-group signal, and no global cleanup.
+        // `kill_on_drop` remains only as a backstop. A failed kill or reap is surfaced
+        // instead of pretending the owned child is gone.
+        child.start_kill().map_err(|error| {
+            AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                format!(
-                    "{} api schema --json timed out after {}s",
-                    binary.display(),
-                    schema_timeout.as_secs()
-                ),
-            ));
+                format!("could not kill timed-out Herdr schema child: {error}"),
+            )
+        })?;
+        match tokio::time::timeout(reap_timeout, child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    format!("could not reap timed-out Herdr schema child: {error}"),
+                ));
+            }
+            Err(_) => {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    format!(
+                        "timed out after {}s while reaping the owned Herdr schema child",
+                        reap_timeout.as_secs()
+                    ),
+                ));
+            }
         }
+        return Err(AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            format!(
+                "{} api schema --json timed out after {}s",
+                binary.display(),
+                schema_timeout.as_secs()
+            ),
+        ));
     };
     if !status.success() {
         return Err(AdapterError::new(
@@ -257,14 +268,27 @@ async fn collect_schema_output(
     Ok((status, schema, diagnostics))
 }
 
+/// Probes the live server and returns its opaque host identity.
+///
+/// # Errors
+///
+/// Returns `AdapterError` when the ping is rejected, the schema does not declare
+/// it, or the endpoint cannot be observed.
 pub async fn probe_live_identity(client: &HerdrSocketClient) -> Result<HostIdentity, AdapterError> {
-    probe_endpoint_identity(client).await.map(|(identity, _)| identity)
+    probe_endpoint_identity(client)
+        .await
+        .map(|(identity, _)| identity)
 }
 
 /// Probes the live server and returns its opaque host identity together with an OS-visible
 /// endpoint observation. An observed inequality can prove replacement even when the
 /// replacement reports the same protocol and version on the same socket path. Equality
 /// never proves continuity; the retained subscription stream and local epoch do.
+///
+/// # Errors
+///
+/// Returns `AdapterError` when the ping metadata is missing, the server rejects
+/// the ping, the protocol mismatches, or the endpoint cannot be observed.
 pub async fn probe_endpoint_identity(
     client: &HerdrSocketClient,
 ) -> Result<(HostIdentity, EndpointIdentity), AdapterError> {
@@ -273,7 +297,7 @@ pub async fn probe_endpoint_identity(
     let result = match client
         .unary(metadata, Value::Object(Map::new()))
         .await
-        .map_err(socket_error)?
+        .map_err(|error| socket_error(&error))?
     {
         HerdrResponse::Success(result) => result,
         HerdrResponse::Error { code, message } => {
@@ -283,19 +307,23 @@ pub async fn probe_endpoint_identity(
             ));
         }
     };
-    let endpoint = client.probe_endpoint().await.map_err(socket_error)?;
-    let identity = identity_from_ping_result(
-        client.socket().display().to_string(),
-        &endpoint,
-        result,
-    )?;
+    let endpoint = client
+        .probe_endpoint()
+        .await
+        .map_err(|error| socket_error(&error))?;
+    let identity =
+        identity_from_ping_result(client.socket().display().to_string(), &endpoint, &result)?;
     Ok((identity, endpoint))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
 fn identity_from_ping_result(
     discovery_key: String,
     endpoint: &EndpointIdentity,
-    result: Value,
+    result: &Value,
 ) -> Result<HostIdentity, AdapterError> {
     let object = result
         .as_object()
@@ -329,6 +357,21 @@ fn identity_from_ping_result(
     })
 }
 
+fn socket_error(error: &SocketError) -> AdapterError {
+    AdapterError::new(
+        if error.delivery() == DeliveryState::MayHaveReachedHost {
+            AdapterErrorKind::OutcomeUnknown
+        } else {
+            AdapterErrorKind::Unavailable
+        },
+        error.to_string(),
+    )
+}
+
+fn incompatible(message: impl Into<String>) -> AdapterError {
+    AdapterError::new(AdapterErrorKind::Incompatible, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,9 +392,8 @@ mod tests {
     async fn pong_identity_binds_to_endpoint_incarnation() {
         let temp = tempfile::TempDir::new().unwrap();
         let endpoint = capture_at(&temp.path().join("herdr.sock")).await;
-        let identity =
-            identity_from_ping_result("/owned/socket".to_owned(), &endpoint, pong())
-                .expect("protocol 20 pong has type, version, and protocol");
+        let identity = identity_from_ping_result("/owned/socket".to_owned(), &endpoint, &pong())
+            .expect("protocol 20 pong has type, version, and protocol");
 
         assert_eq!(identity.discovery_key, "/owned/socket");
         assert_eq!(
@@ -433,20 +475,4 @@ mod tests {
             "the owned schema child must be reaped rather than left as a zombie"
         );
     }
-
-}
-
-fn socket_error(error: SocketError) -> AdapterError {
-    AdapterError::new(
-        if error.delivery() == DeliveryState::MayHaveReachedHost {
-            AdapterErrorKind::OutcomeUnknown
-        } else {
-            AdapterErrorKind::Unavailable
-        },
-        error.to_string(),
-    )
-}
-
-fn incompatible(message: impl Into<String>) -> AdapterError {
-    AdapterError::new(AdapterErrorKind::Incompatible, message)
 }

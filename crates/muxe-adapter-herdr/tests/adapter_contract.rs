@@ -1,4 +1,8 @@
 mod support {
+    #[expect(
+        dead_code,
+        reason = "the contract test shares the complete production-connect surface with suspend and transport tests"
+    )]
     pub mod production_connect;
     #[expect(
         dead_code,
@@ -33,7 +37,7 @@ use muxe_core::{
     PaneId, PortableAction, ServerId, SourceId, SourceSpan,
 };
 use muxe_zellij_protocol::{
-    BridgeArtifact, BridgeIdentity, BridgeRequest, CommandOutcome, PipeEvent, PipeEventKind,
+    BridgeIdentity, BridgeRequest, CommandOutcome, PipeEvent, PipeEventKind, bridge_build_id,
     bridge_protocol_fingerprint, decode_request_line, encode_event_line,
     generated_action_fingerprint, pinned_source_revision,
 };
@@ -220,9 +224,30 @@ impl HostAdapter for RecordedContractAdapter {
         Err(Self::unsupported())
     }
 
+    async fn register_pending_pane(
+        &self,
+        registration: PendingPaneRegistration,
+    ) -> Result<muxe_adapter_api::PendingPaneLease, AdapterError> {
+        Ok(muxe_adapter_api::PendingPaneLease {
+            id: muxe_adapter_api::PendingPaneLeaseId::new(format!(
+                "recorded:{}",
+                registration.ui_session
+            )),
+            ui_session: registration.ui_session,
+        })
+    }
+
     async fn close_pending_pane(
         &self,
         _registration: PendingPaneRegistration,
+        _lease: muxe_adapter_api::PendingPaneLease,
+    ) -> Result<(), AdapterError> {
+        Err(Self::unsupported())
+    }
+
+    async fn release_pending_pane(
+        &self,
+        _lease: muxe_adapter_api::PendingPaneLease,
     ) -> Result<(), AdapterError> {
         Err(Self::unsupported())
     }
@@ -248,12 +273,10 @@ impl HostAdapter for RecordedContractAdapter {
         let candidate = &request.action.candidate;
         self.validate_native_batch(std::slice::from_ref(&candidate))
             .map_err(|diagnostics| {
-                let message = diagnostics
-                    .first()
-                    .map(|diagnostic| diagnostic.message.clone())
-                    .unwrap_or_else(|| {
-                        "the recorded contract rejected the native action".to_owned()
-                    });
+                let message = diagnostics.first().map_or_else(
+                    || "the recorded contract rejected the native action".to_owned(),
+                    |diagnostic| diagnostic.message.clone(),
+                );
                 AdapterError::new(AdapterErrorKind::InvalidRequest, message)
             })?;
         self.dispatches
@@ -338,7 +361,7 @@ fn candidate(type_name: &str) -> NativeActionCandidate {
     }
 }
 
-fn register_event(registration: [u8; 16], artifact: BridgeArtifact) -> PipeEvent {
+fn register_event(registration: [u8; 16], build_id: muxe_protocol::SchemaFingerprint) -> PipeEvent {
     PipeEvent {
         sequence: 1,
         event: PipeEventKind::Register {
@@ -351,7 +374,7 @@ fn register_event(registration: [u8; 16], artifact: BridgeArtifact) -> PipeEvent
                 source_revision: pinned_source_revision().to_owned(),
                 action_fingerprint: generated_action_fingerprint().0,
                 protocol_fingerprint: bridge_protocol_fingerprint().0,
-                artifact,
+                bridge_build_id: Some(build_id),
             },
         },
     }
@@ -524,9 +547,8 @@ async fn recorded_common_contract_preserves_broker_visible_transitions() {
 /// child and a recorded Unix peer; no Herdr host process is started.
 #[tokio::test]
 async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
-    let fixture = ProductionConnectFixture::start()
-        .await
-        .expect("recorded production-connect fixture starts");
+    let fixture =
+        ProductionConnectFixture::start().expect("recorded production-connect fixture starts");
     let adapter = HerdrAdapter::connect(fixture.adapter_config())
         .await
         .expect(
@@ -583,6 +605,78 @@ async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
     adapter.shutdown().await.expect("Herdr shutdown");
 }
 
+async fn self_attested_registration_is_contained() {
+    let request = RecordedPipeChannel::new();
+    let event = RecordedPipeChannel::new();
+    let contained = ZellijAdapter::new(
+        ZellijAdapterConfig {
+            session_name: "session-alpha".to_owned(),
+            zellij_exe: PathBuf::from("/nonexistent/zellij"),
+        },
+        Arc::clone(&request) as Arc<dyn PipeChannel>,
+        Arc::clone(&event) as Arc<dyn PipeChannel>,
+    );
+    event.push_line(
+        encode_event_line(&register_event(
+            [9; 16],
+            muxe_protocol::SchemaFingerprint([1; 32]),
+        ))
+        .expect("registration encodes"),
+    );
+    let rejection = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let result = contained
+                .dispatch_native(NativeDispatchRequest {
+                    execution: ExecutionId(8),
+                    action: muxe_adapter_api::ResolvedNativeAction {
+                        candidate: candidate("native.zellij.command:close-focus"),
+                    },
+                    origin: origin(),
+                })
+                .await;
+            if let Err(error) = result
+                && error.kind == AdapterErrorKind::Incompatible
+            {
+                return error;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("self-attestation is contained before timeout");
+    assert!(rejection.message.contains("incompatible"));
+    assert!(request.take_outbound().is_empty());
+    contained
+        .shutdown()
+        .await
+        .expect("contained Zellij adapter shutdown");
+}
+
+async fn await_registration_accepted(
+    adapter: &ZellijAdapter,
+    execution: ExecutionId,
+) -> DispatchAccepted {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match adapter
+                .dispatch_native(NativeDispatchRequest {
+                    execution,
+                    action: muxe_adapter_api::ResolvedNativeAction {
+                        candidate: candidate("native.zellij.command:close-focus"),
+                    },
+                    origin: origin(),
+                })
+                .await
+            {
+                Ok(accepted) => break accepted,
+                Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .expect("registration becomes active before dispatch timeout")
+}
+
 /// Replays a typed bridge registration and dispatch correlation through the
 /// public Zellij pipe boundary, including the self-attestation containment path.
 #[tokio::test]
@@ -611,29 +705,11 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
     );
 
     event.push_line(
-        encode_event_line(&register_event([7; 16], BridgeArtifact::Unattested))
+        encode_event_line(&register_event([7; 16], bridge_build_id()))
             .expect("registration encodes"),
     );
     let execution = ExecutionId(7);
-    let accepted = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match adapter
-                .dispatch_native(NativeDispatchRequest {
-                    execution,
-                    action: muxe_adapter_api::ResolvedNativeAction {
-                        candidate: candidate("native.zellij.command:close-focus"),
-                    },
-                    origin: origin(),
-                })
-                .await
-            {
-                Ok(accepted) => break accepted,
-                Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
-            }
-        }
-    })
-    .await
-    .expect("registration becomes active before dispatch timeout");
+    let accepted = await_registration_accepted(&adapter, execution).await;
     assert_eq!(accepted.execution, execution);
     assert_eq!(
         adapter
@@ -697,51 +773,7 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
     )
     .await;
     adapter.shutdown().await.expect("Zellij adapter shutdown");
-
-    let request = RecordedPipeChannel::new();
-    let event = RecordedPipeChannel::new();
-    let contained = ZellijAdapter::new(
-        ZellijAdapterConfig {
-            session_name: "session-alpha".to_owned(),
-            zellij_exe: PathBuf::from("/nonexistent/zellij"),
-        },
-        Arc::clone(&request) as Arc<dyn PipeChannel>,
-        Arc::clone(&event) as Arc<dyn PipeChannel>,
-    );
-    event.push_line(
-        encode_event_line(&register_event(
-            [9; 16],
-            BridgeArtifact::NativeVerified { sha256: [1; 32] },
-        ))
-        .expect("self-attested registration encodes"),
-    );
-    let rejection = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let result = contained
-                .dispatch_native(NativeDispatchRequest {
-                    execution: ExecutionId(8),
-                    action: muxe_adapter_api::ResolvedNativeAction {
-                        candidate: candidate("native.zellij.command:close-focus"),
-                    },
-                    origin: origin(),
-                })
-                .await;
-            if let Err(error) = result
-                && error.kind == AdapterErrorKind::Incompatible
-            {
-                return error;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("self-attestation is contained before timeout");
-    assert!(rejection.message.contains("incompatible"));
-    assert!(request.take_outbound().is_empty());
-    contained
-        .shutdown()
-        .await
-        .expect("contained Zellij adapter shutdown");
+    self_attested_registration_is_contained().await;
 }
 
 /// Drives the production monitor through a retained-subscription loss with
@@ -754,7 +786,6 @@ async fn recorded_herdr_reconnect_reestablishes_subscription_with_recorded_messa
     exchanges.push(ProductionConnectFixture::ping_exchange());
     exchanges.push(ProductionConnectFixture::subscription_exchange());
     let fixture = ProductionConnectFixture::start_scripted(exchanges)
-        .await
         .expect("recorded reconnect fixture starts");
     let adapter = HerdrAdapter::connect(fixture.adapter_config())
         .await
@@ -787,9 +818,8 @@ async fn recorded_herdr_reconnect_reestablishes_subscription_with_recorded_messa
         .await
         .expect("the monitor reconnects through recorded messages")
         .expect("reconnect is a valid event");
-    let (previous, current) = match reconnected {
-        AdapterHealthEvent::Reconnected { previous, current } => (previous, current),
-        _ => panic!("expected a Reconnected event after the recorded reconnect"),
+    let AdapterHealthEvent::Reconnected { previous, current } = reconnected else {
+        panic!("expected a Reconnected event after the recorded reconnect")
     };
     assert_eq!(previous, before);
     // Endpoint peer credentials are diagnostic only and may legitimately

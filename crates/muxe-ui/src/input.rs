@@ -25,6 +25,7 @@ pub struct ConvertedKeyEvent {
 
 impl ConvertedKeyEvent {
     /// Returns whether at least one reported identity can participate in core matching.
+    #[must_use]
     pub fn is_matchable(&self) -> bool {
         self.event.primary.is_some()
             || self.event.alternate.is_some()
@@ -90,7 +91,7 @@ fn functional_code(key: FunctionalKey) -> Option<u32> {
         FunctionalKey::PrintScreen => 57361,
         FunctionalKey::Pause => 57362,
         FunctionalKey::Menu => 57363,
-        FunctionalKey::Function(number @ 1..=35) => 57363 + number as u32,
+        FunctionalKey::Function(number @ 1..=35) => 57363 + u32::from(number),
         FunctionalKey::Function(_) => return None,
         FunctionalKey::Keypad(key) => keypad_code(key)?,
         FunctionalKey::Media(key) => media_code(key),
@@ -100,7 +101,7 @@ fn functional_code(key: FunctionalKey) -> Option<u32> {
 
 fn keypad_code(key: KeypadKey) -> Option<u32> {
     Some(match key {
-        KeypadKey::Digit(number @ 0..=9) => 57399 + number as u32,
+        KeypadKey::Digit(number @ 0..=9) => 57399 + u32::from(number),
         KeypadKey::Digit(_) => return None,
         KeypadKey::Decimal => 57409,
         KeypadKey::Divide => 57410,

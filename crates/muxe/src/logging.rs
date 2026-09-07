@@ -22,9 +22,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::json;
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
-use serde_json::json;
 use thiserror::Error;
 
 use crate::fsutil::{self, FsError};
@@ -66,6 +66,10 @@ pub struct LogEvent {
 
 impl LogEvent {
     /// Builds an event, rejecting oversized messages before any IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogError::MessageTooLong`] when `message` exceeds [`MAX_MESSAGE_LEN`] bytes.
     pub fn new(
         version: impl Into<String>,
         host: impl Into<String>,
@@ -110,6 +114,10 @@ pub struct Logger {
 
 impl Logger {
     /// Opens the logger for `cache_dir`, creating `$CACHE_DIR/logs/` owner-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogError`] when the owner-only log directory cannot be created or validated.
     pub fn open(cache_dir: &Path, version: impl Into<String>) -> Result<Self, LogError> {
         let directory = cache_dir.join("logs");
         fsutil::ensure_owner_dir(&directory)?;
@@ -132,6 +140,10 @@ impl Logger {
     /// Rotation runs first when the append would exceed [`MAX_LOG_BYTES`].
     /// Any rotation or sink failure is also written to stderr and returned as
     /// an error so auditable operations fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogError::SinkFailed`] when rotation or the log sink fails.
     pub fn append(&self, event: &LogEvent) -> Result<(), LogError> {
         let record = json!({
             "timestamp": unix_timestamp(),
@@ -199,16 +211,14 @@ impl Logger {
     }
 
     fn generation(&self, generation: u8) -> PathBuf {
-        self.directory
-            .join(format!("{LOG_FILE_NAME}.{generation}"))
+        self.directory.join(format!("{LOG_FILE_NAME}.{generation}"))
     }
 }
 
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 /// Process-wide advisory lock held across one complete rotation and append.
@@ -313,7 +323,10 @@ mod tests {
         let log = temp.path().join("logs").join(LOG_FILE_NAME);
         fs::write(&log, []).unwrap();
         fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(logger.append(&event("must not append")), Err(LogError::SinkFailed)));
+        assert!(matches!(
+            logger.append(&event("must not append")),
+            Err(LogError::SinkFailed)
+        ));
         assert_eq!(fs::metadata(&log).unwrap().len(), 0);
     }
 
@@ -325,7 +338,10 @@ mod tests {
         fs::write(&target, "unrelated\n").unwrap();
         let log = temp.path().join("logs").join(LOG_FILE_NAME);
         symlink(&target, &log).unwrap();
-        assert!(matches!(logger.append(&event("must not follow")), Err(LogError::SinkFailed)));
+        assert!(matches!(
+            logger.append(&event("must not follow")),
+            Err(LogError::SinkFailed)
+        ));
         assert_eq!(fs::read_to_string(&target).unwrap(), "unrelated\n");
     }
 
@@ -336,7 +352,10 @@ mod tests {
         };
         let child_id = env::var(CHILD_ID).unwrap();
         let logger = test_logger(Path::new(&directory));
-        let message = format!("{child_id}:{}", "x".repeat(MAX_MESSAGE_LEN - child_id.len() - 1));
+        let message = format!(
+            "{child_id}:{}",
+            "x".repeat(MAX_MESSAGE_LEN - child_id.len() - 1)
+        );
         for _ in 0..CHILD_RECORDS {
             logger.append(&event(&message)).unwrap();
         }
@@ -350,7 +369,11 @@ mod tests {
         for child_id in 0..3 {
             children.push(
                 Command::new(&executable)
-                    .args(["--exact", "logging::tests::child_process_appends", "--nocapture"])
+                    .args([
+                        "--exact",
+                        "logging::tests::child_process_appends",
+                        "--nocapture",
+                    ])
                     .env(CHILD_DIRECTORY, temp.path())
                     .env(CHILD_ID, child_id.to_string())
                     .spawn()
@@ -362,10 +385,10 @@ mod tests {
         }
 
         let directory = temp.path().join("logs");
-        let paths = std::iter::once(directory.join(LOG_FILE_NAME))
-            .chain((1..=RETAINED_GENERATIONS).map(|generation| {
-                directory.join(format!("{LOG_FILE_NAME}.{generation}"))
-            }));
+        let paths = std::iter::once(directory.join(LOG_FILE_NAME)).chain(
+            (1..=RETAINED_GENERATIONS)
+                .map(|generation| directory.join(format!("{LOG_FILE_NAME}.{generation}"))),
+        );
         let mut records = 0;
         for path in paths {
             assert_owner_only(&path);

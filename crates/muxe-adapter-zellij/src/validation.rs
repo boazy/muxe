@@ -24,6 +24,10 @@ pub struct ZellijValidator;
 
 impl ZellijValidator {
     /// Validates one portable action structurally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigDiagnostic`] when the action is not structurally mappable.
     pub fn validate_portable(
         &self,
         action: &PortableAction,
@@ -42,6 +46,11 @@ impl ZellijValidator {
     }
 
     /// Validates one native candidate through parsing plus generated conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigDiagnostic`] when the candidate is not a Zellij native
+    /// action or fails generated conversion.
     pub fn validate_native_candidate(
         &self,
         candidate: &NativeActionCandidate,
@@ -61,7 +70,7 @@ impl ZellijValidator {
         validated_from_raw(&raw).map_err(|error| {
             ConfigDiagnostic::error(
                 DiagnosticCode::InvalidActionArguments,
-                error.to_string(),
+                error,
                 candidate.type_span.clone(),
             )
         })?;
@@ -75,6 +84,10 @@ impl ZellijValidator {
     /// Successful output preserves the input cardinality and order. When one or
     /// more candidates are invalid, every diagnostic remains attached to that
     /// candidate's source span.
+    ///
+    /// # Errors
+    ///
+    /// Returns the per-candidate [`ConfigDiagnostic`] list when any candidate is invalid.
     pub fn validate_native_batch(
         &self,
         candidates: &[&NativeActionCandidate],
@@ -143,6 +156,10 @@ impl ActionValidator for ZellijValidator {
 /// Stock Zellij supports only the Kitty baseline (`CSI > 1 u`); the adapter
 /// rejects an effective configuration that enables the three optional
 /// enhancements. Sending a larger flag set cannot upgrade the host path.
+///
+/// # Errors
+///
+/// Returns [`ConfigDiagnostic`] when any optional keyboard enhancement is enabled.
 pub fn check_keyboard_profile(
     event_types: bool,
     alternate_keys: bool,

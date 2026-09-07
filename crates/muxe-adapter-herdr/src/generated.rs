@@ -5,128 +5,685 @@
 // typify emits schema types in its own style; the pedantic lints
 // below are expected on generated output and must be fixed in the
 // generator templates, never by hand-editing the output.
-#![expect(clippy::derivable_impls, clippy::clone_on_copy, clippy::must_use_candidate, clippy::default_trait_access, clippy::same_functions_in_if_condition, reason = "typify-emitted schema types; fix the generator, not the output")]
+#![expect(
+    clippy::derivable_impls,
+    clippy::clone_on_copy,
+    clippy::must_use_candidate,
+    clippy::default_trait_access,
+    clippy::same_functions_in_if_condition,
+    reason = "typify-emitted schema types; fix the generator, not the output"
+)]
 
 pub const BUNDLED_PROTOCOL: u64 = 20;
 pub const BUNDLED_SCHEMA_VERSION: u64 = 1;
-pub const BUNDLED_RAW_SCHEMA_SHA256: &str = "c48f1f54ee0150ca27e11fd44455fe94aeadb20fdf4e4a62393ed822a4e5b150";
-pub const BUNDLED_REQUEST_SCHEMA_SHA256: &str = "3c7283bdfadd483e957fada8849fc4e4061d1fdf03aea8994da04fe3e4aded69";
+pub const BUNDLED_RAW_SCHEMA_SHA256: &str =
+    "c48f1f54ee0150ca27e11fd44455fe94aeadb20fdf4e4a62393ed822a4e5b150";
+pub const BUNDLED_REQUEST_SCHEMA_SHA256: &str =
+    "3c7283bdfadd483e957fada8849fc4e4061d1fdf03aea8994da04fe3e4aded69";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodTransport {
-	Unary,
-	EventStream,
+    Unary,
+    EventStream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MethodMetadata {
-	pub method: &'static str,
-	pub native_type: &'static str,
-	pub params_ref: &'static str,
-	pub params_type: &'static str,
-	pub transport: MethodTransport,
+    pub method: &'static str,
+    pub native_type: &'static str,
+    pub params_ref: &'static str,
+    pub params_type: &'static str,
+    pub transport: MethodTransport,
 }
 
 pub const METHODS: &[MethodMetadata] = &[
-    MethodMetadata { method: "agent.explain", native_type: "native.herdr.agent:explain", params_ref: "#/schemas/request/$defs/AgentTarget", params_type: "AgentTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.focus", native_type: "native.herdr.agent:focus", params_ref: "#/schemas/request/$defs/AgentTarget", params_type: "AgentTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.get", native_type: "native.herdr.agent:get", params_ref: "#/schemas/request/$defs/AgentTarget", params_type: "AgentTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.list", native_type: "native.herdr.agent:list", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.prompt", native_type: "native.herdr.agent:prompt", params_ref: "#/schemas/request/$defs/AgentPromptParams", params_type: "AgentPromptParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.read", native_type: "native.herdr.agent:read", params_ref: "#/schemas/request/$defs/AgentReadParams", params_type: "AgentReadParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.rename", native_type: "native.herdr.agent:rename", params_ref: "#/schemas/request/$defs/AgentRenameParams", params_type: "AgentRenameParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.send_keys", native_type: "native.herdr.agent:send-keys", params_ref: "#/schemas/request/$defs/AgentSendKeysParams", params_type: "AgentSendKeysParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.start", native_type: "native.herdr.agent:start", params_ref: "#/schemas/request/$defs/AgentStartParams", params_type: "AgentStartParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.view.clear", native_type: "native.herdr.agent.view:clear", params_ref: "#/schemas/request/$defs/AgentViewClearParams", params_type: "AgentViewClearParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.view.set", native_type: "native.herdr.agent.view:set", params_ref: "#/schemas/request/$defs/AgentViewSetParams", params_type: "AgentViewSetParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "agent.wait", native_type: "native.herdr.agent:wait", params_ref: "#/schemas/request/$defs/AgentWaitParams", params_type: "AgentWaitParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "client.window_title.clear", native_type: "native.herdr.client.window_title:clear", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "client.window_title.set", native_type: "native.herdr.client.window_title:set", params_ref: "#/schemas/request/$defs/ClientWindowTitleSetParams", params_type: "ClientWindowTitleSetParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "events.subscribe", native_type: "native.herdr.events:subscribe", params_ref: "#/schemas/request/$defs/EventsSubscribeParams", params_type: "EventsSubscribeParams", transport: MethodTransport::EventStream },
-    MethodMetadata { method: "events.wait", native_type: "native.herdr.events:wait", params_ref: "#/schemas/request/$defs/EventsWaitParams", params_type: "EventsWaitParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "integration.install", native_type: "native.herdr.integration:install", params_ref: "#/schemas/request/$defs/IntegrationInstallParams", params_type: "IntegrationInstallParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "integration.uninstall", native_type: "native.herdr.integration:uninstall", params_ref: "#/schemas/request/$defs/IntegrationUninstallParams", params_type: "IntegrationUninstallParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "layout.apply", native_type: "native.herdr.layout:apply", params_ref: "#/schemas/request/$defs/LayoutApplyParams", params_type: "LayoutApplyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "layout.export", native_type: "native.herdr.layout:export", params_ref: "#/schemas/request/$defs/LayoutExportParams", params_type: "LayoutExportParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "layout.set_split_ratio", native_type: "native.herdr.layout:set-split-ratio", params_ref: "#/schemas/request/$defs/LayoutSetSplitRatioParams", params_type: "LayoutSetSplitRatioParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "notification.show", native_type: "native.herdr.notification:show", params_ref: "#/schemas/request/$defs/NotificationShowParams", params_type: "NotificationShowParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.clear_agent_authority", native_type: "native.herdr.pane:clear-agent-authority", params_ref: "#/schemas/request/$defs/PaneClearAgentAuthorityParams", params_type: "PaneClearAgentAuthorityParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.close", native_type: "native.herdr.pane:close", params_ref: "#/schemas/request/$defs/PaneTarget", params_type: "PaneTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.current", native_type: "native.herdr.pane:current", params_ref: "#/schemas/request/$defs/PaneCurrentParams", params_type: "PaneCurrentParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.edges", native_type: "native.herdr.pane:edges", params_ref: "#/schemas/request/$defs/PaneEdgesParams", params_type: "PaneEdgesParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.focus", native_type: "native.herdr.pane:focus", params_ref: "#/schemas/request/$defs/PaneTarget", params_type: "PaneTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.focus_direction", native_type: "native.herdr.pane:focus-direction", params_ref: "#/schemas/request/$defs/PaneFocusDirectionParams", params_type: "PaneFocusDirectionParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.get", native_type: "native.herdr.pane:get", params_ref: "#/schemas/request/$defs/PaneTarget", params_type: "PaneTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.graphics.clear", native_type: "native.herdr.pane.graphics:clear", params_ref: "#/schemas/request/$defs/PaneGraphicsClearParams", params_type: "PaneGraphicsClearParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.graphics.info", native_type: "native.herdr.pane.graphics:info", params_ref: "#/schemas/request/$defs/PaneTarget", params_type: "PaneTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.graphics.set", native_type: "native.herdr.pane.graphics:set", params_ref: "#/schemas/request/$defs/PaneGraphicsSetParams", params_type: "PaneGraphicsSetParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.input.set", native_type: "native.herdr.pane.input:set", params_ref: "#/schemas/request/$defs/PaneInputSetParams", params_type: "PaneInputSetParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.layout", native_type: "native.herdr.pane:layout", params_ref: "#/schemas/request/$defs/PaneLayoutParams", params_type: "PaneLayoutParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.list", native_type: "native.herdr.pane:list", params_ref: "#/schemas/request/$defs/PaneListParams", params_type: "PaneListParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.move", native_type: "native.herdr.pane:move", params_ref: "#/schemas/request/$defs/PaneMoveParams", params_type: "PaneMoveParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.neighbor", native_type: "native.herdr.pane:neighbor", params_ref: "#/schemas/request/$defs/PaneNeighborParams", params_type: "PaneNeighborParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.process_info", native_type: "native.herdr.pane:process-info", params_ref: "#/schemas/request/$defs/PaneProcessInfoParams", params_type: "PaneProcessInfoParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.read", native_type: "native.herdr.pane:read", params_ref: "#/schemas/request/$defs/PaneReadParams", params_type: "PaneReadParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.release_agent", native_type: "native.herdr.pane:release-agent", params_ref: "#/schemas/request/$defs/PaneReleaseAgentParams", params_type: "PaneReleaseAgentParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.rename", native_type: "native.herdr.pane:rename", params_ref: "#/schemas/request/$defs/PaneRenameParams", params_type: "PaneRenameParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.report_agent", native_type: "native.herdr.pane:report-agent", params_ref: "#/schemas/request/$defs/PaneReportAgentParams", params_type: "PaneReportAgentParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.report_agent_session", native_type: "native.herdr.pane:report-agent-session", params_ref: "#/schemas/request/$defs/PaneReportAgentSessionParams", params_type: "PaneReportAgentSessionParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.report_metadata", native_type: "native.herdr.pane:report-metadata", params_ref: "#/schemas/request/$defs/PaneReportMetadataParams", params_type: "PaneReportMetadataParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.resize", native_type: "native.herdr.pane:resize", params_ref: "#/schemas/request/$defs/PaneResizeParams", params_type: "PaneResizeParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.send_input", native_type: "native.herdr.pane:send-input", params_ref: "#/schemas/request/$defs/PaneSendInputParams", params_type: "PaneSendInputParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.send_keys", native_type: "native.herdr.pane:send-keys", params_ref: "#/schemas/request/$defs/PaneSendKeysParams", params_type: "PaneSendKeysParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.send_text", native_type: "native.herdr.pane:send-text", params_ref: "#/schemas/request/$defs/PaneSendTextParams", params_type: "PaneSendTextParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.split", native_type: "native.herdr.pane:split", params_ref: "#/schemas/request/$defs/PaneSplitParams", params_type: "PaneSplitParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.swap", native_type: "native.herdr.pane:swap", params_ref: "#/schemas/request/$defs/PaneSwapParams", params_type: "PaneSwapParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.wait_for_output", native_type: "native.herdr.pane:wait-for-output", params_ref: "#/schemas/request/$defs/PaneWaitForOutputParams", params_type: "PaneWaitForOutputParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "pane.zoom", native_type: "native.herdr.pane:zoom", params_ref: "#/schemas/request/$defs/PaneZoomParams", params_type: "PaneZoomParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "ping", native_type: "native.herdr:ping", params_ref: "#/schemas/request/$defs/PingParams", params_type: "PingParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.action.invoke", native_type: "native.herdr.plugin.action:invoke", params_ref: "#/schemas/request/$defs/PluginActionInvokeParams", params_type: "PluginActionInvokeParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.action.list", native_type: "native.herdr.plugin.action:list", params_ref: "#/schemas/request/$defs/PluginActionListParams", params_type: "PluginActionListParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.disable", native_type: "native.herdr.plugin:disable", params_ref: "#/schemas/request/$defs/PluginSetEnabledParams", params_type: "PluginSetEnabledParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.enable", native_type: "native.herdr.plugin:enable", params_ref: "#/schemas/request/$defs/PluginSetEnabledParams", params_type: "PluginSetEnabledParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.link", native_type: "native.herdr.plugin:link", params_ref: "#/schemas/request/$defs/PluginLinkParams", params_type: "PluginLinkParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.list", native_type: "native.herdr.plugin:list", params_ref: "#/schemas/request/$defs/PluginListParams", params_type: "PluginListParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.log.list", native_type: "native.herdr.plugin.log:list", params_ref: "#/schemas/request/$defs/PluginLogListParams", params_type: "PluginLogListParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.pane.close", native_type: "native.herdr.plugin.pane:close", params_ref: "#/schemas/request/$defs/PluginPaneCloseParams", params_type: "PluginPaneCloseParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.pane.focus", native_type: "native.herdr.plugin.pane:focus", params_ref: "#/schemas/request/$defs/PluginPaneFocusParams", params_type: "PluginPaneFocusParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.pane.open", native_type: "native.herdr.plugin.pane:open", params_ref: "#/schemas/request/$defs/PluginPaneOpenParams", params_type: "PluginPaneOpenParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "plugin.unlink", native_type: "native.herdr.plugin:unlink", params_ref: "#/schemas/request/$defs/PluginUnlinkParams", params_type: "PluginUnlinkParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "popup.close", native_type: "native.herdr.popup:close", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "server.agent_manifests", native_type: "native.herdr.server:agent-manifests", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "server.live_handoff", native_type: "native.herdr.server:live-handoff", params_ref: "#/schemas/request/$defs/ServerLiveHandoffParams", params_type: "ServerLiveHandoffParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "server.reload_agent_manifests", native_type: "native.herdr.server:reload-agent-manifests", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "server.reload_config", native_type: "native.herdr.server:reload-config", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "server.stop", native_type: "native.herdr.server:stop", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "session.snapshot", native_type: "native.herdr.session:snapshot", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "tab.close", native_type: "native.herdr.tab:close", params_ref: "#/schemas/request/$defs/TabTarget", params_type: "TabTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "tab.create", native_type: "native.herdr.tab:create", params_ref: "#/schemas/request/$defs/TabCreateParams", params_type: "TabCreateParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "tab.focus", native_type: "native.herdr.tab:focus", params_ref: "#/schemas/request/$defs/TabTarget", params_type: "TabTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "tab.get", native_type: "native.herdr.tab:get", params_ref: "#/schemas/request/$defs/TabTarget", params_type: "TabTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "tab.list", native_type: "native.herdr.tab:list", params_ref: "#/schemas/request/$defs/TabListParams", params_type: "TabListParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "tab.move", native_type: "native.herdr.tab:move", params_ref: "#/schemas/request/$defs/TabMoveParams", params_type: "TabMoveParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "tab.rename", native_type: "native.herdr.tab:rename", params_ref: "#/schemas/request/$defs/TabRenameParams", params_type: "TabRenameParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.close", native_type: "native.herdr.workspace:close", params_ref: "#/schemas/request/$defs/WorkspaceTarget", params_type: "WorkspaceTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.create", native_type: "native.herdr.workspace:create", params_ref: "#/schemas/request/$defs/WorkspaceCreateParams", params_type: "WorkspaceCreateParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.focus", native_type: "native.herdr.workspace:focus", params_ref: "#/schemas/request/$defs/WorkspaceTarget", params_type: "WorkspaceTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.get", native_type: "native.herdr.workspace:get", params_ref: "#/schemas/request/$defs/WorkspaceTarget", params_type: "WorkspaceTarget", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.list", native_type: "native.herdr.workspace:list", params_ref: "#/schemas/request/$defs/EmptyParams", params_type: "EmptyParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.move", native_type: "native.herdr.workspace:move", params_ref: "#/schemas/request/$defs/WorkspaceMoveParams", params_type: "WorkspaceMoveParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.move_block", native_type: "native.herdr.workspace:move-block", params_ref: "#/schemas/request/$defs/WorkspaceMoveBlockParams", params_type: "WorkspaceMoveBlockParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.rename", native_type: "native.herdr.workspace:rename", params_ref: "#/schemas/request/$defs/WorkspaceRenameParams", params_type: "WorkspaceRenameParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "workspace.report_metadata", native_type: "native.herdr.workspace:report-metadata", params_ref: "#/schemas/request/$defs/WorkspaceReportMetadataParams", params_type: "WorkspaceReportMetadataParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "worktree.create", native_type: "native.herdr.worktree:create", params_ref: "#/schemas/request/$defs/WorktreeCreateParams", params_type: "WorktreeCreateParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "worktree.list", native_type: "native.herdr.worktree:list", params_ref: "#/schemas/request/$defs/WorktreeListParams", params_type: "WorktreeListParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "worktree.open", native_type: "native.herdr.worktree:open", params_ref: "#/schemas/request/$defs/WorktreeOpenParams", params_type: "WorktreeOpenParams", transport: MethodTransport::Unary },
-    MethodMetadata { method: "worktree.remove", native_type: "native.herdr.worktree:remove", params_ref: "#/schemas/request/$defs/WorktreeRemoveParams", params_type: "WorktreeRemoveParams", transport: MethodTransport::Unary },
+    MethodMetadata {
+        method: "agent.explain",
+        native_type: "native.herdr.agent:explain",
+        params_ref: "#/schemas/request/$defs/AgentTarget",
+        params_type: "AgentTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.focus",
+        native_type: "native.herdr.agent:focus",
+        params_ref: "#/schemas/request/$defs/AgentTarget",
+        params_type: "AgentTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.get",
+        native_type: "native.herdr.agent:get",
+        params_ref: "#/schemas/request/$defs/AgentTarget",
+        params_type: "AgentTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.list",
+        native_type: "native.herdr.agent:list",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.prompt",
+        native_type: "native.herdr.agent:prompt",
+        params_ref: "#/schemas/request/$defs/AgentPromptParams",
+        params_type: "AgentPromptParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.read",
+        native_type: "native.herdr.agent:read",
+        params_ref: "#/schemas/request/$defs/AgentReadParams",
+        params_type: "AgentReadParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.rename",
+        native_type: "native.herdr.agent:rename",
+        params_ref: "#/schemas/request/$defs/AgentRenameParams",
+        params_type: "AgentRenameParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.send_keys",
+        native_type: "native.herdr.agent:send-keys",
+        params_ref: "#/schemas/request/$defs/AgentSendKeysParams",
+        params_type: "AgentSendKeysParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.start",
+        native_type: "native.herdr.agent:start",
+        params_ref: "#/schemas/request/$defs/AgentStartParams",
+        params_type: "AgentStartParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.view.clear",
+        native_type: "native.herdr.agent.view:clear",
+        params_ref: "#/schemas/request/$defs/AgentViewClearParams",
+        params_type: "AgentViewClearParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.view.set",
+        native_type: "native.herdr.agent.view:set",
+        params_ref: "#/schemas/request/$defs/AgentViewSetParams",
+        params_type: "AgentViewSetParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "agent.wait",
+        native_type: "native.herdr.agent:wait",
+        params_ref: "#/schemas/request/$defs/AgentWaitParams",
+        params_type: "AgentWaitParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "client.window_title.clear",
+        native_type: "native.herdr.client.window_title:clear",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "client.window_title.set",
+        native_type: "native.herdr.client.window_title:set",
+        params_ref: "#/schemas/request/$defs/ClientWindowTitleSetParams",
+        params_type: "ClientWindowTitleSetParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "events.subscribe",
+        native_type: "native.herdr.events:subscribe",
+        params_ref: "#/schemas/request/$defs/EventsSubscribeParams",
+        params_type: "EventsSubscribeParams",
+        transport: MethodTransport::EventStream,
+    },
+    MethodMetadata {
+        method: "events.wait",
+        native_type: "native.herdr.events:wait",
+        params_ref: "#/schemas/request/$defs/EventsWaitParams",
+        params_type: "EventsWaitParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "integration.install",
+        native_type: "native.herdr.integration:install",
+        params_ref: "#/schemas/request/$defs/IntegrationInstallParams",
+        params_type: "IntegrationInstallParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "integration.uninstall",
+        native_type: "native.herdr.integration:uninstall",
+        params_ref: "#/schemas/request/$defs/IntegrationUninstallParams",
+        params_type: "IntegrationUninstallParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "layout.apply",
+        native_type: "native.herdr.layout:apply",
+        params_ref: "#/schemas/request/$defs/LayoutApplyParams",
+        params_type: "LayoutApplyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "layout.export",
+        native_type: "native.herdr.layout:export",
+        params_ref: "#/schemas/request/$defs/LayoutExportParams",
+        params_type: "LayoutExportParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "layout.set_split_ratio",
+        native_type: "native.herdr.layout:set-split-ratio",
+        params_ref: "#/schemas/request/$defs/LayoutSetSplitRatioParams",
+        params_type: "LayoutSetSplitRatioParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "notification.show",
+        native_type: "native.herdr.notification:show",
+        params_ref: "#/schemas/request/$defs/NotificationShowParams",
+        params_type: "NotificationShowParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.clear_agent_authority",
+        native_type: "native.herdr.pane:clear-agent-authority",
+        params_ref: "#/schemas/request/$defs/PaneClearAgentAuthorityParams",
+        params_type: "PaneClearAgentAuthorityParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.close",
+        native_type: "native.herdr.pane:close",
+        params_ref: "#/schemas/request/$defs/PaneTarget",
+        params_type: "PaneTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.current",
+        native_type: "native.herdr.pane:current",
+        params_ref: "#/schemas/request/$defs/PaneCurrentParams",
+        params_type: "PaneCurrentParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.edges",
+        native_type: "native.herdr.pane:edges",
+        params_ref: "#/schemas/request/$defs/PaneEdgesParams",
+        params_type: "PaneEdgesParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.focus",
+        native_type: "native.herdr.pane:focus",
+        params_ref: "#/schemas/request/$defs/PaneTarget",
+        params_type: "PaneTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.focus_direction",
+        native_type: "native.herdr.pane:focus-direction",
+        params_ref: "#/schemas/request/$defs/PaneFocusDirectionParams",
+        params_type: "PaneFocusDirectionParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.get",
+        native_type: "native.herdr.pane:get",
+        params_ref: "#/schemas/request/$defs/PaneTarget",
+        params_type: "PaneTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.graphics.clear",
+        native_type: "native.herdr.pane.graphics:clear",
+        params_ref: "#/schemas/request/$defs/PaneGraphicsClearParams",
+        params_type: "PaneGraphicsClearParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.graphics.info",
+        native_type: "native.herdr.pane.graphics:info",
+        params_ref: "#/schemas/request/$defs/PaneTarget",
+        params_type: "PaneTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.graphics.set",
+        native_type: "native.herdr.pane.graphics:set",
+        params_ref: "#/schemas/request/$defs/PaneGraphicsSetParams",
+        params_type: "PaneGraphicsSetParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.input.set",
+        native_type: "native.herdr.pane.input:set",
+        params_ref: "#/schemas/request/$defs/PaneInputSetParams",
+        params_type: "PaneInputSetParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.layout",
+        native_type: "native.herdr.pane:layout",
+        params_ref: "#/schemas/request/$defs/PaneLayoutParams",
+        params_type: "PaneLayoutParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.list",
+        native_type: "native.herdr.pane:list",
+        params_ref: "#/schemas/request/$defs/PaneListParams",
+        params_type: "PaneListParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.move",
+        native_type: "native.herdr.pane:move",
+        params_ref: "#/schemas/request/$defs/PaneMoveParams",
+        params_type: "PaneMoveParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.neighbor",
+        native_type: "native.herdr.pane:neighbor",
+        params_ref: "#/schemas/request/$defs/PaneNeighborParams",
+        params_type: "PaneNeighborParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.process_info",
+        native_type: "native.herdr.pane:process-info",
+        params_ref: "#/schemas/request/$defs/PaneProcessInfoParams",
+        params_type: "PaneProcessInfoParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.read",
+        native_type: "native.herdr.pane:read",
+        params_ref: "#/schemas/request/$defs/PaneReadParams",
+        params_type: "PaneReadParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.release_agent",
+        native_type: "native.herdr.pane:release-agent",
+        params_ref: "#/schemas/request/$defs/PaneReleaseAgentParams",
+        params_type: "PaneReleaseAgentParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.rename",
+        native_type: "native.herdr.pane:rename",
+        params_ref: "#/schemas/request/$defs/PaneRenameParams",
+        params_type: "PaneRenameParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.report_agent",
+        native_type: "native.herdr.pane:report-agent",
+        params_ref: "#/schemas/request/$defs/PaneReportAgentParams",
+        params_type: "PaneReportAgentParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.report_agent_session",
+        native_type: "native.herdr.pane:report-agent-session",
+        params_ref: "#/schemas/request/$defs/PaneReportAgentSessionParams",
+        params_type: "PaneReportAgentSessionParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.report_metadata",
+        native_type: "native.herdr.pane:report-metadata",
+        params_ref: "#/schemas/request/$defs/PaneReportMetadataParams",
+        params_type: "PaneReportMetadataParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.resize",
+        native_type: "native.herdr.pane:resize",
+        params_ref: "#/schemas/request/$defs/PaneResizeParams",
+        params_type: "PaneResizeParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.send_input",
+        native_type: "native.herdr.pane:send-input",
+        params_ref: "#/schemas/request/$defs/PaneSendInputParams",
+        params_type: "PaneSendInputParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.send_keys",
+        native_type: "native.herdr.pane:send-keys",
+        params_ref: "#/schemas/request/$defs/PaneSendKeysParams",
+        params_type: "PaneSendKeysParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.send_text",
+        native_type: "native.herdr.pane:send-text",
+        params_ref: "#/schemas/request/$defs/PaneSendTextParams",
+        params_type: "PaneSendTextParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.split",
+        native_type: "native.herdr.pane:split",
+        params_ref: "#/schemas/request/$defs/PaneSplitParams",
+        params_type: "PaneSplitParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.swap",
+        native_type: "native.herdr.pane:swap",
+        params_ref: "#/schemas/request/$defs/PaneSwapParams",
+        params_type: "PaneSwapParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.wait_for_output",
+        native_type: "native.herdr.pane:wait-for-output",
+        params_ref: "#/schemas/request/$defs/PaneWaitForOutputParams",
+        params_type: "PaneWaitForOutputParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "pane.zoom",
+        native_type: "native.herdr.pane:zoom",
+        params_ref: "#/schemas/request/$defs/PaneZoomParams",
+        params_type: "PaneZoomParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "ping",
+        native_type: "native.herdr:ping",
+        params_ref: "#/schemas/request/$defs/PingParams",
+        params_type: "PingParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.action.invoke",
+        native_type: "native.herdr.plugin.action:invoke",
+        params_ref: "#/schemas/request/$defs/PluginActionInvokeParams",
+        params_type: "PluginActionInvokeParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.action.list",
+        native_type: "native.herdr.plugin.action:list",
+        params_ref: "#/schemas/request/$defs/PluginActionListParams",
+        params_type: "PluginActionListParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.disable",
+        native_type: "native.herdr.plugin:disable",
+        params_ref: "#/schemas/request/$defs/PluginSetEnabledParams",
+        params_type: "PluginSetEnabledParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.enable",
+        native_type: "native.herdr.plugin:enable",
+        params_ref: "#/schemas/request/$defs/PluginSetEnabledParams",
+        params_type: "PluginSetEnabledParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.link",
+        native_type: "native.herdr.plugin:link",
+        params_ref: "#/schemas/request/$defs/PluginLinkParams",
+        params_type: "PluginLinkParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.list",
+        native_type: "native.herdr.plugin:list",
+        params_ref: "#/schemas/request/$defs/PluginListParams",
+        params_type: "PluginListParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.log.list",
+        native_type: "native.herdr.plugin.log:list",
+        params_ref: "#/schemas/request/$defs/PluginLogListParams",
+        params_type: "PluginLogListParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.pane.close",
+        native_type: "native.herdr.plugin.pane:close",
+        params_ref: "#/schemas/request/$defs/PluginPaneCloseParams",
+        params_type: "PluginPaneCloseParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.pane.focus",
+        native_type: "native.herdr.plugin.pane:focus",
+        params_ref: "#/schemas/request/$defs/PluginPaneFocusParams",
+        params_type: "PluginPaneFocusParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.pane.open",
+        native_type: "native.herdr.plugin.pane:open",
+        params_ref: "#/schemas/request/$defs/PluginPaneOpenParams",
+        params_type: "PluginPaneOpenParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "plugin.unlink",
+        native_type: "native.herdr.plugin:unlink",
+        params_ref: "#/schemas/request/$defs/PluginUnlinkParams",
+        params_type: "PluginUnlinkParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "popup.close",
+        native_type: "native.herdr.popup:close",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "server.agent_manifests",
+        native_type: "native.herdr.server:agent-manifests",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "server.live_handoff",
+        native_type: "native.herdr.server:live-handoff",
+        params_ref: "#/schemas/request/$defs/ServerLiveHandoffParams",
+        params_type: "ServerLiveHandoffParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "server.reload_agent_manifests",
+        native_type: "native.herdr.server:reload-agent-manifests",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "server.reload_config",
+        native_type: "native.herdr.server:reload-config",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "server.stop",
+        native_type: "native.herdr.server:stop",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "session.snapshot",
+        native_type: "native.herdr.session:snapshot",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "tab.close",
+        native_type: "native.herdr.tab:close",
+        params_ref: "#/schemas/request/$defs/TabTarget",
+        params_type: "TabTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "tab.create",
+        native_type: "native.herdr.tab:create",
+        params_ref: "#/schemas/request/$defs/TabCreateParams",
+        params_type: "TabCreateParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "tab.focus",
+        native_type: "native.herdr.tab:focus",
+        params_ref: "#/schemas/request/$defs/TabTarget",
+        params_type: "TabTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "tab.get",
+        native_type: "native.herdr.tab:get",
+        params_ref: "#/schemas/request/$defs/TabTarget",
+        params_type: "TabTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "tab.list",
+        native_type: "native.herdr.tab:list",
+        params_ref: "#/schemas/request/$defs/TabListParams",
+        params_type: "TabListParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "tab.move",
+        native_type: "native.herdr.tab:move",
+        params_ref: "#/schemas/request/$defs/TabMoveParams",
+        params_type: "TabMoveParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "tab.rename",
+        native_type: "native.herdr.tab:rename",
+        params_ref: "#/schemas/request/$defs/TabRenameParams",
+        params_type: "TabRenameParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.close",
+        native_type: "native.herdr.workspace:close",
+        params_ref: "#/schemas/request/$defs/WorkspaceTarget",
+        params_type: "WorkspaceTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.create",
+        native_type: "native.herdr.workspace:create",
+        params_ref: "#/schemas/request/$defs/WorkspaceCreateParams",
+        params_type: "WorkspaceCreateParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.focus",
+        native_type: "native.herdr.workspace:focus",
+        params_ref: "#/schemas/request/$defs/WorkspaceTarget",
+        params_type: "WorkspaceTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.get",
+        native_type: "native.herdr.workspace:get",
+        params_ref: "#/schemas/request/$defs/WorkspaceTarget",
+        params_type: "WorkspaceTarget",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.list",
+        native_type: "native.herdr.workspace:list",
+        params_ref: "#/schemas/request/$defs/EmptyParams",
+        params_type: "EmptyParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.move",
+        native_type: "native.herdr.workspace:move",
+        params_ref: "#/schemas/request/$defs/WorkspaceMoveParams",
+        params_type: "WorkspaceMoveParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.move_block",
+        native_type: "native.herdr.workspace:move-block",
+        params_ref: "#/schemas/request/$defs/WorkspaceMoveBlockParams",
+        params_type: "WorkspaceMoveBlockParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.rename",
+        native_type: "native.herdr.workspace:rename",
+        params_ref: "#/schemas/request/$defs/WorkspaceRenameParams",
+        params_type: "WorkspaceRenameParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "workspace.report_metadata",
+        native_type: "native.herdr.workspace:report-metadata",
+        params_ref: "#/schemas/request/$defs/WorkspaceReportMetadataParams",
+        params_type: "WorkspaceReportMetadataParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "worktree.create",
+        native_type: "native.herdr.worktree:create",
+        params_ref: "#/schemas/request/$defs/WorktreeCreateParams",
+        params_type: "WorktreeCreateParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "worktree.list",
+        native_type: "native.herdr.worktree:list",
+        params_ref: "#/schemas/request/$defs/WorktreeListParams",
+        params_type: "WorktreeListParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "worktree.open",
+        native_type: "native.herdr.worktree:open",
+        params_ref: "#/schemas/request/$defs/WorktreeOpenParams",
+        params_type: "WorktreeOpenParams",
+        transport: MethodTransport::Unary,
+    },
+    MethodMetadata {
+        method: "worktree.remove",
+        native_type: "native.herdr.worktree:remove",
+        params_ref: "#/schemas/request/$defs/WorktreeRemoveParams",
+        params_type: "WorktreeRemoveParams",
+        transport: MethodTransport::Unary,
+    },
 ];
 
 pub fn method_metadata(method: &str) -> Option<&'static MethodMetadata> {
-	METHODS.iter().find(|metadata| metadata.method == method)
+    METHODS.iter().find(|metadata| metadata.method == method)
 }
 
 pub fn metadata_for_native_type(native_type: &str) -> Option<&'static MethodMetadata> {
-	METHODS.iter().find(|metadata| metadata.native_type == native_type)
+    METHODS
+        .iter()
+        .find(|metadata| metadata.native_type == native_type)
 }
 
 pub mod request_types {
@@ -136,18 +693,12 @@ pub mod request_types {
         pub struct ConversionError(::std::borrow::Cow<'static, str>);
         impl ::std::error::Error for ConversionError {}
         impl ::std::fmt::Display for ConversionError {
-            fn fmt(
-                &self,
-                f: &mut ::std::fmt::Formatter<'_>,
-            ) -> Result<(), ::std::fmt::Error> {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> Result<(), ::std::fmt::Error> {
                 ::std::fmt::Display::fmt(&self.0, f)
             }
         }
         impl ::std::fmt::Debug for ConversionError {
-            fn fmt(
-                &self,
-                f: &mut ::std::fmt::Formatter<'_>,
-            ) -> Result<(), ::std::fmt::Error> {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> Result<(), ::std::fmt::Error> {
                 ::std::fmt::Debug::fmt(&self.0, f)
             }
         }
@@ -460,7 +1011,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum AgentStatus {
         #[serde(rename = "idle")]
@@ -492,9 +1043,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for AgentStatus {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "idle" => Ok(Self::Idle),
                 "working" => Ok(Self::Working),
@@ -507,9 +1056,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for AgentStatus {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -585,7 +1132,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum AgentViewBuiltinField {
         #[serde(rename = "status")]
@@ -623,9 +1170,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for AgentViewBuiltinField {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "status" => Ok(Self::Status),
                 "workspace_id" => Ok(Self::WorkspaceId),
@@ -640,9 +1185,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for AgentViewBuiltinField {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -692,7 +1235,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum AgentViewBuiltinSortField {
         #[serde(rename = "workspace_order")]
@@ -733,9 +1276,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for AgentViewBuiltinSortField {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "workspace_order" => Ok(Self::WorkspaceOrder),
                 "tab_order" => Ok(Self::TabOrder),
@@ -751,9 +1292,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for AgentViewBuiltinSortField {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -803,7 +1342,9 @@ pub mod request_types {
     }
     impl ::std::default::Default for AgentViewClearParams {
         fn default() -> Self {
-            Self { source: Default::default() }
+            Self {
+                source: Default::default(),
+            }
         }
     }
     ///`AgentViewContext`
@@ -830,7 +1371,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum AgentViewContext {
         #[serde(rename = "current_workspace_id")]
@@ -853,9 +1394,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for AgentViewContext {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "current_workspace_id" => Ok(Self::CurrentWorkspaceId),
                 "current_tab_id" => Ok(Self::CurrentTabId),
@@ -865,9 +1404,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for AgentViewContext {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -1056,15 +1593,27 @@ pub mod request_types {
     #[serde(tag = "op")]
     pub enum AgentViewFilter {
         #[serde(rename = "all")]
-        All { filters: ::std::vec::Vec<AgentViewFilter> },
+        All {
+            filters: ::std::vec::Vec<AgentViewFilter>,
+        },
         #[serde(rename = "any")]
-        Any { filters: ::std::vec::Vec<AgentViewFilter> },
+        Any {
+            filters: ::std::vec::Vec<AgentViewFilter>,
+        },
         #[serde(rename = "not")]
-        Not { filter: ::std::boxed::Box<AgentViewFilter> },
+        Not {
+            filter: ::std::boxed::Box<AgentViewFilter>,
+        },
         #[serde(rename = "eq")]
-        Eq { field: AgentViewField, value: AgentViewValue },
+        Eq {
+            field: AgentViewField,
+            value: AgentViewValue,
+        },
         #[serde(rename = "in")]
-        In { field: AgentViewField, values: ::std::vec::Vec<AgentViewValue> },
+        In {
+            field: AgentViewField,
+            values: ::std::vec::Vec<AgentViewValue>,
+        },
         #[serde(rename = "exists")]
         Exists { field: AgentViewField },
     }
@@ -1226,7 +1775,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum AgentViewSortOrder {
         #[serde(rename = "asc")]
@@ -1249,9 +1798,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for AgentViewSortOrder {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "asc" => Ok(Self::Asc),
                 "desc" => Ok(Self::Desc),
@@ -1261,9 +1808,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for AgentViewSortOrder {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -1423,9 +1968,7 @@ pub mod request_types {
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
     #[serde(transparent)]
-    pub struct EmptyParams(
-        pub ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-    );
+    pub struct EmptyParams(pub ::serde_json::Map<::std::string::String, ::serde_json::Value>);
     impl ::std::ops::Deref for EmptyParams {
         type Target = ::serde_json::Map<::std::string::String, ::serde_json::Value>;
         fn deref(&self) -> &::serde_json::Map<::std::string::String, ::serde_json::Value> {
@@ -1433,7 +1976,8 @@ pub mod request_types {
         }
     }
     impl ::std::convert::From<EmptyParams>
-    for ::serde_json::Map<::std::string::String, ::serde_json::Value> {
+        for ::serde_json::Map<::std::string::String, ::serde_json::Value>
+    {
         fn from(value: EmptyParams) -> Self {
             value.0
         }
@@ -1444,10 +1988,9 @@ pub mod request_types {
         }
     }
     impl ::std::convert::From<::serde_json::Map<::std::string::String, ::serde_json::Value>>
-    for EmptyParams {
-        fn from(
-            value: ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-        ) -> Self {
+        for EmptyParams
+    {
+        fn from(value: ::serde_json::Map<::std::string::String, ::serde_json::Value>) -> Self {
             Self(value)
         }
     }
@@ -1883,7 +2426,10 @@ pub mod request_types {
             pane_id: ::std::string::String,
         },
         #[serde(rename = "pane_agent_status_changed")]
-        PaneAgentStatusChanged { agent_status: AgentStatus, pane_id: ::std::string::String },
+        PaneAgentStatusChanged {
+            agent_status: AgentStatus,
+            pane_id: ::std::string::String,
+        },
     }
     impl ::std::convert::From<&Self> for EventMatch {
         fn from(value: &EventMatch) -> Self {
@@ -2023,7 +2569,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum IntegrationTarget {
         #[serde(rename = "pi")]
@@ -2091,9 +2637,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for IntegrationTarget {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "pi" => Ok(Self::Pi),
                 "omp" => Ok(Self::Omp),
@@ -2118,9 +2662,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for IntegrationTarget {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -2514,7 +3056,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum NotificationShowSound {
         #[serde(rename = "none")]
@@ -2540,9 +3082,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for NotificationShowSound {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "none" => Ok(Self::None),
                 "done" => Ok(Self::Done),
@@ -2553,9 +3093,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for NotificationShowSound {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -2657,7 +3195,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum PaneAgentState {
         #[serde(rename = "idle")]
@@ -2686,9 +3224,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PaneAgentState {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "idle" => Ok(Self::Idle),
                 "working" => Ok(Self::Working),
@@ -2700,9 +3236,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PaneAgentState {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -2762,8 +3296,7 @@ pub mod request_types {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub source: ::std::option::Option<::std::string::String>,
     }
-    impl ::std::convert::From<&PaneClearAgentAuthorityParams>
-    for PaneClearAgentAuthorityParams {
+    impl ::std::convert::From<&PaneClearAgentAuthorityParams> for PaneClearAgentAuthorityParams {
         fn from(value: &PaneClearAgentAuthorityParams) -> Self {
             value.clone()
         }
@@ -2829,7 +3362,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum PaneDirection {
         #[serde(rename = "left")]
@@ -2858,9 +3391,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PaneDirection {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "left" => Ok(Self::Left),
                 "right" => Ok(Self::Right),
@@ -2872,9 +3403,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PaneDirection {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -3025,7 +3554,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum PaneGraphicsFormat {
         #[serde(rename = "png")]
@@ -3054,9 +3583,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PaneGraphicsFormat {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "png" => Ok(Self::Png),
                 "rgb" => Ok(Self::Rgb),
@@ -3068,9 +3595,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PaneGraphicsFormat {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -3840,8 +4365,7 @@ pub mod request_types {
         pub session_start_source: ::std::option::Option<::std::string::String>,
         pub source: ::std::string::String,
     }
-    impl ::std::convert::From<&PaneReportAgentSessionParams>
-    for PaneReportAgentSessionParams {
+    impl ::std::convert::From<&PaneReportAgentSessionParams> for PaneReportAgentSessionParams {
         fn from(value: &PaneReportAgentSessionParams) -> Self {
             value.clone()
         }
@@ -3958,14 +4482,17 @@ pub mod request_types {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub seq: ::std::option::Option<u64>,
         pub source: ::std::string::String,
-        #[serde(default, skip_serializing_if = ":: std :: collections :: HashMap::is_empty")]
-        pub state_labels: ::std::collections::HashMap<
-            ::std::string::String,
-            ::std::string::String,
-        >,
+        #[serde(
+            default,
+            skip_serializing_if = ":: std :: collections :: HashMap::is_empty"
+        )]
+        pub state_labels: ::std::collections::HashMap<::std::string::String, ::std::string::String>,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub title: ::std::option::Option<::std::string::String>,
-        #[serde(default, skip_serializing_if = ":: std :: collections :: HashMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = ":: std :: collections :: HashMap::is_empty"
+        )]
         pub tokens: ::std::collections::HashMap<
             PaneReportMetadataParamsTokensKey,
             ::std::option::Option<::std::string::String>,
@@ -4004,18 +4531,19 @@ pub mod request_types {
         }
     }
     impl ::std::convert::From<&PaneReportMetadataParamsTokensKey>
-    for PaneReportMetadataParamsTokensKey {
+        for PaneReportMetadataParamsTokensKey
+    {
         fn from(value: &PaneReportMetadataParamsTokensKey) -> Self {
             value.clone()
         }
     }
     impl ::std::str::FromStr for PaneReportMetadataParamsTokensKey {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
-            static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
-            { ::regress::Regex::new("^[A-Za-z0-9_-]{1,32}$").unwrap() });
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+            static PATTERN: ::std::sync::LazyLock<::regress::Regex> =
+                ::std::sync::LazyLock::new(|| {
+                    ::regress::Regex::new("^[A-Za-z0-9_-]{1,32}$").unwrap()
+                });
             if PATTERN.find(value).is_none() {
                 return Err("doesn't match pattern \"^[A-Za-z0-9_-]{1,32}$\"".into());
             }
@@ -4024,14 +4552,11 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PaneReportMetadataParamsTokensKey {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
-    impl ::std::convert::TryFrom<&::std::string::String>
-    for PaneReportMetadataParamsTokensKey {
+    impl ::std::convert::TryFrom<&::std::string::String> for PaneReportMetadataParamsTokensKey {
         type Error = self::error::ConversionError;
         fn try_from(
             value: &::std::string::String,
@@ -4039,8 +4564,7 @@ pub mod request_types {
             value.parse()
         }
     }
-    impl ::std::convert::TryFrom<::std::string::String>
-    for PaneReportMetadataParamsTokensKey {
+    impl ::std::convert::TryFrom<::std::string::String> for PaneReportMetadataParamsTokensKey {
         type Error = self::error::ConversionError;
         fn try_from(
             value: ::std::string::String,
@@ -4128,7 +4652,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum PaneRightClickTarget {
         #[serde(rename = "herdr")]
@@ -4151,9 +4675,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PaneRightClickTarget {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "herdr" => Ok(Self::Herdr),
                 "pane" => Ok(Self::Pane),
@@ -4163,9 +4685,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PaneRightClickTarget {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -4354,7 +4874,10 @@ pub mod request_types {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub cwd: ::std::option::Option<::std::string::String>,
         pub direction: SplitDirection,
-        #[serde(default, skip_serializing_if = ":: std :: collections :: HashMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = ":: std :: collections :: HashMap::is_empty"
+        )]
         pub env: ::std::collections::HashMap<::std::string::String, ::std::string::String>,
         #[serde(default)]
         pub focus: bool,
@@ -4554,7 +5077,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum PaneZoomMode {
         #[serde(rename = "toggle")]
@@ -4580,9 +5103,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PaneZoomMode {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "toggle" => Ok(Self::Toggle),
                 "on" => Ok(Self::On),
@@ -4593,9 +5114,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PaneZoomMode {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -4677,7 +5196,8 @@ pub mod request_types {
         }
     }
     impl ::std::convert::From<PingParams>
-    for ::serde_json::Map<::std::string::String, ::serde_json::Value> {
+        for ::serde_json::Map<::std::string::String, ::serde_json::Value>
+    {
         fn from(value: PingParams) -> Self {
             value.0
         }
@@ -4688,10 +5208,9 @@ pub mod request_types {
         }
     }
     impl ::std::convert::From<::serde_json::Map<::std::string::String, ::serde_json::Value>>
-    for PingParams {
-        fn from(
-            value: ::serde_json::Map<::std::string::String, ::serde_json::Value>,
-        ) -> Self {
+        for PingParams
+    {
+        fn from(value: ::serde_json::Map<::std::string::String, ::serde_json::Value>) -> Self {
             Self(value)
         }
     }
@@ -5223,7 +5742,10 @@ pub mod request_types {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub direction: ::std::option::Option<SplitDirection>,
         pub entrypoint: ::std::string::String,
-        #[serde(default, skip_serializing_if = ":: std :: collections :: HashMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = ":: std :: collections :: HashMap::is_empty"
+        )]
         pub env: ::std::collections::HashMap<::std::string::String, ::std::string::String>,
         #[serde(default)]
         pub focus: bool,
@@ -5271,7 +5793,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum PluginPanePlacement {
         #[serde(rename = "overlay")]
@@ -5303,9 +5825,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PluginPanePlacement {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "overlay" => Ok(Self::Overlay),
                 "popup" => Ok(Self::Popup),
@@ -5318,9 +5838,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PluginPanePlacement {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -5489,7 +6007,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum PluginSourceKind {
         #[serde(rename = "local")]
@@ -5512,9 +6030,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PluginSourceKind {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "local" => Ok(Self::Local),
                 "github" => Ok(Self::Github),
@@ -5524,9 +6040,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PluginSourceKind {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -5608,9 +6122,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PopupSize {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             if let Ok(v) = value.parse() {
                 Ok(Self::Integer(v))
             } else if let Ok(v) = value.parse() {
@@ -5622,9 +6134,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PopupSize {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -5695,11 +6205,11 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for PopupSizeString {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
-            static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
-            { ::regress::Regex::new("^(100|[1-9][0-9]?)%$").unwrap() });
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+            static PATTERN: ::std::sync::LazyLock<::regress::Regex> =
+                ::std::sync::LazyLock::new(|| {
+                    ::regress::Regex::new("^(100|[1-9][0-9]?)%$").unwrap()
+                });
             if PATTERN.find(value).is_none() {
                 return Err("doesn't match pattern \"^(100|[1-9][0-9]?)%$\"".into());
             }
@@ -5708,9 +6218,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for PopupSizeString {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -5766,7 +6274,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum ReadFormat {
         #[serde(rename = "text")]
@@ -5789,9 +6297,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for ReadFormat {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "text" => Ok(Self::Text),
                 "ansi" => Ok(Self::Ansi),
@@ -5801,9 +6307,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for ReadFormat {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -5849,7 +6353,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum ReadSource {
         #[serde(rename = "visible")]
@@ -5878,9 +6382,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for ReadSource {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "visible" => Ok(Self::Visible),
                 "recent" => Ok(Self::Recent),
@@ -5892,9 +6394,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for ReadSource {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -7934,7 +8434,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum SplitDirection {
         #[serde(rename = "right")]
@@ -7957,9 +8457,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for SplitDirection {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "right" => Ok(Self::Right),
                 "down" => Ok(Self::Down),
@@ -7969,9 +8467,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for SplitDirection {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -8488,7 +8984,10 @@ pub mod request_types {
     pub struct TabCreateParams {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub cwd: ::std::option::Option<::std::string::String>,
-        #[serde(default, skip_serializing_if = ":: std :: collections :: HashMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = ":: std :: collections :: HashMap::is_empty"
+        )]
         pub env: ::std::collections::HashMap<::std::string::String, ::std::string::String>,
         #[serde(default)]
         pub focus: bool,
@@ -8667,7 +9166,7 @@ pub mod request_types {
         Hash,
         Ord,
         PartialEq,
-        PartialOrd
+        PartialOrd,
     )]
     pub enum ToastHerdrPosition {
         #[serde(rename = "top-left")]
@@ -8696,9 +9195,7 @@ pub mod request_types {
     }
     impl ::std::str::FromStr for ToastHerdrPosition {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             match value {
                 "top-left" => Ok(Self::TopLeft),
                 "top-right" => Ok(Self::TopRight),
@@ -8710,9 +9207,7 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for ToastHerdrPosition {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
@@ -8770,7 +9265,10 @@ pub mod request_types {
     pub struct WorkspaceCreateParams {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub cwd: ::std::option::Option<::std::string::String>,
-        #[serde(default, skip_serializing_if = ":: std :: collections :: HashMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = ":: std :: collections :: HashMap::is_empty"
+        )]
         pub env: ::std::collections::HashMap<::std::string::String, ::std::string::String>,
         #[serde(default)]
         pub focus: bool,
@@ -8962,8 +9460,7 @@ pub mod request_types {
         pub ttl_ms: ::std::option::Option<::std::num::NonZeroU64>,
         pub workspace_id: ::std::string::String,
     }
-    impl ::std::convert::From<&WorkspaceReportMetadataParams>
-    for WorkspaceReportMetadataParams {
+    impl ::std::convert::From<&WorkspaceReportMetadataParams> for WorkspaceReportMetadataParams {
         fn from(value: &WorkspaceReportMetadataParams) -> Self {
             value.clone()
         }
@@ -8988,25 +9485,25 @@ pub mod request_types {
             &self.0
         }
     }
-    impl ::std::convert::From<WorkspaceReportMetadataParamsTokensKey>
-    for ::std::string::String {
+    impl ::std::convert::From<WorkspaceReportMetadataParamsTokensKey> for ::std::string::String {
         fn from(value: WorkspaceReportMetadataParamsTokensKey) -> Self {
             value.0
         }
     }
     impl ::std::convert::From<&WorkspaceReportMetadataParamsTokensKey>
-    for WorkspaceReportMetadataParamsTokensKey {
+        for WorkspaceReportMetadataParamsTokensKey
+    {
         fn from(value: &WorkspaceReportMetadataParamsTokensKey) -> Self {
             value.clone()
         }
     }
     impl ::std::str::FromStr for WorkspaceReportMetadataParamsTokensKey {
         type Err = self::error::ConversionError;
-        fn from_str(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
-            static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
-            { ::regress::Regex::new("^[A-Za-z0-9_-]{1,32}$").unwrap() });
+        fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+            static PATTERN: ::std::sync::LazyLock<::regress::Regex> =
+                ::std::sync::LazyLock::new(|| {
+                    ::regress::Regex::new("^[A-Za-z0-9_-]{1,32}$").unwrap()
+                });
             if PATTERN.find(value).is_none() {
                 return Err("doesn't match pattern \"^[A-Za-z0-9_-]{1,32}$\"".into());
             }
@@ -9015,14 +9512,11 @@ pub mod request_types {
     }
     impl ::std::convert::TryFrom<&str> for WorkspaceReportMetadataParamsTokensKey {
         type Error = self::error::ConversionError;
-        fn try_from(
-            value: &str,
-        ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
             value.parse()
         }
     }
-    impl ::std::convert::TryFrom<&::std::string::String>
-    for WorkspaceReportMetadataParamsTokensKey {
+    impl ::std::convert::TryFrom<&::std::string::String> for WorkspaceReportMetadataParamsTokensKey {
         type Error = self::error::ConversionError;
         fn try_from(
             value: &::std::string::String,
@@ -9030,8 +9524,7 @@ pub mod request_types {
             value.parse()
         }
     }
-    impl ::std::convert::TryFrom<::std::string::String>
-    for WorkspaceReportMetadataParamsTokensKey {
+    impl ::std::convert::TryFrom<::std::string::String> for WorkspaceReportMetadataParamsTokensKey {
         type Error = self::error::ConversionError;
         fn try_from(
             value: ::std::string::String,

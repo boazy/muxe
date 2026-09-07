@@ -14,16 +14,19 @@
 //! for host selection.
 
 pub mod activate;
+pub mod coldstart;
 pub mod control;
 pub mod journal;
 pub mod registry;
 pub mod retire;
-
 pub use activate::{
     ActivateError, ActivateHooks, ActivateInputs, ActivateReport, ActivateStep, BrokerSpawner,
-    ControlPort, ControlSession, DetectedHost, HostReloader, LiveControl, LivePreflight,
-    Preflight, ProcessSpawner, RecoveryOutcome, SpawnMember, SpawnRequest, StagedBridge,
-    TargetHandle, UnitOutcome, ZellijCliReloader, activate, recover,
+    ControlPort, ControlSession, DetectedHost, HostReloader, LiveControl, LivePreflight, Preflight,
+    ProcessSpawner, RecoveryOutcome, SpawnMember, SpawnRequest, StagedBridge, TargetHandle,
+    UnitOutcome, ZellijCliReloader, activate, recover,
+};
+pub use coldstart::{
+    ColdstartError, ColdstartHost, ColdstartInputs, ColdstartOutcome, LiveBroker, ensure_broker,
 };
 pub use journal::{JournalState, MemberState, MemberTransition, UnitKind};
 pub use registry::{BrokerEntry, Liveness, Registry};

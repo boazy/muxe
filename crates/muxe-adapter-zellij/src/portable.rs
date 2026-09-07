@@ -123,6 +123,11 @@ pub enum Cardinal {
 
 impl Cardinal {
     /// Parses a portable direction literal into a cardinal host direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableError`] when the scalar is not one of left, right, up,
+    /// or down, or when a context marker reaches this point.
     pub fn parse(action: &'static str, scalar: &ActionScalar) -> Result<Self, PortableError> {
         match &scalar.value.kind {
             ConfigValueKind::String(text) => match text.as_str() {
@@ -149,6 +154,7 @@ impl Cardinal {
     }
 
     /// Pinned mirror direction.
+    #[must_use]
     pub const fn into_mirror(self) -> raw::Direction {
         match self {
             Self::Left => raw::Direction::Left,
@@ -159,6 +165,7 @@ impl Cardinal {
     }
 
     /// Pipe neighbor direction.
+    #[must_use]
     pub const fn into_neighbor(self) -> muxe_zellij_protocol::NeighborDirection {
         use muxe_zellij_protocol::NeighborDirection;
         match self {
@@ -309,17 +316,12 @@ fn wrap(action: raw::Action) -> PortableMapping {
     }
 }
 
-fn keyboard_error(action: &'static str, error: KeyboardError) -> PortableError {
-    match error {
-        KeyboardError::UnresolvedContext => PortableError::UnresolvedContext {
-            action,
-            parameter: "keys",
-        },
-        KeyboardError::Unsupported { reason, .. } => PortableError::InvalidScalar {
-            action,
-            parameter: "keys",
-            reason,
-        },
+fn keyboard_error(action: &'static str, error: &KeyboardError) -> PortableError {
+    let KeyboardError::Unsupported { reason, .. } = error;
+    PortableError::InvalidScalar {
+        action,
+        parameter: "keys",
+        reason,
     }
 }
 
@@ -330,29 +332,48 @@ fn keyboard_error(action: &'static str, error: KeyboardError) -> PortableError {
 /// markers are accepted only where the originating path type fits the target
 /// field. No payload is constructed: validation proves constraints, never
 /// substitutes dummy values.
+///
+/// # Errors
+///
+/// Returns [`PortableError`] for structurally unmappable actions; see the
+/// variant reasons on [`PortableError`].
 pub fn validate_portable_structure(action: &PortableAction) -> Result<(), PortableError> {
     match action {
         PortableAction::Menu(_) | PortableAction::Config(_) | PortableAction::Command(_) => Ok(()),
-        PortableAction::Keyboard(KeyboardAction::SendText(text)) => {
-            check_marker("keyboard:send", "text", text, &[ContextType::String], true)?;
-            if !is_marker(text) {
-                scalar_string("keyboard:send", "text", text).map(|_| ())
-            } else {
-                Ok(())
-            }
-        }
-        PortableAction::Keyboard(KeyboardAction::SendKeys(keys)) => {
+        PortableAction::Keyboard(keyboard) => validate_keyboard_structure(keyboard),
+        PortableAction::Tab(tab) => validate_tab_structure(tab),
+        PortableAction::Pane(pane) => validate_pane_structure(pane),
+        PortableAction::Session(session) => validate_session_structure(session),
+    }
+}
+/// Validates the keyboard subgroup structurally.
+fn validate_keyboard_structure(keyboard: &KeyboardAction) -> Result<(), PortableError> {
+    match keyboard {
+        KeyboardAction::SendText(text) => check_concrete_string("keyboard:send", "text", text),
+        KeyboardAction::SendKeys(keys) => {
             for key in keys {
-                check_marker("keyboard:send", "keys", key, &[ContextType::String], true)?;
-                if !is_marker(key) {
-                    let text = scalar_string("keyboard:send", "keys", key)?;
-                    map_canonical_key(&text)
-                        .map_err(|error| keyboard_error("keyboard:send", error))?;
-                }
+                check_keyboard_key(key)?;
             }
             Ok(())
         }
-        PortableAction::Tab(TabAction::Create { workspace_id }) => {
+    }
+}
+
+/// Validates one sendable key: markers pass through, literals face the key table.
+fn check_keyboard_key(key: &ActionScalar) -> Result<(), PortableError> {
+    check_marker("keyboard:send", "keys", key, &[ContextType::String], true)?;
+    if is_marker(key) {
+        return Ok(());
+    }
+    let text = scalar_string("keyboard:send", "keys", key)?;
+    map_canonical_key(&text).map_err(|error| keyboard_error("keyboard:send", &error))?;
+    Ok(())
+}
+
+/// Validates the tab subgroup structurally.
+fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
+    match tab {
+        TabAction::Create { workspace_id } => {
             if workspace_id.is_some() {
                 return Err(PortableError::Incompatible {
                     action: "tab:create",
@@ -361,41 +382,25 @@ pub fn validate_portable_structure(action: &PortableAction) -> Result<(), Portab
             }
             Ok(())
         }
-        PortableAction::Tab(TabAction::Close) => Ok(()),
-        PortableAction::Tab(TabAction::Rename { name }) => {
+        TabAction::Close => Ok(()),
+        TabAction::Rename { name } => {
             let Some(name) = name else {
                 return Err(PortableError::Incompatible {
                     action: "tab:rename",
                     reason: "pinned RenameTab requires a name; no host prompt variant exists",
                 });
             };
-            check_marker("tab:rename", "name", name, &[ContextType::String], true)?;
-            if !is_marker(name) {
-                scalar_string("tab:rename", "name", name).map(|_| ())
-            } else {
-                Ok(())
-            }
+            check_concrete_string("tab:rename", "name", name)
         }
-        PortableAction::Tab(TabAction::Focus(target)) => match target {
+        TabAction::Focus(target) => match target {
             muxe_core::IndexOrDirection::Index(index) => {
-                check_marker(
-                    "tab:focus",
-                    "index",
-                    index,
-                    &[ContextType::UnsignedInteger],
-                    true,
-                )?;
-                if !is_marker(index) {
-                    scalar_index_u32("tab:focus", "index", index).map(|_| ())
-                } else {
-                    Ok(())
-                }
+                check_concrete_index("tab:focus", "index", index)
             }
             muxe_core::IndexOrDirection::Direction(direction) => {
                 check_tab_focus_direction(direction)
             }
         },
-        PortableAction::Tab(TabAction::Move(target)) => match target {
+        TabAction::Move(target) => match target {
             muxe_core::IndexOrDirection::Direction(direction) => {
                 Cardinal::parse("tab:move", direction).map(|_| ())
             }
@@ -404,38 +409,32 @@ pub fn validate_portable_structure(action: &PortableAction) -> Result<(), Portab
                 reason: "pinned MoveTab and MoveTabByTabId are directional; positional moves have no host primitive",
             }),
         },
-        PortableAction::Tab(TabAction::Swap(_)) => Err(PortableError::Incompatible {
+        TabAction::Swap(_) => Err(PortableError::Incompatible {
             action: "tab:swap",
             reason: "no atomic pinned primitive swaps two tabs",
         }),
-        PortableAction::Pane(PaneAction::Create) => Ok(()),
-        PortableAction::Pane(PaneAction::Split { direction }) => {
+    }
+}
+
+/// Validates the pane subgroup structurally.
+fn validate_pane_structure(pane: &PaneAction) -> Result<(), PortableError> {
+    match pane {
+        PaneAction::Create | PaneAction::Close => Ok(()),
+        PaneAction::Split { direction } => {
             if let Some(direction) = direction {
                 Cardinal::parse("pane:split", direction).map(|_| ())?;
             }
             Ok(())
         }
-        PortableAction::Pane(PaneAction::Close) => Ok(()),
-        PortableAction::Pane(PaneAction::Focus(target)) => match target {
+        PaneAction::Focus(target) => match target {
             muxe_core::IndexOrDirection::Direction(direction) => {
                 Cardinal::parse("pane:focus", direction).map(|_| ())
             }
             muxe_core::IndexOrDirection::Index(index) => {
-                check_marker(
-                    "pane:focus",
-                    "index",
-                    index,
-                    &[ContextType::UnsignedInteger],
-                    true,
-                )?;
-                if !is_marker(index) {
-                    scalar_index_u32("pane:focus", "index", index).map(|_| ())
-                } else {
-                    Ok(())
-                }
+                check_concrete_index("pane:focus", "index", index)
             }
         },
-        PortableAction::Pane(PaneAction::Move(target)) => match target {
+        PaneAction::Move(target) => match target {
             muxe_core::IndexOrDirection::Direction(direction) => {
                 Cardinal::parse("pane:move", direction).map(|_| ())
             }
@@ -444,11 +443,11 @@ pub fn validate_portable_structure(action: &PortableAction) -> Result<(), Portab
                 reason: "MovePaneByPaneId takes an optional direction, not a positional destination",
             }),
         },
-        PortableAction::Pane(PaneAction::Swap(_)) => Err(PortableError::Incompatible {
+        PaneAction::Swap(_) => Err(PortableError::Incompatible {
             action: "pane:swap",
             reason: "no pinned primitive swaps two panes",
         }),
-        PortableAction::Pane(PaneAction::Resize { direction, amount }) => {
+        PaneAction::Resize { direction, amount } => {
             if let Some(amount) = amount {
                 check_marker("pane:resize", "amount", amount, &[], true)?;
                 return Err(PortableError::Incompatible {
@@ -458,52 +457,72 @@ pub fn validate_portable_structure(action: &PortableAction) -> Result<(), Portab
             }
             Cardinal::parse("pane:resize", direction).map(|_| ())
         }
-        PortableAction::Pane(PaneAction::Zoom { enabled }) => check_toggle("pane:zoom", enabled),
-        PortableAction::Pane(PaneAction::Fullscreen { enabled }) => {
-            check_toggle("pane:fullscreen", enabled)
-        }
-        PortableAction::Pane(PaneAction::Floating { enabled }) => {
-            check_toggle("pane:floating", enabled)
-        }
-        PortableAction::Pane(PaneAction::Frame { .. }) => Err(PortableError::Incompatible {
+        PaneAction::Zoom { enabled } => check_toggle("pane:zoom", enabled.as_ref()),
+        PaneAction::Fullscreen { enabled } => check_toggle("pane:fullscreen", enabled.as_ref()),
+        PaneAction::Floating { enabled } => check_toggle("pane:floating", enabled.as_ref()),
+        PaneAction::Frame { .. } => Err(PortableError::Incompatible {
             action: "pane:frame",
             reason: "no pane-targeted frame primitive exists; TogglePaneFrames acts on the focused menu pane",
         }),
-        PortableAction::Session(SessionAction::Attach { name })
-        | PortableAction::Session(SessionAction::Switch { name }) => {
-            check_marker("session:switch", "name", name, &[ContextType::String], true)?;
-            if !is_marker(name) {
-                scalar_string("session:switch", "name", name).map(|_| ())
-            } else {
-                Ok(())
-            }
+    }
+}
+
+/// Validates the session subgroup structurally.
+fn validate_session_structure(session: &SessionAction) -> Result<(), PortableError> {
+    match session {
+        SessionAction::Attach { name } | SessionAction::Switch { name } => {
+            check_concrete_string("session:switch", "name", name)
         }
-        PortableAction::Session(SessionAction::Rename { name }) => {
-            check_marker("session:rename", "name", name, &[ContextType::String], true)?;
-            if !is_marker(name) {
-                scalar_string("session:rename", "name", name).map(|_| ())
-            } else {
-                Ok(())
-            }
-        }
-        PortableAction::Session(SessionAction::Detach) => Ok(()),
-        PortableAction::Session(SessionAction::Kill) => Ok(()),
-        PortableAction::Session(SessionAction::Create) => Err(PortableError::Incompatible {
+        SessionAction::Rename { name } => check_concrete_string("session:rename", "name", name),
+        SessionAction::Detach | SessionAction::Kill => Ok(()),
+        SessionAction::Create => Err(PortableError::Incompatible {
             action: "session:create",
             reason: "no one-to-one plugin API creates a session",
         }),
-        PortableAction::Session(SessionAction::Quit) => Err(PortableError::Incompatible {
+        SessionAction::Quit => Err(PortableError::Incompatible {
             action: "session:quit",
             reason: "quit_zellij terminates the server; it is not a portable session quit",
         }),
     }
 }
 
+/// Accepts a context marker whose path type fits, else proves a concrete string.
+fn check_concrete_string(
+    action: &'static str,
+    parameter: &'static str,
+    scalar: &ActionScalar,
+) -> Result<(), PortableError> {
+    check_marker(action, parameter, scalar, &[ContextType::String], true)?;
+    if is_marker(scalar) {
+        return Ok(());
+    }
+    scalar_string(action, parameter, scalar).map(|_| ())
+}
+
+/// Accepts a context marker whose path type fits, else proves a concrete index.
+fn check_concrete_index(
+    action: &'static str,
+    parameter: &'static str,
+    scalar: &ActionScalar,
+) -> Result<(), PortableError> {
+    check_marker(
+        action,
+        parameter,
+        scalar,
+        &[ContextType::UnsignedInteger],
+        true,
+    )?;
+    if is_marker(scalar) {
+        return Ok(());
+    }
+    scalar_index_u32(action, parameter, scalar).map(|_| ())
+}
+
 fn is_marker(scalar: &ActionScalar) -> bool {
     matches!(scalar.value.kind, ConfigValueKind::Context(_))
 }
 
-fn check_toggle(action: &'static str, enabled: &Option<ActionScalar>) -> Result<(), PortableError> {
+fn check_toggle(action: &'static str, enabled: Option<&ActionScalar>) -> Result<(), PortableError> {
     if let Some(scalar) = enabled {
         // No boolean-typed context path exists, so any marker here is unresolvable.
         if is_marker(scalar) {
@@ -552,6 +571,11 @@ fn check_tab_focus_direction(scalar: &ActionScalar) -> Result<(), PortableError>
 ///
 /// Every scalar must be concrete; a surviving context marker fails closed
 /// rather than substituting an implicit current pane.
+///
+/// # Errors
+///
+/// Returns [`PortableError`] when a scalar is unresolvable, incompatible with
+/// the pinned host surface, or references missing origin context.
 pub fn map_portable(
     action: &PortableAction,
     origin: &OriginContext,
@@ -560,7 +584,20 @@ pub fn map_portable(
         PortableAction::Menu(_) | PortableAction::Config(_) | PortableAction::Command(_) => {
             Ok(PortableMapping::BrokerOwned)
         }
-        PortableAction::Keyboard(KeyboardAction::SendText(text)) => {
+        PortableAction::Keyboard(keyboard) => map_keyboard_action(keyboard, origin),
+        PortableAction::Tab(tab) => map_tab_action(tab, origin),
+        PortableAction::Pane(pane) => map_pane_action(pane, origin),
+        PortableAction::Session(session) => map_session_action(session, origin),
+    }
+}
+
+/// Maps keyboard actions against the origin pane.
+fn map_keyboard_action(
+    keyboard: &KeyboardAction,
+    origin: &OriginContext,
+) -> Result<PortableMapping, PortableError> {
+    match keyboard {
+        KeyboardAction::SendText(text) => {
             let chars = scalar_string("keyboard:send", "text", text)?;
             let pane = origin_pane("keyboard:send", origin)?;
             Ok(wrap(raw::Action::WriteCharsToPaneId {
@@ -568,13 +605,13 @@ pub fn map_portable(
                 pane_id: pane,
             }))
         }
-        PortableAction::Keyboard(KeyboardAction::SendKeys(keys)) => {
+        KeyboardAction::SendKeys(keys) => {
             let pane = origin_pane("keyboard:send", origin)?;
             let mut commands = Vec::with_capacity(keys.len());
             for key in keys {
                 let text = scalar_string("keyboard:send", "keys", key)?;
                 let mapped = map_canonical_key(&text)
-                    .map_err(|error| keyboard_error("keyboard:send", error))?;
+                    .map_err(|error| keyboard_error("keyboard:send", &error))?;
                 commands.push(RawNativeCommand::RunAction {
                     // Pinned WriteToPaneId carries bytes only: the mapped
                     // identity above proves those bytes encode the pressed key
@@ -589,7 +626,16 @@ pub fn map_portable(
             }
             Ok(PortableMapping::HostAction { commands })
         }
-        PortableAction::Tab(TabAction::Create { workspace_id }) => {
+    }
+}
+
+/// Maps tab actions; rename resolves its index from the immutable origin.
+fn map_tab_action(
+    tab: &TabAction,
+    origin: &OriginContext,
+) -> Result<PortableMapping, PortableError> {
+    match tab {
+        TabAction::Create { workspace_id } => {
             if workspace_id.is_some() {
                 return Err(PortableError::Incompatible {
                     action: "tab:create",
@@ -608,8 +654,8 @@ pub fn map_portable(
                 first_pane_unblock_condition: None,
             }))
         }
-        PortableAction::Tab(TabAction::Close) => Ok(wrap(raw::Action::CloseTab)),
-        PortableAction::Tab(TabAction::Rename { name }) => {
+        TabAction::Close => Ok(wrap(raw::Action::CloseTab)),
+        TabAction::Rename { name } => {
             let Some(name) = name else {
                 return Err(PortableError::Incompatible {
                     action: "tab:rename",
@@ -633,7 +679,7 @@ pub fn map_portable(
             let name = scalar_string("tab:rename", "name", name)?.into_bytes();
             Ok(wrap(raw::Action::RenameTab { tab_index, name }))
         }
-        PortableAction::Tab(TabAction::Focus(target)) => match target {
+        TabAction::Focus(target) => match target {
             muxe_core::IndexOrDirection::Index(index) => {
                 let position = scalar_index_u32("tab:focus", "index", index)?;
                 Ok(wrap(raw::Action::GoToTab { index: position }))
@@ -649,7 +695,7 @@ pub fn map_portable(
                 }
             }
         },
-        PortableAction::Tab(TabAction::Move(target)) => match target {
+        TabAction::Move(target) => match target {
             muxe_core::IndexOrDirection::Direction(direction) => {
                 let cardinal = Cardinal::parse("tab:move", direction)?;
                 Ok(wrap(raw::Action::MoveTab {
@@ -661,22 +707,52 @@ pub fn map_portable(
                 reason: "pinned MoveTab and MoveTabByTabId are directional; positional moves have no host primitive",
             }),
         },
-        PortableAction::Tab(TabAction::Swap(_)) => Err(PortableError::Incompatible {
+        TabAction::Swap(_) => Err(PortableError::Incompatible {
             action: "tab:swap",
             reason: "no atomic pinned primitive swaps two tabs",
         }),
-        PortableAction::Pane(PaneAction::Create) => Ok(wrap(raw::Action::NewPane {
-            direction: None,
-            pane_name: None,
-            start_suppressed: false,
-        })),
-        PortableAction::Pane(PaneAction::Split { direction }) => {
+    }
+}
+
+/// A plain new pane with no direction, name, or suppression.
+fn new_plain_pane() -> PortableMapping {
+    wrap(raw::Action::NewPane {
+        direction: None,
+        pane_name: None,
+        start_suppressed: false,
+    })
+}
+
+/// Maps pane actions, split into creation and targeted operations.
+fn map_pane_action(
+    pane: &PaneAction,
+    origin: &OriginContext,
+) -> Result<PortableMapping, PortableError> {
+    match pane {
+        PaneAction::Create | PaneAction::Split { .. } | PaneAction::Close => {
+            map_pane_lifecycle(pane, origin)
+        }
+        PaneAction::Focus(_)
+        | PaneAction::Move(_)
+        | PaneAction::Swap(_)
+        | PaneAction::Resize { .. }
+        | PaneAction::Zoom { .. }
+        | PaneAction::Fullscreen { .. }
+        | PaneAction::Floating { .. }
+        | PaneAction::Frame { .. } => map_pane_operation(pane, origin),
+    }
+}
+
+/// Maps pane creation, split, and close.
+fn map_pane_lifecycle(
+    pane: &PaneAction,
+    origin: &OriginContext,
+) -> Result<PortableMapping, PortableError> {
+    match pane {
+        PaneAction::Create => Ok(new_plain_pane()),
+        PaneAction::Split { direction } => {
             let Some(direction) = direction else {
-                return Ok(wrap(raw::Action::NewPane {
-                    direction: None,
-                    pane_name: None,
-                    start_suppressed: false,
-                }));
+                return Ok(new_plain_pane());
             };
             let cardinal = Cardinal::parse("pane:split", direction)?;
             Ok(wrap(raw::Action::NewTiledPane {
@@ -689,11 +765,21 @@ pub fn map_portable(
                 tab_id: None,
             }))
         }
-        PortableAction::Pane(PaneAction::Close) => {
+        PaneAction::Close => {
             let pane = origin_pane("pane:close", origin)?;
             Ok(wrap(raw::Action::CloseFocusByPaneId { pane_id: pane }))
         }
-        PortableAction::Pane(PaneAction::Focus(target)) => match target {
+        _ => unreachable!("pane lifecycle dispatch covers only creation, split, and close"),
+    }
+}
+
+/// Maps targeted operations on existing panes.
+fn map_pane_operation(
+    pane: &PaneAction,
+    origin: &OriginContext,
+) -> Result<PortableMapping, PortableError> {
+    match pane {
+        PaneAction::Focus(target) => match target {
             muxe_core::IndexOrDirection::Direction(direction) => {
                 let cardinal = Cardinal::parse("pane:focus", direction)?;
                 Ok(PortableMapping::BridgeFocus {
@@ -709,7 +795,7 @@ pub fn map_portable(
                 })
             }
         },
-        PortableAction::Pane(PaneAction::Move(target)) => match target {
+        PaneAction::Move(target) => match target {
             muxe_core::IndexOrDirection::Direction(direction) => {
                 let cardinal = Cardinal::parse("pane:move", direction)?;
                 let pane = origin_pane("pane:move", origin)?;
@@ -723,11 +809,11 @@ pub fn map_portable(
                 reason: "MovePaneByPaneId takes an optional direction, not a positional destination",
             }),
         },
-        PortableAction::Pane(PaneAction::Swap(_)) => Err(PortableError::Incompatible {
+        PaneAction::Swap(_) => Err(PortableError::Incompatible {
             action: "pane:swap",
             reason: "no pinned primitive swaps two panes",
         }),
-        PortableAction::Pane(PaneAction::Resize { direction, amount }) => {
+        PaneAction::Resize { direction, amount } => {
             if amount.is_some() {
                 return Err(PortableError::Incompatible {
                     action: "pane:resize",
@@ -742,36 +828,41 @@ pub fn map_portable(
                 direction: Some(cardinal.into_mirror()),
             }))
         }
-        PortableAction::Pane(PaneAction::Zoom { enabled }) => {
-            map_toggle("pane:zoom", enabled, origin, |pane| {
-                raw::Action::ToggleFocusFullscreenByPaneId { pane_id: pane }
-            })
-        }
-        PortableAction::Pane(PaneAction::Fullscreen { enabled }) => {
-            map_toggle("pane:fullscreen", enabled, origin, |pane| {
+        PaneAction::Zoom { enabled } => map_toggle("pane:zoom", enabled.as_ref(), origin, |pane| {
+            raw::Action::ToggleFocusFullscreenByPaneId { pane_id: pane }
+        }),
+        PaneAction::Fullscreen { enabled } => {
+            map_toggle("pane:fullscreen", enabled.as_ref(), origin, |pane| {
                 raw::Action::ToggleFocusNoUiFullscreenByPaneId { pane_id: pane }
             })
         }
-        PortableAction::Pane(PaneAction::Floating { enabled }) => {
-            map_toggle("pane:floating", enabled, origin, |pane| {
+        PaneAction::Floating { enabled } => {
+            map_toggle("pane:floating", enabled.as_ref(), origin, |pane| {
                 raw::Action::TogglePaneEmbedOrFloatingByPaneId { pane_id: pane }
             })
         }
-        PortableAction::Pane(PaneAction::Frame { .. }) => Err(PortableError::Incompatible {
+        PaneAction::Frame { .. } => Err(PortableError::Incompatible {
             action: "pane:frame",
             reason: "no pane-targeted frame primitive exists; TogglePaneFrames acts on the focused menu pane",
         }),
-        PortableAction::Session(SessionAction::Attach { name })
-        | PortableAction::Session(SessionAction::Switch { name }) => {
-            switch_session(scalar_string("session:switch", "name", name)?)
-        }
-        PortableAction::Session(SessionAction::Rename { name }) => {
-            Ok(wrap(raw::Action::RenameSession {
-                name: scalar_string("session:rename", "name", name)?,
-            }))
-        }
-        PortableAction::Session(SessionAction::Detach) => Ok(wrap(raw::Action::Detach)),
-        PortableAction::Session(SessionAction::Kill) => {
+        _ => unreachable!("pane operation dispatch covers only targeted operations"),
+    }
+}
+
+/// Maps session actions; kill resolves its target from the immutable origin.
+fn map_session_action(
+    session: &SessionAction,
+    origin: &OriginContext,
+) -> Result<PortableMapping, PortableError> {
+    match session {
+        SessionAction::Attach { name } | SessionAction::Switch { name } => Ok(switch_session(
+            scalar_string("session:switch", "name", name)?,
+        )),
+        SessionAction::Rename { name } => Ok(wrap(raw::Action::RenameSession {
+            name: scalar_string("session:rename", "name", name)?,
+        })),
+        SessionAction::Detach => Ok(wrap(raw::Action::Detach)),
+        SessionAction::Kill => {
             let session = origin
                 .session_id
                 .as_ref()
@@ -785,11 +876,11 @@ pub fn map_portable(
                 }],
             })
         }
-        PortableAction::Session(SessionAction::Create) => Err(PortableError::Incompatible {
+        SessionAction::Create => Err(PortableError::Incompatible {
             action: "session:create",
             reason: "no one-to-one plugin API creates a session",
         }),
-        PortableAction::Session(SessionAction::Quit) => Err(PortableError::Incompatible {
+        SessionAction::Quit => Err(PortableError::Incompatible {
             action: "session:quit",
             reason: "quit_zellij terminates the server; it is not a portable session quit",
         }),
@@ -821,19 +912,20 @@ fn scalar_direction_text<'a>(
     }
 }
 
-fn switch_session(name: String) -> Result<PortableMapping, PortableError> {
-    Ok(wrap(raw::Action::SwitchSession {
+/// Wraps a resolved session name in the pinned switch-session payload.
+fn switch_session(name: String) -> PortableMapping {
+    wrap(raw::Action::SwitchSession {
         name,
         tab_position: None,
         pane_id: None,
         layout: None,
         cwd: None,
-    }))
+    })
 }
 
 fn map_toggle(
     action: &'static str,
-    enabled: &Option<ActionScalar>,
+    enabled: Option<&ActionScalar>,
     origin: &OriginContext,
     build: impl FnOnce(raw::PaneId) -> raw::Action,
 ) -> Result<PortableMapping, PortableError> {
@@ -857,6 +949,11 @@ fn map_toggle(
 ///
 /// Callers that retain no raw form use this; the dispatch path validates
 /// through the same generated conversion at its own ownership boundary.
+///
+/// # Errors
+///
+/// Returns the generated [`ValidationError`](muxe_zellij_protocol::generated::ValidationError)
+/// when the raw mirror fails generated conversion.
 pub fn to_validated_action(
     raw_action: raw::Action,
 ) -> Result<validated::Action, muxe_zellij_protocol::generated::ValidationError> {

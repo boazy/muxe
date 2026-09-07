@@ -1,12 +1,29 @@
-use std::mem;
+use std::{mem, num::NonZeroUsize};
 
-use rkyv::{rancor::Error as RkyvError, util::AlignedVec};
+use rkyv::{
+    rancor::Error as RkyvError,
+    util::AlignedVec,
+    validation::{Validator, archive::ArchiveValidator, shared::SharedValidator},
+};
 use thiserror::Error;
 
 use crate::wire::{
     ArchivedWireMessage, Codec, ConnectionPhase, MAX_FRAME_LEN, MessageDirection, PROTOCOL_VERSION,
     PeerRole, SchemaFingerprint, SemanticError, WireMessage, validate_archived_wire_message,
 };
+
+/// Maximum nested-subtree depth accepted while bytecheck-validating one frame.
+///
+/// Measured evidence (2 MiB worker-sized stacks, debug profile): a 1000-deep
+/// `Not` condition chain (16 KiB) passes every pipeline stage, while a
+/// 2000-deep chain (32 KiB) overflows inside bytecheck before any broker code
+/// runs. rkyv's validator additionally rejects cyclic and overlapping claims
+/// structurally, so nesting depth is the only remaining unbounded axis. 512
+/// sits 2x below the measured survival point and far above legitimate use:
+/// menus nest by identifier reference, never by condition nesting, and
+/// shipped configurations nest conditions a handful deep. This is a transport
+/// bound, not a menu-depth limit.
+pub const MAX_ARCHIVE_NESTING: usize = 512;
 
 pub const PRELUDE_LEN: usize = 44;
 const MAGIC: [u8; 4] = *b"MUXE";
@@ -22,6 +39,7 @@ pub struct Prelude {
 }
 
 impl Prelude {
+    #[must_use]
     pub const fn rkyv(role: PeerRole, schema_fingerprint: SchemaFingerprint) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
@@ -32,6 +50,7 @@ impl Prelude {
         }
     }
 
+    #[must_use]
     pub const fn control(role: PeerRole) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
@@ -42,6 +61,7 @@ impl Prelude {
         }
     }
 
+    #[must_use]
     pub fn encode(self) -> [u8; PRELUDE_LEN] {
         let mut bytes = [0; PRELUDE_LEN];
         bytes[..4].copy_from_slice(&MAGIC);
@@ -53,6 +73,11 @@ impl Prelude {
         bytes
     }
 
+    /// Decodes a prelude, checking magic, version, codec, and role tags.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecodeError` on bad magic or unknown codec/role tags.
     pub fn decode(bytes: [u8; PRELUDE_LEN]) -> Result<Self, DecodeError> {
         if bytes[..4] != MAGIC {
             return Err(DecodeError::BadMagic);
@@ -72,6 +97,11 @@ impl Prelude {
         })
     }
 
+    /// Checks this prelude against the expected handshake parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecodeError` on protocol, codec, role, fingerprint, or limit mismatch.
     pub fn validate(
         &self,
         expected_codec: Codec,
@@ -118,6 +148,7 @@ pub struct ConnectionPolicy {
 }
 
 impl ConnectionPolicy {
+    #[must_use]
     pub const fn broker(role: PeerRole, schema_fingerprint: SchemaFingerprint) -> Self {
         Self {
             role,
@@ -126,6 +157,7 @@ impl ConnectionPolicy {
         }
     }
 
+    #[must_use]
     pub const fn client(role: PeerRole, schema_fingerprint: SchemaFingerprint) -> Self {
         Self {
             role,
@@ -148,17 +180,36 @@ pub struct ArchivedFrame {
 }
 
 impl ArchivedFrame {
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 
+    /// Accesses the checked archive under the depth-bounded validator.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecodeError::InvalidArchive` when byte validation fails.
     pub fn archived(&self) -> Result<&ArchivedWireMessage, DecodeError> {
-        rkyv::access::<ArchivedWireMessage, RkyvError>(self.bytes.as_slice()).map_err(archive_error)
+        let mut context = Validator::new(
+            ArchiveValidator::with_max_depth(
+                self.bytes.as_slice(),
+                NonZeroUsize::new(MAX_ARCHIVE_NESTING),
+            ),
+            SharedValidator::new(),
+        );
+        rkyv::api::access_with_context(self.bytes.as_slice(), &mut context)
+            .map_err(|error| archive_error(&error))
     }
 
+    /// Deserializes the checked archive into an owned message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecodeError` from archive access or deserialization.
     pub fn deserialize(&self) -> Result<WireMessage, DecodeError> {
         let archived = self.archived()?;
-        rkyv::deserialize::<WireMessage, RkyvError>(archived).map_err(archive_error)
+        rkyv::deserialize::<WireMessage, RkyvError>(archived).map_err(|error| archive_error(&error))
     }
 }
 
@@ -172,21 +223,29 @@ pub struct EncodedFrame {
 }
 
 impl EncodedFrame {
+    #[must_use]
     pub fn prefix(&self) -> &[u8; LENGTH_PREFIX_LEN] {
         &self.prefix
     }
 
+    #[must_use]
     pub fn payload(&self) -> &[u8] {
         self.payload.as_slice()
     }
 
+    #[must_use]
     pub fn into_parts(self) -> ([u8; LENGTH_PREFIX_LEN], AlignedVec) {
         (self.prefix, self.payload)
     }
 }
 
+/// Serializes a message into a length-prefixed aligned frame.
+///
+/// # Errors
+///
+/// Returns `DecodeError::FrameTooLarge` when the archive exceeds the u32 length prefix.
 pub fn encode_frame(message: &WireMessage) -> Result<EncodedFrame, DecodeError> {
-    let payload = rkyv::to_bytes::<RkyvError>(message).map_err(archive_error)?;
+    let payload = rkyv::to_bytes::<RkyvError>(message).map_err(|error| archive_error(&error))?;
     let payload_len = u32::try_from(payload.len()).map_err(|_| DecodeError::FrameTooLarge {
         declared: u32::MAX,
         maximum: MAX_FRAME_LEN,
@@ -233,6 +292,7 @@ enum DecoderState {
 }
 
 impl ConnectionDecoder {
+    #[must_use]
     pub fn new(policy: ConnectionPolicy) -> Self {
         Self {
             phase: policy.initial_phase(),
@@ -246,6 +306,7 @@ impl ConnectionDecoder {
         }
     }
 
+    #[must_use]
     pub fn prelude(&self) -> Option<Prelude> {
         self.prelude
     }
@@ -253,6 +314,10 @@ impl ConnectionDecoder {
     /// Decodes arbitrary stream chunks and calls `on_frame` for each valid frame before any later
     /// coalesced frame can close the connection. Earlier valid messages therefore never disappear
     /// merely because a subsequent frame is malformed.
+    /// # Errors
+    ///
+    /// Returns `DecodeError` when the decoder already failed, framing is malformed,
+    /// or a frame violates direction, handshake, or role semantics.
     pub fn push<F>(&mut self, mut input: &[u8], mut on_frame: F) -> Result<(), DecodeError>
     where
         F: FnMut(ArchivedFrame),
@@ -361,6 +426,12 @@ impl ConnectionDecoder {
         Ok(())
     }
 
+    /// Drains a closing stream, reporting a truncated tail as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecodeError::DecoderClosed` when already failed and
+    /// `DecodeError::Truncated` with the buffered stage otherwise.
     pub fn finish(&mut self) -> Result<(), DecodeError> {
         if self.failed {
             return Err(DecodeError::DecoderClosed);
@@ -377,7 +448,7 @@ impl ConnectionDecoder {
                 ..
             } => Some(TruncationStage::Payload {
                 expected: *declared_len,
-                received: bytes.len() as u32,
+                received: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
             }),
             DecoderState::Failed => return Err(DecodeError::DecoderClosed),
         };
@@ -413,7 +484,7 @@ fn copy_from_input<const N: usize>(
     copied
 }
 
-fn archive_error(error: RkyvError) -> DecodeError {
+fn archive_error(error: &RkyvError) -> DecodeError {
     DecodeError::InvalidArchive(format!("{error:?}"))
 }
 
@@ -496,7 +567,7 @@ mod tests {
             .to_vec()
     }
 
-    fn append_frame(output: &mut Vec<u8>, frame: EncodedFrame) {
+    fn append_frame(output: &mut Vec<u8>, frame: &EncodedFrame) {
         output.extend_from_slice(frame.prefix());
         output.extend_from_slice(frame.payload());
     }
@@ -504,10 +575,10 @@ mod tests {
     #[test]
     fn delivers_valid_coalesced_frames_before_later_processing() {
         let mut bytes = prelude();
-        append_frame(&mut bytes, encode_frame(&hello()).unwrap());
+        append_frame(&mut bytes, &encode_frame(&hello()).unwrap());
         append_frame(
             &mut bytes,
-            encode_frame(&WireMessage::Request {
+            &encode_frame(&WireMessage::Request {
                 request_id: request_id(2),
                 request: crate::wire::ClientRequest::Heartbeat,
             })
@@ -526,7 +597,7 @@ mod tests {
     #[test]
     fn delivers_a_valid_frame_before_a_later_coalesced_malformed_frame() {
         let mut bytes = prelude();
-        append_frame(&mut bytes, encode_frame(&hello()).unwrap());
+        append_frame(&mut bytes, &encode_frame(&hello()).unwrap());
         bytes.extend_from_slice(&4_u32.to_be_bytes());
         bytes.extend_from_slice(&[0, 0, 0, 0]);
 
@@ -541,14 +612,15 @@ mod tests {
     #[test]
     fn accepts_every_source_alignment_after_copying_to_aligned_storage() {
         let mut stream = prelude();
-        append_frame(&mut stream, encode_frame(&hello()).unwrap());
+        append_frame(&mut stream, &encode_frame(&hello()).unwrap());
         for offset in 0..32 {
             let mut source = vec![0; offset];
             source.extend_from_slice(&stream);
             let mut aligned = false;
             decoder()
                 .push(&source[offset..], |frame| {
-                    aligned = frame.as_bytes().as_ptr() as usize % AlignedVec::<16>::ALIGNMENT == 0;
+                    aligned = (frame.as_bytes().as_ptr() as usize)
+                        .is_multiple_of(AlignedVec::<16>::ALIGNMENT);
                 })
                 .unwrap();
             assert!(aligned);
@@ -621,7 +693,7 @@ mod tests {
         let mut wrong_role = Prelude::rkyv(PeerRole::Launcher, SchemaFingerprint::application())
             .encode()
             .to_vec();
-        append_frame(&mut wrong_role, encode_frame(&hello()).unwrap());
+        append_frame(&mut wrong_role, &encode_frame(&hello()).unwrap());
         assert!(matches!(
             decoder().push(&wrong_role, |_| {}),
             Err(DecodeError::PeerRoleMismatch { .. })
@@ -630,17 +702,17 @@ mod tests {
         let mut wrong_schema = Prelude::rkyv(PeerRole::Ui, SchemaFingerprint::ZERO)
             .encode()
             .to_vec();
-        append_frame(&mut wrong_schema, encode_frame(&hello()).unwrap());
+        append_frame(&mut wrong_schema, &encode_frame(&hello()).unwrap());
         assert!(matches!(
             decoder().push(&wrong_schema, |_| {}),
             Err(DecodeError::SchemaFingerprintMismatch)
         ));
 
         let mut illegal = prelude();
-        append_frame(&mut illegal, encode_frame(&hello()).unwrap());
+        append_frame(&mut illegal, &encode_frame(&hello()).unwrap());
         append_frame(
             &mut illegal,
-            encode_frame(&WireMessage::Request {
+            &encode_frame(&WireMessage::Request {
                 request_id: request_id(2),
                 request: crate::wire::ClientRequest::PrepareUiLaunch(
                     crate::wire::PrepareUiLaunch {

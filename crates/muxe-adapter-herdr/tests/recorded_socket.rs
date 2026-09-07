@@ -1,15 +1,19 @@
 mod support {
+    #[expect(
+        dead_code,
+        reason = "the transport tests share the complete production-connect surface with suspend and contract tests"
+    )]
     pub mod production_connect;
     pub mod recorded_socket;
 }
 
-use muxe_core::{ActionValidator, NativeActionCandidate, SourceId, SourceSpan};
 use muxe_adapter_api::{AdapterHealthEvent, HostAdapter};
 use muxe_adapter_herdr::{
     ApiSchema, CommandPaneLaunch, FocusedPane, HerdrAdapter, HerdrResponse, HerdrRuntime,
     HerdrSocketClient, UiSplitDirection, focused_pane, generated::method_metadata,
     open_command_pane,
 };
+use muxe_core::{ActionValidator, NativeActionCandidate, SourceId, SourceSpan};
 use serde_json::json;
 use support::{
     production_connect::ProductionConnectFixture,
@@ -30,7 +34,6 @@ async fn captures_the_client_generated_id_for_an_exact_ping_exchange() {
             })),
         }],
     )
-    .await
     .expect("recorded server starts");
     let client = HerdrSocketClient::new(server.socket());
     let metadata = method_metadata("ping").expect("bundled ping metadata");
@@ -48,9 +51,7 @@ async fn captures_the_client_generated_id_for_an_exact_ping_exchange() {
 
 #[tokio::test]
 async fn connects_the_production_adapter_through_schema_ping_probe_and_retained_subscription() {
-    let fixture = ProductionConnectFixture::start()
-        .await
-        .expect("owned fake-native fixture starts");
+    let fixture = ProductionConnectFixture::start().expect("owned fake-native fixture starts");
     let adapter = HerdrAdapter::connect(fixture.adapter_config())
         .await
         .expect("production adapter connect accepts the recorded child and socket handshake");
@@ -84,7 +85,6 @@ async fn runtime_connect_reuses_then_heals_the_cached_normalized_request_represe
         ProductionConnectFixture::ping_exchange(),
     ];
     let fixture = ProductionConnectFixture::start_scripted(script)
-        .await
         .expect("owned runtime-cache fixture starts");
     let cache = tempfile::tempdir().expect("owned shared cache");
     let mut config = fixture.adapter_config();
@@ -129,16 +129,15 @@ async fn runtime_connect_reuses_then_heals_the_cached_normalized_request_represe
 
 #[tokio::test]
 async fn runtime_schema_drift_misses_the_cached_normalized_request_representation() {
-    let runtime_schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../../fixtures/herdr/herdr-api.schema.json"))
-            .expect("bundled schema JSON");
-    let first_fixture =
-        ProductionConnectFixture::start_scripted_with_schema(
-            vec![ProductionConnectFixture::ping_exchange()],
-            runtime_schema.clone(),
-        )
-        .await
-        .expect("first owned runtime-schema fixture starts");
+    let runtime_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/herdr/herdr-api.schema.json"
+    ))
+    .expect("bundled schema JSON");
+    let first_fixture = ProductionConnectFixture::start_scripted_with_schema(
+        vec![ProductionConnectFixture::ping_exchange()],
+        &runtime_schema,
+    )
+    .expect("first owned runtime-schema fixture starts");
     let cache = tempfile::tempdir().expect("owned shared cache");
     let mut first_config = first_fixture.adapter_config();
     first_config.cache_dir = cache.path().join("cache");
@@ -153,9 +152,8 @@ async fn runtime_schema_drift_misses_the_cached_normalized_request_representatio
     drifted_schema["schema_version"] = json!(2);
     let drifted_fixture = ProductionConnectFixture::start_scripted_with_schema(
         vec![ProductionConnectFixture::ping_exchange()],
-        drifted_schema,
+        &drifted_schema,
     )
-    .await
     .expect("drifted owned runtime-schema fixture starts");
     let mut drifted_config = drifted_fixture.adapter_config();
     drifted_config.cache_dir = cache.path().join("cache");
@@ -170,12 +168,9 @@ async fn runtime_schema_drift_misses_the_cached_normalized_request_representatio
     drop(drifted_fixture);
 }
 
-
 #[tokio::test]
 async fn production_native_batch_cache_keeps_mixed_outcomes_in_current_candidate_order() {
-    let fixture = ProductionConnectFixture::start()
-        .await
-        .expect("owned production batch fixture starts");
+    let fixture = ProductionConnectFixture::start().expect("owned production batch fixture starts");
     let mut config = fixture.adapter_config();
     let cache = tempfile::tempdir().expect("owned comparison cache");
     config.cache_dir = cache.path().join("cache");
@@ -194,7 +189,10 @@ async fn production_native_batch_cache_keeps_mixed_outcomes_in_current_candidate
         .validate_native_batch(&first)
         .expect_err("the first effective native set is intentionally mixed");
     assert_eq!(first_diagnostics.len(), 1);
-    assert_eq!(first_diagnostics[0].labels[0].span.source.as_str(), "first-invalid");
+    assert_eq!(
+        first_diagnostics[0].labels[0].span.source.as_str(),
+        "first-invalid"
+    );
 
     let reordered_invalid = candidate("native.herdr.not-real:reject", "reordered-invalid");
     let reordered_valid = candidate("native.herdr.agent:list", "reordered-valid");
@@ -216,7 +214,6 @@ async fn reconnects_the_production_adapter_only_after_retained_subscription_loss
     let mut script = ProductionConnectFixture::initial_handshake();
     script.extend(ProductionConnectFixture::initial_handshake());
     let fixture = ProductionConnectFixture::start_scripted(script)
-        .await
         .expect("owned fake-native reconnect fixture starts");
     let adapter = HerdrAdapter::connect(fixture.adapter_config())
         .await
@@ -264,77 +261,91 @@ async fn reconnects_the_production_adapter_only_after_retained_subscription_loss
     drop(fixture);
 }
 
+fn command_launch_exchanges() -> Vec<RecordedExchange> {
+    vec![
+        RecordedExchange {
+            method: "session.snapshot",
+            params: json!({}),
+            response: RecordedResponse::Result(json!({
+                "type": "session_snapshot",
+                "snapshot": {
+                    "focused_workspace_id": "workspace-1",
+                    "focused_tab_id": "tab-1",
+                    "focused_pane_id": "pane-1",
+                    "panes": [{
+                        "workspace_id": "workspace-1",
+                        "tab_id": "tab-1",
+                        "pane_id": "pane-1",
+                        "cwd": "/captured/origin",
+                    }],
+                    "layouts": [{
+                        "workspace_id": "workspace-1",
+                        "tab_id": "tab-1",
+                        "panes": [{
+                            "pane_id": "pane-1",
+                            "rect": { "width": 80, "height": 24 },
+                        }],
+                    }],
+                },
+            })),
+        },
+        RecordedExchange {
+            method: "layout.apply",
+            params: json!({
+                "focus": false,
+                "workspace_id": "workspace-1",
+                "root": {
+                    "type": "pane",
+                    "command": ["tool", "--literal"],
+                    "cwd": "/captured/origin",
+                    "env": {},
+                },
+            }),
+            response: RecordedResponse::Result(json!({
+                "type": "layout_apply",
+                "layout": {
+                    "workspace_id": "workspace-1",
+                    "tab_id": "temporary-tab",
+                    "zoomed": false,
+                    "focused_pane_id": "new-pane",
+                    "root": { "type": "pane", "pane_id": "new-pane" },
+                },
+            })),
+        },
+        RecordedExchange {
+            method: "pane.move",
+            params: json!({
+                "pane_id": "new-pane",
+                "focus": true,
+                "destination": {
+                    "type": "tab",
+                    "tab_id": "tab-1",
+                    "target_pane_id": "pane-1",
+                    "split": "down",
+                    "ratio": 0.5,
+                },
+            }),
+            response: RecordedResponse::Result(json!({
+                "type": "pane_move",
+                "move_result": { "changed": true },
+            })),
+        },
+    ]
+}
+
 #[tokio::test]
 async fn launches_an_exact_command_from_the_live_focused_origin() {
     let server = RecordedUnixServer::start(
         tempfile::tempdir().expect("owned fixture directory"),
-        vec![
-            RecordedExchange {
-                method: "session.snapshot",
-                params: json!({}),
-                response: RecordedResponse::Result(json!({
-                    "type": "session_snapshot",
-                    "snapshot": {
-                        "focused_workspace_id": "workspace-1",
-                        "focused_tab_id": "tab-1",
-                        "focused_pane_id": "pane-1",
-                        "panes": [{
-                            "workspace_id": "workspace-1",
-                            "tab_id": "tab-1",
-                            "pane_id": "pane-1",
-                            "cwd": "/captured/origin",
-                        }],
-                        "layouts": [{
-                            "workspace_id": "workspace-1",
-                            "tab_id": "tab-1",
-                            "panes": [{
-                                "pane_id": "pane-1",
-                                "rect": { "width": 80, "height": 24 },
-                            }],
-                        }],
-                    },
-                })),
-            },
-            RecordedExchange {
-                method: "layout.apply",
-                params: json!({
-                    "focus": false,
-                    "workspace_id": "workspace-1",
-                    "root": {
-                        "type": "pane",
-                        "command": ["tool", "--literal"],
-                        "cwd": "/captured/origin",
-                        "env": {},
-                    },
-                }),
-                response: RecordedResponse::Result(json!({
-                    "tab_id": "temporary-tab",
-                    "pane_id": "new-pane",
-                })),
-            },
-            RecordedExchange {
-                method: "pane.move",
-                params: json!({
-                    "pane_id": "new-pane",
-                    "focus": true,
-                    "destination": {
-                        "type": "tab",
-                        "tab_id": "tab-1",
-                        "target_pane_id": "pane-1",
-                        "split": "down",
-                        "ratio": 0.5,
-                    },
-                }),
-                response: RecordedResponse::Result(json!({ "changed": true })),
-            },
-        ],
+        command_launch_exchanges(),
     )
-    .await
     .expect("recorded server starts");
     let client = HerdrSocketClient::new(server.socket());
     let schema = ApiSchema::parse(
-        serde_json::from_str(include_str!("../../../fixtures/herdr/herdr-api.schema.json"))
-            .expect("bundled schema JSON"),
+        serde_json::from_str(include_str!(
+            "../../../fixtures/herdr/herdr-api.schema.json"
+        ))
+        .expect("bundled schema JSON"),
     )
     .expect("bundled schema parses");
 

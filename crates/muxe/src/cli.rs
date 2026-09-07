@@ -278,6 +278,7 @@ pub struct ZellijIntegrationOptions {
 
 impl ZellijIntegrationOptions {
     /// Returns the policy requested explicitly by the command line, if any.
+    #[must_use]
     pub const fn configuration_policy(&self) -> Option<ConfigurationPolicy> {
         if self.always_configure {
             Some(ConfigurationPolicy::Always)
@@ -311,19 +312,117 @@ pub struct BrokerCommand {
     pub command: BrokerSubcommand,
 }
 
-/// Public broker subcommands.
+/// Broker subcommands.
 #[derive(Debug, Subcommand)]
 pub enum BrokerSubcommand {
     /// Drain and retire brokers without starting replacements.
     Retire(BrokerRetireCommand),
+    /// Start the target Herdr broker in the repository-owned upgrade runner.
+    #[command(name = "serve-herdr", hide = true)]
+    ServeHerdr(BrokerServeHerdrCommand),
+    /// Start the target Zellij broker in the repository-owned upgrade runner.
+    #[command(name = "serve-zellij", hide = true)]
+    ServeZellij(BrokerServeZellijCommand),
 }
-
 /// Arguments for `muxe broker retire`.
 #[derive(Debug, Args)]
 pub struct BrokerRetireCommand {
     /// Select live hosts to retire. The public contract intentionally has no default.
     #[arg(long, value_enum)]
     pub host: Option<HostScope>,
+}
+
+/// Fixed inputs for the hidden target-Herdr serving command.
+///
+/// The command accepts only the runner's pinned endpoint and installation
+/// inputs; it deliberately provides no arbitrary command or argument hook.
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("activation-handoff")
+        .args(["handoff", "activation_journal"])
+        .multiple(true)
+))]
+pub struct BrokerServeHerdrCommand {
+    /// Absolute Muxe broker endpoint socket path.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub socket: PathBuf,
+    /// Absolute path to the pinned Herdr binary.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub herdr_binary: PathBuf,
+    /// Absolute Herdr server socket path.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub herdr_socket: PathBuf,
+    /// Absolute configuration path for the target broker.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub config: PathBuf,
+    /// Absolute cache directory for the target broker.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub cache_dir: PathBuf,
+    /// Exact 32-hex-character target activation handoff ID.
+    #[arg(
+        long,
+        requires = "activation_journal",
+        value_parser = parse_handoff_hex
+    )]
+    pub handoff: Option<String>,
+    /// Durable activation journal read before the target broker binds.
+    #[arg(long, requires = "handoff", value_parser = parse_absolute_path)]
+    pub activation_journal: Option<PathBuf>,
+}
+
+/// Fixed inputs for the hidden target-Zellij serving command.
+///
+/// Mirrors [`BrokerServeHerdrCommand`]: only the runner's pinned endpoint and
+/// installation inputs, with the Zellij session name and executable in place
+/// of the Herdr socket pair. No arbitrary command or argument hook.
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("activation-handoff")
+        .args(["handoff", "activation_journal"])
+        .multiple(true)
+))]
+pub struct BrokerServeZellijCommand {
+    /// Absolute Muxe broker endpoint socket path.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub socket: PathBuf,
+    /// Absolute path to the pinned Zellij binary.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub zellij_exe: PathBuf,
+    /// Live Zellij session name the target broker serves.
+    #[arg(long)]
+    pub session: String,
+    /// Absolute configuration path for the target broker.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub config: PathBuf,
+    /// Absolute cache directory for the target broker.
+    #[arg(long, value_parser = parse_absolute_path)]
+    pub cache_dir: PathBuf,
+    /// Exact 32-hex-character target activation handoff ID.
+    #[arg(
+        long,
+        requires = "activation_journal",
+        value_parser = parse_handoff_hex
+    )]
+    pub handoff: Option<String>,
+    /// Durable activation journal read before the target broker binds.
+    #[arg(long, requires = "handoff", value_parser = parse_absolute_path)]
+    pub activation_journal: Option<PathBuf>,
+}
+fn parse_absolute_path(value: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("path must be absolute".to_owned())
+    }
+}
+
+fn parse_handoff_hex(value: &str) -> Result<String, String> {
+    if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(value.to_owned())
+    } else {
+        Err("handoff must be exactly 32 hexadecimal characters".to_owned())
+    }
 }
 
 /// A lifecycle host scope.
@@ -338,7 +437,7 @@ pub enum HostScope {
 /// Arguments for `muxe compatibility`.
 #[derive(Debug, Args)]
 pub struct CompatibilityCommand {
-    /// Emit the stable snake_case JSON record.
+    /// Emit the stable `snake_case` JSON record.
     #[arg(long)]
     pub json: bool,
 }
@@ -392,7 +491,7 @@ pub struct UiMenuCommand {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::*;
 
@@ -477,15 +576,17 @@ mod tests {
 
     #[test]
     fn integration_policy_flags_are_exclusive() {
-        assert!(Cli::try_parse_from([
-            "muxe",
-            "integration",
-            "install",
-            "zellij",
-            "--always-configure",
-            "--never-configure",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "muxe",
+                "integration",
+                "install",
+                "zellij",
+                "--always-configure",
+                "--never-configure",
+            ])
+            .is_err()
+        );
         let cli = Cli::try_parse_from([
             "muxe",
             "integration",
@@ -525,6 +626,208 @@ mod tests {
         assert_eq!(command.host, None);
         assert!(Cli::try_parse_from(["muxe", "purge", "--yes"]).is_err());
         assert!(Cli::try_parse_from(["muxe", "purge", "--config", "--yes"]).is_ok());
+    }
+
+    #[test]
+    fn hidden_herdr_serve_command_accepts_only_typed_inputs() {
+        let base_serve_args = [
+            "muxe",
+            "broker",
+            "serve-herdr",
+            "--socket",
+            "/tmp/muxe-target.sock",
+            "--herdr-binary",
+            "/opt/herdr/herdr",
+            "--herdr-socket",
+            "/tmp/herdr.sock",
+            "--config",
+            "/tmp/config.yml",
+            "--cache-dir",
+            "/tmp/muxe-cache",
+        ];
+        let serve = Cli::try_parse_from(base_serve_args.iter().copied())
+            .expect("old broker inputs without handoff parse");
+        let Command::Broker(BrokerCommand {
+            command: BrokerSubcommand::ServeHerdr(serve),
+        }) = serve.command
+        else {
+            panic!("expected hidden Herdr serve command");
+        };
+        assert_eq!(serve.socket, PathBuf::from("/tmp/muxe-target.sock"));
+        assert_eq!(serve.herdr_socket, PathBuf::from("/tmp/herdr.sock"));
+        assert_eq!(serve.handoff, None);
+        assert_eq!(serve.activation_journal, None);
+
+        let mut relative_socket_args = base_serve_args;
+        relative_socket_args[4] = "relative.sock";
+        assert!(Cli::try_parse_from(relative_socket_args).is_err());
+        assert!(
+            Cli::try_parse_from(
+                base_serve_args
+                    .iter()
+                    .copied()
+                    .chain(["--command", "arbitrary"])
+            )
+            .is_err()
+        );
+
+        assert!(
+            Cli::try_parse_from(
+                base_serve_args
+                    .iter()
+                    .copied()
+                    .chain(["--handoff", "0123456789abcdef0123456789ABCDEF"])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(
+                base_serve_args
+                    .iter()
+                    .copied()
+                    .chain(["--activation-journal", "/tmp/activation-journal.json"])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(base_serve_args.iter().copied().chain([
+                "--handoff",
+                "not-a-handoff",
+                "--activation-journal",
+                "/tmp/activation-journal.json",
+            ]))
+            .is_err()
+        );
+
+        let target = Cli::try_parse_from(base_serve_args.iter().copied().chain([
+            "--handoff",
+            "0123456789abcdef0123456789ABCDEF",
+            "--activation-journal",
+            "/tmp/activation-journal.json",
+        ]))
+        .expect("target inputs with handoff record parse");
+        let Command::Broker(BrokerCommand {
+            command: BrokerSubcommand::ServeHerdr(target),
+        }) = target.command
+        else {
+            panic!("expected hidden target Herdr serve command");
+        };
+        assert_eq!(
+            target.handoff.as_deref(),
+            Some("0123456789abcdef0123456789ABCDEF")
+        );
+        assert_eq!(
+            target.activation_journal.as_deref(),
+            Some(std::path::Path::new("/tmp/activation-journal.json"))
+        );
+
+        let mut command = Cli::command();
+        let broker = command
+            .find_subcommand_mut("broker")
+            .expect("broker command is present");
+        let help = broker.render_long_help().to_string();
+        assert!(!help.contains("serve-herdr"));
+    }
+    #[test]
+    fn hidden_zellij_serve_command_accepts_only_typed_inputs() {
+        let base_serve_args = [
+            "muxe",
+            "broker",
+            "serve-zellij",
+            "--socket",
+            "/tmp/muxe-target.sock",
+            "--zellij-exe",
+            "/opt/zellij/zellij",
+            "--session",
+            "work",
+            "--config",
+            "/tmp/config.yml",
+            "--cache-dir",
+            "/tmp/muxe-cache",
+        ];
+        let serve = Cli::try_parse_from(base_serve_args.iter().copied())
+            .expect("old broker inputs without handoff parse");
+        let Command::Broker(BrokerCommand {
+            command: BrokerSubcommand::ServeZellij(serve),
+        }) = serve.command
+        else {
+            panic!("expected hidden Zellij serve command");
+        };
+        assert_eq!(serve.socket, PathBuf::from("/tmp/muxe-target.sock"));
+        assert_eq!(serve.zellij_exe, PathBuf::from("/opt/zellij/zellij"));
+        assert_eq!(serve.session, "work");
+        assert_eq!(serve.handoff, None);
+        assert_eq!(serve.activation_journal, None);
+
+        let mut relative_socket_args = base_serve_args;
+        relative_socket_args[4] = "relative.sock";
+        assert!(Cli::try_parse_from(relative_socket_args).is_err());
+        assert!(
+            Cli::try_parse_from(
+                base_serve_args
+                    .iter()
+                    .copied()
+                    .chain(["--command", "arbitrary"])
+            )
+            .is_err()
+        );
+
+        assert!(
+            Cli::try_parse_from(
+                base_serve_args
+                    .iter()
+                    .copied()
+                    .chain(["--handoff", "0123456789abcdef0123456789ABCDEF"])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(
+                base_serve_args
+                    .iter()
+                    .copied()
+                    .chain(["--activation-journal", "/tmp/activation-journal.json"])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(base_serve_args.iter().copied().chain([
+                "--handoff",
+                "not-a-handoff",
+                "--activation-journal",
+                "/tmp/activation-journal.json",
+            ]))
+            .is_err()
+        );
+
+        let target = Cli::try_parse_from(base_serve_args.iter().copied().chain([
+            "--handoff",
+            "0123456789abcdef0123456789ABCDEF",
+            "--activation-journal",
+            "/tmp/activation-journal.json",
+        ]))
+        .expect("target inputs with handoff record parse");
+        let Command::Broker(BrokerCommand {
+            command: BrokerSubcommand::ServeZellij(target),
+        }) = target.command
+        else {
+            panic!("expected hidden target Zellij serve command");
+        };
+        assert_eq!(
+            target.handoff.as_deref(),
+            Some("0123456789abcdef0123456789ABCDEF")
+        );
+        assert_eq!(
+            target.activation_journal.as_deref(),
+            Some(std::path::Path::new("/tmp/activation-journal.json"))
+        );
+
+        let mut command = Cli::command();
+        let broker = command
+            .find_subcommand_mut("broker")
+            .expect("broker command is present");
+        let help = broker.render_long_help().to_string();
+        assert!(!help.contains("serve-zellij"));
     }
 
     #[test]

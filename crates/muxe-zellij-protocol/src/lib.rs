@@ -16,12 +16,12 @@ pub mod compat;
 pub mod generated;
 pub mod pipe;
 pub use compat::{
-    bridge_protocol_fingerprint, generated_action_fingerprint, native_verified_artifact_sha256,
-    pinned_source_revision, pinned_zellij_version,
+    bridge_build_id, bridge_build_id_hex, bridge_protocol_fingerprint,
+    generated_action_fingerprint, pinned_source_revision, pinned_zellij_version,
 };
 pub use pipe::{
-    BRIDGE_PROTOCOL_VERSION, BridgeArtifact, BridgeIdentity, BridgeRequest, BridgeTarget,
-    CaptureEndReason, CaptureLostReason, CommandOutcome, CommandStatus, MAX_DETAIL_LEN,
-    MAX_PIPE_LINE_LEN, NeighborDirection, PipeError, PipeEvent, PipeEventKind, PipeRequest,
-    ZellijOrigin, decode_event_line, decode_request_line, encode_event_line, encode_request_line,
+    BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, BridgeTarget, CaptureEndReason,
+    CaptureLostReason, CommandOutcome, CommandStatus, MAX_DETAIL_LEN, MAX_PIPE_LINE_LEN,
+    NeighborDirection, PipeError, PipeEvent, PipeEventKind, PipeRequest, ZellijOrigin,
+    decode_event_line, decode_request_line, encode_event_line, encode_request_line,
 };

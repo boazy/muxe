@@ -21,29 +21,49 @@ pub struct ConditionProgram {
 }
 
 impl ConditionProgram {
+    /// Compiles one closed condition expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when parsing or lowering the expression fails.
     pub fn compile(source: &str, span: SourceSpan) -> Result<Self, ConfigDiagnostic> {
         Program::compile(source).map_err(|error| {
-            ConfigDiagnostic::error(DiagnosticCode::InvalidCondition, error.to_string(), span.clone())
+            ConfigDiagnostic::error(
+                DiagnosticCode::InvalidCondition,
+                error.to_string(),
+                span.clone(),
+            )
         })?;
         let mut parser = ConditionParser::new(source);
         let ir = parser.parse().map_err(|message| {
             ConfigDiagnostic::error(DiagnosticCode::InvalidCondition, message, span)
         })?;
-        Ok(Self { source: source.to_owned(), ir })
+        Ok(Self {
+            source: source.to_owned(),
+            ir,
+        })
     }
 
+    #[must_use]
     pub fn source(&self) -> &str {
         &self.source
     }
 
+    #[must_use]
     pub fn ir(&self) -> &ConditionIr {
         &self.ir
     }
 
+    #[must_use]
     pub fn uses_pages(&self) -> bool {
         self.ir.uses_pages()
     }
 
+    /// Evaluates the expression for one pager state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when evaluation cannot produce a Boolean result.
     pub fn evaluate(&self, pages: PagesContext) -> Result<bool, ConditionEvaluationError> {
         match self.ir.evaluate(pages)? {
             ConditionValue::Bool(value) => Ok(value),
@@ -58,15 +78,15 @@ pub enum ConditionIr {
     Integer(i64),
     PagesCount,
     PagesCurrent,
-    Not(Box<ConditionIr>),
-    And(Box<ConditionIr>, Box<ConditionIr>),
-    Or(Box<ConditionIr>, Box<ConditionIr>),
-    Equal(Box<ConditionIr>, Box<ConditionIr>),
-    NotEqual(Box<ConditionIr>, Box<ConditionIr>),
-    Less(Box<ConditionIr>, Box<ConditionIr>),
-    LessEqual(Box<ConditionIr>, Box<ConditionIr>),
-    Greater(Box<ConditionIr>, Box<ConditionIr>),
-    GreaterEqual(Box<ConditionIr>, Box<ConditionIr>),
+    Not(Box<Self>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+    Equal(Box<Self>, Box<Self>),
+    NotEqual(Box<Self>, Box<Self>),
+    Less(Box<Self>, Box<Self>),
+    LessEqual(Box<Self>, Box<Self>),
+    Greater(Box<Self>, Box<Self>),
+    GreaterEqual(Box<Self>, Box<Self>),
 }
 
 impl ConditionIr {
@@ -91,8 +111,12 @@ impl ConditionIr {
         match self {
             Ir::Bool(value) => Ok(ConditionValue::Bool(*value)),
             Ir::Integer(value) => Ok(ConditionValue::Integer(*value)),
-            Ir::PagesCount => Ok(ConditionValue::Integer(i64::try_from(pages.count).unwrap_or(i64::MAX))),
-            Ir::PagesCurrent => Ok(ConditionValue::Integer(i64::try_from(pages.current).unwrap_or(i64::MAX))),
+            Ir::PagesCount => Ok(ConditionValue::Integer(
+                i64::try_from(pages.count).unwrap_or(i64::MAX),
+            )),
+            Ir::PagesCurrent => Ok(ConditionValue::Integer(
+                i64::try_from(pages.current).unwrap_or(i64::MAX),
+            )),
             Ir::Not(value) => Ok(ConditionValue::Bool(!value.evaluate(pages)?.bool()?)),
             Ir::And(left, right) => {
                 let left = left.evaluate(pages)?.bool()?;
@@ -102,12 +126,18 @@ impl ConditionIr {
                 let left = left.evaluate(pages)?.bool()?;
                 Ok(ConditionValue::Bool(left || right.evaluate(pages)?.bool()?))
             }
-            Ir::Equal(left, right) => Ok(ConditionValue::Bool(left.evaluate(pages)? == right.evaluate(pages)?)),
-            Ir::NotEqual(left, right) => Ok(ConditionValue::Bool(left.evaluate(pages)? != right.evaluate(pages)?)),
+            Ir::Equal(left, right) => Ok(ConditionValue::Bool(
+                left.evaluate(pages)? == right.evaluate(pages)?,
+            )),
+            Ir::NotEqual(left, right) => Ok(ConditionValue::Bool(
+                left.evaluate(pages)? != right.evaluate(pages)?,
+            )),
             Ir::Less(left, right) => compare(left, right, pages, |left, right| left < right),
             Ir::LessEqual(left, right) => compare(left, right, pages, |left, right| left <= right),
             Ir::Greater(left, right) => compare(left, right, pages, |left, right| left > right),
-            Ir::GreaterEqual(left, right) => compare(left, right, pages, |left, right| left >= right),
+            Ir::GreaterEqual(left, right) => {
+                compare(left, right, pages, |left, right| left >= right)
+            }
         }
     }
 }
@@ -166,7 +196,10 @@ impl<'a> ConditionParser<'a> {
         let expression = self.or()?;
         self.whitespace();
         if self.position != self.input.len() {
-            return Err(format!("unsupported CEL condition syntax near `{}`", &self.input[self.position..]));
+            return Err(format!(
+                "unsupported CEL condition syntax near `{}`",
+                &self.input[self.position..]
+            ));
         }
         Ok(expression)
     }
@@ -190,7 +223,10 @@ impl<'a> ConditionParser<'a> {
     fn comparison(&mut self) -> Result<ConditionIr, String> {
         let left = self.unary()?;
         for (operator, build) in [
-            ("==", ConditionIr::Equal as fn(Box<ConditionIr>, Box<ConditionIr>) -> ConditionIr),
+            (
+                "==",
+                ConditionIr::Equal as fn(Box<ConditionIr>, Box<ConditionIr>) -> ConditionIr,
+            ),
             ("!=", ConditionIr::NotEqual),
             ("<=", ConditionIr::LessEqual),
             (">=", ConditionIr::GreaterEqual),
@@ -231,7 +267,11 @@ impl<'a> ConditionParser<'a> {
             }
         }
         let start = self.position;
-        while self.input[self.position..].chars().next().is_some_and(|character| character.is_ascii_digit()) {
+        while self.input[self.position..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+        {
             self.position += 1;
         }
         if start != self.position {
@@ -240,7 +280,10 @@ impl<'a> ConditionParser<'a> {
                 .map(ConditionIr::Integer)
                 .map_err(|_| "CEL integer is out of range".to_owned());
         }
-        Err(format!("unsupported CEL condition syntax near `{}`", &self.input[self.position..]))
+        Err(format!(
+            "unsupported CEL condition syntax near `{}`",
+            &self.input[self.position..]
+        ))
     }
 
     fn consume(&mut self, token: &str) -> bool {
@@ -259,7 +302,11 @@ impl<'a> ConditionParser<'a> {
         if !remainder.starts_with(token) {
             return false;
         }
-        if remainder[token.len()..].chars().next().is_some_and(|character| character.is_ascii_alphanumeric() || character == '_') {
+        if remainder[token.len()..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
             return false;
         }
         self.position += token.len();
@@ -267,7 +314,11 @@ impl<'a> ConditionParser<'a> {
     }
 
     fn whitespace(&mut self) {
-        while self.input[self.position..].chars().next().is_some_and(char::is_whitespace) {
+        while self.input[self.position..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
             self.position += 1;
         }
     }
@@ -286,7 +337,21 @@ mod tests {
         )
         .unwrap();
         assert!(program.uses_pages());
-        assert!(program.evaluate(PagesContext { current: 1, count: 2 }).unwrap());
-        assert!(!program.evaluate(PagesContext { current: 2, count: 2 }).unwrap());
+        assert!(
+            program
+                .evaluate(PagesContext {
+                    current: 1,
+                    count: 2
+                })
+                .unwrap()
+        );
+        assert!(
+            !program
+                .evaluate(PagesContext {
+                    current: 2,
+                    count: 2
+                })
+                .unwrap()
+        );
     }
 }

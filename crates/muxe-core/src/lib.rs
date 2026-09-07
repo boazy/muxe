@@ -6,9 +6,9 @@
 #![forbid(unsafe_code)]
 
 mod action;
+mod compiler;
 mod condition;
 mod config;
-mod compiler;
 mod context;
 mod diagnostic;
 mod execution;
@@ -23,14 +23,12 @@ pub use action::{
     PortableActionDescriptor, PortableActionKind, PortableActionResolutionError, SessionAction,
     TabAction,
 };
-pub use condition::{
-    ConditionEvaluationError, ConditionIr, ConditionProgram, PagesContext,
-};
+pub use condition::{ConditionEvaluationError, ConditionIr, ConditionProgram, PagesContext};
 pub use config::{
-    compile_yaml, merge_values, ActionValidation, ActionValidator, CompileInput, CompiledConfig,
-    Compiler, ConfigDocument, ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError,
-    HostSettings, HostVersionCheck, KeyboardProfile, RawConfig, ReloadSettings, ThemeAssets,
-    ThemeSelection,
+    ActionValidation, ActionValidator, CompileInput, CompiledConfig, Compiler, ConfigDocument,
+    ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError, HostSettings,
+    HostVersionCheck, KeyboardProfile, RawConfig, ReloadSettings, ThemeAssets, ThemeSelection,
+    compile_yaml, merge_values,
 };
 pub use context::{
     AgentId, ClientId, ContextPath, ContextReference, ContextType, ContextValue, LinkHandlerId,
@@ -49,16 +47,16 @@ pub use key::{
     KeyParseError, LockModifiers, Modifiers, NamedKey,
 };
 pub use menu::{
-    binding_index, menu_view, BindingConditions, BindingId, BindingLocation, BindingSettings,
-    BindingView, CompiledBinding, CompiledGeneration, CompiledMenu, LayoutPadding, LayoutSettings,
-    LocalMenuAction, MenuId, MenuView, MenuViewMenu, UiAttachmentView, ViewBindingSettings,
-    ViewBindingState,
+    BindingConditions, BindingId, BindingLocation, BindingSettings, BindingView, CompiledBinding,
+    CompiledGeneration, CompiledMenu, LayoutPadding, LayoutSettings, LocalMenuAction, MenuId,
+    MenuView, MenuViewMenu, UiAttachmentView, ViewBindingSettings, ViewBindingState, binding_index,
+    menu_view,
 };
 pub use session::{
     ExecutionId, MenuSession, MenuSessionEvent, MenuSessionInput, MenuSessionOutput,
     MenuSessionState, SessionInstant,
 };
 pub use theme::{
-    compiled_default_theme, default_color_scheme, default_theme, Color, ColorScheme, CompiledTheme,
-    Style, Theme, ThemePairError, ThemeSection,
+    Color, ColorScheme, CompiledTheme, Style, Theme, ThemePairError, ThemeSection,
+    compiled_default_theme, default_color_scheme, default_theme,
 };

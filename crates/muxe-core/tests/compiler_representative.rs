@@ -1,6 +1,4 @@
-use muxe_core::{
-    compile_yaml, CompiledGeneration, KeyCapabilities, MenuId, SourceId,
-};
+use muxe_core::{CompiledGeneration, KeyCapabilities, MenuId, SourceId, compile_yaml};
 
 const COMPLETE_BASE: &str = r#"
 version: 1
@@ -119,11 +117,17 @@ fn compiles_the_complete_design_base_example_with_injections_and_inline_menu() {
     assert_eq!(config.generation, CompiledGeneration(7));
     assert!(config.menu(&MenuId::new("main")).is_some());
     assert!(config.menu(&MenuId::new("tabs")).is_some());
-    assert_eq!(config.menus.len(), 3, "the inline submenu is compiled as a graph node");
-    assert!(config
-        .menu(&MenuId::new("main"))
-        .expect("main menu")
-        .bindings
-        .iter()
-        .any(|binding| binding.key.canonical_string() == "esc"));
+    assert_eq!(
+        config.menus.len(),
+        3,
+        "the inline submenu is compiled as a graph node"
+    );
+    assert!(
+        config
+            .menu(&MenuId::new("main"))
+            .expect("main menu")
+            .bindings
+            .iter()
+            .any(|binding| binding.key.canonical_string() == "esc")
+    );
 }

@@ -7,9 +7,16 @@ publish = false
 [[bin]]
 name = "muxe-zellij-foreground"
 path = "src/main.rs"
+[[bin]]
+name = "muxe-zellij-bootstrap"
+path = "src/bootstrap.rs"
 
 [[bin]]
-name = "muxe-fault-injector"
+name = "muxe-zellij-permit"
+path = "src/permit.rs"
+
+[[bin]]
+name = "muxe-zellij-fault-injector"
 path = "src/fault_injector.rs"
 
 [dependencies]

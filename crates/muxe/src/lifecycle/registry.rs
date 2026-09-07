@@ -127,7 +127,11 @@ impl RegistryLock {
     fn acquire(lock_path: &Path) -> Result<Self, RegistryError> {
         let file = fsutil::open_owner_file(lock_path, false)?;
         file.lock().map_err(|source| {
-            RegistryError::Fs(fsutil::io_error("locking broker registry", lock_path, source))
+            RegistryError::Fs(fsutil::io_error(
+                "locking broker registry",
+                lock_path,
+                source,
+            ))
         })?;
         fsutil::verify_owner_file_descriptor(lock_path, &file)?;
         Ok(Self { _file: file })
@@ -142,6 +146,10 @@ pub struct Registry {
 
 impl Registry {
     /// Opens the registry, creating the owner-only directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the owner-only directory cannot be created or validated.
     pub fn open(cache_dir: &Path) -> Result<Self, RegistryError> {
         let directory = cache_dir.join(REGISTRY_DIR_NAME);
         fsutil::ensure_owner_dir(&directory)?;
@@ -157,6 +165,10 @@ impl Registry {
     /// concurrent broker startups cannot overwrite each other's entries.
     /// Returns an ownership-scoped token; only [`Registry::unregister`] with
     /// that token removes this record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the registry cannot be locked, read, or written.
     pub fn register(&self, entry: BrokerEntry) -> Result<Registration, RegistryError> {
         let _lock = RegistryLock::acquire(&self.lock_path)?;
         let mut file = self.read()?;
@@ -169,6 +181,10 @@ impl Registry {
     /// Removes only the exact entry owned by `registration`. Returns true
     /// when it was present. An old broker shutting down after its target
     /// replaced the same normal socket keeps the target's record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the registry cannot be locked, read, or written.
     pub fn unregister(&self, registration: &Registration) -> Result<bool, RegistryError> {
         self.unregister_entry(&registration.entry)
     }
@@ -176,6 +192,10 @@ impl Registry {
     /// Removes only the exact observed `entry`. Coordinator form of
     /// [`Registry::unregister`] for observations (probes, planned units)
     /// rather than owned registration tokens. Returns true when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the registry cannot be locked, read, or written.
     pub fn unregister_entry(&self, entry: &BrokerEntry) -> Result<bool, RegistryError> {
         let _lock = RegistryLock::acquire(&self.lock_path)?;
         let mut file = self.read()?;
@@ -187,27 +207,14 @@ impl Registry {
         }
         Ok(removed)
     }
-
-    /// Removes the record for `socket`, whatever it currently holds.
-    ///
-    /// Legacy socket-scoped removal retained only for the serve-herdr
-    /// shutdown path until it migrates to [`Registry::unregister`]; new
-    /// callers must use the ownership-scoped token instead.
-    pub fn unregister_socket(&self, socket: &Path) -> Result<bool, RegistryError> {
-        let _lock = RegistryLock::acquire(&self.lock_path)?;
-        let mut file = self.read()?;
-        let before = file.brokers.len();
-        file.brokers.retain(|known| known.socket != socket);
-        let removed = file.brokers.len() != before;
-        if removed {
-            self.write(&file)?;
-        }
-        Ok(removed)
-    }
 }
 
 impl Registry {
     /// Returns every recorded entry. A missing registry reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the registry cannot be read or is corrupt.
     pub fn entries(&self) -> Result<Vec<BrokerEntry>, RegistryError> {
         Ok(self.read()?.brokers)
     }
@@ -215,6 +222,10 @@ impl Registry {
     /// Probes every entry: a refused or missing socket is stale, an accepted
     /// connection is live. Any other socket error fails closed instead of
     /// guessing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the registry cannot be read or a socket probe fails unexpectedly.
     pub fn probe(&self) -> Result<Liveness, RegistryError> {
         let mut liveness = Liveness::default();
         for entry in self.entries()? {
@@ -232,6 +243,10 @@ impl Registry {
     /// Each observed entry is re-probed under the registry lock and only the
     /// exact observed entry is removed, so a replacement that rebound the
     /// same socket after the probe is never deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the registry cannot be locked, read, written, or probed.
     pub fn prune_stale(&self) -> Result<usize, RegistryError> {
         let stale: Vec<BrokerEntry> = self.probe()?.stale;
         let _lock = RegistryLock::acquire(&self.lock_path)?;
@@ -319,8 +334,7 @@ fn socket_is_stale(socket: &Path) -> Result<bool, RegistryError> {
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -357,7 +371,7 @@ mod tests {
         let mut old = entry(socket.clone());
         old.server_pid = 100;
         old.started_at = 1;
-        let mut target = entry(socket.clone());
+        let mut target = entry(socket);
         target.server_pid = 200;
         target.started_at = 2;
         let old_registration = registry.register(old).unwrap();
@@ -399,7 +413,14 @@ mod tests {
         let registry = test_registry(temp.path());
         let socket = temp.path().join("rebound.sock");
         registry.register(entry(socket.clone())).unwrap();
-        assert!(registry.probe().unwrap().stale.iter().any(|stale| stale.socket == socket));
+        assert!(
+            registry
+                .probe()
+                .unwrap()
+                .stale
+                .iter()
+                .any(|stale| stale.socket == socket)
+        );
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         assert_eq!(registry.prune_stale().unwrap(), 0);
         assert_eq!(registry.entries().unwrap().len(), 1);
@@ -415,7 +436,7 @@ mod tests {
         old.started_at = 1;
         registry.register(old).unwrap();
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let mut target = entry(socket.clone());
+        let mut target = entry(socket);
         target.server_pid = 200;
         target.started_at = 2;
         registry.register(target.clone()).unwrap();
@@ -440,8 +461,11 @@ mod tests {
     fn concurrent_processes_keep_distinct_registrations() {
         const CHILDREN: usize = 8;
         let temp = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let executable = std::env::current_exe().unwrap();
         let mut children = Vec::new();
         for child_id in 0..CHILDREN {

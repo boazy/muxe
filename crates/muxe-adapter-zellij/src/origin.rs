@@ -36,9 +36,18 @@ pub enum OriginError {
 ///
 /// `server_name` is the live session name the broker was configured with; a
 /// snapshot for a different session fails rather than cross-wiring dispatch.
-/// `ui_pane` is the attaching Muxe UI's own pane, kept as the pane identity so
-/// cleanup targets the right pane while action targets resolve from the prior
-/// (pre-menu) pane snapshot.
+/// `ui_pane` is the attaching Muxe UI's own pane. It is verified against the
+/// snapshot but never stored as the action origin: pane-scoped actions resolve
+/// from the verified bridge PRIOR (pre-menu) pane, so the UI pane can never
+/// become a dispatch target. The UI pane identity remains the key for
+/// cleanup/session/capture correlation in the adapter's snapshot tables.
+///
+/// # Errors
+///
+/// Returns [`OriginError::InvalidId`] when the snapshot names a different UI
+/// pane or session, or when the prior pane is empty. Returns
+/// [`OriginError::RelativeCwd`] when the prior pane working directory is not
+/// absolute.
 pub fn build_origin_context(
     snapshot: &ZellijOrigin,
     server_name: &str,
@@ -47,6 +56,22 @@ pub fn build_origin_context(
     tab_id: Option<&str>,
     tab_index: Option<u64>,
 ) -> Result<OriginContext, OriginError> {
+    if snapshot.ui_pane_id != ui_pane {
+        return Err(OriginError::InvalidId {
+            field: "ui-pane",
+            reason: "snapshot is for a different UI pane",
+        });
+    }
+    let prior = match snapshot.prior_pane_id.as_deref() {
+        None => None,
+        Some("") => {
+            return Err(OriginError::InvalidId {
+                field: "prior-pane",
+                reason: "bridge reported an empty prior pane",
+            });
+        }
+        Some(pane) => Some(PaneId::new(pane)),
+    };
     if let Some(session) = &snapshot.session_name
         && session != server_name
     {
@@ -77,7 +102,7 @@ pub fn build_origin_context(
         workspace_id: None,
         tab_id: tab_id.map(TabId::new),
         tab_index,
-        pane_id: Some(PaneId::new(ui_pane)),
+        pane_id: prior,
         pane_type: None,
         pane_cwd: prior_cwd,
         selection_text: None,
@@ -92,6 +117,7 @@ pub fn build_origin_context(
 
 /// The prior (pre-menu) pane is the action target for pane-scoped behavior.
 /// Returns its snapshot ID when the bridge tracked one.
+#[must_use]
 pub fn prior_pane_id(snapshot: &ZellijOrigin) -> Option<&str> {
     snapshot.prior_pane_id.as_deref()
 }
@@ -124,6 +150,12 @@ mod tests {
         .expect("valid snapshot builds");
         assert_eq!(origin.host_kind, OriginHostKind::Zellij);
         assert_eq!(origin.server_id.as_str(), "alpha");
+        // The action origin is the bridge PRIOR pane, never the Muxe UI pane:
+        // pane-scoped dispatch must not close or write into the menu itself.
+        assert_eq!(
+            origin.pane_id.as_ref().map(muxe_core::PaneId::as_str),
+            Some("terminal-2")
+        );
         assert_eq!(origin.pane_cwd, Some(PathBuf::from("/home/user/work")));
         assert_eq!(origin.tab_index, Some(0));
         assert_eq!(prior_pane_id(&snapshot()), Some("terminal-2"));
@@ -161,6 +193,47 @@ mod tests {
             build_origin_context(&snapshot, "alpha", "plugin-9", None, None, None).expect("builds");
         assert_eq!(origin.pane_cwd, None);
         assert_eq!(origin.session_id, None);
+        assert_eq!(
+            origin.pane_id.as_ref().map(muxe_core::PaneId::as_str),
+            Some("terminal-2")
+        );
         assert_eq!(prior_pane_id(&snapshot), Some("terminal-2"));
+    }
+
+    #[test]
+    fn ui_pane_mismatch_fails() {
+        let error = build_origin_context(&snapshot(), "alpha", "plugin-8", None, None, None)
+            .expect_err("foreign UI pane fails");
+        assert!(matches!(
+            error,
+            OriginError::InvalidId {
+                field: "ui-pane",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_prior_pane_fails() {
+        let mut snapshot = snapshot();
+        snapshot.prior_pane_id = Some(String::new());
+        let error = build_origin_context(&snapshot, "alpha", "plugin-9", None, None, None)
+            .expect_err("empty prior fails");
+        assert!(matches!(
+            error,
+            OriginError::InvalidId {
+                field: "prior-pane",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_prior_pane_stays_missing() {
+        let mut snapshot = snapshot();
+        snapshot.prior_pane_id = None;
+        let origin =
+            build_origin_context(&snapshot, "alpha", "plugin-9", None, None, None).expect("builds");
+        assert_eq!(origin.pane_id, None);
     }
 }

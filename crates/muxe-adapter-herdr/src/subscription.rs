@@ -64,16 +64,20 @@ impl EventSubscription {
     /// Sends the retained subscribe request on a fresh connection and reads exactly
     /// one correlated initial response, keeping the stream open for events. The
     /// returned value is the server's subscribe result for the broker to record.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SocketError` when the subscribe request cannot be sent, no
+    /// correlated initial response arrives, or the server rejects the subscription.
     pub async fn connect(
         client: &HerdrSocketClient,
         config: SubscriptionConfig,
     ) -> Result<(Self, Value), SocketError> {
-        let metadata = method_metadata("events.subscribe").ok_or_else(|| {
-            SocketError::Protocol {
+        let metadata =
+            method_metadata("events.subscribe").ok_or_else(|| SocketError::Protocol {
                 delivery: DeliveryState::NotSent,
                 message: "bundled Herdr metadata does not declare events.subscribe".to_owned(),
-            }
-        })?;
+            })?;
         if metadata.method != "events.subscribe" {
             return Err(SocketError::Protocol {
                 delivery: DeliveryState::NotSent,
@@ -81,7 +85,7 @@ impl EventSubscription {
             });
         }
         let id = client.next_id()?;
-        let mut line = encode_request(metadata.method, &id, config.params.clone())?;
+        let mut line = encode_request(metadata.method, &id, &config.params)?;
         line.push(b'\n');
         let mut stream = client.connect_stream().await?;
         write_line(&mut stream, &line).await?;
@@ -96,7 +100,7 @@ impl EventSubscription {
                 delivery: DeliveryState::MayHaveReachedHost,
                 source,
             })?;
-        match parse_response(response, &id)? {
+        match parse_response(&response, &id)? {
             crate::transport::HerdrResponse::Success(result) => Ok((
                 Self {
                     reader,
@@ -119,17 +123,21 @@ impl EventSubscription {
     /// elapses. Every received line restarts the bound on the following call; an
     /// expired bound reports `MayHaveReachedHost` so the broker treats a lost
     /// subscription as continuity loss, never as a detach or a replayable request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SocketError` when the silence bound expires or the next line is
+    /// not valid JSON.
     pub async fn next_event(&mut self) -> Result<SubscriptionEvent, SocketError> {
         let line = timeout(self.max_silence, read_response_line(&mut self.reader))
             .await
             .map_err(|_| SocketError::Timeout {
                 delivery: DeliveryState::MayHaveReachedHost,
             })??;
-        let event =
-            serde_json::from_slice(&line).map_err(|source| SocketError::InvalidJson {
-                delivery: DeliveryState::MayHaveReachedHost,
-                source,
-            })?;
+        let event = serde_json::from_slice(&line).map_err(|source| SocketError::InvalidJson {
+            delivery: DeliveryState::MayHaveReachedHost,
+            source,
+        })?;
         Ok(SubscriptionEvent::Event(event))
     }
 
@@ -148,6 +156,10 @@ impl EventSubscription {
     /// request itself is re-sent; host mutations are never replayed here. Attempts
     /// and sleeps use virtual-time-compatible clocks, so tests drive this
     /// deterministically with a paused clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last `SocketError` when no reconnect succeeds within `grace`.
     pub async fn reconnect_with_grace(
         client: &HerdrSocketClient,
         config: SubscriptionConfig,
@@ -215,7 +227,9 @@ mod tests {
             let (mut reader, id, params) = read_subscribe_line(stream).await;
             assert_eq!(params["subscriptions"][0]["type"], "tab.focused");
             reader
-                .write_all(format!("{{\"id\":\"{id}\",\"result\":{{\"subscribed\":true}}}}\n").as_bytes())
+                .write_all(
+                    format!("{{\"id\":\"{id}\",\"result\":{{\"subscribed\":true}}}}\n").as_bytes(),
+                )
                 .await
                 .unwrap();
             reader
@@ -228,7 +242,8 @@ mod tests {
                 .unwrap();
         });
         let client = HerdrSocketClient::new(&path);
-        let (mut subscription, result) = EventSubscription::connect(&client, config()).await.unwrap();
+        let (mut subscription, result) =
+            EventSubscription::connect(&client, config()).await.unwrap();
         assert_eq!(result, json!({"subscribed": true}));
         assert_eq!(
             subscription.params(),
@@ -259,7 +274,9 @@ mod tests {
                 .unwrap();
         });
         let client = HerdrSocketClient::new(&path);
-        let error = EventSubscription::connect(&client, config()).await.unwrap_err();
+        let error = EventSubscription::connect(&client, config())
+            .await
+            .unwrap_err();
         server.await.unwrap();
         assert!(matches!(error, SocketError::Protocol { .. }));
         assert_eq!(error.delivery(), DeliveryState::MayHaveReachedHost);
@@ -299,7 +316,7 @@ mod tests {
                 .write_all(format!("{{\"id\":\"{id}\",\"result\":{{}}}}\n").as_bytes())
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
         });
         let client = HerdrSocketClient::new(&path);
         let short = SubscriptionConfig {
@@ -354,10 +371,12 @@ mod tests {
             let (mut reader, id, params) = read_subscribe_line(stream).await;
             assert_eq!(params["subscriptions"][0]["type"], "tab.focused");
             reader
-                .write_all(format!("{{\"id\":\"{id}\",\"result\":{{\"subscribed\":true}}}}\n").as_bytes())
+                .write_all(
+                    format!("{{\"id\":\"{id}\",\"result\":{{\"subscribed\":true}}}}\n").as_bytes(),
+                )
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
         });
         let client = HerdrSocketClient::new(&path);
         let mut retry_config = config();

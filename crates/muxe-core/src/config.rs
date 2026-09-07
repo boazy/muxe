@@ -10,8 +10,8 @@ use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceId, SourceSpan};
 use crate::execution::ExecutionCapabilities;
 use crate::key::{CanonicalKey, KeyCapabilities, KeyEvent};
 use crate::menu::{
-    menu_view, BindingId, BindingLocation, CompiledBinding, CompiledGeneration, CompiledMenu,
-    MenuId, UiAttachmentView,
+    BindingId, BindingLocation, CompiledBinding, CompiledGeneration, CompiledMenu, MenuId,
+    UiAttachmentView, menu_view,
 };
 use crate::theme::CompiledTheme;
 
@@ -42,7 +42,6 @@ pub struct ConfigField {
     pub name_span: SourceSpan,
     pub value: ConfigValue,
 }
-
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextResolutionError {
@@ -117,7 +116,9 @@ impl ConfigValue {
     }
 
     pub fn field_mut(&mut self, name: &str) -> Option<&mut ConfigField> {
-        self.as_mapping_mut()?.iter_mut().find(|field| field.name == name)
+        self.as_mapping_mut()?
+            .iter_mut()
+            .find(|field| field.name == name)
     }
 
     pub fn remove_field(&mut self, name: &str) -> Option<ConfigField> {
@@ -128,7 +129,8 @@ impl ConfigValue {
 
     #[must_use]
     pub fn contains_marker(&self, marker: &str) -> bool {
-        self.field(marker).is_some_and(|field| field.value.as_bool() == Some(true))
+        self.field(marker)
+            .is_some_and(|field| field.value.as_bool() == Some(true))
     }
 
     /// Resolves every typed context marker from the attach-time immutable origin. A missing known
@@ -142,11 +144,19 @@ impl ConfigValue {
             ConfigValueKind::Context(reference) => {
                 let value = reference
                     .resolve(origin)
-                    .ok_or_else(|| ContextResolutionError { reference: reference.clone() })?;
-                return Ok(Self { span: self.span.clone(), kind: context_value_kind(value) });
+                    .ok_or_else(|| ContextResolutionError {
+                        reference: reference.clone(),
+                    })?;
+                return Ok(Self {
+                    span: self.span.clone(),
+                    kind: context_value_kind(value),
+                });
             }
             ConfigValueKind::Sequence(values) => ConfigValueKind::Sequence(
-                values.iter().map(|value| value.resolve_context(origin)).collect::<Result<_, _>>()?,
+                values
+                    .iter()
+                    .map(|value| value.resolve_context(origin))
+                    .collect::<Result<_, _>>()?,
             ),
             ConfigValueKind::Mapping(fields) => ConfigValueKind::Mapping(
                 fields
@@ -162,18 +172,31 @@ impl ConfigValue {
             ),
             _ => return Ok(self.clone()),
         };
-        Ok(Self { span: self.span.clone(), kind })
+        Ok(Self {
+            span: self.span.clone(),
+            kind,
+        })
     }
 }
 
 fn context_value_kind(value: ContextValue) -> ConfigValueKind {
     match value {
-        ContextValue::UnsignedInteger(value) => ConfigValueKind::Integer(i64::try_from(value).unwrap_or(i64::MAX)),
+        ContextValue::UnsignedInteger(value) => {
+            ConfigValueKind::Integer(i64::try_from(value).unwrap_or(i64::MAX))
+        }
         ContextValue::String(value) | ContextValue::Url(value) => ConfigValueKind::String(value),
-        ContextValue::AbsolutePath(value) => ConfigValueKind::String(value.to_string_lossy().into_owned()),
-        ContextValue::HostKind(value) => ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase()),
-        ContextValue::PaneType(value) => ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase()),
-        ContextValue::InvocationSource(value) => ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase()),
+        ContextValue::AbsolutePath(value) => {
+            ConfigValueKind::String(value.to_string_lossy().into_owned())
+        }
+        ContextValue::HostKind(value) => {
+            ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase())
+        }
+        ContextValue::PaneType(value) => {
+            ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase())
+        }
+        ContextValue::InvocationSource(value) => {
+            ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase())
+        }
         ContextValue::ServerId(value) => ConfigValueKind::String(value.to_string()),
         ContextValue::ClientId(value) => ConfigValueKind::String(value.to_string()),
         ContextValue::SessionId(value) => ConfigValueKind::String(value.to_string()),
@@ -240,7 +263,11 @@ fn config_value_from_yaml(
     value: MarkedYamlOwned,
     source: &SourceId,
 ) -> Result<ConfigValue, ConfigDiagnostic> {
-    let span = SourceSpan::new(source.clone(), value.span.start.index(), value.span.end.index());
+    let span = SourceSpan::new(
+        source.clone(),
+        value.span.start.index(),
+        value.span.end.index(),
+    );
     let kind = match value.data {
         YamlDataOwned::Value(scalar) => match scalar {
             ScalarOwned::Null => ConfigValueKind::Null,
@@ -259,7 +286,8 @@ fn config_value_from_yaml(
             let mut names = HashSet::new();
             let mut fields = Vec::with_capacity(mapping.len());
             for (key, value) in mapping {
-                let key_span = SourceSpan::new(source.clone(), key.span.start.index(), key.span.end.index());
+                let key_span =
+                    SourceSpan::new(source.clone(), key.span.start.index(), key.span.end.index());
                 let YamlDataOwned::Value(ScalarOwned::String(name)) = key.data else {
                     return Err(ConfigDiagnostic::error(
                         DiagnosticCode::InvalidValue,
@@ -309,20 +337,27 @@ fn config_value_from_yaml(
 
 /// Deep merge with Muxe's ordering, removal, and wholesale-replacement semantics.
 pub fn merge_values(base: &mut ConfigValue, overlay: ConfigValue) {
-    let (Some(base_mapping), Some(overlay_mapping)) = (base.as_mapping_mut(), overlay.as_mapping()) else {
+    let (Some(base_mapping), Some(overlay_mapping)) = (base.as_mapping_mut(), overlay.as_mapping())
+    else {
         *base = clean_directives(overlay);
         return;
     };
 
     for overlay_field in overlay_mapping {
         if overlay_field.value.contains_marker("_remove") {
-            if let Some(position) = base_mapping.iter().position(|field| field.name == overlay_field.name) {
+            if let Some(position) = base_mapping
+                .iter()
+                .position(|field| field.name == overlay_field.name)
+            {
                 base_mapping.remove(position);
             }
             continue;
         }
         let overlay_value = clean_directives(overlay_field.value.clone());
-        if let Some(existing) = base_mapping.iter_mut().find(|field| field.name == overlay_field.name) {
+        if let Some(existing) = base_mapping
+            .iter_mut()
+            .find(|field| field.name == overlay_field.name)
+        {
             if overlay_field.value.contains_marker("_replace") {
                 existing.value = overlay_value;
                 existing.name_span = overlay_field.name_span.clone();
@@ -386,7 +421,10 @@ pub struct ReloadSettings {
 
 impl Default for ReloadSettings {
     fn default() -> Self {
-        Self { watch: true, debounce: Duration::from_millis(200) }
+        Self {
+            watch: true,
+            debounce: Duration::from_millis(200),
+        }
     }
 }
 
@@ -421,7 +459,10 @@ pub struct ThemeSelection {
 
 impl Default for ThemeSelection {
     fn default() -> Self {
-        Self { theme: "default".to_owned(), color_scheme: "default".to_owned() }
+        Self {
+            theme: "default".to_owned(),
+            color_scheme: "default".to_owned(),
+        }
     }
 }
 
@@ -498,11 +539,20 @@ impl CompiledConfig {
     }
 
     #[must_use]
-    pub fn binding(&self, generation: CompiledGeneration, id: BindingId) -> Option<&CompiledBinding> {
+    pub fn binding(
+        &self,
+        generation: CompiledGeneration,
+        id: BindingId,
+    ) -> Option<&CompiledBinding> {
         (generation == self.generation && id.generation() == generation)
             .then(|| self.bindings.get(&id))
             .flatten()
-            .and_then(|location| self.menus.get(location.menu)?.bindings.get(location.binding))
+            .and_then(|location| {
+                self.menus
+                    .get(location.menu)?
+                    .bindings
+                    .get(location.binding)
+            })
     }
 }
 
@@ -549,4 +599,3 @@ pub fn compile_yaml(
         action_validator,
     )
 }
-

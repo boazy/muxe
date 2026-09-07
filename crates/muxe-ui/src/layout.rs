@@ -54,14 +54,17 @@ pub struct GridPlan {
 }
 
 impl GridPlan {
+    #[must_use]
     pub fn page(&self, page: usize) -> Option<&GridPage> {
         self.pages.get(page)
     }
 
+    #[must_use]
     pub const fn cell_row_offset(&self, row: u16) -> u16 {
         row.saturating_mul(self.row_gap.saturating_add(1))
     }
 
+    #[must_use]
     pub const fn pager_row_offset(&self) -> u16 {
         if self.rows_per_page == 0 {
             0
@@ -75,6 +78,7 @@ impl GridPlan {
 }
 
 /// Removes Unicode controls and cuts a label at its first line boundary.
+#[must_use]
 pub fn sanitize_single_line(value: &str) -> String {
     value
         .chars()
@@ -84,6 +88,7 @@ pub fn sanitize_single_line(value: &str) -> String {
 }
 
 /// Truncates a single-line value to a display width, using an ellipsis when necessary.
+#[must_use]
 pub fn ellipsize(value: &str, max_width: usize) -> String {
     let value = sanitize_single_line(value);
     if display_width(&value) <= max_width {
@@ -116,6 +121,7 @@ pub fn ellipsize(value: &str, max_width: usize) -> String {
 /// page. A single overwide cell falls back to one clipped column. The function first tests the
 /// full physical grid height without a pager row, then reserves a pager row only when multiple
 /// pages are necessary.
+#[must_use]
 pub fn arrange_cells(
     cells: &[Cell<'_>],
     area: GridRect,
@@ -202,11 +208,9 @@ fn select_plan(
     row_gap: u16,
     column_gap: u16,
 ) -> GridPlan {
-    let max_columns = cells.len().div_ceil(rows as usize).min(u16::MAX as usize);
+    let max_columns = u16::try_from(cells.len().div_ceil(usize::from(rows))).unwrap_or(u16::MAX);
     for columns in (1..=max_columns).rev() {
-        if let Some(plan) =
-            plan_for_columns(cells, width, rows, row_gap, column_gap, columns as u16)
-        {
+        if let Some(plan) = plan_for_columns(cells, width, rows, row_gap, column_gap, columns) {
             return plan;
         }
     }
@@ -253,7 +257,7 @@ fn plan_for_columns(
         let mut offset = 0u16;
         let mut page_columns = Vec::with_capacity(widths.len());
         for width in widths {
-            let width = width.min(u16::MAX as usize) as u16;
+            let width = u16::try_from(width.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
             page_columns.push(GridColumn { offset, width });
             offset = offset.saturating_add(width).saturating_add(column_gap);
         }
@@ -262,8 +266,8 @@ fn plan_for_columns(
             slots.push(GridSlot {
                 source_index,
                 page,
-                column: (within_page / rows as usize) as u16,
-                row: (within_page % rows as usize) as u16,
+                column: u16::try_from(within_page / usize::from(rows)).unwrap_or(u16::MAX),
+                row: u16::try_from(within_page % usize::from(rows)).unwrap_or(u16::MAX),
             });
         }
         pages.push(GridPage {

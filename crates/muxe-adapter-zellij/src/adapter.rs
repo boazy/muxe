@@ -36,24 +36,25 @@ use std::{
 
 use async_trait::async_trait;
 use muxe_adapter_api::{
-    AdapterCapabilities, AdapterError, AdapterErrorKind, AdapterHealthEvent,
+    ActivationReadiness, AdapterCapabilities, AdapterError, AdapterErrorKind, AdapterHealthEvent,
     CaptureLease as ApiCaptureLease, CaptureLeaseId, CaptureReleaseReason, CaptureRequest,
     DispatchAccepted, DispatchCompletion, ExecutionCorrelationId, HostAdapter, HostIdentity,
     HostKind as ApiHostKind, KeyboardCapabilities, ModalScopeId, NativeDispatchRequest,
-    OriginCaptureRequest, PendingPaneRegistration, PortableDispatchRequest, UiSessionId,
+    OriginCaptureRequest, PendingPaneLease, PendingPaneLeaseId, PendingPaneRegistration,
+    PortableDispatchRequest, UiSessionId,
 };
 use muxe_core::{
     ActionValidation, ActionValidator, ConfigDiagnostic, ExecutionCapabilities, ExecutionId,
     NativeActionCandidate, OriginContext, PaneId, PortableAction, SourceSpan,
 };
 use muxe_zellij_protocol::{
-    BridgeRequest, CaptureEndReason, PipeEventKind, PipeRequest, ZellijOrigin,
-    bridge_protocol_fingerprint, decode_event_line, encode_request_line,
+    BridgeRequest, CaptureEndReason, MAX_PIPE_LINE_LEN, PipeEventKind, PipeRequest, ZellijOrigin,
+    bridge_build_id, bridge_protocol_fingerprint, decode_event_line, encode_request_line,
     generated::{RawNativeCommand, ValidatedNativeCommand},
     generated_action_fingerprint, pinned_source_revision,
 };
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, Notify, mpsc, oneshot},
     time::timeout,
 };
 
@@ -73,9 +74,24 @@ const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long origin fan-out waits per client attempt before trying the next one.
 const ORIGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-
+/// How long resume waits for fresh compatible registrations covering the
+/// authoritative membership before failing closed and staying suspended.
+const RESUME_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Event-loop sweep cadence for heartbeat-lease expiry: a quiet bridge is
+/// noticed within a few seconds past its 15s lease even when no caller
+/// touches the availability gates.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+/// How long one authoritative `list-clients` membership query may take
+/// before resume and readiness fail closed instead of pretending Healthy.
+const MEMBERSHIP_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Output cap for one `list-clients` query: the pipe protocol's own line
+/// bound. A table larger than a single pipe line cannot be a genuine
+/// client census, so the read fails closed instead of buffering it.
+const MEMBERSHIP_OUTPUT_CAP: usize = MAX_PIPE_LINE_LEN;
 type CaptureReady = Result<String, AdapterError>;
-type CaptureWaiters = BTreeMap<[u8; 16], oneshot::Sender<CaptureReady>>;
+/// Pending capture waiters keyed by lease, each tagged with the owning
+/// client so lease expiry can release only that client's waiters.
+type CaptureWaiters = BTreeMap<[u8; 16], (String, oneshot::Sender<CaptureReady>)>;
 
 /// Static adapter configuration. Live-server identity beyond the session name
 /// is verified against bridge registrations, never assumed.
@@ -105,6 +121,202 @@ impl ZellijAdapterConfig {
             ));
         }
         Ok(())
+    }
+}
+/// Authoritative host membership oracle: the currently attached Zellij
+/// client IDs for one session, in deterministic order, IDs only.
+///
+/// Bridge registrations prove a bridge is alive and compatible, but silence
+/// proves nothing: a detached client sends no signal and a late newcomer
+/// may not have registered yet. Resume coverage is always measured against
+/// a fresh snapshot from this oracle, never against pipe-observed silence.
+#[async_trait]
+pub trait MembershipSource: Send + Sync {
+    /// Returns the current attached client IDs, sorted and deduplicated.
+    async fn snapshot_members(&self) -> Result<Vec<String>, AdapterError>;
+}
+
+/// Production oracle: a bounded one-shot `zellij --session <session> action
+/// list-clients` over the pinned CLI (`zellij-utils/src/cli.rs`:
+/// `Action(ListClients)` maps to `Action::ListClients`, routed through
+/// screen/pty `ListClientsMetadata` and rendered by
+/// `ClientMetadata::render_many` as
+/// `CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND` rows). The query carries the
+/// exact scoped binary and an explicit session, never a default host; the
+/// querying CLI client holds no focused pane, so it never appears in its
+/// own output (route.rs prefers the CLI client precisely for this query).
+/// Only the client-ID column is retained; running commands and every other
+/// payload stay out of logs, errors, and readiness records.
+pub struct CliMembershipSource {
+    zellij_exe: PathBuf,
+    session_name: String,
+}
+
+impl CliMembershipSource {
+    /// Builds the oracle for one session over its scoped binary.
+    #[must_use]
+    pub fn new(zellij_exe: PathBuf, session_name: String) -> Self {
+        Self {
+            zellij_exe,
+            session_name,
+        }
+    }
+}
+
+/// Parses pinned `list-clients` table output into sorted unique client IDs.
+/// The header row is skipped when present; every other non-blank line
+/// contributes its first whitespace column. A header-only table is an empty
+/// session, not an error; empty output fails closed instead of pretending
+/// an empty membership.
+///
+/// IDs are classified from source, not guessed: the pinned host renders one
+/// row per attached client holding a focused pane (`screen.rs`
+/// `get_layout_metadata` over `connected_clients` with
+/// `get_active_pane_id`, rendered by `ClientMetadata::render_many`), and a
+/// client ID is a `u16` (`zellij-utils/src/data.rs`). Transient CLI
+/// callers — including this query and the broker's pipe children — never
+/// enter `connected_clients` (no `AttachClient` on the `is_cli_client`
+/// path), so the census cannot include its own processes. A row whose
+/// first column is not a numeric client ID is an unsupported host shape
+/// and fails closed explicitly: carrying it as a member would demand a
+/// bridge registration no client can ever satisfy and deadlock coverage.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the public host-adapter error; boxing it would burden every caller"
+)]
+fn parse_list_clients_output(output: &str) -> Result<Vec<String>, AdapterError> {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(first) = lines.next() else {
+        return Err(AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            "zellij list-clients returned no output",
+        ));
+    };
+    let rest: Vec<&str> = if first.split_whitespace().next() == Some("CLIENT_ID") {
+        lines.collect()
+    } else {
+        std::iter::once(first).chain(lines).collect()
+    };
+    let mut members = Vec::new();
+    for line in rest {
+        let Some(id) = line.split_whitespace().next() else {
+            continue;
+        };
+        if id.parse::<u16>().is_err() {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "zellij list-clients returned an unsupported row shape",
+            ));
+        }
+        members.push(id.to_owned());
+    }
+    members.sort();
+    members.dedup();
+    Ok(members)
+}
+
+#[async_trait]
+impl MembershipSource for CliMembershipSource {
+    async fn snapshot_members(&self) -> Result<Vec<String>, AdapterError> {
+        use tokio::io::AsyncReadExt;
+        let mut child = tokio::process::Command::new(&self.zellij_exe)
+            .arg("--session")
+            .arg(&self.session_name)
+            .arg("action")
+            .arg("list-clients")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    format!("could not query zellij list-clients: {error}"),
+                )
+            })?;
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "zellij list-clients child has no stdout",
+            )
+        })?;
+        // Bounded drain: the cap is enforced DURING the read, chunk by
+        // chunk, so an output flood is killed and reaped without ever
+        // allocating past the bound. A post-hoc length check after
+        // `read_to_end` would already have buffered the flood.
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_QUERY_TIMEOUT;
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                let _ = child.start_kill();
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "zellij list-clients query timed out",
+                ));
+            }
+            match timeout(remaining, stdout.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(count)) => {
+                    if raw.len() + count > MEMBERSHIP_OUTPUT_CAP {
+                        let _ = child.start_kill();
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                        });
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Unavailable,
+                            "zellij list-clients output exceeded its bound",
+                        ));
+                    }
+                    raw.extend_from_slice(&chunk[..count]);
+                }
+                Ok(Err(error)) => {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Unavailable,
+                        format!("zellij list-clients query failed: {error}"),
+                    ));
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                    tokio::spawn(async move {
+                        let _ = child.wait().await;
+                    });
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Unavailable,
+                        "zellij list-clients query timed out",
+                    ));
+                }
+            }
+        }
+        let status = timeout(MEMBERSHIP_QUERY_TIMEOUT, child.wait())
+            .await
+            .map_err(|_| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "zellij list-clients query timed out",
+                )
+            })?
+            .map_err(|error| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    format!("zellij list-clients query failed: {error}"),
+                )
+            })?;
+        if !status.success() {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "zellij list-clients query failed",
+            ));
+        }
+        parse_list_clients_output(&String::from_utf8_lossy(&raw))
     }
 }
 
@@ -212,6 +424,7 @@ struct AdapterInner {
     pending_origin: Mutex<BTreeMap<String, oneshot::Sender<Result<ZellijOrigin, OriginError>>>>,
     pending_capture: Mutex<CaptureWaiters>,
     pane_claims: Mutex<BTreeMap<String, String>>,
+    pending_leases: Mutex<BTreeMap<String, (String, [u8; 16])>>,
     snapshots: Mutex<BTreeMap<String, ZellijOrigin>>,
     generation: AtomicU64,
     next_id: AtomicU64,
@@ -219,6 +432,37 @@ struct AdapterInner {
     events_tx: mpsc::Sender<AdapterHealthEvent>,
     events_rx: Mutex<mpsc::Receiver<AdapterHealthEvent>>,
     shutdown: AtomicBool,
+    /// True between `suspend_for_activation` and either resume or shutdown.
+    /// While set, host-bound operations fail closed with `Unavailable` and
+    /// pipe recovery pauses until resume reinstalls the transport.
+    suspended: AtomicBool,
+    /// Monotonic resume-attempt generation. Incremented at the start of every
+    /// resume attempt; each registration is stamped with the observing
+    /// generation, so evidence never combines across attempts.
+    resume_epoch: AtomicU64,
+    /// Freshness stamp of the last registration per client: the observing
+    /// resume generation plus the event-channel install epoch that
+    /// delivered it, captured at receipt. Coverage requires both to match
+    /// the current attempt, so a line already read from a displaced child
+    /// can never be mistaken for post-respawn evidence, while a still-live
+    /// bridge re-emitting its pre-suspend ID on the new channel stays
+    /// accepted: freshness comes from the transport boundary, never from
+    /// assuming bridge IDs rotate.
+    register_epoch: Mutex<BTreeMap<String, (u64, u64)>>,
+    /// Authoritative membership snapshot of the last successful resume
+    /// attempt: the exact round coverage was proven against. Feeds the
+    /// readiness hook; `None` until a real round completes, cleared back
+    /// to `None` on suspend and failed resume so stale evidence — and in
+    /// particular constructor defaults on a fresh adapter that never ran
+    /// a census — can never serve a coordinator.
+    success_snapshot: Mutex<Option<Vec<String>>>,
+    /// Authoritative host membership oracle (production: bounded
+    /// `list-clients` CLI query). Resume measures coverage against a fresh
+    /// snapshot per attempt; the readiness hook reports the retained
+    /// success round, never a separate live query that could skew the set.
+    membership: Arc<dyn MembershipSource>,
+    /// Wakes resume while it awaits fresh post-suspend registrations.
+    registry_notify: Notify,
     /// Monotonic base for heartbeat-lease timestamps. Lease times are elapsed
     /// milliseconds on this clock, never wall-clock time.
     started: tokio::time::Instant,
@@ -241,6 +485,23 @@ impl ZellijAdapter {
         request: Arc<dyn PipeChannel>,
         event: Arc<dyn PipeChannel>,
     ) -> Self {
+        let oracle = Arc::new(CliMembershipSource::new(
+            config.zellij_exe.clone(),
+            config.session_name.clone(),
+        ));
+        Self::new_with_membership(config, request, event, oracle)
+    }
+
+    /// Builds the adapter over injected channels with an injected membership
+    /// oracle. The contract suite injects scripted channels with recorded
+    /// lines and a scripted oracle; production callers use
+    /// [`ZellijAdapter::connect`], which installs the live CLI oracle.
+    pub fn new_with_membership(
+        config: ZellijAdapterConfig,
+        request: Arc<dyn PipeChannel>,
+        event: Arc<dyn PipeChannel>,
+        membership: Arc<dyn MembershipSource>,
+    ) -> Self {
         let (events_tx, events_rx) = mpsc::channel(256);
         let adapter = Self {
             inner: Arc::new(AdapterInner {
@@ -254,15 +515,22 @@ impl ZellijAdapter {
                 in_flight: Mutex::new(None),
                 live_executions: Mutex::new(HashSet::new()),
                 pending_origin: Mutex::new(BTreeMap::new()),
+                snapshots: Mutex::new(BTreeMap::new()),
                 pending_capture: Mutex::new(BTreeMap::new()),
                 pane_claims: Mutex::new(BTreeMap::new()),
-                snapshots: Mutex::new(BTreeMap::new()),
+                pending_leases: Mutex::new(BTreeMap::new()),
                 generation: AtomicU64::new(1),
                 next_id: AtomicU64::new(1),
                 next_correlation: AtomicU64::new(1),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
                 shutdown: AtomicBool::new(false),
+                suspended: AtomicBool::new(false),
+                resume_epoch: AtomicU64::new(0),
+                register_epoch: Mutex::new(BTreeMap::new()),
+                success_snapshot: Mutex::new(None),
+                membership,
+                registry_notify: Notify::new(),
                 started: tokio::time::Instant::now(),
             }),
         };
@@ -291,7 +559,7 @@ impl ZellijAdapter {
             None,
         )
         .await
-        .map_err(transport_error)?;
+        .map_err(|error| transport_error(&error))?;
         let subscribe = format!(
             "{{\"muxe\":\"subscribe\",\"protocol\":{}}}",
             muxe_zellij_protocol::BRIDGE_PROTOCOL_VERSION
@@ -303,18 +571,123 @@ impl ZellijAdapter {
             Some(subscribe),
         )
         .await
-        .map_err(transport_error)?;
+        .map_err(|error| transport_error(&error))?;
         Ok(Self::new(config, request, event))
     }
 
     /// Injection point for the contract suite: the request channel under test.
+    #[must_use]
     pub fn request_channel(&self) -> &Arc<dyn PipeChannel> {
         &self.inner.request
     }
 
     /// Injection point for the contract suite: the event channel under test.
+    #[must_use]
     pub fn event_channel(&self) -> &Arc<dyn PipeChannel> {
         &self.inner.event
+    }
+    /// Establishes the initial census round on a fresh target that never
+    /// went through suspend/resume: takes one authoritative membership
+    /// snapshot and awaits fresh compatible registrations covering it on
+    /// the current event-channel install, then retains the round and
+    /// reports `Healthy`. The transport is left alone — no respawn, no
+    /// generation bump, no park — so pre-swap control stays available and
+    /// registrations already in flight count: with no transport
+    /// replacement there is no stale-evidence ambiguity to disambiguate.
+    /// Fails closed (leaving prior partial stamps for the next retry)
+    /// when suspended — the abort path owns that state — when no channel
+    /// is installed, when the query fails, or when coverage times out.
+    /// Already-established adapters return `Ok` immediately. Never blocks
+    /// target bootstrap itself: call once after control bind, then poll
+    /// [`activation_readiness`](HostAdapter::activation_readiness) and
+    /// retry on `Err`; no UI or commit may proceed until it reports `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] when shut down (`Shutdown`, fail fast without
+    /// touching the transport), when suspended, when no event channel is
+    /// installed, when the membership query fails, or when coverage times
+    /// out. Failures leave partial stamps for the next retry and never
+    pub async fn establish_initial_round(&self) -> Result<(), AdapterError> {
+        if self.inner.shutdown.load(Ordering::Relaxed) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Zellij adapter is shut down; initial census is unavailable",
+            ));
+        }
+        if self.inner.suspended.load(Ordering::SeqCst) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij adapter is suspended for activation; resume owns the census round",
+            ));
+        }
+        if self.inner.success_snapshot.lock().await.is_some() {
+            return Ok(());
+        }
+        let epoch = self.inner.resume_epoch.load(Ordering::SeqCst);
+        let Some(channel) = self.inner.event.install_epoch().await else {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij initial census has no installed event channel",
+            ));
+        };
+        let snapshot = match self.inner.membership.snapshot_members().await {
+            Ok(mut members) => {
+                members.sort();
+                members.dedup();
+                members
+            }
+            Err(_) => {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Zellij initial census could not observe the current client membership",
+                ));
+            }
+        };
+        if !self
+            .await_resume_membership(epoch, channel, &snapshot)
+            .await
+        {
+            if self.inner.shutdown.load(Ordering::Relaxed) {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Shutdown,
+                    "Zellij adapter shut down while awaiting the initial census",
+                ));
+            }
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij initial census did not observe fresh registrations for the current membership",
+            ));
+        }
+        if self.inner.shutdown.load(Ordering::Relaxed) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Zellij adapter shut down while awaiting the initial census",
+            ));
+        }
+        *self.inner.success_snapshot.lock().await = Some(snapshot);
+        self.emit(AdapterHealthEvent::Healthy {
+            identity: self.host_identity(),
+        })
+        .await;
+        Ok(())
+    }
+    /// Fresh compatible census for the readiness hook: client IDs holding a
+    /// compatible record in the current evidence generation. Private; the
+    /// typed `activation_readiness` hook is the only consumer surface.
+    async fn fresh_census(&self) -> Vec<String> {
+        let registry = self.inner.registry.lock().await;
+        let stamps = self.inner.register_epoch.lock().await;
+        let epoch = self.inner.resume_epoch.load(Ordering::SeqCst);
+        let mut census: Vec<String> = stamps
+            .iter()
+            .filter(|(client, stamped)| {
+                stamped.0 == epoch && registry.get(client).is_some_and(|record| record.compatible)
+            })
+            .map(|(client, _)| client.clone())
+            .collect();
+        census.sort();
+        census
     }
 
     fn mint_id(&self) -> [u8; 16] {
@@ -337,6 +710,9 @@ impl ZellijAdapter {
             .try_into()
             .unwrap_or(u64::MAX)
     }
+    async fn emit(&self, event: AdapterHealthEvent) {
+        let _ = self.inner.events_tx.send(event).await;
+    }
 
     fn correlation(&self) -> ExecutionCorrelationId {
         ExecutionCorrelationId::new(format!(
@@ -345,43 +721,48 @@ impl ZellijAdapter {
         ))
     }
 
-    async fn emit(&self, event: AdapterHealthEvent) {
-        let _ = self.inner.events_tx.send(event).await;
-    }
-
     async fn event_loop(&self) {
         // Consecutive failures back off so a dead channel can never busy-spin
         // the runtime and starve dispatch work on the same thread.
         let mut failures: u32 = 0;
+        // Lease-expiry sweep runs on this loop so an idle captured client
+        // cannot stay stale without a caller: the availability gates
+        // re-check the same sweep for callers racing the timer. The first
+        // tick fires immediately and is consumed below so expiry is judged
+        // over full periods. Shutdown drops the loop and the timer with it;
+        // suspend pauses the sweep inside the helper.
+        let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
+        sweep.tick().await;
         loop {
             if self.inner.shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            match self.inner.event.next_line().await {
-                Ok(line) => {
-                    failures = 0;
-                    self.handle_event_line(&line).await;
-                }
-                Err(_) => {
-                    if self.inner.shutdown.load(Ordering::Relaxed) {
-                        return;
+            tokio::select! {
+                result = self.inner.event.next_line_tagged() => {
+                    if let Ok((channel, line)) = result {
+                        failures = 0;
+                        self.handle_event_line(channel, &line).await;
+                    } else {
+                        if self.inner.shutdown.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        failures = failures.saturating_add(1);
+                        self.restart_whole_pipe().await;
+                        let backoff = Duration::from_millis(10).saturating_mul(failures.min(100));
+                        tokio::time::sleep(backoff).await;
                     }
-                    failures = failures.saturating_add(1);
-                    self.restart_whole_pipe().await;
-                    let backoff = Duration::from_millis(10).saturating_mul(failures.min(100));
-                    tokio::time::sleep(backoff).await;
+                }
+                _ = sweep.tick() => {
+                    self.sweep_expired_clients().await;
                 }
             }
         }
     }
 
-    async fn handle_event_line(&self, line: &str) {
-        let event = match decode_event_line(line) {
-            Ok(event) => event,
-            Err(_) => {
-                self.restart_whole_pipe().await;
-                return;
-            }
+    async fn handle_event_line(&self, channel: u64, line: &str) {
+        let Ok(event) = decode_event_line(line) else {
+            self.restart_whole_pipe().await;
+            return;
         };
         match event.event {
             PipeEventKind::Register {
@@ -391,8 +772,8 @@ impl ZellijAdapter {
                 identity,
                 ..
             } => {
-                self.on_register(client_id, current_pane, registration, identity)
-                    .await
+                self.on_register(channel, client_id, current_pane, registration, identity)
+                    .await;
             }
             PipeEventKind::RequestReleased {
                 request_id,
@@ -424,7 +805,7 @@ impl ZellijAdapter {
                 }
             }
             PipeEventKind::CaptureReady { lease, prior_mode } => {
-                if let Some(sender) = self.inner.pending_capture.lock().await.remove(&lease) {
+                if let Some((_, sender)) = self.inner.pending_capture.lock().await.remove(&lease) {
                     let _ = sender.send(Ok(prior_mode));
                 }
             }
@@ -463,26 +844,26 @@ impl ZellijAdapter {
         }
     }
 
+    /// Records one bridge registration, stamped with the observing resume
+    /// generation and the event-channel install epoch that delivered it,
+    /// captured at receipt by the event loop. Freshness is a transport
+    /// property: a line already read from a displaced child keeps its older
+    /// channel tag even when processed after a respawn, while a still-live
+    /// bridge re-emitting its pre-suspend ID on the new channel is current
+    /// evidence. No registration ID is ever rejected for looking old.
     async fn on_register(
         &self,
+        channel: u64,
         client_id: String,
         current_pane: Option<String>,
         registration: [u8; 16],
         identity: muxe_zellij_protocol::BridgeIdentity,
     ) {
-        // A bridge that self-attests NativeVerified is rejected: native
-        // verification is established locally from packaged/stable bytes, and
-        // the plugin SDK exposes no digest of its own loaded bytes. Only
-        // Unattested is an honest bridge report; anything else fails closed
-        // until the user decides the artifact-hash proposal.
-        let honestly_attested = matches!(
-            identity.artifact,
-            muxe_zellij_protocol::BridgeArtifact::Unattested
-        );
-        let compatible = honestly_attested
+        let compatible = identity.bridge_build_id == Some(bridge_build_id())
             && identity.source_revision == pinned_source_revision()
             && identity.action_fingerprint == generated_action_fingerprint().0
-            && identity.protocol_fingerprint == bridge_protocol_fingerprint().0;
+            && identity.protocol_fingerprint == bridge_protocol_fingerprint().0
+            && identity.muxe_version == env!("CARGO_PKG_VERSION");
         let now = self.clock_millis();
         let displaced = self.inner.registry.lock().await.register(
             &client_id,
@@ -495,6 +876,17 @@ impl ZellijAdapter {
         if displaced.is_err() {
             return;
         }
+        // Stamp receipt, not execution: `channel` was fixed when the line
+        // arrived, so coverage can require current-attempt evidence per
+        // member without cross-attempt reuse.
+        let epoch = self.inner.resume_epoch.load(Ordering::SeqCst);
+        self.inner
+            .register_epoch
+            .lock()
+            .await
+            .insert(client_id.clone(), (epoch, channel));
+        // Wake a resume awaiting fresh post-suspend registrations.
+        self.inner.registry_notify.notify_waiters();
         if compatible {
             self.emit(AdapterHealthEvent::Healthy {
                 identity: self.host_identity(),
@@ -584,7 +976,9 @@ impl ZellijAdapter {
     }
 
     async fn pump_all(&self) {
-        if self.inner.shutdown.load(Ordering::Relaxed) {
+        if self.inner.shutdown.load(Ordering::Relaxed)
+            || self.inner.suspended.load(Ordering::SeqCst)
+        {
             return;
         }
         if self.inner.in_flight.lock().await.is_some() {
@@ -622,10 +1016,7 @@ impl ZellijAdapter {
             };
             let item = {
                 let mut queues = self.inner.queues.lock().await;
-                match queues
-                    .get_mut(client_id)
-                    .and_then(|queue| queue.pop_front())
-                {
+                match queues.get_mut(client_id).and_then(VecDeque::pop_front) {
                     Some(item) => item,
                     None => return false,
                 }
@@ -693,7 +1084,7 @@ impl ZellijAdapter {
                 self.emit(AdapterHealthEvent::DispatchCompleted(
                     DispatchCompletion::OutcomeUnknown {
                         execution,
-                        error: transport_error(error),
+                        error: transport_error(&error),
                     },
                 ))
                 .await;
@@ -759,12 +1150,22 @@ impl ZellijAdapter {
                     ))
                     .await;
             }
+            // Never recover the transport while suspended for activation:
+            // resume reinstalls both children after revalidation.
+            if inner.shutdown.load(Ordering::Relaxed) || inner.suspended.load(Ordering::SeqCst) {
+                return;
+            }
             let _ = inner.request.respawn().await;
             adapter.pump_all().await;
         });
     }
 
     async fn replace_request_child(&self) {
+        if self.inner.shutdown.load(Ordering::Relaxed)
+            || self.inner.suspended.load(Ordering::SeqCst)
+        {
+            return;
+        }
         // No pump here: the caller's retry loop re-attempts the head item, so
         // replacing never recurses back through pump_all.
         if self.inner.request.respawn().await.is_err() {
@@ -773,7 +1174,9 @@ impl ZellijAdapter {
     }
 
     async fn restart_whole_pipe(&self) {
-        if self.inner.shutdown.load(Ordering::Relaxed) {
+        if self.inner.shutdown.load(Ordering::Relaxed)
+            || self.inner.suspended.load(Ordering::SeqCst)
+        {
             return;
         }
         self.inner.generation.fetch_add(1, Ordering::Relaxed);
@@ -819,6 +1222,92 @@ impl ZellijAdapter {
         }
     }
 
+    /// Fails closed while suspended for activation or shut down. Every
+    /// host-bound operation (capture, origin, dispatch, cleanup) calls this
+    /// first so no stale-bridge work proceeds on a subscription about to be
+    /// released to an activation target.
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the public host-adapter error; boxing it would burden every caller"
+    )]
+    fn require_active(&self) -> Result<(), AdapterError> {
+        if self.inner.suspended.load(Ordering::SeqCst) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij adapter is suspended for activation; host-bound operations are blocked until resume or commit",
+            ));
+        }
+        if self.inner.shutdown.load(Ordering::Relaxed) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Zellij adapter is shut down",
+            ));
+        }
+        Ok(())
+    }
+    /// Reports whether current-attempt fresh compatible registrations cover
+    /// the authoritative membership snapshot for (`epoch`, `channel`). Every
+    /// snapshot member must hold a compatible registry record stamped with
+    /// exactly this attempt's receipt tag; records from earlier attempts or
+    /// displaced channels never count. Additionally, every client stamped in
+    /// this attempt must hold a compatible record on this channel, so a
+    /// client that attaches after the snapshot and registers mid-attempt is
+    /// gated by the normal compatibility handshake instead of slipping past.
+    /// A member absent from the snapshot (detached before the query) is not
+    /// required; a member present without a registration fails closed.
+    async fn resume_covered(&self, epoch: u64, channel: u64, snapshot: &[String]) -> bool {
+        // A bridge that registered then went quiet past its lease is dead
+        // evidence: expire it before coverage so silence never counts.
+        self.sweep_expired_clients().await;
+        let registry = self.inner.registry.lock().await;
+        let stamps = self.inner.register_epoch.lock().await;
+        let fresh_compatible = |client: &str| {
+            registry.get(client).is_some_and(|record| record.compatible)
+                && stamps
+                    .get(client)
+                    .is_some_and(|stamped| *stamped == (epoch, channel))
+        };
+        if !snapshot.iter().all(|client| fresh_compatible(client)) {
+            return false;
+        }
+        stamps
+            .iter()
+            .filter(|(_, stamped)| stamped.0 == epoch)
+            .all(|(client, stamped)| {
+                stamped.1 == channel && registry.get(client).is_some_and(|record| record.compatible)
+            })
+    }
+    /// Waits bounded for [`Self::resume_covered`]. Evidence is a fresh
+    /// all-required handshake in this attempt: registrations already present
+    /// count immediately; later ones wake the wait without polling. Shutdown
+    /// fails the wait promptly (`false`) so callers map it without stalling
+    /// to the deadline; [`Self::shutdown`] notifies this wait first.
+    async fn await_resume_membership(&self, epoch: u64, channel: u64, snapshot: &[String]) -> bool {
+        let deadline = tokio::time::Instant::now() + RESUME_READY_TIMEOUT;
+        loop {
+            // Shutdown wins over a simultaneously completing coverage: no
+            // success round may be retained after the transport is gone.
+            if self.inner.shutdown.load(Ordering::Relaxed) {
+                return false;
+            }
+            if self.resume_covered(epoch, channel, snapshot).await {
+                return true;
+            }
+            // Pin the wakeup before re-checking so a registration racing
+            // this check cannot slip between the check and the wait.
+            let wake = self.inner.registry_notify.notified();
+            tokio::pin!(wake);
+            if self.resume_covered(epoch, channel, snapshot).await {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return self.resume_covered(epoch, channel, snapshot).await;
+            }
+            // A spurious wake re-loops; the deadline still bounds the wait.
+            let _ = tokio::time::timeout(remaining, &mut wake).await;
+        }
+    }
     fn scope_for_client(client_id: &str) -> ModalScopeId {
         ModalScopeId::new(format!("zellij-client:{client_id}"))
     }
@@ -836,6 +1325,7 @@ impl ZellijAdapter {
     }
 
     async fn active_registration(&self, client_id: &str) -> Result<[u8; 16], AdapterError> {
+        self.sweep_expired_clients().await;
         let registry = self.inner.registry.lock().await;
         match registry.get(client_id) {
             Some(record) if record.compatible => Ok(record.registration),
@@ -848,6 +1338,82 @@ impl ZellijAdapter {
                 format!("no active Zellij bridge for client {client_id}"),
             )),
         }
+    }
+    /// Invalidates heartbeat-expired clients: registration, capture, and
+    /// pending capture waiters for exactly the expired clients. Queues
+    /// pause by absence (no compatible record to send through) and resume
+    /// on fresh registration; the shared event channel and healthy
+    /// clients are untouched, and no whole-pipe restart follows. An
+    /// expired active capture reports `CaptureLost` (adapter health) so
+    /// its UI session fails closed, then the client reports `Unhealthy`
+    /// with its modal scope. Skipped while suspended or shut down, where
+    /// suspend/shutdown teardown already owns registration state. Driven
+    /// by the event-loop timer and re-checked at the availability gates.
+    async fn sweep_expired_clients(&self) {
+        if self.inner.shutdown.load(Ordering::Relaxed)
+            || self.inner.suspended.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let now = self.clock_millis();
+        let expired = self.inner.registry.lock().await.expire_leases(now);
+        if expired.is_empty() {
+            return;
+        }
+        let mut captures = self.inner.captures.lock().await;
+        let mut waiters = self.inner.pending_capture.lock().await;
+        for client in expired {
+            let displaced = captures.invalidate_client(&client);
+            // Dropping a waiter sender fails its receiver promptly through
+            // the existing capture timeout/else path; only this client's
+            // leases are released.
+            waiters.retain(|_, (owner, _)| owner != &client);
+            if let Some(state) = displaced {
+                let (ui_session, lease) = match state {
+                    crate::capture::CaptureState::Beginning { ui_session, lease } => {
+                        (ui_session, lease)
+                    }
+                    crate::capture::CaptureState::Captured(record) => {
+                        (record.ui_session, record.lease)
+                    }
+                    crate::capture::CaptureState::Idle => continue,
+                };
+                self.emit(AdapterHealthEvent::CaptureLost {
+                    lease: ApiCaptureLease {
+                        id: CaptureLeaseId::new(hex_id(&lease)),
+                        ui_session: UiSessionId::new(ui_session),
+                        modal_scope: Self::scope_for_client(&client),
+                    },
+                    reason: muxe_adapter_api::CaptureLossReason::AdapterHealth,
+                })
+                .await;
+            }
+            self.emit(AdapterHealthEvent::Unhealthy {
+                modal_scope: Some(Self::scope_for_client(&client)),
+                error: AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    format!("Zellij client {client} heartbeat lease expired"),
+                ),
+            })
+            .await;
+        }
+    }
+
+    /// Parks both children, drops this attempt's partial evidence, and
+    /// reports `Unhealthy` while staying suspended. Every resume failure
+    /// funnels here so no partial adapter can overlap the next attempt.
+    async fn fail_resume(&self, message: &str) -> AdapterError {
+        self.inner.request.park().await;
+        self.inner.event.park().await;
+        self.inner.registry.lock().await.invalidate_all();
+        self.inner.register_epoch.lock().await.clear();
+        *self.inner.success_snapshot.lock().await = None;
+        self.emit(AdapterHealthEvent::Unhealthy {
+            modal_scope: None,
+            error: AdapterError::new(AdapterErrorKind::Unavailable, message),
+        })
+        .await;
+        AdapterError::new(AdapterErrorKind::Unavailable, message)
     }
 
     /// Resolves the unique client owning a pane through the claim fan-out.
@@ -883,24 +1449,21 @@ impl ZellijAdapter {
                     .collect()
             };
             for (client_id, registration) in clients {
-                match self
+                if let Ok(snapshot) = self
                     .request_origin_from(&client_id, registration, ui_session, ui_pane)
                     .await
                 {
-                    Ok(snapshot) => {
-                        self.inner
-                            .pane_claims
-                            .lock()
-                            .await
-                            .insert(ui_pane.to_owned(), client_id.clone());
-                        self.inner
-                            .snapshots
-                            .lock()
-                            .await
-                            .insert(ui_pane.to_owned(), snapshot);
-                        return Ok(client_id);
-                    }
-                    Err(_) => continue,
+                    self.inner
+                        .pane_claims
+                        .lock()
+                        .await
+                        .insert(ui_pane.to_owned(), client_id.clone());
+                    self.inner
+                        .snapshots
+                        .lock()
+                        .await
+                        .insert(ui_pane.to_owned(), snapshot);
+                    return Ok(client_id);
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1068,7 +1631,7 @@ impl ZellijAdapter {
     ) -> Result<DispatchAccepted, AdapterError> {
         let (raw, target) = launch
             .into_command()
-            .map_err(|error| error.into_adapter_error())?;
+            .map_err(super::launch::LaunchError::into_adapter_error)?;
         let client_id = match target {
             crate::launch::LaunchTarget::Client(client) => client,
             crate::launch::LaunchTarget::UiPane(pane) => {
@@ -1117,12 +1680,36 @@ fn parse_hex_lease(text: &str) -> Result<[u8; 16], AdapterError> {
     Ok(id)
 }
 
-fn transport_error(error: PipeTransportError) -> AdapterError {
+fn transport_error(error: &PipeTransportError) -> AdapterError {
     AdapterError::new(AdapterErrorKind::Unavailable, error.to_string())
 }
 
 fn invalid_request(message: impl Into<String>) -> AdapterError {
     AdapterError::new(AdapterErrorKind::InvalidRequest, message)
+}
+/// Maximum member IDs in one readiness report, mirroring the protocol wire
+/// bound (`MAX_READINESS_CLIENTS`): evidence larger than the wire record
+/// cannot be served, so an over-bound session reports no per-client
+/// evidence and the coordinator gates on adapter health instead. This is
+/// the wire's bound, not an adapter invention.
+const MAX_READINESS_MEMBERS: usize = 1024;
+
+/// Canonicalizes a retained snapshot round into the authoritative member
+/// set: byte-lexicographic order, deduplicated, wire-bounded. An empty
+/// snapshot is genuine evidence (`Some([])`): a header-only CLI table
+/// proves an empty session, and the coordinator's exact-set predicate
+/// admits it. Only an over-bound set reports no evidence (`None`).
+/// Member IDs stay opaque here: numeric `u16` validation is the oracle
+/// parse boundary's job (non-numeric CLI rows already fail closed there),
+/// never a report-time reinterpretation. A count alone could let a
+/// newcomer mask a missing member; the exact set cannot.
+fn canonical_member_set(mut members: Vec<String>) -> Option<Vec<String>> {
+    if members.len() > MAX_READINESS_MEMBERS {
+        return None;
+    }
+    members.sort();
+    members.dedup();
+    Some(members)
 }
 
 /// Parses a Zellij pane ID string using the exact pinned text format
@@ -1189,6 +1776,7 @@ impl HostAdapter for ZellijAdapter {
     }
 
     async fn modal_scope(&self, ui_pane: &PaneId) -> Result<ModalScopeId, AdapterError> {
+        self.require_active()?;
         // A throwaway session namespace keeps the claim fan-out keyed without
         // allocating a broker session.
         let probe_session = format!("claim-{}", hex_id(&self.mint_id()));
@@ -1202,6 +1790,7 @@ impl HostAdapter for ZellijAdapter {
         &self,
         request: CaptureRequest,
     ) -> Result<ApiCaptureLease, AdapterError> {
+        self.require_active()?;
         let client_id = Self::client_for_scope(&request.modal_scope)?;
         // Guard: a live compatible bridge must own the client before capture.
         let _registration = self.active_registration(&client_id).await?;
@@ -1219,7 +1808,7 @@ impl HostAdapter for ZellijAdapter {
             .pending_capture
             .lock()
             .await
-            .insert(lease, sender);
+            .insert(lease, (client_id.clone(), sender));
         self.enqueue_lifecycle(
             client_id.clone(),
             BridgeRequest::BeginCapture {
@@ -1228,35 +1817,32 @@ impl HostAdapter for ZellijAdapter {
             },
         )
         .await;
-        match timeout(CAPTURE_TIMEOUT, receiver).await {
-            Ok(Ok(Ok(prior_mode))) => {
-                self.inner
-                    .captures
-                    .lock()
-                    .await
-                    .confirm(&client_id, lease, prior_mode)
-                    .map_err(|error| {
-                        AdapterError::new(AdapterErrorKind::Unavailable, error.to_string())
-                    })?;
-                Ok(ApiCaptureLease {
-                    id: CaptureLeaseId::new(hex_id(&lease)),
-                    ui_session: request.ui_session,
-                    modal_scope: request.modal_scope,
-                })
-            }
-            _ => {
-                self.inner.pending_capture.lock().await.remove(&lease);
-                let _ = self
-                    .inner
-                    .captures
-                    .lock()
-                    .await
-                    .release(&client_id, lease, false);
-                Err(AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    "timed out waiting for Zellij Locked-mode capture",
-                ))
-            }
+        if let Ok(Ok(Ok(prior_mode))) = timeout(CAPTURE_TIMEOUT, receiver).await {
+            self.inner
+                .captures
+                .lock()
+                .await
+                .confirm(&client_id, lease, prior_mode)
+                .map_err(|error| {
+                    AdapterError::new(AdapterErrorKind::Unavailable, error.to_string())
+                })?;
+            Ok(ApiCaptureLease {
+                id: CaptureLeaseId::new(hex_id(&lease)),
+                ui_session: request.ui_session,
+                modal_scope: request.modal_scope,
+            })
+        } else {
+            self.inner.pending_capture.lock().await.remove(&lease);
+            let _ = self
+                .inner
+                .captures
+                .lock()
+                .await
+                .release(&client_id, lease, false);
+            Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "timed out waiting for Zellij Locked-mode capture",
+            ))
         }
     }
 
@@ -1265,6 +1851,7 @@ impl HostAdapter for ZellijAdapter {
         lease: ApiCaptureLease,
         reason: CaptureReleaseReason,
     ) -> Result<(), AdapterError> {
+        self.require_active()?;
         let client_id = Self::client_for_scope(&lease.modal_scope)?;
         let lease_id = parse_hex_lease(lease.id.as_str())?;
         // Guarded restoration decision first: only a current lease owner still
@@ -1279,10 +1866,13 @@ impl HostAdapter for ZellijAdapter {
                     CaptureReleaseReason::UiDismissed | CaptureReleaseReason::Replaced
                 ),
             ) {
-                Ok(_) | Err(crate::capture::CaptureError::StaleLease)
-                | Err(crate::capture::CaptureError::NotCaptured)
                 // `Busy` only comes from `begin`; listed for exhaustiveness.
-                | Err(crate::capture::CaptureError::Busy) => {}
+                Ok(_)
+                | Err(
+                    crate::capture::CaptureError::StaleLease
+                    | crate::capture::CaptureError::NotCaptured
+                    | crate::capture::CaptureError::Busy,
+                ) => {}
             }
         }
         if self.active_registration(&client_id).await.is_ok() {
@@ -1305,62 +1895,134 @@ impl HostAdapter for ZellijAdapter {
         Ok(())
     }
 
-    async fn close_pending_pane(
+    async fn register_pending_pane(
         &self,
         registration: PendingPaneRegistration,
-    ) -> Result<(), AdapterError> {
-        // Zellij launchers create UI panes directly through host Run bindings;
-        // there is no transient-tab trampoline. Idempotent cleanup closes only
-        // the strictly validated registered pane, and only when a live bridge
-        // owns its client; an unknown pane is already gone.
+    ) -> Result<PendingPaneLease, AdapterError> {
+        self.require_active()?;
         if registration.temporary_tab.is_some() {
             return Err(invalid_request(
-                "Zellij has no transient-tab launch; refusing to close a temporary tab",
+                "Zellij pending panes cannot carry a temporary tab",
             ));
         }
         let pane = parse_pane_id(registration.pane.as_str())?;
-        let owner = self
+        let client = self
             .inner
             .registry
             .lock()
             .await
             .client_for_pane(registration.pane.as_str())
-            .map(|record| record.client_id.clone());
-        if let Some(client) = owner {
-            self.enqueue_lifecycle(
-                client,
-                BridgeRequest::Dispatch {
-                    execution: format!("cleanup-{}", hex_id(&self.mint_id())),
-                    command: RawNativeCommand::ClosePaneWithId { pane_id: pane },
-                },
-            )
-            .await;
+            .map(|record| record.client_id.clone())
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "registered Zellij pane has no live client",
+                )
+            })?;
+        let bridge_registration = self.active_registration(&client).await?;
+        let id = format!(
+            "zellij:{}:{}:{}",
+            client,
+            hex_id(&bridge_registration),
+            registration.pane
+        );
+        self.inner
+            .pending_leases
+            .lock()
+            .await
+            .insert(id.clone(), (client, bridge_registration));
+        let _ = pane;
+        Ok(PendingPaneLease {
+            id: PendingPaneLeaseId::new(id),
+            ui_session: registration.ui_session,
+        })
+    }
+
+    async fn close_pending_pane(
+        &self,
+        registration: PendingPaneRegistration,
+        lease: PendingPaneLease,
+    ) -> Result<(), AdapterError> {
+        self.require_active()?;
+        if lease.ui_session != registration.ui_session {
+            return Err(invalid_request(
+                "Zellij pending cleanup lease belongs to another UI session",
+            ));
         }
+        let (client, bridge_registration) = self
+            .inner
+            .pending_leases
+            .lock()
+            .await
+            .get(lease.id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Zellij pending cleanup lease is stale",
+                )
+            })?;
+        let current = self.active_registration(&client).await?;
+        if current != bridge_registration {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij pending cleanup lease registration is stale",
+            ));
+        }
+        let pane = parse_pane_id(registration.pane.as_str())?;
+        self.enqueue_lifecycle(
+            client.clone(),
+            BridgeRequest::Dispatch {
+                execution: format!("cleanup-{}", hex_id(&self.mint_id())),
+                command: RawNativeCommand::ClosePaneWithId { pane_id: pane },
+            },
+        )
+        .await;
+        self.inner
+            .pending_leases
+            .lock()
+            .await
+            .remove(lease.id.as_str());
         Ok(())
     }
 
+    async fn release_pending_pane(&self, lease: PendingPaneLease) -> Result<(), AdapterError> {
+        self.require_active()?;
+        let (client, bridge_registration) = self
+            .inner
+            .pending_leases
+            .lock()
+            .await
+            .get(lease.id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Zellij pending cleanup lease is stale",
+                )
+            })?;
+        if self.active_registration(&client).await? != bridge_registration {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij pending cleanup lease registration is stale",
+            ));
+        }
+        self.inner
+            .pending_leases
+            .lock()
+            .await
+            .remove(lease.id.as_str());
+        Ok(())
+    }
     async fn capture_origin(
         &self,
         request: OriginCaptureRequest,
     ) -> Result<OriginContext, AdapterError> {
-        let hint = request.origin_hint.as_ref().ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::ContextUnavailable,
-                "Zellij AttachUi did not provide the saved origin bootstrap tuple",
-            )
-        })?;
-        let caller = request.caller_identity.as_ref().ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::ContextUnavailable,
-                "Zellij AttachUi did not provide the UI caller identity tuple",
-            )
-        })?;
-        if caller.pane_id != request.ui_pane {
-            return Err(AdapterError::new(
-                AdapterErrorKind::InvalidRequest,
-                "Zellij caller pane does not match the pane that is attaching the UI",
-            ));
-        }
+        self.require_active()?;
+        // Zellij native Run carries no Herdr bootstrap tuples: the UI attaches
+        // through its own pane ID and the target bridge snapshots the prior
+        // non-Muxe pane as the authoritative origin (DESIGN 1189-1196,
+        // 1959-1967). Hint/caller tuples are never required here.
         let ui_pane = request.ui_pane.as_str().to_owned();
         // The claim fan-out in modal_scope usually cached the snapshot already;
         // reuse it so attach costs no second host round-trip.
@@ -1383,27 +2045,9 @@ impl HostAdapter for ZellijAdapter {
                         )
                     })?
             };
-        if snapshot.ui_pane_id != ui_pane {
-            return Err(AdapterError::new(
-                AdapterErrorKind::InvalidRequest,
-                "origin snapshot is for a different UI pane",
-            ));
-        }
-        match &snapshot.prior_pane_id {
-            Some(prior) if prior == hint.pane_id.as_str() => {}
-            Some(_) => {
-                return Err(AdapterError::new(
-                    AdapterErrorKind::InvalidRequest,
-                    "saved origin pane does not match the live bridge prior pane",
-                ));
-            }
-            None => {
-                return Err(AdapterError::new(
-                    AdapterErrorKind::ContextUnavailable,
-                    "bridge tracked no prior pane for origin",
-                ));
-            }
-        }
+        // `build_origin_context` verifies the snapshot belongs to this UI pane
+        // and stores the bridge PRIOR pane as the action origin, never the UI
+        // pane itself.
         build_origin_context(
             &snapshot,
             &self.inner.config.session_name,
@@ -1419,6 +2063,7 @@ impl HostAdapter for ZellijAdapter {
         &self,
         request: PortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
+        self.require_active()?;
         match map_portable(&request.action.action, &request.origin) {
             Ok(PortableMapping::BrokerOwned) => Err(invalid_request(
                 "broker-owned portable action must not reach the host adapter",
@@ -1482,6 +2127,7 @@ impl HostAdapter for ZellijAdapter {
         &self,
         request: NativeDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
+        self.require_active()?;
         let candidate = &request.action.candidate;
         let raw =
             candidate_to_raw(&candidate.type_name, &candidate.fields, false).map_err(|error| {
@@ -1508,22 +2154,195 @@ impl HostAdapter for ZellijAdapter {
             .ok_or_else(|| AdapterError::new(AdapterErrorKind::Shutdown, "adapter shut down"))
     }
 
+    /// Stops the retained pipe transport after broker-owned UI state drains
+    /// and before the activation coordinator releases this broker's endpoint.
+    /// Parks both pipe children (terminated and reaped, channels left open
+    /// for resume), invalidates bridge registrations so no stale origin or
+    /// capture survives, and emits `Unhealthy`. The await proves the old
+    /// children are gone before any target connects. Idempotent: a second
+    /// suspend while suspended succeeds without touching the transport.
     async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
-        Err(AdapterError::new(
-            AdapterErrorKind::Unsupported,
-            "Zellij cannot suspend for activation: bridge-sharing group activation needs whole-group coordinator support",
-        ))
+        if self.inner.suspended.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Fail closed while the old pipes drain: stale registrations,
+        // captures, claims, snapshots, queues, and waiters must never serve
+        // a target release. Dropping the waiter senders releases their
+        // receivers immediately instead of hanging to timeout.
+        if let Some(pending) = self.inner.in_flight.lock().await.take()
+            && let Some(execution) = pending.execution
+        {
+            self.inner.live_executions.lock().await.remove(&execution.0);
+            self.emit(AdapterHealthEvent::DispatchCompleted(
+                DispatchCompletion::OutcomeUnknown {
+                    execution,
+                    error: AdapterError::new(
+                        AdapterErrorKind::OutcomeUnknown,
+                        "Zellij adapter suspended for activation with a request in flight",
+                    ),
+                },
+            ))
+            .await;
+        }
+        // Fail closed while the old pipes drain: stale registrations,
+        // captures, claims, snapshots, queues, stamps, and waiters must never
+        // serve a target release. Dropping the waiter senders releases their
+        // receivers immediately instead of hanging to timeout. Membership for
+        // resume comes from a fresh authoritative query per attempt, never
+        // from this pre-suspend registry, so nothing is snapshotted here.
+        self.inner.registry.lock().await.invalidate_all();
+        self.inner.register_epoch.lock().await.clear();
+        *self.inner.success_snapshot.lock().await = None;
+        self.inner.captures.lock().await.invalidate_all_clients();
+        self.inner.pane_claims.lock().await.clear();
+        self.inner.snapshots.lock().await.clear();
+        self.inner.queues.lock().await.clear();
+        self.inner.pending_origin.lock().await.clear();
+        self.inner.pending_capture.lock().await.clear();
+        self.inner.request.park().await;
+        self.inner.event.park().await;
+        self.emit(AdapterHealthEvent::Unhealthy {
+            modal_scope: None,
+            error: AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij pipe transport suspended for activation",
+            ),
+        })
+        .await;
+        Ok(())
     }
 
+    /// Re-establishes the retained pipe transport after an activation abort,
+    /// before the old endpoint accepts dispatch again. Opens a fresh evidence
+    /// generation, respawns both children over the pinned production argv,
+    /// records the new event-channel install epoch as the attempt's delivery
+    /// boundary, then takes one fresh authoritative membership snapshot and
+    /// awaits fresh compatible registrations covering exactly that snapshot
+    /// with live fingerprint checks. `Healthy` is emitted only after the
+    /// snapshot is covered: child spawn alone never counts as bridge
+    /// readiness, and old capture leases stay invalid. Every attempt demands
+    /// all-required registrations stamped with its own generation and
+    /// channel; a failed attempt parks both children, drops its partial
+    /// evidence, and leaves the adapter suspended and unhealthy, so the next
+    /// attempt cannot reuse a retained subset and no partial adapter
+    /// overlaps it. A member absent from this attempt's snapshot (detached
+    /// before the query) is not required; a snapshot member without a fresh
+    /// registration, or a failed query, fails closed.
     async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
-        Err(AdapterError::new(
-            AdapterErrorKind::Unsupported,
-            "Zellij cannot resume after an activation abort: no suspendible subscription exists",
-        ))
+        if !self.inner.suspended.load(Ordering::SeqCst) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij adapter is not suspended for activation; refusing to fabricate a resumed subscription",
+            ));
+        }
+        // Open a fresh evidence generation BEFORE touching the transport: only
+        // registrations stamped with this generation count, so partial
+        // evidence from an earlier attempt can never combine with this one.
+        // The registry and stamps are cleared with the new generation; a line
+        // already read from the old pipe keeps its older channel tag at
+        // receipt and can never satisfy the new channel boundary below.
+        let epoch = self.inner.resume_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner.registry.lock().await.invalidate_all();
+        self.inner.register_epoch.lock().await.clear();
+        let request_ok = self.inner.request.respawn().await.is_ok();
+        let event_ok = self.inner.event.respawn().await.is_ok();
+        if !request_ok || !event_ok {
+            return Err(self
+                .fail_resume(
+                    "Zellij activation resume could not revalidate the retained pipe transport",
+                )
+                .await);
+        }
+        // Linearized snapshot boundary: the channel that must deliver this
+        // attempt's evidence, read after the respawn that installed it. A
+        // missing install means the transport never came back: fail closed.
+        let Some(channel) = self.inner.event.install_epoch().await else {
+            return Err(self
+                .fail_resume(
+                    "Zellij activation resume could not revalidate the retained pipe transport",
+                )
+                .await);
+        };
+        // Fresh authoritative membership for this attempt only. A detached
+        // baseline member absent here stops blocking; a newly attached
+        // client present here must register fresh. Query or transport
+        // failure parks both children and stays suspended, never Healthy.
+        let snapshot = match self.inner.membership.snapshot_members().await {
+            Ok(mut members) => {
+                members.sort();
+                members.dedup();
+                members
+            }
+            Err(_) => {
+                return Err(self
+                    .fail_resume(
+                        "Zellij activation resume could not observe the current client membership",
+                    )
+                    .await);
+            }
+        };
+        if !self
+            .await_resume_membership(epoch, channel, &snapshot)
+            .await
+        {
+            return Err(self
+                .fail_resume("Zellij activation resume did not observe fresh registrations for the current membership")
+                .await);
+        }
+        // Retain the success round: the snapshot this attempt covered plus
+        // the success-generation stamps. The readiness hook reports exactly
+        // this round, and the next suspend clears it with the registry.
+        *self.inner.success_snapshot.lock().await = Some(snapshot);
+        self.inner.suspended.store(false, Ordering::SeqCst);
+        self.emit(AdapterHealthEvent::Healthy {
+            identity: self.host_identity(),
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Reports per-client commit-gate evidence from the retained success
+    /// round: the authoritative member set of the snapshot coverage was
+    /// proven against, plus the fresh-compatible subset of it in the current
+    /// evidence generation. While suspended, or with no retained success,
+    /// the adapter reports `None` so the broker serves no stale evidence;
+    /// an over-bound member set also reports `None` so the broker gates on
+    /// adapter health instead of pretending coverage. An empty snapshot is
+    /// genuine `Some` evidence of an empty session. Only IDs leave this
+    /// hook, never commands or payloads.
+    async fn activation_readiness(&self) -> Result<Option<ActivationReadiness>, AdapterError> {
+        if self.inner.suspended.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.sweep_expired_clients().await;
+        let Some(snapshot) = self.inner.success_snapshot.lock().await.clone() else {
+            return Ok(None);
+        };
+        let Some(members) = canonical_member_set(snapshot) else {
+            return Ok(None);
+        };
+        let census = self.fresh_census().await;
+        let registered: Vec<String> = members
+            .iter()
+            .filter(|member| census.iter().any(|id| id == *member))
+            .cloned()
+            .collect();
+        Ok(Some(ActivationReadiness {
+            registered_clients: registered,
+            member_clients: members,
+        }))
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
         self.inner.shutdown.store(true, Ordering::Relaxed);
+        // Wake every waiter before tearing down the transport: the census
+        // notify releases establish/resume waits into their fail-closed
+        // paths, and dropping the lifecycle waiter senders fails pending
+        // capture/origin receivers promptly through their existing
+        // timeout/else branches instead of stalling to deadline.
+        self.inner.registry_notify.notify_waiters();
+        self.inner.pending_origin.lock().await.clear();
+        self.inner.pending_capture.lock().await.clear();
         self.inner.request.close().await;
         self.inner.event.close().await;
         Ok(())
@@ -1540,12 +2359,48 @@ impl CaptureTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipes::SubprocessChannel;
     use crate::pipes::testing::ScriptedChannel;
     use muxe_zellij_protocol::{
-        BridgeArtifact, BridgeIdentity, CommandOutcome, PipeEvent, PipeEventKind,
+        BridgeIdentity, CommandOutcome, PipeEvent, PipeEventKind, bridge_build_id,
         decode_request_line, encode_event_line,
     };
 
+    fn register_event(
+        registration: [u8; 16],
+        bridge_build_id: Option<muxe_protocol::SchemaFingerprint>,
+    ) -> PipeEvent {
+        register_event_for(
+            "client-1",
+            registration,
+            bridge_build_id,
+            env!("CARGO_PKG_VERSION"),
+        )
+    }
+
+    fn register_event_for(
+        client_id: &str,
+        registration: [u8; 16],
+        bridge_build_id: Option<muxe_protocol::SchemaFingerprint>,
+        muxe_version: &str,
+    ) -> PipeEvent {
+        PipeEvent {
+            sequence: 1,
+            event: PipeEventKind::Register {
+                client_id: client_id.to_owned(),
+                current_pane: Some("terminal_2".to_owned()),
+                registration,
+                plugin_id: Some(3),
+                identity: BridgeIdentity {
+                    muxe_version: muxe_version.to_owned(),
+                    source_revision: pinned_source_revision().to_owned(),
+                    action_fingerprint: generated_action_fingerprint().0,
+                    protocol_fingerprint: bridge_protocol_fingerprint().0,
+                    bridge_build_id,
+                },
+            },
+        }
+    }
     fn test_origin() -> OriginContext {
         OriginContext {
             host_kind: muxe_core::OriginHostKind::Zellij,
@@ -1576,34 +2431,84 @@ mod tests {
         }
     }
 
-    fn register_event(registration: [u8; 16], artifact: BridgeArtifact) -> PipeEvent {
-        PipeEvent {
-            sequence: 1,
-            event: PipeEventKind::Register {
-                client_id: "client-1".to_owned(),
-                current_pane: Some("terminal_2".to_owned()),
-                registration,
-                plugin_id: Some(3),
-                identity: BridgeIdentity {
-                    muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
-                    source_revision: pinned_source_revision().to_owned(),
-                    action_fingerprint: generated_action_fingerprint().0,
-                    protocol_fingerprint: bridge_protocol_fingerprint().0,
-                    artifact,
-                },
-            },
+    /// Scripted membership oracle: replays a staged snapshot per resume
+    /// query and counts queries, so tests prove a fresh authoritative
+    /// snapshot per attempt instead of snapshot reuse. A set failure makes
+    /// every query fail closed like a broken CLI transport.
+    struct ScriptedMembership {
+        snapshot: Mutex<Vec<String>>,
+        fail: AtomicBool,
+        queries: AtomicU64,
+    }
+
+    impl ScriptedMembership {
+        fn fresh(members: Vec<String>) -> Arc<Self> {
+            Arc::new(Self {
+                snapshot: Mutex::new(members),
+                fail: AtomicBool::new(false),
+                queries: AtomicU64::new(0),
+            })
+        }
+
+        /// Stages the snapshot for the next query.
+        async fn stage(&self, members: Vec<String>) {
+            *self.snapshot.lock().await = members;
+        }
+
+        /// Makes every further query fail closed.
+        fn fail_closed(&self) {
+            self.fail.store(true, Ordering::SeqCst);
+        }
+
+        fn query_count(&self) -> u64 {
+            self.queries.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl MembershipSource for ScriptedMembership {
+        async fn snapshot_members(&self) -> Result<Vec<String>, AdapterError> {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "scripted membership query failed",
+                ));
+            }
+            Ok(self.snapshot.lock().await.clone())
         }
     }
 
     fn test_adapter(request: &Arc<ScriptedChannel>, event: &Arc<ScriptedChannel>) -> ZellijAdapter {
-        ZellijAdapter::new(
+        test_adapter_with(request, event, ScriptedMembership::fresh(Vec::new()))
+    }
+
+    fn test_adapter_with(
+        request: &Arc<ScriptedChannel>,
+        event: &Arc<ScriptedChannel>,
+        membership: Arc<ScriptedMembership>,
+    ) -> ZellijAdapter {
+        ZellijAdapter::new_with_membership(
             ZellijAdapterConfig {
                 session_name: "session-alpha".to_owned(),
                 zellij_exe: PathBuf::from("/nonexistent/zellij"),
             },
             Arc::clone(request) as Arc<dyn PipeChannel>,
             Arc::clone(event) as Arc<dyn PipeChannel>,
+            membership,
         )
+    }
+    /// Writes an owned fake `zellij` executable asserting its argv.
+    fn write_fake_exe(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::with_prefix("muxe-oracle-").expect("unique temp dir");
+        let exe = dir.path().join("zellij");
+        std::fs::write(&exe, body).expect("fake exe");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        (dir, exe)
     }
 
     async fn poll_outbound(channel: &ScriptedChannel) -> String {
@@ -1613,9 +2518,35 @@ mod tests {
             if let Some(line) = outbound.into_iter().next() {
                 return line;
             }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("timed out waiting for outbound request line");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for outbound request line"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    /// Log barrier, not a sleep: returns once the owned fake's invocation
+    /// log shows both initial pipe children plus exactly one scoped
+    /// `list-clients` query, bounded by an explicit deadline.
+    async fn await_fake_invocations(log: &std::path::Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let invocations = std::fs::read_to_string(log).unwrap_or_default();
+            let pipes = invocations
+                .lines()
+                .filter(|line| line.contains("--session session-alpha pipe --name"))
+                .count();
+            let queries = invocations
+                .lines()
+                .filter(|line| line.contains("--session session-alpha action list-clients"))
+                .count();
+            if pipes >= 2 && queries == 1 {
+                return;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fake invocations missing pipes+query: {invocations:?}"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -1626,8 +2557,242 @@ mod tests {
             .expect("health arrives")
             .expect("event ok")
     }
+    /// Readiness barrier, not a sleep: returns once every named client holds
+    /// a live compatible registration, bounded by an explicit deadline.
+    async fn await_registered(adapter: &ZellijAdapter, clients: &[&str]) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut ready = true;
+                for client in clients {
+                    if adapter.active_registration(client).await.is_err() {
+                        ready = false;
+                        break;
+                    }
+                }
+                if ready {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registrations land bounded");
+    }
+    /// Resume barrier, not a sleep: returns once the event channel installs
+    /// an epoch newer than `prev`, proving the attempt respawned the
+    /// transport and fixed its delivery boundary. Pushing lines only after
+    /// this barrier models bridges re-registering on the new child after
+    /// respawn; lines pushed before it carry the displaced epoch.
+    async fn await_channel_bump(event: &ScriptedChannel, prev: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if event
+                    .install_epoch()
+                    .await
+                    .is_some_and(|epoch| epoch > prev)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resume respawns the transport bounded");
+    }
+    /// Turnover barrier, not a sleep: returns once the re-registered bridge
+    /// lands in the registry under its new ID, bounded by an explicit deadline.
+    async fn await_turnover_registration(adapter: &ZellijAdapter) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let refreshed = adapter
+                .inner
+                .registry
+                .lock()
+                .await
+                .get("client-1")
+                .is_some_and(|record| record.registration == [8; 16]);
+            if refreshed {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turnover registration did not land"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 
-    /// Recorded Register → request → RequestReleased → DispatchCompleted flow:
+    /// Dispatch-blocked probe: the observable suspended signal. Host-bound
+    /// work fails fast with `Unavailable` while suspended, before touching
+    /// bridge state.
+    async fn assert_suspended(adapter: &ZellijAdapter) {
+        let blocked = adapter
+            .dispatch_native(NativeDispatchRequest {
+                execution: ExecutionId(900),
+                action: muxe_adapter_api::ResolvedNativeAction {
+                    candidate: candidate(),
+                },
+                origin: test_origin(),
+            })
+            .await
+            .expect_err("dispatch blocked while suspended");
+        assert_eq!(blocked.kind, AdapterErrorKind::Unavailable);
+        assert!(
+            adapter
+                .activation_readiness()
+                .await
+                .expect("readiness query")
+                .is_none(),
+            "suspended adapter reports no readiness evidence"
+        );
+    }
+
+    /// Pushes one registration line for `client` on the event pipe.
+    /// `muxe_version` is explicit so tests can prove a stale bridge version
+    /// never counts; production-correct callers pass the native compiled version.
+    fn push_register(
+        event: &ScriptedChannel,
+        client: &str,
+        registration: [u8; 16],
+        muxe_version: &str,
+    ) {
+        event.push_line(
+            encode_event_line(&register_event_for(
+                client,
+                registration,
+                Some(bridge_build_id()),
+                muxe_version,
+            ))
+            .expect("register encodes"),
+        );
+    }
+
+    /// Starts one resume attempt: respawns the transport and waits for the
+    /// new delivery boundary. The caller replays registration lines, then
+    /// settles the attempt with [`finish_resume_attempt`].
+    async fn begin_resume_attempt(
+        adapter: &ZellijAdapter,
+        event: &ScriptedChannel,
+    ) -> tokio::task::JoinHandle<Result<(), AdapterError>> {
+        let channel = event.install_epoch().await.unwrap_or(0);
+        let pending = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.resume_after_activation_abort().await }
+        });
+        await_channel_bump(event, channel).await;
+        pending
+    }
+
+    /// Settles a started resume attempt with a bounded wait for its outcome.
+    async fn finish_resume_attempt(
+        pending: tokio::task::JoinHandle<Result<(), AdapterError>>,
+    ) -> Result<(), AdapterError> {
+        tokio::time::timeout(Duration::from_secs(10), pending)
+            .await
+            .expect("resume finishes bounded")
+            .expect("resume task")
+    }
+
+    /// Runs one resume attempt: respawns the transport, waits for the new
+    /// delivery boundary, optionally replays one fresh registration on it,
+    /// and returns the attempt outcome bounded.
+    async fn resume_once(
+        adapter: &ZellijAdapter,
+        event: &ScriptedChannel,
+        fresh: Option<(&str, [u8; 16])>,
+    ) -> Result<(), AdapterError> {
+        let pending = begin_resume_attempt(adapter, event).await;
+        if let Some((client, registration)) = fresh {
+            push_register(event, client, registration, env!("CARGO_PKG_VERSION"));
+        }
+        finish_resume_attempt(pending).await
+    }
+    /// Pushes a fingerprint-dishonest registration for the newcomer:
+    /// observed by the attempt, never compatible.
+    fn push_incompatible_newcomer(event: &ScriptedChannel) {
+        event.push_line(
+            encode_event_line(&PipeEvent {
+                sequence: 1,
+                event: PipeEventKind::Register {
+                    client_id: "new-client".to_owned(),
+                    current_pane: Some("terminal_2".to_owned()),
+                    registration: [20; 16],
+                    plugin_id: Some(3),
+                    identity: BridgeIdentity {
+                        muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        source_revision: pinned_source_revision().to_owned(),
+                        action_fingerprint: generated_action_fingerprint().0,
+                        protocol_fingerprint: bridge_protocol_fingerprint().0,
+                        bridge_build_id: Some(muxe_protocol::SchemaFingerprint([1; 32])),
+                    },
+                },
+            })
+            .expect("incompatible newcomer encodes"),
+        );
+    }
+    /// Seeds two registered clients, plants a stale capture lease, suspends,
+    /// and replays one stale pre-suspend registration: the first resume
+    /// attempt starts with displaced evidence it must ignore. Returns the
+    /// adapter, both channels, the membership oracle, and the stale lease.
+    async fn suspend_with_stale_evidence() -> (
+        ZellijAdapter,
+        Arc<ScriptedChannel>,
+        Arc<ScriptedChannel>,
+        Arc<ScriptedMembership>,
+        [u8; 16],
+    ) {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership =
+            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        for (client, registration) in [("client-1", [7; 16]), ("client-2", [8; 16])] {
+            push_register(&event, client, registration, env!("CARGO_PKG_VERSION"));
+        }
+        await_registered(&adapter, &["client-1", "client-2"]).await;
+        // Drain the two registration health reports so later assertions
+        // observe exactly the suspend/resume transitions below.
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        // Seed an old capture lease: suspend must invalidate it and resume
+        // must never restore it.
+        let stale_lease = adapter.mint_id();
+        adapter
+            .inner
+            .captures
+            .lock()
+            .await
+            .begin("client-1", "session-9", stale_lease)
+            .expect("old lease begins");
+        adapter
+            .suspend_for_activation()
+            .await
+            .expect("suspend succeeds");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_suspended(&adapter).await;
+        // A late old-pipe Register carrying the pre-suspend ID is processed
+        // while suspended and stamped with the displaced channel. The next
+        // attempt clears the registry and fixes a newer channel boundary,
+        // so this evidence can never count toward it.
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        (adapter, request, event, membership, stale_lease)
+    }
+
+    /// Recorded `Register` → request → `RequestReleased` → `DispatchCompleted` flow:
     /// the exact script the common adapter-contract suite replays.
     #[tokio::test]
     async fn recorded_dispatch_flow_targets_active_registration() {
@@ -1636,7 +2801,7 @@ mod tests {
         let adapter = test_adapter(&request, &event);
 
         event.push_line(
-            encode_event_line(&register_event([7; 16], BridgeArtifact::Unattested))
+            encode_event_line(&register_event([7; 16], Some(bridge_build_id())))
                 .expect("register encodes"),
         );
         // Wait until the registration lands: a dispatch to an unknown client
@@ -1717,17 +2882,17 @@ mod tests {
         }
     }
 
-    /// A self-attested NativeVerified registration is contained: the bridge is
+    /// A mismatched `bridge_build_id` registration is contained: the bridge is
     /// recorded but flagged incompatible, so no dispatch line reaches the pipe.
     #[tokio::test]
-    async fn self_attested_artifact_is_incompatible() {
+    async fn mismatched_build_id_is_incompatible() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         event.push_line(
             encode_event_line(&register_event(
                 [9; 16],
-                BridgeArtifact::NativeVerified { sha256: [1; 32] },
+                Some(muxe_protocol::SchemaFingerprint([1; 32])),
             ))
             .expect("encodes"),
         );
@@ -1743,18 +2908,89 @@ mod tests {
                 })
                 .await;
             if let Err(error) = &result
-                && error.to_string().contains("incompatible")
+                && error.kind == AdapterErrorKind::Incompatible
             {
                 break;
             }
             // Before the registration lands the error is Unavailable; either
             // way no dispatch line may reach the pipe.
-            if tokio::time::Instant::now() >= deadline {
-                panic!("attested registration was not contained: {result:?}");
-            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mismatched build ID registration was not contained: {result:?}"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(request.take_outbound().is_empty());
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn missing_build_id_does_not_invalidate_healthy_peer() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        event.push_line(
+            encode_event_line(&register_event([9; 16], None)).expect("missing-ID register encodes"),
+        );
+        event.push_line(
+            encode_event_line(&register_event_for(
+                "client-2",
+                [10; 16],
+                Some(bridge_build_id()),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .expect("healthy register encodes"),
+        );
+
+        let mut missing_origin = test_origin();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = adapter
+                .dispatch_native(NativeDispatchRequest {
+                    execution: ExecutionId(9),
+                    action: muxe_adapter_api::ResolvedNativeAction {
+                        candidate: candidate(),
+                    },
+                    origin: missing_origin.clone(),
+                })
+                .await;
+            if let Err(error) = &result
+                && error.kind == AdapterErrorKind::Incompatible
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "missing-ID registration was not rejected: {result:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(request.take_outbound().is_empty());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        missing_origin.client_id = Some(muxe_core::ClientId::new("client-2"));
+        let accepted = loop {
+            let result = adapter
+                .dispatch_native(NativeDispatchRequest {
+                    execution: ExecutionId(10),
+                    action: muxe_adapter_api::ResolvedNativeAction {
+                        candidate: candidate(),
+                    },
+                    origin: missing_origin.clone(),
+                })
+                .await;
+            if let Ok(accepted) = result {
+                break accepted;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "healthy peer was invalidated by missing-ID registration"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(accepted.execution, ExecutionId(10));
+        let frame = decode_request_line(&poll_outbound(&request).await).expect("healthy request");
+        assert_eq!(frame.target.client_id, "client-2");
         adapter.shutdown().await.expect("shutdown");
     }
 
@@ -1769,7 +3005,7 @@ mod tests {
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         event.push_line(
-            encode_event_line(&register_event([7; 16], BridgeArtifact::Unattested))
+            encode_event_line(&register_event([7; 16], Some(bridge_build_id())))
                 .expect("register encodes"),
         );
         let accepted = loop {
@@ -1814,44 +3050,1055 @@ mod tests {
         adapter.shutdown().await.expect("shutdown");
     }
     #[tokio::test]
-    async fn activation_suspend_and_resume_are_explicitly_unsupported() {
+    async fn activation_suspend_blocks_host_work_and_resume_restores() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
-        let suspend = adapter
-            .suspend_for_activation()
-            .await
-            .expect_err("suspend fails");
-        assert_eq!(suspend.kind, AdapterErrorKind::Unsupported);
-        let resume = adapter
+        // Resume without suspend fabricates nothing: fails closed.
+        let premature = adapter
             .resume_after_activation_abort()
             .await
-            .expect_err("resume fails");
-        assert_eq!(resume.kind, AdapterErrorKind::Unsupported);
+            .expect_err("resume without suspend fails");
+        assert_eq!(premature.kind, AdapterErrorKind::Unavailable);
+        // Suspend parks the transport (scripted no-op) and fails closed;
+        // a second suspend while suspended stays idempotent.
+        tokio::time::timeout(Duration::from_secs(10), adapter.suspend_for_activation())
+            .await
+            .expect("suspend finishes bounded")
+            .expect("suspend succeeds");
+        tokio::time::timeout(Duration::from_secs(10), adapter.suspend_for_activation())
+            .await
+            .expect("second suspend finishes bounded")
+            .expect("suspend is idempotent");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        // Host-bound operations fail fast with Unavailable while suspended,
+        // before touching bridge state (no 15s fan-out, no scope parsing).
+        let suspended_scope = adapter
+            .modal_scope(&PaneId::new("pane-9"))
+            .await
+            .expect_err("modal scope blocked while suspended");
+        assert_eq!(suspended_scope.kind, AdapterErrorKind::Unavailable);
+        let suspended_capture = adapter
+            .begin_capture(CaptureRequest {
+                ui_session: UiSessionId::new("session-1"),
+                modal_scope: ModalScopeId::new("bad-scope"),
+            })
+            .await
+            .expect_err("capture blocked while suspended");
+        assert_eq!(suspended_capture.kind, AdapterErrorKind::Unavailable);
+        let suspended_origin = adapter
+            .capture_origin(origin_request("pane-9"))
+            .await
+            .expect_err("origin blocked while suspended");
+        assert_eq!(suspended_origin.kind, AdapterErrorKind::Unavailable);
+        // Resume revalidates (scripted no-op) and reports Healthy; the gate
+        // clears so the same malformed scope now fails on scope parsing
+        // instead of suspension.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            adapter.resume_after_activation_abort(),
+        )
+        .await
+        .expect("resume finishes bounded")
+        .expect("resume succeeds");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        let cleared = adapter
+            .begin_capture(CaptureRequest {
+                ui_session: UiSessionId::new("session-1"),
+                modal_scope: ModalScopeId::new("bad-scope"),
+            })
+            .await
+            .expect_err("gate cleared after resume");
+        assert_eq!(cleared.kind, AdapterErrorKind::InvalidRequest);
+        let again = adapter
+            .resume_after_activation_abort()
+            .await
+            .expect_err("second resume fails");
+        assert_eq!(again.kind, AdapterErrorKind::Unavailable);
         adapter.shutdown().await.expect("shutdown");
     }
-    fn origin_request(
-        ui_pane: &str,
-        hint_pane: Option<&str>,
-        caller_pane: Option<&str>,
-    ) -> OriginCaptureRequest {
-        use muxe_adapter_api::{HostCallerIdentity, OriginHintSource, UntrustedOriginHint};
+    /// Resume measures coverage against a fresh authoritative snapshot per
+    /// attempt, with registrations stamped at receipt on the attempt's
+    /// delivery channel. Two clients register pre-suspend; suspend parks
+    /// and fails closed. A late old-pipe Register processed before the
+    /// first attempt never counts (displaced channel tag). Attempt 1
+    /// snapshots both members but sees no fresh lines and fails; attempt 2
+    /// sees only client-1 fresh and fails, proving attempt 1 left no usable
+    /// evidence; attempt 3 snapshots only client-1 (client-2 detached
+    /// before the query) and succeeds on client-1 re-emitting its
+    /// pre-suspend ID on the new channel, proving detached members stop
+    /// blocking while a still-live bridge stays accepted. Readiness,
+    /// dispatch targeting, and old-lease invalidity prove the outcome;
+    /// every assertion is consumer observable.
+    #[tokio::test]
+    async fn activation_resume_waits_for_fresh_member_registrations() {
+        let (adapter, request, event, membership, stale_lease) =
+            suspend_with_stale_evidence().await;
+        // Attempt 1: the snapshot covers both members but no fresh lines
+        // arrive. Fails closed; the pre-attempt evidence above must not
+        // count, and exactly one query ran for this attempt.
+        let unregistered = resume_once(&adapter, &event, None)
+            .await
+            .expect_err("unregistered resume fails closed");
+        assert_eq!(unregistered.kind, AdapterErrorKind::Unavailable);
+        assert_suspended(&adapter).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_eq!(membership.query_count(), 1);
+        // Attempt 2: only client-1 re-registers fresh in this generation.
+        // The snapshot still needs client-2, so the attempt fails and its
+        // evidence is dropped, never retained for the next attempt.
+        membership
+            .stage(vec!["client-1".to_owned(), "client-2".to_owned()])
+            .await;
+        let partial = resume_once(&adapter, &event, Some(("client-1", [9; 16])))
+            .await
+            .expect_err("partial resume fails closed");
+        assert_eq!(partial.kind, AdapterErrorKind::Unavailable);
+        assert_suspended(&adapter).await;
+        // The fresh registration reported Healthy on arrival; the failed
+        // attempt then reports Unhealthy and drops its evidence.
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_eq!(membership.query_count(), 2);
+        // Attempt 3: client-2 detached before the query, so the authoritative
+        // snapshot holds only client-1. It re-emits its pre-suspend ID on
+        // the new channel (still-live bridge after an abort before reload):
+        // freshness comes from the delivery boundary, so this counts and
+        // the resume succeeds.
+        membership.stage(vec!["client-1".to_owned()]).await;
+        resume_once(&adapter, &event, Some(("client-1", [7; 16])))
+            .await
+            .expect("complete resume succeeds");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert_eq!(membership.query_count(), 3);
+        // Readiness evidence: client-1 fresh against one authoritative member.
+        let readiness = adapter
+            .activation_readiness()
+            .await
+            .expect("readiness query")
+            .expect("ready after complete resume");
+        assert_eq!(readiness.registered_clients, vec!["client-1".to_owned()]);
+        assert_eq!(readiness.member_clients, vec!["client-1".to_owned()]);
+        assert_eq!(
+            adapter
+                .active_registration("client-1")
+                .await
+                .expect("client-1 live"),
+            [7; 16]
+        );
+        // Observable dispatch now targets the fresh registration, proving
+        // restored bridge readiness beyond the health event.
+        let accepted = adapter
+            .dispatch_native(NativeDispatchRequest {
+                execution: ExecutionId(91),
+                action: muxe_adapter_api::ResolvedNativeAction {
+                    candidate: candidate(),
+                },
+                origin: test_origin(),
+            })
+            .await
+            .expect("dispatch succeeds after complete resume");
+        assert_eq!(accepted.execution, ExecutionId(91));
+        let line = poll_outbound(&request).await;
+        let frame = decode_request_line(&line).expect("typed request frame");
+        assert_eq!(frame.target.client_id, "client-1");
+        assert_eq!(frame.target.registration, [7; 16]);
+        // The pre-suspend lease was never restored: the cleared table
+        // reports no active capture for the old lease.
+        assert!(
+            adapter
+                .inner
+                .captures
+                .lock()
+                .await
+                .release("client-1", stale_lease, false)
+                .is_err()
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+    /// Readiness reports the covered snapshot exactly: a compatible
+    /// registration from a client outside the snapshot never leaks into
+    /// the registered set, so a count-based consumer cannot mistake the
+    /// extra registration for coverage of a missing member.
+    #[tokio::test]
+    async fn activation_readiness_reports_covered_subset_only() {
+        let (adapter, _request, event, membership, _lease) = suspend_with_stale_evidence().await;
+        membership.stage(vec!["client-1".to_owned()]).await;
+        let pending = begin_resume_attempt(&adapter, &event).await;
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        // client-9 holds a compatible registration in this generation but
+        // was never a snapshot member: the evidence must exclude it.
+        push_register(&event, "client-9", [9; 16], env!("CARGO_PKG_VERSION"));
+        finish_resume_attempt(pending)
+            .await
+            .expect("resume succeeds with extra non-member registration");
+        let readiness = adapter
+            .activation_readiness()
+            .await
+            .expect("readiness query")
+            .expect("ready after covered resume");
+        assert_eq!(readiness.member_clients, vec!["client-1".to_owned()]);
+        assert_eq!(readiness.registered_clients, vec!["client-1".to_owned()]);
+        adapter.shutdown().await.expect("shutdown");
+    }
+    /// An empty authoritative snapshot is genuine evidence: resume covers
+    /// vacuously and the hook reports empty sets, never `None`. Only a
+    /// missing success round (suspended, never resumed) reports `None`.
+    #[tokio::test]
+    async fn activation_readiness_reports_empty_session() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership = ScriptedMembership::fresh(Vec::new());
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        adapter
+            .suspend_for_activation()
+            .await
+            .expect("suspend succeeds");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_suspended(&adapter).await;
+        resume_once(&adapter, &event, None)
+            .await
+            .expect("empty snapshot resume succeeds");
+        let readiness = adapter
+            .activation_readiness()
+            .await
+            .expect("readiness query")
+            .expect("empty session is evidence");
+        assert!(readiness.member_clients.is_empty());
+        assert!(readiness.registered_clients.is_empty());
+        adapter.shutdown().await.expect("shutdown");
+    }
+    /// A stale bridge version never counts: identical source, action, and
+    /// protocol fingerprints with an old `muxe_version` stay incompatible,
+    /// so the member blocks coverage, the attempt fails, and no dispatch
+    /// targets it. The same bridge at the native compiled version covers
+    /// and reports exact readiness. A fresh adapter that never ran a round
+    /// reports `None` throughout, never constructor-default evidence.
+    #[tokio::test]
+    async fn activation_resume_rejects_stale_bridge_version() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership =
+            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        // Fresh adapter, nonempty session, no round ever ran: no evidence.
+        assert!(
+            adapter
+                .activation_readiness()
+                .await
+                .expect("readiness query")
+                .is_none()
+        );
+        adapter
+            .suspend_for_activation()
+            .await
+            .expect("suspend succeeds");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_suspended(&adapter).await;
+        // Attempt 1: client-1 registers at the native version but client-2
+        // reports an old bridge. The member blocks coverage and the attempt
+        // fails closed; nothing dispatches to the stale bridge.
+        membership
+            .stage(vec!["client-1".to_owned(), "client-2".to_owned()])
+            .await;
+        let pending = begin_resume_attempt(&adapter, &event).await;
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        push_register(&event, "client-2", [8; 16], "0.0.0-old");
+        let stale = finish_resume_attempt(pending)
+            .await
+            .expect_err("stale-version member blocks coverage");
+        assert_eq!(stale.kind, AdapterErrorKind::Unavailable);
+        assert_suspended(&adapter).await;
+        assert!(
+            adapter
+                .activation_readiness()
+                .await
+                .expect("readiness query")
+                .is_none()
+        );
+        // Attempt 2: the same bridge at the native compiled version covers.
+        let pending = begin_resume_attempt(&adapter, &event).await;
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
+        finish_resume_attempt(pending)
+            .await
+            .expect("native-version round succeeds");
+        let readiness = adapter
+            .activation_readiness()
+            .await
+            .expect("readiness query")
+            .expect("covered round is evidence");
+        assert_eq!(
+            readiness.member_clients,
+            vec!["client-1".to_owned(), "client-2".to_owned()]
+        );
+        assert_eq!(
+            readiness.registered_clients,
+            vec!["client-1".to_owned(), "client-2".to_owned()]
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+    /// A fresh target that never went through suspend/resume still reaches
+    /// readiness through its own initial round: no evidence before any
+    /// census, then the production census function snapshots the live
+    /// oracle and covers it with current-channel registrations — no abort
+    /// cycle anywhere. Without this path fresh targets would stay
+    /// permanently unready.
+    #[tokio::test]
+    async fn activation_initial_round_covers_fresh_target() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership =
+            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        // Fresh target, nonempty session, no round ever ran: no evidence.
+        assert!(
+            adapter
+                .activation_readiness()
+                .await
+                .expect("readiness query")
+                .is_none()
+        );
+        // Bridges register on the live channel before the census starts.
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1", "client-2"]).await;
+        adapter
+            .establish_initial_round()
+            .await
+            .expect("initial round covers the live membership");
+        let readiness = adapter
+            .activation_readiness()
+            .await
+            .expect("readiness query")
+            .expect("covered fresh target is evidence");
+        assert_eq!(
+            readiness.member_clients,
+            vec!["client-1".to_owned(), "client-2".to_owned()]
+        );
+        assert_eq!(
+            readiness.registered_clients,
+            vec!["client-1".to_owned(), "client-2".to_owned()]
+        );
+        assert_eq!(membership.query_count(), 1);
+        adapter.shutdown().await.expect("shutdown");
+    }
+    /// Shutdown fails an in-flight initial census promptly instead of
+    /// stalling to the census deadline: the waiter wakes on the shutdown
+    /// notify and maps to `Shutdown`, retaining no success round.
+    #[tokio::test]
+    async fn activation_initial_round_shutdown_wakes_census_wait() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership =
+            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        // No bridge ever registers, so the round must be awaiting coverage;
+        // the completed membership query proves it passed the entry checks.
+        let pending = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.establish_initial_round().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while membership.query_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("census query runs bounded");
+        adapter.shutdown().await.expect("shutdown");
+        let outcome = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("shutdown wakes the census wait promptly")
+            .expect("round task joins");
+        let error = outcome.expect_err("shutdown fails the round");
+        assert_eq!(error.kind, AdapterErrorKind::Shutdown);
+        assert!(
+            adapter
+                .activation_readiness()
+                .await
+                .expect("readiness query")
+                .is_none(),
+            "shutdown retains no readiness evidence"
+        );
+    }
+    /// Shutdown releases a pending capture waiter promptly: dropping the
+    /// waiter sender fails the receiver through the existing timeout/else
+    /// path instead of stalling to the capture deadline.
+    #[tokio::test]
+    async fn activation_shutdown_wakes_pending_capture() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        // No bridge answers the capture, so the waiter must be pending; the
+        // outbound line proves the request reached the transport.
+        let pending = tokio::spawn({
+            let adapter = adapter.clone();
+            async move {
+                adapter
+                    .begin_capture(CaptureRequest {
+                        ui_session: UiSessionId::new("session-1"),
+                        modal_scope: ZellijAdapter::scope_for_client("client-1"),
+                    })
+                    .await
+            }
+        });
+        poll_outbound(&request).await;
+        adapter.shutdown().await.expect("shutdown");
+        let outcome = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("shutdown wakes the capture waiter promptly")
+            .expect("capture task joins");
+        let error = outcome.expect_err("shutdown fails the capture");
+        assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+    }
+    /// A bridge that registers then goes quiet past its heartbeat lease is
+    /// invalidated at the next availability gate: dispatch fails with
+    /// `Unavailable` and the client reports `Unhealthy` once with its modal
+    /// scope, while the queue pauses for lack of a compatible record.
+    /// Paused tokio time proves the 15s lease without wall-clock waiting.
+    #[tokio::test(start_paused = true)]
+    async fn activation_heartbeat_expiry_invalidates_quiet_bridge() {
+        use crate::registry::HEARTBEAT_LEASE;
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        // Drain the registration health report so only the expiry report
+        // remains observable below.
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        tokio::time::advance(HEARTBEAT_LEASE + Duration::from_secs(1)).await;
+        let expired = adapter
+            .active_registration("client-1")
+            .await
+            .expect_err("quiet bridge is unavailable");
+        assert_eq!(expired.kind, AdapterErrorKind::Unavailable);
+        assert!(
+            matches!(
+                next_event(&adapter).await,
+                AdapterHealthEvent::Unhealthy {
+                    modal_scope: Some(scope),
+                    ..
+                } if scope == ZellijAdapter::scope_for_client("client-1")
+            ),
+            "expiry reports the client scope unhealthy once"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+    /// Timer-driven sweep isolates one quiet client: while client-2
+    /// heartbeats, client-1 expires with only its own registration,
+    /// capture, waiter, and session health invalidated. Its queued
+    /// dispatch pauses (kept, never sent); the shared event channel,
+    /// healthy registrations, and ongoing dispatch acceptance continue
+    /// with no whole-pipe restart. Paused tokio time proves lease timing
+    /// without wall-clock waiting.
+    #[tokio::test(start_paused = true)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear two-client isolation script: setup, timer travel with barriers, then per-client assertions in expiry order"
+    )]
+    async fn activation_sweep_expires_only_quiet_client() {
+        use crate::registry::HEARTBEAT_LEASE;
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership =
+            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1", "client-2"]).await;
+        // Seed the states an idle captured client holds: a confirmed
+        // capture, one queued dispatch, and one pending capture waiter.
+        // Seeded directly so no release-deadline timer starts before the
+        // sweep under test.
+        let lease = [9; 16];
+        {
+            let mut captures = adapter.inner.captures.lock().await;
+            captures
+                .begin("client-1", "session-1", lease)
+                .expect("capture begins");
+            captures
+                .confirm("client-1", lease, "normal".to_owned())
+                .expect("capture confirms");
+        }
+        adapter.inner.live_executions.lock().await.insert(77);
+        adapter
+            .inner
+            .queues
+            .lock()
+            .await
+            .entry("client-1".to_owned())
+            .or_default()
+            .push_back(QueuedItem {
+                request_id: [5; 16],
+                execution: Some(ExecutionId(77)),
+                client_id: "client-1".to_owned(),
+                payload: None,
+            });
+        let (waiter_tx, mut waiter_rx) = oneshot::channel();
+        adapter
+            .inner
+            .pending_capture
+            .lock()
+            .await
+            .insert([10; 16], ("client-1".to_owned(), waiter_tx));
+        // Drain both registration health reports so only sweep reports
+        // remain observable below.
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        let first_epoch = event.install_epoch().await;
+        // Keep client-2 alive while client-1 goes quiet past its lease.
+        let stamped = adapter
+            .inner
+            .registry
+            .lock()
+            .await
+            .get("client-2")
+            .map(|record| record.last_event_millis)
+            .expect("client-2 registered");
+        tokio::time::advance(
+            HEARTBEAT_LEASE
+                .checked_sub(Duration::from_secs(5))
+                .expect("lease exceeds heartbeat margin"),
+        )
+        .await;
+        event.push_line(
+            encode_event_line(&PipeEvent {
+                sequence: 3,
+                event: PipeEventKind::Heartbeat {
+                    registration: [8; 16],
+                    client_id: "client-2".to_owned(),
+                },
+            })
+            .expect("heartbeat encodes"),
+        );
+        // Barrier, not a sleep: the heartbeat renewal must land before the
+        // clock moves past client-1's lease.
+        for _ in 0..1000 {
+            let renewed = adapter
+                .inner
+                .registry
+                .lock()
+                .await
+                .get("client-2")
+                .is_some_and(|record| record.last_event_millis > stamped);
+            if renewed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        // Barrier: the timer sweep must have reaped client-1.
+        for _ in 0..1000 {
+            if adapter
+                .inner
+                .registry
+                .lock()
+                .await
+                .get("client-1")
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Only the quiet client expired: registration, capture, waiter.
+        assert!(
+            adapter
+                .inner
+                .registry
+                .lock()
+                .await
+                .get("client-1")
+                .is_none(),
+            "quiet registration reaped"
+        );
+        assert!(
+            adapter
+                .inner
+                .registry
+                .lock()
+                .await
+                .get("client-2")
+                .is_some_and(|record| record.registration == [8; 16]),
+            "heartbeating registration survives with its ID"
+        );
+        assert!(
+            adapter
+                .inner
+                .captures
+                .lock()
+                .await
+                .state("client-1")
+                .is_idle(),
+            "expired capture never stays valid"
+        );
+        assert!(
+            adapter
+                .inner
+                .captures
+                .lock()
+                .await
+                .confirm("client-1", lease, "normal".to_owned())
+                .is_err(),
+            "expired lease confirms nothing"
+        );
+        assert!(
+            matches!(
+                waiter_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "expired waiter sender dropped"
+        );
+        // Session health for exactly the expired client: capture loss with
+        // its real session, then the scoped unavailable report.
+        assert!(
+            matches!(
+                next_event(&adapter).await,
+                AdapterHealthEvent::CaptureLost { lease, .. }
+                    if lease.modal_scope == ZellijAdapter::scope_for_client("client-1")
+            ),
+            "expiry reports capture loss for the quiet session"
+        );
+        assert!(
+            matches!(
+                next_event(&adapter).await,
+                AdapterHealthEvent::Unhealthy {
+                    modal_scope: Some(scope),
+                    ..
+                } if scope == ZellijAdapter::scope_for_client("client-1")
+            ),
+            "expiry reports the quiet client unhealthy once"
+        );
+        // The healthy client re-registers and pumps without touching the
+        // expired client's paused queue; nothing new reaches the transport
+        // and the shared event channel never restarted.
+        push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        adapter.pump_all().await;
+        assert!(
+            adapter
+                .inner
+                .queues
+                .lock()
+                .await
+                .get("client-1")
+                .is_some_and(|queue| queue.len() == 1),
+            "expired queue pauses instead of purging"
+        );
+        assert!(
+            adapter.inner.live_executions.lock().await.contains(&77),
+            "paused execution never completes as unknown"
+        );
+        assert!(
+            request.take_outbound().is_empty(),
+            "nothing dispatched for the expired client"
+        );
+        assert_eq!(
+            event.install_epoch().await,
+            first_epoch,
+            "no whole-pipe restart around one expiry"
+        );
+        // Healthy dispatch acceptance continues; the expired client fails
+        // at the gate before anything queues.
+        let blocked = adapter
+            .dispatch_native(NativeDispatchRequest {
+                execution: ExecutionId(78),
+                action: muxe_adapter_api::ResolvedNativeAction {
+                    candidate: candidate(),
+                },
+                origin: test_origin(),
+            })
+            .await
+            .expect_err("expired client dispatches nothing");
+        assert_eq!(blocked.kind, AdapterErrorKind::Unavailable);
+        let mut origin_2 = test_origin();
+        origin_2.client_id = Some(muxe_core::ClientId::new("client-2"));
+        let accepted = adapter
+            .dispatch_native(NativeDispatchRequest {
+                execution: ExecutionId(79),
+                action: muxe_adapter_api::ResolvedNativeAction {
+                    candidate: candidate(),
+                },
+                origin: origin_2,
+            })
+            .await
+            .expect("healthy dispatch accepted");
+        assert_eq!(accepted.execution, ExecutionId(79));
+        let outbound = request.take_outbound();
+        assert_eq!(outbound.len(), 1, "healthy dispatch reaches the transport");
+        let frame = decode_request_line(&outbound[0]).expect("typed request frame");
+        assert_eq!(frame.target.client_id, "client-2");
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    /// A snapshot member without a registration never reports Healthy, and
+    /// an incompatible registration never counts. Suspended with no prior
+    /// clients, attempt 1 snapshots a newly attached client but sees no
+    /// registration and fails: membership without evidence blocks, so
+    /// silence is never proof. Attempt 2 sees an incompatible registration
+    /// for the snapshotted newcomer and fails. Attempt 3 sees the honest
+    /// compatible handshake and succeeds with the newcomer in the
+    /// readiness evidence. Every assertion is consumer observable.
+    #[tokio::test]
+    async fn activation_resume_empty_membership_discovers_newcomers() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership = ScriptedMembership::fresh(Vec::new());
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        adapter
+            .suspend_for_activation()
+            .await
+            .expect("suspend succeeds");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_suspended(&adapter).await;
+        // Attempt 1: the authoritative snapshot reports a newly attached
+        // client that never registers. Resume fails closed: the snapshot
+        // member without evidence blocks, and silence never reads Healthy.
+        membership.stage(vec!["new-client".to_owned()]).await;
+        let silent = resume_once(&adapter, &event, None)
+            .await
+            .expect_err("membership without registration fails closed");
+        assert_eq!(silent.kind, AdapterErrorKind::Unavailable);
+        assert_suspended(&adapter).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_eq!(membership.query_count(), 1);
+        // Attempt 2: the snapshotted newcomer registers with a dishonest
+        // handshake. The registration is observed but incompatible, so the
+        // attempt fails closed instead of covering the snapshot.
+        membership.stage(vec!["new-client".to_owned()]).await;
+        let pending = begin_resume_attempt(&adapter, &event).await;
+        push_incompatible_newcomer(&event);
+        let rejected = finish_resume_attempt(pending)
+            .await
+            .expect_err("incompatible newcomer fails closed");
+        assert_eq!(rejected.kind, AdapterErrorKind::Unavailable);
+        assert_suspended(&adapter).await;
+        // The incompatible arrival reports Unhealthy; the failed attempt
+        // reports Unhealthy again and drops its evidence.
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_eq!(membership.query_count(), 2);
+        // Attempt 3: the newcomer returns with an honest compatible
+        // handshake in this generation. Resume succeeds and the readiness
+        // hook proves the current-attempt registration.
+        membership.stage(vec!["new-client".to_owned()]).await;
+        resume_once(&adapter, &event, Some(("new-client", [21; 16])))
+            .await
+            .expect("compatible newcomer succeeds");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert_eq!(membership.query_count(), 3);
+        let readiness = adapter
+            .activation_readiness()
+            .await
+            .expect("readiness query")
+            .expect("ready after newcomer resume");
+        assert_eq!(readiness.registered_clients, vec!["new-client".to_owned()]);
+        assert_eq!(readiness.member_clients, vec!["new-client".to_owned()]);
+        adapter.shutdown().await.expect("shutdown");
+    }
+    /// A failed membership query parks both children and stays suspended:
+    /// without an authoritative snapshot there is nothing to cover, so the
+    /// attempt fails closed with `Unavailable` and the next attempt takes
+    /// its own fresh snapshot.
+    #[tokio::test]
+    async fn activation_resume_membership_query_failure_parks_and_stays_suspended() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership = ScriptedMembership::fresh(Vec::new());
+        membership.fail_closed();
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        adapter
+            .suspend_for_activation()
+            .await
+            .expect("suspend succeeds");
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        let channel = event.install_epoch().await.unwrap_or(0);
+        let pending = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.resume_after_activation_abort().await }
+        });
+        await_channel_bump(&event, channel).await;
+        let failed = tokio::time::timeout(Duration::from_secs(10), pending)
+            .await
+            .expect("failed-query resume finishes bounded")
+            .expect("resume task")
+            .expect_err("failed query fails closed");
+        assert_eq!(failed.kind, AdapterErrorKind::Unavailable);
+        assert_suspended(&adapter).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert_eq!(membership.query_count(), 1);
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    /// Pinned `list-clients` table fixtures, derived from
+    /// `ClientMetadata::render_many`: header plus space-padded rows, a
+    /// header-only empty session, and empty output failing closed.
+    #[test]
+    fn list_clients_output_parses_pinned_table_format() {
+        let table = "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n\
+                     1         terminal_2     /bin/zsh      \n\
+                     2         terminal_5     N/A           \n";
+        assert_eq!(
+            super::parse_list_clients_output(table).expect("table parses"),
+            vec!["1".to_owned(), "2".to_owned()]
+        );
+        let header_only = "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n";
+        assert!(
+            super::parse_list_clients_output(header_only)
+                .expect("empty session parses")
+                .is_empty()
+        );
+        assert!(
+            super::parse_list_clients_output("")
+                .expect_err("empty output fails closed")
+                .to_string()
+                .contains("no output")
+        );
+        let bad_row =
+            "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n???       terminal_2     /bin/zsh\n";
+        assert!(
+            super::parse_list_clients_output(bad_row)
+                .expect_err("non-numeric ID fails closed")
+                .to_string()
+                .contains("unsupported row shape")
+        );
+    }
+
+    /// Production oracle against owned fake executables (no live host): the
+    /// fake asserts the exact scoped argv and prints a recorded-format
+    /// table, proving the query path end to end; a rejecting fake proves
+    /// transport failure surfaces as `Unavailable` with no payload logged.
+    #[tokio::test]
+    async fn cli_membership_oracle_queries_scoped_session_binary() {
+        let table = r#"#!/bin/sh
+if [ "$1" != "--session" ] || [ "$2" != "session-alpha" ] || [ "$3" != "action" ] || [ "$4" != "list-clients" ]; then
+  echo "bad argv: $*" >&2
+  exit 3
+fi
+printf 'CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n3         terminal_2     /bin/zsh\n1         plugin_9       N/A\n'
+"#;
+        let (_dir, exe) = write_fake_exe(table);
+        let members = super::CliMembershipSource::new(exe, "session-alpha".to_owned())
+            .snapshot_members()
+            .await
+            .expect("table oracle succeeds");
+        assert_eq!(members, vec!["1".to_owned(), "3".to_owned()]);
+        let rejecting = "#!/bin/sh\nexit 3\n";
+        let (_dir, exe) = write_fake_exe(rejecting);
+        let failed = super::CliMembershipSource::new(exe, "session-alpha".to_owned())
+            .snapshot_members()
+            .await
+            .expect_err("rejecting oracle fails closed");
+        assert_eq!(failed.kind, AdapterErrorKind::Unavailable);
+    }
+    /// An output flood never buffers unboundedly: the cap is enforced
+    /// during the read, so the child is killed and reaped past the bound
+    /// and the query fails closed within its timeout.
+    #[tokio::test]
+    async fn cli_membership_oracle_rejects_output_flood_bounded() {
+        let flood =
+            "#!/bin/sh\npython3 -c 'import sys; sys.stdout.write(\"x\" * 70000 + \"\\n\")'\n";
+        let (_dir, exe) = write_fake_exe(flood);
+        let flooded = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::CliMembershipSource::new(exe, "session-alpha".to_owned()).snapshot_members(),
+        )
+        .await
+        .expect("flood terminates bounded")
+        .expect_err("flood fails closed");
+        assert_eq!(flooded.kind, AdapterErrorKind::Unavailable);
+    }
+
+    /// Suspend parks both production children and resume respawns them over
+    /// the pinned argv, against owned fake executables (no live host).
+    #[tokio::test]
+    async fn activation_suspend_parks_and_resume_revalidates_transport() {
+        let dir = tempfile::TempDir::with_prefix("muxe-suspend-").expect("unique temp dir");
+        let log = dir.path().join("invocations.log");
+        let script = format!(
+            r#"#!/bin/sh
+LOG="{}"
+echo "start: $*" >> "$LOG"
+if [ "$1" = "--session" ] && [ "$3" = "action" ] && [ "$4" = "list-clients" ]; then
+  exit 3
+fi
+if [ "$1" != "--session" ] || [ "$3" != "pipe" ] || [ "$4" != "--name" ]; then
+  echo "bad argv: $*" >&2
+  exit 3
+fi
+while IFS= read -r line; do
+  printf 'got:%s\n' "$line"
+done
+"#,
+            log.display()
+        );
+        let exe = dir.path().join("zellij");
+        std::fs::write(&exe, script).expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let request = SubprocessChannel::launch(
+            exe.clone(),
+            "session-alpha".to_owned(),
+            "req".to_owned(),
+            None,
+        )
+        .await
+        .expect("launches request fake");
+        let event = SubprocessChannel::launch(
+            exe.clone(),
+            "session-alpha".to_owned(),
+            "evt".to_owned(),
+            Some("subscribe".to_owned()),
+        )
+        .await
+        .expect("launches event fake");
+        let adapter = ZellijAdapter::new(
+            ZellijAdapterConfig {
+                session_name: "session-alpha".to_owned(),
+                zellij_exe: exe,
+            },
+            Arc::clone(&request) as Arc<dyn crate::pipes::PipeChannel>,
+            Arc::clone(&event) as Arc<dyn crate::pipes::PipeChannel>,
+        );
+        // Functional pipe-argv proof while live: the request child speaks
+        // the pinned `pipe --name` shape (the fake exits 3 otherwise).
+        request
+            .send_line("ping\n".to_owned())
+            .await
+            .expect("live request child accepts writes");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), request.next_line())
+                .await
+                .expect("live request child answers bounded")
+                .expect("live line"),
+            "got:ping"
+        );
+        tokio::time::timeout(Duration::from_secs(10), adapter.suspend_for_activation())
+            .await
+            .expect("suspend finishes bounded")
+            .expect("suspend succeeds");
+        // Parked channels accept nothing: the children are gone but the
+        // channels stay open for resume.
+        assert!(matches!(
+            request.send_line("parked\n".to_owned()).await,
+            Err(crate::pipes::PipeTransportError::Closed)
+        ));
+        let failed = tokio::time::timeout(
+            Duration::from_secs(20),
+            adapter.resume_after_activation_abort(),
+        )
+        .await
+        .expect("resume finishes bounded")
+        .expect_err("failed membership query fails closed");
+        assert_eq!(failed.kind, AdapterErrorKind::Unavailable);
+        // Production-boundary proof: both initial pipe children launched
+        // over the pinned argv (the pre-suspend echo round-trip above
+        // proves the request child speaks it), plus exactly one scoped
+        // list-clients query. Resume ordering proves the respawn: the
+        // query runs strictly after both respawns return `Ok` with a live
+        // install, so its log line cannot precede them. Respawn echoes are
+        // not asserted: the failing attempt parks — killing the
+        // just-spawned children, which may die before their first echo
+        // under load. Polled, not slept: spawn-to-log races the resume
+        // return.
+        await_fake_invocations(&log).await;
+        assert!(matches!(
+            request.send_line("parked\n".to_owned()).await,
+            Err(crate::pipes::PipeTransportError::Closed)
+        ));
+        assert!(matches!(
+            event.send_line("parked\n".to_owned()).await,
+            Err(crate::pipes::PipeTransportError::Closed)
+        ));
+        let blocked = adapter
+            .modal_scope(&PaneId::new("pane-9"))
+            .await
+            .expect_err("still suspended after failed resume");
+        assert_eq!(blocked.kind, AdapterErrorKind::Unavailable);
+        adapter.shutdown().await.expect("shutdown");
+    }
+    fn origin_request(ui_pane: &str) -> OriginCaptureRequest {
+        // Zellij native Run supplies no Herdr bootstrap tuples; broker always
+        // supplies ui_pane from attach.
         OriginCaptureRequest {
             ui_session: UiSessionId::new("session-1"),
             ui_pane: PaneId::new(ui_pane),
-            origin_hint: hint_pane.map(|pane| UntrustedOriginHint {
-                workspace_id: muxe_core::WorkspaceId::new("workspace-1"),
-                tab_id: muxe_core::TabId::new("tab-1"),
-                pane_id: PaneId::new(pane),
-                cwd: Some(std::path::PathBuf::from("/work")),
-                source: OriginHintSource::LauncherBootstrap,
-            }),
-            caller_identity: caller_pane.map(|pane| HostCallerIdentity {
-                workspace_id: muxe_core::WorkspaceId::new("workspace-1"),
-                tab_id: muxe_core::TabId::new("tab-1"),
-                pane_id: PaneId::new(pane),
-                cwd: Some(std::path::PathBuf::from("/work")),
-            }),
+            origin_hint: None,
+            caller_identity: None,
         }
     }
 
@@ -1866,25 +4113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_origin_requires_hint_and_caller() {
-        let request = ScriptedChannel::new();
-        let event = ScriptedChannel::new();
-        let adapter = test_adapter(&request, &event);
-        let missing_hint = adapter
-            .capture_origin(origin_request("plugin-9", None, Some("plugin-9")))
-            .await
-            .expect_err("missing hint fails");
-        assert_eq!(missing_hint.kind, AdapterErrorKind::ContextUnavailable);
-        let missing_caller = adapter
-            .capture_origin(origin_request("plugin-9", Some("terminal_2"), None))
-            .await
-            .expect_err("missing caller fails");
-        assert_eq!(missing_caller.kind, AdapterErrorKind::ContextUnavailable);
-        adapter.shutdown().await.expect("shutdown");
-    }
-
-    #[tokio::test]
-    async fn capture_origin_validates_caller_and_prior_pane() {
+    async fn capture_origin_resolves_from_ui_pane_without_hint_tuples() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
@@ -1892,54 +4121,156 @@ mod tests {
             "plugin-9".to_owned(),
             origin_snapshot("plugin-9", Some("terminal_2")),
         );
-        let caller_mismatch = adapter
-            .capture_origin(origin_request(
-                "plugin-9",
-                Some("terminal_2"),
-                Some("terminal_7"),
-            ))
+        let origin = adapter
+            .capture_origin(origin_request("plugin-9"))
             .await
-            .expect_err("caller mismatch fails");
-        assert_eq!(caller_mismatch.kind, AdapterErrorKind::InvalidRequest);
-        let prior_mismatch = adapter
-            .capture_origin(origin_request(
-                "plugin-9",
-                Some("terminal_9"),
-                Some("plugin-9"),
-            ))
-            .await
-            .expect_err("prior mismatch fails");
-        assert_eq!(prior_mismatch.kind, AdapterErrorKind::InvalidRequest);
-        let matched = adapter
-            .capture_origin(origin_request(
-                "plugin-9",
-                Some("terminal_2"),
-                Some("plugin-9"),
-            ))
-            .await
-            .expect("matched hint and caller capture");
+            .expect("ui pane resolves without hint tuples");
+        // The action origin is the bridge PRIOR pane: pane-scoped dispatch
+        // must target terminal_2, never the Muxe UI pane plugin-9.
         assert_eq!(
-            matched.pane_id.as_ref().map(|pane| pane.as_str()),
-            Some("plugin-9")
+            origin.pane_id.as_ref().map(muxe_core::PaneId::as_str),
+            Some("terminal_2")
         );
+        assert_eq!(origin.pane_cwd, Some(std::path::PathBuf::from("/work")));
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn capture_origin_rejects_snapshot_for_another_ui_pane() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        adapter.inner.snapshots.lock().await.insert(
+            "plugin-9".to_owned(),
+            origin_snapshot("plugin-8", Some("terminal_2")),
+        );
+        let mismatch = adapter
+            .capture_origin(origin_request("plugin-9"))
+            .await
+            .expect_err("foreign snapshot fails");
+        assert_eq!(mismatch.kind, AdapterErrorKind::InvalidRequest);
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    /// Direct `Run` origin end to end over the injected channels: the adapter
+    /// fans a typed `RequestOrigin` out on the request pipe, the bridge answer
+    /// returns as a typed `OriginSnapshot` event, and capture resolves with no
+    /// Herdr hint/caller tuples. A registration turnover between the request
+    /// and the answer is contained: the stale answer fails the registration
+    /// check, the fan-out re-queries the refreshed bridge, and the captured
+    /// origin plus every pane-scoped consumer target the PRIOR pane, never
+    /// the Muxe UI pane.
+    #[tokio::test]
+    async fn capture_origin_round_trip_targets_prior_pane_after_turnover() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+
+        event.push_line(
+            encode_event_line(&register_event([7; 16], Some(bridge_build_id())))
+                .expect("register line"),
+        );
+
+        let worker = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.capture_origin(origin_request("plugin-9")).await }
+        });
+        let first = decode_request_line(&poll_outbound(&request).await).expect("origin frame");
+        assert_eq!(first.target.client_id, "client-1");
+        assert_eq!(first.target.registration, [7; 16]);
+        let (session, pane) = match &first.payload {
+            BridgeRequest::RequestOrigin {
+                ui_session,
+                ui_pane,
+            } => (ui_session.clone(), ui_pane.clone()),
+            _ => panic!("expected origin fan-out, got {:?}", first.payload),
+        };
+        assert_eq!(pane, "plugin-9");
+
+        // The bridge re-registers before answering: the stale answer below
+        // must fail the registration check so the fan-out re-queries.
+        event.push_line(
+            encode_event_line(&PipeEvent {
+                sequence: 2,
+                event: PipeEventKind::Register {
+                    client_id: "client-1".to_owned(),
+                    current_pane: Some("plugin-9".to_owned()),
+                    registration: [8; 16],
+                    plugin_id: Some(3),
+                    identity: BridgeIdentity {
+                        muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        source_revision: pinned_source_revision().to_owned(),
+                        action_fingerprint: generated_action_fingerprint().0,
+                        protocol_fingerprint: bridge_protocol_fingerprint().0,
+                        bridge_build_id: Some(bridge_build_id()),
+                    },
+                },
+            })
+            .expect("turnover encodes"),
+        );
+        await_turnover_registration(&adapter).await;
+
+        let snapshot = |sequence| PipeEvent {
+            sequence,
+            event: PipeEventKind::OriginSnapshot {
+                ui_session: session.clone(),
+                origin: muxe_zellij_protocol::ZellijOrigin {
+                    client_id: "client-1".to_owned(),
+                    session_name: Some("session-alpha".to_owned()),
+                    prior_pane_id: Some("terminal_2".to_owned()),
+                    ui_pane_id: "plugin-9".to_owned(),
+                    prior_pane_cwd: Some("/work".to_owned()),
+                },
+            },
+        };
+        event.push_line(encode_event_line(&snapshot(3)).expect("snapshot encodes"));
+        // The refreshed bridge is re-queried with its current registration.
+        let second = decode_request_line(&poll_outbound(&request).await).expect("origin frame");
+        assert_eq!(second.target.client_id, "client-1");
+        assert_eq!(second.target.registration, [8; 16]);
+        event.push_line(encode_event_line(&snapshot(4)).expect("snapshot encodes"));
+        let origin = worker
+            .await
+            .expect("capture task")
+            .expect("origin captures");
+        // The captured action origin is the PRIOR pane, never the UI pane.
+        assert_eq!(
+            origin.pane_id.as_ref().map(muxe_core::PaneId::as_str),
+            Some("terminal_2")
+        );
+        assert_eq!(origin.pane_cwd, Some(std::path::PathBuf::from("/work")));
+
+        // Consumer proof: closing the origin pane closes the PRIOR pane, not
+        // the Muxe UI that now holds focus.
+        let PortableMapping::HostAction { commands } = map_portable(
+            &muxe_core::PortableAction::Pane(muxe_core::PaneAction::Close),
+            &origin,
+        )
+        .expect("pane close maps") else {
+            panic!("expected host action");
+        };
+        assert_eq!(commands.len(), 1);
+        let RawNativeCommand::RunAction { action, .. } = commands.into_iter().next().expect("one")
+        else {
+            panic!("expected run-action wrap");
+        };
+        assert!(matches!(
+            action,
+            muxe_zellij_protocol::generated::raw::Action::CloseFocusByPaneId {
+                pane_id: muxe_zellij_protocol::generated::raw::PaneId::Terminal(2),
+            }
+        ));
         adapter.shutdown().await.expect("shutdown");
     }
 
     #[test]
     fn zellij_exe_search_uses_owned_dir_entries() {
-        let dir = std::env::temp_dir().join(format!("muxe-exe-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let exe = dir.join("zellij");
+        let dir = tempfile::TempDir::with_prefix("muxe-exe-").expect("unique temp dir");
+        let exe = dir.path().join("zellij");
         std::fs::write(&exe, "#!/bin/sh\nexit 0\n").expect("fake exe");
-        let found =
-            super::find_zellij_in_dirs([dir.clone()].into_iter()).expect("finds owned fake");
+        let found = super::find_zellij_in_dirs([dir.path().to_owned()].into_iter())
+            .expect("finds owned fake");
         assert_eq!(found, exe);
-        assert!(
-            super::find_zellij_in_dirs(
-                [std::env::temp_dir().join("muxe-exe-test-missing-dir")].into_iter()
-            )
-            .is_none()
-        );
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(super::find_zellij_in_dirs([dir.path().join("missing-dir")].into_iter()).is_none());
     }
 }

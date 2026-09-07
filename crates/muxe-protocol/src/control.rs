@@ -5,13 +5,14 @@ use thiserror::Error;
 
 use crate::{
     frame::{DecodeError, PRELUDE_LEN, Prelude},
-    wire::{
-        Codec, HostKind, LiveServerIdentity, MAX_CONTROL_FRAME_LEN, PeerRole, SchemaFingerprint,
-    },
+    wire::{Codec, LiveServerIdentity, MAX_CONTROL_FRAME_LEN, PeerRole, SchemaFingerprint},
 };
 
 const LENGTH_PREFIX_LEN: usize = 4;
 const MAX_CONTROL_DIAGNOSTIC_LEN: usize = 4 * 1024;
+/// Upper bound on per-client readiness IDs per status: membership is small and
+/// control frames are capped, so anything larger is a corrupt or hostile record.
+const MAX_READINESS_CLIENTS: usize = 1024;
 
 macro_rules! control_nonce {
     ($name:ident) => {
@@ -36,6 +37,12 @@ pub struct ZellijCompatibility {
     pub source_revision: String,
     pub generated_action_fingerprint: SchemaFingerprint,
     pub bridge_protocol_fingerprint: SchemaFingerprint,
+    /// Shared deterministic pre-link bridge/protocol build identity.
+    ///
+    /// Legacy control-json-v1 records may omit this field; such records never
+    /// qualify a Zellij target as ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_build_id: Option<SchemaFingerprint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +72,12 @@ impl CompatibilityRecord {
             validate_control_text("Zellij source revision", &zellij.source_revision)?;
             validate_fingerprint(zellij.generated_action_fingerprint)?;
             validate_fingerprint(zellij.bridge_protocol_fingerprint)?;
+            if zellij
+                .bridge_build_id
+                .is_some_and(SchemaFingerprint::is_zero)
+            {
+                return Err(ControlSemanticError::InvalidCompatibility);
+            }
         }
         if let Some(herdr) = &self.herdr {
             if herdr.protocol_version == 0 || herdr.schema_version == 0 {
@@ -83,8 +96,30 @@ pub struct ActivationStatus {
     pub current: CompatibilityRecord,
     pub target: Option<CompatibilityRecord>,
     pub handoff_id: Option<HandoffId>,
+    /// Optional commit-gate readiness evidence, DES2137-additive: missing on old
+    /// records and None where the host reports no per-client evidence. Coordinators
+    /// treat None as "no per-client evidence" and apply the host-appropriate gate;
+    /// it is never required on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<TargetReadiness>,
 }
 
+/// Per-client commit-gate evidence: which CURRENT clients hold a fresh compatible
+/// registration in this attempt. IDs and counts only, never payloads.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetReadiness {
+    /// Client IDs holding a fresh compatible registration in this attempt.
+    pub registered_clients: Vec<String>,
+    /// Current membership count the registrations are measured against.
+    /// Diagnostic only, never proof: exact coverage compares the ID sets.
+    pub member_clients: u64,
+    /// Authoritative member IDs of the same snapshot round. A count alone cannot
+    /// prove coverage: a newcomer could mask a missing member. Omitted or null on
+    /// older records decodes as unknown, which is never ready; present (even empty
+    /// for a legitimate zero-client unit) is authoritative for its round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_ids: Option<Vec<String>>,
+}
 impl ActivationStatus {
     fn validate(&self) -> Result<(), ControlSemanticError> {
         validate_live_server(&self.live_server)?;
@@ -95,12 +130,48 @@ impl ActivationStatus {
         if let Some(handoff) = self.handoff_id {
             handoff.validate("handoff ID")?;
         }
+        if let Some(ready) = &self.ready {
+            validate_readiness(ready)?;
+        }
         Ok(())
     }
 }
 
+fn validate_readiness(ready: &TargetReadiness) -> Result<(), ControlSemanticError> {
+    if ready.registered_clients.len() > MAX_READINESS_CLIENTS {
+        return Err(ControlSemanticError::InvalidCompatibility);
+    }
+    for client in &ready.registered_clients {
+        validate_control_text("readiness client", client)?;
+    }
+    let mut sorted = ready.registered_clients.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != ready.registered_clients.len() {
+        return Err(ControlSemanticError::InvalidCompatibility);
+    }
+    if let Some(member_ids) = &ready.member_ids {
+        if member_ids.len() > MAX_READINESS_CLIENTS {
+            return Err(ControlSemanticError::InvalidCompatibility);
+        }
+        for client in member_ids {
+            validate_control_text("readiness member", client)?;
+        }
+        let mut sorted = member_ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() != member_ids.len() {
+            return Err(ControlSemanticError::InvalidCompatibility);
+        }
+    }
+    Ok(())
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "control wire stability: variants carry whole request/response messages by design and the framed bytes are already heap-allocated; boxing would churn every coordinator and broker construction site across crates"
+)]
 pub enum ControlMessage {
     Request(ControlRequest),
     Response(ControlResponse),
@@ -116,7 +187,7 @@ pub struct ControlRequest {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum ControlOperation {
     Status,
-    Prepare { target: CompatibilityRecord },
+    Prepare { target: Box<CompatibilityRecord> },
     Commit { handoff_id: HandoffId },
     Abort { handoff_id: HandoffId },
     Retire,
@@ -205,12 +276,14 @@ pub struct ControlPolicy {
 }
 
 impl ControlPolicy {
+    #[must_use]
     pub const fn broker() -> Self {
         Self {
             direction: ControlDirection::CoordinatorToBroker,
         }
     }
 
+    #[must_use]
     pub const fn coordinator() -> Self {
         Self {
             direction: ControlDirection::BrokerToCoordinator,
@@ -250,6 +323,7 @@ enum ControlDecoderState {
 }
 
 impl ControlDecoder {
+    #[must_use]
     pub fn new(policy: ControlPolicy) -> Self {
         Self {
             policy,
@@ -261,6 +335,12 @@ impl ControlDecoder {
         }
     }
 
+    /// Decodes length-prefixed coordinator frames and delivers each message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlDecodeError` when the decoder already failed, framing is
+    /// malformed, or a message violates the broker direction or semantics.
     pub fn push<F>(&mut self, mut input: &[u8], mut on_message: F) -> Result<(), ControlDecodeError>
     where
         F: FnMut(ControlMessage),
@@ -356,19 +436,28 @@ impl ControlDecoder {
         Ok(())
     }
 
+    /// Drains a closing stream, reporting a truncated tail as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlDecodeError::DecoderClosed` when already failed and
+    /// `ControlDecodeError::Truncated` with the buffered byte count otherwise.
     pub fn finish(&mut self) -> Result<(), ControlDecodeError> {
         if self.failed {
             return Err(ControlDecodeError::DecoderClosed);
         }
         let truncated = match &self.state {
-            ControlDecoderState::Prelude { filled, .. } => Some(*filled),
             ControlDecoderState::LengthPrefix { filled: 0, .. } => None,
-            ControlDecoderState::LengthPrefix { filled, .. } => Some(*filled),
+            ControlDecoderState::Prelude { filled, .. }
+            | ControlDecoderState::LengthPrefix { filled, .. } => Some(*filled),
             ControlDecoderState::Payload {
                 declared_len,
                 bytes,
                 ..
-            } => Some((declared_len - bytes.len() as u32) as usize),
+            } => Some(
+                declared_len.saturating_sub(u32::try_from(bytes.len()).unwrap_or(u32::MAX))
+                    as usize,
+            ),
             ControlDecoderState::Failed => return Err(ControlDecodeError::DecoderClosed),
         };
         match truncated {
@@ -384,6 +473,44 @@ impl ControlDecoder {
     }
 }
 
+/// Serializes one broker-to-coordinator response as its length-prefixed JSON payload.
+///
+/// The caller writes the broker control prelude once at connection setup. Keeping framing here
+/// prevents service crates from independently serializing a control response with a divergent
+/// length or semantic check.
+/// # Errors
+///
+/// Returns `ControlEncodeError` when the response violates broker direction or
+/// exceeds the control frame cap.
+pub fn encode_broker_control_response(
+    response: &ControlResponse,
+) -> Result<Vec<u8>, ControlEncodeError> {
+    let message = ControlMessage::Response(response.clone());
+    message
+        .validate(ControlDirection::BrokerToCoordinator)
+        .map_err(ControlEncodeError::Semantic)?;
+    let payload = serde_json::to_vec(&message)
+        .map_err(|error| ControlEncodeError::Json(error.to_string()))?;
+    let length = u32::try_from(payload.len()).map_err(|_| ControlEncodeError::TooLarge)?;
+    if length > MAX_CONTROL_FRAME_LEN {
+        return Err(ControlEncodeError::TooLarge);
+    }
+    let mut framed = Vec::with_capacity(LENGTH_PREFIX_LEN + payload.len());
+    framed.extend_from_slice(&length.to_be_bytes());
+    framed.extend_from_slice(&payload);
+    Ok(framed)
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ControlEncodeError {
+    #[error("control response violates the broker-to-coordinator contract: {0}")]
+    Semantic(ControlSemanticError),
+    #[error("could not serialize control response: {0}")]
+    Json(String),
+    #[error("control response exceeds the fixed frame limit")]
+    TooLarge,
+}
+
 fn validate_fingerprint(value: SchemaFingerprint) -> Result<(), ControlSemanticError> {
     (!value.is_zero())
         .then_some(())
@@ -394,13 +521,10 @@ fn validate_live_server(value: &LiveServerIdentity) -> Result<(), ControlSemanti
     if value.discovery_key.is_empty()
         || value.discovery_key.chars().any(char::is_control)
         || value.server_id.as_str().is_empty()
-        || value.server_id.as_str().chars().any(char::is_control)
     {
         return Err(ControlSemanticError::InvalidLiveServerIdentity);
     }
-    match value.host {
-        HostKind::Zellij | HostKind::Herdr => Ok(()),
-    }
+    Ok(())
 }
 
 fn validate_control_text(field: &'static str, value: &str) -> Result<(), ControlSemanticError> {
@@ -461,6 +585,7 @@ pub enum ControlDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::HostKind;
 
     fn identity() -> LiveServerIdentity {
         LiveServerIdentity {
@@ -487,14 +612,20 @@ mod tests {
     fn request() -> ControlMessage {
         ControlMessage::Request(ControlRequest {
             request_id: ControlRequestId([1; 16]),
-            operation: ControlOperation::Prepare { target: record() },
+            operation: ControlOperation::Prepare {
+                target: Box::new(record()),
+            },
         })
     }
 
     fn frame(role: PeerRole, message: &ControlMessage) -> Vec<u8> {
         let payload = serde_json::to_vec(message).unwrap();
         let mut bytes = Prelude::control(role).encode().to_vec();
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("test payload fits the control frame cap")
+                .to_be_bytes(),
+        );
         bytes.extend(payload);
         bytes
     }
@@ -508,11 +639,17 @@ mod tests {
         payload["future_field"] = serde_json::json!(true);
         let payload = serde_json::to_vec(&payload).unwrap();
         bytes.truncate(PRELUDE_LEN);
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("test payload fits the control frame cap")
+                .to_be_bytes(),
+        );
         bytes.extend(payload);
         let mut messages = Vec::new();
         ControlDecoder::new(ControlPolicy::broker())
-            .push(&bytes, |message| messages.push(message))
+            .push(&bytes, |message| {
+                messages.push(message);
+            })
             .unwrap();
         assert_eq!(messages, vec![request()]);
         assert!(payload_start < bytes.len());
@@ -539,7 +676,41 @@ mod tests {
                 ControlSemanticError::WrongDirection
             ))
         ));
+    }
 
+    #[test]
+    fn herdr_compat_stays_additive_for_v1_handoffs() {
+        // DES2133-2139: a v1 handoff record carries exactly the three original Herdr
+        // fields. Later metadata must stay native-only; any new REQUIRED control
+        // field would reject existing handoffs, so this pins the wire shape.
+        let bytes = frame(PeerRole::ActivationCoordinator, &request());
+        let mut messages = Vec::new();
+        ControlDecoder::new(ControlPolicy::broker())
+            .push(&bytes, |message| messages.push(message))
+            .expect("v1 prepare bytes decode");
+        let [ControlMessage::Request(request)] = messages.as_slice() else {
+            panic!("v1 prepare decodes to a request");
+        };
+        request.validate().expect("v1 prepare validates");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes[PRELUDE_LEN + LENGTH_PREFIX_LEN..]).unwrap();
+        let herdr = &payload["body"]["operation"]["target"]["herdr"];
+        let mut keys: Vec<&str> = herdr
+            .as_object()
+            .expect("v1 herdr record is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["protocol_version", "schema_fingerprint", "schema_version"],
+            "v1 herdr record carries exactly its three original fields"
+        );
+    }
+
+    #[test]
+    fn empty_frame_is_rejected() {
         let mut empty = Prelude::control(PeerRole::ActivationCoordinator)
             .encode()
             .to_vec();
@@ -558,6 +729,7 @@ mod tests {
             current: record(),
             target: None,
             handoff_id: None,
+            ready: None,
         };
         let response = ControlMessage::Response(ControlResponse {
             request_id: ControlRequestId([2; 16]),
@@ -566,9 +738,76 @@ mod tests {
         let mut messages = Vec::new();
         ControlDecoder::new(ControlPolicy::coordinator())
             .push(&frame(PeerRole::Broker, &response), |message| {
-                messages.push(message)
+                messages.push(message);
             })
             .unwrap();
         assert_eq!(messages, vec![response]);
+    }
+    #[test]
+    fn status_without_readiness_stays_v1_compatible() {
+        // Additive-optional DES2137: old records omit `ready` entirely and must
+        // still decode and validate; None serializes to omission on the wire.
+        let status = ActivationStatus {
+            lifecycle: LifecycleState::Running,
+            live_server: identity(),
+            current: record(),
+            target: None,
+            handoff_id: None,
+            ready: None,
+        };
+        let mut payload = serde_json::to_value(&status).expect("status serializes");
+        assert!(
+            payload.get("ready").is_none(),
+            "absent readiness is omitted, never null"
+        );
+        payload
+            .as_object_mut()
+            .expect("status is an object")
+            .remove("target");
+        let decoded: ActivationStatus =
+            serde_json::from_value(payload).expect("v1-shaped status decodes");
+        assert_eq!(decoded.ready, None);
+        decoded.validate().expect("v1-shaped status validates");
+    }
+
+    #[test]
+    fn readiness_member_ids_omitted_decode_as_unknown() {
+        // member_ids is additive-optional: omitted or null decodes as unknown (None),
+        // which is never ready. Present (even empty for a legitimate zero-client
+        // unit) is authoritative for its round. A writer always emits the key.
+        let payload = serde_json::json!({
+            "registered_clients": ["c1"],
+            "member_clients": 1,
+        });
+        let decoded: TargetReadiness =
+            serde_json::from_value(payload).expect("member_ids omission decodes");
+        assert_eq!(decoded.member_ids, None);
+        validate_readiness(&decoded).expect("omitted member set validates");
+
+        let payload = serde_json::json!({
+            "registered_clients": [],
+            "member_clients": 0,
+            "member_ids": [],
+        });
+        let decoded: TargetReadiness =
+            serde_json::from_value(payload).expect("empty member set decodes");
+        assert_eq!(decoded.member_ids, Some(Vec::new()));
+        validate_readiness(&decoded).expect("authoritative empty set validates");
+
+        let payload = serde_json::json!({
+            "registered_clients": ["c1"],
+            "member_clients": 1,
+            "member_ids": ["c1"],
+        });
+        let decoded: TargetReadiness = serde_json::from_value(payload).expect("member set decodes");
+        assert_eq!(decoded.member_ids, Some(vec!["c1".to_owned()]));
+        validate_readiness(&decoded).expect("covered member set validates");
+
+        let duplicate = TargetReadiness {
+            registered_clients: vec!["c1".to_owned(), "c1".to_owned()],
+            member_clients: 1,
+            member_ids: Some(vec!["c1".to_owned()]),
+        };
+        assert!(validate_readiness(&duplicate).is_err());
     }
 }

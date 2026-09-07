@@ -859,9 +859,28 @@ mod tests {
         ) -> Result<(), muxe_adapter_api::AdapterError> {
             Ok(())
         }
+        async fn register_pending_pane(
+            &self,
+            registration: muxe_adapter_api::PendingPaneRegistration,
+        ) -> Result<muxe_adapter_api::PendingPaneLease, muxe_adapter_api::AdapterError> {
+            Ok(muxe_adapter_api::PendingPaneLease {
+                id: muxe_adapter_api::PendingPaneLeaseId::new(format!(
+                    "gate:{}",
+                    registration.ui_session
+                )),
+                ui_session: registration.ui_session,
+            })
+        }
         async fn close_pending_pane(
             &self,
             _registration: muxe_adapter_api::PendingPaneRegistration,
+            _lease: muxe_adapter_api::PendingPaneLease,
+        ) -> Result<(), muxe_adapter_api::AdapterError> {
+            Ok(())
+        }
+        async fn release_pending_pane(
+            &self,
+            _lease: muxe_adapter_api::PendingPaneLease,
         ) -> Result<(), muxe_adapter_api::AdapterError> {
             Ok(())
         }

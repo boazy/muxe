@@ -4,25 +4,30 @@
 
 mod input;
 mod layout;
+mod runner;
 mod runtime;
 mod snapshot;
 mod template;
 mod terminal;
 mod widget;
 
-pub use input::{convert_input, ConvertedInput, ConvertedKeyEvent};
+pub use input::{ConvertedInput, ConvertedKeyEvent, convert_input};
 pub use layout::{
-    arrange_cells, ellipsize, sanitize_single_line, Cell, GridColumn, GridPage, GridPlan, GridRect,
-    GridSlot,
+    Cell, GridColumn, GridPage, GridPlan, GridRect, GridSlot, arrange_cells, ellipsize,
+    sanitize_single_line,
 };
-pub use runtime::{PreparedMenu, UiCommand, UiError, UiRuntime};
+pub use runner::{
+    DEFAULT_KITTY_NEGOTIATION_TIMEOUT, DETACH_CLEANUP_TIMEOUT, UiControl, UiExit, UiRunError,
+    UiSession, run_attached,
+};
+pub use runtime::{InvocationDisposition, PreparedMenu, UiCommand, UiError, UiRuntime};
 pub use snapshot::{ArchivedUiSnapshot, SnapshotError};
 pub use template::{
-    escape_markup_text, BreadcrumbTemplate, CellTemplate, PaginationTemplate, RenderedSpan,
-    RenderedText, StatusTemplate, TemplateError, TemplateRenderer,
+    BreadcrumbTemplate, CellTemplate, PaginationTemplate, RenderedSpan, RenderedText,
+    StatusTemplate, TemplateError, TemplateRenderer, escape_markup_text,
 };
 pub use terminal::{
-    kitty_flags, InputDriver, KittyNegotiation, KittyNegotiationError, NegotiationUpdate,
-    SurfaceFrame, SurfacePadding, TerminalSurface,
+    InputDriver, KittyNegotiation, KittyNegotiationError, NegotiationUpdate, SurfaceFrame,
+    SurfacePadding, TerminalSurface, kitty_flags,
 };
 pub use widget::{MenuGrid, MenuStatus};

@@ -1617,7 +1617,6 @@ mod tests {
     fn install(inputs: InstallInputs<'_>) -> Result<InstallOutcome, IntegrationError> {
         let verification = compatibility::NativeAssetVerification {
             packaged_digest: fsutil::sha256_hex(inputs.packaged_wasm),
-            registration: compatibility::BridgeRegistrationDigest::current(),
         };
         install_verified(&inputs, verification)
     }

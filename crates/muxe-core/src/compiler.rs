@@ -75,7 +75,10 @@ inject:
           conditions: { include: "pages.count > 1", enable: "pages.current < pages.count" }
 "#;
 
-#[expect(clippy::too_many_lines, reason = "single compiler pass over one config generation; splitting would scatter phase order")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single compiler pass over one config generation; splitting would scatter phase order"
+)]
 pub(crate) fn compile_effective(
     input: CompileInput,
     action_validator: Option<&dyn ActionValidator>,
@@ -374,7 +377,10 @@ enum SettingsScope {
     Binding,
 }
 
-#[expect(clippy::too_many_lines, reason = "one settings scope resolved in a single match; splitting would duplicate the scope table")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one settings scope resolved in a single match; splitting would duplicate the scope table"
+)]
 fn compile_settings(
     value: Option<&ConfigValue>,
     mut base: EffectiveSettings,
@@ -814,7 +820,10 @@ struct MenuCompiler<'a> {
 }
 
 impl MenuCompiler<'_> {
-    #[expect(clippy::too_many_lines, reason = "one menu field compiled in order; splitting would scatter diagnostics attribution")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one menu field compiled in order; splitting would scatter diagnostics attribution"
+    )]
     fn compile_menu(&mut self, field: &ConfigField) -> Option<CompiledMenu> {
         let mapping = match mapping_fields(&field.value, "a menu must be a mapping") {
             Ok(mapping) => mapping,
@@ -1506,7 +1515,7 @@ fn compact_action_fields(
                 return Err(vec![ConfigDiagnostic::error(
                     DiagnosticCode::InvalidActionArguments,
                     "named action argument requires a field name before `=`",
-                    span.clone(),
+                    span,
                 )]);
             }
             named = true;
@@ -1519,14 +1528,14 @@ fn compact_action_fields(
                 return Err(vec![ConfigDiagnostic::error(
                     DiagnosticCode::InvalidActionArguments,
                     "positional action arguments must precede named arguments",
-                    span.clone(),
+                    span,
                 )]);
             }
             let Some(name) = positional.get(position) else {
                 return Err(vec![ConfigDiagnostic::error(
                     DiagnosticCode::InvalidActionArguments,
                     "too many positional action arguments",
-                    span.clone(),
+                    span,
                 )]);
             };
             position += 1;
@@ -1539,7 +1548,7 @@ fn compact_action_fields(
             return Err(vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidActionArguments,
                 format!("duplicate action argument `{name}`"),
-                span.clone(),
+                span,
             )]);
         }
         fields.push(ConfigField {
@@ -2138,12 +2147,12 @@ fn action_bool_scalar(
         ConfigValueKind::Context(_) => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::ContextTypeMismatch,
             format!("{parameter} has no boolean context reference in v1"),
-            scalar.value.span.clone(),
+            scalar.value.span,
         )]),
         _ => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
             format!("{parameter} must be boolean"),
-            scalar.value.span.clone(),
+            scalar.value.span,
         )]),
     }
 }

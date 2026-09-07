@@ -69,16 +69,16 @@ pub enum ControlError {
 /// need uniqueness (duplicates are rejected), not secrecy.
 fn new_request_id(counter: &AtomicU64) -> ControlRequestId {
     let mut bytes = [0u8; 16];
-    if let Ok(mut entropy) = File::open("/dev/urandom") {
-        if entropy.read_exact(&mut bytes).is_ok() && bytes != [0; 16] {
-            return ControlRequestId(bytes);
-        }
+    if let Ok(mut entropy) = File::open("/dev/urandom")
+        && entropy.read_exact(&mut bytes).is_ok()
+        && bytes != [0; 16]
+    {
+        return ControlRequestId(bytes);
     }
     let count = counter.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_nanos());
     bytes[..8].copy_from_slice(&nanos.to_be_bytes()[..8]);
     bytes[8..12].copy_from_slice(&std::process::id().to_be_bytes());
     bytes[12..].copy_from_slice(&count.to_be_bytes()[..4]);
@@ -89,6 +89,10 @@ fn new_request_id(counter: &AtomicU64) -> ControlRequestId {
 }
 
 /// Decodes a 32-hex-character handoff ID from journal form.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Rejected`] when `hex` is not 32 hexadecimal characters.
 pub fn handoff_from_hex(hex: &str) -> Result<HandoffId, ControlError> {
     if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ControlError::Rejected {
@@ -116,6 +120,10 @@ pub struct ControlClient {
 
 impl ControlClient {
     /// Connects to a broker control socket and sends the coordinator prelude.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::Connect`] when the socket cannot be reached, or [`ControlError::Io`] when the prelude write fails.
     pub async fn connect(socket: &Path) -> Result<Self, ControlError> {
         let mut stream =
             UnixStream::connect(socket)
@@ -135,6 +143,10 @@ impl ControlClient {
     }
 
     /// Sends `status` and returns the broker's activation status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError`] when the broker reports an error, closes, mismatches the request, or the operation times out.
     pub async fn status(&mut self) -> Result<ActivationStatus, ControlError> {
         match self.round_trip(ControlOperation::Status).await? {
             ControlResult::Status(status) => Ok(status),
@@ -143,12 +155,18 @@ impl ControlClient {
     }
 
     /// Sends `prepare` with the target compatibility record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError`] when the broker reports an error, closes, mismatches the request, or the operation times out.
     pub async fn prepare(
         &mut self,
         target: CompatibilityRecord,
     ) -> Result<ActivationStatus, ControlError> {
         match self
-            .round_trip(ControlOperation::Prepare { target })
+            .round_trip(ControlOperation::Prepare {
+                target: Box::new(target),
+            })
             .await?
         {
             ControlResult::Prepared(status) => Ok(status),
@@ -157,6 +175,10 @@ impl ControlClient {
     }
 
     /// Sends `commit` for a handoff ID from the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError`] when the broker reports an error, closes, mismatches the request, or the operation times out.
     pub async fn commit(
         &mut self,
         handoff_id: HandoffId,
@@ -171,6 +193,10 @@ impl ControlClient {
     }
 
     /// Sends `abort` for a handoff ID from the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError`] when the broker reports an error, closes, mismatches the request, or the operation times out.
     pub async fn abort(&mut self, handoff_id: HandoffId) -> Result<ActivationStatus, ControlError> {
         match self
             .round_trip(ControlOperation::Abort { handoff_id })
@@ -182,6 +208,10 @@ impl ControlClient {
     }
 
     /// Sends `retire` to drain a broker without a replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError`] when the broker reports an error, closes, mismatches the request, or the operation times out.
     pub async fn retire(&mut self) -> Result<ActivationStatus, ControlError> {
         match self.round_trip(ControlOperation::Retire).await? {
             ControlResult::Retired(status) => Ok(status),
@@ -206,10 +236,11 @@ impl ControlClient {
                 diagnostic: "control request exceeds frame cap".to_owned(),
             });
         }
+        let len = u32::try_from(payload.len()).map_err(|_| ControlError::Rejected {
+            diagnostic: "control request exceeds frame cap".to_owned(),
+        })?;
         timeout(OPERATION_TIMEOUT, async {
-            self.stream
-                .write_all(&(payload.len() as u32).to_be_bytes())
-                .await?;
+            self.stream.write_all(&len.to_be_bytes()).await?;
             self.stream.write_all(&payload).await?;
             self.stream.flush().await?;
             loop {
@@ -325,10 +356,8 @@ mod tests {
             result,
         });
         let payload = serde_json::to_vec(&response).unwrap();
-        stream
-            .write_all(&(payload.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
+        let len = u32::try_from(payload.len()).unwrap();
+        stream.write_all(&len.to_be_bytes()).await.unwrap();
         stream.write_all(&payload).await.unwrap();
         stream.flush().await.unwrap();
         // Hold the connection briefly so the client reads before close.

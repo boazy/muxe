@@ -29,7 +29,18 @@ pub struct RecordedExchange {
 #[derive(Clone, Debug)]
 pub enum RecordedResponse {
     Result(Value),
-    Error { code: i64, message: String },
+    #[expect(
+        dead_code,
+        reason = "scripted error and close responses cover Herdr failure paths the current transport tests have not scripted yet"
+    )]
+    Error {
+        code: i64,
+        message: String,
+    },
+    #[expect(
+        dead_code,
+        reason = "scripted error and close responses cover Herdr failure paths the current transport tests have not scripted yet"
+    )]
     Close,
     KeepOpen(Value),
 }
@@ -49,13 +60,13 @@ pub struct RecordedUnixServer {
 }
 
 impl RecordedUnixServer {
-    pub async fn start(temp: TempDir, exchanges: Vec<RecordedExchange>) -> io::Result<Self> {
-        Self::start_inner(temp, exchanges, false).await
+    pub fn start(temp: TempDir, exchanges: Vec<RecordedExchange>) -> io::Result<Self> {
+        Self::start_inner(temp, exchanges, false)
     }
 
     /// Starts a recording server whose first request is followed by the raw connection made by
     /// `HerdrRuntime::probe_endpoint`. That probe deliberately sends no JSON-RPC request.
-    pub async fn start_with_endpoint_probe(
+    pub fn start_with_endpoint_probe(
         temp: TempDir,
         exchanges: Vec<RecordedExchange>,
     ) -> io::Result<Self> {
@@ -65,10 +76,10 @@ impl RecordedUnixServer {
                 "an endpoint-probe recording needs at least the ping exchange",
             ));
         }
-        Self::start_inner(temp, exchanges, true).await
+        Self::start_inner(temp, exchanges, true)
     }
 
-    async fn start_inner(
+    fn start_inner(
         temp: TempDir,
         exchanges: Vec<RecordedExchange>,
         expect_endpoint_probe: bool,

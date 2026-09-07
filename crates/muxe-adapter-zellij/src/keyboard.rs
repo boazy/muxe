@@ -45,9 +45,6 @@ pub enum KeyboardError {
         /// Why it cannot map.
         reason: &'static str,
     },
-    /// A context marker survived to concrete mapping time.
-    #[error("unresolved context reference in keyboard key")]
-    UnresolvedContext,
 }
 
 /// A mapped key: pinned identity plus the exact bytes written to the pane.
@@ -259,10 +256,10 @@ fn csi_modified_sequence(sequence: &[u8], code: u8) -> Option<Vec<u8>> {
     let (params, final_byte) = rest.split_at(split);
     let mut modified = vec![0x1b, b'['];
     modified.extend_from_slice(params);
-    if !params.is_empty() {
-        modified.push(b';');
-    } else {
+    if params.is_empty() {
         modified.extend_from_slice(b"1;");
+    } else {
+        modified.push(b';');
     }
     modified.extend_from_slice(code.to_string().as_bytes());
     modified.extend_from_slice(final_byte);

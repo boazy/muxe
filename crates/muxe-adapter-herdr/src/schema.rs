@@ -101,6 +101,12 @@ impl fmt::Display for ValidationCode {
 }
 
 impl ApiSchema {
+    /// Parses one raw schema document into a validated request-surface schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ValidationError` when the document lacks its protocol metadata
+    /// or its request surface is malformed.
     pub fn parse(raw: Value) -> Result<Self, ValidationError> {
         let request = raw
             .pointer("/schemas/request")
@@ -112,10 +118,7 @@ impl ApiSchema {
     /// Parses a live schema document while taking its cache-verified normalized request
     /// representation as the authoritative request surface. `$ref` resolution still consults
     /// the exact live raw document retained by the schema.
-    pub(crate) fn parse_with_request(
-        raw: Value,
-        request: &Value,
-    ) -> Result<Self, ValidationError> {
+    pub(crate) fn parse_with_request(raw: Value, request: &Value) -> Result<Self, ValidationError> {
         let (protocol, schema_version) = Self::metadata(&raw)?;
         let branches = request
             .get("oneOf")
@@ -179,18 +182,22 @@ impl ApiSchema {
         Ok((protocol, schema_version))
     }
 
+    #[must_use]
     pub fn protocol(&self) -> u64 {
         self.protocol
     }
 
+    #[must_use]
     pub fn schema_version(&self) -> u64 {
         self.schema_version
     }
 
+    #[must_use]
     pub fn canonical_request_sha256(&self) -> &str {
         &self.canonical_request_sha256
     }
 
+    #[must_use]
     pub fn method(&self, name: &str) -> Option<&MethodSchema> {
         self.methods
             .get(name)
@@ -204,6 +211,13 @@ impl ApiSchema {
         self.methods.values().flatten()
     }
 
+    /// Validates one method's params against the live request surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ValidationError` when the method is undeclared, its schema
+    /// branch is ambiguous, its reference cannot be resolved, or the params
+    /// violate the schema.
     pub fn validate_method(&self, method: &str, params: &Value) -> Result<(), ValidationError> {
         let method_schemas = self.methods.get(method).ok_or_else(|| ValidationError {
             code: ValidationCode::MissingMethod,
@@ -211,14 +225,11 @@ impl ApiSchema {
             schema_path: "#/schemas/request".to_owned(),
             detail: format!("Herdr method {method:?} is not declared by this schema"),
         })?;
-        let method_schema = match method_schemas.as_slice() {
-            [method_schema] => method_schema,
-            _ => {
-                return Err(malformed(
-                    "#/schemas/request",
-                    format!("Herdr method {method:?} has multiple request schema branches"),
-                ));
-            }
+        let [method_schema] = method_schemas.as_slice() else {
+            return Err(malformed(
+                "#/schemas/request",
+                format!("Herdr method {method:?} has multiple request schema branches"),
+            ));
         };
         let (root, schema_path) = match &method_schema.params {
             ParameterSchema::Reference(reference) => {
@@ -232,6 +243,13 @@ impl ApiSchema {
         self.validate(root, params, "#", schema_path, 0)
     }
 
+    /// Returns the cache-verified normalized request representation retained at construction.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when the schema was constructed without its request surface,
+    /// which the constructors guarantee is present.
+    #[must_use]
     pub fn canonical_request_schema(&self) -> Value {
         self.raw
             .pointer("/schemas/request")
@@ -258,7 +276,7 @@ impl ApiSchema {
         let object = schema
             .as_object()
             .ok_or_else(|| malformed(schema_path, "schema node must be an object"))?;
-        self.reject_unknown_keywords(object, instance_path, schema_path)?;
+        Self::reject_unknown_keywords(object, instance_path, schema_path)?;
 
         if let Some(reference) = string_keyword(object, "$ref", schema_path)? {
             let resolved = self.resolve_reference(reference, schema_path)?;
@@ -272,15 +290,15 @@ impl ApiSchema {
                 reference_depth + 1,
             );
         }
-        if let Some(constant) = object.get("const") {
-            if value != constant {
-                return Err(error(
-                    ValidationCode::Const,
-                    instance_path,
-                    schema_path,
-                    "value does not equal schema const",
-                ));
-            }
+        if let Some(constant) = object.get("const")
+            && value != constant
+        {
+            return Err(error(
+                ValidationCode::Const,
+                instance_path,
+                schema_path,
+                "value does not equal schema const",
+            ));
         }
         if let Some(values) = object.get("enum") {
             let values = values
@@ -296,12 +314,12 @@ impl ApiSchema {
             }
         }
         if let Some(types) = object.get("type") {
-            self.validate_type(types, value, instance_path, schema_path)?;
+            Self::validate_type(types, value, instance_path, schema_path)?;
         }
         if let Some(format) = string_keyword(object, "format", schema_path)? {
-            self.validate_format(format, value, instance_path, schema_path)?;
+            Self::validate_format(format, value, instance_path, schema_path)?;
         }
-        self.validate_number_constraints(object, value, instance_path, schema_path)?;
+        Self::validate_number_constraints(object, value, instance_path, schema_path)?;
         self.validate_string_constraints(object, value, instance_path, schema_path)?;
         self.validate_array_constraints(
             object,
@@ -321,7 +339,6 @@ impl ApiSchema {
     }
 
     fn reject_unknown_keywords(
-        &self,
         schema: &Map<String, Value>,
         instance_path: &str,
         schema_path: &str,
@@ -370,7 +387,6 @@ impl ApiSchema {
     }
 
     fn validate_type(
-        &self,
         types: &Value,
         value: &Value,
         instance_path: &str,
@@ -404,7 +420,6 @@ impl ApiSchema {
     }
 
     fn validate_format(
-        &self,
         format: &str,
         value: &Value,
         instance_path: &str,
@@ -415,9 +430,9 @@ impl ApiSchema {
                 .as_number()
                 .is_none_or(|number| number.as_f64().is_some()),
             "int32" => value.as_number().is_none_or(|number| {
-                number
-                    .as_i64()
-                    .is_some_and(|number| (i32::MIN as i64..=i32::MAX as i64).contains(&number))
+                number.as_i64().is_some_and(|number| {
+                    (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&number)
+                })
             }),
             "uint" | "uint64" => value
                 .as_number()
@@ -454,7 +469,6 @@ impl ApiSchema {
     }
 
     fn validate_number_constraints(
-        &self,
         schema: &Map<String, Value>,
         value: &Value,
         instance_path: &str,
@@ -463,25 +477,25 @@ impl ApiSchema {
         let Some(number) = value.as_number() else {
             return Ok(());
         };
-        if let Some(minimum) = number_keyword(schema, "minimum", schema_path)? {
-            if compare_json_numbers(number, minimum, schema_path)? == Ordering::Less {
-                return Err(error(
-                    ValidationCode::Minimum,
-                    instance_path,
-                    schema_path,
-                    format!("number must be at least {minimum}"),
-                ));
-            }
+        if let Some(minimum) = number_keyword(schema, "minimum", schema_path)?
+            && compare_json_numbers(number, minimum, schema_path)? == Ordering::Less
+        {
+            return Err(error(
+                ValidationCode::Minimum,
+                instance_path,
+                schema_path,
+                format!("number must be at least {minimum}"),
+            ));
         }
-        if let Some(maximum) = number_keyword(schema, "maximum", schema_path)? {
-            if compare_json_numbers(number, maximum, schema_path)? == Ordering::Greater {
-                return Err(error(
-                    ValidationCode::Maximum,
-                    instance_path,
-                    schema_path,
-                    format!("number must be at most {maximum}"),
-                ));
-            }
+        if let Some(maximum) = number_keyword(schema, "maximum", schema_path)?
+            && compare_json_numbers(number, maximum, schema_path)? == Ordering::Greater
+        {
+            return Err(error(
+                ValidationCode::Maximum,
+                instance_path,
+                schema_path,
+                format!("number must be at most {maximum}"),
+            ));
         }
         Ok(())
     }
@@ -497,25 +511,25 @@ impl ApiSchema {
             return Ok(());
         };
         let length = string.chars().count();
-        if let Some(minimum) = usize_keyword(schema, "minLength", schema_path)? {
-            if length < minimum {
-                return Err(error(
-                    ValidationCode::MinLength,
-                    instance_path,
-                    schema_path,
-                    format!("string must contain at least {minimum} Unicode scalar values"),
-                ));
-            }
+        if let Some(minimum) = usize_keyword(schema, "minLength", schema_path)?
+            && length < minimum
+        {
+            return Err(error(
+                ValidationCode::MinLength,
+                instance_path,
+                schema_path,
+                format!("string must contain at least {minimum} Unicode scalar values"),
+            ));
         }
-        if let Some(maximum) = usize_keyword(schema, "maxLength", schema_path)? {
-            if length > maximum {
-                return Err(error(
-                    ValidationCode::MaxLength,
-                    instance_path,
-                    schema_path,
-                    format!("string must contain at most {maximum} Unicode scalar values"),
-                ));
-            }
+        if let Some(maximum) = usize_keyword(schema, "maxLength", schema_path)?
+            && length > maximum
+        {
+            return Err(error(
+                ValidationCode::MaxLength,
+                instance_path,
+                schema_path,
+                format!("string must contain at most {maximum} Unicode scalar values"),
+            ));
         }
         if let Some(pattern) = string_keyword(schema, "pattern", schema_path)? {
             let expression = self.compile_pattern(pattern, instance_path, schema_path)?;
@@ -569,25 +583,25 @@ impl ApiSchema {
         let Some(values) = value.as_array() else {
             return Ok(());
         };
-        if let Some(minimum) = usize_keyword(schema, "minItems", schema_path)? {
-            if values.len() < minimum {
-                return Err(error(
-                    ValidationCode::MinItems,
-                    instance_path,
-                    schema_path,
-                    format!("array must contain at least {minimum} items"),
-                ));
-            }
+        if let Some(minimum) = usize_keyword(schema, "minItems", schema_path)?
+            && values.len() < minimum
+        {
+            return Err(error(
+                ValidationCode::MinItems,
+                instance_path,
+                schema_path,
+                format!("array must contain at least {minimum} items"),
+            ));
         }
-        if let Some(maximum) = usize_keyword(schema, "maxItems", schema_path)? {
-            if values.len() > maximum {
-                return Err(error(
-                    ValidationCode::MaxItems,
-                    instance_path,
-                    schema_path,
-                    format!("array must contain at most {maximum} items"),
-                ));
-            }
+        if let Some(maximum) = usize_keyword(schema, "maxItems", schema_path)?
+            && values.len() > maximum
+        {
+            return Err(error(
+                ValidationCode::MaxItems,
+                instance_path,
+                schema_path,
+                format!("array must contain at most {maximum} items"),
+            ));
         }
         if schema.get("uniqueItems") == Some(&Value::Bool(true)) {
             let mut unique = BTreeSet::new();
@@ -628,25 +642,25 @@ impl ApiSchema {
         let Some(properties) = value.as_object() else {
             return Ok(());
         };
-        if let Some(minimum) = usize_keyword(schema, "minProperties", schema_path)? {
-            if properties.len() < minimum {
-                return Err(error(
-                    ValidationCode::MinProperties,
-                    instance_path,
-                    schema_path,
-                    format!("object must contain at least {minimum} properties"),
-                ));
-            }
+        if let Some(minimum) = usize_keyword(schema, "minProperties", schema_path)?
+            && properties.len() < minimum
+        {
+            return Err(error(
+                ValidationCode::MinProperties,
+                instance_path,
+                schema_path,
+                format!("object must contain at least {minimum} properties"),
+            ));
         }
-        if let Some(maximum) = usize_keyword(schema, "maxProperties", schema_path)? {
-            if properties.len() > maximum {
-                return Err(error(
-                    ValidationCode::MaxProperties,
-                    instance_path,
-                    schema_path,
-                    format!("object must contain at most {maximum} properties"),
-                ));
-            }
+        if let Some(maximum) = usize_keyword(schema, "maxProperties", schema_path)?
+            && properties.len() > maximum
+        {
+            return Err(error(
+                ValidationCode::MaxProperties,
+                instance_path,
+                schema_path,
+                format!("object must contain at most {maximum} properties"),
+            ));
         }
         let declared = schema
             .get("properties")
@@ -665,19 +679,7 @@ impl ApiSchema {
             })
             .transpose()?;
         if let Some(required) = required {
-            for name in required {
-                let name = name
-                    .as_str()
-                    .ok_or_else(|| malformed(schema_path, "required entries must be strings"))?;
-                if !properties.contains_key(name) {
-                    return Err(error(
-                        ValidationCode::Required,
-                        instance_path,
-                        schema_path,
-                        format!("required property {name:?} is missing"),
-                    ));
-                }
-            }
+            Self::check_required(properties, required, instance_path, schema_path)?;
         }
         if let Some(property_names) = schema.get("propertyNames") {
             for name in properties.keys() {
@@ -713,7 +715,7 @@ impl ApiSchema {
                 continue;
             }
             match additional {
-                Some(Value::Bool(false)) => {
+                Some(Value::Bool(false)) | None => {
                     return Err(error(
                         ValidationCode::AdditionalProperty,
                         &instance_child(instance_path, name),
@@ -722,14 +724,6 @@ impl ApiSchema {
                     ));
                 }
                 Some(Value::Bool(true)) => {}
-                None => {
-                    return Err(error(
-                        ValidationCode::AdditionalProperty,
-                        &instance_child(instance_path, name),
-                        schema_path,
-                        format!("property {name:?} is not declared"),
-                    ));
-                }
                 Some(additional_schema) => self.validate(
                     additional_schema,
                     value,
@@ -737,6 +731,28 @@ impl ApiSchema {
                     &schema_child(schema_path, "additionalProperties"),
                     reference_depth,
                 )?,
+            }
+        }
+        Ok(())
+    }
+
+    fn check_required(
+        properties: &Map<String, Value>,
+        required: &[Value],
+        instance_path: &str,
+        schema_path: &str,
+    ) -> Result<(), ValidationError> {
+        for name in required {
+            let name = name
+                .as_str()
+                .ok_or_else(|| malformed(schema_path, "required entries must be strings"))?;
+            if !properties.contains_key(name) {
+                return Err(error(
+                    ValidationCode::Required,
+                    instance_path,
+                    schema_path,
+                    format!("required property {name:?} is missing"),
+                ));
             }
         }
         Ok(())
@@ -759,7 +775,7 @@ impl ApiSchema {
             };
             let alternatives = alternatives
                 .as_array()
-                .ok_or_else(|| malformed(schema_path, &format!("{keyword} must be an array")))?;
+                .ok_or_else(|| malformed(schema_path, format!("{keyword} must be an array")))?;
             let mut matching = 0;
             for (index, alternative) in alternatives.iter().enumerate() {
                 let alternative_path =
@@ -843,10 +859,10 @@ impl ApiSchema {
                 return Ok(false);
             }
         }
-        if let Some(constant) = object.get("const") {
-            if value != constant {
-                return Ok(false);
-            }
+        if let Some(constant) = object.get("const")
+            && value != constant
+        {
+            return Ok(false);
         }
         if let Some(values) = object.get("enum") {
             let values = values
@@ -925,7 +941,7 @@ fn string_keyword<'a>(
         .map(|value| {
             value
                 .as_str()
-                .ok_or_else(|| malformed(schema_path, &format!("{keyword} must be a string")))
+                .ok_or_else(|| malformed(schema_path, format!("{keyword} must be a string")))
         })
         .transpose()
 }
@@ -940,7 +956,7 @@ fn number_keyword<'a>(
         .map(|value| {
             value
                 .as_number()
-                .ok_or_else(|| malformed(schema_path, &format!("{keyword} must be a number")))
+                .ok_or_else(|| malformed(schema_path, format!("{keyword} must be a number")))
         })
         .transpose()
 }
@@ -983,9 +999,9 @@ impl ExactInteger {
             (Self::Signed(left), Self::Signed(right)) => left.cmp(&right),
             (Self::Unsigned(left), Self::Unsigned(right)) => left.cmp(&right),
             (Self::Signed(left), Self::Unsigned(_)) if left < 0 => Ordering::Less,
-            (Self::Signed(left), Self::Unsigned(right)) => (left as u64).cmp(&right),
+            (Self::Signed(left), Self::Unsigned(right)) => left.cast_unsigned().cmp(&right),
             (Self::Unsigned(_), Self::Signed(right)) if right < 0 => Ordering::Greater,
-            (Self::Unsigned(left), Self::Signed(right)) => left.cmp(&(right as u64)),
+            (Self::Unsigned(left), Self::Signed(right)) => left.cmp(&right.cast_unsigned()),
         }
     }
 }
@@ -1004,7 +1020,7 @@ fn usize_keyword(
                 .ok_or_else(|| {
                     malformed(
                         schema_path,
-                        &format!("{keyword} must be a nonnegative integer"),
+                        format!("{keyword} must be a nonnegative integer"),
                     )
                 })
         })
@@ -1087,7 +1103,7 @@ mod tests {
         ApiSchema::parse(raw).unwrap()
     }
 
-    fn inline_method_schema(params: Value) -> ApiSchema {
+    fn inline_method_schema(params: &Value) -> ApiSchema {
         ApiSchema::parse(serde_json::json!({
             "protocol": 20,
             "schema_version": 1,
@@ -1178,7 +1194,7 @@ mod tests {
 
     #[test]
     fn relevant_unsupported_one_of_branch_fails_closed() {
-        let schema = inline_method_schema(serde_json::json!({
+        let schema = inline_method_schema(&serde_json::json!({
             "oneOf": [
                 {"type": "integer"},
                 {"type": "string", "unevaluatedProperties": false},
@@ -1192,7 +1208,7 @@ mod tests {
 
     #[test]
     fn incompatible_unsupported_one_of_branch_does_not_block_matching_alternative() {
-        let schema = inline_method_schema(serde_json::json!({
+        let schema = inline_method_schema(&serde_json::json!({
             "oneOf": [
                 {"type": "integer"},
                 {"type": "string", "unevaluatedProperties": false},
@@ -1207,7 +1223,7 @@ mod tests {
 
     #[test]
     fn compares_adjacent_large_integers_exactly() {
-        let schema = inline_method_schema(serde_json::json!({
+        let schema = inline_method_schema(&serde_json::json!({
             "type": "integer",
             "minimum": 9_007_199_254_740_993u64,
         }));
@@ -1219,7 +1235,7 @@ mod tests {
 
     #[test]
     fn compiles_a_used_pattern_once_per_schema_lifetime() {
-        let schema = inline_method_schema(serde_json::json!({
+        let schema = inline_method_schema(&serde_json::json!({
             "type": "string",
             "pattern": "^[a-z]+$",
         }));

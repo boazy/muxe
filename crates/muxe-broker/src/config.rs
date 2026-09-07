@@ -26,10 +26,16 @@ pub struct ConfigInputs {
 }
 
 impl ConfigInputs {
-    pub fn for_host(
-        base: impl Into<PathBuf>,
-        host: AdapterHostKind,
-    ) -> Result<Self, ConfigError> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "ConfigError is a public cold-path error API shared with the native binary; boxing diagnostic variants churns consumers for no frame-size gain"
+    )]
+    /// Derives watched input locations for one host kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::AssetDirectory` when the base path has no parent.
+    pub fn for_host(base: impl Into<PathBuf>, host: AdapterHostKind) -> Result<Self, ConfigError> {
         let base = base.into();
         let directory = base
             .parent()
@@ -48,7 +54,10 @@ impl ConfigInputs {
 
     fn base_only(base: impl Into<PathBuf>) -> Self {
         let base = base.into();
-        let directory = base.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let directory = base
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         Self {
             base,
             host_override: None,
@@ -56,27 +65,32 @@ impl ConfigInputs {
         }
     }
 
+    #[must_use]
     pub fn base(&self) -> &Path {
         &self.base
     }
 
     /// The selected host's optional override location. It may be absent on disk; a reload checks
     /// the path again so creating or removing it is atomic with the next candidate compilation.
+    #[must_use]
     pub fn host_override(&self) -> Option<&Path> {
         self.host_override.as_deref()
     }
 
+    #[must_use]
     pub fn watch_root(&self) -> &Path {
         &self.directory
     }
 
     /// Returns whether a recursively watched path can affect this generation.
+    #[must_use]
     pub fn tracks_change(&self, changed: &Path) -> bool {
         changed == self.base
             || self.host_override.as_deref() == Some(changed)
-            || ["themes", "color-schemes"].iter().map(|name| self.directory.join(name)).any(
-                |directory| changed == directory || changed.starts_with(directory),
-            )
+            || ["themes", "color-schemes"]
+                .iter()
+                .map(|name| self.directory.join(name))
+                .any(|directory| changed == directory || changed.starts_with(directory))
     }
 }
 
@@ -98,6 +112,12 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
+    /// Loads and host-validates the initial configuration snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError` when inputs cannot be derived, files are unreadable,
+    /// or compilation against the host adapter fails.
     pub async fn load(
         path: impl Into<PathBuf>,
         adapter: &dyn HostAdapter,
@@ -107,6 +127,11 @@ impl ConfigStore {
         Self::load_inputs(inputs, adapter).await
     }
 
+    /// Compiles inputs into the initial snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError` when reading, parsing, or host-validating fails.
     pub async fn load_inputs(
         inputs: ConfigInputs,
         adapter: &dyn HostAdapter,
@@ -149,6 +174,11 @@ impl ConfigStore {
 
     /// Compiles the next generation completely before replacing the active immutable snapshot.
     /// Existing UI sessions retain their own Arc and therefore cannot observe a partial reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError` when the next generation fails to compile; the active
+    /// snapshot is untouched.
     pub async fn reload(
         &self,
         adapter: &dyn HostAdapter,
@@ -218,7 +248,7 @@ async fn compile_inputs(
                 generation,
                 base,
                 host_override,
-                key_capabilities: key_capabilities(capabilities),
+                key_capabilities: key_capabilities(&capabilities),
                 theme_assets,
             },
             Some(&validator),
@@ -226,6 +256,15 @@ async fn compile_inputs(
         .map_err(ConfigError::Diagnostics)
 }
 
+/// Reads an optional document, treating absence as empty.
+///
+/// # Errors
+///
+/// Returns `ConfigError` when reading or parsing fails for a present file.
+#[expect(
+    clippy::result_large_err,
+    reason = "ConfigError is a public cold-path error API shared with the native binary; boxing diagnostic variants churns consumers for no frame-size gain"
+)]
 fn read_optional_document(path: &Path) -> Result<Option<ConfigDocument>, ConfigError> {
     let yaml = match fs::read_to_string(path) {
         Ok(yaml) => yaml,
@@ -242,6 +281,10 @@ fn read_optional_document(path: &Path) -> Result<Option<ConfigDocument>, ConfigE
         .map_err(ConfigError::Diagnostic)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ConfigError is a public cold-path error API shared with the native binary; boxing diagnostic variants churns consumers for no frame-size gain"
+)]
 fn load_theme_assets(config_path: &Path) -> Result<ThemeAssets, ConfigError> {
     let config_dir = config_path
         .parent()
@@ -252,6 +295,10 @@ fn load_theme_assets(config_path: &Path) -> Result<ThemeAssets, ConfigError> {
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ConfigError is a public cold-path error API shared with the native binary; boxing diagnostic variants churns consumers for no frame-size gain"
+)]
 fn load_asset_catalog(directory: &Path) -> Result<BTreeMap<String, ConfigDocument>, ConfigError> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -297,7 +344,7 @@ fn load_asset_catalog(directory: &Path) -> Result<BTreeMap<String, ConfigDocumen
     Ok(documents)
 }
 
-fn key_capabilities(capabilities: AdapterCapabilities) -> KeyCapabilities {
+fn key_capabilities(capabilities: &AdapterCapabilities) -> KeyCapabilities {
     KeyCapabilities {
         event_types: capabilities.keyboard.kitty_event_types,
         alternate_keys: capabilities.keyboard.kitty_alternate_keys,
@@ -416,9 +463,30 @@ mod tests {
             Ok(())
         }
 
+        async fn register_pending_pane(
+            &self,
+            registration: PendingPaneRegistration,
+        ) -> Result<muxe_adapter_api::PendingPaneLease, AdapterError> {
+            Ok(muxe_adapter_api::PendingPaneLease {
+                id: muxe_adapter_api::PendingPaneLeaseId::new(format!(
+                    "reload:{}",
+                    registration.ui_session
+                )),
+                ui_session: registration.ui_session,
+            })
+        }
+
         async fn close_pending_pane(
             &self,
             _registration: PendingPaneRegistration,
+            _lease: muxe_adapter_api::PendingPaneLease,
+        ) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn release_pending_pane(
+            &self,
+            _lease: muxe_adapter_api::PendingPaneLease,
         ) -> Result<(), AdapterError> {
             Ok(())
         }
@@ -497,7 +565,10 @@ mod tests {
         .unwrap();
         let adapter = Arc::new(ReloadAdapter::new());
         let store = Arc::new(ConfigStore::load(&path, adapter.as_ref()).await.unwrap());
-        assert_eq!(store.snapshot().await.config.generation, CompiledGeneration(1));
+        assert_eq!(
+            store.snapshot().await.config.generation,
+            CompiledGeneration(1)
+        );
 
         adapter.pause_capabilities.store(true, Ordering::Release);
         let reloading_store = Arc::clone(&store);
@@ -513,14 +584,19 @@ mod tests {
 
         adapter.capabilities_release.notify_one();
         assert_eq!(reload.await.unwrap().unwrap(), CompiledGeneration(2));
-        assert_eq!(store.snapshot().await.config.generation, CompiledGeneration(2));
+        assert_eq!(
+            store.snapshot().await.config.generation,
+            CompiledGeneration(2)
+        );
 
         fs::write(&path, "version: [").unwrap();
         assert!(store.reload(adapter.as_ref()).await.is_err());
-        assert_eq!(store.snapshot().await.config.generation, CompiledGeneration(2));
+        assert_eq!(
+            store.snapshot().await.config.generation,
+            CompiledGeneration(2)
+        );
     }
 }
-
 
 struct AdapterValidator<'a>(&'a dyn HostAdapter);
 

@@ -8,16 +8,19 @@ name: release
 #   LICENSE
 #
 # Gate order is load-bearing: wasm producer -> per-arch assets -> verify
-# (checksums, byte-identity, layout, attestations) -> live gates ->
-# publish. Nothing becomes public before every required gate passes.
-# In particular there is no first-release waiver: with no predecessor
-# artifact the live upgrade gate fails naming the missing predecessor.
+# (checksums, byte-identity, layout, attestations) -> current target-only
+# live gates -> publish. Nothing becomes public before every required gate
+# passes. The cross-release upgrade/rollback/fault matrix is explicitly
+# deferred until the implementation is complete and a genuine predecessor
+# release is available; see TODO-CROSS-RELEASE.md.
 #
-# Toolchain rule: the Rust pin lives only in mise.toml. Workflows install it
-# with jdx/mise-action and assert `cargo --version` against
-# `mise current rust`; no workflow repeats the version literal, and no
-# rust-toolchain action is used. Every `run` block sets pipefail so a
-# failing producer can never hide behind a pipe.
+# Producer identity flow (no sidecar trust, no hardcoded values): the wasm job
+# records both the SHA-256 of the bytes it built and the generated shared
+# bridge-build-ID witness from that exact producer build. Each asset job
+# re-verifies the bytes, exports both identities, and runs its native
+# compatibility CLI. Verify aggregates all four reports and requires every
+# native bridge ID to equal the single WASM build witness; byte SHA checks
+# remain a separate assertion.
 #
 # Linux archives target musl for static distribution. If either Linux
 # architecture cannot pass the static-linkage gate below, the release is
@@ -70,6 +73,17 @@ jobs:
           set -euo pipefail
           mise trust
           mise run wasm-build
+      - name: stage bridge build identity witness
+        # This witness is emitted from the exact shared-protocol build used by
+        # the producer WASM, not inferred from native archives or WASM bytes.
+        run: |
+          set -euo pipefail
+          id_files=(target/wasm32-wasip1/release/build/muxe-zellij-protocol-*/out/bridge_build_id.rs)
+          test "${#id_files[@]}" -eq 1
+          bridge_build_id="$(sed -n 's/^pub const BRIDGE_BUILD_ID_HEX: &str = "\([0-9a-f]\{64\}\)";$/\1/p' "${id_files[0]}")"
+          test "${#bridge_build_id}" -eq 64
+          test "$bridge_build_id" != "$(printf '%064d' 0)"
+          printf '%s\n' "$bridge_build_id" > dist-wasm/muxe-zellij.build-id
       - name: stage digest
         # The manifest names the bare basename so every consumer checks it
           # inside one known directory, never by searching the workspace.
@@ -160,10 +174,33 @@ jobs:
           }
           test -f bridge-stage/muxe-zellij.wasm
           test -f bridge-stage/muxe-zellij.sha256
+          test -f bridge-stage/muxe-zellij.build-id
+          bridge_build_id="$(cat bridge-stage/muxe-zellij.build-id)"
+          test "${#bridge_build_id}" -eq 64
+          case "$bridge_build_id" in
+            ""|*[!0-9a-f]*) echo "release failure: malformed bridge build ID witness"; exit 1 ;;
+          esac
+          test "$bridge_build_id" != "$(printf '%064d' 0)"
+          echo "BRIDGE_BUILD_ID=$bridge_build_id" >> "$GITHUB_ENV"
           file bridge-stage/muxe-zellij.wasm | tee bridge-file.out
           grep -Fi "WebAssembly" bridge-file.out
           manifest_check muxe-zellij.sha256 bridge-stage
           echo "WASM_PATH=bridge-stage/muxe-zellij.wasm" >> "$GITHUB_ENV"
+      - name: producer digest to build env
+        # The digest below comes from the verified producer manifest, never
+        # from a repo sidecar: it is the SHA-256 of the staged bytes checked
+        # two steps above. The native build (core-owned build.rs) consumes
+        # MUXE_WASM_SHA256 and bakes it into the compatibility record; release
+        # builds fail closed without it. All four archives embed the same
+        # producer bytes.
+        run: |
+          set -euo pipefail
+          expected="$(cut -d' ' -f1 bridge-stage/muxe-zellij.sha256)"
+          test "${#expected}" -eq 64 || { echo "release failure: malformed producer digest"; exit 1; }
+          case "$expected" in
+            *[!0-9a-f]*) echo "release failure: producer digest is not lowercase hex"; exit 1 ;;
+          esac
+          echo "MUXE_WASM_SHA256=$expected" >> "$GITHUB_ENV"
       - name: musl toolchain (linux only)
         if: matrix.static
         run: |
@@ -223,6 +260,12 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           test "$("$bin" --version | cut -d' ' -f2)" = "$version"
           echo "BIN=$bin" >> "$GITHUB_ENV"
+      - name: native compatibility report (same runner)
+        run: |
+          set -euo pipefail
+          report="native-compat-${{ matrix.asset }}.json"
+          "$BIN" compatibility --json > "$report"
+          test -s "$report"
       - name: completions byte-clean
         run: |
           set -euo pipefail
@@ -248,7 +291,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARCHIVE }}
-          path: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            native-compat-${{ matrix.asset }}.json
 
   verify:
     name: checksums, identity, layout, attestations (pre-publish)
@@ -328,16 +373,64 @@ jobs:
             echo "does not match producer digest $expected"
             exit 1
           }
-          echo "$first_digest" > WASM_SHA256
-          echo "WASM bytes identical in all archives and match producer: $first_digest"
-      - name: runnable native smoke (linux-x64 on its own arch)
+      - name: native compatibility reports equal WASM witness
         run: |
           set -euo pipefail
+          command -v jq >/dev/null 2>&1 || {
+            echo "MISSING: jq on this runner"
+            exit 1
+          }
+          test -f producer/muxe-zellij.build-id
+          bridge_build_id="$(cat producer/muxe-zellij.build-id)"
+          test "${#bridge_build_id}" -eq 64
+          test "$bridge_build_id" != "$(printf '%064d' 0)"
+          expected_sha="$(cut -d' ' -f1 producer/muxe-zellij.sha256)"
+          reports=(dist/native-compat-*.json)
+          test "${#reports[@]}" -eq 4
+          for report in "${reports[@]}"; do
+            report_id="$(jq -r '.hosts.zellij.bridge_build_id' "$report")"
+            test "$report_id" = "$bridge_build_id" || {
+              echo "release failure: $report reports bridge ID $report_id, expected $bridge_build_id"
+              exit 1
+            }
+            test "$(jq -r '.packaged_wasm.sha256' "$report")" = "$expected_sha"
+            test "$(jq -r '.packaged_wasm.unavailable_reason' "$report")" = "null"
+          done
+      - name: runnable native smoke (linux-x64 on its own arch)
+        # The native report carries the shared pre-link bridge identity and
+        # the separately producer-attested packaged-WASM digest. These are
+        # distinct: this step does not claim that the host API attested the
+        # bytes loaded by Zellij.
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || {
+            echo "MISSING: jq on this runner"
+            exit 1
+          }
+          # Re-read the producer digest from the downloaded artifact in
+          # this step: shell variables do not survive steps, and `set -u`
+          # fails the gate on the previous step's `$first_digest`.
+          # This validates the binary against independent producer bytes,
+          # not a same-step variable.
+          test -f producer/muxe-zellij.sha256
+          expected="$(cut -d' ' -f1 producer/muxe-zellij.sha256)"
+          test -n "$expected"
           version="${GITHUB_REF_NAME#v}"
           bin="verify-tmp/muxe-v${version}-linux-x64/muxe"
           test -x "$bin"
           report="$("$bin" compatibility --json)"
-          test "$(printf '%s' "$report" | grep -o '"muxe_version":"[^"]*"' | cut -d'"' -f4)" = "$version"
+          test "$(jq -r '.muxe_version' <<< "$report")" = "$version"
+          test "$(jq -r '.packaged_wasm.sha256' <<< "$report")" = "$expected"
+          test "$(jq -r '.packaged_wasm.unavailable_reason' <<< "$report")" = "null"
+          bridge_build_id="$(jq -r '.hosts.zellij.bridge_build_id' <<< "$report")"
+          test -f producer/muxe-zellij.build-id
+          expected_bridge_build_id="$(cat producer/muxe-zellij.build-id)"
+          test "$bridge_build_id" = "$expected_bridge_build_id"
+          test "${#bridge_build_id}" -eq 64
+          case "$bridge_build_id" in
+            ""|null|*[!0-9a-f]*) echo "invalid bridge build ID: $bridge_build_id"; exit 1 ;;
+          esac
+          test "$bridge_build_id" != "$(printf '%064d' 0)"
       - name: attest archives (before any publication)
         uses: actions/attest-build-provenance@v2
         with:
@@ -382,53 +475,67 @@ jobs:
           set -euo pipefail
           env -u RUSTUP_TOOLCHAIN cargo test --locked \
             -p muxe-adapter-herdr --test recorded_socket
-
-  live-upgrade:
-    name: predecessor upgrade/rollback gate
-    needs: [verify, live-matrix]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: predecessor check (no waiver)
-        id: predecessor
+      - name: runner owned-spawn proofs (no live host)
+        # Release-owned foreground/bootstrap/PTY/CLI/muxe scoping proofs:
+        # real children observe their real environment, the real
+        # paths::resolve proves the shared registry, and the PTY proves
+        # explicit geometry. Green without hosts or approval; the live
+        # matrix itself stays behind MUXE_LIVE_HOSTS_APPROVED.
         run: |
           set -euo pipefail
-          prev="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
-            --json tagName \
-            --jq '[.[].tagName] | map(select(. != env.GITHUB_REF_NAME)) | sort | last // empty')"
-          if [ -z "$prev" ]; then
-            echo "BLOCKED: no predecessor release exists for $GITHUB_REF_NAME." \
-              "The previous-to-target live upgrade/rollback matrix cannot run" \
-              "on a first release and is a failing gate, not a waiver." \
-              >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "PREVIOUS=$prev" >> "$GITHUB_ENV"
-          echo "previous=$prev" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          env -u RUSTUP_TOOLCHAIN cargo test --locked -p muxe \
+            --test live_hosts scoped_spawn
+  target-smoke:
+    name: current target-only host smoke (${{ matrix.asset }})
+    needs: [verify, live-matrix]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - asset: linux-x64
+            os: ubuntu-24.04
+            herdr_asset: herdr-linux-x86_64
+            herdr_digest: 976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4
+          - asset: linux-arm64
+            os: ubuntu-24.04-arm
+            herdr_asset: herdr-linux-aarch64
+            herdr_digest: f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d
+          - asset: macos-arm64
+            os: macos-15
+            herdr_asset: herdr-macos-aarch64
+            herdr_digest: a5d4f4d504d8b309c91f811050559300faba31258425f53c50852fc96f6ae574
+          - asset: macos-x64
+            os: macos-15-intel
+            herdr_asset: herdr-macos-x86_64
+            herdr_digest: ab50262c8190cd7aa9056d249d255c08c328c3e8716de9cfa29db4f131b8e2c1
+    env:
+      ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
       - name: live-host approval opt-in (before costly installs)
-        # The isolated Zellij probe permissions and the bridge-digest design
-        # decision are user approvals, not CI autodetects. The gate fails
-        # closed naming them until the release owner records approval by
-        # setting this repository variable to "true".
+        # This explicit repository-variable guard authorizes only the current
+        # target-only owned-host smoke. Cross-release execution remains
+        # deferred in TODO-CROSS-RELEASE.md until a real predecessor exists.
         run: |
           set -euo pipefail
           test "${ALLOW_LIVE_HOST_MATRIX:-}" = "true" || {
-            echo "BLOCKED: live-host upgrade requires recorded user approval" \
-              "of the isolated Zellij probe permissions and the bridge" \
-              "embedded-report design decision (DESIGN 2074). Set the" \
-              "ALLOW_LIVE_HOST_MATRIX repository variable to \"true\" only" \
-              "after those approvals exist."
+            echo "BLOCKED: current target-only live-host smoke requires recorded user approval." >&2
+            echo "Set the ALLOW_LIVE_HOST_MATRIX repository variable to \"true\" only after approval." >&2
             exit 1
           }
       - uses: jdx/mise-action@v2
         with:
           install: true
+      - name: pinned toolchain assert (single source is mise.toml)
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$pin"
+          cargo --version | grep -F "cargo $pin"
       - name: pinned Zellij host (source build at pin)
-        # Mirrors the scheduled host matrix: no official 0.46.0 release
-        # asset exists, so build the exact pinned source revision. Pin
-        # values come from pins/zellij.toml, never from this file.
+        # No official 0.46.0 release asset exists, so build the exact pinned
+        # source revision. Pin values come from pins/zellij.toml.
         run: |
           set -euo pipefail
           zrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/zellij.toml)"
@@ -444,8 +551,8 @@ jobs:
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
       - name: pinned Herdr host (0.8.2, digest-verified)
-        # Official v0.8.2 assets with published SHA-256 digests
-        # (release id 373248423), verified here before use.
+        # Official v0.8.2 assets with published SHA-256 digests, verified
+        # before use. Asset and digest come from this matrix row.
         run: |
           set -euo pipefail
           file_digest() {
@@ -453,8 +560,10 @@ jobs:
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
             else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
           }
-          hasset="herdr-linux-x86_64"
-          hdigest="976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4"
+          hasset="${{ matrix.herdr_asset }}"
+          hdigest="${{ matrix.herdr_digest }}"
+          test -n "$hasset"
+          test "${#hdigest}" -eq 64
           hdir="$RUNNER_TEMP/herdr-host"
           mkdir -p "$hdir"
           curl -fSL "https://github.com/herdrdev/herdr/releases/download/v0.8.2/$hasset" -o "$hdir/herdr"
@@ -463,27 +572,82 @@ jobs:
             exit 1
           }
           chmod 755 "$hdir/herdr"
+          if [ "$(uname)" = "Darwin" ]; then
+            xattr -d com.apple.quarantine "$hdir/herdr" || {
+              echo "MISSING: cannot clear macOS quarantine on $hdir/herdr"
+              exit 1
+            }
+          fi
           echo "$hdir" >> "$GITHUB_PATH"
           "$hdir/herdr" --version | grep -F "0.8.2"
-      - name: target archives for the driver
+      - name: target archive for the current smoke
         uses: actions/download-artifact@v4
         with:
           path: target-dist
           merge-multiple: true
-      - name: upgrade and rollback driver
-        # tools/release/live-upgrade.sh stages both stacks from real archives
-        # and hands them to the broker-owned session scenario. Until that
-        # scenario command exists the driver fails closed naming it; the
-        # predecessor, host, and approval checks above are all real.
+      - name: stage current target installation
+        # Stage the complete archive produced by this tagged workflow. No
+        # predecessor lookup or synthetic old artifact is used here.
         run: |
           set -euo pipefail
-          test -n "${PREVIOUS:-}" || { echo "BLOCKED: no predecessor recorded"; exit 1; }
-          bash tools/release/live-upgrade.sh "$PREVIOUS" "$GITHUB_REF_NAME" target-dist upgrade-work
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version="${GITHUB_REF_NAME#v}"
+          archive="target-dist/muxe-v${version}-${{ matrix.asset }}.tar.gz"
+          test -f "$archive" || {
+            echo "MISSING: current target archive $archive"
+            exit 1
+          }
+          rm -rf "$RUNNER_TEMP/target-install"
+          mkdir -p "$RUNNER_TEMP/target-install"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/target-install"
+          root="$RUNNER_TEMP/target-install/muxe-v${version}-${{ matrix.asset }}"
+          test -x "$root/muxe" || { echo "MISSING: target executable"; exit 1; }
+          test -f "$root/lib/muxe/muxe-zellij.wasm" || {
+            echo "MISSING: target bridge WASM"
+            exit 1
+          }
+          test ! -e "$root/bin/muxe" || {
+            echo "INVALID: target archive uses a bin-nested executable"
+            exit 1
+          }
+          test "$("$root/muxe" --version | cut -d' ' -f2)" = "$version" || {
+            echo "target binary version mismatch"
+            exit 1
+          }
+          echo "MUXE_TARGET_INSTALLATION=$root" >> "$GITHUB_ENV"
+      - name: runner fixture binaries and host-free proofs
+        # Match the CI target-only invocation pattern before the approved
+        # real-host smoke. Missing helpers fail closed.
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
+          fx="$PWD/tools/muxe-zellij-foreground/target/debug"
+          test -x "$fx/muxe-zellij-foreground" || { echo "MISSING: built foreground binary"; exit 1; }
+          test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
+          test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
+          test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
+          cargo test --locked -p muxe --test live_hosts scoped_spawn
+          cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
+          {
+            echo "MUXE_ZELLIJ_FOREGROUND_BINARY=$fx/muxe-zellij-foreground"
+            echo "MUXE_ZELLIJ_BOOTSTRAP_BINARY=$fx/muxe-zellij-bootstrap"
+            echo "MUXE_ZELLIJ_PERMISSION_SEEDER=$fx/muxe-zellij-permit"
+          } >> "$GITHUB_ENV"
+      - name: current target-only both-host smoke
+        # The release archive is the only installation under test. Every typed
+        # input and the explicit live-host approval is required; missing
+        # capability never becomes a green skip.
+        run: |
+          set -euo pipefail
+          MUXE_TARGET_INSTALLATION="$MUXE_TARGET_INSTALLATION" \
+          MUXE_HERDR_BINARY="$(command -v herdr)" \
+          MUXE_ZELLIJ_BINARY="$(command -v zellij)" \
+          MUXE_ZELLIJ_FOREGROUND_BINARY="$MUXE_ZELLIJ_FOREGROUND_BINARY" \
+          MUXE_ZELLIJ_BOOTSTRAP_BINARY="$MUXE_ZELLIJ_BOOTSTRAP_BINARY" \
+          MUXE_ZELLIJ_PERMISSION_SEEDER="$MUXE_ZELLIJ_PERMISSION_SEEDER" \
+          MUXE_LIVE_HOSTS_APPROVED=true \
+          cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
   publish:
-    name: publish release (all gates green)
-    needs: [verify, live-matrix, live-upgrade]
+    needs: [verify, live-matrix, target-smoke]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

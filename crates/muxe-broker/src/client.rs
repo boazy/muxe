@@ -26,6 +26,12 @@ pub struct BrokerClient {
 }
 
 impl BrokerClient {
+    /// Connects over the owner-only socket and completes the versioned handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError` on connection, prelude, identity-mismatch, or
+    /// welcome failures.
     pub async fn connect(
         socket: impl AsRef<Path>,
         role: PeerRole,
@@ -73,6 +79,10 @@ impl BrokerClient {
 
     /// Sends one request and returns its checked response frame. Callers attaching the terminal UI
     /// should pass this frame directly to `UiRuntime::attach` rather than deserialize it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError` on transport, framing, or unexpected-message failures.
     pub async fn request_frame(
         &mut self,
         request: ClientRequest,
@@ -105,6 +115,11 @@ impl BrokerClient {
         }
     }
 
+    /// Sends one request and returns its checked response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError` from the frame round trip or a non-response message.
     pub async fn request(&mut self, request: ClientRequest) -> Result<BrokerResponse, ClientError> {
         let frame = self.request_frame(request).await?;
         let message = frame.deserialize()?;
@@ -116,6 +131,10 @@ impl BrokerClient {
 
     /// Receives the next broker event without dropping events that arrived while a correlated
     /// request response was in flight. Callers invoke this only when they have no request pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError` on transport close or a non-event message.
     pub async fn next_event(&mut self) -> Result<BrokerEvent, ClientError> {
         if let Some(event) = self.events.pop_front() {
             return Ok(event);
@@ -123,7 +142,6 @@ impl BrokerClient {
         let frame = self.next_frame().await?;
         match frame.deserialize()? {
             WireMessage::Event { event, .. } => Ok(event),
-            WireMessage::Response { .. } => Err(ClientError::ExpectedEvent),
             _ => Err(ClientError::ExpectedEvent),
         }
     }
@@ -139,9 +157,9 @@ impl BrokerClient {
         if let Some(frame) = self.frames.pop_front() {
             return Ok(frame);
         }
-        let mut bytes = [0; 16 * 1024];
+        let mut bytes = Box::new([0; 16 * 1024]);
         loop {
-            let count = self.stream.read(&mut bytes).await?;
+            let count = self.stream.read(bytes.as_mut()).await?;
             if count == 0 {
                 return Err(ClientError::ConnectionClosed);
             }
@@ -189,4 +207,3 @@ pub enum ClientError {
     #[error("expected broker event while no request was pending")]
     ExpectedEvent,
 }
-

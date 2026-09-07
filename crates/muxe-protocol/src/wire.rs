@@ -37,10 +37,12 @@ pub struct SchemaFingerprint(pub [u8; 32]);
 impl SchemaFingerprint {
     pub const ZERO: Self = Self([0; 32]);
 
+    #[must_use]
     pub fn application() -> Self {
         *APPLICATION_SCHEMA_FINGERPRINT
     }
 
+    #[must_use]
     pub fn is_zero(self) -> bool {
         self == Self::ZERO
     }
@@ -72,6 +74,7 @@ pub enum Codec {
 }
 
 impl Codec {
+    #[must_use]
     pub const fn from_byte(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::Rkyv),
@@ -80,6 +83,7 @@ impl Codec {
         }
     }
 
+    #[must_use]
     pub const fn as_byte(self) -> u8 {
         self as u8
     }
@@ -107,6 +111,7 @@ pub enum PeerRole {
 }
 
 impl PeerRole {
+    #[must_use]
     pub const fn from_byte(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::Ui),
@@ -118,6 +123,7 @@ impl PeerRole {
         }
     }
 
+    #[must_use]
     pub const fn as_byte(self) -> u8 {
         self as u8
     }
@@ -426,6 +432,10 @@ impl Validate for BindingSettingsWire {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "rkyv wire stability: field layout is part of the archived schema fingerprint"
+)]
 #[derive(
     Archive,
     Deserialize,
@@ -552,10 +562,11 @@ pub struct BindingConditionsWire {
 
 impl Validate for BindingConditionsWire {
     fn validate(&self) -> Result<(), SemanticError> {
-        for condition in [&self.include, &self.enable, &self.show] {
-            if let Some(condition) = condition {
-                condition.validate()?;
-            }
+        for condition in [&self.include, &self.enable, &self.show]
+            .into_iter()
+            .flatten()
+        {
+            condition.validate()?;
         }
         Ok(())
     }
@@ -595,6 +606,9 @@ impl ConditionValueWire {
 
 /// Evaluates a checked archived condition directly; no CEL parser or deserialized menu graph is
 /// involved when page geometry changes.
+/// # Errors
+///
+/// Returns the evaluation error when the checked condition is not boolean.
 pub fn evaluate_archived_condition(
     condition: &ArchivedConditionIrWire,
     pages: PagesContextWire,
@@ -605,6 +619,9 @@ pub fn evaluate_archived_condition(
     }
 }
 
+/// # Errors
+///
+/// Returns the evaluation error when a binding condition is not boolean.
 pub fn evaluate_archived_binding_state(
     binding: &ArchivedBindingViewWire,
     pages: PagesContextWire,
@@ -867,10 +884,10 @@ impl Validate for MenuViewWire {
                 if binding.id.generation != self.generation {
                     return Err(SemanticError::BindingGenerationMismatch);
                 }
-                if let Some(LocalMenuActionWire::Open { target }) = &binding.local_menu_action {
-                    if !self.menus.iter().any(|candidate| candidate.id == *target) {
-                        return Err(SemanticError::UnknownMenuTarget);
-                    }
+                if let Some(LocalMenuActionWire::Open { target }) = &binding.local_menu_action
+                    && !self.menus.iter().any(|candidate| candidate.id == *target)
+                {
+                    return Err(SemanticError::UnknownMenuTarget);
                 }
             }
         }
@@ -931,6 +948,10 @@ impl Validate for NamedStringWire {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "rkyv wire stability: field layout is part of the archived schema fingerprint"
+)]
 #[derive(
     Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -946,10 +967,8 @@ pub struct StyleWire {
 
 impl Validate for StyleWire {
     fn validate(&self) -> Result<(), SemanticError> {
-        for color in [&self.foreground, &self.background] {
-            if let Some(color) = color {
-                validate_clean_text("style color", color)?;
-            }
+        for color in [&self.foreground, &self.background].into_iter().flatten() {
+            validate_clean_text("style color", color)?;
         }
         Ok(())
     }
@@ -1099,7 +1118,7 @@ pub struct UiOriginBootstrap {
     pub workspace: WorkspaceId,
     pub tab: HostTabId,
     pub pane: HostPaneId,
-    pub cwd: String,
+    pub cwd: Option<String>,
 }
 
 impl Validate for UiOriginBootstrap {
@@ -1107,7 +1126,10 @@ impl Validate for UiOriginBootstrap {
         self.workspace.validate()?;
         self.tab.validate()?;
         self.pane.validate()?;
-        validate_absolute_path("origin cwd", &self.cwd)
+        if let Some(cwd) = &self.cwd {
+            validate_absolute_path("origin cwd", cwd)?;
+        }
+        Ok(())
     }
 }
 
@@ -1141,6 +1163,8 @@ pub struct AttachUi {
     pub pending_launch: Option<PendingLaunchToken>,
     pub origin: Option<UiOriginBootstrap>,
     pub caller_identity: Option<UiCallerIdentityWire>,
+    pub theme: Option<String>,
+    pub color_scheme: Option<String>,
 }
 
 impl Validate for AttachUi {
@@ -1155,6 +1179,12 @@ impl Validate for AttachUi {
         }
         if let Some(caller_identity) = &self.caller_identity {
             caller_identity.validate()?;
+        }
+        if let Some(theme) = &self.theme {
+            validate_identifier("theme override", theme)?;
+        }
+        if let Some(color_scheme) = &self.color_scheme {
+            validate_identifier("color scheme override", color_scheme)?;
         }
         Ok(())
     }
@@ -1245,6 +1275,10 @@ impl Validate for DetachUi {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "rkyv wire stability: variant layout is part of the archived schema fingerprint"
+)]
 #[derive(
     Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -1261,7 +1295,8 @@ pub enum ClientRequest {
 }
 
 impl ClientRequest {
-    pub const fn allowed_for(self: &Self, role: PeerRole) -> bool {
+    #[must_use]
+    pub const fn allowed_for(&self, role: PeerRole) -> bool {
         match role {
             PeerRole::Launcher => matches!(
                 self,
@@ -1340,6 +1375,28 @@ impl Validate for ProtocolDiagnostic {
 }
 
 #[derive(
+    Archive,
+    Deserialize,
+    Serialize,
+    SerdeSerialize,
+    SerdeDeserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+#[repr(u8)]
+pub enum InvocationDisposition {
+    Awaited = 1,
+    Detached = 2,
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "rkyv wire stability: variant layout is part of the archived schema fingerprint"
+)]
+#[derive(
     Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
 )]
 pub enum BrokerResponse {
@@ -1355,6 +1412,11 @@ pub enum BrokerResponse {
     },
     InvocationAccepted {
         execution: ExecutionId,
+        disposition: InvocationDisposition,
+    },
+    PendingControlCompleted {
+        execution: ExecutionId,
+        control: MenuControl,
     },
     Detached,
     Acknowledged,
@@ -1378,7 +1440,8 @@ impl Validate for BrokerResponse {
                 session.validate()?;
                 snapshot.validate()
             }
-            Self::InvocationAccepted { execution } => execution.validate(),
+            Self::InvocationAccepted { execution, .. }
+            | Self::PendingControlCompleted { execution, .. } => execution.validate(),
             Self::Error(error) => error.validate(),
             Self::PendingPaneRegistered
             | Self::AttachPending
@@ -1501,6 +1564,9 @@ pub enum WireMessage {
 }
 
 impl WireMessage {
+    /// # Errors
+    ///
+    /// Returns `SemanticError` on illegal role, direction, phase, or request content.
     pub fn validate_for_peer(
         &self,
         role: PeerRole,
@@ -1572,6 +1638,9 @@ impl WireMessage {
 
 /// Validates message direction, handshake order, and role legality directly against an already
 /// checked archive. This deliberately does not deserialize a retained UI view.
+/// # Errors
+///
+/// Returns `SemanticError` on illegal role, direction, phase, or archived content.
 pub fn validate_archived_wire_message(
     message: &ArchivedWireMessage,
     role: PeerRole,
@@ -1742,6 +1811,12 @@ fn validate_archived_request(request: &ArchivedClientRequest) -> Result<(), Sema
             if let Some(caller_identity) = value.caller_identity.as_ref() {
                 validate_archived_caller_identity(caller_identity)?;
             }
+            if let Some(theme) = value.theme.as_ref() {
+                validate_archived_identifier("theme override", theme.as_str())?;
+            }
+            if let Some(color_scheme) = value.color_scheme.as_ref() {
+                validate_archived_identifier("color scheme override", color_scheme.as_str())?;
+            }
             Ok(())
         }
         ArchivedClientRequest::CommitUiLaunch(value) => {
@@ -1787,7 +1862,8 @@ fn validate_archived_response(response: &ArchivedBrokerResponse) -> Result<(), S
             validate_archived_identifier("UiSessionId", session.0.as_str())?;
             validate_archived_attachment(snapshot)
         }
-        ArchivedBrokerResponse::InvocationAccepted { execution } => {
+        ArchivedBrokerResponse::InvocationAccepted { execution, .. }
+        | ArchivedBrokerResponse::PendingControlCompleted { execution, .. } => {
             validate_archived_nonce(&execution.0, "ExecutionId")
         }
         ArchivedBrokerResponse::Error(diagnostic) => validate_archived_diagnostic(diagnostic),
@@ -1828,7 +1904,9 @@ fn validate_archived_event(event: &ArchivedBrokerEvent) -> Result<(), SemanticEr
                 (ArchivedBindingAvailability::Enabled, Some(_)) => {
                     Err(SemanticError::UnexpectedDiagnostic)
                 }
-                (ArchivedBindingAvailability::Blocked, None) => Err(SemanticError::MissingDiagnostic),
+                (ArchivedBindingAvailability::Blocked, None) => {
+                    Err(SemanticError::MissingDiagnostic)
+                }
                 (_, Some(diagnostic)) => validate_archived_diagnostic(diagnostic),
                 (_, None) => Ok(()),
             }
@@ -1871,18 +1949,18 @@ fn validate_archived_menu_view(value: &ArchivedMenuViewWire) -> Result<(), Seman
             }
             if let Some(ArchivedLocalMenuActionWire::Open { target }) =
                 binding.local_menu_action.as_ref()
-            {
-                if !value
+                && !value
                     .menus
                     .iter()
                     .any(|candidate| candidate.id.0.as_str() == target.0.as_str())
-                {
-                    return Err(SemanticError::UnknownMenuTarget);
-                }
+            {
+                return Err(SemanticError::UnknownMenuTarget);
             }
         }
     }
-    root_found.then_some(()).ok_or(SemanticError::MissingRootMenu)
+    root_found
+        .then_some(())
+        .ok_or(SemanticError::MissingRootMenu)
 }
 
 fn validate_archived_menu(value: &ArchivedMenuViewMenuWire) -> Result<(), SemanticError> {
@@ -1923,7 +2001,9 @@ fn validate_archived_binding(value: &ArchivedBindingViewWire) -> Result<(), Sema
     }
 }
 
-fn validate_archived_local_action(value: &ArchivedLocalMenuActionWire) -> Result<(), SemanticError> {
+fn validate_archived_local_action(
+    value: &ArchivedLocalMenuActionWire,
+) -> Result<(), SemanticError> {
     match value {
         ArchivedLocalMenuActionWire::Open { target } => {
             validate_archived_identifier("MenuId", target.0.as_str())
@@ -1991,7 +2071,10 @@ fn validate_archived_origin_bootstrap(
     validate_archived_identifier("WorkspaceId", value.workspace.0.as_str())?;
     validate_archived_identifier("HostTabId", value.tab.0.as_str())?;
     validate_archived_identifier("HostPaneId", value.pane.0.as_str())?;
-    validate_archived_absolute_path("origin cwd", value.cwd.as_str())
+    if let Some(cwd) = value.cwd.as_ref() {
+        validate_archived_absolute_path("origin cwd", cwd.as_str())?;
+    }
+    Ok(())
 }
 
 fn validate_archived_caller_identity(
@@ -2018,7 +2101,10 @@ fn validate_archived_diagnostic(value: &ArchivedProtocolDiagnostic) -> Result<()
 fn validate_archived_optional_diagnostic(
     value: Option<&ArchivedProtocolDiagnostic>,
 ) -> Result<(), SemanticError> {
-    value.map(validate_archived_diagnostic).transpose().map(|_| ())
+    value
+        .map(validate_archived_diagnostic)
+        .transpose()
+        .map(|_| ())
 }
 
 fn validate_archived_absolute_path(field: &'static str, value: &str) -> Result<(), SemanticError> {
@@ -2029,10 +2115,7 @@ fn validate_archived_absolute_path(field: &'static str, value: &str) -> Result<(
         .ok_or(SemanticError::RelativePath { field })
 }
 
-fn validate_archived_clean_text(
-    field: &'static str,
-    value: &str,
-) -> Result<(), SemanticError> {
+fn validate_archived_clean_text(field: &'static str, value: &str) -> Result<(), SemanticError> {
     validate_archived_text(field, value, false)
 }
 
@@ -2123,28 +2206,30 @@ impl Validate for OriginContextWire {
     fn validate(&self) -> Result<(), SemanticError> {
         self.server.validate()?;
         for identifier in [
-            self.client.as_ref().map(|value| value.validate()),
-            self.session.as_ref().map(|value| value.validate()),
-            self.workspace.as_ref().map(|value| value.validate()),
-            self.tab.as_ref().map(|value| value.validate()),
-            self.pane.as_ref().map(|value| value.validate()),
-            self.worktree.as_ref().map(|value| value.validate()),
-            self.agent.as_ref().map(|value| value.validate()),
-            self.link_handler.as_ref().map(|value| value.validate()),
-        ] {
-            if let Some(result) = identifier {
-                result?;
-            }
+            self.client.as_ref().map(Validate::validate),
+            self.session.as_ref().map(Validate::validate),
+            self.workspace.as_ref().map(Validate::validate),
+            self.tab.as_ref().map(Validate::validate),
+            self.pane.as_ref().map(Validate::validate),
+            self.worktree.as_ref().map(Validate::validate),
+            self.agent.as_ref().map(Validate::validate),
+            self.link_handler.as_ref().map(Validate::validate),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            identifier?;
         }
         for text in [
             self.pane_cwd.as_deref(),
             self.selection_text.as_deref(),
             self.worktree_path.as_deref(),
             self.link_url.as_deref(),
-        ] {
-            if let Some(value) = text {
-                validate_text("origin context value", value)?;
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_text("origin context value", text)?;
         }
         Ok(())
     }
@@ -2239,6 +2324,10 @@ pub enum CaptureLostReason {
     AdapterHealth = 2,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "rkyv wire stability: variant layout is part of the archived schema fingerprint"
+)]
 #[derive(
     Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -2280,6 +2369,11 @@ pub enum BridgeMessage<P> {
 }
 
 impl<P: Validate> Validate for BridgeMessage<P> {
+    /// Validates the enclosed bridge payload for every message shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns the enclosed payload validation error.
     fn validate(&self) -> Result<(), SemanticError> {
         match self {
             Self::Register(value) => value.validate(),
@@ -2318,6 +2412,12 @@ pub struct BridgeEnvelope<P> {
 }
 
 impl<P: Validate> Validate for BridgeEnvelope<P> {
+    /// Rejects zero sequences before validating the enclosed message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SemanticError::ZeroSequence` for sequence zero and propagates the
+    /// enclosed message validation error.
     fn validate(&self) -> Result<(), SemanticError> {
         if self.sequence == 0 {
             return Err(SemanticError::ZeroSequence);
@@ -2327,6 +2427,11 @@ impl<P: Validate> Validate for BridgeEnvelope<P> {
 }
 
 pub trait Validate {
+    /// Validates structural and semantic invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SemanticError` describing the first violation.
     fn validate(&self) -> Result<(), SemanticError>;
 }
 
@@ -2406,7 +2511,7 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), SemanticError> 
     if value.contains('\0') {
         return Err(SemanticError::Nul { field });
     }
-    if value.chars().any(|character| character.is_control()) {
+    if value.chars().any(char::is_control) {
         return Err(SemanticError::Control { field });
     }
     Ok(())
@@ -2416,7 +2521,7 @@ fn validate_clean_text(field: &'static str, value: &str) -> Result<(), SemanticE
     if value.contains('\0') {
         return Err(SemanticError::Nul { field });
     }
-    if value.chars().any(|character| character.is_control()) {
+    if value.chars().any(char::is_control) {
         return Err(SemanticError::Control { field });
     }
     Ok(())
@@ -2662,7 +2767,63 @@ mod tests {
             Err(crate::DecodeError::Semantic(SemanticError::ZeroGeneration))
         ));
     }
+    fn deep_condition(depth: usize) -> ConditionIrWire {
+        let mut condition = ConditionIrWire::Bool(true);
+        for _ in 0..depth {
+            condition = ConditionIrWire::Not(Box::new(condition));
+        }
+        condition
+    }
 
+    fn attached_with_condition(condition: ConditionIrWire) -> WireMessage {
+        let mut snapshot = attachment();
+        let mut view_binding = binding(1, 0, None);
+        view_binding.conditions.include = Some(condition);
+        snapshot.menu.menus[0].bindings.push(view_binding);
+        WireMessage::Response {
+            request_id: RequestId([2; 16]),
+            response: BrokerResponse::UiAttached {
+                session: UiSessionId::new("ui"),
+                snapshot,
+            },
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_condition_nesting_beyond_transport_depth() {
+        // Serialization itself recurses; build the hostile frame off the
+        // worker-sized test stack so the test measures the serving pipeline.
+        let hostile = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| client_stream(&attached_with_condition(deep_condition(3000))))
+            .expect("hostile frame builder spawns")
+            .join()
+            .expect("hostile frame builds");
+        let Err(crate::DecodeError::InvalidArchive(diagnostic)) =
+            client_decoder().push(&hostile, |_| {})
+        else {
+            panic!("a 3000-deep condition frame must not validate");
+        };
+        assert!(
+            diagnostic.contains("SubtreeDepth"),
+            "rejection names the nesting bound"
+        );
+    }
+    #[test]
+    fn decoder_accepts_condition_nesting_within_transport_depth() {
+        let mut frames = 0;
+        assert!(
+            client_decoder()
+                .push(
+                    &client_stream(&attached_with_condition(deep_condition(64))),
+                    |_| {
+                        frames += 1;
+                    }
+                )
+                .is_ok()
+        );
+        assert_eq!(frames, 2);
+    }
     #[test]
     fn decoder_rejects_archived_attach_origin_and_caller_boundaries() {
         let origin = WireMessage::Request {
@@ -2675,9 +2836,11 @@ mod tests {
                     workspace: WorkspaceId::new("workspace"),
                     tab: HostTabId::new("tab"),
                     pane: HostPaneId::new("origin-pane"),
-                    cwd: "relative".into(),
+                    cwd: Some("relative".into()),
                 }),
                 caller_identity: None,
+                theme: None,
+                color_scheme: None,
             }),
         };
         assert!(matches!(
@@ -2697,7 +2860,7 @@ mod tests {
                     workspace: WorkspaceId::new("workspace"),
                     tab: HostTabId::new("tab"),
                     pane: HostPaneId::new("origin-pane"),
-                    cwd: "/origin".into(),
+                    cwd: Some("/origin".into()),
                 }),
                 caller_identity: Some(UiCallerIdentityWire {
                     workspace: WorkspaceId::new("workspace"),
@@ -2705,6 +2868,8 @@ mod tests {
                     pane: HostPaneId::new("caller-pane"),
                     cwd: "relative".into(),
                 }),
+                theme: None,
+                color_scheme: None,
             }),
         };
         assert!(matches!(
@@ -2714,10 +2879,66 @@ mod tests {
             }))
         ));
     }
+    #[test]
+    fn decoder_accepts_archived_attach_origin_without_cwd() {
+        let request = WireMessage::Request {
+            request_id: RequestId([8; 16]),
+            request: ClientRequest::AttachUi(AttachUi {
+                root: MenuId::new("root"),
+                pane: HostPaneId::new("ui-pane"),
+                pending_launch: Some(PendingLaunchToken([9; 16])),
+                origin: Some(UiOriginBootstrap {
+                    workspace: WorkspaceId::new("workspace"),
+                    tab: HostTabId::new("tab"),
+                    pane: HostPaneId::new("origin-pane"),
+                    cwd: None,
+                }),
+                caller_identity: Some(UiCallerIdentityWire {
+                    workspace: WorkspaceId::new("workspace"),
+                    tab: HostTabId::new("tab"),
+                    pane: HostPaneId::new("caller-pane"),
+                    cwd: "/live-caller".into(),
+                }),
+                theme: None,
+                color_scheme: None,
+            }),
+        };
+        let mut frames = 0;
+        broker_decoder()
+            .push(&broker_stream(&request), |_| {
+                frames += 1;
+            })
+            .expect(
+                "valid origin IDs with absent cwd must validate; the live snapshot enriches it",
+            );
+        assert_eq!(frames, 2);
+    }
+
+    #[test]
+    fn decoder_rejects_archived_attach_override_boundaries() {
+        let request = WireMessage::Request {
+            request_id: RequestId([6; 16]),
+            request: ClientRequest::AttachUi(AttachUi {
+                root: MenuId::new("root"),
+                pane: HostPaneId::new("ui-pane"),
+                pending_launch: None,
+                origin: None,
+                caller_identity: None,
+                theme: Some("invalid theme".into()),
+                color_scheme: None,
+            }),
+        };
+        assert!(matches!(
+            broker_decoder().push(&broker_stream(&request), |_| {}),
+            Err(crate::DecodeError::Semantic(SemanticError::Whitespace {
+                field: "theme override"
+            }))
+        ));
+    }
 
     #[test]
     fn accepts_absent_titles_and_unbounded_acyclic_navigation_depth() {
-        let depth = 256;
+        let depth: u64 = 256;
         let menus = (0..depth)
             .map(|index| {
                 let action = (index + 1 < depth).then(|| LocalMenuActionWire::Open {
@@ -2727,7 +2948,7 @@ mod tests {
                     id: MenuId::new(format!("menu-{index}")),
                     title: None,
                     layout: layout(),
-                    bindings: vec![binding(7, index as u64, action)],
+                    bindings: vec![binding(7, index, action)],
                 }
             })
             .collect();

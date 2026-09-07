@@ -47,6 +47,10 @@ opaque_id!(
     "Opaque exclusive active-input-capture lease identity."
 );
 opaque_id!(
+    PendingPaneLeaseId,
+    "Opaque adapter-owned pending-pane cleanup lease identity."
+);
+opaque_id!(
     ExecutionCorrelationId,
     "Adapter correlation identity for a broker execution."
 );
@@ -65,7 +69,10 @@ pub struct HostIdentity {
     pub live_server_id: String,
 }
 
-#[expect(clippy::struct_excessive_bools, reason = "four independent Kitty protocol flag bits negotiated with the host")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent Kitty protocol flag bits negotiated with the host"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyboardCapabilities {
     pub kitty_baseline: bool,
@@ -109,6 +116,15 @@ pub struct PendingPaneRegistration {
     pub ui_session: UiSessionId,
     pub pane: PaneId,
     pub temporary_tab: Option<TabId>,
+}
+
+/// Adapter-owned provenance for one registered pending pane. The broker stores
+/// this opaque lease with the pending launch and must explicitly release it on
+/// successful publication; dropping the value does not mutate adapter state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPaneLease {
+    pub id: PendingPaneLeaseId,
+    pub ui_session: UiSessionId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,12 +357,23 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
 
     /// Returns a host-defined scope used to enforce v1's one-ready-UI modal rule.
     async fn modal_scope(&self, ui_pane: &PaneId) -> Result<ModalScopeId, AdapterError>;
+    /// Validates and binds host continuity for a newly-created pending pane.
+    /// The returned lease is adapter-owned provenance, not a broker token.
+    async fn register_pending_pane(
+        &self,
+        registration: PendingPaneRegistration,
+    ) -> Result<PendingPaneLease, AdapterError>;
 
-    /// Starts capture only after the host confirms it. Implementations serialize replacement and
-    /// guarded restoration for their own host state.
-    async fn begin_capture(&self, request: CaptureRequest) -> Result<CaptureLease, AdapterError>;
+    /// Closes one validated pending pane exactly once.
+    async fn close_pending_pane(
+        &self,
+        registration: PendingPaneRegistration,
+        lease: PendingPaneLease,
+    ) -> Result<(), AdapterError>;
 
-    /// Releases a lease idempotently. A host mode changed by the user is never restored from a
+    /// Releases adapter provenance after full UI publication without mutating
+    /// host panes or tabs.
+    async fn release_pending_pane(&self, lease: PendingPaneLease) -> Result<(), AdapterError>;
     /// stale capture snapshot.
     async fn end_capture(
         &self,
@@ -354,13 +381,8 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
         reason: CaptureReleaseReason,
     ) -> Result<(), AdapterError>;
 
-    /// Idempotently closes only a revalidated pending UI pane. Implementations must never infer or
-    /// close an origin pane/tab from stale launch metadata.
-    async fn close_pending_pane(
-        &self,
-        registration: PendingPaneRegistration,
-    ) -> Result<(), AdapterError>;
-
+    /// Starts capture only after the host confirms it.
+    async fn begin_capture(&self, request: CaptureRequest) -> Result<CaptureLease, AdapterError>;
     /// Captures and enriches a typed immutable origin before dispatchable focus can move.
     async fn capture_origin(
         &self,

@@ -14,14 +14,21 @@ pub struct CandidateValidationError {
     pub error: ValidationError,
 }
 
+/// Validates one native action candidate against the live schema and the bundled metadata.
+///
+/// # Errors
+///
+/// Returns `CandidateValidationError` when the candidate type is unknown, the method
+/// is not unary, a field cannot be converted to wire JSON, or the params fail schema validation.
 pub fn validate_candidate(
     schema: &ApiSchema,
     candidate: &NativeActionCandidate,
 ) -> Result<&'static MethodMetadata, CandidateValidationError> {
-    let metadata = metadata_for_native_type(&candidate.type_name).ok_or_else(|| CandidateValidationError {
-        field: None,
-        error: missing_method_error(&candidate.type_name),
-    })?;
+    let metadata =
+        metadata_for_native_type(&candidate.type_name).ok_or_else(|| CandidateValidationError {
+            field: None,
+            error: missing_method_error(&candidate.type_name),
+        })?;
     if metadata.transport != MethodTransport::Unary {
         return Err(CandidateValidationError {
             field: None,
@@ -33,10 +40,8 @@ pub fn validate_candidate(
             },
         });
     }
-    let params = fields_to_json(&candidate.fields).map_err(|error| CandidateValidationError {
-        field: None,
-        error,
-    })?;
+    let params = fields_to_json(&candidate.fields)
+        .map_err(|error| CandidateValidationError { field: None, error })?;
     schema
         .validate_method(metadata.method, &Value::Object(params))
         .map_err(|error| CandidateValidationError {
@@ -46,6 +51,12 @@ pub fn validate_candidate(
     Ok(metadata)
 }
 
+/// Converts compiler YAML fields to `snake_case` wire JSON params.
+///
+/// # Errors
+///
+/// Returns `ValidationError` when a field name is not `kebab-case`, two fields map to
+/// the same wire name, or a value cannot be represented as JSON.
 pub fn fields_to_json(fields: &[ConfigField]) -> Result<Map<String, Value>, ValidationError> {
     let mut params = Map::new();
     let mut names = BTreeSet::new();
@@ -69,22 +80,21 @@ fn value_to_json(value: &ConfigValue) -> Result<Value, ValidationError> {
         ConfigValueKind::Null => Value::Null,
         ConfigValueKind::Boolean(value) => Value::Bool(*value),
         ConfigValueKind::Integer(value) => Value::Number(Number::from(*value)),
-        ConfigValueKind::Float(value) => Number::from_f64(*value).map(Value::Number).ok_or_else(|| {
-            ValidationError {
-                code: ValidationCode::Type,
-                instance_path: "#".to_owned(),
-                schema_path: "#/schemas/request".to_owned(),
-                detail: "non-finite floating point values are not valid JSON".to_owned(),
-            }
-        })?,
+        ConfigValueKind::Float(value) => {
+            Number::from_f64(*value)
+                .map(Value::Number)
+                .ok_or_else(|| ValidationError {
+                    code: ValidationCode::Type,
+                    instance_path: "#".to_owned(),
+                    schema_path: "#/schemas/request".to_owned(),
+                    detail: "non-finite floating point values are not valid JSON".to_owned(),
+                })?
+        }
         ConfigValueKind::String(value) => Value::String(value.clone()),
         ConfigValueKind::Context(reference) => context_placeholder(reference.expected_type()),
-        ConfigValueKind::Sequence(values) => Value::Array(
-            values
-                .iter()
-                .map(value_to_json)
-                .collect::<Result<_, _>>()?,
-        ),
+        ConfigValueKind::Sequence(values) => {
+            Value::Array(values.iter().map(value_to_json).collect::<Result<_, _>>()?)
+        }
         ConfigValueKind::Mapping(fields) => Value::Object(fields_to_json(fields)?),
     })
 }

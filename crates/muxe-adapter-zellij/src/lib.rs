@@ -29,12 +29,13 @@ mod registry;
 mod validation;
 
 pub use adapter::{
-    ZellijAdapter, ZellijAdapterConfig, resolve_zellij_exe, zellij_session_from_env,
+    CliMembershipSource, MembershipSource, ZellijAdapter, ZellijAdapterConfig, resolve_zellij_exe,
+    zellij_session_from_env,
 };
-pub use keyboard::{KeyboardError, MappedKey, map_canonical_key};
 pub use launch::{
     LaunchError, LaunchKind, LaunchTarget, SizeSpec, ZellijPaneKind, ZellijPaneLaunch,
-    ZellijPlacement, ZellijSplitDirection, normalize_placement, resolve_launch_cwd, split_argv,
+    ZellijPlacement, ZellijSplitDirection, is_ui_argv, normalize_placement, resolve_launch_cwd,
+    split_argv,
 };
 pub use names::{
     ACTION_NAMESPACE, COMMAND_NAMESPACE, NativeType, action_kebab_to_variant, is_exposed_command,

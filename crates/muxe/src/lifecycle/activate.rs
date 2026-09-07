@@ -104,7 +104,7 @@ pub enum ActivateError {
     #[error(transparent)]
     Journal(#[from] JournalError),
     #[error(transparent)]
-    Control(#[from] ControlError),
+    Receipt(#[from] crate::integration::receipt::ReceiptError),
     #[error(transparent)]
     Asset(#[from] compatibility::AssetVerificationError),
     #[error(transparent)]
@@ -551,10 +551,22 @@ impl PlannedUnit {
 /// Outcome of one activation unit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnitOutcome {
-    Committed { unit: String },
-    Unchanged { unit: String },
-    RolledBack { unit: String, reason: String },
-    Failed { unit: String, reason: String },
+    Committed {
+        unit: String,
+    },
+    /// Every broker already reports the target; Zellij also has a
+    /// receipt-authorized stable bridge whose bytes match the verified package.
+    Unchanged {
+        unit: String,
+    },
+    RolledBack {
+        unit: String,
+        reason: String,
+    },
+    Failed {
+        unit: String,
+        reason: String,
+    },
 }
 
 /// Final activation report naming every unit outcome.
@@ -589,6 +601,16 @@ pub struct ActivateInputs<'a, C, S, R, P> {
     pub logger: Option<&'a Logger>,
 }
 
+/// Artifacts and authority captured before any broker is drained. The staging
+/// path remains owned by this activation until the Zellij swap consumes it or
+#[derive(Debug)]
+struct GlobalPreflight {
+    verified_bridge: Option<compatibility::NativeAssetVerification>,
+    staged_bridge_path: Option<PathBuf>,
+    expected_current: Option<String>,
+    previous_authority: Option<String>,
+}
+
 /// Runs one activation across every selected unit, committing or rolling back
 /// each independently.
 ///
@@ -621,6 +643,7 @@ where
             reason: format!("activation recovery remains unresolved for {unit}: {reason}"),
         });
     }
+
     inputs.hooks.check(ActivateStep::PreflightDone)?;
 
     let registry = Registry::open(inputs.cache_dir)?;
@@ -630,17 +653,26 @@ where
         return Err(ActivateError::NoLiveUnits);
     }
 
-    // Global preflight before any unit mutates.
-    let verified_bridge = global_preflight(&inputs, &units)
+    // Global preflight before any unit mutates. Zellij authority and staged
+    // bytes are acquired here, before any old broker is drained.
+    let mut preparation = global_preflight(&inputs, &units)
         .await
         .map_err(ActivateError::Preflight)?;
-    inputs.hooks.check(ActivateStep::PreflightDone)?;
+    if let Err(error) = inputs.hooks.check(ActivateStep::PreflightDone) {
+        if let Some(staged) = preparation.staged_bridge_path.take() {
+            integration::bridge::discard_staging(&staged);
+        }
+        return Err(error);
+    }
 
     let mut report = ActivateReport::default();
     for unit in units {
         report
             .units
-            .push(activate_unit(&inputs, &unit, verified_bridge.as_ref()).await);
+            .push(activate_unit(&inputs, &unit, &mut preparation).await);
+    }
+    if let Some(staged) = preparation.staged_bridge_path.take() {
+        integration::bridge::discard_staging(&staged);
     }
     Ok(report)
 }
@@ -739,28 +771,72 @@ fn group_zellij(live: &[BrokerEntry]) -> Vec<PlannedUnit> {
         .collect()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "global preflight keeps receipt ownership, bridge backup authority, and all-member admission checks in one ordered gate"
+)]
 async fn global_preflight<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     units: &[PlannedUnit],
-) -> Result<Option<compatibility::NativeAssetVerification>, String>
+) -> Result<GlobalPreflight, String>
 where
     P: Preflight,
 {
     let zellij_selected = units
         .iter()
         .any(|unit| matches!(unit, PlannedUnit::Zellij { .. }));
-    let verified_bridge = if zellij_selected {
+    let mut preparation = GlobalPreflight {
+        verified_bridge: None,
+        staged_bridge_path: None,
+        expected_current: None,
+        previous_authority: None,
+    };
+    if zellij_selected {
         let staged = inputs.staged_bridge.as_ref().ok_or_else(|| {
             "a Zellij unit is selected but no staged replacement bridge was provided".to_owned()
         })?;
-        Some(
+        let verification =
             compatibility::verify_packaged_asset(&staged.bytes).map_err(|error| {
                 format!("staged bridge rejected by native package identity: {error}")
-            })?,
-        )
-    } else {
-        None
-    };
+            })?;
+        let stable = integration::stable_bridge_path(inputs.config_dir);
+        let directory = integration::integration_dir(inputs.config_dir);
+        fsutil::ensure_owner_dir(&directory)
+            .map_err(|error| format!("integration directory is not writable: {error}"))?;
+        let receipt = integration::receipt::load(&directory)
+            .map_err(|error| format!("cannot read integration receipt: {error}"))?
+            .ok_or_else(|| {
+                "activation requires an existing receipt-owned Zellij bridge; install it first"
+                    .to_owned()
+            })?;
+        if receipt.bridge.canonical_path != stable {
+            return Err(format!(
+                "integration receipt canonical path {} does not match {}",
+                receipt.bridge.canonical_path.display(),
+                stable.display()
+            ));
+        }
+        let receipt_digest = Some(receipt.bridge.installed_digest.as_str());
+        integration::bridge::check_previous(&stable, receipt.bridge.previous_digest.as_deref())
+            .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
+        let (eligibility, _) = integration::bridge::check_destination(&stable, receipt_digest)
+            .map_err(|error| format!("bridge preflight failed: {error}"))?;
+        let expected_current = match eligibility {
+            integration::bridge::Eligibility::Absent => None,
+            integration::bridge::Eligibility::EligibleReplace { current_digest } => {
+                Some(current_digest)
+            }
+        };
+        if expected_current.is_some() {
+            fsutil::read_owner_file(&stable)
+                .map_err(|error| format!("bridge destination is not owner-only: {error}"))?;
+        }
+        preparation.verified_bridge = Some(verification);
+        preparation.expected_current = expected_current;
+        preparation
+            .previous_authority
+            .clone_from(&receipt.bridge.previous_digest);
+    }
     inputs.preflight.validate_config().await?;
     for unit in units {
         match unit {
@@ -796,12 +872,23 @@ where
     }
     fsutil::ensure_owner_dir(&journal::activation_dir(inputs.cache_dir))
         .map_err(|error| format!("activation journal directory is not writable: {error}"))?;
-    Ok(verified_bridge)
+    if zellij_selected {
+        let stable = integration::stable_bridge_path(inputs.config_dir);
+        let staged = inputs
+            .staged_bridge
+            .as_ref()
+            .ok_or_else(|| "missing staged replacement bridge".to_owned())?;
+        let staged_path = integration::bridge::stage(&stable, &staged.bytes)
+            .map_err(|error| format!("bridge staging failed: {error}"))?;
+        preparation.staged_bridge_path = Some(staged_path);
+    }
+    Ok(preparation)
 }
+
 async fn activate_unit<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     unit: &PlannedUnit,
-    verified_bridge: Option<&compatibility::NativeAssetVerification>,
+    preparation: &mut GlobalPreflight,
 ) -> UnitOutcome
 where
     C: ControlPort,
@@ -810,8 +897,25 @@ where
     P: Preflight,
 {
     let label = unit_label(unit);
-    match activate_unit_inner(inputs, unit, verified_bridge).await {
-        Ok(outcome) => outcome,
+    let _unit_lock = match journal::acquire_unit_lock(inputs.cache_dir, &unit.unit_kind()) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return UnitOutcome::Failed {
+                unit: label,
+                reason: format!("activation unit is already in progress: {error}"),
+            };
+        }
+    };
+    match activate_unit_inner_prepared(inputs, unit, preparation).await {
+        Ok(outcome) => {
+            if matches!(unit, PlannedUnit::Zellij { .. })
+                && matches!(outcome, UnitOutcome::Unchanged { .. })
+                && let Some(staged) = preparation.staged_bridge_path.take()
+            {
+                integration::bridge::discard_staging(&staged);
+            }
+            outcome
+        }
         Err(ActivateError::FaultInjected { step }) => UnitOutcome::Failed {
             unit: label,
             reason: format!("fault injected after {step:?}"),
@@ -841,14 +945,31 @@ struct PreparedMember<C: ControlPort> {
     old_session: C::Session,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "single activation transaction with ordered phases (fast-path, journal, drain, spawn, bridge swap, reload, readiness, commit) plus coupled rollback; splitting would scatter the phase ordering and abort coupling this function exists to pin"
-)]
-async fn activate_unit_inner<C, S, R, P>(
+#[cfg(test)]
+async fn activate_unit_with_global_preflight<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     unit: &PlannedUnit,
-    verified_bridge: Option<&compatibility::NativeAssetVerification>,
+) -> Result<UnitOutcome, ActivateError>
+where
+    C: ControlPort,
+    S: BrokerSpawner,
+    R: HostReloader,
+    P: Preflight,
+{
+    let mut preparation = global_preflight(inputs, std::slice::from_ref(unit))
+        .await
+        .map_err(ActivateError::Preflight)?;
+    Ok(activate_unit(inputs, unit, &mut preparation).await)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "single activation transaction with ordered phases (fast-path, journal, drain, spawn, bridge swap, reload, readiness, commit) plus coupled rollback"
+)]
+async fn activate_unit_inner_prepared<C, S, R, P>(
+    inputs: &ActivateInputs<'_, C, S, R, P>,
+    unit: &PlannedUnit,
+    preparation: &mut GlobalPreflight,
 ) -> Result<UnitOutcome, ActivateError>
 where
     C: ControlPort,
@@ -862,7 +983,9 @@ where
         PlannedUnit::Zellij { entries, .. } => entries.clone(),
     };
 
-    // Fast path: every old broker already runs the target record.
+    // Fast path: every old broker already runs the target record. A Zellij
+    // unit also needs the stable bridge bytes to match the verified package;
+    // broker status alone cannot prove the installed bridge identity.
     let mut all_current = true;
     for entry in &entries {
         if let Ok(mut session) = inputs.control.connect(&entry.socket).await {
@@ -878,7 +1001,18 @@ where
             break;
         }
     }
-    if all_current {
+    let bridge_current = all_current
+        && match unit {
+            PlannedUnit::Herdr { .. } => true,
+            PlannedUnit::Zellij { .. } => {
+                matches!(
+                    (&preparation.expected_current, &preparation.verified_bridge),
+                    (Some(current_digest), Some(verification))
+                        if current_digest == &verification.packaged_digest
+                )
+            }
+        };
+    if all_current && bridge_current {
         return Ok(UnitOutcome::Unchanged { unit: label });
     }
 
@@ -941,14 +1075,17 @@ where
         record.handoff_id = Some(member.handoff_hex.clone());
     }
     if matches!(unit, PlannedUnit::Zellij { .. }) {
-        let verification = verified_bridge.ok_or_else(|| ActivateError::UnitFailed {
-            reason: "Zellij bridge was not verified during global preflight".to_owned(),
-        })?;
+        let verification =
+            preparation
+                .verified_bridge
+                .as_ref()
+                .ok_or_else(|| ActivateError::UnitFailed {
+                    reason: "Zellij bridge was not verified during global preflight".to_owned(),
+                })?;
         journal.staged_bridge_digest = Some(verification.packaged_digest.clone());
     }
+    journal.refresh_target_members();
     journal::write_journal(inputs.cache_dir, &journal)?;
-    inputs.hooks.check(ActivateStep::OldPrepared)?;
-
     // Start one target broker per prepared old broker.
     let mut targets: Vec<TargetHandle> = Vec::new();
     let mut spawn_failure: Option<String> = None;
@@ -988,6 +1125,7 @@ where
             }
         }
     }
+    journal.refresh_target_members();
     if let Some(reason) = spawn_failure {
         let rollback = abort_prepared(
             inputs,
@@ -1009,46 +1147,31 @@ where
 
     // Zellij bridge transaction: swap once, reload every session.
     if let PlannedUnit::Zellij { .. } = unit {
-        let staged = inputs
-            .staged_bridge
-            .as_ref()
-            .ok_or_else(|| ActivateError::UnitFailed {
-                reason: "missing staged bridge for Zellij unit".to_owned(),
-            })?;
+        let disk_staged =
+            preparation
+                .staged_bridge_path
+                .clone()
+                .ok_or_else(|| ActivateError::UnitFailed {
+                    reason: "missing globally staged bridge for Zellij unit".to_owned(),
+                })?;
         let stable = integration::stable_bridge_path(inputs.config_dir);
-        let directory = integration::integration_dir(inputs.config_dir);
-        fsutil::ensure_owner_dir(&directory)?;
-        let (expected_current, authority) = match activation_authority(&directory, &stable) {
-            Ok(authority) => authority,
-            Err(reason) => {
-                let rollback = abort_prepared(
-                    inputs,
-                    unit,
-                    &journal,
-                    &journal_path,
-                    prepared,
-                    targets,
-                    None,
-                )
-                .await;
-                return Ok(UnitOutcome::RolledBack {
-                    unit: label,
-                    reason: with_rollback(reason, &rollback),
-                });
-            }
-        };
-        let disk_staged = integration::bridge::stage(&stable, &staged.bytes)?;
         if stable.exists() {
-            let record = integration::bridge::ensure_backup(&stable, authority.as_deref())?;
+            let record = integration::bridge::ensure_backup(
+                &stable,
+                preparation.previous_authority.as_deref(),
+            )?;
             journal.old_bridge_digest = Some(record.digest.clone());
             journal.backup_path = Some(record.path);
             journal::write_journal(inputs.cache_dir, &journal)?;
         }
-        if let Err(error) =
-            integration::bridge::commit(&disk_staged, &stable, expected_current.as_deref())
-        {
+        if let Err(error) = integration::bridge::commit(
+            &disk_staged,
+            &stable,
+            preparation.expected_current.as_deref(),
+        ) {
             let reason = error.to_string();
             integration::bridge::discard_staging(&disk_staged);
+            preparation.staged_bridge_path = None;
             let rollback = abort_prepared(
                 inputs,
                 unit,
@@ -1064,6 +1187,7 @@ where
                 reason: with_rollback(reason, &rollback),
             });
         }
+        preparation.staged_bridge_path = None;
         inputs.hooks.check(ActivateStep::BridgeSwapped)?;
         let bridge_url = integration::kdl::bridge_url(&stable);
         for member in &prepared {
@@ -1165,9 +1289,35 @@ where
     }
     inputs.hooks.check(ActivateStep::Committed)?;
     if commit_failures.is_empty() {
+        if let PlannedUnit::Zellij { .. } = unit {
+            let verification =
+                preparation
+                    .verified_bridge
+                    .as_ref()
+                    .ok_or_else(|| ActivateError::UnitFailed {
+                        reason: "Zellij commit lacks packaged bridge verification".to_owned(),
+                    })?;
+            if let Err(error) = commit_bridge_receipt(
+                inputs.config_dir,
+                &integration::stable_bridge_path(inputs.config_dir),
+                &inputs.target,
+                verification,
+                journal.old_bridge_digest.clone(),
+            ) {
+                return Ok(UnitOutcome::Failed {
+                    unit: label,
+                    reason: format!("bridge commit receipt update failed: {error}"),
+                });
+            }
+        }
         for record in &mut journal.members {
             record.state = MemberTransition::Committed;
         }
+        for target in &mut journal.target_members {
+            target.state = journal::TargetTransition::Committed;
+        }
+        journal.recovery = journal::RecoveryPhase::Committed;
+        journal::write_journal(inputs.cache_dir, &journal)?;
         journal::remove_journal(&journal_path)?;
         log(inputs.logger, &label, "activation committed")?;
         Ok(UnitOutcome::Committed { unit: label })
@@ -1219,48 +1369,6 @@ fn session_name(entry: &BrokerEntry) -> String {
         .unwrap_or_else(|| entry.discovery_key.clone())
 }
 
-/// Determines the swap authority for a Zellij group: the expected current
-/// digest plus the receipt authority for rotating the rollback copy.
-///
-/// Returns the human reason when the existing bridge is untrusted, in which
-/// case the caller rolls back before staging anything.
-fn activation_authority(
-    directory: &Path,
-    stable: &Path,
-) -> Result<(Option<String>, Option<String>), String> {
-    if let Some(receipt) =
-        integration::receipt::load(directory).map_err(|error| error.to_string())?
-    {
-        if receipt.bridge.canonical_path != stable {
-            return Err(format!(
-                "receipt canonical path {} does not match {}",
-                receipt.bridge.canonical_path.display(),
-                stable.display()
-            ));
-        }
-        match std::fs::read(stable) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok((None, receipt.bridge.previous_digest))
-            }
-            Err(error) => Err(format!("cannot read existing bridge: {error}")),
-            Ok(current) => {
-                let found = fsutil::sha256_hex(&current);
-                if found != receipt.bridge.installed_digest {
-                    return Err(format!(
-                        "existing bridge digest {found} does not match receipt {}; resolve the file before retrying",
-                        receipt.bridge.installed_digest
-                    ));
-                }
-                Ok((Some(found), receipt.bridge.previous_digest))
-            }
-        }
-    } else if stable.exists() {
-        Err("existing bridge has no receipt; resolve the file before retrying".to_owned())
-    } else {
-        Ok((None, None))
-    }
-}
-
 /// A target is ready only when it reports the exact expected handoff, the
 /// matching host identity, and the complete target compatibility record.
 /// Zellij members additionally require a complete, nonempty, duplicate-free
@@ -1282,7 +1390,12 @@ fn target_ready(
         return false;
     }
     if member.host_kind == "zellij" {
-        return status.ready.as_ref().is_some_and(zellij_census_covered);
+        let expected_build_id = target
+            .zellij
+            .as_ref()
+            .and_then(|zellij| zellij.bridge_build_id);
+        return expected_build_id.is_some_and(|build_id| !build_id.is_zero())
+            && status.ready.as_ref().is_some_and(zellij_census_covered);
     }
     true
 }
@@ -1426,6 +1539,58 @@ where
     rollback_errors
 }
 
+fn commit_bridge_receipt(
+    config_dir: &Path,
+    stable: &Path,
+    target: &CompatibilityRecord,
+    verification: &compatibility::NativeAssetVerification,
+    old_bridge_digest: Option<String>,
+) -> Result<(), ActivateError> {
+    let directory = integration::integration_dir(config_dir);
+    let mut receipt =
+        integration::receipt::load(&directory)?.ok_or_else(|| ActivateError::UnitFailed {
+            reason: "Zellij bridge commit has no integration receipt".to_owned(),
+        })?;
+    if receipt.bridge.canonical_path != stable {
+        return Err(ActivateError::UnitFailed {
+            reason: format!(
+                "Zellij receipt canonical path {} does not match {}",
+                receipt.bridge.canonical_path.display(),
+                stable.display()
+            ),
+        });
+    }
+    let target_digest = verification.packaged_digest.as_str();
+    if let Some(old_digest) = old_bridge_digest.as_deref()
+        && receipt.bridge.installed_digest != old_digest
+        && receipt.bridge.installed_digest != target_digest
+    {
+        return Err(ActivateError::UnitFailed {
+            reason: format!(
+                "Zellij receipt ownership changed during activation: expected {old_digest} or target {target_digest}, found {}",
+                receipt.bridge.installed_digest
+            ),
+        });
+    }
+    let previous_digest = if receipt.bridge.installed_digest == target_digest {
+        receipt.bridge.previous_digest.clone()
+    } else {
+        old_bridge_digest.or(receipt.bridge.previous_digest.take())
+    };
+    receipt
+        .bridge
+        .installed_version
+        .clone_from(&target.muxe_version);
+    receipt
+        .bridge
+        .installed_digest
+        .clone_from(&verification.packaged_digest);
+    receipt.bridge.previous_digest = previous_digest;
+    receipt.bridge.bridge_compat.clone_from(&target.zellij);
+    integration::receipt::store(&directory, &receipt)?;
+    Ok(())
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1498,7 +1663,18 @@ where
                 continue;
             }
         };
+        let lock = match journal::acquire_unit_lock(cache_dir, &journal.unit) {
+            Ok(lock) => lock,
+            Err(error) => {
+                outcomes.push(RecoveryOutcome::Preserved {
+                    unit: path.display().to_string(),
+                    reason: format!("recovery unit lock unavailable: {error}"),
+                });
+                continue;
+            }
+        };
         outcomes.push(recover_one(cache_dir, control, reloader, journal, &path, logger).await);
+        drop(lock);
     }
     Ok(outcomes)
 }
@@ -1590,7 +1766,6 @@ where
                     reason: "journal handoff ID malformed".to_owned(),
                 };
             };
-            // Commit is idempotent: targets that self-committed acknowledge.
             match control.connect(&record.old_socket).await {
                 Ok(mut session) => {
                     if let Err(error) = session.commit(&handoff).await {
@@ -1600,7 +1775,25 @@ where
                 Err(error) => failures.push(format!("{}: {error}", record.host_identity)),
             }
         }
+        if journal.backup_path.is_some()
+            && matches!(journal.unit, UnitKind::Zellij { .. })
+            && let Err(error) = restore_recorded_receipt(&journal)
+        {
+            return RecoveryOutcome::Preserved {
+                unit,
+                reason: format!("target is committed but receipt recovery failed: {error}"),
+            };
+        }
         if failures.is_empty() {
+            for record in &mut journal.members {
+                record.state = MemberTransition::Committed;
+            }
+            if let Err(error) = journal::write_journal(cache_dir, &journal) {
+                return RecoveryOutcome::Preserved {
+                    unit,
+                    reason: format!("target commit state could not be persisted: {error}"),
+                };
+            }
             if let Err(error) = journal::remove_journal(path) {
                 return RecoveryOutcome::Preserved {
                     unit,
@@ -1623,7 +1816,8 @@ where
     let mut contacted_any = false;
     let mut absent: Vec<String> = Vec::new();
     let unit_durable = matches!(journal.state, JournalState::Ready);
-    for (record, probe) in journal.members.iter().zip(probes.iter()) {
+    for (member, probe) in journal.members.iter_mut().zip(probes.iter()) {
+        let record = member.clone();
         if matches!(probe, Probe::Silent) {
             // An absent target after durable Ready is a unit fate, not an
             // ambiguity: the member recorded Ready with its handoff, the unit
@@ -1669,6 +1863,8 @@ where
                 contacted_any = true;
                 if let Err(error) = session.abort(&handoff).await {
                     failures.push(format!("{}: {error}", record.host_identity));
+                } else {
+                    member.state = MemberTransition::Aborted;
                 }
             }
             Err(error) => failures.push(format!("{}: {error}", record.host_identity)),
@@ -1684,6 +1880,12 @@ where
         }
     }
     if failures.is_empty() && contacted_any {
+        if let Err(error) = journal::write_journal(cache_dir, &journal) {
+            return RecoveryOutcome::Preserved {
+                unit,
+                reason: format!("old-unit resume acknowledgments could not be persisted: {error}"),
+            };
+        }
         if let Err(error) = journal::remove_journal(path) {
             return RecoveryOutcome::Preserved {
                 unit,
@@ -1708,6 +1910,7 @@ where
         // was verified. Preserve the journal for diagnosis or restart.
         RecoveryOutcome::Preserved {
             unit,
+
             reason: "no member reachable and no target recorded; operator restart required"
                 .to_owned(),
         }
@@ -1719,6 +1922,142 @@ where
     }
 }
 
+/// # Errors
+///
+/// Returns an error when the recorded backup, staged digest, or restored
+/// bridge bytes are missing or inconsistent.
+/// Restores only recorded bridge bytes; callers persist `bridge_restored`
+/// before resuming any old member.
+pub fn restore_recorded_bridge_artifact(journal: &mut ActivationJournal) -> Result<(), String> {
+    if journal.bridge_restored {
+        return Ok(());
+    }
+    let backup = journal
+        .backup_path
+        .clone()
+        .ok_or_else(|| "no recorded bridge backup; diagnosis required".to_owned())?;
+    let staged = journal
+        .staged_bridge_digest
+        .clone()
+        .ok_or_else(|| "no recorded staged digest; diagnosis required".to_owned())?;
+    let old = journal
+        .old_bridge_digest
+        .clone()
+        .ok_or_else(|| "no recorded old digest; diagnosis required".to_owned())?;
+    let stable = backup
+        .parent()
+        .map(|parent| parent.join(integration::BRIDGE_FILE_NAME))
+        .ok_or_else(|| "recorded bridge backup has no parent".to_owned())?;
+    let current =
+        std::fs::read(&stable).map_err(|error| format!("cannot read stable bridge: {error}"))?;
+    if fsutil::sha256_hex(&current) != staged {
+        return Err("stable bridge is neither staged nor old; diagnosis required".to_owned());
+    }
+    std::fs::rename(&backup, &stable)
+        .map_err(|error| format!("cannot restore old bridge: {error}"))?;
+    let restored = std::fs::read(&stable)
+        .map_err(|error| format!("cannot verify restored bridge: {error}"))?;
+    if fsutil::sha256_hex(&restored) != old {
+        return Err("restored bridge digest mismatch; diagnosis required".to_owned());
+    }
+    journal.bridge_restored = true;
+    Ok(())
+}
+
+fn restore_recorded_receipt(journal: &ActivationJournal) -> Result<(), String> {
+    let backup = journal
+        .backup_path
+        .as_ref()
+        .ok_or_else(|| "committed Zellij journal has no bridge backup".to_owned())?;
+    let stable = backup
+        .parent()
+        .map(|parent| parent.join(integration::BRIDGE_FILE_NAME))
+        .ok_or_else(|| "recorded bridge backup has no parent".to_owned())?;
+    let directory = stable
+        .parent()
+        .ok_or_else(|| "recorded bridge has no integration directory".to_owned())?;
+    let mut receipt = integration::receipt::load(directory)
+        .map_err(|error| format!("cannot read integration receipt: {error}"))?
+        .ok_or_else(|| "committed Zellij journal has no integration receipt".to_owned())?;
+    if receipt.bridge.canonical_path != stable {
+        return Err("integration receipt canonical path changed during recovery".to_owned());
+    }
+    let target_digest = journal
+        .staged_bridge_digest
+        .as_deref()
+        .ok_or_else(|| "committed Zellij journal has no staged bridge digest".to_owned())?;
+    if let Some(old_digest) = journal.old_bridge_digest.as_deref()
+        && receipt.bridge.installed_digest != old_digest
+        && receipt.bridge.installed_digest != target_digest
+    {
+        return Err("integration receipt ownership changed during recovery".to_owned());
+    }
+    let previous = journal
+        .old_bridge_digest
+        .clone()
+        .or(receipt.bridge.previous_digest.take());
+    receipt
+        .bridge
+        .installed_version
+        .clone_from(&journal.target_record.muxe_version);
+    target_digest.clone_into(&mut receipt.bridge.installed_digest);
+    receipt.bridge.previous_digest = previous;
+    receipt
+        .bridge
+        .bridge_compat
+        .clone_from(&journal.target_record.zellij);
+    integration::receipt::store(directory, &receipt)
+        .map_err(|error| format!("cannot store recovered integration receipt: {error}"))
+}
+/// # Errors
+///
+/// Returns an error when receipt ownership or the recorded rollback artifacts
+/// do not match the journal.
+/// Restores receipt ownership for a durable rollback after the recorded old
+/// bridge has been installed. The receipt remains authoritative and preserves
+/// the target digest as the next rollback authority.
+pub fn restore_recorded_rollback_receipt(journal: &ActivationJournal) -> Result<(), String> {
+    let backup = journal
+        .backup_path
+        .as_ref()
+        .ok_or_else(|| "rollback journal has no bridge backup".to_owned())?;
+    let stable = backup
+        .parent()
+        .map(|parent| parent.join(integration::BRIDGE_FILE_NAME))
+        .ok_or_else(|| "rollback bridge has no integration directory".to_owned())?;
+    let directory = stable
+        .parent()
+        .ok_or_else(|| "rollback bridge has no integration directory".to_owned())?;
+    let mut receipt = integration::receipt::load(directory)
+        .map_err(|error| format!("cannot read integration receipt: {error}"))?
+        .ok_or_else(|| "rollback integration receipt is missing".to_owned())?;
+    if receipt.bridge.canonical_path != stable {
+        return Err("integration receipt canonical path changed during rollback".to_owned());
+    }
+    let old = journal
+        .old_bridge_digest
+        .as_deref()
+        .ok_or_else(|| "rollback journal has no old bridge digest".to_owned())?;
+    let target = journal
+        .staged_bridge_digest
+        .clone()
+        .ok_or_else(|| "rollback journal has no staged bridge digest".to_owned())?;
+    if receipt.bridge.installed_digest != target && receipt.bridge.installed_digest != old {
+        return Err("integration receipt ownership changed during rollback".to_owned());
+    }
+    receipt
+        .bridge
+        .installed_version
+        .clone_from(&journal.old_record.muxe_version);
+    old.clone_into(&mut receipt.bridge.installed_digest);
+    receipt.bridge.previous_digest = Some(target);
+    receipt
+        .bridge
+        .bridge_compat
+        .clone_from(&journal.old_record.zellij);
+    integration::receipt::store(directory, &receipt)
+        .map_err(|error| format!("cannot store rollback integration receipt: {error}"))
+}
 /// Restores the recorded old bridge when the stable bytes are exactly the
 /// staged ones, then reloads every recorded session. Any other on-disk state
 /// is ambiguity, reported as an error with artifacts preserved.
@@ -1755,18 +2094,20 @@ where
         UnitKind::Herdr { .. } => return Ok(()),
     };
     let _ = cache_dir;
-    let current =
-        std::fs::read(&stable).map_err(|error| format!("cannot read stable bridge: {error}"))?;
-    if fsutil::sha256_hex(&current) != staged_digest {
-        return Err("stable bridge is neither staged nor old; diagnosis required".to_owned());
-    }
-    std::fs::rename(&backup, &stable)
-        .map_err(|error| format!("cannot restore old bridge: {error}"))?;
-    let _ = fsutil::sync_dir_of(&stable);
-    let restored = std::fs::read(&stable)
-        .map_err(|error| format!("cannot verify restored bridge: {error}"))?;
-    if fsutil::sha256_hex(&restored) != old_digest {
-        return Err("restored bridge digest mismatch; diagnosis required".to_owned());
+    if !journal.bridge_restored {
+        let current = std::fs::read(&stable)
+            .map_err(|error| format!("cannot read stable bridge: {error}"))?;
+        if fsutil::sha256_hex(&current) != staged_digest {
+            return Err("stable bridge is neither staged nor old; diagnosis required".to_owned());
+        }
+        std::fs::rename(&backup, &stable)
+            .map_err(|error| format!("cannot restore old bridge: {error}"))?;
+        let _ = fsutil::sync_dir_of(&stable);
+        let restored = std::fs::read(&stable)
+            .map_err(|error| format!("cannot verify restored bridge: {error}"))?;
+        if fsutil::sha256_hex(&restored) != old_digest {
+            return Err("restored bridge digest mismatch; diagnosis required".to_owned());
+        }
     }
     let bridge_url = integration::kdl::bridge_url(&stable);
     for record in &journal.members {
@@ -1774,6 +2115,26 @@ where
             .reload_bridge(&record.host_identity, &bridge_url)
             .map_err(|error| format!("rollback reload {}: {error}", record.host_identity))?;
     }
+    Ok(())
+}
+/// # Errors
+///
+/// Returns an error when the recorded bridge cannot be restored or a session
+/// reload fails.
+/// Production recovery entry point for restoring the recorded bridge and
+/// reloading every recorded session through an explicitly supplied reloader.
+pub fn restore_recorded_bridge_and_reload<R>(
+    journal: &mut ActivationJournal,
+    reloader: &R,
+) -> Result<(), String>
+where
+    R: HostReloader,
+{
+    if journal.bridge_restored {
+        return Ok(());
+    }
+    restore_recorded_bridge(Path::new("."), journal, reloader)?;
+    journal.bridge_restored = true;
     Ok(())
 }
 
@@ -1798,6 +2159,14 @@ mod tests {
     fn target_record() -> CompatibilityRecord {
         CompatibilityRecord {
             muxe_version: "0.2.0".to_owned(),
+            zellij: Some(muxe_protocol::control::ZellijCompatibility {
+                source_revision: muxe_zellij_protocol::compat::pinned_source_revision().to_owned(),
+                generated_action_fingerprint:
+                    muxe_zellij_protocol::compat::generated_action_fingerprint(),
+                bridge_protocol_fingerprint:
+                    muxe_zellij_protocol::compat::bridge_protocol_fingerprint(),
+                bridge_build_id: Some(muxe_zellij_protocol::compat::bridge_build_id()),
+            }),
             ..old_record()
         }
     }
@@ -2131,14 +2500,28 @@ mod tests {
     struct FixtureReloader {
         fail_sessions: Vec<String>,
         reloaded: Arc<Mutex<Vec<(String, String)>>>,
+        reloaded_bytes: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl HostReloader for FixtureReloader {
         fn reload_bridge(&self, session: &str, bridge_url: &str) -> Result<(), ActivateError> {
+            let path =
+                bridge_url
+                    .strip_prefix("file:")
+                    .ok_or_else(|| ActivateError::UnitFailed {
+                        reason: format!("fixture bridge URL is not file-based: {bridge_url}"),
+                    })?;
+            let bytes = std::fs::read(path).map_err(|error| ActivateError::UnitFailed {
+                reason: format!("fixture cannot observe bridge bytes: {error}"),
+            })?;
             self.reloaded
                 .lock()
                 .expect("fixture reloads are not poisoned")
                 .push((session.to_owned(), bridge_url.to_owned()));
+            self.reloaded_bytes
+                .lock()
+                .expect("fixture bridge bytes are not poisoned")
+                .push(bytes);
             if self.fail_sessions.iter().any(|entry| entry == session) {
                 return Err(ActivateError::Reload {
                     session: session.to_owned(),
@@ -2275,6 +2658,421 @@ mod tests {
             handoff_byte: 0x11,
             fail_prepare: false,
         }
+    }
+    fn zellij_entry(socket: PathBuf, bridge_path: PathBuf) -> BrokerEntry {
+        BrokerEntry {
+            host_kind: "zellij".to_owned(),
+            discovery_key: "session".to_owned(),
+            socket,
+            server_pid: std::process::id(),
+            started_at: 1,
+            bridge_path: Some(bridge_path),
+            live_server: Some("session".to_owned()),
+        }
+    }
+
+    async fn zellij_member(
+        fixture: &Fixture,
+        bridge_path: &Path,
+        current: CompatibilityRecord,
+    ) -> (BrokerEntry, JoinHandle<()>) {
+        let (socket, old) = fixture
+            .old_broker(
+                "session",
+                BrokerScript {
+                    current,
+                    ..herdr_script()
+                },
+            )
+            .await;
+        let entry = zellij_entry(socket, bridge_path.to_path_buf());
+        Registry::open(&fixture.cache)
+            .expect("registry opens")
+            .register(entry.clone())
+            .expect("Zellij registration replaces the fixture host entry");
+        (entry, old)
+    }
+
+    fn zellij_inputs<'a>(
+        fixture: &'a Fixture,
+        staged_bridge: &[u8],
+    ) -> ActivateInputs<'a, LiveControl, ProcessSpawner, FixtureReloader, FixturePreflight> {
+        ActivateInputs {
+            config_dir: &fixture.config,
+            cache_dir: &fixture.cache,
+            target: target_record(),
+            staged_bridge: Some(StagedBridge {
+                bytes: staged_bridge.to_vec(),
+            }),
+            scope: HostScope::Zellij,
+            current: None,
+            control: &fixture.control,
+            spawner: &fixture.spawner,
+            reloader: &fixture.reloader,
+            preflight: &fixture.preflight,
+            spawn_argv: &|_member| Ok((PathBuf::from("/bin/sleep"), vec![OsString::from("30")])),
+            readiness_deadline: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(5),
+            hooks: ActivateHooks::default(),
+            logger: None,
+        }
+    }
+
+    fn store_bridge_receipt(fixture: &Fixture, stable: &Path, installed_digest: String) {
+        let directory = integration::integration_dir(&fixture.config);
+        integration::receipt::store(
+            &directory,
+            &integration::receipt::Receipt {
+                schema_version: integration::receipt::RECEIPT_SCHEMA_VERSION,
+                bridge: integration::receipt::BridgeRecord {
+                    canonical_path: stable.to_path_buf(),
+                    installed_version: "0.1.0".to_owned(),
+                    installed_digest,
+                    previous_digest: None,
+                    bridge_compat: None,
+                },
+                configs: Vec::new(),
+            },
+        )
+        .expect("bridge receipt stores");
+    }
+    fn producer_wasm_bytes() -> Vec<u8> {
+        let path = std::env::var_os("MUXE_TEST_PACKAGED_WASM")
+            .expect("packaged activation tests require MUXE_TEST_PACKAGED_WASM");
+        std::fs::read(path).expect("read pinned producer WASM")
+    }
+    fn prepare_bridge_directory(fixture: &Fixture) -> PathBuf {
+        let directory = integration::integration_dir(&fixture.config);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(
+            &directory,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        directory
+    }
+    fn previous_producer_wasm_bytes() -> Vec<u8> {
+        std::env::var_os("MUXE_TEST_PREVIOUS_WASM").map_or_else(
+            || b"old-bridge-bytes".to_vec(),
+            |path| std::fs::read(path).expect("read preserved previous producer WASM"),
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned producer WASM; run mise run verify-activation-preflight"]
+    async fn zellij_fast_path_requires_verified_stable_bridge_bytes() {
+        let fixture = Fixture::new();
+        let stable = integration::stable_bridge_path(&fixture.config);
+        prepare_bridge_directory(&fixture);
+        let target_bytes = producer_wasm_bytes();
+        std::fs::write(&stable, &target_bytes).unwrap();
+        std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
+        let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
+        let outcome = activate_unit_with_global_preflight(
+            &zellij_inputs(&fixture, &target_bytes),
+            &PlannedUnit::Zellij {
+                bridge_path: stable.clone(),
+                entries: vec![entry],
+            },
+        )
+        .await
+        .expect("matching broker and bridge take the fast path");
+        assert!(
+            matches!(outcome, UnitOutcome::Unchanged { .. }),
+            "matching broker and bridge should be unchanged: {outcome:?}"
+        );
+        assert_eq!(std::fs::read(&stable).unwrap(), target_bytes);
+        let mut names = std::fs::read_dir(integration::integration_dir(&fixture.config))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut expected = vec![
+            std::ffi::OsString::from(integration::bridge::BRIDGE_FILE_NAME),
+            std::ffi::OsString::from(integration::receipt::RECEIPT_FILE_NAME),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            names, expected,
+            "second Unchanged activation leaves no bridge staging artifact"
+        );
+        old.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned producer WASM; run mise run verify-activation-preflight"]
+    async fn zellij_stale_receipt_owned_bridge_transacts_despite_target_record() {
+        {
+            let fixture = Fixture::new();
+            let stable = integration::stable_bridge_path(&fixture.config);
+            prepare_bridge_directory(&fixture);
+            let target_bytes = producer_wasm_bytes();
+            let foreign_previous = b"foreign-rollback-artifact";
+            std::fs::write(&stable, &target_bytes).unwrap();
+            std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .unwrap();
+            store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
+            let directory = integration::integration_dir(&fixture.config);
+            let mut receipt = integration::receipt::load(&directory).unwrap().unwrap();
+            receipt.bridge.previous_digest = Some(fsutil::sha256_hex(b"recorded-rollback"));
+            integration::receipt::store(&directory, &receipt).unwrap();
+            let previous = integration::bridge::previous_path(&stable);
+            std::fs::write(&previous, foreign_previous).unwrap();
+            std::fs::set_permissions(
+                &previous,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )
+            .unwrap();
+            let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
+            let result = activate_unit_with_global_preflight(
+                &zellij_inputs(&fixture, &target_bytes),
+                &PlannedUnit::Zellij {
+                    bridge_path: stable,
+                    entries: vec![entry],
+                },
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(ActivateError::Preflight(message))
+                    if message.contains("rollback copy preflight failed")
+            ));
+            assert!(
+                fixture
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|event| { !event.contains("prepare") && !event.contains("spawn") }),
+                "foreign .previous rejection precedes Prepare and target spawn"
+            );
+            old.abort();
+        }
+        let fixture = Fixture::new();
+        let stable = integration::stable_bridge_path(&fixture.config);
+        prepare_bridge_directory(&fixture);
+        let old_bytes = previous_producer_wasm_bytes();
+        let target_bytes = producer_wasm_bytes();
+        assert_ne!(
+            old_bytes, target_bytes,
+            "packaged smoke needs distinct previous and current producer artifacts"
+        );
+        std::fs::write(&stable, &old_bytes).unwrap();
+        std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&old_bytes));
+        let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
+        let outcome = activate_unit_with_global_preflight(
+            &zellij_inputs(&fixture, &target_bytes),
+            &PlannedUnit::Zellij {
+                bridge_path: stable.clone(),
+                entries: vec![entry],
+            },
+        )
+        .await
+        .expect("transaction returns a unit outcome");
+        assert!(matches!(outcome, UnitOutcome::RolledBack { .. }));
+        let reloaded_bytes = fixture.reloader.reloaded_bytes.lock().unwrap();
+        assert_eq!(
+            &*reloaded_bytes,
+            &vec![target_bytes.clone(), old_bytes.clone()],
+            "reload observes target bytes before rollback and old bytes after rollback"
+        );
+        assert_eq!(
+            std::fs::read(&stable).unwrap(),
+            old_bytes,
+            "rollback preserves the receipt-owned old bytes"
+        );
+        old.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned producer WASM; run mise run verify-activation-preflight"]
+    async fn zellij_missing_or_unrecognized_bridge_never_reports_unchanged() {
+        for corrupt in [false, true] {
+            let fixture = Fixture::new();
+            let stable = integration::stable_bridge_path(&fixture.config);
+            prepare_bridge_directory(&fixture);
+            let target_bytes = producer_wasm_bytes();
+            let original = if corrupt {
+                std::fs::write(&stable, &target_bytes).unwrap();
+                std::fs::set_permissions(
+                    &stable,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                )
+                .unwrap();
+                store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(b"wrong-receipt"));
+                Some(target_bytes.as_slice())
+            } else {
+                None
+            };
+            if !corrupt {
+                assert!(!stable.exists(), "absent read must not create the bridge");
+            }
+            let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
+            let result = activate_unit_with_global_preflight(
+                &zellij_inputs(&fixture, &target_bytes),
+                &PlannedUnit::Zellij {
+                    bridge_path: stable.clone(),
+                    entries: vec![entry],
+                },
+            )
+            .await;
+            match result {
+                Err(ActivateError::Preflight(message)) => {
+                    if corrupt {
+                        assert!(message.contains("unrecognized bridge bytes"), "{message}");
+                    } else {
+                        assert!(message.contains("receipt-owned Zellij bridge"), "{message}");
+                    }
+                    if let Some(bytes) = original {
+                        assert_eq!(std::fs::read(&stable).unwrap(), bytes);
+                    }
+                }
+                Ok(outcome) => {
+                    panic!("unrecognized bridge unexpectedly reached activation: {outcome:?}");
+                }
+                Err(error) => panic!("unexpected activation error: {error}"),
+            }
+            old.abort();
+        }
+
+        let fixture = Fixture::new();
+        let stable = integration::stable_bridge_path(&fixture.config);
+        prepare_bridge_directory(&fixture);
+        let target_bytes = producer_wasm_bytes();
+        std::fs::write(&stable, &target_bytes).unwrap();
+        std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
+        let result = activate_unit_with_global_preflight(
+            &zellij_inputs(&fixture, &target_bytes),
+            &PlannedUnit::Zellij {
+                bridge_path: stable.clone(),
+                entries: vec![entry],
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ActivateError::Preflight(message))
+                if message.contains("receipt-owned Zellij bridge")
+        ));
+        assert_eq!(std::fs::read(&stable).unwrap(), target_bytes);
+        old.abort();
+    }
+    #[tokio::test]
+    #[ignore = "requires pinned producer WASM; run mise run verify-activation-preflight"]
+    async fn zellij_symlink_with_matching_receipt_fails_closed() {
+        let fixture = Fixture::new();
+        let stable = integration::stable_bridge_path(&fixture.config);
+        prepare_bridge_directory(&fixture);
+        let target = fixture.config.join("target-bridge.wasm");
+        let target_bytes = producer_wasm_bytes();
+        std::fs::write(&target, &target_bytes).unwrap();
+        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &stable).unwrap();
+        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
+        let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
+        let result = activate_unit_with_global_preflight(
+            &zellij_inputs(&fixture, &target_bytes),
+            &PlannedUnit::Zellij {
+                bridge_path: stable.clone(),
+                entries: vec![entry],
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ActivateError::Preflight(message))
+                if message.contains("not a regular owner-only file")
+        ));
+        assert!(
+            std::fs::symlink_metadata(&stable)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), target_bytes);
+        old.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned producer WASM; run mise run verify-activation-preflight"]
+    async fn zellij_receipt_path_and_mode_fail_closed() {
+        let fixture = Fixture::new();
+        let stable = integration::stable_bridge_path(&fixture.config);
+        prepare_bridge_directory(&fixture);
+        let target_bytes = producer_wasm_bytes();
+        std::fs::write(&stable, &target_bytes).unwrap();
+        std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let wrong_path = fixture.config.join("wrong-bridge.wasm");
+        let directory = integration::integration_dir(&fixture.config);
+        integration::receipt::store(
+            &directory,
+            &integration::receipt::Receipt {
+                schema_version: integration::receipt::RECEIPT_SCHEMA_VERSION,
+                bridge: integration::receipt::BridgeRecord {
+                    canonical_path: wrong_path,
+                    installed_version: "0.1.0".to_owned(),
+                    installed_digest: fsutil::sha256_hex(&target_bytes),
+                    previous_digest: None,
+                    bridge_compat: None,
+                },
+                configs: Vec::new(),
+            },
+        )
+        .unwrap();
+        let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
+        let result = activate_unit_with_global_preflight(
+            &zellij_inputs(&fixture, &target_bytes),
+            &PlannedUnit::Zellij {
+                bridge_path: stable.clone(),
+                entries: vec![entry],
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ActivateError::Preflight(message))
+                if message.contains("canonical path")
+        ));
+        assert_eq!(std::fs::read(&stable).unwrap(), target_bytes);
+        assert!(fixture.reloader.reloaded.lock().unwrap().is_empty());
+        old.abort();
+
+        let fixture = Fixture::new();
+        let stable = integration::stable_bridge_path(&fixture.config);
+        prepare_bridge_directory(&fixture);
+        std::fs::write(&stable, &target_bytes).unwrap();
+        std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
+        let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
+        let result = activate_unit_with_global_preflight(
+            &zellij_inputs(&fixture, &target_bytes),
+            &PlannedUnit::Zellij {
+                bridge_path: stable.clone(),
+                entries: vec![entry],
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ActivateError::Preflight(message))
+                if message.contains("not owner-only")
+        ));
+        assert_eq!(std::fs::read(&stable).unwrap(), target_bytes);
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&stable).unwrap()) & 0o777,
+            0o644,
+            "preflight must not chmod an unowned-mode bridge"
+        );
+        old.abort();
     }
 
     #[tokio::test]
@@ -2622,6 +3420,33 @@ mod tests {
             &handoff(3),
             &target_record(),
         ));
+    }
+
+    #[test]
+    fn target_ready_rejects_missing_or_zero_bridge_build_id() {
+        let expected = handoff(9);
+        let socket = PathBuf::from("/run/census.sock");
+        let member = census_member(socket, "zellij", "session-a");
+        let ready = Some(ready_census(&["a", "b"], Some(&["a", "b"])));
+
+        let mut missing = target_record();
+        missing
+            .zellij
+            .as_mut()
+            .expect("test target has Zellij compatibility")
+            .bridge_build_id = None;
+        let mut missing_status = census_status(expected, "session-a", ready.clone());
+        missing_status.current = missing.clone();
+        assert!(!target_ready(&missing_status, &member, &expected, &missing));
+
+        let mut zero = target_record();
+        zero.zellij
+            .as_mut()
+            .expect("test target has Zellij compatibility")
+            .bridge_build_id = Some(muxe_protocol::SchemaFingerprint([0; 32]));
+        let mut zero_status = census_status(expected, "session-a", ready);
+        zero_status.current = zero.clone();
+        assert!(!target_ready(&zero_status, &member, &expected, &zero));
     }
 
     /// Serves one fixed readiness status over the real control framing so
@@ -2972,13 +3797,16 @@ mod tests {
         std::fs::create_dir_all(&cache).expect("cache exists");
         std::fs::set_permissions(&cache, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .expect("cache is owner-only");
-        let handoff = handoff(23);
+        let handoff_a = handoff(23);
+        let handoff_b = handoff(24);
         let socket_a = temp.path().join("a.sock");
         let socket_b = temp.path().join("b.sock");
         // Only B answers, from its live target: A is silent after its target
         // died with its old already drained.
-        let peer_b =
-            serve_readiness_status(socket_b.clone(), census_status(handoff, "session-b", None));
+        let peer_b = serve_readiness_status(
+            socket_b.clone(),
+            census_status(handoff_b, "session-b", None),
+        );
         let bound = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !socket_b.exists() {
             assert!(
@@ -3006,14 +3834,14 @@ mod tests {
                     host_identity: "session-a".to_owned(),
                     old_socket: socket_a,
                     target_socket: None,
-                    handoff_id: Some(hex_lower(&handoff.0)),
+                    handoff_id: Some(hex_lower(&handoff_a.0)),
                     state: MemberTransition::Ready,
                 },
                 MemberState {
                     host_identity: "session-b".to_owned(),
                     old_socket: socket_b,
                     target_socket: None,
-                    handoff_id: Some(hex_lower(&handoff.0)),
+                    handoff_id: Some(hex_lower(&handoff_b.0)),
                     state: MemberTransition::Ready,
                 },
             ],

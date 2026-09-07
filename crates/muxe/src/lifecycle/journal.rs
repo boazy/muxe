@@ -17,9 +17,12 @@
 
 use std::{
     fs, io,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use nix::fcntl::{Flock, FlockArg};
 
 use muxe_protocol::control::CompatibilityRecord;
 use serde::{Deserialize, Serialize};
@@ -48,6 +51,8 @@ pub enum JournalError {
     UnsupportedVersion { path: PathBuf, version: u32 },
     #[error("activation journal state is inconsistent: {0}")]
     Inconsistent(String),
+    #[error("cache lifetime is active at {path}")]
+    CacheActive { path: PathBuf },
 }
 
 /// One activation unit: a single Herdr broker, or all live Zellij brokers
@@ -69,6 +74,192 @@ impl UnitKind {
         }
     }
 }
+/// Cross-process cache lease held for every activation or recovery participant.
+/// Its persistent lock file lives beside, rather than inside, `$CACHE_DIR`, so
+/// cache purge cannot remove the inode while a participant still owns it.
+#[derive(Debug)]
+pub struct CacheLease {
+    _file: Flock<fs::File>,
+}
+
+/// Cross-process unit lock held for the full activation or recovery decision.
+/// The cache lease is acquired first and retained with the unit lock.
+#[derive(Debug)]
+pub struct UnitLock {
+    _cache: CacheLease,
+    _file: Flock<fs::File>,
+}
+
+/// Acquires the shared cache lifetime lease used by activation and recovery.
+///
+/// # Errors
+///
+/// Returns a journal error when the persistent lock cannot be prepared or is
+/// exclusively owned by cache purge.
+pub fn acquire_cache_lease(cache_dir: &Path) -> Result<CacheLease, JournalError> {
+    acquire_cache_lock(cache_dir, FlockArg::LockSharedNonblock)
+}
+
+/// Acquires the exclusive cache lifetime lease used by cache purge.
+///
+/// # Errors
+///
+/// Returns a journal error when an activation/recovery participant owns the
+/// shared lease or the persistent lock cannot be prepared.
+pub fn acquire_cache_purge_lock(cache_dir: &Path) -> Result<CacheLease, JournalError> {
+    acquire_cache_lock(cache_dir, FlockArg::LockExclusiveNonblock)
+}
+
+/// Acquires the one shared lock for an activation unit.
+///
+/// # Errors
+///
+/// Returns a journal error when the cache/unit lock cannot be created or acquired.
+pub fn acquire_unit_lock(cache_dir: &Path, unit: &UnitKind) -> Result<UnitLock, JournalError> {
+    let cache = acquire_cache_lease(cache_dir)?;
+    let directory = activation_dir(cache_dir);
+    fsutil::ensure_owner_dir(&directory)?;
+    let file = acquire_lock_path(&directory.join(format!(
+        "{}.lock",
+        unit.journal_name().trim_end_matches(".json")
+    )))?;
+    Ok(UnitLock {
+        _cache: cache,
+        _file: file,
+    })
+}
+
+/// Acquires an existing journal lock with a kernel-blocking flock. Callers
+/// invoke this from `spawn_blocking` when the lifecycle participant must wait
+/// for the current owner to finish its retirement barrier.
+///
+/// # Errors
+///
+/// Returns a journal error when the cache/unit lock cannot be prepared or acquired.
+pub fn acquire_journal_lock_blocking(path: &Path) -> Result<UnitLock, JournalError> {
+    let lock = path.with_extension("lock");
+    let activation = lock
+        .parent()
+        .ok_or_else(|| JournalError::Inconsistent("journal lock path has no parent".to_owned()))?;
+    let cache_dir = activation.parent().ok_or_else(|| {
+        JournalError::Inconsistent("activation lock path has no cache parent".to_owned())
+    })?;
+    let cache = acquire_cache_lease(cache_dir)?;
+    fsutil::ensure_owner_dir(activation)?;
+    let file = acquire_lock_path_blocking(&lock)?;
+    Ok(UnitLock {
+        _cache: cache,
+        _file: file,
+    })
+}
+
+fn cache_lock_path(cache_dir: &Path) -> Result<PathBuf, JournalError> {
+    let absolute = if cache_dir.is_absolute() {
+        cache_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                JournalError::Inconsistent(format!("cannot resolve cache directory: {error}"))
+            })?
+            .join(cache_dir)
+    };
+    let identity = fs::canonicalize(&absolute)
+        .or_else(|_| {
+            let parent = absolute
+                .parent()
+                .ok_or_else(|| io::Error::other("cache directory has no parent"))?;
+            let parent = fs::canonicalize(parent)?;
+            Ok::<_, io::Error>(
+                parent.join(
+                    absolute
+                        .file_name()
+                        .ok_or_else(|| io::Error::other("cache directory has no name"))?,
+                ),
+            )
+        })
+        .map_err(|error| {
+            JournalError::Inconsistent(format!("cannot canonicalize cache directory: {error}"))
+        })?;
+    let parent = identity.parent().ok_or_else(|| {
+        JournalError::Inconsistent("cache directory has no lock parent".to_owned())
+    })?;
+    if !parent.exists() {
+        fsutil::ensure_owner_dir(parent)?;
+    }
+    let digest = fsutil::sha256_hex(identity.to_string_lossy().as_bytes());
+    Ok(parent.join(format!(".muxe-cache-{}.lock", &digest[..32])))
+}
+
+fn acquire_cache_lock(cache_dir: &Path, mode: FlockArg) -> Result<CacheLease, JournalError> {
+    let path = cache_lock_path(cache_dir)?;
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    let file = options.open(&path).map_err(|source| {
+        JournalError::Inconsistent(format!(
+            "cannot open cache lifetime lock at {}: {source}",
+            path.display()
+        ))
+    })?;
+    let file = Flock::lock(file, mode).map_err(|(_, error)| match mode {
+        FlockArg::LockExclusiveNonblock | FlockArg::LockExclusive => {
+            JournalError::CacheActive { path: path.clone() }
+        }
+        _ => JournalError::Inconsistent(format!(
+            "cannot acquire cache lifetime lock at {}: {error}",
+            path.display()
+        )),
+    })?;
+    Ok(CacheLease { _file: file })
+}
+
+fn acquire_lock_path(path: &Path) -> Result<Flock<fs::File>, JournalError> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|source| {
+        JournalError::Inconsistent(format!(
+            "cannot open activation unit lock at {}: {source}",
+            path.display()
+        ))
+    })?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, error)| {
+        JournalError::Inconsistent(format!(
+            "activation unit is already owned by another process at {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn acquire_lock_path_blocking(path: &Path) -> Result<Flock<fs::File>, JournalError> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|source| {
+        JournalError::Inconsistent(format!(
+            "cannot open activation unit lock at {}: {source}",
+            path.display()
+        ))
+    })?;
+    Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, error)| {
+        JournalError::Inconsistent(format!(
+            "cannot acquire activation unit lock at {}: {error}",
+            path.display()
+        ))
+    })
+}
 
 /// Hashes an identity string into the 32-hex-character journal key.
 #[must_use]
@@ -76,7 +267,7 @@ pub fn unit_hash(identity: &str) -> String {
     fsutil::sha256_hex(identity.as_bytes())[..32].to_owned()
 }
 
-/// Per-member transition state inside a unit.
+/// Per-member old-broker transition state inside a unit.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberTransition {
@@ -84,54 +275,74 @@ pub enum MemberTransition {
     Ready,
     Committed,
     Aborted,
+    Resumed,
+}
+
+/// Per-target transition state. Target retirement is never represented by the
+/// old-broker state, because one member has two distinct lifecycle participants.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetTransition {
+    #[default]
+    Pending,
+    Retired,
+    Committed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TargetMemberState {
+    pub host_identity: String,
+    pub handoff_id: String,
+    pub state: TargetTransition,
+}
+
+/// Durable unit-level recovery decision.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhase {
+    #[default]
+    Pending,
+    RestoringOld,
+    TargetOwns,
+    Committed,
 }
 
 /// One group member: a prepared old broker and its replacement target.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MemberState {
-    /// Human-scope identity (Herdr discovery key or Zellij session name).
     pub host_identity: String,
-    /// Control socket of the prepared old broker.
     pub old_socket: PathBuf,
-    /// Control socket of the started target broker (once spawned).
     pub target_socket: Option<PathBuf>,
-    /// 128-bit handoff ID as lowercase hex; None until prepare assigns one.
-    /// Recovery adopts observed handoffs into undecided members, never
-    /// placeholders: None means undecided, not zero.
     pub handoff_id: Option<String>,
-    /// Current transition state.
     pub state: MemberTransition,
 }
 
-/// Journal lifecycle state.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalState {
-    /// Written before the first external mutation; handoffs still unknown.
     Announced,
-    /// Old brokers drained and prepared; targets may be starting.
     Prepared,
-    /// Every target broker (and every required bridge registration for a
-    /// Zellij group) reports ready; commit may proceed.
     Ready,
 }
 
-/// The durable activation journal for one unit.
+/// Durable activation journal for one unit.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ActivationJournal {
     pub schema_version: u32,
     pub unit: UnitKind,
     pub old_record: CompatibilityRecord,
     pub target_record: CompatibilityRecord,
-    /// Digest of the bridge being replaced (Zellij units only).
+    #[serde(default)]
+    pub bridge_restored: bool,
     pub old_bridge_digest: Option<String>,
-    /// Digest of the staged replacement bridge (Zellij units only).
     pub staged_bridge_digest: Option<String>,
-    /// Byte-for-byte backup of the old bridge (Zellij units only).
     pub backup_path: Option<PathBuf>,
     pub members: Vec<MemberState>,
+    #[serde(default)]
+    pub target_members: Vec<TargetMemberState>,
+    #[serde(default)]
+    pub recovery: RecoveryPhase,
     pub state: JournalState,
-    /// Unix epoch seconds after which recovery requires operator diagnosis.
     pub recovery_deadline: u64,
 }
 
@@ -144,18 +355,52 @@ impl ActivationJournal {
         target_record: CompatibilityRecord,
         members: Vec<MemberState>,
     ) -> Self {
+        let target_members = members
+            .iter()
+            .filter_map(|member| {
+                Some(TargetMemberState {
+                    host_identity: member.host_identity.clone(),
+                    handoff_id: member.handoff_id.clone()?,
+                    state: TargetTransition::Pending,
+                })
+            })
+            .collect();
         Self {
             schema_version: ACTIVATION_JOURNAL_SCHEMA_VERSION,
             unit,
             old_record,
             target_record,
+            bridge_restored: false,
             old_bridge_digest: None,
             staged_bridge_digest: None,
             backup_path: None,
             members,
+            target_members,
+            recovery: RecoveryPhase::Pending,
             state: JournalState::Prepared,
             recovery_deadline: unix_now() + RECOVERY_DEADLINE_SECS,
         }
+    }
+    /// Rebuilds role-separated target progress from current member handoffs,
+    /// preserving already durable target acknowledgements.
+    pub fn refresh_target_members(&mut self) {
+        let prior = self
+            .target_members
+            .iter()
+            .map(|target| (target.handoff_id.clone(), target.state))
+            .collect::<std::collections::HashMap<_, _>>();
+        self.target_members = self
+            .members
+            .iter()
+            .filter_map(|member| {
+                let handoff = member.handoff_id.clone()?;
+                Some(TargetMemberState {
+                    host_identity: member.host_identity.clone(),
+                    state: prior.get(&handoff).copied().unwrap_or_default(),
+                    handoff_id: handoff,
+                })
+            })
+            .collect();
     }
 
     /// Validates internal consistency: schema version, non-empty membership,
@@ -199,6 +444,39 @@ impl ActivationJournal {
                         "journal has a malformed handoff ID".to_owned(),
                     ));
                 }
+            }
+        }
+        if self.state != JournalState::Announced {
+            if self.target_members.len() != self.members.len() {
+                return Err(JournalError::Inconsistent(
+                    "journal target acknowledgement membership is incomplete".to_owned(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for target in &self.target_members {
+                if !seen.insert(target.handoff_id.clone())
+                    || !self.members.iter().any(|member| {
+                        member.host_identity == target.host_identity
+                            && member.handoff_id.as_deref() == Some(target.handoff_id.as_str())
+                    })
+                {
+                    return Err(JournalError::Inconsistent(
+                        "journal target acknowledgement membership is not bijective".to_owned(),
+                    ));
+                }
+            }
+        }
+        for target in &self.target_members {
+            if target.host_identity.is_empty()
+                || target.handoff_id.len() != 32
+                || !target
+                    .handoff_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(JournalError::Inconsistent(
+                    "journal has malformed target acknowledgement".to_owned(),
+                ));
             }
         }
         for digest in self
@@ -375,6 +653,69 @@ mod tests {
         );
         crate::logging::assert_owner_only(&path);
         assert_eq!(read_journal(&path).unwrap(), journal);
+    }
+    #[test]
+    fn unit_lock_is_released_when_owner_process_dies_and_inode_persists() {
+        const CHILD_DIRECTORY: &str = "MUXE_UNIT_LOCK_CHILD_DIRECTORY";
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = Path::new(&directory);
+            let unit = UnitKind::Herdr {
+                host_hash: unit_hash("server"),
+            };
+            let _lock = acquire_unit_lock(directory, &unit).expect("child acquires unit lock");
+            println!("UNIT_LOCK_READY");
+            std::io::Write::flush(&mut std::io::stdout()).expect("flush lock-ready marker");
+            loop {
+                std::thread::park();
+            }
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let unit = UnitKind::Herdr {
+            host_hash: unit_hash("server"),
+        };
+        let executable = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "lifecycle::journal::tests::unit_lock_is_released_when_owner_process_dies_and_inode_persists",
+                "--nocapture",
+            ])
+            .env(CHILD_DIRECTORY, temp.path())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(std::io::BufRead::read_line(&mut reader, &mut line).unwrap() > 0);
+            if line.trim_end() == "UNIT_LOCK_READY" {
+                break;
+            }
+        }
+
+        assert!(acquire_unit_lock(temp.path(), &unit).is_err());
+        let lock_path = activation_dir(temp.path()).join(format!(
+            "{}.lock",
+            unit.journal_name().trim_end_matches(".json")
+        ));
+        let before = std::fs::metadata(&lock_path).unwrap();
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "lock owner must be killed, not exit cleanly"
+        );
+        let reacquired = acquire_unit_lock(temp.path(), &unit).unwrap();
+        let after = std::fs::metadata(&lock_path).unwrap();
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&before),
+            std::os::unix::fs::MetadataExt::ino(&after),
+            "reacquisition keeps the persistent lock inode"
+        );
+        drop(reacquired);
     }
 
     #[test]

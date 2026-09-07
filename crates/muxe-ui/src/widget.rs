@@ -1,7 +1,7 @@
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 use unicode_width::UnicodeWidthStr;
 
-use crate::{layout::GridPlan, RenderedText};
+use crate::{RenderedText, layout::GridPlan};
 
 /// The single status-line value selected by the UI's status precedence rules.
 #[derive(Clone, Copy, Debug)]
@@ -70,7 +70,9 @@ pub(crate) fn write_rendered(
         }
         let remaining = right.saturating_sub(x);
         buffer.set_stringn(x, y, &span.text, remaining as usize, span.style);
-        x = x.saturating_add(UnicodeWidthStr::width(span.text.as_str()) as u16);
+        x = x.saturating_add(
+            u16::try_from(UnicodeWidthStr::width(span.text.as_str())).unwrap_or(u16::MAX),
+        );
     }
 }
 
@@ -79,8 +81,8 @@ mod tests {
     use ratatui::{buffer::Buffer, layout::Rect, style::Modifier, widgets::Widget};
 
     use crate::{
-        layout::{GridColumn, GridPage, GridSlot},
         RenderedSpan,
+        layout::{GridColumn, GridPage, GridSlot},
     };
 
     use super::*;

@@ -311,6 +311,7 @@ pub enum LaunchError {
 
 impl LaunchError {
     /// Converts the failure into an adapter error for broker dispatch paths.
+    #[must_use]
     pub fn into_adapter_error(self) -> AdapterError {
         AdapterError::new(AdapterErrorKind::InvalidRequest, self.to_string())
     }
@@ -435,15 +436,34 @@ pub fn split_argv(argv: Vec<OsString>) -> Result<(PathBuf, Vec<String>), LaunchE
     let program_text = program
         .into_string()
         .map_err(|_| LaunchError::NonUtf8Arg { index: 0 })?;
-    let mut args = Vec::new();
+    let mut arguments = Vec::new();
     for (index, argument) in argv {
-        args.push(
+        arguments.push(
             argument
                 .into_string()
                 .map_err(|_| LaunchError::NonUtf8Arg { index })?,
         );
     }
-    Ok((PathBuf::from(program_text), args))
+    Ok((PathBuf::from(program_text), arguments))
+}
+
+/// Reports whether a `pane open -- <argv>` trailing vector invokes the
+/// canonical Muxe UI (`muxe ui menu ...`, the only `UiSubcommand` on the
+/// parsed CLI surface). The native launcher routes such invocations into
+/// the token-minted UI path instead of a generic command pane. Matching is
+/// structural: program file name `muxe`, first argument `ui`, second
+/// `menu`. Anything else — including a bare `muxe` with other subcommands —
+/// stays a generic launch.
+#[must_use]
+pub fn is_ui_argv(argv: &[String]) -> bool {
+    let [program, first, second, ..] = argv else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "muxe")
+        && first == "ui"
+        && second == "menu"
 }
 
 #[cfg(test)]
@@ -701,6 +721,31 @@ mod tests {
                 split_argv(vec![OsString::from("prog"), bad]),
                 Err(LaunchError::NonUtf8Arg { index: 1 })
             ));
+        }
+    }
+
+    #[test]
+    fn ui_argv_matches_canonical_menu_invocation_only() {
+        let ui: Vec<String> = ["muxe", "ui", "menu", "main"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(is_ui_argv(&ui));
+        let pathed: Vec<String> = ["/opt/mise/shims/muxe", "ui", "menu", "main"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(is_ui_argv(&pathed));
+        for argv in [
+            Vec::new(),
+            vec!["muxe".to_owned()],
+            vec!["muxe".to_owned(), "ui".to_owned()],
+            vec!["muxe".to_owned(), "menu".to_owned(), "main".to_owned()],
+            vec!["muxe".to_owned(), "ui".to_owned(), "other".to_owned()],
+            vec!["sh".to_owned(), "ui".to_owned(), "menu".to_owned()],
+            vec!["muxe".to_owned(), "ui".to_owned(), "menu main".to_owned()],
+        ] {
+            assert!(!is_ui_argv(&argv), "not a UI invocation: {argv:?}");
         }
     }
 

@@ -32,6 +32,7 @@ pub struct InputDriver {
 }
 
 impl InputDriver {
+    #[must_use]
     pub fn new(profile: KeyboardProfile) -> Self {
         Self {
             profile,
@@ -39,6 +40,7 @@ impl InputDriver {
         }
     }
 
+    #[must_use]
     pub fn profile(&self) -> &KeyboardProfile {
         &self.profile
     }
@@ -97,6 +99,7 @@ pub enum KittyNegotiationError {
 }
 
 impl KittyNegotiation {
+    #[must_use]
     pub fn new(capabilities: KeyCapabilities) -> Self {
         Self {
             expected_flags: kitty_flags(capabilities),
@@ -105,10 +108,12 @@ impl KittyNegotiation {
         }
     }
 
+    #[must_use]
     pub const fn expected_flags(&self) -> u32 {
         self.expected_flags
     }
 
+    #[must_use]
     pub const fn is_confirmed(&self) -> bool {
         self.confirmed
     }
@@ -117,6 +122,13 @@ impl KittyNegotiation {
     ///
     /// Responses must exactly match the compiled capability flags. Every other input result is
     /// retained until confirmation, so a key that shares a read with the response is not lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KittyNegotiationError::Refused`] when the terminal reports Kitty flags that do
+    /// not exactly match the compiled capabilities, or
+    /// [`KittyNegotiationError::PendingInputOverflow`] when more than
+    /// [`MAX_PENDING_NEGOTIATION_INPUT`] key events arrive before confirmation.
     pub fn observe(
         &mut self,
         input: ConvertedInput,
@@ -140,6 +152,11 @@ impl KittyNegotiation {
     }
 
     /// Reports a caller-owned readiness deadline without accepting a degraded mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KittyNegotiationError::TimedOut`] when the Kitty response has not confirmed the
+    /// requested mode before the caller's deadline.
     pub const fn timeout(&self) -> Result<(), KittyNegotiationError> {
         if self.confirmed {
             Ok(())
@@ -157,6 +174,7 @@ impl KittyNegotiation {
 }
 
 /// Converts a compiled Kitty profile to its required progressive-enhancement flag mask.
+#[must_use]
 pub const fn kitty_flags(capabilities: KeyCapabilities) -> u32 {
     0b1 | if capabilities.event_types { 0b10 } else { 0 }
         | if capabilities.alternate_keys {
@@ -181,6 +199,7 @@ pub struct SurfacePadding {
 }
 
 /// Borrowed content for one terminal render.
+#[derive(Clone, Copy)]
 pub struct SurfaceFrame<'a> {
     pub title: &'a str,
     pub breadcrumb: &'a RenderedText,
@@ -205,12 +224,17 @@ pub struct TerminalSurface<W: Write> {
 
 impl<W: Write> TerminalSurface<W> {
     /// Enters raw mode and the alternate screen before rendering input-sensitive UI content.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying terminal error when raw mode cannot be enabled, or when the
+    /// alternate screen, cursor-hide, or flush writes fail.
     pub fn enter(mut output: W) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         if let Err(error) = output
             .queue(EnterAlternateScreen)
             .and_then(|output| output.queue(Hide))
-            .and_then(|output| output.flush())
+            .and_then(std::io::Write::flush)
         {
             let _ = terminal::disable_raw_mode();
             return Err(error);
@@ -227,6 +251,10 @@ impl<W: Write> TerminalSurface<W> {
     ///
     /// The caller must feed stdin bytes through [`InputDriver`] and [`KittyNegotiation::observe`]
     /// before accepting menu input. A timeout, refusal, or disconnect must call [`Self::restore`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying terminal error when the Kitty push sequence or its flush fails.
     pub fn begin_kitty_negotiation(
         &mut self,
         capabilities: KeyCapabilities,
@@ -243,6 +271,11 @@ impl<W: Write> TerminalSurface<W> {
     }
 
     /// Clears and redraws one frame at the supplied terminal dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying terminal error when clearing, cursor movement, row writes, or the
+    /// final flush fails.
     pub fn render(&mut self, frame: SurfaceFrame<'_>, area: Rect) -> io::Result<()> {
         if area.width == 0 || area.height == 0 {
             return Ok(());
@@ -255,7 +288,9 @@ impl<W: Write> TerminalSurface<W> {
             area.width as usize,
             ratatui::style::Style::default(),
         );
-        let title_width = UnicodeWidthStr::width(frame.title).min(area.width as usize) as u16;
+        let title_width =
+            u16::try_from(UnicodeWidthStr::width(frame.title).min(usize::from(area.width)))
+                .unwrap_or(u16::MAX);
         if !frame.breadcrumb.plain.is_empty() && title_width < area.width {
             let breadcrumb_x = area.x.saturating_add(title_width);
             buffer.set_stringn(
@@ -311,6 +346,11 @@ impl<W: Write> TerminalSurface<W> {
     }
 
     /// Restores Kitty mode, raw mode, and the alternate screen.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first underlying terminal error when the Kitty reset, alternate-screen exit,
+    /// or raw-mode teardown fails.
     pub fn restore(mut self) -> io::Result<()> {
         self.restore_inner()
     }
@@ -322,7 +362,7 @@ impl<W: Write> TerminalSurface<W> {
             if let Err(error) = self
                 .output
                 .write_all(b"\x1b[<u")
-                .and_then(|_| self.output.flush())
+                .and_then(|()| self.output.flush())
             {
                 first_error = Some(error);
             }
@@ -333,7 +373,7 @@ impl<W: Write> TerminalSurface<W> {
                 .output
                 .queue(Show)
                 .and_then(|output| output.queue(LeaveAlternateScreen))
-                .and_then(|output| output.flush())
+                .and_then(std::io::Write::flush)
             {
                 first_error.get_or_insert(error);
             }

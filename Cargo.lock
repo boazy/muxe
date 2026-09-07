@@ -1884,6 +1884,7 @@ dependencies = [
  "muxe-adapter-api",
  "muxe-adapter-zellij",
  "muxe-core",
+ "muxe-protocol",
  "muxe-zellij-protocol",
  "nix",
  "regex",

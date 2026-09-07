@@ -1,10 +1,7 @@
 use std::{io, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use muxe_adapter_api::{HostIdentity, HostKind};
-use muxe_adapter_herdr::{
-    EndpointIdentity, HerdrAdapterConfig,
-    generated::BUNDLED_PROTOCOL,
-};
+use muxe_adapter_herdr::{EndpointIdentity, HerdrAdapterConfig, generated::BUNDLED_PROTOCOL};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
@@ -26,26 +23,27 @@ pub struct ProductionConnectFixture {
 
 impl ProductionConnectFixture {
     /// Starts only the concrete production connection handshake.
-    pub async fn start() -> io::Result<Self> {
-        Self::start_scripted(Self::initial_handshake()).await
+    pub fn start() -> io::Result<Self> {
+        Self::start_scripted(Self::initial_handshake())
     }
 
     /// Starts a production `HerdrAdapter::connect` fixture followed by exact additional RPC
     /// exchanges. Every `ping` exchange is followed by the raw endpoint-probe connection made by
     /// `HerdrRuntime::connect`; `KeepOpen` subscriptions can be closed with
     /// [`Self::lose_retained_subscriptions`] to drive a reconnect.
-    pub async fn start_scripted(exchanges: Vec<RecordedExchange>) -> io::Result<Self> {
-        let schema: Value =
-            serde_json::from_str(include_str!("../../../../fixtures/herdr/herdr-api.schema.json"))
-                .expect("bundled fixture schema is valid JSON");
-        Self::start_scripted_with_schema(exchanges, schema).await
+    pub fn start_scripted(exchanges: Vec<RecordedExchange>) -> io::Result<Self> {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/herdr/herdr-api.schema.json"
+        ))
+        .expect("bundled fixture schema is valid JSON");
+        Self::start_scripted_with_schema(exchanges, &schema)
     }
 
     /// Uses an injected complete runtime schema document while retaining the same concrete schema
     /// child executable, Unix transport, endpoint probe, and exact request recording.
-    pub async fn start_scripted_with_schema(
+    pub fn start_scripted_with_schema(
         exchanges: Vec<RecordedExchange>,
-        schema: Value,
+        schema: &Value,
     ) -> io::Result<Self> {
         let schema_temp = tempfile::tempdir()?;
         let schema_binary = schema_temp.path().join("herdr");
@@ -57,7 +55,7 @@ impl ProductionConnectFixture {
         )?;
         std::fs::set_permissions(&schema_binary, std::fs::Permissions::from_mode(0o700))?;
         let server =
-            RecordedUnixServer::start_with_endpoint_probe(tempfile::tempdir()?, exchanges).await?;
+            RecordedUnixServer::start_with_endpoint_probe(tempfile::tempdir()?, exchanges)?;
         let cache_dir = schema_temp.path().join("cache");
         Ok(Self {
             _schema_temp: schema_temp,
@@ -96,7 +94,7 @@ impl ProductionConnectFixture {
     }
 
     /// Wraps one exact snapshot body in the generated `session.snapshot` result shape.
-    pub fn snapshot_exchange(snapshot: Value) -> RecordedExchange {
+    pub fn snapshot_exchange(snapshot: &Value) -> RecordedExchange {
         RecordedExchange {
             method: "session.snapshot",
             params: json!({}),

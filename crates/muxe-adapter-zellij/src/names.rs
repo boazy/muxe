@@ -1,8 +1,8 @@
 //! Native-action namespace parsing and kebab-case mapping helpers.
 //!
-//! YAMLfacing names are lowercase kebab-case per the design: action variants,
-//! enum values, and action fields. Generated raw mirrors use PascalCase variants
-//! with snake_case fields, so this module owns the exact mechanical mapping
+//! YAML-facing names are lowercase kebab-case per the design: action variants,
+//! enum values, and action fields. Generated raw mirrors use `PascalCase` variants
+//! with `snake_case` fields, so this module owns the exact mechanical mapping
 //! between the two. The mapping is total over the pinned inventory tables: an
 //! unknown kebab name or field is a precise configuration error, never a guess.
 
@@ -25,6 +25,7 @@ pub enum NativeType {
 /// Splits a candidate type name into its namespace and kebab-case member.
 ///
 /// Returns `None` for types outside both Zellij namespaces.
+#[must_use]
 pub fn parse_native_type(type_name: &str) -> Option<NativeType> {
     if let Some(kebab) = type_name.strip_prefix(ACTION_NAMESPACE) {
         return Some(NativeType::Action(kebab.to_owned()));
@@ -36,28 +37,32 @@ pub fn parse_native_type(type_name: &str) -> Option<NativeType> {
 }
 
 /// Whether a candidate type name belongs to either Zellij native namespace.
+#[must_use]
 pub fn is_zellij_native_type(type_name: &str) -> bool {
     parse_native_type(type_name).is_some()
 }
 
 /// Whether a kebab-case command name is in the exposed v1 surface.
+#[must_use]
 pub fn is_exposed_command(kebab: &str) -> bool {
     NATIVE_ZELLIJ_COMMANDS
         .iter()
         .any(|(name, _, _, _)| *name == kebab)
 }
 
-/// Converts a kebab-case action name to its PascalCase `Action` variant.
+/// Converts a kebab-case action name to its `PascalCase` `Action` variant.
 ///
 /// Returns `None` when no pinned variant matches, so callers fail closed with
 /// the inventory table as the source of truth.
+#[must_use]
 pub fn action_kebab_to_variant(kebab: &str) -> Option<&'static str> {
     ACTION_VARIANTS
         .iter()
         .find_map(|(variant, _)| (to_kebab(variant) == kebab).then_some(*variant))
 }
 
-/// Converts a PascalCase identifier to kebab-case (`NewTab` to `new-tab`).
+/// Converts a `PascalCase` identifier to kebab-case (`NewTab` to `new-tab`).
+#[must_use]
 pub fn to_kebab(name: &str) -> String {
     let mut kebab = String::with_capacity(name.len() + 4);
     for (index, character) in name.chars().enumerate() {
@@ -73,7 +78,8 @@ pub fn to_kebab(name: &str) -> String {
     kebab
 }
 
-/// Converts a kebab-case field name to its snake_case mirror field.
+/// Converts a kebab-case field name to its `snake_case` mirror field.
+#[must_use]
 pub fn field_to_snake(field: &str) -> String {
     field.replace('-', "_")
 }

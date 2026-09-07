@@ -83,11 +83,12 @@ pub enum SocketError {
 }
 
 impl SocketError {
+    #[must_use]
     pub const fn delivery(&self) -> DeliveryState {
         match self {
-            Self::StreamingMethod { .. }
-            | Self::RequestTooLarge
-            | Self::RequestIdExhausted => DeliveryState::NotSent,
+            Self::StreamingMethod { .. } | Self::RequestTooLarge | Self::RequestIdExhausted => {
+                DeliveryState::NotSent
+            }
             Self::Connect { .. } | Self::Endpoint { .. } => DeliveryState::NotSent,
             Self::Write { delivery, .. }
             | Self::EarlyEof { delivery }
@@ -122,6 +123,11 @@ impl HerdrSocketClient {
 
     /// Sends one generated unary method and verifies that the server closes the connection after
     /// exactly one response with the generated request ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SocketError` when the request cannot be sent, the response is not
+    /// exactly one correlated line, or trailing bytes follow it.
     pub async fn unary(
         &self,
         metadata: &MethodMetadata,
@@ -136,6 +142,11 @@ impl HerdrSocketClient {
     /// the request bytes were already flushed, so an elapsed deadline reports
     /// `MayHaveReachedHost` and the caller must surface `outcome_unknown` instead of
     /// retrying a state-changing request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SocketError` when the request cannot be sent, the wait deadline
+    /// elapses, or the response is not exactly one correlated line.
     pub async fn unary_with_timeout(
         &self,
         metadata: &MethodMetadata,
@@ -143,18 +154,17 @@ impl HerdrSocketClient {
         timeout: Duration,
     ) -> Result<HerdrResponse, SocketError> {
         let (mut reader, id) = self.send_request(metadata, params).await?;
-        let response_line =
-            tokio::time::timeout(timeout, read_response_line(&mut reader))
-                .await
-                .map_err(|_| SocketError::Timeout {
-                    delivery: DeliveryState::MayHaveReachedHost,
-                })??;
+        let response_line = tokio::time::timeout(timeout, read_response_line(&mut reader))
+            .await
+            .map_err(|_| SocketError::Timeout {
+                delivery: DeliveryState::MayHaveReachedHost,
+            })??;
         let response =
             serde_json::from_slice(&response_line).map_err(|source| SocketError::InvalidJson {
                 delivery: DeliveryState::MayHaveReachedHost,
                 source,
             })?;
-        let outcome = parse_response(response, &id)?;
+        let outcome = parse_response(&response, &id)?;
         reject_trailing_data(&mut reader).await?;
         Ok(outcome)
     }
@@ -162,6 +172,10 @@ impl HerdrSocketClient {
     /// Opens one fresh connection without sending bytes. The subscription monitor uses this to
     /// hold its own long-lived `events.subscribe` stream; no ordinary request is multiplexed
     /// onto that stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SocketError` when the socket cannot be connected.
     pub async fn connect_stream(&self) -> Result<UnixStream, SocketError> {
         UnixStream::connect(&self.socket)
             .await
@@ -171,11 +185,14 @@ impl HerdrSocketClient {
             })
     }
 
-    /// Captures the OS-visible identity of the exact server behind the socket: canonical path,
-    /// socket-file device and inode, and best-effort peer credentials from one fresh
-    /// connection. A replacement server rebound to the same path carries a new inode, so it
-    /// can never compare equal to the old incarnation even when it reports the same
-    /// protocol and version.
+    /// Captures the OS-visible endpoint observation of the exact server behind the socket:
+    /// canonical path, socket-file device and inode, and best-effort peer credentials from one
+    /// fresh connection. A changed observation proves replacement; an equal observation is
+    /// deliberately inconclusive because inode and process identifiers can be recycled.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SocketError` when the socket cannot be connected or observed.
     pub async fn probe_endpoint(&self) -> Result<EndpointIdentity, SocketError> {
         let stream = self.connect_stream().await?;
         EndpointIdentity::capture(&self.socket, &stream).map_err(|source| SocketError::Endpoint {
@@ -197,7 +214,7 @@ impl HerdrSocketClient {
             });
         }
         let id = self.next_id()?;
-        let mut line = encode_request(metadata.method, &id, params)?;
+        let mut line = encode_request(metadata.method, &id, &params)?;
         line.push(b'\n');
         let mut stream = self.connect_stream().await?;
         write_line(&mut stream, &line).await?;
@@ -214,7 +231,7 @@ impl HerdrSocketClient {
                 delivery: DeliveryState::MayHaveReachedHost,
                 source,
             })?;
-        let outcome = parse_response(response, id)?;
+        let outcome = parse_response(&response, id)?;
         reject_trailing_data(&mut reader).await?;
         Ok(outcome)
     }
@@ -235,7 +252,7 @@ impl HerdrSocketClient {
 pub(crate) fn encode_request(
     method: &str,
     id: &str,
-    params: Value,
+    params: &Value,
 ) -> Result<Vec<u8>, SocketError> {
     let request = json!({
         "id": id,
@@ -315,6 +332,10 @@ impl EndpointIdentity {
     /// credentials degrade to `None` and are reported through
     /// [`EndpointIdentity::has_peer_evidence`] so the broker can fail closed where its
     /// policy requires peer evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the socket path cannot be canonicalized or stat'ed.
     pub fn capture(socket: &Path, stream: &UnixStream) -> io::Result<Self> {
         let canonical = fs::canonicalize(socket).unwrap_or_else(|_| socket.to_path_buf());
         let peer = stream.peer_cred().ok().map(|credentials| PeerIdentity {
@@ -326,12 +347,12 @@ impl EndpointIdentity {
         {
             use std::os::unix::fs::MetadataExt;
             let metadata = fs::metadata(&canonical)?;
-            return Ok(Self {
+            Ok(Self {
                 socket: canonical,
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 peer,
-            });
+            })
         }
         #[cfg(not(unix))]
         {
@@ -345,18 +366,22 @@ impl EndpointIdentity {
         }
     }
 
+    #[must_use]
     pub fn socket(&self) -> &Path {
         &self.socket
     }
 
+    #[must_use]
     pub fn device(&self) -> u64 {
         self.device
     }
 
+    #[must_use]
     pub fn inode(&self) -> u64 {
         self.inode
     }
 
+    #[must_use]
     pub fn peer(&self) -> Option<PeerIdentity> {
         self.peer
     }
@@ -364,6 +389,7 @@ impl EndpointIdentity {
     /// Whether OS peer credentials were available at capture. Without them the
     /// device/inode boundary still observes replacement, but broker policy may
     /// require this evidence before trusting even the observation.
+    #[must_use]
     pub fn has_peer_evidence(&self) -> bool {
         self.peer.is_some()
     }
@@ -376,6 +402,7 @@ impl EndpointIdentity {
     /// subscription stream staying alive plus a new local epoch after any loss;
     /// callers must never treat `!proven_replacement(a, b)` as proof that `a`
     /// and `b` are the same live server.
+    #[must_use]
     pub fn proven_replacement(&self, other: &Self) -> bool {
         self != other
     }
@@ -383,13 +410,13 @@ impl EndpointIdentity {
     /// Re-stats the captured socket path and reports whether its device and inode still
     /// match. `false` proves replacement; `true` is only a cheap gate and never a
     /// continuity proof on its own.
+    #[must_use]
     pub fn recheck(&self) -> bool {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            fs::metadata(&self.socket).is_ok_and(|metadata| {
-                metadata.dev() == self.device && metadata.ino() == self.inode
-            })
+            fs::metadata(&self.socket)
+                .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
         }
         #[cfg(not(unix))]
         {
@@ -402,6 +429,7 @@ impl EndpointIdentity {
     /// from it. Equality is necessary but never sufficient for continuity: a changed
     /// value proves replacement, an unchanged value proves nothing (see
     /// [`EndpointIdentity::proven_replacement`]).
+    #[must_use]
     pub fn live_server_id(&self, protocol: u64, version: &str) -> String {
         let peer = match self.peer {
             Some(peer) => match peer.pid {
@@ -459,7 +487,10 @@ pub(crate) async fn read_response_line(
         }
     }
 }
-pub(crate) fn parse_response(response: Value, expected_id: &str) -> Result<HerdrResponse, SocketError> {
+pub(crate) fn parse_response(
+    response: &Value,
+    expected_id: &str,
+) -> Result<HerdrResponse, SocketError> {
     let object = response
         .as_object()
         .ok_or_else(|| protocol("response must be a JSON object"))?;
@@ -540,7 +571,7 @@ mod tests {
         crate::generated::method_metadata("ping").unwrap()
     }
 
-    async fn listen(temp: &TempDir) -> (UnixListener, PathBuf) {
+    fn listen(temp: &TempDir) -> (UnixListener, PathBuf) {
         let path = temp.path().join("herdr.sock");
         (UnixListener::bind(&path).unwrap(), path)
     }
@@ -559,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn accepts_one_correlated_response_and_eof() {
         let temp = TempDir::new().unwrap();
-        let (listener, path) = listen(&temp).await;
+        let (listener, path) = listen(&temp);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (mut reader, id) = read_request(stream).await;
@@ -581,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_an_uncorrelated_response() {
         let temp = TempDir::new().unwrap();
-        let (listener, path) = listen(&temp).await;
+        let (listener, path) = listen(&temp);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (mut reader, _) = read_request(stream).await;
@@ -602,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_trailing_response_bytes() {
         let temp = TempDir::new().unwrap();
-        let (listener, path) = listen(&temp).await;
+        let (listener, path) = listen(&temp);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (mut reader, id) = read_request(stream).await;
@@ -632,13 +663,13 @@ mod tests {
     async fn wait_deadline_reports_unknown_outcome_after_flush() {
         tokio::time::pause();
         let temp = TempDir::new().unwrap();
-        let (listener, path) = listen(&temp).await;
+        let (listener, path) = listen(&temp);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (_reader, _id) = read_request(stream).await;
             // Accept the mutation bytes, then never answer: the client must give
             // up waiting without ever replaying the request.
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            tokio::time::sleep(std::time::Duration::from_hours(1)).await;
         });
         let waiting = tokio::spawn({
             let path = path.clone();
@@ -661,7 +692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_identity_distinguishes_rebound_server() {
+    async fn endpoint_identity_recheck_and_comparison_are_one_way() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("herdr.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -673,30 +704,33 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(
             !first.recheck(),
-            "a removed socket must fail the cheap stat gate"
+            "a missing socket is affirmative evidence that the old observation is stale"
         );
-        // A replacement server rebound to the same canonical path carries a fresh
-        // inode even though it reports the same protocol and version.
+
         let replacement = UnixListener::bind(&path).unwrap();
         let second_stream = UnixStream::connect(&path).await.unwrap();
         let second = EndpointIdentity::capture(&path, &second_stream).unwrap();
-        drop(replacement);
-        assert!(second.recheck());
-        assert_ne!(
-            first, second,
-            "rebound servers must never compare equal across incarnations"
-        );
-        assert_ne!(
-            first.live_server_id(20, "0.8.2"),
-            second.live_server_id(20, "0.8.2")
-        );
         assert!(
-            first.proven_replacement(&second),
-            "endpoint inequality is sound proof of replacement"
+            second.recheck(),
+            "a fresh observation can pass the stat gate without proving continuity"
+        );
+        let observed_difference = EndpointIdentity {
+            peer: Some(PeerIdentity {
+                uid: 1,
+                gid: 2,
+                pid: Some(3),
+            }),
+            ..second.clone()
+        };
+        assert!(
+            second.proven_replacement(&observed_difference),
+            "only an observed inequality is affirmative replacement evidence"
         );
         assert!(
             !second.proven_replacement(&second),
-            "equality never proves continuity on its own"
+            "equal observations remain inconclusive"
         );
+        drop(second_stream);
+        drop(replacement);
     }
 }

@@ -53,8 +53,9 @@ impl ParseError {
     /// Renders the failure as a span-anchored configuration diagnostic.
     pub fn to_diagnostic(&self, type_span: &muxe_core::SourceSpan) -> ConfigDiagnostic {
         let (code, message) = match self {
-            Self::NotZellij { .. } => (DiagnosticCode::InvalidAction, self.to_string()),
-            Self::UnknownName { .. } => (DiagnosticCode::InvalidAction, self.to_string()),
+            Self::NotZellij { .. } | Self::UnknownName { .. } => {
+                (DiagnosticCode::InvalidAction, self.to_string())
+            }
             Self::InvalidArguments { .. } => {
                 (DiagnosticCode::InvalidActionArguments, self.to_string())
             }
@@ -71,8 +72,8 @@ impl ParseError {
 /// Key casing follows the generated serde shapes: high-level command arguments
 /// use kebab-case (`rename_all_fields = "kebab-case"` on `RawNativeCommand`),
 /// while low-level action fields and every nested mirror struct use
-/// snake_case. `top_snake` selects the top level; nested mappings are always
-/// snake_case.
+/// `snake_case`. `top_snake` selects the top level; nested mappings are always
+/// `snake_case`.
 ///
 /// Context markers have no concrete value: load-time validation substitutes a
 /// neutral placeholder per context type, exactly like the Herdr boundary, while
@@ -131,7 +132,7 @@ fn pane_id_json(text: &str, field: &str) -> Result<Value, ParseError> {
         })
 }
 
-/// Maps a closed kebab literal set to its PascalCase mirror variant.
+/// Maps a closed kebab literal set to its `PascalCase` mirror variant.
 fn closed_literal(
     text: &str,
     field: &str,

@@ -1,15 +1,26 @@
 //! Compatibility fingerprints for the Zellij integration record.
 //!
 //! The typed compatibility record compiled into the native binary carries the
-//! pinned Zellij source revision, the generated-action fingerprint, and the
-//! bridge protocol fingerprint. Semantic versions alone are insufficient for the
-//! runtime handshake. There is intentionally no loaded-artifact digest here: the
-//! pinned plugin SDK exposes no digest of its own loaded bytes, so none is
-//! fabricated. See [`crate::pipe::BridgeArtifact`] for the honest attestation type.
+//! pinned Zellij source revision, generated-action fingerprint, bridge protocol
+//! fingerprint, and shared pre-link bridge build identity. Semantic versions
+//! alone are insufficient for the runtime handshake.
 
 use muxe_protocol::wire::SchemaFingerprint;
 use sha2::{Digest, Sha256};
 
+include!(concat!(env!("OUT_DIR"), "/bridge_build_id.rs"));
+
+/// Shared opaque identity for the pre-link bridge/protocol build.
+#[must_use]
+pub const fn bridge_build_id() -> SchemaFingerprint {
+    SchemaFingerprint(BRIDGE_BUILD_ID)
+}
+
+/// Lowercase representation used by compatibility reports and release checks.
+#[must_use]
+pub const fn bridge_build_id_hex() -> &'static str {
+    BRIDGE_BUILD_ID_HEX
+}
 use crate::generated::{
     ACTION_CONVERTER_HOLES, ACTION_CONVERTERS, ACTION_VARIANTS, EXPECTED_ZELLIJ_REVISION,
     EXPECTED_ZELLIJ_VERSION, NATIVE_ZELLIJ_COMMAND_ARGUMENTS,
@@ -98,18 +109,6 @@ pub fn bridge_protocol_fingerprint() -> SchemaFingerprint {
     )
 }
 
-/// SHA-256 of staged native bridge bytes, labeled exactly as what it is.
-///
-/// This helper measures bytes the native side staged for installation. It must
-/// never be presented as a bridge-attested full-bytes digest: the bridge SDK
-/// cannot attest its own loaded bytes.
-#[must_use]
-pub fn native_verified_artifact_sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,12 +128,5 @@ mod tests {
     fn pin_guards_hold() {
         assert_pinned_revision();
         assert_eq!(pinned_zellij_version(), "0.46.0");
-    }
-
-    #[test]
-    fn native_artifact_hash_measures_bytes() {
-        let digest = native_verified_artifact_sha256(b"wasm-bytes");
-        assert_ne!(digest, [0; 32]);
-        assert_ne!(digest, native_verified_artifact_sha256(b"other-bytes"));
     }
 }

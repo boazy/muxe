@@ -34,6 +34,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the generated reference keeps its ordered document sections together"
+)]
 fn render(host_support: &HostSupport) -> String {
     let mut output = String::new();
     writeln!(output, "# Muxe core reference\n").unwrap();
@@ -75,13 +79,10 @@ fn render(host_support: &HostSupport) -> String {
             "| `{}` | {} | {} | {} | Core source only |",
             action.as_str(),
             descriptor.parameter_syntax,
-            descriptor
-                .default_execution
-                .map(|mode| match mode {
-                    muxe_core::ExecutionMode::Await => "await",
-                    muxe_core::ExecutionMode::Detach => "detach",
-                })
-                .unwrap_or("—"),
+            descriptor.default_execution.map_or("—", |mode| match mode {
+                muxe_core::ExecutionMode::Await => "await",
+                muxe_core::ExecutionMode::Detach => "detach",
+            }),
             capabilities(descriptor.capabilities),
         )
         .unwrap();
@@ -192,7 +193,11 @@ fn load_host_support(path: &PathBuf) -> Result<HostSupport, Box<dyn std::error::
         }
         let action = columns[0].trim();
         let kind = PortableActionKind::parse(action).ok_or_else(|| {
-            format!("{}:{}: unknown portable action `{action}`", path.display(), line_number + 1)
+            format!(
+                "{}:{}: unknown portable action `{action}`",
+                path.display(),
+                line_number + 1
+            )
         })?;
         let row = HostSupportRow {
             zellij: columns[1].trim().to_owned(),
@@ -224,7 +229,7 @@ fn render_host_support(output: &mut String, host_support: &HostSupport) {
     writeln!(output, "\n## Host support evidence\n").unwrap();
     writeln!(
         output,
-        "- **E1 — owned-fixture smoke:** An approved fresh-TempDir Herdr child completed `ping`, observed `Herdr` at its exact configured socket with protocol 20/version 0.8.2, then terminated gracefully and reaped its retained child. It did not smoke a portable action.\n- **E2 — Herdr source evidence:** Adapter mapping and schema tests passed. The mappings below are source-tested, not live action tests.\n- **E3 — Zellij source evidence:** Pinned 0.46.0 conversion and inventory checks passed. No active Zellij host smoke has run.\n"
+        "- **E1 — owned-fixture smoke:** An approved fresh-TempDir Herdr child completed `ping`, observed `Herdr` at its exact configured socket with protocol 20/version 0.8.2, then terminated gracefully and reaped its retained child. It did not smoke a portable action.\n- **E2 — Herdr source evidence:** Adapter mapping and schema tests passed. The mappings below are source-tested, not live action tests.\n- **E3 — Zellij qualified source evidence:** Pinned Rust 1.97.1 source tests passed (55 adapter, 10 protocol, 18 bridge lifecycle) plus the pinned WASM component build. This proves the listed source paths, not a live Zellij host; external artifact digest/grant verification remains blocked.\n"
     )
     .unwrap();
     writeln!(
@@ -233,7 +238,10 @@ fn render_host_support(output: &mut String, host_support: &HostSupport) {
     )
     .unwrap();
     for action in PortableActionKind::ALL {
-        let row = host_support.rows.get(action).expect("host support was validated");
+        let row = host_support
+            .rows
+            .get(action)
+            .expect("host support was validated");
         writeln!(
             output,
             "| `{}` | {} | {} |",

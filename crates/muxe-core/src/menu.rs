@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::action::{ActionSpec, MenuAction, MenuTarget, PortableAction};
 use crate::condition::{ConditionEvaluationError, ConditionProgram, PagesContext};
-use crate::execution::{AfterAction, ExecutionPolicy, MenuControl};
 use crate::config::{KeyboardProfile, ThemeSelection};
+use crate::execution::{AfterAction, ExecutionPolicy, MenuControl};
 use crate::key::CanonicalKey;
 use crate::theme::CompiledTheme;
 
@@ -18,10 +18,12 @@ pub struct CompiledGeneration(pub u64);
 pub struct MenuId(Arc<str>);
 
 impl MenuId {
+    #[must_use]
     pub fn new(value: impl Into<Arc<str>>) -> Self {
         Self(value.into())
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -35,14 +37,20 @@ pub struct BindingId {
 }
 
 impl BindingId {
+    #[must_use]
     pub const fn new(generation: CompiledGeneration, ordinal: u64) -> Self {
-        Self { generation, ordinal }
+        Self {
+            generation,
+            ordinal,
+        }
     }
 
+    #[must_use]
     pub const fn generation(self) -> CompiledGeneration {
         self.generation
     }
 
+    #[must_use]
     pub const fn ordinal(self) -> u64 {
         self.ordinal
     }
@@ -75,7 +83,7 @@ pub struct CompiledBinding {
 }
 
 /// Parsed-once condition programs that a UI evaluates against pager geometry without reparsing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BindingConditions {
     pub include: Option<ConditionProgram>,
     pub enable: Option<ConditionProgram>,
@@ -83,19 +91,36 @@ pub struct BindingConditions {
 }
 
 impl BindingConditions {
-    pub fn evaluate(&self, pages: PagesContext) -> Result<ViewBindingState, ConditionEvaluationError> {
+    /// Evaluates the configured conditions for one pager state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a compiled condition cannot evaluate.
+    pub fn evaluate(
+        &self,
+        pages: PagesContext,
+    ) -> Result<ViewBindingState, ConditionEvaluationError> {
         Ok(ViewBindingState {
-            included: self.include.as_ref().map(|program| program.evaluate(pages)).transpose()?.unwrap_or(true),
-            enabled: self.enable.as_ref().map(|program| program.evaluate(pages)).transpose()?.unwrap_or(true),
-            shown: self.show.as_ref().map(|program| program.evaluate(pages)).transpose()?.unwrap_or(true),
+            included: self
+                .include
+                .as_ref()
+                .map(|program| program.evaluate(pages))
+                .transpose()?
+                .unwrap_or(true),
+            enabled: self
+                .enable
+                .as_ref()
+                .map(|program| program.evaluate(pages))
+                .transpose()?
+                .unwrap_or(true),
+            shown: self
+                .show
+                .as_ref()
+                .map(|program| program.evaluate(pages))
+                .transpose()?
+                .unwrap_or(true),
             blocked: false,
         })
-    }
-}
-
-impl Default for BindingConditions {
-    fn default() -> Self {
-        Self { include: None, enable: None, show: None }
     }
 }
 
@@ -143,6 +168,10 @@ pub struct CompiledMenu {
 
 /// Evaluated binding conditions and adapter compatibility. `included` removes an item before
 /// layout; `shown` controls the menu bar only; `enabled` controls executability.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the four independently serialized UI visibility states are part of the attachment contract"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ViewBindingState {
     pub included: bool,
@@ -219,10 +248,12 @@ pub struct MenuView {
 }
 
 impl MenuView {
+    #[must_use]
     pub fn menu(&self, id: &MenuId) -> Option<&MenuViewMenu> {
         self.menus.iter().find(|menu| &menu.id == id)
     }
 
+    #[must_use]
     pub fn binding(&self, id: BindingId) -> Option<&BindingView> {
         (id.generation() == self.generation)
             .then(|| {
@@ -278,8 +309,10 @@ fn local_menu_action(action: &ActionSpec) -> Option<LocalMenuAction> {
         return None;
     };
     Some(match action {
-        MenuAction::Open(MenuTarget::Named(target)) | MenuAction::Open(MenuTarget::Inline(target)) => {
-            LocalMenuAction::Open { target: MenuId::new(target.clone()) }
+        MenuAction::Open(MenuTarget::Named(target) | MenuTarget::Inline(target)) => {
+            LocalMenuAction::Open {
+                target: MenuId::new(target.clone()),
+            }
         }
         MenuAction::Return => LocalMenuAction::Control(MenuControl::Return),
         MenuAction::Quit => LocalMenuAction::Control(MenuControl::Quit),
@@ -289,6 +322,7 @@ fn local_menu_action(action: &ActionSpec) -> Option<LocalMenuAction> {
 }
 
 /// Builds a root-specific immutable UI snapshot from broker-authoritative compiled configuration.
+#[must_use]
 pub fn menu_view(
     generation: CompiledGeneration,
     root: &MenuId,
@@ -302,6 +336,7 @@ pub fn menu_view(
 }
 
 /// Indexes broker-authoritative bindings without duplicating action payloads.
+#[must_use]
 pub fn binding_index(menus: &[CompiledMenu]) -> BTreeMap<BindingId, BindingLocation> {
     menus
         .iter()

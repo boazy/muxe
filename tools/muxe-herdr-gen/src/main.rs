@@ -1,6 +1,14 @@
 mod classification;
 
-use std::{collections::BTreeMap, env, fmt::Write as _, fs, path::PathBuf, process::ExitCode};
+use std::{
+    collections::BTreeMap,
+    env,
+    fmt::Write as _,
+    fs,
+    io::Write as _,
+    path::PathBuf,
+    process::{Command, ExitCode, Stdio},
+};
 
 use eyre::{Result, WrapErr, bail};
 use schemars::schema::RootSchema;
@@ -187,7 +195,7 @@ fn generate(schema: &Value, raw_provenance_sha256: &str) -> Result<String> {
         writeln!(generated, "    {line}")?;
     }
     generated.push_str("}\n");
-    Ok(generated)
+    rustfmt_generated(&generated)
 }
 
 fn methods(request: &Value) -> Result<Vec<Method>> {
@@ -377,6 +385,33 @@ fn sort_json(value: &mut Value) {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
+}
+
+fn rustfmt_generated(source: &str) -> Result<String> {
+    let rustfmt = env::var_os("RUSTFMT").unwrap_or_else(|| "rustfmt".into());
+    let mut child = Command::new(rustfmt)
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .wrap_err("could not start rustfmt for generated Herdr source")?;
+    let Some(mut stdin) = child.stdin.take() else {
+        bail!("rustfmt stdin was not available for generated Herdr source");
+    };
+    stdin
+        .write_all(source.as_bytes())
+        .wrap_err("could not send generated Herdr source to rustfmt")?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .wrap_err("could not wait for rustfmt on generated Herdr source")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("rustfmt rejected generated Herdr source: {stderr}");
+    }
+    String::from_utf8(output.stdout).wrap_err("rustfmt emitted non-UTF-8 generated Herdr source")
 }
 
 #[cfg(test)]

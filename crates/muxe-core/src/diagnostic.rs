@@ -6,10 +6,12 @@ use std::sync::Arc;
 pub struct SourceId(Arc<str>);
 
 impl SourceId {
+    #[must_use]
     pub fn new(value: impl Into<Arc<str>>) -> Self {
         Self(value.into())
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -30,10 +32,12 @@ pub struct SourceSpan {
 }
 
 impl SourceSpan {
+    #[must_use]
     pub fn new(source: SourceId, start: usize, end: usize) -> Self {
         Self { source, start, end }
     }
 
+    #[must_use]
     pub fn whole(source: SourceId, source_text: &str) -> Self {
         Self::new(source, 0, source_text.len())
     }
@@ -72,6 +76,7 @@ pub enum DiagnosticCode {
 }
 
 impl DiagnosticCode {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::YamlSyntax => "yaml_syntax",
@@ -122,7 +127,10 @@ impl ConfigDiagnostic {
             severity: DiagnosticSeverity::Error,
             code,
             message: message.into(),
-            labels: vec![DiagnosticLabel { span, message: String::new() }],
+            labels: vec![DiagnosticLabel {
+                span,
+                message: String::new(),
+            }],
             notes: Vec::new(),
             help: None,
         }
@@ -133,22 +141,31 @@ impl ConfigDiagnostic {
             severity: DiagnosticSeverity::Warning,
             code,
             message: message.into(),
-            labels: vec![DiagnosticLabel { span, message: String::new() }],
+            labels: vec![DiagnosticLabel {
+                span,
+                message: String::new(),
+            }],
             notes: Vec::new(),
             help: None,
         }
     }
 
+    #[must_use]
     pub fn with_label(mut self, span: SourceSpan, message: impl Into<String>) -> Self {
-        self.labels.push(DiagnosticLabel { span, message: message.into() });
+        self.labels.push(DiagnosticLabel {
+            span,
+            message: message.into(),
+        });
         self
     }
 
+    #[must_use]
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
         self
     }
 
+    #[must_use]
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help = Some(help.into());
         self

@@ -60,6 +60,7 @@ pub struct ZellijRegistry {
 
 impl ZellijRegistry {
     /// Empty table.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -67,6 +68,10 @@ impl ZellijRegistry {
     /// Registers a fresh bridge, atomically superseding any previous
     /// registration for the client. Returns the displaced registration ID, if any,
     /// so the caller can send a best-effort retirement notice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::ZeroRegistration`] when `registration` is all zeros.
     pub fn register(
         &mut self,
         client_id: &str,
@@ -105,6 +110,7 @@ impl ZellijRegistry {
         Ok(displaced)
     }
     /// Deterministically ordered active client IDs, for origin fan-out.
+    #[must_use]
     pub fn client_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.records.keys().cloned().collect();
         ids.sort();
@@ -113,6 +119,11 @@ impl ZellijRegistry {
 
     /// Renews the heartbeat lease for the active registration; rejects late
     /// events from displaced registrations without mutating table state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Stale`] when no active registration matches
+    /// (`client_id`, `registration`).
     pub fn heartbeat(
         &mut self,
         client_id: &str,
@@ -131,6 +142,11 @@ impl ZellijRegistry {
     }
 
     /// Checks that an event's registration is still active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Stale`] when no active registration matches
+    /// (`client_id`, `registration`).
     pub fn check(
         &self,
         client_id: &str,
@@ -145,12 +161,14 @@ impl ZellijRegistry {
     }
 
     /// Returns the active record for a client, if any.
+    #[must_use]
     pub fn get(&self, client_id: &str) -> Option<&BridgeRecord> {
         self.records.get(client_id)
     }
 
     /// Resolves the unique client owning a pane through active registrations.
     /// Fails rather than guessing when no unique client owns the pane.
+    #[must_use]
     pub fn client_for_pane(&self, pane_id: &str) -> Option<&BridgeRecord> {
         let mut matches = self
             .records
@@ -197,11 +215,13 @@ impl ZellijRegistry {
     }
 
     /// Number of active registrations.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
     /// Whether the table holds no registrations.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }

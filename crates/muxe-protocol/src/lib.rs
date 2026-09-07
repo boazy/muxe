@@ -12,6 +12,7 @@ pub mod wire;
 pub use control::{
     ActivationStatus, CompatibilityRecord, ControlDecoder, ControlDirection, ControlMessage,
     ControlOperation, ControlPolicy, ControlRequest, ControlRequestId, ControlResponse, HandoffId,
+    TargetReadiness,
 };
 pub use frame::{
     ArchivedFrame, ConnectionDecoder, ConnectionPolicy, DecodeError, EncodedFrame, PRELUDE_LEN,

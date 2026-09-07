@@ -17,11 +17,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use eyre::{bail, Result, WrapErr};
+use eyre::{Result, WrapErr, bail};
 use quote::ToTokens;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use syn::{Attribute, Fields, FnArg, Item, ItemEnum, ItemFn, ItemStruct, ItemType, Pat, ReturnType, Type, Variant, Visibility};
+use syn::{
+    Attribute, Fields, FnArg, Item, ItemEnum, ItemFn, ItemStruct, ItemType, Pat, ReturnType, Type,
+    Variant, Visibility,
+};
 
 use crate::classification::{ConverterClass, FunctionClass};
 
@@ -72,6 +75,18 @@ const BACKGROUND_INTEGRATIONS: &[&str] = &[
 ];
 
 #[derive(Debug)]
+struct TemplateWrites {
+    function: bool,
+    converter: bool,
+}
+
+impl TemplateWrites {
+    fn any(&self) -> bool {
+        self.function || self.converter
+    }
+}
+
+#[derive(Debug)]
 struct Arguments {
     source_root: PathBuf,
     pin: PathBuf,
@@ -81,8 +96,7 @@ struct Arguments {
     check: bool,
     materialize_fixtures: bool,
     verify_fixtures: bool,
-    write_function_template: bool,
-    write_converter_template: bool,
+    templates: TemplateWrites,
 }
 
 #[derive(Debug)]
@@ -174,24 +188,23 @@ fn run() -> Result<()> {
         let source_root = resolved_cargo_source_root(&pin)?;
         let fresh_root = fresh_fixture_root()?;
         materialize_fixture_corpus(&source_root, &fresh_root, &pin)?;
-        if let Err(error) = compare_fixture_corpus(&arguments.source_root, &fresh_root, &pin)
-            .and_then(|()| {
-                let source_hashes = fixture_source_hashes(&fresh_root, &pin)?;
-                let generated = generate_from_source(&arguments, &pin, &fresh_root, &source_hashes)?;
-                let existing = read(&arguments.output)?;
-                (existing == generated).then_some(()).ok_or_else(|| {
-                    eyre::eyre!(
-                        "{} differs from a freshly materialized pinned fixture corpus at {}",
-                        arguments.output.display(),
-                        fresh_root.display()
-                    )
-                })
-            })
-        {
-            return Err(error);
+        compare_fixture_corpus(&arguments.source_root, &fresh_root, &pin)?;
+        let source_hashes = fixture_source_hashes(&fresh_root, &pin)?;
+        let generated = generate_from_source(&arguments, &pin, &fresh_root, &source_hashes)?;
+        let existing = read(&arguments.output)?;
+        if existing != generated {
+            bail!(
+                "{} differs from a freshly materialized pinned fixture corpus at {}",
+                arguments.output.display(),
+                fresh_root.display()
+            );
         }
-        fs::remove_dir_all(&fresh_root)
-            .wrap_err_with(|| format!("could not remove fresh fixture directory {}", fresh_root.display()))?;
+        fs::remove_dir_all(&fresh_root).wrap_err_with(|| {
+            format!(
+                "could not remove fresh fixture directory {}",
+                fresh_root.display()
+            )
+        })?;
         return Ok(());
     }
 
@@ -225,14 +238,14 @@ fn generate_from_source(
     let shim_functions = public_function_specs(&shim_source)?;
     let public_functions = shim_functions.keys().cloned().collect::<BTreeSet<_>>();
 
-    if arguments.write_function_template {
+    if arguments.templates.function {
         write_policy_template(
             &arguments.function_policy,
             public_functions.iter().map(String::as_str),
             FunctionClass::Unsupported.as_str(),
         )?;
     }
-    if arguments.write_converter_template {
+    if arguments.templates.converter {
         write_policy_template(
             &arguments.converter_policy,
             direct_types.iter().map(String::as_str),
@@ -250,14 +263,17 @@ fn generate_from_source(
     let mirror_schema = mirror_schema(source_root, &mirror_roots)?;
     validate_unsupported_function_policy(&function_policy)?;
 
+    let surface = ActionSurface {
+        variants: &action_variants,
+        direct_types: &direct_types,
+        public_functions: &public_functions,
+    };
     generate(
         pin,
         &mirror_schema,
         source_hashes,
         &shim_functions,
-        &action_variants,
-        &direct_types,
-        &public_functions,
+        &surface,
         &function_policy,
         &converter_policy,
     )
@@ -273,24 +289,36 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
         check: false,
         materialize_fixtures: false,
         verify_fixtures: false,
-        write_function_template: false,
-        write_converter_template: false,
+        templates: TemplateWrites {
+            function: false,
+            converter: false,
+        },
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--source-root" => result.source_root = PathBuf::from(next_value(&mut arguments, "--source-root")?),
+            "--source-root" => {
+                result.source_root = PathBuf::from(next_value(&mut arguments, "--source-root")?);
+            }
             "--pin" => result.pin = PathBuf::from(next_value(&mut arguments, "--pin")?),
-            "--function-policy" => result.function_policy = PathBuf::from(next_value(&mut arguments, "--function-policy")?),
-            "--converter-policy" => result.converter_policy = PathBuf::from(next_value(&mut arguments, "--converter-policy")?),
+            "--function-policy" => {
+                result.function_policy =
+                    PathBuf::from(next_value(&mut arguments, "--function-policy")?);
+            }
+            "--converter-policy" => {
+                result.converter_policy =
+                    PathBuf::from(next_value(&mut arguments, "--converter-policy")?);
+            }
             "--output" => result.output = PathBuf::from(next_value(&mut arguments, "--output")?),
             "--check" => result.check = true,
             "--materialize-fixtures" => result.materialize_fixtures = true,
             "--verify-fixtures" => result.verify_fixtures = true,
-            "--write-function-template" => result.write_function_template = true,
-            "--write-converter-template" => result.write_converter_template = true,
+            "--write-function-template" => result.templates.function = true,
+            "--write-converter-template" => result.templates.converter = true,
             "--help" | "-h" => {
-                println!("Usage: muxe-zellij-gen [--source-root PATH] [--pin PATH] [--function-policy PATH] [--converter-policy PATH] [--output PATH] [--check | --materialize-fixtures | --verify-fixtures] [--write-function-template] [--write-converter-template]");
+                println!(
+                    "Usage: muxe-zellij-gen [--source-root PATH] [--pin PATH] [--function-policy PATH] [--converter-policy PATH] [--output PATH] [--check | --materialize-fixtures | --verify-fixtures] [--write-function-template] [--write-converter-template]"
+                );
                 std::process::exit(0);
             }
             _ => bail!("unknown argument {argument:?}"),
@@ -300,9 +328,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
     if special_modes > 1 {
         bail!("--materialize-fixtures and --verify-fixtures are mutually exclusive");
     }
-    if (result.check || special_modes > 0)
-        && (result.write_function_template || result.write_converter_template)
-    {
+    if (result.check || special_modes > 0) && result.templates.any() {
         bail!("--check and fixture modes cannot be combined with template-writing options");
     }
     Ok(result)
@@ -325,7 +351,10 @@ fn parse_pin(path: &Path) -> Result<Pin> {
         bail!("{} has invalid revision {revision:?}", path.display());
     }
     if !repository.starts_with("https://") {
-        bail!("{} has a non-HTTPS repository {repository:?}", path.display());
+        bail!(
+            "{} has a non-HTTPS repository {repository:?}",
+            path.display()
+        );
     }
     Ok(Pin {
         repository,
@@ -413,10 +442,12 @@ fn resolved_cargo_source_root(pin: &Pin) -> Result<PathBuf> {
         );
     }
     let package = packages[0];
-    let source = package
-        .source
-        .as_deref()
-        .ok_or_else(|| eyre::eyre!("resolved SDK package {:?} is not a git source", pin.crate_name))?;
+    let source = package.source.as_deref().ok_or_else(|| {
+        eyre::eyre!(
+            "resolved SDK package {:?} is not a git source",
+            pin.crate_name
+        )
+    })?;
     let (source_with_query, resolved_revision) = source
         .rsplit_once('#')
         .ok_or_else(|| eyre::eyre!("resolved SDK source has no revision fragment: {source:?}"))?;
@@ -440,7 +471,12 @@ fn resolved_cargo_source_root(pin: &Pin) -> Result<PathBuf> {
         .manifest_path
         .parent()
         .and_then(Path::parent)
-        .ok_or_else(|| eyre::eyre!("resolved SDK manifest has no repository root: {}", package.manifest_path.display()))?
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "resolved SDK manifest has no repository root: {}",
+                package.manifest_path.display()
+            )
+        })?
         .to_owned();
     source_hashes(&source_root, &pin.source_inputs)?;
     Ok(source_root)
@@ -467,7 +503,10 @@ fn materialize_fixture_corpus(source_root: &Path, fixture_root: &Path, pin: &Pin
         };
         write_file(&fixture_root.join(relative), reduced)?;
     }
-    write_file(&fixture_root.join(FIXTURE_HASHES), render_fixture_hashes(&hashes)?)?;
+    write_file(
+        &fixture_root.join(FIXTURE_HASHES),
+        render_fixture_hashes(&hashes)?,
+    )?;
     Ok(())
 }
 
@@ -496,7 +535,7 @@ fn minimized_model_source(source: &str, relative: &str) -> Result<String> {
     if retained == 0 {
         bail!("minimized fixture source {relative} would contain no type declarations");
     }
-    format_minimized_fixture(reduced, relative)
+    format_minimized_fixture(&reduced, relative)
 }
 
 fn minimized_shim_source(source: &str, relative: &str) -> Result<String> {
@@ -517,11 +556,11 @@ fn minimized_shim_source(source: &str, relative: &str) -> Result<String> {
     if retained == 0 {
         bail!("minimized fixture source {relative} would contain no public functions");
     }
-    format_minimized_fixture(reduced, relative)
+    format_minimized_fixture(&reduced, relative)
 }
 
-fn format_minimized_fixture(reduced: String, relative: &str) -> Result<String> {
-    let parsed = syn::parse_file(&reduced)
+fn format_minimized_fixture(reduced: &str, relative: &str) -> Result<String> {
+    let parsed = syn::parse_file(reduced)
         .wrap_err_with(|| format!("could not format minimized fixture source {relative}"))?;
     Ok(format!(
         "// Minimized from the exact pinned source: {relative}\n\n{}",
@@ -547,17 +586,29 @@ fn fixture_source_hashes(fixture_root: &Path, pin: &Pin) -> Result<BTreeMap<Stri
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (source, hash) = line
-            .split_once('\t')
-            .ok_or_else(|| eyre::eyre!("{}:{} must be SOURCE<TAB>SHA256", path.display(), line_number + 1))?;
+        let (source, hash) = line.split_once('\t').ok_or_else(|| {
+            eyre::eyre!(
+                "{}:{} must be SOURCE<TAB>SHA256",
+                path.display(),
+                line_number + 1
+            )
+        })?;
         if source.is_empty()
             || hash.len() != 64
             || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
-            bail!("{}:{} has an invalid source hash", path.display(), line_number + 1);
+            bail!(
+                "{}:{} has an invalid source hash",
+                path.display(),
+                line_number + 1
+            );
         }
         if hashes.insert(source.to_owned(), hash.to_owned()).is_some() {
-            bail!("{}:{} duplicates fixture source {source:?}", path.display(), line_number + 1);
+            bail!(
+                "{}:{} duplicates fixture source {source:?}",
+                path.display(),
+                line_number + 1
+            );
         }
     }
     let expected = pin.source_inputs.iter().cloned().collect::<BTreeSet<_>>();
@@ -566,8 +617,16 @@ fn fixture_source_hashes(fixture_root: &Path, pin: &Pin) -> Result<BTreeMap<Stri
         bail!(
             "{} source set drifts from pins/zellij.toml: missing [{}]; stale [{}]",
             path.display(),
-            expected.difference(&actual).cloned().collect::<Vec<_>>().join(", "),
-            actual.difference(&expected).cloned().collect::<Vec<_>>().join(", "),
+            expected
+                .difference(&actual)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            actual
+                .difference(&expected)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
         );
     }
     Ok(hashes)
@@ -578,10 +637,18 @@ fn compare_fixture_corpus(expected_root: &Path, fresh_root: &Path, pin: &Pin) ->
         .into_iter()
         .chain(std::iter::once(FIXTURE_HASHES.to_owned()))
     {
-        let expected = fs::read(expected_root.join(&relative))
-            .wrap_err_with(|| format!("could not read checked-in fixture {}", expected_root.join(&relative).display()))?;
-        let fresh = fs::read(fresh_root.join(&relative))
-            .wrap_err_with(|| format!("could not read fresh fixture {}", fresh_root.join(&relative).display()))?;
+        let expected = fs::read(expected_root.join(&relative)).wrap_err_with(|| {
+            format!(
+                "could not read checked-in fixture {}",
+                expected_root.join(&relative).display()
+            )
+        })?;
+        let fresh = fs::read(fresh_root.join(&relative)).wrap_err_with(|| {
+            format!(
+                "could not read fresh fixture {}",
+                fresh_root.join(&relative).display()
+            )
+        })?;
         if expected != fresh {
             bail!(
                 "checked-in minimized fixture {} differs from fresh materialization at {}",
@@ -599,8 +666,16 @@ fn fresh_fixture_root() -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .wrap_err("system clock predates Unix epoch")?
         .as_nanos();
-    let root = env::temp_dir().join(format!("muxe-zellij-fixture-{}-{nonce}", std::process::id()));
-    fs::create_dir(&root).wrap_err_with(|| format!("could not create fresh fixture directory {}", root.display()))?;
+    let root = env::temp_dir().join(format!(
+        "muxe-zellij-fixture-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).wrap_err_with(|| {
+        format!(
+            "could not create fresh fixture directory {}",
+            root.display()
+        )
+    })?;
     Ok(root)
 }
 
@@ -654,7 +729,6 @@ fn direct_action_types(source: &str) -> Result<BTreeSet<String>> {
 fn action_enum(source: &str) -> Result<ItemEnum> {
     let file = syn::parse_file(source).wrap_err("could not parse pinned actions.rs with syn")?;
     file.items
-
         .into_iter()
         .find_map(|item| match item {
             Item::Enum(item) if item.ident == "Action" => Some(item),
@@ -764,8 +838,14 @@ fn collect_type_names(ty: &Type, names: &mut BTreeSet<String>) {
                     for argument in &arguments.args {
                         match argument {
                             syn::GenericArgument::Type(ty) => collect_type_names(ty, names),
-                            syn::GenericArgument::AssocType(associated) => collect_type_names(&associated.ty, names),
-                            syn::GenericArgument::Constraint(_) | syn::GenericArgument::Const(_) | syn::GenericArgument::Lifetime(_) | syn::GenericArgument::AssocConst(_) | _ => {}
+                            syn::GenericArgument::AssocType(associated) => {
+                                collect_type_names(&associated.ty, names);
+                            }
+                            syn::GenericArgument::Constraint(_)
+                            | syn::GenericArgument::Const(_)
+                            | syn::GenericArgument::Lifetime(_)
+                            | syn::GenericArgument::AssocConst(_)
+                            | _ => {}
                         }
                     }
                 }
@@ -779,7 +859,9 @@ fn collect_type_names(ty: &Type, names: &mut BTreeSet<String>) {
                 collect_type_names(element, names);
             }
         }
-        Type::ImplTrait(_) | Type::Infer(_) | Type::Macro(_) | Type::Never(_) | Type::TraitObject(_) | Type::Verbatim(_) => {}
+        // Every other shape (arrays, parens, groups, impl-trait, infer,
+        // macros, never, bare functions, trait objects, verbatim, and any
+        // future non-exhaustive addition) carries no collectible type names.
         _ => {}
     }
 }
@@ -825,7 +907,12 @@ fn public_function_specs(source: &str) -> Result<BTreeMap<String, ShimFunction>>
     let file = syn::parse_file(source).wrap_err("could not parse pinned shim.rs with syn")?;
     let mut functions = BTreeMap::new();
     for item in file.items {
-        let Item::Fn(ItemFn { vis: Visibility::Public(_), sig, .. }) = item else {
+        let Item::Fn(ItemFn {
+            vis: Visibility::Public(_),
+            sig,
+            ..
+        }) = item
+        else {
             continue;
         };
         let name = sig.ident.to_string();
@@ -844,7 +931,9 @@ fn public_function_specs(source: &str) -> Result<BTreeMap<String, ShimFunction>>
                         ty: (*argument.ty).clone(),
                     })
                 }
-                FnArg::Receiver(_) => bail!("public shim function {name:?} has an unexpected receiver"),
+                FnArg::Receiver(_) => {
+                    bail!("public shim function {name:?} has an unexpected receiver")
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         let return_type = match &sig.output {
@@ -943,16 +1032,28 @@ where
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (name, class) = line
-            .split_once('\t')
-            .ok_or_else(|| eyre::eyre!("{}:{} must be NAME<TAB>CLASS", path.display(), line_number + 1))?;
+        let (name, class) = line.split_once('\t').ok_or_else(|| {
+            eyre::eyre!(
+                "{}:{} must be NAME<TAB>CLASS",
+                path.display(),
+                line_number + 1
+            )
+        })?;
         if name.is_empty() || class.is_empty() {
-            bail!("{}:{} has an empty name or class", path.display(), line_number + 1);
+            bail!(
+                "{}:{} has an empty name or class",
+                path.display(),
+                line_number + 1
+            );
         }
         let class = T::from_str(class)
             .map_err(|error| eyre::eyre!("{}:{}: {error}", path.display(), line_number + 1))?;
         if policy.insert(name.to_owned(), class).is_some() {
-            bail!("{}:{} duplicates policy entry {name:?}", path.display(), line_number + 1);
+            bail!(
+                "{}:{} duplicates policy entry {name:?}",
+                path.display(),
+                line_number + 1
+            );
         }
     }
     Ok(policy)
@@ -963,7 +1064,8 @@ fn write_policy_template<'a>(
     names: impl Iterator<Item = &'a str>,
     default_class: &str,
 ) -> Result<()> {
-    let mut template = String::from("# Generated from the pinned Zellij source. Review every entry before use.\n");
+    let mut template =
+        String::from("# Generated from the pinned Zellij source. Review every entry before use.\n");
     for name in names {
         writeln!(template, "{name}\t{default_class}")?;
     }
@@ -981,18 +1083,27 @@ fn validate_exact_policy<T>(
     if !missing.is_empty() || !stale.is_empty() {
         bail!(
             "{subject} policy drift: missing [{}]; stale [{}]",
-            missing.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", "),
-            stale.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", "),
+            missing
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            stale
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
         );
     }
     Ok(())
 }
 
-
 fn reject_unsupported_converters(policy: &BTreeMap<String, ConverterClass>) -> Result<()> {
     let unsupported = policy
         .iter()
-        .filter_map(|(name, class)| (*class == ConverterClass::Unsupported).then_some(name.as_str()))
+        .filter_map(|(name, class)| {
+            (*class == ConverterClass::Unsupported).then_some(name.as_str())
+        })
         .collect::<Vec<_>>();
     if unsupported.is_empty() {
         return Ok(());
@@ -1003,14 +1114,15 @@ fn reject_unsupported_converters(policy: &BTreeMap<String, ConverterClass>) -> R
     )
 }
 
-fn validate_unsupported_function_policy(
-    policy: &BTreeMap<String, FunctionClass>,
-) -> Result<()> {
+fn validate_unsupported_function_policy(policy: &BTreeMap<String, FunctionClass>) -> Result<()> {
     let actual = policy
         .iter()
         .filter_map(|(name, class)| (*class == FunctionClass::Unsupported).then_some(name.as_str()))
         .collect::<BTreeSet<_>>();
-    let expected = BACKGROUND_INTEGRATIONS.iter().copied().collect::<BTreeSet<_>>();
+    let expected = BACKGROUND_INTEGRATIONS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     if actual != expected {
         let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
         let unexpected = actual.difference(&expected).copied().collect::<Vec<_>>();
@@ -1029,27 +1141,26 @@ fn source_hashes(source_root: &Path, inputs: &[String]) -> Result<BTreeMap<Strin
         if Path::new(input).is_absolute() || input.split('/').any(|component| component == "..") {
             bail!("pin source input must be a relative in-tree path: {input:?}");
         }
-        hashes.insert(input.clone(), sha256_hex(read(&source_root.join(input))?.as_bytes()));
+        hashes.insert(
+            input.clone(),
+            sha256_hex(read(&source_root.join(input))?.as_bytes()),
+        );
     }
     Ok(hashes)
 }
-
-fn generate(
-    pin: &Pin,
-    mirror_schema: &MirrorSchema,
+/// The derived action surface every render stage measures against: pinned
+/// variants plus the exact direct-type and public-function sets.
+struct ActionSurface<'a> {
+    variants: &'a [ActionVariant],
+    direct_types: &'a BTreeSet<String>,
+    public_functions: &'a BTreeSet<String>,
+}
+/// Renders source-provenance tables: input hashes plus mirror type sources.
+fn render_source_tables(
     source_hashes: &BTreeMap<String, String>,
-    shim_functions: &BTreeMap<String, ShimFunction>,
-    variants: &[ActionVariant],
-    direct_types: &BTreeSet<String>,
-    public_functions: &BTreeSet<String>,
-    function_policy: &BTreeMap<String, FunctionClass>,
-    converter_policy: &BTreeMap<String, ConverterClass>,
-) -> Result<String> {
-    let mut output = String::from("// @generated by tools/muxe-zellij-gen; do not edit by hand.\n");
-    output.push_str("// Regenerate with: cargo run --locked -p muxe-zellij-gen --\n");
-    output.push_str("// Raw input validates into a typed model; dispatch converts directly without JSON.\n\n");
-    writeln!(output, "pub const PINNED_ZELLIJ_REVISION: &str = {:?};", pin.revision)?;
-    writeln!(output, "pub const PINNED_ZELLIJ_VERSION: &str = {:?};\n", pin.host_version)?;
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
     output.push_str("pub const SOURCE_INPUT_SHA256: &[(&str, &str)] = &[\n");
     for (path, hash) in source_hashes {
         writeln!(output, "    ({path:?}, {hash:?}),")?;
@@ -1064,8 +1175,19 @@ fn generate(
         writeln!(output, "    ({name:?}, {:?}),", definition.source)?;
     }
     output.push_str("];\n\n");
+    Ok(())
+}
+
+/// Renders action-inventory tables: variants, converters, holes, plugin
+/// functions, policy reasons, unsupported sets, and validation rules.
+fn render_action_tables(
+    surface: &ActionSurface<'_>,
+    converter_policy: &BTreeMap<String, ConverterClass>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    output: &mut String,
+) -> Result<()> {
     output.push_str("pub const ACTION_VARIANTS: &[(&str, &[&str])] = &[\n");
-    for variant in variants {
+    for variant in surface.variants {
         write!(output, "    ({:?}, &[", variant.name)?;
         for field in &variant.fields {
             write!(output, "{field:?}, ")?;
@@ -1074,7 +1196,7 @@ fn generate(
     }
     output.push_str("];\n\n");
     output.push_str("pub const ACTION_CONVERTERS: &[(&str, &str)] = &[\n");
-    for ty in direct_types {
+    for ty in surface.direct_types {
         let class = converter_policy
             .get(ty)
             .expect("converter policy was exact-validated")
@@ -1090,7 +1212,7 @@ fn generate(
     }
     output.push_str("];\n\n");
     output.push_str("pub const PUBLIC_PLUGIN_FUNCTIONS: &[(&str, &str)] = &[\n");
-    for function in public_functions {
+    for function in surface.public_functions {
         let class = function_policy
             .get(function)
             .expect("function policy was exact-validated")
@@ -1100,7 +1222,11 @@ fn generate(
     output.push_str("];\n\n");
     output.push_str("pub const FUNCTION_POLICY_REASONS: &[(&str, &str)] = &[\n");
     for (function, class) in function_policy {
-        writeln!(output, "    ({function:?}, {:?}),", function_policy_reason(*class))?;
+        writeln!(
+            output,
+            "    ({function:?}, {:?}),",
+            function_policy_reason(*class)
+        )?;
     }
     output.push_str("];\n\n");
     output.push_str("pub const UNSUPPORTED_PUBLIC_PLUGIN_FUNCTIONS: &[&str] = &[\n");
@@ -1114,24 +1240,78 @@ fn generate(
     output.push_str("    (\"PercentOrFixed::Percent\", \"must not exceed 100, matching the pinned source parser\"),\n");
     output.push_str("    (\"PluginUserConfiguration\", \"must not contain keys the pinned source constructor would silently discard\"),\n");
     output.push_str("];\n\n");
+    Ok(())
+}
+
+fn generate(
+    pin: &Pin,
+    mirror_schema: &MirrorSchema,
+    source_hashes: &BTreeMap<String, String>,
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    surface: &ActionSurface<'_>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    converter_policy: &BTreeMap<String, ConverterClass>,
+) -> Result<String> {
+    let mut output = String::from("// @generated by tools/muxe-zellij-gen; do not edit by hand.\n");
+    output.push_str("// Regenerate with: cargo run --locked -p muxe-zellij-gen --\n");
+    output.push_str(
+        "// Raw input validates into a typed model; dispatch converts directly without JSON.\n\n",
+    );
+    writeln!(
+        output,
+        "pub const PINNED_ZELLIJ_REVISION: &str = {:?};",
+        pin.revision
+    )?;
+    writeln!(
+        output,
+        "pub const PINNED_ZELLIJ_VERSION: &str = {:?};\n",
+        pin.host_version
+    )?;
+    render_source_tables(source_hashes, mirror_schema, &mut output)?;
+    render_action_tables(surface, converter_policy, function_policy, &mut output)?;
     render_native_command_metadata(shim_functions, function_policy, mirror_schema, &mut output)?;
-    render_model_module("raw", "Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize", ModelFlavor::Raw, mirror_schema, &mut output)?;
-    render_model_module("validated", "Clone, Debug, PartialEq, Eq, serde::Serialize", ModelFlavor::Validated, mirror_schema, &mut output)?;
+    render_model_module(
+        "raw",
+        "Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize",
+        ModelFlavor::Raw,
+        mirror_schema,
+        &mut output,
+    )?;
+    render_model_module(
+        "validated",
+        "Clone, Debug, PartialEq, Eq, serde::Serialize",
+        ModelFlavor::Validated,
+        mirror_schema,
+        &mut output,
+    )?;
     output.push_str("pub use validated::Action as ValidatedAction;\n\n");
-    render_validation_error(&mut output)?;
+    render_validation_error(&mut output);
     render_native_command_models(shim_functions, function_policy, mirror_schema, &mut output)?;
     render_raw_to_validated_converters(mirror_schema, &mut output)?;
     render_upstream_converters(mirror_schema, &mut output)?;
-    render_native_command_return_converters(shim_functions, function_policy, mirror_schema, &mut output)?;
+    render_native_command_return_converters(
+        shim_functions,
+        function_policy,
+        mirror_schema,
+        &mut output,
+    )?;
     Ok(output)
 }
 
 fn function_policy_reason(class: FunctionClass) -> &'static str {
     match class {
-        FunctionClass::Exposed => "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration",
-        FunctionClass::Internal => "bridge lifecycle, client targeting, permission, capture, or subscription primitive; never user-dispatched",
-        FunctionClass::Query => "source query or input/output helper; v1 native command surface excludes queries",
-        FunctionClass::Unsupported => "background integration or subsystem administration; excluded from the v1 native command surface",
+        FunctionClass::Exposed => {
+            "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"
+        }
+        FunctionClass::Internal => {
+            "bridge lifecycle, client targeting, permission, capture, or subscription primitive; never user-dispatched"
+        }
+        FunctionClass::Query => {
+            "source query or input/output helper; v1 native command surface excludes queries"
+        }
+        FunctionClass::Unsupported => {
+            "background integration or subsystem administration; excluded from the v1 native command surface"
+        }
     }
 }
 
@@ -1149,7 +1329,14 @@ fn render_native_command_metadata(
         let return_type = function
             .return_type
             .as_ref()
-            .map(|ty| command_model_type_text(ty, &function.generic_types, ModelFlavor::Validated, mirror_schema))
+            .map(|ty| {
+                command_model_type_text(
+                    ty,
+                    &function.generic_types,
+                    ModelFlavor::Validated,
+                    mirror_schema,
+                )
+            })
             .transpose()?
             .unwrap_or_else(|| "()".to_owned());
         writeln!(
@@ -1161,7 +1348,8 @@ fn render_native_command_metadata(
         )?;
     }
     output.push_str("];\n\n");
-    output.push_str("pub const NATIVE_ZELLIJ_COMMAND_ARGUMENTS: &[(&str, &str, &str, &str)] = &[\n");
+    output
+        .push_str("pub const NATIVE_ZELLIJ_COMMAND_ARGUMENTS: &[(&str, &str, &str, &str)] = &[\n");
     for function in shim_functions.values() {
         if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
             continue;
@@ -1183,7 +1371,9 @@ fn render_native_command_metadata(
         }
     }
     output.push_str("];\n\n");
-    output.push_str("pub const NATIVE_ZELLIJ_COMMAND_CONVERTER_HOLES: &[(&str, &str, &str)] = &[];\n\n");
+    output.push_str(
+        "pub const NATIVE_ZELLIJ_COMMAND_CONVERTER_HOLES: &[(&str, &str, &str)] = &[];\n\n",
+    );
     Ok(())
 }
 
@@ -1191,26 +1381,17 @@ fn yaml_kebab(name: &str) -> String {
     name.replace('_', "-")
 }
 
-
-fn render_native_command_models(
+/// Renders one validated-flavor command enum (`ValidatedNativeCommand`,
+/// `NativeCommandDispatch`) with its exposed variants.
+fn render_validated_enum(
+    enum_name: &str,
     shim_functions: &BTreeMap<String, ShimFunction>,
     function_policy: &BTreeMap<String, FunctionClass>,
     mirror_schema: &MirrorSchema,
     output: &mut String,
 ) -> Result<()> {
-    output.push_str("#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]\n");
-    output.push_str("#[serde(tag = \"command\", content = \"arguments\", rename_all = \"kebab-case\", rename_all_fields = \"kebab-case\")]\n");
-    output.push_str("pub enum RawNativeCommand {\n");
-    for function in shim_functions.values() {
-        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
-            continue;
-        }
-        render_command_variant(function, ModelFlavor::Raw, mirror_schema, output)?;
-    }
-    output.push_str("}\n\n");
-
     output.push_str("#[derive(Clone, Debug, PartialEq)]\n");
-    output.push_str("pub enum ValidatedNativeCommand {\n");
+    writeln!(output, "pub enum {enum_name} {{")?;
     for function in shim_functions.values() {
         if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
             continue;
@@ -1218,7 +1399,17 @@ fn render_native_command_models(
         render_command_variant(function, ModelFlavor::Validated, mirror_schema, output)?;
     }
     output.push_str("}\n\n");
+    Ok(())
+}
 
+/// Renders the `TryFrom<RawNativeCommand>` conversion with per-argument
+/// validated expressions.
+fn render_validated_conversion(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
     output.push_str("impl TryFrom<RawNativeCommand> for ValidatedNativeCommand {\n");
     output.push_str("    type Error = ValidationError;\n");
     output.push_str("    fn try_from(value: RawNativeCommand) -> Result<Self, Self::Error> {\n");
@@ -1229,7 +1420,10 @@ fn render_native_command_models(
         }
         let variant = command_variant_name(&function.name);
         if function.arguments.is_empty() {
-            writeln!(output, "            RawNativeCommand::{variant} => Ok(Self::{variant}),")?;
+            writeln!(
+                output,
+                "            RawNativeCommand::{variant} => Ok(Self::{variant}),"
+            )?;
             continue;
         }
         let names = function
@@ -1237,7 +1431,11 @@ fn render_native_command_models(
             .iter()
             .map(|argument| argument.name.as_str())
             .collect::<Vec<_>>();
-        writeln!(output, "            RawNativeCommand::{variant} {{ {} }} => Ok(Self::{variant} {{", names.join(", "))?;
+        writeln!(
+            output,
+            "            RawNativeCommand::{variant} {{ {} }} => Ok(Self::{variant} {{",
+            names.join(", ")
+        )?;
         for argument in &function.arguments {
             writeln!(
                 output,
@@ -1254,16 +1452,15 @@ fn render_native_command_models(
         output.push_str("            }),\n");
     }
     output.push_str("        }\n    }\n}\n\n");
+    Ok(())
+}
 
-    output.push_str("#[derive(Clone, Debug, PartialEq)]\n");
-    output.push_str("pub enum NativeCommandDispatch {\n");
-    for function in shim_functions.values() {
-        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
-            continue;
-        }
-        render_command_variant(function, ModelFlavor::Validated, mirror_schema, output)?;
-    }
-    output.push_str("}\n\n");
+/// Renders the infallible `From<ValidatedNativeCommand>` dispatch conversion.
+fn render_dispatch_conversion(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    output: &mut String,
+) -> Result<()> {
     output.push_str("impl From<ValidatedNativeCommand> for NativeCommandDispatch {\n");
     output.push_str("    fn from(value: ValidatedNativeCommand) -> Self {\n");
     output.push_str("        match value {\n");
@@ -1273,17 +1470,35 @@ fn render_native_command_models(
         }
         let variant = command_variant_name(&function.name);
         if function.arguments.is_empty() {
-            writeln!(output, "            ValidatedNativeCommand::{variant} => Self::{variant},")?;
+            writeln!(
+                output,
+                "            ValidatedNativeCommand::{variant} => Self::{variant},"
+            )?;
         } else {
             let names = function
                 .arguments
                 .iter()
                 .map(|argument| argument.name.as_str())
                 .collect::<Vec<_>>();
-            writeln!(output, "            ValidatedNativeCommand::{variant} {{ {} }} => Self::{variant} {{ {} }},", names.join(", "), names.join(", "))?;
+            writeln!(
+                output,
+                "            ValidatedNativeCommand::{variant} {{ {} }} => Self::{variant} {{ {} }},",
+                names.join(", "),
+                names.join(", ")
+            )?;
         }
     }
     output.push_str("        }\n    }\n}\n\n");
+    Ok(())
+}
+
+/// Renders the `NativeCommandReturn` enum with validated return payloads.
+fn render_return_enum(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
     output.push_str("#[derive(Clone, Debug, PartialEq)]\n");
     output.push_str("pub enum NativeCommandReturn {\n");
     for function in shim_functions.values() {
@@ -1294,12 +1509,54 @@ fn render_native_command_models(
         let return_type = function
             .return_type
             .as_ref()
-            .map(|ty| command_model_type_text(ty, &function.generic_types, ModelFlavor::Validated, mirror_schema))
+            .map(|ty| {
+                command_model_type_text(
+                    ty,
+                    &function.generic_types,
+                    ModelFlavor::Validated,
+                    mirror_schema,
+                )
+            })
             .transpose()?
             .unwrap_or_else(|| "()".to_owned());
         writeln!(output, "    {variant}({return_type}),")?;
     }
     output.push_str("}\n\n");
+    Ok(())
+}
+fn render_native_command_models(
+    shim_functions: &BTreeMap<String, ShimFunction>,
+    function_policy: &BTreeMap<String, FunctionClass>,
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
+    output.push_str("#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]\n");
+    output.push_str("#[serde(tag = \"command\", content = \"arguments\", rename_all = \"kebab-case\", rename_all_fields = \"kebab-case\")]\n");
+    output.push_str("pub enum RawNativeCommand {\n");
+    for function in shim_functions.values() {
+        if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
+            continue;
+        }
+        render_command_variant(function, ModelFlavor::Raw, mirror_schema, output)?;
+    }
+    output.push_str("}\n\n");
+    render_validated_enum(
+        "ValidatedNativeCommand",
+        shim_functions,
+        function_policy,
+        mirror_schema,
+        output,
+    )?;
+    render_validated_conversion(shim_functions, function_policy, mirror_schema, output)?;
+    render_validated_enum(
+        "NativeCommandDispatch",
+        shim_functions,
+        function_policy,
+        mirror_schema,
+        output,
+    )?;
+    render_dispatch_conversion(shim_functions, function_policy, output)?;
+    render_return_enum(shim_functions, function_policy, mirror_schema, output)?;
     Ok(())
 }
 
@@ -1312,10 +1569,14 @@ fn render_native_command_return_converters(
     let return_roots = command_return_type_roots(shim_functions, function_policy);
     if return_roots.contains("PaneId") {
         output.push_str("#[allow(dead_code)]\n");
-        output.push_str("fn from_zellij_pane_id(value: zellij_utils::data::PaneId) -> validated::PaneId {\n");
+        output.push_str(
+            "fn from_zellij_pane_id(value: zellij_utils::data::PaneId) -> validated::PaneId {\n",
+        );
         output.push_str("    match value {\n");
         output.push_str("        zellij_utils::data::PaneId::Terminal(id) => validated::PaneId::Terminal(id),\n");
-        output.push_str("        zellij_utils::data::PaneId::Plugin(id) => validated::PaneId::Plugin(id),\n");
+        output.push_str(
+            "        zellij_utils::data::PaneId::Plugin(id) => validated::PaneId::Plugin(id),\n",
+        );
         output.push_str("    }\n}\n\n");
     }
     for function in shim_functions.values() {
@@ -1331,7 +1592,14 @@ fn render_native_command_return_converters(
         let expression = function
             .return_type
             .as_ref()
-            .map(|ty| source_return_to_validated_expression(ty, "value", &function.generic_types, mirror_schema))
+            .map(|ty| {
+                source_return_to_validated_expression(
+                    ty,
+                    "value",
+                    &function.generic_types,
+                    mirror_schema,
+                )
+            })
             .transpose()?
             .unwrap_or_else(|| "value".to_owned());
         let variant = command_variant_name(&function.name);
@@ -1341,7 +1609,9 @@ fn render_native_command_return_converters(
             function.name,
         )?;
     }
-    output.push_str("pub fn dispatch_native_command(value: NativeCommandDispatch) -> NativeCommandReturn {\n");
+    output.push_str(
+        "pub fn dispatch_native_command(value: NativeCommandDispatch) -> NativeCommandReturn {\n",
+    );
     output.push_str("    match value {\n");
     for function in shim_functions.values() {
         if function_policy.get(&function.name) != Some(&FunctionClass::Exposed) {
@@ -1393,29 +1663,55 @@ fn command_validated_to_source_expression(
 ) -> Result<String> {
     match ty {
         Type::Reference(reference) if matches!(reference.elem.as_ref(), Type::Slice(_)) => {
-            command_validated_to_source_expression(&reference.elem, value, generic_types, mirror_schema)
+            command_validated_to_source_expression(
+                &reference.elem,
+                value,
+                generic_types,
+                mirror_schema,
+            )
         }
         Type::Reference(reference) => Ok(format!(
             "&{}",
-            command_validated_to_source_expression(&reference.elem, value, generic_types, mirror_schema)?
+            command_validated_to_source_expression(
+                &reference.elem,
+                value,
+                generic_types,
+                mirror_schema
+            )?
         )),
         Type::Slice(slice) if !source_conversion_needed(&slice.elem, mirror_schema) => {
             Ok(format!("&{value}"))
         }
         Type::Slice(slice) => {
-            let item = command_validated_to_source_expression(&slice.elem, "item", generic_types, mirror_schema)?;
-            Ok(format!("&{value}.into_iter().map(|item| {item}).collect::<Vec<_>>()"))
+            let item = command_validated_to_source_expression(
+                &slice.elem,
+                "item",
+                generic_types,
+                mirror_schema,
+            )?;
+            Ok(format!(
+                "&{value}.into_iter().map(|item| {item}).collect::<Vec<_>>()"
+            ))
         }
         Type::ImplTrait(impl_trait) => {
-            let normalized = normalized_trait_bounds(&impl_trait.bounds)
-                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command parameter {}", type_text(ty)))?;
+            let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
+                eyre::eyre!(
+                    "unrecognized impl Trait command parameter {}",
+                    type_text(ty)
+                )
+            })?;
             command_validated_to_source_expression(&normalized, value, generic_types, mirror_schema)
         }
         Type::Path(path) => {
             let segment = path.path.segments.last().expect("path has a segment");
             let name = segment.ident.to_string();
             if let Some(normalized) = generic_types.get(&name) {
-                return command_validated_to_source_expression(normalized, value, generic_types, mirror_schema);
+                return command_validated_to_source_expression(
+                    normalized,
+                    value,
+                    generic_types,
+                    mirror_schema,
+                );
             }
             let arguments = type_arguments(segment)?;
             if name == "Option"
@@ -1441,7 +1737,14 @@ fn command_validated_to_source_expression(
                 .elems
                 .iter()
                 .zip(&names)
-                .map(|(element, name)| command_validated_to_source_expression(element, name, generic_types, mirror_schema))
+                .map(|(element, name)| {
+                    command_validated_to_source_expression(
+                        element,
+                        name,
+                        generic_types,
+                        mirror_schema,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(format!(
                 "{{ let ({},) = {value}; ({},) }}",
@@ -1449,12 +1752,15 @@ fn command_validated_to_source_expression(
                 values.join(", ")
             ))
         }
-        Type::Group(group) => command_validated_to_source_expression(&group.elem, value, generic_types, mirror_schema),
-        Type::Paren(paren) => command_validated_to_source_expression(&paren.elem, value, generic_types, mirror_schema),
+        Type::Group(group) => {
+            command_validated_to_source_expression(&group.elem, value, generic_types, mirror_schema)
+        }
+        Type::Paren(paren) => {
+            command_validated_to_source_expression(&paren.elem, value, generic_types, mirror_schema)
+        }
         _ => into_source_expression(ty, value, mirror_schema),
     }
 }
-
 
 fn command_return_type_roots(
     shim_functions: &BTreeMap<String, ShimFunction>,
@@ -1482,14 +1788,17 @@ fn source_command_type_text(
     mirror_schema: &MirrorSchema,
 ) -> Result<String> {
     match ty {
-        Type::Reference(reference) => source_command_type_text(&reference.elem, generic_types, mirror_schema),
+        Type::Reference(reference) => {
+            source_command_type_text(&reference.elem, generic_types, mirror_schema)
+        }
         Type::Slice(slice) => Ok(format!(
             "Vec < {} >",
             source_command_type_text(&slice.elem, generic_types, mirror_schema)?
         )),
         Type::ImplTrait(impl_trait) => {
-            let normalized = normalized_trait_bounds(&impl_trait.bounds)
-                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command return {}", type_text(ty)))?;
+            let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
+                eyre::eyre!("unrecognized impl Trait command return {}", type_text(ty))
+            })?;
             source_command_type_text(&normalized, generic_types, mirror_schema)
         }
         Type::Path(path) => {
@@ -1503,17 +1812,23 @@ fn source_command_type_text(
                 return source_type_path(definition, &name);
             }
             match name.as_str() {
-                "Option" | "Vec" | "Box" | "Result" | "BTreeSet" | "HashSet" | "BTreeMap" | "HashMap" => Ok(format!(
+                "Option" | "Vec" | "Box" | "Result" | "BTreeSet" | "HashSet" | "BTreeMap"
+                | "HashMap" => Ok(format!(
                     "{} < {} >",
                     name,
                     arguments
                         .iter()
-                        .map(|argument| source_command_type_text(argument, generic_types, mirror_schema))
+                        .map(|argument| source_command_type_text(
+                            argument,
+                            generic_types,
+                            mirror_schema
+                        ))
                         .collect::<Result<Vec<_>>>()?
                         .join(", ")
                 )),
                 "Path" | "PathBuf" => Ok("std::path::PathBuf".to_owned()),
-                "String" | "bool" | "char" | "usize" | "u8" | "u16" | "u32" | "u64" | "i32" | "i64" | "f64" => Ok(name),
+                "String" | "bool" | "char" | "usize" | "u8" | "u16" | "u32" | "u64" | "i32"
+                | "i64" | "f64" => Ok(name),
                 _ => bail!("no typed source return converter for {}", type_text(ty)),
             }
         }
@@ -1527,7 +1842,10 @@ fn source_command_type_text(
                 .map(|element| source_command_type_text(element, generic_types, mirror_schema))
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
-            Ok(format!("({elements}{})", if tuple.elems.len() == 1 { "," } else { "" }))
+            Ok(format!(
+                "({elements}{})",
+                if tuple.elems.len() == 1 { "," } else { "" }
+            ))
         }
         Type::Group(group) => source_command_type_text(&group.elem, generic_types, mirror_schema),
         Type::Paren(paren) => source_command_type_text(&paren.elem, generic_types, mirror_schema),
@@ -1535,6 +1853,93 @@ fn source_command_type_text(
     }
 }
 
+/// Builds the source-to-validated expression for one path-typed return:
+/// generic substitution, mirror leaves, and standard containers.
+fn source_path_return_expression(
+    segment: &syn::PathSegment,
+    name: &str,
+    value: &str,
+    generic_types: &BTreeMap<String, Type>,
+    mirror_schema: &MirrorSchema,
+) -> Result<String> {
+    if let Some(normalized) = generic_types.get(name) {
+        return source_return_to_validated_expression(
+            normalized,
+            value,
+            generic_types,
+            mirror_schema,
+        );
+    }
+    if selected_definition(name, mirror_schema).is_some() {
+        return match name {
+            "PaneId" => Ok(format!("from_zellij_pane_id({value})")),
+            _ => bail!("no source-to-validated command return converter for {name}"),
+        };
+    }
+    let arguments = type_arguments(segment)?;
+    match name {
+        "Option" => {
+            let item = source_return_to_validated_expression(
+                arguments[0],
+                "item",
+                generic_types,
+                mirror_schema,
+            )?;
+            Ok(format!("{value}.map(|item| {item})"))
+        }
+        "Vec" | "BTreeSet" | "HashSet" => {
+            let item = source_return_to_validated_expression(
+                arguments[0],
+                "item",
+                generic_types,
+                mirror_schema,
+            )?;
+            Ok(format!("{value}.into_iter().map(|item| {item}).collect()"))
+        }
+        "Result" => {
+            let ok = source_return_to_validated_expression(
+                arguments[0],
+                "item",
+                generic_types,
+                mirror_schema,
+            )?;
+            let error = source_return_to_validated_expression(
+                arguments[1],
+                "error",
+                generic_types,
+                mirror_schema,
+            )?;
+            Ok(format!("{value}.map(|item| {ok}).map_err(|error| {error})"))
+        }
+        "BTreeMap" | "HashMap" => {
+            let key = source_return_to_validated_expression(
+                arguments[0],
+                "key",
+                generic_types,
+                mirror_schema,
+            )?;
+            let item = source_return_to_validated_expression(
+                arguments[1],
+                "item",
+                generic_types,
+                mirror_schema,
+            )?;
+            Ok(format!(
+                "{value}.into_iter().map(|(key, item)| ({key}, {item})).collect()"
+            ))
+        }
+        "Box" => {
+            let item = source_return_to_validated_expression(
+                arguments[0],
+                &format!("*{value}"),
+                generic_types,
+                mirror_schema,
+            )?;
+            Ok(format!("Box::new({item})"))
+        }
+        _ => Ok(value.to_owned()),
+    }
+}
 fn source_return_to_validated_expression(
     ty: &Type,
     value: &str,
@@ -1545,54 +1950,31 @@ fn source_return_to_validated_expression(
         return Ok(value.to_owned());
     }
     match ty {
-        Type::Reference(reference) => source_return_to_validated_expression(&reference.elem, value, generic_types, mirror_schema),
+        Type::Reference(reference) => source_return_to_validated_expression(
+            &reference.elem,
+            value,
+            generic_types,
+            mirror_schema,
+        ),
         Type::Slice(slice) => {
-            let item = source_return_to_validated_expression(&slice.elem, "item", generic_types, mirror_schema)?;
+            let item = source_return_to_validated_expression(
+                &slice.elem,
+                "item",
+                generic_types,
+                mirror_schema,
+            )?;
             Ok(format!("{value}.into_iter().map(|item| {item}).collect()"))
         }
         Type::ImplTrait(impl_trait) => {
-            let normalized = normalized_trait_bounds(&impl_trait.bounds)
-                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command return {}", type_text(ty)))?;
+            let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
+                eyre::eyre!("unrecognized impl Trait command return {}", type_text(ty))
+            })?;
             source_return_to_validated_expression(&normalized, value, generic_types, mirror_schema)
         }
         Type::Path(path) => {
             let segment = path.path.segments.last().expect("path has a segment");
             let name = segment.ident.to_string();
-            if let Some(normalized) = generic_types.get(&name) {
-                return source_return_to_validated_expression(normalized, value, generic_types, mirror_schema);
-            }
-            if selected_definition(&name, mirror_schema).is_some() {
-                return match name.as_str() {
-                    "PaneId" => Ok(format!("from_zellij_pane_id({value})")),
-                    _ => bail!("no source-to-validated command return converter for {name}"),
-                };
-            }
-            let arguments = type_arguments(segment)?;
-            match name.as_str() {
-                "Option" => {
-                    let item = source_return_to_validated_expression(arguments[0], "item", generic_types, mirror_schema)?;
-                    Ok(format!("{value}.map(|item| {item})"))
-                }
-                "Vec" | "BTreeSet" | "HashSet" => {
-                    let item = source_return_to_validated_expression(arguments[0], "item", generic_types, mirror_schema)?;
-                    Ok(format!("{value}.into_iter().map(|item| {item}).collect()"))
-                }
-                "Result" => {
-                    let ok = source_return_to_validated_expression(arguments[0], "item", generic_types, mirror_schema)?;
-                    let error = source_return_to_validated_expression(arguments[1], "error", generic_types, mirror_schema)?;
-                    Ok(format!("{value}.map(|item| {ok}).map_err(|error| {error})"))
-                }
-                "BTreeMap" | "HashMap" => {
-                    let key = source_return_to_validated_expression(arguments[0], "key", generic_types, mirror_schema)?;
-                    let item = source_return_to_validated_expression(arguments[1], "item", generic_types, mirror_schema)?;
-                    Ok(format!("{value}.into_iter().map(|(key, item)| ({key}, {item})).collect()"))
-                }
-                "Box" => {
-                    let item = source_return_to_validated_expression(arguments[0], &format!("*{value}"), generic_types, mirror_schema)?;
-                    Ok(format!("Box::new({item})"))
-                }
-                _ => Ok(value.to_owned()),
-            }
+            source_path_return_expression(segment, &name, value, generic_types, mirror_schema)
         }
         Type::Tuple(tuple) => {
             if tuple.elems.is_empty() {
@@ -1605,7 +1987,14 @@ fn source_return_to_validated_expression(
                 .elems
                 .iter()
                 .zip(&names)
-                .map(|(element, name)| source_return_to_validated_expression(element, name, generic_types, mirror_schema))
+                .map(|(element, name)| {
+                    source_return_to_validated_expression(
+                        element,
+                        name,
+                        generic_types,
+                        mirror_schema,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(format!(
                 "{{ let ({},) = {value}; ({},) }}",
@@ -1613,8 +2002,12 @@ fn source_return_to_validated_expression(
                 values.join(", ")
             ))
         }
-        Type::Group(group) => source_return_to_validated_expression(&group.elem, value, generic_types, mirror_schema),
-        Type::Paren(paren) => source_return_to_validated_expression(&paren.elem, value, generic_types, mirror_schema),
+        Type::Group(group) => {
+            source_return_to_validated_expression(&group.elem, value, generic_types, mirror_schema)
+        }
+        Type::Paren(paren) => {
+            source_return_to_validated_expression(&paren.elem, value, generic_types, mirror_schema)
+        }
         _ => Ok(value.to_owned()),
     }
 }
@@ -1636,16 +2029,97 @@ fn render_command_variant(
             output,
             "        {}: {},",
             argument.name,
-            command_model_type_text(
-                &argument.ty,
-                &function.generic_types,
-                flavor,
-                mirror_schema,
-            )?
+            command_model_type_text(&argument.ty, &function.generic_types, flavor, mirror_schema,)?
         )?;
     }
     output.push_str("    },\n");
     Ok(())
+}
+/// Builds the model type text for one path-typed command parameter:
+/// generic substitution, mirror qualification, and standard containers.
+fn command_path_model_text(
+    segment: &syn::PathSegment,
+    name: &str,
+    generic_types: &BTreeMap<String, Type>,
+    flavor: ModelFlavor,
+    mirror_schema: &MirrorSchema,
+) -> Result<String> {
+    if let Some(normalized) = generic_types.get(name) {
+        return command_model_type_text(normalized, generic_types, flavor, mirror_schema);
+    }
+    let arguments = type_arguments(segment)?;
+    if name == "str" {
+        return Ok("String".to_owned());
+    }
+    if selected_definition(name, mirror_schema).is_some() {
+        return Ok(format!(
+            "{}::{}",
+            match flavor {
+                ModelFlavor::Raw => "raw",
+                ModelFlavor::Validated => "validated",
+            },
+            name
+        ));
+    }
+    match name {
+        "Option" | "Vec" | "Box" | "Result" => Ok(format!(
+            "{} < {} >",
+            name,
+            arguments
+                .iter()
+                .map(|argument| command_model_type_text(
+                    argument,
+                    generic_types,
+                    flavor,
+                    mirror_schema
+                ))
+                .collect::<Result<Vec<_>>>()?
+                .join(", ")
+        )),
+        "BTreeSet" | "HashSet" => Ok(format!(
+            "std::collections::{} < {} >",
+            name,
+            arguments
+                .iter()
+                .map(|argument| command_model_type_text(
+                    argument,
+                    generic_types,
+                    flavor,
+                    mirror_schema
+                ))
+                .collect::<Result<Vec<_>>>()?
+                .join(", ")
+        )),
+        "BTreeMap" | "HashMap" if matches!(flavor, ModelFlavor::Raw) => {
+            if arguments.len() != 2 {
+                bail!("{name} command parameter needs key and value types");
+            }
+            Ok(format!(
+                "Vec < raw::MapEntry < {}, {} > >",
+                command_model_type_text(arguments[0], generic_types, flavor, mirror_schema)?,
+                command_model_type_text(arguments[1], generic_types, flavor, mirror_schema)?,
+            ))
+        }
+        "BTreeMap" | "HashMap" => Ok(format!(
+            "std::collections::{} < {} >",
+            name,
+            arguments
+                .iter()
+                .map(|argument| command_model_type_text(
+                    argument,
+                    generic_types,
+                    flavor,
+                    mirror_schema
+                ))
+                .collect::<Result<Vec<_>>>()?
+                .join(", ")
+        )),
+        "Path" | "PathBuf" => Ok("std::path::PathBuf".to_owned()),
+        "String" | "bool" | "usize" | "u8" | "u16" | "u32" | "u64" | "i32" | "i64" | "f64" => {
+            Ok(name.to_owned())
+        }
+        _ => bail!("no typed command converter for {name}"),
+    }
 }
 
 fn command_model_type_text(
@@ -1655,78 +2129,26 @@ fn command_model_type_text(
     mirror_schema: &MirrorSchema,
 ) -> Result<String> {
     match ty {
-        Type::Reference(reference) => command_model_type_text(&reference.elem, generic_types, flavor, mirror_schema),
+        Type::Reference(reference) => {
+            command_model_type_text(&reference.elem, generic_types, flavor, mirror_schema)
+        }
         Type::Slice(slice) => Ok(format!(
             "Vec < {} >",
             command_model_type_text(&slice.elem, generic_types, flavor, mirror_schema)?
         )),
         Type::ImplTrait(impl_trait) => {
-            let normalized = normalized_trait_bounds(&impl_trait.bounds)
-                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command parameter {}", type_text(ty)))?;
+            let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
+                eyre::eyre!(
+                    "unrecognized impl Trait command parameter {}",
+                    type_text(ty)
+                )
+            })?;
             command_model_type_text(&normalized, generic_types, flavor, mirror_schema)
         }
         Type::Path(path) => {
             let segment = path.path.segments.last().expect("path has a segment");
             let name = segment.ident.to_string();
-            if let Some(normalized) = generic_types.get(&name) {
-                return command_model_type_text(normalized, generic_types, flavor, mirror_schema);
-            }
-            let arguments = type_arguments(segment)?;
-            if name == "str" {
-                return Ok("String".to_owned());
-            }
-            if selected_definition(&name, mirror_schema).is_some() {
-                return Ok(format!(
-                    "{}::{}",
-                    match flavor {
-                        ModelFlavor::Raw => "raw",
-                        ModelFlavor::Validated => "validated",
-                    },
-                    name
-                ));
-            }
-            match name.as_str() {
-                "Option" | "Vec" | "Box" | "Result" => Ok(format!(
-                    "{} < {} >",
-                    name,
-                    arguments
-                        .iter()
-                        .map(|argument| command_model_type_text(argument, generic_types, flavor, mirror_schema))
-                        .collect::<Result<Vec<_>>>()?
-                        .join(", ")
-                )),
-                "BTreeSet" | "HashSet" => Ok(format!(
-                    "std::collections::{} < {} >",
-                    name,
-                    arguments
-                        .iter()
-                        .map(|argument| command_model_type_text(argument, generic_types, flavor, mirror_schema))
-                        .collect::<Result<Vec<_>>>()?
-                        .join(", ")
-                )),
-                "BTreeMap" | "HashMap" if matches!(flavor, ModelFlavor::Raw) => {
-                    if arguments.len() != 2 {
-                        bail!("{name} command parameter needs key and value types");
-                    }
-                    Ok(format!(
-                        "Vec < raw::MapEntry < {}, {} > >",
-                        command_model_type_text(arguments[0], generic_types, flavor, mirror_schema)?,
-                        command_model_type_text(arguments[1], generic_types, flavor, mirror_schema)?,
-                    ))
-                }
-                "BTreeMap" | "HashMap" => Ok(format!(
-                    "std::collections::{} < {} >",
-                    name,
-                    arguments
-                        .iter()
-                        .map(|argument| command_model_type_text(argument, generic_types, flavor, mirror_schema))
-                        .collect::<Result<Vec<_>>>()?
-                        .join(", ")
-                )),
-                "Path" | "PathBuf" => Ok("std::path::PathBuf".to_owned()),
-                "String" | "bool" | "usize" | "u8" | "u16" | "u32" | "u64" | "i32" | "i64" | "f64" => Ok(name),
-                _ => bail!("no typed command converter for {}", type_text(ty)),
-            }
+            command_path_model_text(segment, &name, generic_types, flavor, mirror_schema)
         }
         Type::Tuple(tuple) => {
             if tuple.elems.is_empty() {
@@ -1735,13 +2157,22 @@ fn command_model_type_text(
             let elements = tuple
                 .elems
                 .iter()
-                .map(|element| command_model_type_text(element, generic_types, flavor, mirror_schema))
+                .map(|element| {
+                    command_model_type_text(element, generic_types, flavor, mirror_schema)
+                })
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
-            Ok(format!("({elements}{})", if tuple.elems.len() == 1 { "," } else { "" }))
+            Ok(format!(
+                "({elements}{})",
+                if tuple.elems.len() == 1 { "," } else { "" }
+            ))
         }
-        Type::Group(group) => command_model_type_text(&group.elem, generic_types, flavor, mirror_schema),
-        Type::Paren(paren) => command_model_type_text(&paren.elem, generic_types, flavor, mirror_schema),
+        Type::Group(group) => {
+            command_model_type_text(&group.elem, generic_types, flavor, mirror_schema)
+        }
+        Type::Paren(paren) => {
+            command_model_type_text(&paren.elem, generic_types, flavor, mirror_schema)
+        }
         _ => bail!("no typed command converter for {}", type_text(ty)),
     }
 }
@@ -1753,20 +2184,47 @@ fn command_raw_to_validated_expression(
     mirror_schema: &MirrorSchema,
 ) -> Result<String> {
     match ty {
-        Type::Reference(reference) => command_raw_to_validated_expression(&reference.elem, value, generic_types, mirror_schema),
+        Type::Reference(reference) => command_raw_to_validated_expression(
+            &reference.elem,
+            value,
+            generic_types,
+            mirror_schema,
+        ),
         Type::Slice(slice) => {
-            let item = command_raw_to_validated_expression(&slice.elem, "item", generic_types, mirror_schema)?;
-            Ok(format!("{value}.into_iter().map(|item| -> Result<_, ValidationError> {{ Ok({item}) }}).collect::<Result<_, ValidationError>>()?"))
+            let item = command_raw_to_validated_expression(
+                &slice.elem,
+                "item",
+                generic_types,
+                mirror_schema,
+            )?;
+            Ok(format!(
+                "{value}.into_iter().map(|item| -> Result<_, ValidationError> {{ Ok({item}) }}).collect::<Result<_, ValidationError>>()?"
+            ))
         }
         Type::ImplTrait(impl_trait) => {
-            let normalized = normalized_trait_bounds(&impl_trait.bounds)
-                .ok_or_else(|| eyre::eyre!("unrecognized impl Trait command parameter {}", type_text(ty)))?;
+            let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
+                eyre::eyre!(
+                    "unrecognized impl Trait command parameter {}",
+                    type_text(ty)
+                )
+            })?;
             command_raw_to_validated_expression(&normalized, value, generic_types, mirror_schema)
         }
         Type::Path(path) => {
-            let name = path.path.segments.last().expect("path has a segment").ident.to_string();
+            let name = path
+                .path
+                .segments
+                .last()
+                .expect("path has a segment")
+                .ident
+                .to_string();
             if let Some(normalized) = generic_types.get(&name) {
-                return command_raw_to_validated_expression(normalized, value, generic_types, mirror_schema);
+                return command_raw_to_validated_expression(
+                    normalized,
+                    value,
+                    generic_types,
+                    mirror_schema,
+                );
             }
             raw_to_validated_expression(ty, value, mirror_schema)
         }
@@ -1778,7 +2236,9 @@ fn command_raw_to_validated_expression(
                 .elems
                 .iter()
                 .zip(&names)
-                .map(|(element, name)| command_raw_to_validated_expression(element, name, generic_types, mirror_schema))
+                .map(|(element, name)| {
+                    command_raw_to_validated_expression(element, name, generic_types, mirror_schema)
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(format!(
                 "{{ let ({},) = {value}; ({},) }}",
@@ -1786,20 +2246,27 @@ fn command_raw_to_validated_expression(
                 values.join(", ")
             ))
         }
-        Type::Group(group) => command_raw_to_validated_expression(&group.elem, value, generic_types, mirror_schema),
-        Type::Paren(paren) => command_raw_to_validated_expression(&paren.elem, value, generic_types, mirror_schema),
+        Type::Group(group) => {
+            command_raw_to_validated_expression(&group.elem, value, generic_types, mirror_schema)
+        }
+        Type::Paren(paren) => {
+            command_raw_to_validated_expression(&paren.elem, value, generic_types, mirror_schema)
+        }
         _ => raw_to_validated_expression(ty, value, mirror_schema),
     }
 }
 
 fn command_variant_name(name: &str) -> String {
-    name.split('_')
-        .map(|part| {
-            let mut characters = part.chars();
-            let first = characters.next().expect("function name segments are non-empty");
-            format!("{}{}", first.to_ascii_uppercase(), characters.as_str())
-        })
-        .collect()
+    let mut pascal = String::new();
+    for part in name.split('_') {
+        let mut characters = part.chars();
+        let first = characters
+            .next()
+            .expect("function name segments are non-empty");
+        pascal.push(first.to_ascii_uppercase());
+        pascal.push_str(characters.as_str());
+    }
+    pascal
 }
 fn render_model_module(
     name: &str,
@@ -1811,10 +2278,14 @@ fn render_model_module(
     writeln!(output, "pub mod {name} {{")?;
     output.push_str(match flavor {
         ModelFlavor::Raw => "    use std::{collections::BTreeSet, path::PathBuf};\n\n",
-        ModelFlavor::Validated => "    use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf};\n\n",
+        ModelFlavor::Validated => {
+            "    use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf};\n\n"
+        }
     });
     if matches!(flavor, ModelFlavor::Raw) {
-        output.push_str("    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n");
+        output.push_str(
+            "    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n",
+        );
         output.push_str("    pub struct MapEntry<K, V> { pub key: K, pub value: V }\n\n");
     }
     for type_name in &mirror_schema.selected {
@@ -1837,13 +2308,21 @@ fn render_model_type(
 ) -> Result<()> {
     match &definition.item {
         ParsedType::Struct(item) => {
-            writeln!(output, "    #[derive({})]", model_derives(base_derives, &item.attrs))?;
+            writeln!(
+                output,
+                "    #[derive({})]",
+                model_derives(base_derives, &item.attrs)
+            )?;
             render_serde_attributes(&item.attrs, "    ", output)?;
             write!(output, "    pub struct {}", item.ident)?;
             render_struct_fields(&item.fields, flavor, output)?;
         }
         ParsedType::Enum(item) => {
-            writeln!(output, "    #[derive({})]", model_derives(base_derives, &item.attrs))?;
+            writeln!(
+                output,
+                "    #[derive({})]",
+                model_derives(base_derives, &item.attrs)
+            )?;
             render_serde_attributes(&item.attrs, "    ", output)?;
             writeln!(output, "    pub enum {} {{", item.ident)?;
             for variant in &item.variants {
@@ -1852,7 +2331,12 @@ fn render_model_type(
             output.push_str("    }\n");
         }
         ParsedType::Alias(item) => {
-            writeln!(output, "    pub type {} = {};", item.ident, model_type_text(&item.ty, flavor)?)?;
+            writeln!(
+                output,
+                "    pub type {} = {};",
+                item.ident,
+                model_type_text(&item.ty, flavor)?
+            )?;
         }
     }
     Ok(())
@@ -1869,11 +2353,12 @@ fn model_derives(base: &str, attributes: &[Attribute]) -> String {
 fn has_derive(attributes: &[Attribute], expected: &str) -> bool {
     attributes.iter().any(|attribute| {
         attribute.path().is_ident("derive")
-            && attribute
-                .meta
-                .require_list()
-                .map(|list| list.tokens.to_string().split(',').any(|item| item.trim() == expected))
-                .unwrap_or(false)
+            && attribute.meta.require_list().is_ok_and(|list| {
+                list.tokens
+                    .to_string()
+                    .split(',')
+                    .any(|item| item.trim() == expected)
+            })
     })
 }
 
@@ -1885,7 +2370,11 @@ fn render_struct_fields(fields: &Fields, flavor: ModelFlavor, output: &mut Strin
             for field in &fields.named {
                 render_serde_attributes(&field.attrs, "        ", output)?;
                 let name = field.ident.as_ref().expect("named syn field has ident");
-                writeln!(output, "        pub {name}: {},", model_type_text(&field.ty, flavor)?)?;
+                writeln!(
+                    output,
+                    "        pub {name}: {},",
+                    model_type_text(&field.ty, flavor)?
+                )?;
             }
             output.push_str("    }\n");
         }
@@ -1909,7 +2398,11 @@ fn render_enum_variant(variant: &Variant, flavor: ModelFlavor, output: &mut Stri
             for field in &fields.named {
                 render_serde_attributes(&field.attrs, "            ", output)?;
                 let name = field.ident.as_ref().expect("named syn field has ident");
-                writeln!(output, "            {name}: {},", model_type_text(&field.ty, flavor)?)?;
+                writeln!(
+                    output,
+                    "            {name}: {},",
+                    model_type_text(&field.ty, flavor)?
+                )?;
             }
             output.push_str("        },\n");
         }
@@ -1930,7 +2423,8 @@ fn model_type_text(ty: &Type, flavor: ModelFlavor) -> Result<String> {
             let segment = path.path.segments.last().expect("path has a segment");
             let name = segment.ident.to_string();
             let arguments = type_arguments(segment)?;
-            if matches!(flavor, ModelFlavor::Raw) && matches!(name.as_str(), "BTreeMap" | "HashMap") {
+            if matches!(flavor, ModelFlavor::Raw) && matches!(name.as_str(), "BTreeMap" | "HashMap")
+            {
                 if arguments.len() != 2 {
                     bail!("{name} must have key and value types");
                 }
@@ -1963,7 +2457,10 @@ fn model_type_text(ty: &Type, flavor: ModelFlavor) -> Result<String> {
                 .map(|element| model_type_text(element, flavor))
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
-            Ok(format!("({elements}{})", if tuple.elems.len() == 1 { "," } else { "" }))
+            Ok(format!(
+                "({elements}{})",
+                if tuple.elems.len() == 1 { "," } else { "" }
+            ))
         }
         Type::Group(group) => model_type_text(&group.elem, flavor),
         Type::Paren(paren) => model_type_text(&paren.elem, flavor),
@@ -1971,7 +2468,11 @@ fn model_type_text(ty: &Type, flavor: ModelFlavor) -> Result<String> {
     }
 }
 
-fn render_serde_attributes(attributes: &[Attribute], indent: &str, output: &mut String) -> Result<()> {
+fn render_serde_attributes(
+    attributes: &[Attribute],
+    indent: &str,
+    output: &mut String,
+) -> Result<()> {
     for attribute in attributes {
         if attribute.path().is_ident("serde") {
             writeln!(output, "{indent}{}", attribute.to_token_stream())?;
@@ -1980,16 +2481,18 @@ fn render_serde_attributes(attributes: &[Attribute], indent: &str, output: &mut 
     Ok(())
 }
 
-fn render_validation_error(output: &mut String) -> Result<()> {
+fn render_validation_error(output: &mut String) {
     output.push_str("#[derive(Clone, Debug, Eq, PartialEq)]\n");
     output.push_str("pub struct ValidationError { pub type_name: &'static str, pub field: &'static str, pub message: String }\n");
     output.push_str("impl ValidationError { fn new(type_name: &'static str, field: &'static str, message: impl Into<String>) -> Self { Self { type_name, field, message: message.into() } } }\n");
     output.push_str("impl std::fmt::Display for ValidationError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, \"{}::{}: {}\", self.type_name, self.field, self.message) } }\n");
     output.push_str("impl std::error::Error for ValidationError {}\n\n");
-    Ok(())
 }
 
-fn render_raw_to_validated_converters(mirror_schema: &MirrorSchema, output: &mut String) -> Result<()> {
+fn render_raw_to_validated_converters(
+    mirror_schema: &MirrorSchema,
+    output: &mut String,
+) -> Result<()> {
     for type_name in &mirror_schema.selected {
         let definition = mirror_schema
             .definitions
@@ -1997,14 +2500,20 @@ fn render_raw_to_validated_converters(mirror_schema: &MirrorSchema, output: &mut
             .expect("selected mirror types have declarations");
         match &definition.item {
             ParsedType::Alias(_) => {}
-            ParsedType::Struct(_) | ParsedType::Enum(_) if type_name == "PluginUserConfiguration" => {
-                render_plugin_user_configuration_validation(output)?;
+            ParsedType::Struct(_) | ParsedType::Enum(_)
+                if type_name == "PluginUserConfiguration" =>
+            {
+                render_plugin_user_configuration_validation(output);
             }
             ParsedType::Struct(_) | ParsedType::Enum(_) if type_name == "PercentOrFixed" => {
-                render_percent_or_fixed_validation(output)?;
+                render_percent_or_fixed_validation(output);
             }
-            ParsedType::Struct(item) => render_struct_validation(type_name, item, mirror_schema, output)?,
-            ParsedType::Enum(item) => render_enum_validation(type_name, item, mirror_schema, output)?,
+            ParsedType::Struct(item) => {
+                render_struct_validation(type_name, item, mirror_schema, output)?;
+            }
+            ParsedType::Enum(item) => {
+                render_enum_validation(type_name, item, mirror_schema, output)?;
+            }
         }
         if !matches!(definition.item, ParsedType::Alias(_)) {
             output.push('\n');
@@ -2013,8 +2522,10 @@ fn render_raw_to_validated_converters(mirror_schema: &MirrorSchema, output: &mut
     Ok(())
 }
 
-fn render_plugin_user_configuration_validation(output: &mut String) -> Result<()> {
-    output.push_str("impl TryFrom<raw::PluginUserConfiguration> for validated::PluginUserConfiguration {\n");
+fn render_plugin_user_configuration_validation(output: &mut String) {
+    output.push_str(
+        "impl TryFrom<raw::PluginUserConfiguration> for validated::PluginUserConfiguration {\n",
+    );
     output.push_str("    type Error = ValidationError;\n");
     output.push_str("    fn try_from(raw::PluginUserConfiguration(configuration): raw::PluginUserConfiguration) -> Result<Self, Self::Error> {\n");
     output.push_str("        const RESERVED: &[&str] = &[\"hold_on_close\", \"hold_on_start\", \"cwd\", \"name\", \"direction\", \"floating\", \"move_to_focused_tab\", \"launch_new\", \"payload\", \"skip_cache\", \"title\", \"in_place\", \"skip_plugin_cache\"];\n");
@@ -2030,10 +2541,9 @@ fn render_plugin_user_configuration_validation(output: &mut String) -> Result<()
     output.push_str("        Ok(Self(converted))\n");
     output.push_str("    }\n");
     output.push_str("}\n");
-    Ok(())
 }
 
-fn render_percent_or_fixed_validation(output: &mut String) -> Result<()> {
+fn render_percent_or_fixed_validation(output: &mut String) {
     output.push_str("impl TryFrom<raw::PercentOrFixed> for validated::PercentOrFixed {\n");
     output.push_str("    type Error = ValidationError;\n");
     output.push_str("    fn try_from(value: raw::PercentOrFixed) -> Result<Self, Self::Error> {\n");
@@ -2044,7 +2554,6 @@ fn render_percent_or_fixed_validation(output: &mut String) -> Result<()> {
     output.push_str("        }\n");
     output.push_str("    }\n");
     output.push_str("}\n");
-    Ok(())
 }
 
 fn render_struct_validation(
@@ -2053,9 +2562,15 @@ fn render_struct_validation(
     mirror_schema: &MirrorSchema,
     output: &mut String,
 ) -> Result<()> {
-    writeln!(output, "impl TryFrom<raw::{type_name}> for validated::{type_name} {{")?;
+    writeln!(
+        output,
+        "impl TryFrom<raw::{type_name}> for validated::{type_name} {{"
+    )?;
     output.push_str("    type Error = ValidationError;\n");
-    writeln!(output, "    fn try_from(value: raw::{type_name}) -> Result<Self, Self::Error> {{")?;
+    writeln!(
+        output,
+        "    fn try_from(value: raw::{type_name}) -> Result<Self, Self::Error> {{"
+    )?;
     match &item.fields {
         Fields::Unit => output.push_str("        let _ = value;\n        Ok(Self)\n"),
         Fields::Named(fields) => {
@@ -2064,7 +2579,11 @@ fn render_struct_validation(
                 .iter()
                 .map(|field| field.ident.as_ref().expect("named field").to_string())
                 .collect::<Vec<_>>();
-            writeln!(output, "        let raw::{type_name} {{ {} }} = value;", names.join(", "))?;
+            writeln!(
+                output,
+                "        let raw::{type_name} {{ {} }} = value;",
+                names.join(", ")
+            )?;
             output.push_str("        Ok(Self {\n");
             for field in &fields.named {
                 let name = field.ident.as_ref().expect("named field").to_string();
@@ -2080,10 +2599,18 @@ fn render_struct_validation(
             let names = (0..fields.unnamed.len())
                 .map(|index| format!("field_{index}"))
                 .collect::<Vec<_>>();
-            writeln!(output, "        let raw::{type_name}({}) = value;", names.join(", "))?;
+            writeln!(
+                output,
+                "        let raw::{type_name}({}) = value;",
+                names.join(", ")
+            )?;
             output.push_str("        Ok(Self(");
             for (field, name) in fields.unnamed.iter().zip(&names) {
-                write!(output, "{}, ", raw_to_validated_expression(&field.ty, name, mirror_schema)?)?;
+                write!(
+                    output,
+                    "{}, ",
+                    raw_to_validated_expression(&field.ty, name, mirror_schema)?
+                )?;
             }
             output.push_str("))\n");
         }
@@ -2098,14 +2625,24 @@ fn render_enum_validation(
     mirror_schema: &MirrorSchema,
     output: &mut String,
 ) -> Result<()> {
-    writeln!(output, "impl TryFrom<raw::{type_name}> for validated::{type_name} {{")?;
+    writeln!(
+        output,
+        "impl TryFrom<raw::{type_name}> for validated::{type_name} {{"
+    )?;
     output.push_str("    type Error = ValidationError;\n");
-    writeln!(output, "    fn try_from(value: raw::{type_name}) -> Result<Self, Self::Error> {{")?;
+    writeln!(
+        output,
+        "    fn try_from(value: raw::{type_name}) -> Result<Self, Self::Error> {{"
+    )?;
     output.push_str("        match value {\n");
     for variant in &item.variants {
         match &variant.fields {
             Fields::Unit => {
-                writeln!(output, "            raw::{type_name}::{} => Ok(Self::{}),", variant.ident, variant.ident)?;
+                writeln!(
+                    output,
+                    "            raw::{type_name}::{} => Ok(Self::{}),",
+                    variant.ident, variant.ident
+                )?;
             }
             Fields::Named(fields) => {
                 let names = fields
@@ -2178,22 +2715,28 @@ fn raw_to_validated_expression(
             match name.as_str() {
                 "Option" => {
                     let item = raw_to_validated_expression(arguments[0], "item", mirror_schema)?;
-                    Ok(format!("{value}.map(|item| -> Result<_, ValidationError> {{ Ok({item}) }}).transpose()?"))
+                    Ok(format!(
+                        "{value}.map(|item| -> Result<_, ValidationError> {{ Ok({item}) }}).transpose()?"
+                    ))
                 }
                 "Vec" | "BTreeSet" | "HashSet" => {
                     let item = raw_to_validated_expression(arguments[0], "item", mirror_schema)?;
-                    Ok(format!("{value}.into_iter().map(|item| -> Result<_, ValidationError> {{ Ok({item}) }}).collect::<Result<_, ValidationError>>()?"))
+                    Ok(format!(
+                        "{value}.into_iter().map(|item| -> Result<_, ValidationError> {{ Ok({item}) }}).collect::<Result<_, ValidationError>>()?"
+                    ))
                 }
                 "BTreeMap" => {
                     let key = raw_to_validated_expression(arguments[0], "key", mirror_schema)?;
-                    let map_value = raw_to_validated_expression(arguments[1], "map_value", mirror_schema)?;
+                    let map_value =
+                        raw_to_validated_expression(arguments[1], "map_value", mirror_schema)?;
                     Ok(format!(
                         "{{ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry {{ key, value: map_value }} in {value} {{ let key = {key}; let map_value = {map_value}; if converted.insert(key, map_value).is_some() {{ return Err(ValidationError::new(\"BTreeMap\", \"key\", \"duplicate semantic key\")); }} }} converted }}"
                     ))
                 }
                 "HashMap" => {
                     let key = raw_to_validated_expression(arguments[0], "key", mirror_schema)?;
-                    let map_value = raw_to_validated_expression(arguments[1], "map_value", mirror_schema)?;
+                    let map_value =
+                        raw_to_validated_expression(arguments[1], "map_value", mirror_schema)?;
                     Ok(format!(
                         "{{ let mut converted = std::collections::HashMap::new(); for raw::MapEntry {{ key, value: map_value }} in {value} {{ let key = {key}; let map_value = {map_value}; if converted.insert(key, map_value).is_some() {{ return Err(ValidationError::new(\"HashMap\", \"key\", \"duplicate semantic key\")); }} }} converted }}"
                     ))
@@ -2238,21 +2781,30 @@ fn raw_validation_conversion_needed(ty: &Type, mirror_schema: &MirrorSchema) -> 
             let name = segment.ident.to_string();
             if let Some(definition) = selected_definition(&name, mirror_schema) {
                 return match &definition.item {
-                    ParsedType::Alias(alias) => raw_validation_conversion_needed(&alias.ty, mirror_schema),
+                    ParsedType::Alias(alias) => {
+                        raw_validation_conversion_needed(&alias.ty, mirror_schema)
+                    }
                     ParsedType::Struct(_) | ParsedType::Enum(_) => true,
                 };
             }
             if matches!(name.as_str(), "BTreeMap" | "HashMap") {
                 return true;
             }
-            type_arguments(segment)
-                .map(|arguments| arguments.into_iter().any(|argument| raw_validation_conversion_needed(argument, mirror_schema)))
-                .unwrap_or(true)
+            type_arguments(segment).map_or(true, |arguments| {
+                arguments
+                    .into_iter()
+                    .any(|argument| raw_validation_conversion_needed(argument, mirror_schema))
+            })
         }
         Type::Array(array) => raw_validation_conversion_needed(&array.elem, mirror_schema),
-        Type::Reference(reference) => raw_validation_conversion_needed(&reference.elem, mirror_schema),
+        Type::Reference(reference) => {
+            raw_validation_conversion_needed(&reference.elem, mirror_schema)
+        }
         Type::Slice(slice) => raw_validation_conversion_needed(&slice.elem, mirror_schema),
-        Type::Tuple(tuple) => tuple.elems.iter().any(|element| raw_validation_conversion_needed(element, mirror_schema)),
+        Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .any(|element| raw_validation_conversion_needed(element, mirror_schema)),
         Type::Group(group) => raw_validation_conversion_needed(&group.elem, mirror_schema),
         Type::Paren(paren) => raw_validation_conversion_needed(&paren.elem, mirror_schema),
         _ => false,
@@ -2270,14 +2822,19 @@ fn source_conversion_needed(ty: &Type, mirror_schema: &MirrorSchema) -> bool {
                     ParsedType::Struct(_) | ParsedType::Enum(_) => true,
                 };
             }
-            type_arguments(segment)
-                .map(|arguments| arguments.into_iter().any(|argument| source_conversion_needed(argument, mirror_schema)))
-                .unwrap_or(true)
+            type_arguments(segment).map_or(true, |arguments| {
+                arguments
+                    .into_iter()
+                    .any(|argument| source_conversion_needed(argument, mirror_schema))
+            })
         }
         Type::Array(array) => source_conversion_needed(&array.elem, mirror_schema),
         Type::Reference(reference) => source_conversion_needed(&reference.elem, mirror_schema),
         Type::Slice(slice) => source_conversion_needed(&slice.elem, mirror_schema),
-        Type::Tuple(tuple) => tuple.elems.iter().any(|element| source_conversion_needed(element, mirror_schema)),
+        Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .any(|element| source_conversion_needed(element, mirror_schema)),
         Type::Group(group) => source_conversion_needed(&group.elem, mirror_schema),
         Type::Paren(paren) => source_conversion_needed(&paren.elem, mirror_schema),
         _ => false,
@@ -2293,8 +2850,16 @@ fn render_upstream_converters(mirror_schema: &MirrorSchema, output: &mut String)
             continue;
         }
         match &definition.item {
-            ParsedType::Struct(item) => render_upstream_struct_converter(type_name, item, definition, mirror_schema, output)?,
-            ParsedType::Enum(item) => render_upstream_enum_converter(type_name, item, definition, mirror_schema, output)?,
+            ParsedType::Struct(item) => render_upstream_struct_converter(
+                type_name,
+                item,
+                definition,
+                mirror_schema,
+                output,
+            )?,
+            ParsedType::Enum(item) => {
+                render_upstream_enum_converter(type_name, item, definition, mirror_schema, output)?;
+            }
             ParsedType::Alias(_) => unreachable!("aliases were skipped"),
         }
         output.push('\n');
@@ -2324,7 +2889,9 @@ fn render_upstream_struct_converter(
             output.push_str("    zellij_utils::data::PluginTag::new(value.0)\n");
         }
         "PluginUserConfiguration" => {
-            output.push_str("    zellij_utils::input::layout::PluginUserConfiguration::new(value.0)\n");
+            output.push_str(
+                "    zellij_utils::input::layout::PluginUserConfiguration::new(value.0)\n",
+            );
         }
         _ => match &item.fields {
             Fields::Unit => writeln!(output, "    {source_type}")?,
@@ -2334,7 +2901,11 @@ fn render_upstream_struct_converter(
                     .iter()
                     .map(|field| field.ident.as_ref().expect("named field").to_string())
                     .collect::<Vec<_>>();
-                writeln!(output, "    let validated::{type_name} {{ {} }} = value;", names.join(", "))?;
+                writeln!(
+                    output,
+                    "    let validated::{type_name} {{ {} }} = value;",
+                    names.join(", ")
+                )?;
                 writeln!(output, "    {source_type} {{")?;
                 for field in &fields.named {
                     let name = field.ident.as_ref().expect("named field").to_string();
@@ -2350,10 +2921,18 @@ fn render_upstream_struct_converter(
                 let names = (0..fields.unnamed.len())
                     .map(|index| format!("field_{index}"))
                     .collect::<Vec<_>>();
-                writeln!(output, "    let validated::{type_name}({}) = value;", names.join(", "))?;
+                writeln!(
+                    output,
+                    "    let validated::{type_name}({}) = value;",
+                    names.join(", ")
+                )?;
                 write!(output, "    {source_type}(")?;
                 for (field, name) in fields.unnamed.iter().zip(&names) {
-                    write!(output, "{}, ", into_source_expression(&field.ty, name, mirror_schema)?)?;
+                    write!(
+                        output,
+                        "{}, ",
+                        into_source_expression(&field.ty, name, mirror_schema)?
+                    )?;
                 }
                 output.push_str(")\n");
             }
@@ -2381,7 +2960,11 @@ fn render_upstream_enum_converter(
     for variant in &item.variants {
         match &variant.fields {
             Fields::Unit => {
-                writeln!(output, "        validated::{type_name}::{} => {source_type}::{},", variant.ident, variant.ident)?;
+                writeln!(
+                    output,
+                    "        validated::{type_name}::{} => {source_type}::{},",
+                    variant.ident, variant.ident
+                )?;
             }
             Fields::Named(fields) => {
                 let names = fields
@@ -2459,10 +3042,13 @@ fn into_source_expression(ty: &Type, value: &str, mirror_schema: &MirrorSchema) 
                 "BTreeMap" | "HashMap" => {
                     let key = into_source_expression(arguments[0], "key", mirror_schema)?;
                     let item = into_source_expression(arguments[1], "item", mirror_schema)?;
-                    Ok(format!("{value}.into_iter().map(|(key, item)| ({key}, {item})).collect()"))
+                    Ok(format!(
+                        "{value}.into_iter().map(|(key, item)| ({key}, {item})).collect()"
+                    ))
                 }
                 "Box" => {
-                    let item = into_source_expression(arguments[0], &format!("*{value}"), mirror_schema)?;
+                    let item =
+                        into_source_expression(arguments[0], &format!("*{value}"), mirror_schema)?;
                     Ok(format!("Box::new({item})"))
                 }
                 _ => Ok(value.to_owned()),
@@ -2490,7 +3076,10 @@ fn into_source_expression(ty: &Type, value: &str, mirror_schema: &MirrorSchema) 
     }
 }
 
-fn selected_definition<'a>(name: &str, mirror_schema: &'a MirrorSchema) -> Option<&'a TypeDefinition> {
+fn selected_definition<'a>(
+    name: &str,
+    mirror_schema: &'a MirrorSchema,
+) -> Option<&'a TypeDefinition> {
     mirror_schema
         .selected
         .contains(name)
@@ -2498,7 +3087,7 @@ fn selected_definition<'a>(name: &str, mirror_schema: &'a MirrorSchema) -> Optio
         .flatten()
 }
 
-fn type_arguments<'a>(segment: &'a syn::PathSegment) -> Result<Vec<&'a Type>> {
+fn type_arguments(segment: &syn::PathSegment) -> Result<Vec<&Type>> {
     match &segment.arguments {
         syn::PathArguments::None => Ok(Vec::new()),
         syn::PathArguments::AngleBracketed(arguments) => Ok(arguments
@@ -2509,7 +3098,10 @@ fn type_arguments<'a>(segment: &'a syn::PathSegment) -> Result<Vec<&'a Type>> {
                 _ => None,
             })
             .collect()),
-        _ => bail!("unsupported path arguments in {}", segment.to_token_stream()),
+        syn::PathArguments::Parenthesized(_) => bail!(
+            "unsupported path arguments in {}",
+            segment.to_token_stream()
+        ),
     }
 }
 
@@ -2548,11 +3140,11 @@ fn type_text(ty: &Type) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(bytes);
-    digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut hex = String::new();
+    for byte in digest.finalize() {
+        write!(hex, "{byte:02x}").expect("formatting a digest into a String is infallible");
+    }
+    hex
 }
 
 fn read(path: &Path) -> Result<String> {
@@ -2561,7 +3153,8 @@ fn read(path: &Path) -> Result<String> {
 
 fn write_file(path: &Path, contents: String) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).wrap_err_with(|| format!("could not create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("could not create {}", parent.display()))?;
     }
     fs::write(path, contents).wrap_err_with(|| format!("could not write {}", path.display()))
 }

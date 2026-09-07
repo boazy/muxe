@@ -158,9 +158,9 @@ impl NonblockingStdin {
     async fn read(&self, bytes: &mut [u8]) -> io::Result<usize> {
         loop {
             let mut readiness = self.fd.readable().await?;
-            match readiness.try_io(|fd| read_fd(fd.get_ref(), bytes).map_err(nix_io)) {
-                Ok(result) => return result,
-                Err(_) => continue,
+            if let Ok(result) = readiness.try_io(|fd| read_fd(fd.get_ref(), bytes).map_err(nix_io))
+            {
+                return result;
             }
         }
     }
@@ -182,6 +182,11 @@ pub struct UiSession {
 
 impl UiSession {
     /// Builds a session from the checked `UiAttached` response frame supplied by the broker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the frame cannot be decoded, is not a UI attachment response,
+    /// carries an invalid binding key, or supplies templates that fail to compile.
     pub fn attach(frame: muxe_protocol::ArchivedFrame) -> Result<Self, UiError> {
         let started = Instant::now();
         let runtime = UiRuntime::attach_at(frame, muxe_core::SessionInstant(Duration::ZERO))?;
@@ -208,6 +213,10 @@ impl UiSession {
     }
 
     /// Starts terminal-dependent input behavior after raw mode and the alternate screen exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying terminal error when the Kitty mode push or its flush fails.
     pub fn begin_terminal<W: io::Write>(
         &mut self,
         surface: &mut TerminalSurface<W>,
@@ -219,6 +228,11 @@ impl UiSession {
     }
 
     /// Renders one fresh terminal area, resetting pager state if the area changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiRunError::Ui`] when the menu cannot be prepared from the pinned attachment, or
+    /// [`UiRunError::Io`] when the terminal surface write fails.
     pub fn render<W: io::Write>(
         &mut self,
         surface: &mut TerminalSurface<W>,
@@ -251,6 +265,11 @@ impl UiSession {
     }
 
     /// Fails the terminal setup when the Kitty confirmation deadline expires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KittyNegotiationError::TimedOut`] when the Kitty response has not confirmed the
+    /// requested mode. An already-confirmed or absent negotiation succeeds.
     pub fn kitty_timeout(&self) -> Result<(), KittyNegotiationError> {
         self.kitty
             .as_ref()
@@ -258,6 +277,11 @@ impl UiSession {
     }
 
     /// Applies one broker event to dynamic availability and session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError`] when the attached session ID or attachment cannot be read, or when a
+    /// binding condition fails to evaluate.
     pub fn handle_broker_event(&mut self, event: &BrokerEvent) -> Result<UiCommand, UiError> {
         self.runtime.handle_broker_event(event, self.now())
     }
@@ -336,6 +360,10 @@ impl UiSession {
 /// lifecycle ownership. Every path after [`TerminalSurface::enter`] attempts terminal restoration:
 /// normal detach, stdin EOF, Kitty refusal or timeout, broker failure, and handled signals. During
 /// panic unwinding, `TerminalSurface`'s drop guard performs the same best-effort restoration.
+/// # Errors
+///
+/// Returns [`UiRunError`] when signal installation, session attachment, terminal setup,
+/// input handling, broker communication, or terminal restoration fails.
 pub async fn run_attached<C>(
     frame: muxe_protocol::ArchivedFrame,
     control: &mut C,
@@ -377,16 +405,16 @@ where
 
     loop {
         let now = Instant::now();
-        let escape_wait = escape_deadline
-            .map(|deadline| deadline.saturating_duration_since(now))
-            .unwrap_or(Duration::MAX);
-        let kitty_wait = kitty_deadline
-            .map(|deadline| deadline.saturating_duration_since(now))
-            .unwrap_or(Duration::MAX);
+        let escape_wait = escape_deadline.map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(now)
+        });
+        let kitty_wait = kitty_deadline.map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(now)
+        });
         let inactivity_deadline = session.inactivity_deadline();
-        let inactivity_wait = inactivity_deadline
-            .map(|deadline| deadline.saturating_duration_since(now))
-            .unwrap_or(Duration::MAX);
+        let inactivity_wait = inactivity_deadline.map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(now)
+        });
         tokio::select! {
             read = stdin.read(&mut bytes) => {
                 let read = read?;
@@ -409,18 +437,18 @@ where
                     kitty_deadline = None;
                 }
             }
-            _ = tokio::time::sleep(escape_wait), if escape_deadline.is_some() => {
+            () = tokio::time::sleep(escape_wait), if escape_deadline.is_some() => {
                 escape_deadline = None;
                 session.flush_vt100_escape();
                 if let Some(exit) = dispatch_queued(session, surface, control).await? {
                     return Ok(exit);
                 }
             }
-            _ = tokio::time::sleep(kitty_wait), if kitty_deadline.is_some() => {
+            () = tokio::time::sleep(kitty_wait), if kitty_deadline.is_some() => {
                 session.kitty_timeout()?;
                 kitty_deadline = None;
             }
-            _ = tokio::time::sleep(inactivity_wait), if inactivity_deadline.is_some() => {
+            () = tokio::time::sleep(inactivity_wait), if inactivity_deadline.is_some() => {
                 if let Some(exit) = dispatch(session.tick(), session, surface, control).await? {
                     return Ok(exit);
                 }

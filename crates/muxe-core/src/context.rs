@@ -123,6 +123,7 @@ pub enum ContextValue {
 }
 
 impl ContextValue {
+    #[must_use]
     pub const fn context_type(&self) -> ContextType {
         match self {
             Self::HostKind(_) => ContextType::HostKind,
@@ -168,6 +169,7 @@ pub enum ContextPath {
 }
 
 impl ContextPath {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OriginHostKind => "origin.host.kind",
@@ -190,6 +192,7 @@ impl ContextPath {
         }
     }
 
+    #[must_use]
     pub const fn value_type(self) -> ContextType {
         match self {
             Self::OriginHostKind => ContextType::HostKind,
@@ -201,17 +204,17 @@ impl ContextPath {
             Self::OriginTabIndex => ContextType::UnsignedInteger,
             Self::OriginPaneId => ContextType::PaneId,
             Self::OriginPaneType => ContextType::PaneType,
-            Self::OriginPaneCwd => ContextType::AbsolutePath,
+            Self::OriginPaneCwd | Self::OriginWorktreePath => ContextType::AbsolutePath,
             Self::OriginSelectionText => ContextType::String,
             Self::OriginInvocationSource => ContextType::InvocationSource,
             Self::OriginWorktreeId => ContextType::WorktreeId,
-            Self::OriginWorktreePath => ContextType::AbsolutePath,
             Self::OriginAgentId => ContextType::AgentId,
             Self::OriginLinkUrl => ContextType::Url,
             Self::OriginLinkHandlerId => ContextType::LinkHandlerId,
         }
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "origin.host.kind" => Self::OriginHostKind,
@@ -235,6 +238,7 @@ impl ContextPath {
         })
     }
 
+    #[must_use]
     pub fn resolve(self, origin: &OriginContext) -> Option<ContextValue> {
         match self {
             Self::OriginHostKind => Some(ContextValue::HostKind(origin.host_kind)),
@@ -248,12 +252,19 @@ impl ContextPath {
             Self::OriginPaneType => origin.pane_type.map(ContextValue::PaneType),
             Self::OriginPaneCwd => origin.pane_cwd.clone().map(ContextValue::AbsolutePath),
             Self::OriginSelectionText => origin.selection_text.clone().map(ContextValue::String),
-            Self::OriginInvocationSource => Some(ContextValue::InvocationSource(origin.invocation_source)),
+            Self::OriginInvocationSource => {
+                Some(ContextValue::InvocationSource(origin.invocation_source))
+            }
             Self::OriginWorktreeId => origin.worktree_id.clone().map(ContextValue::WorktreeId),
-            Self::OriginWorktreePath => origin.worktree_path.clone().map(ContextValue::AbsolutePath),
+            Self::OriginWorktreePath => {
+                origin.worktree_path.clone().map(ContextValue::AbsolutePath)
+            }
             Self::OriginAgentId => origin.agent_id.clone().map(ContextValue::AgentId),
             Self::OriginLinkUrl => origin.link_url.clone().map(ContextValue::Url),
-            Self::OriginLinkHandlerId => origin.link_handler_id.clone().map(ContextValue::LinkHandlerId),
+            Self::OriginLinkHandlerId => origin
+                .link_handler_id
+                .clone()
+                .map(ContextValue::LinkHandlerId),
         }
     }
 }
@@ -264,6 +275,11 @@ pub struct ContextReference {
 }
 
 impl ContextReference {
+    /// Parses one closed origin-context reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the reference is not in the v1 registry.
     pub fn parse(value: &str, span: SourceSpan) -> Result<Self, ConfigDiagnostic> {
         ContextPath::parse(value)
             .map(|path| Self { path })
@@ -276,10 +292,12 @@ impl ContextReference {
             })
     }
 
+    #[must_use]
     pub fn expected_type(&self) -> ContextType {
         self.path.value_type()
     }
 
+    #[must_use]
     pub fn resolve(&self, origin: &OriginContext) -> Option<ContextValue> {
         self.path.resolve(origin)
     }

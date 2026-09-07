@@ -78,6 +78,14 @@ impl CaptureTable {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Drops one client's capture state for heartbeat-lease expiry,
+    /// returning the displaced state so the caller can report session
+    /// health. Prior-mode restoration metadata lives broker-side; the
+    /// adapter keeps no restorable lease afterward, so an expired capture
+    /// can never restore or confirm again.
+    pub fn invalidate_client(&mut self, client_id: &str) -> Option<CaptureState> {
+        self.states.remove(client_id)
+    }
 
     /// Current state for a client, defaulting to idle.
     pub fn state(&self, client_id: &str) -> &CaptureState {
@@ -129,7 +137,7 @@ impl CaptureTable {
             }
             // A lease that no longer owns the client is stale, whether the
             // client is mid-begin under another lease or already captured.
-            Some(CaptureState::Beginning { .. }) | Some(CaptureState::Captured(_)) => {
+            Some(CaptureState::Beginning { .. } | CaptureState::Captured(_)) => {
                 Err(CaptureError::StaleLease)
             }
             _ => Err(CaptureError::NotCaptured),
@@ -154,12 +162,13 @@ impl CaptureTable {
                 self.states.insert(client_id.to_owned(), CaptureState::Idle);
                 Ok(restore)
             }
-            Some(CaptureState::Captured(_)) => Err(CaptureError::StaleLease),
             Some(CaptureState::Beginning { lease: pending, .. }) if *pending == lease => {
                 self.states.insert(client_id.to_owned(), CaptureState::Idle);
                 Ok(None)
             }
-            Some(CaptureState::Beginning { .. }) => Err(CaptureError::StaleLease),
+            Some(CaptureState::Captured(_) | CaptureState::Beginning { .. }) => {
+                Err(CaptureError::StaleLease)
+            }
             _ => Err(CaptureError::NotCaptured),
         }
     }

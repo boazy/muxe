@@ -40,8 +40,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use muxe_zellij_protocol::{
-    BRIDGE_PROTOCOL_VERSION, BridgeArtifact, BridgeIdentity, BridgeRequest, CaptureEndReason,
-    CaptureLostReason, CommandOutcome, PipeEvent, PipeEventKind, ZellijOrigin,
+    BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, CaptureEndReason, CaptureLostReason,
+    CommandOutcome, PipeEvent, PipeEventKind, ZellijOrigin, bridge_build_id,
     bridge_protocol_fingerprint, decode_request_line, encode_event_line,
     generated::RawNativeCommand, generated_action_fingerprint, pinned_source_revision,
 };
@@ -98,7 +98,7 @@ pub trait HostEffects {
     /// Unblocks the CLI child with this source UUID.
     fn unblock_pipe(&mut self, cli_id: &str);
     /// Requests a host input-mode change.
-    fn switch_mode(&mut self, mode: &InputMode);
+    fn switch_mode(&mut self, mode: InputMode);
     /// Focuses one host pane by ID.
     fn focus_pane(&mut self, pane: PaneId);
     /// Fills bytes from OS randomness; false when unavailable.
@@ -140,8 +140,8 @@ impl HostEffects for ShimEffects {
         unblock_cli_pipe_input(cli_id);
     }
 
-    fn switch_mode(&mut self, mode: &InputMode) {
-        switch_to_input_mode(mode);
+    fn switch_mode(&mut self, mode: InputMode) {
+        switch_to_input_mode(&mode);
     }
 
     fn focus_pane(&mut self, pane: PaneId) {
@@ -233,11 +233,11 @@ impl Bridge {
     /// Host event pump.
     pub fn update(&mut self, event: Event, effects: &mut dyn HostEffects) {
         match event {
-            Event::ListClients(clients) => self.on_list_clients(clients, effects),
-            Event::ModeUpdate(mode) => self.on_mode_update(mode, effects),
-            Event::PaneUpdate(manifest) => self.on_pane_update(manifest),
-            Event::TabUpdate(tabs) => self.on_tab_update(tabs),
-            Event::ActionComplete(_, _, context) => self.on_action_complete(context, effects),
+            Event::ListClients(clients) => self.on_list_clients(&clients, effects),
+            Event::ModeUpdate(mode) => self.on_mode_update(&mode, effects),
+            Event::PaneUpdate(manifest) => self.on_pane_update(&manifest),
+            Event::TabUpdate(tabs) => self.on_tab_update(&tabs),
+            Event::ActionComplete(_, _, context) => self.on_action_complete(&context, effects),
             Event::Timer(_) => self.on_timer(effects),
             Event::PermissionRequestResult(status) => {
                 if status == PermissionStatus::Denied {
@@ -263,7 +263,7 @@ impl Bridge {
                 if name.starts_with(EVENT_PREFIX) {
                     self.subscribe(cli_id, effects);
                 } else if name.starts_with(REQUEST_PREFIX) {
-                    self.on_request(cli_id, payload, effects);
+                    self.on_request(&cli_id, payload, effects);
                 }
             }
             PipeSource::Plugin(_) | PipeSource::Keybind => {}
@@ -290,8 +290,8 @@ impl Bridge {
         )
     }
 
-    fn on_list_clients(&mut self, clients: Vec<ClientInfo>, effects: &mut dyn HostEffects) {
-        for client in &clients {
+    fn on_list_clients(&mut self, clients: &[ClientInfo], effects: &mut dyn HostEffects) {
+        for client in clients {
             if client.is_current_client {
                 self.client_id = Some(client.client_id.to_string());
                 let focused = format!("{}", client.pane_id);
@@ -312,7 +312,7 @@ impl Bridge {
         self.try_register(effects);
     }
 
-    fn on_mode_update(&mut self, mode: ModeInfo, effects: &mut dyn HostEffects) {
+    fn on_mode_update(&mut self, mode: &ModeInfo, effects: &mut dyn HostEffects) {
         let locked = mode.mode == InputMode::Locked;
         self.current_mode = Some(mode.mode);
         if locked {
@@ -336,12 +336,10 @@ impl Bridge {
         // A first observation while capture is pending snapshots the true
         // prior; the Locked request goes out only now, never on assumed state.
         if let Some(pending) = &mut self.pending {
+            pending.prior = Some(mode.mode);
             if !pending.requested {
-                pending.prior = Some(mode.mode);
                 pending.requested = true;
-                effects.switch_mode(&InputMode::Locked);
-            } else {
-                pending.prior = Some(mode.mode);
+                effects.switch_mode(InputMode::Locked);
             }
         }
         // Away from Locked with an active capture is user-owned newer state:
@@ -357,7 +355,7 @@ impl Bridge {
         }
     }
 
-    fn on_pane_update(&mut self, manifest: PaneManifest) {
+    fn on_pane_update(&mut self, manifest: &PaneManifest) {
         let mut panes = BTreeMap::new();
         for (tab, infos) in &manifest.panes {
             panes.insert(
@@ -378,17 +376,17 @@ impl Bridge {
         self.inventory.set_manifest(panes);
     }
 
-    fn on_tab_update(&mut self, tabs: Vec<TabInfo>) {
+    fn on_tab_update(&mut self, tabs: &[TabInfo]) {
         let active = tabs.iter().find(|tab| tab.active).map(|tab| tab.position);
         self.inventory.set_active_tab(active);
     }
 
     fn on_action_complete(
         &mut self,
-        context: BTreeMap<String, String>,
+        context: &BTreeMap<String, String>,
         effects: &mut dyn HostEffects,
     ) {
-        let Some(execution) = completion_execution(&context) else {
+        let Some(execution) = completion_execution(context) else {
             return;
         };
         if let Some(request_id) = self.pending_actions.remove(execution) {
@@ -426,7 +424,7 @@ impl Bridge {
         if let Some(active) = self.active.take()
             && self.current_mode == Some(InputMode::Locked)
         {
-            effects.switch_mode(&active.prior);
+            effects.switch_mode(active.prior);
             self.emit(
                 PipeEventKind::CaptureLost {
                     lease: active.lease,
@@ -458,7 +456,7 @@ impl Bridge {
         if let Some(active) = self.active.take()
             && self.current_mode == Some(InputMode::Locked)
         {
-            effects.switch_mode(&active.prior);
+            effects.switch_mode(active.prior);
         }
         self.pending = None;
         self.pending_actions.clear();
@@ -494,21 +492,14 @@ impl Bridge {
                     source_revision: pinned_source_revision().to_owned(),
                     action_fingerprint: generated_action_fingerprint().0,
                     protocol_fingerprint: bridge_protocol_fingerprint().0,
-                    // Honest by construction: the SDK exposes no digest of its
-                    // own loaded bytes, so a bridge never self-attests one.
-                    artifact: BridgeArtifact::Unattested,
+                    bridge_build_id: Some(bridge_build_id()),
                 },
             },
             effects,
         );
     }
 
-    fn on_request(
-        &mut self,
-        cli_id: String,
-        payload: Option<String>,
-        effects: &mut dyn HostEffects,
-    ) {
+    fn on_request(&mut self, cli_id: &str, payload: Option<String>, effects: &mut dyn HostEffects) {
         let Some(payload) = payload else {
             return;
         };
@@ -537,7 +528,7 @@ impl Bridge {
                 _ => None,
             };
             self.fail(
-                &cli_id,
+                cli_id,
                 request.request_id,
                 request.channel_generation,
                 execution,
@@ -550,35 +541,33 @@ impl Bridge {
         let generation = request.channel_generation;
         match request.payload {
             BridgeRequest::Dispatch { execution, command } => {
-                self.dispatch_command(&cli_id, request_id, generation, execution, command, effects);
+                self.dispatch_command(cli_id, request_id, generation, execution, command, effects);
             }
             BridgeRequest::BeginCapture { lease, ui_session } => {
-                self.begin_capture(&cli_id, request_id, generation, lease, ui_session, effects);
+                self.begin_capture(cli_id, request_id, generation, lease, ui_session, effects);
             }
             BridgeRequest::EndCapture { lease, reason } => {
-                self.end_capture(&cli_id, request_id, generation, lease, reason, effects);
+                self.end_capture(cli_id, request_id, generation, lease, reason, effects);
             }
             BridgeRequest::RequestOrigin {
                 ui_session,
                 ui_pane,
             } => {
-                self.request_origin(
-                    &cli_id, request_id, generation, ui_session, ui_pane, effects,
-                );
+                self.request_origin(cli_id, request_id, generation, ui_session, ui_pane, effects);
             }
             BridgeRequest::FocusPaneByIndex { execution, index } => {
-                self.focus_by_index(&cli_id, request_id, generation, execution, index, effects);
+                self.focus_by_index(cli_id, request_id, generation, execution, index, effects);
             }
             BridgeRequest::FocusPaneNeighbor {
                 execution,
                 direction,
             } => {
                 self.focus_neighbor(
-                    &cli_id, request_id, generation, execution, direction, effects,
+                    cli_id, request_id, generation, execution, direction, effects,
                 );
             }
             BridgeRequest::RetireBridge => {
-                self.retire(&cli_id, request_id, generation, effects);
+                self.retire(cli_id, request_id, generation, effects);
             }
         }
     }
@@ -689,7 +678,7 @@ impl Bridge {
             requested,
         });
         if requested {
-            effects.switch_mode(&InputMode::Locked);
+            effects.switch_mode(InputMode::Locked);
         }
         self.release(cli_id, request_id, generation, effects);
     }
@@ -710,7 +699,7 @@ impl Bridge {
         if let Some(active) = self.active.take() {
             if active.lease == lease {
                 if self.current_mode == Some(InputMode::Locked) {
-                    effects.switch_mode(&active.prior);
+                    effects.switch_mode(active.prior);
                 }
             } else {
                 self.active = Some(active);
@@ -855,7 +844,7 @@ impl Bridge {
         if let Some(active) = self.active.take()
             && self.current_mode == Some(InputMode::Locked)
         {
-            effects.switch_mode(&active.prior);
+            effects.switch_mode(active.prior);
         }
         self.pending = None;
         let pending: Vec<(String, [u8; 16])> = std::mem::take(&mut self.pending_actions)
@@ -1033,8 +1022,8 @@ mod tests {
         fn unblock_pipe(&mut self, cli_id: &str) {
             self.unblocks.push(cli_id.to_owned());
         }
-        fn switch_mode(&mut self, mode: &InputMode) {
-            self.modes.push(*mode);
+        fn switch_mode(&mut self, mode: InputMode) {
+            self.modes.push(mode);
         }
         fn focus_pane(&mut self, pane: PaneId) {
             self.focused.push(pane);
