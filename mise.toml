@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "1.97.1", targets = ["wasm32-wasip1"] }
+rust = { version = "1.97.1", targets = ["wasm32-wasip1"], components = ["rustfmt", "clippy"] }
 "cargo:cargo-codspeed" = "5.0.1"
 
 [tasks.fmt]
