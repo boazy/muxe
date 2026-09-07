@@ -1,50 +1,50 @@
 [tools]
-rust = "1.97.1"
+rust = { version = "1.97.1", targets = ["wasm32-wasip1"] }
 "cargo:cargo-codspeed" = "5.0.1"
 
 [tasks.fmt]
 description = "Check Rust formatting on the pinned toolchain"
-run = "env -u RUSTUP_TOOLCHAIN cargo fmt --all -- --check"
+run = "cargo fmt --all -- --check"
 
 [tasks.check]
 description = "Compile registered crates with the pinned lockfile"
-run = "env -u RUSTUP_TOOLCHAIN cargo check --workspace --locked"
+run = "cargo check --workspace --locked"
 
 [tasks.test]
 description = "Run registered workspace tests and doctests"
-run = "env -u RUSTUP_TOOLCHAIN cargo test --workspace --locked"
+run = "cargo test --workspace --locked"
 
 [tasks.clippy]
 description = "Run strict Clippy checks"
-run = "env -u RUSTUP_TOOLCHAIN cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -W clippy::allow_attributes -W clippy::allow_attributes_without_reason -W clippy::redundant_clone -W clippy::unused_peekable"
+run = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -W clippy::allow_attributes -W clippy::allow_attributes_without_reason -W clippy::redundant_clone -W clippy::unused_peekable"
 
 [tasks.codegen-herdr]
 description = "Verify Herdr-generated sources are byte-clean"
-run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-herdr-gen -- --check"
+run = "cargo run --locked -p muxe-herdr-gen -- --check"
 
 [tasks.codegen-zellij]
 description = "Verify Zellij-generated sources are byte-clean"
-run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-zellij-gen -- --check"
+run = "cargo run --locked -p muxe-zellij-gen -- --check"
 
 [tasks.codegen-zellij-materialize]
 description = "Materialize minimized Zellij fixtures from the pinned source"
-run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-zellij-gen -- --materialize-fixtures"
+run = "cargo run --locked -p muxe-zellij-gen -- --materialize-fixtures"
 
 [tasks.codegen-zellij-verify]
 description = "Verify Zellij fixtures from a fresh pinned source materialization"
-run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe-zellij-gen -- --verify-fixtures"
+run = "cargo run --locked -p muxe-zellij-gen -- --verify-fixtures"
 
 [tasks.completions]
 description = "Generate committed shell completions from the clap definition"
-run = "env -u RUSTUP_TOOLCHAIN cargo run --locked -p codegen-completions"
+run = "cargo run --locked -p codegen-completions"
 
 [tasks.wasm-build]
 description = "Build the pinned Zellij bridge WASM (release) and stage dist-wasm/muxe-zellij.wasm"
-run = "env -u RUSTUP_TOOLCHAIN cargo build --locked --release -p muxe-zellij-wasm --target wasm32-wasip1 && mkdir -p dist-wasm && cp target/wasm32-wasip1/release/muxe_zellij_wasm.wasm dist-wasm/muxe-zellij.wasm"
+run = "cargo build --locked --release -p muxe-zellij-wasm --target wasm32-wasip1 && mkdir -p dist-wasm && cp target/wasm32-wasip1/release/muxe_zellij_wasm.wasm dist-wasm/muxe-zellij.wasm"
 
 [tasks.wasm-build-previous]
 description = "Build a distinct same-source debug WASM artifact for rollback ownership smoke"
-run = "env -u RUSTUP_TOOLCHAIN cargo build --locked -p muxe-zellij-wasm --target wasm32-wasip1"
+run = "cargo build --locked -p muxe-zellij-wasm --target wasm32-wasip1"
 
 [tasks.verify-packaged-wasm]
 depends = ["wasm-build"]
@@ -62,7 +62,7 @@ file_digest() {
   fi
 }
 export MUXE_WASM_SHA256="$(file_digest dist-wasm/muxe-zellij.wasm)"
-env -u RUSTUP_TOOLCHAIN cargo test --locked -p muxe --lib -- --ignored --exact \
+cargo test --locked -p muxe --lib -- --ignored --exact \
   compatibility::tests::packaged_wasm_matches_producer_bytes_and_rejects_tampering
 '''
 [tasks.verify-activation-preflight]
@@ -90,10 +90,10 @@ for test_name in \
   lifecycle::activate::tests::zellij_symlink_with_matching_receipt_fails_closed \
   lifecycle::activate::tests::zellij_receipt_path_and_mode_fail_closed
 do
-  env -u RUSTUP_TOOLCHAIN cargo test --locked -p muxe --lib -- --ignored --exact "$test_name"
+  cargo test --locked -p muxe --lib -- --ignored --exact "$test_name"
 done
 '''
 
 [tasks.bench-codspeed]
 description = "Build CodSpeed comparisons with the pinned runner"
-run = "env -u RUSTUP_TOOLCHAIN cargo codspeed build --locked"
+run = "cargo codspeed build --locked"

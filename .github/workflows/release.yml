@@ -37,6 +37,8 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+  # Manual runs always execute validation only; publish is push-tag guarded below.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -47,8 +49,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  metadata:
+    name: checked package metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: resolve package version from workspace Cargo.toml
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/ { s/^version = "\(.*\)"$/\1/p; }' Cargo.toml)"
+          test "${version}" != ""
+          printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "$GITHUB_REF_TYPE" = tag
+            test "$GITHUB_REF_NAME" = "v$version"
+          elif [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "unsupported release event: $GITHUB_EVENT_NAME" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   wasm:
     name: wasm bridge producer (single source of bytes)
+    needs: [metadata]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -58,14 +84,9 @@ jobs:
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
-          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
-          cargo --version | grep -F "cargo $pin"
-      - name: wasm target
-        run: |
-          set -euo pipefail
-          env -u RUSTUP_TOOLCHAIN rustup target add \
-            --toolchain "$(mise current rust)" wasm32-wasip1
+          mise exec -- cargo --version | grep -F "cargo $pin"
       - name: build bridge (release)
         # The task definition (flags, profile, stage path) is owned by the
         # mise coordinator; this job only asserts its output.
@@ -111,7 +132,7 @@ jobs:
 
   assets:
     name: build ${{ matrix.asset }}
-    needs: [wasm]
+    needs: [wasm, metadata]
     strategy:
       fail-fast: true
       matrix:
@@ -141,6 +162,8 @@ jobs:
             file_arch: arm64
             static: false
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -149,9 +172,9 @@ jobs:
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
-          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
-          cargo --version | grep -F "cargo $pin"
+          mise exec -- cargo --version | grep -F "cargo $pin"
       - name: runner architecture assert
         # macOS x64 is cross-compiled from the arm64 runner; the binary-arch
         # assert below covers the artifact. The runner itself must still be
@@ -210,12 +233,11 @@ jobs:
       - name: rust target
         run: |
           set -euo pipefail
-          env -u RUSTUP_TOOLCHAIN rustup target add \
-            --toolchain "$(mise current rust)" "${{ matrix.target }}"
+          mise exec -- rustup target add "${{ matrix.target }}"
       - name: build native binary
         run: |
           set -euo pipefail
-          env -u RUSTUP_TOOLCHAIN cargo build --locked --release \
+          mise exec -- cargo build --locked --release \
             -p muxe --target "${{ matrix.target }}"
       - name: verify static linkage (linux musl only)
         if: matrix.static
@@ -257,7 +279,7 @@ jobs:
           bin="target/${{ matrix.target }}/release/muxe"
           file "$bin" | tee bin-file.out
           grep -F "${{ matrix.file_arch }}" bin-file.out
-          version="${GITHUB_REF_NAME#v}"
+          version="$RELEASE_VERSION"
           test "$("$bin" --version | cut -d' ' -f2)" = "$version"
           echo "BIN=$bin" >> "$GITHUB_ENV"
       - name: native compatibility report (same runner)
@@ -269,12 +291,12 @@ jobs:
       - name: completions byte-clean
         run: |
           set -euo pipefail
-          env -u RUSTUP_TOOLCHAIN cargo run --locked \
+          mise exec -- cargo run --locked \
             -p codegen-completions -- --check
       - name: assemble archive
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="$RELEASE_VERSION"
           root="muxe-v${version}-${{ matrix.asset }}"
           rm -rf "$root" "${root}.tar.gz"
           mkdir -p "$root/lib/muxe" "$root/share/muxe/completions"
@@ -297,8 +319,10 @@ jobs:
 
   verify:
     name: checksums, identity, layout, attestations (pre-publish)
-    needs: [assets]
+    needs: [assets, metadata]
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -415,7 +439,7 @@ jobs:
           test -f producer/muxe-zellij.sha256
           expected="$(cut -d' ' -f1 producer/muxe-zellij.sha256)"
           test -n "$expected"
-          version="${GITHUB_REF_NAME#v}"
+          version="$RELEASE_VERSION"
           bin="verify-tmp/muxe-v${version}-linux-x64/muxe"
           test -x "$bin"
           report="$("$bin" compatibility --json)"
@@ -444,7 +468,7 @@ jobs:
 
   live-matrix:
     name: fixture matrix (${{ matrix.os }})
-    needs: [verify]
+    needs: [verify, metadata]
     strategy:
       fail-fast: true
       matrix:
@@ -458,22 +482,22 @@ jobs:
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
-          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
-          cargo --version | grep -F "cargo $pin"
+          mise exec -- cargo --version | grep -F "cargo $pin"
       - name: activation old/target fixtures (no live host)
         # Owned TempDir framed-control transaction fixtures; any missing
         # runner fails here by name instead of passing silently.
         run: |
           set -euo pipefail
-          env -u RUSTUP_TOOLCHAIN cargo test --locked -p muxe \
+          mise exec -- cargo test --locked -p muxe \
             --lib lifecycle::activate::tests
       - name: Herdr recorded-socket smoke (no live host)
         # Production adapter against recorded socket fixtures, including the
         # exact pane argv/cwd exchange.
         run: |
           set -euo pipefail
-          env -u RUSTUP_TOOLCHAIN cargo test --locked \
+          mise exec -- cargo test --locked \
             -p muxe-adapter-herdr --test recorded_socket
       - name: runner owned-spawn proofs (no live host)
         # Release-owned foreground/bootstrap/PTY/CLI/muxe scoping proofs:
@@ -483,11 +507,11 @@ jobs:
         # matrix itself stays behind MUXE_LIVE_HOSTS_APPROVED.
         run: |
           set -euo pipefail
-          env -u RUSTUP_TOOLCHAIN cargo test --locked -p muxe \
+          mise exec -- cargo test --locked -p muxe \
             --test live_hosts scoped_spawn
   target-smoke:
     name: current target-only host smoke (${{ matrix.asset }})
-    needs: [verify, live-matrix]
+    needs: [verify, live-matrix, metadata]
     strategy:
       fail-fast: true
       matrix:
@@ -510,6 +534,7 @@ jobs:
             herdr_digest: ab50262c8190cd7aa9056d249d255c08c328c3e8716de9cfa29db4f131b8e2c1
     env:
       ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -530,9 +555,9 @@ jobs:
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
-          pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
+          pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
-          cargo --version | grep -F "cargo $pin"
+          mise exec -- cargo --version | grep -F "cargo $pin"
       - name: pinned Zellij host (source build at pin)
         # No official 0.46.0 release asset exists, so build the exact pinned
         # source revision. Pin values come from pins/zellij.toml.
@@ -546,7 +571,7 @@ jobs:
           test -n "$zver"
           zdir="$RUNNER_TEMP/zellij-host"
           mkdir -p "$zdir"
-          env -u RUSTUP_TOOLCHAIN cargo install --git "$zrepo" --rev "$zrev" \
+          mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
             --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
@@ -590,7 +615,7 @@ jobs:
         # predecessor lookup or synthetic old artifact is used here.
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="$RELEASE_VERSION"
           archive="target-dist/muxe-v${version}-${{ matrix.asset }}.tar.gz"
           test -f "$archive" || {
             echo "MISSING: current target archive $archive"
@@ -619,14 +644,14 @@ jobs:
         # real-host smoke. Missing helpers fail closed.
         run: |
           set -euo pipefail
-          cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
+          mise exec -- cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
           fx="$PWD/tools/muxe-zellij-foreground/target/debug"
           test -x "$fx/muxe-zellij-foreground" || { echo "MISSING: built foreground binary"; exit 1; }
           test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
           test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
           test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
-          cargo test --locked -p muxe --test live_hosts scoped_spawn
-          cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
+          mise exec -- cargo test --locked -p muxe --test live_hosts scoped_spawn
+          mise exec -- cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
           {
             echo "MUXE_ZELLIJ_FOREGROUND_BINARY=$fx/muxe-zellij-foreground"
             echo "MUXE_ZELLIJ_BOOTSTRAP_BINARY=$fx/muxe-zellij-bootstrap"
@@ -645,9 +670,10 @@ jobs:
           MUXE_ZELLIJ_BOOTSTRAP_BINARY="$MUXE_ZELLIJ_BOOTSTRAP_BINARY" \
           MUXE_ZELLIJ_PERMISSION_SEEDER="$MUXE_ZELLIJ_PERMISSION_SEEDER" \
           MUXE_LIVE_HOSTS_APPROVED=true \
-          cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
+          mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
   publish:
-    needs: [verify, live-matrix, target-smoke]
+    needs: [verify, live-matrix, target-smoke, metadata]
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && needs.verify.result == 'success' && needs.live-matrix.result == 'success' && needs.target-smoke.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
