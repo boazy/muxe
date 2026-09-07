@@ -14,5 +14,7 @@ thiserror.workspace = true
 zellij-tile.workspace = true
 zellij-utils.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+zellij-utils = { workspace = true, features = ["vendored_curl"] }
 [build-dependencies]
 sha2.workspace = true

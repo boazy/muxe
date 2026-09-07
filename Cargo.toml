@@ -46,7 +46,7 @@ data-encoding = "2.9.0"
 sha2 = "0.10.9"
 async-trait = "0.1.89"
 zellij-tile = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f", package = "zellij-tile" }
-zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f", package = "zellij-utils", features = ["vendored_curl"] }
+zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f", package = "zellij-utils" }
 syn = { version = "2.0.108", features = ["full"] }
 quote = "1.0.41"
 proc-macro2 = "1.0.103"
