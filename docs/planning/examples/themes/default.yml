@@ -1,0 +1,50 @@
+# Default theme: host-readable styling over any color scheme.
+# Every style path below must resolve in the selected scheme; pairing is
+# validated at load. Disabled bindings render whole-cell dimmed to answer
+# "different style for disabled keys" with branching, not renderer magic.
+
+common:
+  styles:
+    default:
+      foreground: base.text
+      background: base.background
+    muted:
+      foreground: base.muted
+
+menu:
+  styles:
+    title:
+      foreground: base.text
+      bold: true
+    hotkey:
+      foreground: menu.hotkey
+      bold: true
+    alert:
+      foreground: status.error
+      bold: true
+    arrow:
+      foreground: menu.separator
+    disabled:
+      foreground: base.muted
+      dim: true
+    crumb:
+      foreground: menu.separator
+    error:
+      foreground: status.error
+      bold: true
+    pending:
+      foreground: status.pending
+    blocked:
+      foreground: status.blocked
+      bold: true
+    reload:
+      foreground: status.reload
+    notice:
+      foreground: status.notice
+  templates:
+    cell: "{% if blocked %}[alert]! [/alert]{% endif %}{% if disabled %}[disabled]{{ key | rpad(6, ' ') }} → {{ title }}[/disabled]{% else %}[hotkey]{{ key | rpad(6, ' ') }}[/hotkey] [arrow]→[/arrow] [title]{{ title }}[/title]{% endif %}"
+    breadcrumbs: "{% for c in crumbs %}[crumb]{{ c }}[/crumb]{% if not loop.last %} › {% endif %}{% endfor %}"
+    pagination:
+      full: "[muted]◀ {{ prev_key }} · {{ pages.current }}/{{ pages.count }} · {{ next_key }} ▶[/muted]"
+      short: "[muted]‹{{ pages.current }}/{{ pages.count }}›[/muted]"
+    status: "{% if level == 'error' %}[error]{{ message }}[/error]{% elif level == 'pending' %}[pending]{{ message }}[/pending]{% elif level == 'blocked' %}[blocked]{{ message }}[/blocked]{% elif level == 'reload' %}[reload]{{ message }}[/reload]{% else %}[notice]{{ message }}[/notice]{% endif %}"
