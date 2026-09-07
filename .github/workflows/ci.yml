@@ -28,6 +28,11 @@ jobs:
           pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$pin"
           cargo --version | grep -F "cargo $pin"
+      - name: install pinned WASM target
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN rustup target add \
+            --toolchain "$(mise current rust)" wasm32-wasip1
       - name: formatting
         run: mise run fmt
       - name: compile (locked)
@@ -63,6 +68,10 @@ jobs:
           env -u RUSTUP_TOOLCHAIN cargo test --locked \
             -p muxe-adapter-herdr --test recorded_socket
 
+      - name: packaged WASM identity gate
+        run: mise run verify-packaged-wasm
+      - name: packaged activation preflight gate
+        run: mise run verify-activation-preflight
 
   full-matrix:
     name: full matrix (${{ matrix.os }})
@@ -84,6 +93,19 @@ jobs:
           pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$pin"
           cargo --version | grep -F "cargo $pin"
+      - name: live-host approval opt-in (before costly installs)
+        # Explicit repository-variable guard authorizes the current-target
+        # owned-host smoke below. Without recorded approval the job stops
+        # here; host installs alone never pass the gate.
+        env:
+          ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
+        run: |
+          set -euo pipefail
+          test "${ALLOW_LIVE_HOST_MATRIX:-}" = "true" || {
+            echo "BLOCKED: full-matrix owned-host smoke requires recorded user approval." >&2
+            echo "Set the ALLOW_LIVE_HOST_MATRIX repository variable to \"true\" only after approval." >&2
+            exit 1
+          }
       - name: full workspace tests (locked)
         run: |
           set -euo pipefail
@@ -132,6 +154,97 @@ jobs:
           chmod 755 "$hdir/herdr"
           echo "$hdir" >> "$GITHUB_PATH"
           "$hdir/herdr" --version | grep -F "0.8.2"
+      - name: wasm bridge producer (this checkout)
+        # Same producer task as the release flow; the digest below comes
+        # from these exact bytes, never from a sidecar or hardcoded hash.
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN rustup target add \
+            --toolchain "$(mise current rust)" wasm32-wasip1
+          mise trust
+          mise run wasm-build
+          test -f dist-wasm/muxe-zellij.wasm
+      - name: stage target installation (full, this checkout)
+        # Full installation, not a bare binary: fresh producer WASM above,
+        # native release build with the producer digest compiled in
+        # (MUXE_WASM_SHA256, release builds fail closed without it), and
+        # the canonical root layout (DESIGN 1826: `<root>/muxe` with
+        # `<root>/lib/muxe/muxe-zellij.wasm` alongside, plus completions
+        # plus LICENSE). Native resolves the packaged bridge from the
+        # executable's own parent, so a `bin/`-nested binary would look
+        # in the wrong place; no native fallback exists by design.
+        run: |
+          set -euo pipefail
+          file_digest() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
+            elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
+          expected="$(file_digest dist-wasm/muxe-zellij.wasm)"
+          test "${#expected}" -eq 64
+          export MUXE_WASM_SHA256="$expected"
+          env -u RUSTUP_TOOLCHAIN cargo build --locked --release -p muxe
+          bin="target/release/muxe"
+          test -x "$bin"
+          command -v strings >/dev/null 2>&1 || {
+            echo "MISSING: strings (binutils) on this runner"
+            exit 1
+          }
+          strings "$bin" > strings.out
+          grep -Fq "$expected" strings.out || {
+            echo "staging failure: native binary does not embed producer digest"
+            exit 1
+          }
+          rm -rf "$RUNNER_TEMP/target-install"
+          mkdir -p "$RUNNER_TEMP/target-install/lib/muxe" \
+            "$RUNNER_TEMP/target-install/share/muxe/completions"
+          cp "$bin" "$RUNNER_TEMP/target-install/muxe"
+          chmod 755 "$RUNNER_TEMP/target-install/muxe"
+          cp dist-wasm/muxe-zellij.wasm "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm"
+          cp share/muxe/completions/muxe.bash \
+            share/muxe/completions/_muxe \
+            share/muxe/completions/muxe.fish \
+            "$RUNNER_TEMP/target-install/share/muxe/completions/"
+          cp LICENSE "$RUNNER_TEMP/target-install/LICENSE"
+          test "$(file_digest "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm")" = "$expected"
+          echo "staged full installation from producer digest $expected"
+      - name: target-only both-host smoke (current target, this OS row)
+        # Scope of this gate: the scheduled current-target host-version
+        # matrix on this OS row. The repo-owned retained-child
+        # explicit-endpoint smoke runner (live_hosts::target_only_smoke,
+        # both pinned hosts, real foreground bootstrap plus scoped PTY
+        # clients) runs here with complete typed inputs against the staged
+        # installation above. Authorization comes from the
+        # ALLOW_LIVE_HOST_MATRIX guard at the top of this job; this step
+        # adds no approval of its own. The runner determines pass or fail:
+        # installs above never pass the gate alone, and any missing
+        # capability or input fails, never skips green.
+        # Predecessor-to-target upgrade, rollback, and final-session fault
+        # coverage stays deferred in TODO-CROSS-RELEASE.md until a genuine
+        # published predecessor exists; that matrix is release scope
+        # (release.yml live-upgrade), not this job.
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
+          fx="$PWD/tools/muxe-zellij-foreground/target/debug"
+          test -x "$fx/muxe-zellij-foreground" || { echo "MISSING: built foreground binary"; exit 1; }
+          test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
+          test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
+          test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
+          # Host-free proofs run first on the real fixture path. Evidence,
+          # not a substitute for the live smoke below.
+          cargo test --locked -p muxe --test live_hosts scoped_spawn
+          cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
+          # Live smoke: every typed input explicit, approval recorded by
+          # the guard above. Missing anything fails the gate.
+          MUXE_TARGET_INSTALLATION="$RUNNER_TEMP/target-install" \
+          MUXE_HERDR_BINARY="$(command -v herdr)" \
+          MUXE_ZELLIJ_BINARY="$(command -v zellij)" \
+          MUXE_ZELLIJ_FOREGROUND_BINARY="$fx/muxe-zellij-foreground" \
+          MUXE_ZELLIJ_BOOTSTRAP_BINARY="$fx/muxe-zellij-bootstrap" \
+          MUXE_ZELLIJ_PERMISSION_SEEDER="$fx/muxe-zellij-permit" \
+          MUXE_LIVE_HOSTS_APPROVED=true \
+          cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
 
   benches:
     name: benchmarks (non-blocking)
@@ -183,24 +296,136 @@ jobs:
           pin="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$pin"
           cargo --version | grep -F "cargo $pin"
-      - name: host capability probe
-        id: capability
+      - name: pinned Zellij host (source build at pin)
+        # No official 0.46.0 release asset exists, so CI builds the exact
+        # pinned source revision. Pin values come from pins/zellij.toml.
         run: |
           set -euo pipefail
-          # Both pinned hosts must be present or this gate fails explicitly.
-          # A missing capability is a failing gate, never a silent skip.
-      - name: temp-scoped smoke
-        # All smoke state lives under a fresh TempDir; never the default host.
-        # No real-host scenario command is ready or authorized under the
-        # current no-live-host scope (broker owner: owned Herdr scenario
-        # awaits review; input owns the TempDir CLI pane smoke separately).
-        # Until an exact retained-child/explicit-endpoint command lands, the
-        # probe, version, and binary checks above are the complete gate, and
-        # they fail closed. Nothing here stands in for a host interaction.
+          zrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/zellij.toml)"
+          zrev="$(sed -n 's/^revision = "\(.*\)"$/\1/p' pins/zellij.toml)"
+          zver="$(sed -n 's/^host_version = "\(.*\)"$/\1/p' pins/zellij.toml)"
+          test -n "$zrepo"
+          test -n "$zrev"
+          test -n "$zver"
+          zdir="$RUNNER_TEMP/zellij-host"
+          mkdir -p "$zdir"
+          env -u RUSTUP_TOOLCHAIN cargo install --git "$zrepo" --rev "$zrev" \
+            --locked --root "$zdir" zellij
+          echo "$zdir/bin" >> "$GITHUB_PATH"
+          "$zdir/bin/zellij" --version | grep -F "$zver"
+      - name: pinned Herdr host (0.8.2, digest-verified)
         run: |
           set -euo pipefail
-          SMOKE_DIR="$(mktemp -d)"
-          export SMOKE_DIR
-          trap 'rm -rf "$SMOKE_DIR"' EXIT
-          env -u RUSTUP_TOOLCHAIN cargo run --locked -p muxe -- \
-            compatibility --json | tee "$SMOKE_DIR/compat.json"
+          file_digest() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
+            elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
+          hasset="herdr-linux-x86_64"
+          hdigest="976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4"
+          hdir="$RUNNER_TEMP/herdr-host"
+          mkdir -p "$hdir"
+          curl -fSL "https://github.com/herdrdev/herdr/releases/download/v0.8.2/$hasset" -o "$hdir/herdr"
+          test "$(file_digest "$hdir/herdr")" = "$hdigest" || {
+            echo "Herdr release asset digest mismatch for $hasset"
+            exit 1
+          }
+          chmod 755 "$hdir/herdr"
+          echo "$hdir" >> "$GITHUB_PATH"
+          "$hdir/herdr" --version | grep -F "0.8.2"
+      - name: host capability probe (real version asserts)
+        # Both pinned hosts must answer their version commands or this gate
+        # fails explicitly. A missing capability is a failing gate, never a
+        # silent skip, and never a shell-only success.
+        run: |
+          set -euo pipefail
+          command -v zellij >/dev/null 2>&1 || { echo "MISSING: pinned zellij not on PATH"; exit 1; }
+          command -v herdr >/dev/null 2>&1 || { echo "MISSING: pinned herdr not on PATH"; exit 1; }
+          zellij --version
+          herdr --version
+          herdr api schema --json > /dev/null
+      - name: wasm bridge producer (this checkout)
+        # Same producer task as the release flow; the digest below comes
+        # from these exact bytes, never from a sidecar or hardcoded hash.
+        run: |
+          set -euo pipefail
+          env -u RUSTUP_TOOLCHAIN rustup target add \
+            --toolchain "$(mise current rust)" wasm32-wasip1
+          mise trust
+          mise run wasm-build
+          test -f dist-wasm/muxe-zellij.wasm
+      - name: stage target installation (full, this checkout)
+        # Full installation, not a bare binary: fresh producer WASM above,
+        # native release build with the producer digest compiled in
+        # (MUXE_WASM_SHA256, release builds fail closed without it), and
+        # the canonical root layout (DESIGN 1826: `<root>/muxe` with
+        # `<root>/lib/muxe/muxe-zellij.wasm` alongside, plus completions
+        # plus LICENSE). Native resolves the packaged bridge from the
+        # executable's own parent, so a `bin/`-nested binary would look
+        # in the wrong place; no native fallback exists by design.
+        run: |
+          set -euo pipefail
+          file_digest() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
+            elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
+            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+          }
+          expected="$(file_digest dist-wasm/muxe-zellij.wasm)"
+          test "${#expected}" -eq 64
+          export MUXE_WASM_SHA256="$expected"
+          env -u RUSTUP_TOOLCHAIN cargo build --locked --release -p muxe
+          bin="target/release/muxe"
+          test -x "$bin"
+          command -v strings >/dev/null 2>&1 || {
+            echo "MISSING: strings (binutils) on this runner"
+            exit 1
+          }
+          strings "$bin" > strings.out
+          grep -Fq "$expected" strings.out || {
+            echo "staging failure: native binary does not embed producer digest"
+            exit 1
+          }
+          rm -rf "$RUNNER_TEMP/target-install"
+          mkdir -p "$RUNNER_TEMP/target-install/lib/muxe" \
+            "$RUNNER_TEMP/target-install/share/muxe/completions"
+          cp "$bin" "$RUNNER_TEMP/target-install/muxe"
+          chmod 755 "$RUNNER_TEMP/target-install/muxe"
+          cp dist-wasm/muxe-zellij.wasm "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm"
+          cp share/muxe/completions/muxe.bash \
+            share/muxe/completions/_muxe \
+            share/muxe/completions/muxe.fish \
+            "$RUNNER_TEMP/target-install/share/muxe/completions/"
+          cp LICENSE "$RUNNER_TEMP/target-install/LICENSE"
+          test "$(file_digest "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm")" = "$expected"
+          echo "staged full installation from producer digest $expected"
+      - name: target-only both-host smoke (real runner, DESIGN 1638-40/1795)
+        # The repo-owned retained-child explicit-endpoint smoke runner
+        # (live_hosts::target_only_smoke, both pinned hosts, real
+        # foreground bootstrap plus scoped PTY clients) runs here with
+        # complete typed inputs. This job's own environment expresses
+        # the intended authorization (MUXE_LIVE_HOSTS_APPROVED=true);
+        # any missing capability or input fails, never skips green.
+        # No predecessor belongs in PR smoke: the preceding-to-target
+        # upgrade matrix is release scope (release.yml live-upgrade).
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
+          fx="$PWD/tools/muxe-zellij-foreground/target/debug"
+          test -x "$fx/muxe-zellij-foreground" || { echo "MISSING: built foreground binary"; exit 1; }
+          test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
+          test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
+          test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
+          # the real fixture path. Evidence, not a substitute for the
+          # live smoke below.
+          cargo test --locked -p muxe --test live_hosts scoped_spawn
+          cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
+          # Live smoke: every typed input explicit, approval expressed by
+          # this job's environment. Missing anything fails the gate.
+          MUXE_TARGET_INSTALLATION="$RUNNER_TEMP/target-install" \
+          MUXE_HERDR_BINARY="$(command -v herdr)" \
+          MUXE_ZELLIJ_BINARY="$(command -v zellij)" \
+          MUXE_ZELLIJ_FOREGROUND_BINARY="$fx/muxe-zellij-foreground" \
+          MUXE_ZELLIJ_BOOTSTRAP_BINARY="$fx/muxe-zellij-bootstrap" \
+          MUXE_ZELLIJ_PERMISSION_SEEDER="$fx/muxe-zellij-permit" \
+          MUXE_LIVE_HOSTS_APPROVED=true \
+          cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke

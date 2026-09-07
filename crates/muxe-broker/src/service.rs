@@ -1,4 +1,7 @@
-use std::{collections::HashSet, fmt::Write as _, fs, io, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet, fmt::Write as _, fs, future::Future, io, pin::Pin, sync::Arc,
+    time::Duration,
+};
 
 use crate::{Broker, BrokerError, RequestResult, RuntimeEndpoint, RuntimeError, StartupLock};
 use muxe_adapter_api::AdapterErrorKind;
@@ -61,59 +64,85 @@ struct ActivationController {
     recovery: Arc<Mutex<Option<Arc<dyn RecoveryJournal>>>>,
 }
 
-/// Journal-derived recovery view for one handoff, supplied by the executable that owns
-/// the journal path. The broker never reads journals itself (owner-only files with a
-/// coordinator-owned schema); the executable maps its journal into this view.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "four independent presence flags read once per disconnect drive distinct fail-closed branches; grouping them would obscure the recovery matrix the executable maps"
-)]
-#[derive(Clone, Copy, Debug)]
-pub struct RecoveryView {
-    /// False when no journal exists at the deterministic path: no target could have
-    /// been journal-authorized, so an old broker may restore immediately.
-    pub journal_present: bool,
-    /// True when the journal is present but fails validation or names an identity,
-    /// handoff, or state this broker does not recognize: recovery preserves everything.
-    pub inconsistent: bool,
-    /// This broker's handoff appears in the journal with a member that reached Ready.
-    pub member_ready: bool,
-    /// The journal-named target for this handoff is observably live at map time.
-    /// Member Ready is durable (written after all waitReady), so a live Ready target
-    /// owns completion and the old unit stands down; a dead Ready target cannot
-    /// serve, so the old unit restores instead. Executables derive this by
-    /// connecting to the member's recorded control socket when mapping.
-    pub target_live: bool,
-    /// This broker's handoff appears in the journal with a member that reached Committed.
-    pub member_committed: bool,
-    /// How long after a coordinator disconnect the broker waits before restoring its
-    /// old unit. Derived from the journal recovery deadline (saturating to zero past it).
-    pub recover_after: Duration,
+/// Completion acknowledgement emitted only after the broker has completed its
+/// local retirement or resume barrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryAck {
+    Resumed,
+    TargetRetired,
+    Committed,
 }
 
+pub trait RecoveryPermit: Send + Sync {
+    fn acknowledge<'a>(
+        &'a self,
+        handoff: &'a HandoffId,
+        ack: RecoveryAck,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+#[derive(Clone)]
+pub enum RecoveryDecision {
+    NoJournal,
+    Preserve {
+        reason: String,
+    },
+    TargetOwns {
+        recover_after: Duration,
+        permit: Option<Arc<dyn RecoveryPermit>>,
+    },
+    RestoreOld {
+        recover_after: Duration,
+        permit: Option<Arc<dyn RecoveryPermit>>,
+    },
+    Committed {
+        permit: Option<Arc<dyn RecoveryPermit>>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum RecoveryJournalStatus {
+    Absent,
+    Present,
+    Inconsistent,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum RecoveryMemberStatus {
+    Pending,
+    Ready,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct RecoveryView {
+    journal: RecoveryJournalStatus,
+    member: RecoveryMemberStatus,
+    target_live: bool,
+    recover_after: Duration,
+}
+
+#[cfg(test)]
 impl RecoveryView {
-    /// No journal at the deterministic path: nothing was ever authorized.
-    #[must_use]
-    pub fn absent() -> Self {
+    fn absent() -> Self {
         Self {
-            journal_present: false,
-            inconsistent: false,
-            member_ready: false,
+            journal: RecoveryJournalStatus::Absent,
+            member: RecoveryMemberStatus::Pending,
             target_live: false,
-            member_committed: false,
             recover_after: Duration::ZERO,
         }
     }
 }
 
-/// Owner-side journal mapping for disconnect recovery. Implemented by the executable
-/// (its journal types live outside this crate); methods are synchronous file reads of
-/// small JSON documents on a failure path only.
 pub trait RecoveryJournal: Send + Sync {
-    /// Maps the journal at the executable's deterministic path into a view for `handoff`.
-    /// A missing file must map to [`RecoveryView::absent`]; an unreadable or
-    /// unrecognized journal must map to `inconsistent: true`.
-    fn recovery_view(&self, handoff: &HandoffId) -> RecoveryView;
+    /// Performs owner-side journal validation, per-member probing, and any
+    /// required artifact decision without holding broker transition locks.
+    fn recovery_decision<'a>(
+        &'a self,
+        handoff: &'a HandoffId,
+    ) -> Pin<Box<dyn Future<Output = RecoveryDecision> + Send + 'a>>;
 }
 
 #[derive(Clone, Debug)]
@@ -147,7 +176,37 @@ enum ServerCommand {
     Resume {
         complete: oneshot::Sender<Result<(), String>>,
     },
-    Stop,
+    Stop {
+        complete: oneshot::Sender<Result<RetirementTicket, String>>,
+    },
+}
+
+/// Two-phase retirement ownership. The run loop finishes resource shutdown and
+/// unlinks its endpoint before handing this ticket to the RPC/recovery owner.
+/// Dropping the ticket is the explicit permission for the supervisor loop to
+/// finish and let the process exit.
+struct RetirementTicket {
+    release: Option<oneshot::Sender<()>>,
+}
+
+impl RetirementTicket {
+    fn pair() -> (Self, oneshot::Receiver<()>) {
+        let (release, released) = oneshot::channel();
+        (
+            Self {
+                release: Some(release),
+            },
+            released,
+        )
+    }
+}
+
+impl Drop for RetirementTicket {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
 }
 
 impl ActivationController {
@@ -283,12 +342,16 @@ impl ActivationController {
             .map_err(|_| "activation service exited before resuming".to_owned())?
     }
 
-    async fn stop_listener(&self) -> Result<(), String> {
+    async fn stop_listener(&self) -> Result<RetirementTicket, String> {
+        let (complete, result) = oneshot::channel();
         self.command_sender()
             .await?
-            .send(ServerCommand::Stop)
+            .send(ServerCommand::Stop { complete })
             .await
-            .map_err(|_| "activation service exited".to_owned())
+            .map_err(|_| "activation service exited".to_owned())?;
+        result
+            .await
+            .map_err(|_| "activation service exited before stopping".to_owned())?
     }
 
     async fn command_sender(&self) -> Result<mpsc::Sender<ServerCommand>, String> {
@@ -308,7 +371,7 @@ impl ActivationController {
                 self.status_result(broker, ControlResult::Status).await,
                 false,
             ),
-            ControlOperation::Prepare { target } => self.handle_prepare(broker, target).await,
+            ControlOperation::Prepare { target } => self.handle_prepare(broker, *target).await,
             ControlOperation::Commit { handoff_id } => {
                 let old = {
                     let mut state = self.state.lock().await;
@@ -348,7 +411,12 @@ impl ActivationController {
             ControlOperation::Retire => {
                 {
                     let mut state = self.state.lock().await;
-                    if !matches!(*state, ActivationState::Running | ActivationState::Retired) {
+                    if !matches!(
+                        *state,
+                        ActivationState::Running
+                            | ActivationState::TargetCommitted { .. }
+                            | ActivationState::Retired
+                    ) {
                         return (
                             ControlResult::Error {
                                 diagnostic: "retire is invalid while activation is in progress"
@@ -393,7 +461,10 @@ impl ActivationController {
         };
         {
             let mut state = self.state.lock().await;
-            if !matches!(*state, ActivationState::Running) {
+            if !matches!(
+                *state,
+                ActivationState::Running | ActivationState::TargetCommitted { .. }
+            ) {
                 return (
                     ControlResult::Error {
                         diagnostic: "prepare is valid only for a running old broker".to_owned(),
@@ -626,6 +697,10 @@ impl ActivationController {
     /// this broker is mid-activation. The watch re-verifies everything at fire time,
     /// so a coordinator that reconnects (including per-operation reconnects) owns
     /// recovery instead.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "disconnect recovery keeps target-retire, target-own, and old-restore decisions in one ordered state machine"
+    )]
     async fn spawn_recovery_watch(self: Arc<Self>, broker: Arc<Broker>) {
         enum Watch {
             Old { handoff: HandoffId },
@@ -645,133 +720,222 @@ impl ActivationController {
             Watch::Old { handoff } => (handoff, false),
             Watch::Target { handoff } => (handoff, true),
         };
-        let view = self.recovery_view(&handoff).await;
-        if view.inconsistent {
-            tracing::warn!("activation recovery preserves an inconsistent journal");
-            return;
-        }
-        if view.member_committed {
-            // The unit committed without this broker; an old broker must never resume
-            // concurrently, and a gated target learns nothing new.
-            return;
-        }
-        if !is_target && view.journal_present && view.member_ready && view.target_live {
-            // A live Ready target owns completion from the durable journal; the old
-            // unit stands down so both host adapters never run concurrently. A dead
-            // Ready target cannot serve, so the old unit falls through to restore.
-            return;
-        }
-        if is_target && view.journal_present && view.member_ready && !view.target_live {
-            // Unit-incomplete (DESIGN 2215): a sibling Ready target is absent or dead,
-            // so the complete old unit restores. This live target stands down at once
-            // (no recover_after wait) so old brokers can rebind without overlap;
-            // olds wait out recover_after before restoring.
-            let retire = matches!(
-                self.state.lock().await.clone(),
-                ActivationState::TargetGated { handoff: current } if current == handoff
-            );
-            if !retire {
+        let decision = self.recovery_decision(&handoff).await;
+        match decision {
+            RecoveryDecision::Preserve { reason } => {
+                tracing::warn!(%reason, "activation recovery preserves owner decision");
                 return;
             }
-            *self.state.lock().await = ActivationState::Retired;
-            if let Err(error) = self.stop_listener().await {
-                tracing::warn!(%error, "incomplete-unit target could not stop listener");
-            } else {
-                tracing::warn!("live target stood down for incomplete unit; old unit restores");
+            RecoveryDecision::Committed { permit } => {
+                if let Some(permit) = permit {
+                    let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
+                }
+                return;
             }
-            return;
-        }
-        if is_target && !(view.journal_present && view.member_ready) {
-            // A gated target completes its unit's commit only from a Ready journal
-            // naming its handoff; anything else stays gated for the operator.
-            return;
-        }
-        if !view.recover_after.is_zero() {
-            tokio::time::sleep(view.recover_after).await;
+            RecoveryDecision::TargetOwns { permit, .. } if !is_target => {
+                if let Some(permit) = permit {
+                    let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
+                }
+                return;
+            }
+            RecoveryDecision::TargetOwns { permit, .. } => {
+                let gated = matches!(
+                    self.state.lock().await.clone(),
+                    ActivationState::TargetGated { handoff: current } if current == handoff
+                );
+                if gated {
+                    *self.state.lock().await = ActivationState::TargetCommitted { handoff };
+                    if let Some(permit) = permit {
+                        let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
+                    }
+                    tracing::warn!("target completed its unit commit after coordinator disconnect");
+                }
+                return;
+            }
+            RecoveryDecision::NoJournal if is_target => {
+                let retire = matches!(
+                    self.state.lock().await.clone(),
+                    ActivationState::TargetGated { handoff: current } if current == handoff
+                );
+                if !retire {
+                    return;
+                }
+                *self.state.lock().await = ActivationState::Retired;
+                if let Err(error) = self.stop_listener().await {
+                    tracing::warn!(%error, "incomplete-unit target could not stop listener");
+                }
+                return;
+            }
+            RecoveryDecision::RestoreOld { permit, .. } if is_target => {
+                let retire = matches!(
+                    self.state.lock().await.clone(),
+                    ActivationState::TargetGated { handoff: current } if current == handoff
+                );
+                if !retire {
+                    return;
+                }
+                *self.state.lock().await = ActivationState::Retired;
+                match self.stop_listener().await {
+                    Err(error) => {
+                        tracing::warn!(%error, "incomplete-unit target could not stop listener");
+                    }
+                    Ok(ticket) => {
+                        if let Some(permit) = permit
+                            && let Err(error) = permit
+                                .acknowledge(&handoff, RecoveryAck::TargetRetired)
+                                .await
+                        {
+                            tracing::warn!(%error, "target retirement acknowledgement failed");
+                        }
+                        drop(ticket);
+                    }
+                }
+                return;
+            }
+            RecoveryDecision::NoJournal => {}
+            RecoveryDecision::RestoreOld {
+                recover_after,
+                permit,
+            } => {
+                drop(permit);
+                if !recover_after.is_zero() {
+                    tokio::time::sleep(recover_after).await;
+                }
+            }
         }
         self.run_recovery_watch(&broker, handoff, is_target).await;
     }
-
     async fn run_recovery_watch(&self, broker: &Broker, handoff: HandoffId, is_target: bool) {
         let transition = self.transition.lock().await;
         if *self.connections.lock().await != 0 {
             return; // the coordinator returned; it owns recovery now.
         }
-        // Re-read the journal at fire time: a concurrent coordinator may have advanced it.
-        let view = self.recovery_view(&handoff).await;
-        if view.inconsistent || view.member_committed {
-            return;
-        }
-        if is_target {
-            // The snapshot guard must drop before the commit below takes the state
-            // lock again: a let-chain temporary would hold it into the body and
-            // deadlock the commit write on this non-reentrant mutex.
-            let gated = matches!(
-                self.state.lock().await.clone(),
-                ActivationState::TargetGated { handoff: current } if current == handoff
-            );
-            if !gated {
+        drop(transition);
+        // Re-read the journal at fire time without holding the transition lock:
+        // owner-side probes and restoration may await control sockets.
+        let decision = self.recovery_decision(&handoff).await;
+        let mut resume_permit: Option<Arc<dyn RecoveryPermit>> = None;
+        match decision {
+            RecoveryDecision::Preserve { reason } => {
+                tracing::warn!(%reason, "activation recovery preserves owner decision");
                 return;
             }
-            if view.journal_present && view.member_ready && view.target_live {
-                *self.state.lock().await = ActivationState::TargetCommitted { handoff };
-                tracing::warn!("target completed its unit commit after coordinator disconnect");
+            RecoveryDecision::TargetOwns { permit, .. } if is_target => {
+                let gated = matches!(
+                    self.state.lock().await.clone(),
+                    ActivationState::TargetGated { handoff: current } if current == handoff
+                );
+                if gated {
+                    *self.state.lock().await = ActivationState::TargetCommitted { handoff };
+                    if let Some(permit) = permit {
+                        let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
+                    }
+                }
                 return;
             }
-            if view.journal_present && view.member_ready && !view.target_live {
-                // Unit-incomplete at fire time: a sibling target died while this
-                // target waited out recover_after. Retire so the old unit can
-                // rebind without overlap; the transition guard drops before the
-                // listener stop (handlers never send commands while holding it).
+            RecoveryDecision::Committed { permit }
+            | RecoveryDecision::TargetOwns { permit, .. } => {
+                if let Some(permit) = permit {
+                    let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
+                }
+                return;
+            }
+            RecoveryDecision::NoJournal if is_target => {
+                let gated = matches!(
+                    self.state.lock().await.clone(),
+                    ActivationState::TargetGated { handoff: current } if current == handoff
+                );
+                if gated {
+                    *self.state.lock().await = ActivationState::Retired;
+                    if let Err(error) = self.stop_listener().await {
+                        tracing::warn!(%error, "incomplete-unit target could not stop listener");
+                    }
+                }
+                return;
+            }
+            RecoveryDecision::RestoreOld { permit, .. } if is_target => {
+                let gated = matches!(
+                    self.state.lock().await.clone(),
+                    ActivationState::TargetGated { handoff: current } if current == handoff
+                );
+                if !gated {
+                    return;
+                }
                 *self.state.lock().await = ActivationState::Retired;
-                drop(transition);
-                if let Err(error) = self.stop_listener().await {
-                    tracing::warn!(%error, "incomplete-unit target could not stop listener");
-                } else {
-                    tracing::warn!("live target stood down for incomplete unit; old unit restores");
+                match self.stop_listener().await {
+                    Err(error) => {
+                        tracing::warn!(%error, "incomplete-unit target could not stop listener");
+                    }
+                    Ok(ticket) => {
+                        if let Some(permit) = permit
+                            && let Err(error) = permit
+                                .acknowledge(&handoff, RecoveryAck::TargetRetired)
+                                .await
+                        {
+                            tracing::warn!(%error, "target retirement acknowledgement failed");
+                        }
+                        drop(ticket);
+                    }
+                }
+                return;
+            }
+            RecoveryDecision::NoJournal => {}
+            RecoveryDecision::RestoreOld {
+                recover_after,
+                permit,
+            } => {
+                resume_permit = permit;
+                if !recover_after.is_zero() {
+                    tokio::time::sleep(recover_after).await;
                 }
             }
-            return;
         }
+        self.resume_old_after_disconnect(broker, &handoff, resume_permit)
+            .await;
+    }
+
+    async fn resume_old_after_disconnect(
+        &self,
+        broker: &Broker,
+        handoff: &HandoffId,
+        resume_permit: Option<Arc<dyn RecoveryPermit>>,
+    ) {
         // Old unit restoration: only from the same Draining handoff, never after commit.
         let host_suspended = match self.state.lock().await.clone() {
             ActivationState::Draining {
                 handoff: current,
                 host_suspended,
                 ..
-            } if current == handoff => host_suspended,
+            } if current == *handoff => host_suspended,
             _ => return,
         };
-        if view.journal_present && view.member_ready && view.target_live {
-            return; // a live Ready target owns this handoff now.
-        }
         if host_suspended && let Err(error) = broker.resume_host_after_abort().await {
-            tracing::warn!(
-                %error,
-                "disconnect recovery could not resume host; endpoint stays drained"
-            );
+            tracing::warn!(%error, "disconnect recovery could not resume host; endpoint stays drained");
             return;
         }
         if let Err(error) = self.resume_listener().await {
-            tracing::warn!(
-                %error,
-                "disconnect recovery could not rebind listener; endpoint stays drained"
-            );
+            tracing::warn!(%error, "disconnect recovery could not rebind listener; endpoint stays drained");
             return;
         }
         *self.state.lock().await = ActivationState::Running;
         broker.reopen_dispatch().await;
+        if let Some(permit) = resume_permit
+            && let Err(error) = permit.acknowledge(handoff, RecoveryAck::Resumed).await
+        {
+            tracing::warn!(%error, "disconnect recovery resume acknowledgment failed");
+            return;
+        }
         tracing::warn!("old broker restored its endpoint after coordinator disconnect");
     }
 
-    async fn recovery_view(&self, handoff: &HandoffId) -> RecoveryView {
-        self.recovery
-            .lock()
-            .await
-            .as_ref()
-            .map_or_else(RecoveryView::absent, |recovery| {
-                recovery.recovery_view(handoff)
-            })
+    async fn recovery_decision(&self, handoff: &HandoffId) -> RecoveryDecision {
+        let recovery = self.recovery.lock().await.clone();
+        match recovery {
+            Some(recovery) => recovery.recovery_decision(handoff).await,
+            None => RecoveryDecision::Preserve {
+                reason: "owner recovery operation is not installed".to_owned(),
+            },
+        }
     }
 }
 
@@ -912,6 +1076,10 @@ impl BrokerServer {
     /// # Errors
     ///
     /// Returns `ServerError` when binding, watching, identity, or IO fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "broker run owns the select loop and retirement barrier so command ordering remains auditable"
+    )]
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<(), ServerError> {
         let broker = Arc::clone(&self.broker);
         let endpoint = self.endpoint.clone();
@@ -961,19 +1129,43 @@ impl BrokerServer {
                             )
                             .await;
                         }
-                        Some(ServerCommand::Stop) => {
-                            // Supervisor-only: the endpoint and watcher go away here;
-                            // the linger below reaps detached children before exit.
-                            if listener.take().is_some() {
-                                let _ = remove_owned_socket(
-                                    &endpoint,
-                                    socket_device,
-                                    socket_inode,
-                                );
-                            }
+                        Some(ServerCommand::Stop { complete }) => {
+                            // Supervisor-only: stop the host adapter, watcher, and health
+                            // monitor before unlinking the listener. Only after all resources
+                            // are retired is the response owner handed an exit ticket.
                             drop(config_watch.take());
-                            supervisor_only = true;
-                            break Ok(());
+                            health.abort();
+                            let result = broker
+                                .shutdown_host_adapter()
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|()| {
+                                    if listener.take().is_some() {
+                                        remove_owned_socket(
+                                            &endpoint,
+                                            socket_device,
+                                            socket_inode,
+                                        )
+                                        .map_err(|error| error.to_string())
+                                    } else {
+                                        Ok(())
+                                    }
+                                });
+                            match result {
+                                Ok(()) => {
+                                    let (ticket, released) = RetirementTicket::pair();
+                                    if complete.send(Ok(ticket)).is_ok() {
+                                        supervisor_only = true;
+                                        let _ = released.await;
+                                    }
+                                    break Ok(());
+                                }
+                                Err(error) => {
+                                    let _ = complete.send(Err(error));
+                                    supervisor_only = true;
+                                    break Ok(());
+                                }
+                            }
                         }
                         None => break Ok(()),
                     }
@@ -1175,9 +1367,6 @@ impl ConnectionResources {
             (ClientRequest::AttachUi(_), BrokerResponse::UiAttached { session, .. }) => {
                 self.attached_session = Some(session.clone());
             }
-            (ClientRequest::CommitUiLaunch(request), BrokerResponse::Acknowledged) => {
-                self.launcher_tokens.remove(&request.token);
-            }
             (ClientRequest::AbortUiLaunch(request), BrokerResponse::Acknowledged) => {
                 self.launcher_tokens.remove(&request.token);
             }
@@ -1317,16 +1506,25 @@ async fn serve_activation_connection_inner(
                 return Err(ServerError::DuplicateControlRequestId);
             }
             let (result, stop_after_response) = activation.handle(&broker, request.operation).await;
+            let retirement_ticket = if stop_after_response {
+                Some(
+                    activation
+                        .stop_listener()
+                        .await
+                        .map_err(ServerError::Activation)?,
+                )
+            } else {
+                None
+            };
             let response = ControlResponse {
                 request_id: request.request_id,
                 result,
             };
+            // Keep the two-phase retirement ticket alive through the complete ACK
+            // write and flush. Dropping it permits the run loop to supervise and exit.
             write_control_response(&mut stream, &response).await?;
             if stop_after_response {
-                activation
-                    .stop_listener()
-                    .await
-                    .map_err(ServerError::Activation)?;
+                drop(retirement_ticket);
                 return Ok(());
             }
         }
@@ -1482,7 +1680,7 @@ async fn disconnect_resources(broker: &Arc<Broker>, resources: &mut ConnectionRe
         broker.disconnect(resources.attached_session.as_ref()).await;
     }
     for token in resources.launcher_tokens.drain() {
-        let _ = broker.abort(token).await;
+        let _ = broker.abort_on_launcher_disconnect(token).await;
     }
 }
 
@@ -1750,9 +1948,30 @@ mod tests {
             Ok(())
         }
 
+        async fn register_pending_pane(
+            &self,
+            registration: PendingPaneRegistration,
+        ) -> Result<muxe_adapter_api::PendingPaneLease, AdapterError> {
+            Ok(muxe_adapter_api::PendingPaneLease {
+                id: muxe_adapter_api::PendingPaneLeaseId::new(format!(
+                    "smoke:{}",
+                    registration.ui_session
+                )),
+                ui_session: registration.ui_session,
+            })
+        }
+
         async fn close_pending_pane(
             &self,
             _registration: PendingPaneRegistration,
+            _lease: muxe_adapter_api::PendingPaneLease,
+        ) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn release_pending_pane(
+            &self,
+            _lease: muxe_adapter_api::PendingPaneLease,
         ) -> Result<(), AdapterError> {
             Ok(())
         }
@@ -1911,9 +2130,30 @@ mod tests {
             Ok(())
         }
 
+        async fn register_pending_pane(
+            &self,
+            registration: PendingPaneRegistration,
+        ) -> Result<muxe_adapter_api::PendingPaneLease, AdapterError> {
+            Ok(muxe_adapter_api::PendingPaneLease {
+                id: muxe_adapter_api::PendingPaneLeaseId::new(format!(
+                    "ordering:{}",
+                    registration.ui_session
+                )),
+                ui_session: registration.ui_session,
+            })
+        }
+
         async fn close_pending_pane(
             &self,
             _registration: PendingPaneRegistration,
+            _lease: muxe_adapter_api::PendingPaneLease,
+        ) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn release_pending_pane(
+            &self,
+            _lease: muxe_adapter_api::PendingPaneLease,
         ) -> Result<(), AdapterError> {
             Ok(())
         }
@@ -2057,12 +2297,15 @@ mod tests {
                             .push("resume_listener".to_owned());
                         let _ = complete.send(Ok(()));
                     }
-                    ServerCommand::Stop => break,
+                    ServerCommand::Stop { complete } => {
+                        let (ticket, _released) = RetirementTicket::pair();
+                        let _ = complete.send(Ok(ticket));
+                        break;
+                    }
                 }
             }
         })
     }
-
     async fn running_unix_server() -> (
         tempfile::TempDir,
         tempfile::TempDir,
@@ -2319,7 +2562,7 @@ mod tests {
             .handle(
                 &broker,
                 ControlOperation::Prepare {
-                    target: test_record(),
+                    target: Box::new(test_record()),
                 },
             )
             .await;
@@ -2382,7 +2625,7 @@ mod tests {
             .handle(
                 &broker,
                 ControlOperation::Prepare {
-                    target: test_record(),
+                    target: Box::new(test_record()),
                 },
             )
             .await;
@@ -2431,7 +2674,7 @@ mod tests {
             .handle(
                 &broker,
                 ControlOperation::Prepare {
-                    target: test_record(),
+                    target: Box::new(test_record()),
                 },
             )
             .await;
@@ -2488,8 +2731,32 @@ mod tests {
     struct ScriptedRecovery(std::sync::Mutex<RecoveryView>);
 
     impl RecoveryJournal for ScriptedRecovery {
-        fn recovery_view(&self, _handoff: &HandoffId) -> RecoveryView {
-            *self.0.lock().expect("recovery script is readable")
+        fn recovery_decision<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+        ) -> Pin<Box<dyn Future<Output = RecoveryDecision> + Send + 'a>> {
+            let view = *self.0.lock().expect("recovery script is readable");
+            Box::pin(async move {
+                if matches!(view.journal, RecoveryJournalStatus::Inconsistent) {
+                    return RecoveryDecision::Preserve {
+                        reason: "scripted inconsistent journal".to_owned(),
+                    };
+                }
+                if matches!(view.journal, RecoveryJournalStatus::Absent) {
+                    return RecoveryDecision::NoJournal;
+                }
+                if matches!(view.member, RecoveryMemberStatus::Ready) && view.target_live {
+                    RecoveryDecision::TargetOwns {
+                        recover_after: view.recover_after,
+                        permit: None,
+                    }
+                } else {
+                    RecoveryDecision::RestoreOld {
+                        recover_after: view.recover_after,
+                        permit: None,
+                    }
+                }
+            })
         }
     }
 
@@ -2517,7 +2784,7 @@ mod tests {
             .handle(
                 broker,
                 ControlOperation::Prepare {
-                    target: test_record(),
+                    target: Box::new(test_record()),
                 },
             )
             .await;
@@ -2610,11 +2877,9 @@ mod tests {
         controller
             .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
                 RecoveryView {
-                    journal_present: true,
-                    inconsistent: true,
-                    member_ready: false,
+                    journal: RecoveryJournalStatus::Inconsistent,
+                    member: RecoveryMemberStatus::Pending,
                     target_live: false,
-                    member_committed: false,
                     recover_after: Duration::ZERO,
                 },
             ))))
@@ -2657,11 +2922,9 @@ mod tests {
         controller
             .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
                 RecoveryView {
-                    journal_present: true,
-                    inconsistent: false,
-                    member_ready: true,
+                    journal: RecoveryJournalStatus::Present,
+                    member: RecoveryMemberStatus::Ready,
                     target_live: true,
-                    member_committed: false,
                     recover_after: Duration::ZERO,
                 },
             ))))
@@ -2693,11 +2956,9 @@ mod tests {
         controller
             .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
                 RecoveryView {
-                    journal_present: true,
-                    inconsistent: false,
-                    member_ready: true,
+                    journal: RecoveryJournalStatus::Present,
+                    member: RecoveryMemberStatus::Ready,
                     target_live: false,
-                    member_committed: false,
                     recover_after: Duration::ZERO,
                 },
             ))))
@@ -2733,11 +2994,9 @@ mod tests {
     async fn disconnect_restores_both_olds_when_unit_has_one_dead_target() {
         fn incomplete() -> Arc<ScriptedRecovery> {
             Arc::new(ScriptedRecovery(std::sync::Mutex::new(RecoveryView {
-                journal_present: true,
-                inconsistent: false,
-                member_ready: true,
+                journal: RecoveryJournalStatus::Present,
+                member: RecoveryMemberStatus::Ready,
                 target_live: false,
-                member_committed: false,
                 recover_after: Duration::ZERO,
             })))
         }
@@ -2883,11 +3142,9 @@ mod tests {
         controller
             .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
                 RecoveryView {
-                    journal_present: true,
-                    inconsistent: false,
-                    member_ready: true,
+                    journal: RecoveryJournalStatus::Present,
+                    member: RecoveryMemberStatus::Ready,
                     target_live: true,
-                    member_committed: false,
                     recover_after: Duration::from_millis(50),
                 },
             ))))
@@ -3193,7 +3450,7 @@ mod tests {
         let prepared = match stack
             .control
             .round_trip(ControlOperation::Prepare {
-                target: test_record(),
+                target: Box::new(test_record()),
             })
             .await
             .expect("prepare round trip")
@@ -3224,7 +3481,7 @@ mod tests {
         let prepared = match stack
             .control
             .round_trip(ControlOperation::Prepare {
-                target: test_record(),
+                target: Box::new(test_record()),
             })
             .await
             .expect("second prepare round trip")
@@ -3267,7 +3524,7 @@ mod tests {
         let prepared = match stack
             .control
             .round_trip(ControlOperation::Prepare {
-                target: test_record(),
+                target: Box::new(test_record()),
             })
             .await
             .expect("prepare round trip")
@@ -3514,7 +3771,7 @@ mod tests {
     async fn prepare_draining(control: &mut ProductionControl, what: &str) -> HandoffId {
         let prepared = match control
             .round_trip(ControlOperation::Prepare {
-                target: test_record(),
+                target: Box::new(test_record()),
             })
             .await
             .unwrap_or_else(|_| panic!("{what} round trip"))
@@ -3743,8 +4000,29 @@ mod tests {
             .expect("detached child starts");
     }
 
+    /// The response/recovery owner must explicitly release the retirement ticket:
+    /// resource cleanup is complete before the ticket is issued, but supervisor
+    /// completion remains blocked until its owner has finished the ACK barrier.
+    #[tokio::test]
+    async fn retirement_ticket_blocks_supervisor_until_owner_releases() {
+        let (ticket, released) = RetirementTicket::pair();
+        let supervisor = tokio::spawn(async move {
+            released.await.expect("retirement owner releases ticket");
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !supervisor.is_finished(),
+            "retired resources do not authorize supervisor exit by themselves"
+        );
+        drop(ticket);
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .expect("ticket release wakes supervisor")
+            .expect("supervisor barrier task joins");
+    }
+
     /// Retire lifetime smoke over a production server: a real detached generic
-    /// the child keeps running; the service stays supervisor-only until the
+    /// child keeps running; the service stays supervisor-only until the
     /// child exits and is reaped, then terminates. Barriers throughout: FIFO
     /// readiness, task completion, and liveness probes — no sleep assumptions.
     #[tokio::test]

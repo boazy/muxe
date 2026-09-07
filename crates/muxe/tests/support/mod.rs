@@ -9,6 +9,8 @@
 //! arbitrary processes, touches a default user socket, or passes green
 //! without a live handshake.
 
+mod scoped_env;
+pub use scoped_env::{apply_scoped_env, ensure_scoped_dirs, scoped_env_vec};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -50,65 +52,6 @@ pub const BRIDGE_PERMISSIONS: [&str; 3] = [
 /// consts at the workspace-pinned revision; the socket scanner stays
 /// version-agnostic, but the bind path for a new server must name it.
 pub const ZELLIJ_CONTRACT_DIR: &str = "contract_version_1";
-
-/// Scopes ambient user state out of a muxe child process: HOME, XDG, the
-/// runtime dir, and TMPDIR relocate under the owned `root`, so broker
-/// endpoints, registries, caches, and journals never touch default user
-/// paths. PATH passes through for system tool lookup; every muxe-relevant
-/// path travels via explicit argv.
-pub fn apply_scoped_env(command: &mut Command, root: &Path) {
-    command.env_clear();
-    command.envs(scoped_env_vec(root));
-}
-
-/// The single source for the muxe `TempDir` scope: the exact pairs
-/// [`apply_scoped_env`] installs. Tests feed this map to the real
-/// resolver and real children; no second copy of these roots exists.
-#[must_use]
-pub fn scoped_env_vec(root: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    use std::ffi::OsString;
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    vec![
-        (OsString::from("HOME"), root.join("home").into_os_string()),
-        (
-            OsString::from("XDG_CONFIG_HOME"),
-            root.join("config").into_os_string(),
-        ),
-        (
-            OsString::from("XDG_CACHE_HOME"),
-            root.join("cache").into_os_string(),
-        ),
-        (
-            OsString::from("XDG_RUNTIME_DIR"),
-            root.join("runtime").into_os_string(),
-        ),
-        (OsString::from("TMPDIR"), root.join("tmp").into_os_string()),
-        (OsString::from("PATH"), path),
-    ]
-}
-
-/// Creates the owned scoped tree (home, config, cache, runtime, tmp),
-/// owner-only on Unix. Broker children validate the same modes on use;
-/// pre-creating keeps `TMPDIR` and `XDG_RUNTIME_DIR` inside the owned root
-/// from the first spawn.
-pub fn ensure_scoped_dirs(root: &Path) -> io::Result<()> {
-    for name in ["home", "config", "cache", "runtime", "tmp"] {
-        let dir = root.join(name);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&dir)?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::create_dir_all(&dir)?;
-        }
-    }
-    Ok(())
-}
 
 /// Runs `<binary> init` under the scoped environment and returns the
 /// shared application paths every serve child and every activate must
@@ -1625,41 +1568,30 @@ pub async fn retire_broker(endpoint: &Path, tag: &str) -> io::Result<()> {
     .await
 }
 
-/// Asserts the activation journal directory under `cache_dir` holds no
-/// preserved journals: a missing directory is clean, any leftover file
-/// fails naming it. Journals are removed on commit, so leftovers mean a
-/// preserved/aborted unit the next transfer must not inherit. Call
-/// before a transfer (clean slate for group selection) and after
-/// (commit cleaned up, nothing preserved). This asserts group hygiene
-/// without relying on removed journals' contents.
+/// Asserts that production journal discovery finds no preserved activation
+/// journals under `cache_dir`: a missing directory is clean, while every
+/// returned JSON journal path fails the assertion. Corrupt journals remain
+/// visible in the production listing and therefore fail too. Persistent
+/// unit-lock inodes are not journals and are ignored by `list_journals`.
+/// Journals are removed on commit, so leftovers mean a preserved or aborted
+/// unit the next transfer must not inherit. Call before and after a transfer
+/// to verify group hygiene.
 pub fn assert_no_preserved_journals(cache_dir: &Path, tag: &str) -> io::Result<()> {
-    let dir = muxe::lifecycle::journal::activation_dir(cache_dir);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(io::Error::other(format!(
-                "{tag}: cannot list activation journals at {}: {error}",
-                dir.display(),
-            )));
-        }
-    };
-    let mut leftovers = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            io::Error::other(format!(
-                "{tag}: cannot list activation journals at {}: {error}",
-                dir.display(),
-            ))
-        })?;
-        leftovers.push(entry.path());
-    }
-    if leftovers.is_empty() {
+    let journals = muxe::lifecycle::journal::list_journals(cache_dir).map_err(|error| {
+        io::Error::other(format!("{tag}: cannot list activation journals: {error}"))
+    })?;
+    if journals.is_empty() {
         Ok(())
     } else {
+        let leftovers = journals
+            .into_iter()
+            .map(|(path, result)| match result {
+                Ok(_) => path,
+                Err(error) => PathBuf::from(format!("{} ({error})", path.display())),
+            })
+            .collect::<Vec<_>>();
         Err(io::Error::other(format!(
-            "{tag}: preserved activation journals remain at {}: {leftovers:?}; recovery state would contaminate the next transfer",
-            dir.display(),
+            "{tag}: preserved activation journals remain: {leftovers:?}; recovery state would contaminate the next transfer"
         )))
     }
 }
@@ -2087,9 +2019,12 @@ mod scoped_spawn_tests {
     }
 
     fn case_dir(name: &str) -> tempfile::TempDir {
+        // Resolver tests temporarily redirect the process-wide TMPDIR. Keep
+        // case roots outside that mutable variable so a concurrent resolver
+        // cannot create another test's TempDir beneath a root it will drop.
         tempfile::Builder::new()
             .prefix(&format!("muxe-scope-{name}-"))
-            .tempdir()
+            .tempdir_in("/tmp")
             .expect("owned scope TempDir")
     }
 
@@ -2374,98 +2309,6 @@ mod scoped_spawn_tests {
         );
     }
 
-    /// Process-wide lock for tests that must mutate the process
-    /// environment to drive the real resolver: `std::env` is global, so
-    /// exactly one such test runs at a time and every mutation is
-    /// restored before release.
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Variables the native resolver reads (DESIGN 1570-1584 via
-    /// `platform-dirs` with XDG forced on macOS).
-    const RESOLVER_VARS: [&str; 5] = [
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_RUNTIME_DIR",
-        "TMPDIR",
-    ];
-
-    /// Runs the real `muxe::paths::resolve` under exactly the given
-    /// production pairs, restoring the process environment afterwards.
-    /// The pairs always come from the production single sources
-    /// ([`scoped_env_vec`], [`OwnedZellijHost::host_env_vec`],
-    /// [`OwnedZellijHost::host_env_overlay_vec`]), never a retyped copy.
-    fn resolve_under(pairs: &[(std::ffi::OsString, std::ffi::OsString)]) -> muxe::paths::AppPaths {
-        let _guard = ENV_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut saved = Vec::with_capacity(RESOLVER_VARS.len());
-        for name in RESOLVER_VARS {
-            saved.push((name, std::env::var_os(name)));
-        }
-        // SAFETY: `ENV_GUARD` holds the process-wide lock, no other
-        // thread in this test target mutates these variables, and every
-        // value is restored before the guard releases.
-        unsafe {
-            for (name, value) in pairs {
-                std::env::set_var(name, value);
-            }
-        }
-        let resolved = muxe::paths::resolve().expect("scoped env must resolve");
-        unsafe {
-            for (name, previous) in saved {
-                match previous {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-        resolved
-    }
-
-    #[test]
-    fn muxe_scope_resolves_shared_registry() {
-        // The production muxe scope must resolve the exact shared pair
-        // `init_shared_dirs` documents (`$XDG_*/muxe`): this is the
-        // registry every broker and `activate` has to see.
-        let case = case_dir("resolve");
-        let scoped = scoped_root(case.path());
-        let resolved = resolve_under(&scoped_env_vec(&scoped));
-        assert_eq!(resolved.config_dir, scoped.join("config").join("muxe"));
-        assert_eq!(resolved.cache_dir, scoped.join("cache").join("muxe"));
-    }
-
-    #[test]
-    fn host_overlay_preserves_shared_registry() {
-        // The additive Zellij overlay must not disturb the shared muxe
-        // roots: a broker/`activate` child carrying the merged scope
-        // resolves the same registry `init` wrote.
-        let case = case_dir("overlay");
-        let scoped = scoped_root(case.path());
-        let host = OwnedZellijHost::prepare(&case.path().join("unused"), case.path(), "scope")
-            .expect("prepare host");
-        let mut pairs = scoped_env_vec(&scoped);
-        pairs.extend(host.host_env_overlay_vec());
-        let resolved = resolve_under(&pairs);
-        assert_eq!(resolved.config_dir, scoped.join("config").join("muxe"));
-        assert_eq!(resolved.cache_dir, scoped.join("cache").join("muxe"));
-    }
-
-    #[test]
-    fn host_base_scope_resolves_elsewhere() {
-        // Trap sensitivity: the host-base scope (host HOME/XDG_CACHE,
-        // no muxe XDG_CONFIG_HOME) must resolve a DIFFERENT registry
-        // than the shared one. If this ever equals the shared pair, the
-        // test cannot catch the wipe-trap it guards.
-        let case = case_dir("trap");
-        let scoped = scoped_root(case.path());
-        let host = OwnedZellijHost::prepare(&case.path().join("unused"), case.path(), "scope")
-            .expect("prepare host");
-        let resolved = resolve_under(&host.host_env_vec());
-        assert_ne!(resolved.config_dir, scoped.join("config").join("muxe"));
-        assert_ne!(resolved.cache_dir, scoped.join("cache").join("muxe"));
-    }
-
     #[tokio::test]
     async fn muxe_child_filesystem_matches_shared_registry() {
         // A real child carrying the production merged scope writes into
@@ -2509,7 +2352,9 @@ mod scoped_spawn_tests {
         let output = command.output().await.expect("run proof child");
         assert!(
             output.status.success(),
-            "registry proof child failed: {}",
+            "registry proof child failed (status {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
         for proof in [
@@ -2525,5 +2370,21 @@ mod scoped_spawn_tests {
                 proof.display(),
             );
         }
+    }
+
+    #[test]
+    fn journal_hygiene_ignores_persistent_unit_lock_but_rejects_corrupt_journal() {
+        let temp = tempfile::tempdir().expect("journal hygiene tempdir");
+        let activation = muxe::lifecycle::journal::activation_dir(temp.path());
+        std::fs::create_dir_all(&activation).expect("activation directory");
+        std::fs::write(activation.join("herdr-test.lock"), b"").expect("persistent unit lock");
+        assert_no_preserved_journals(temp.path(), "lock-only")
+            .expect("persistent lock is not a preserved journal");
+
+        std::fs::write(activation.join("herdr-test.json"), b"{").expect("corrupt journal");
+        assert!(
+            assert_no_preserved_journals(temp.path(), "corrupt").is_err(),
+            "corrupt production journal must remain a hygiene failure"
+        );
     }
 }

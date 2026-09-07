@@ -61,12 +61,12 @@ shasum -a 256 -c SHA256SUMS
 gh attestation verify muxe-v0.1.0-linux-x64.tar.gz --repo boazy/muxe
 ```
 
-Release state is currently blocked, not complete. No predecessor release
-artifact exists yet, so the previous-to-target live upgrade and rollback
-gate cannot run and fails closed. The bridge registration digest is
-reported as blocked for the same reason the automation refuses to invent
-one (see Compatibility). Do not treat installation as release-proven
-until those gates pass.
+Release publication requires the current target-only real-host verification on
+all four release architectures. The real cross-release upgrade, rollback, and
+fault matrix is deferred until the implementation is complete and a first
+genuine published release is available as the live predecessor. See
+[`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). This documentation does not
+claim that any live check has passed.
 
 ## Setup
 
@@ -114,16 +114,18 @@ load_plugins {
 
 Options:
 
-- `-q`, `--quiet`: suppress prompts and output. Without a policy flag, the
-  bridge is materialized without editing configuration.
+- `-q`, `--quiet`: silence prompts and normal output. Without a policy flag, the
+  bridge is materialized without editing configuration. A managed node the user
+  modified since installation still warns on stderr.
 - `--always-configure`: apply the safe edit without prompting.
 - `--never-configure`: never edit and never prompt.
 - `--zellij-config {path}`: inspect or edit this file instead of the
   discovered default.
 
 A non-interactive invocation without a policy flag behaves as
-`--never-configure`. Package installation and `muxe init` never touch the
-bridge or Zellij configuration.
+`--never-configure`. Install never changes the selected config file's parent
+directory mode: an existing `0755` parent is accepted as-is. Package
+installation and `muxe init` never touch the bridge or Zellij configuration.
 
 Remove receipt-owned artifacts:
 
@@ -133,7 +135,10 @@ muxe integration uninstall zellij
 ```
 
 Uninstall removes created nodes and restores replaced nodes only when they
-are unchanged since installation. Observed nodes, user-modified nodes, and
+are unchanged since installation, restoring the exact previous bytes. A clean
+restore removes the bridge and the receipt. When a managed node was
+user-modified, uninstall keeps the user's text and the receipt, removes the
+bridge, and names the artifact on stderr. Observed nodes, user-modified nodes, and
 root keybindings are never removed.
 
 ## Herdr
@@ -232,13 +237,17 @@ muxe compatibility --json
 The first release supports Zellij 0.46.0 and Herdr 0.8.2 as both the
 minimum-supported and latest-verified versions.
 
-The bridge registration digest is reported as blocked, not as a hash. The
-host channel gives the running bridge no way to attest its own bytes, so the
-native side verifies packaged and installed digests while the registration
-half awaits a design decision. Release metadata is not claimed complete
-while that decision is pending. The JSON report shape is also still moving
-to its owning module, so treat field names as provisional until that
-cutover lands.
+The report exposes two complementary bridge identities. `hosts.zellij.bridge_build_id`
+is the generated pre-link identity shared by the native binary and bridge
+registration handshake. `packaged_wasm.sha256` is the SHA-256 of the staged
+WASM artifact and proves that the installed bridge bytes match the packaged
+release. The native side verifies both values locally; the host channel uses
+`bridge_build_id` for registration compatibility and does not attest arbitrary
+filesystem bytes.
+
+The JSON report is the release compatibility contract. It records the pinned
+host version and source revision, generated action and protocol fingerprints,
+the bridge build ID, and the packaged-WASM SHA-256.
 
 ## Uninstall and purge
 
@@ -258,8 +267,9 @@ muxe purge --config --cache --yes
 
 At least one of `--config` or `--cache` is required. Without `--yes` the
 command prints every resolved path and asks for confirmation. `--cache`
-refuses while an activation journal is live or needs recovery. The command
-never edits Zellij or Herdr keybindings.
+refuses while an activation journal is live, needs recovery, or an active
+lifecycle participant still holds the cache lease. The command never edits
+Zellij or Herdr keybindings.
 
 ## Completions
 
@@ -268,3 +278,36 @@ archive as `muxe.bash`, `_muxe`, and `muxe.fish`. The Zsh file uses the
 conventional fpath name. They are generated from the command definition by
 `tools/codegen-completions` and committed. CI fails on any byte-for-byte
 difference. There is no runtime `muxe completions` command in V1.
+
+## Live-host test gates
+
+The live-host runners use owned fixture processes under one fresh
+temporary directory per test. No default user socket, configuration, or
+process is ever touched. Each test requires explicit approval before
+any spawn:
+
+- `MUXE_LIVE_HOSTS_APPROVED` must be exactly `true`. Any other value
+  fails the test before anything launches.
+- The bridge permission grant is separate from that guard. The runner
+  seeds exactly three permissions (`ReadApplicationState`,
+  `ChangeApplicationState`, `ReadCliPipes`) for the exact managed
+  bridge path into the owned Zellij permission cache. The guard alone
+  never implies the grant.
+
+The three tests and their inputs:
+
+- `target_only_smoke` needs `MUXE_TARGET_INSTALLATION`,
+  `MUXE_HERDR_BINARY`, `MUXE_ZELLIJ_BINARY`,
+  `MUXE_ZELLIJ_FOREGROUND_BINARY`, `MUXE_ZELLIJ_BOOTSTRAP_BINARY`,
+  and `MUXE_ZELLIJ_PERMISSION_SEEDER`. No predecessor is required.
+- `upgrade_and_rollback` and `final_session_reload_failure` add
+  `MUXE_OLD_INSTALLATION` and `MUXE_ZELLIJ_FAULT_INJECTOR`. The fault test
+  also replays a real downgrade failure.
+
+CI runs `target_only_smoke` as a real target-only smoke on Linux pull
+requests and as a required current-target gate on all four release
+architectures. Missing inputs or approvals fail the gate. The real
+cross-release upgrade, rollback, and fault matrix is deferred until the first
+genuine published predecessor; see
+[`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Passing fixture-only suites
+never stand in for the required target-only live run.
