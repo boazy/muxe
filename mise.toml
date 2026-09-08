@@ -48,6 +48,7 @@ run = "cargo build --locked -p muxe-zellij-wasm --target wasm32-wasip1"
 
 [tasks.verify-packaged-wasm]
 depends = ["wasm-build"]
+shell = "bash -c"
 description = "Verify the native packaged-WASM digest against the real producer bytes"
 run = '''
 set -euo pipefail
@@ -67,6 +68,7 @@ cargo test --locked -p muxe --lib -- --ignored --exact \
 '''
 [tasks.verify-activation-preflight]
 depends = ["wasm-build", "wasm-build-previous"]
+shell = "bash -c"
 description = "Run activation receipt/preflight transaction tests with the pinned producer WASM"
 run = '''
 set -euo pipefail
