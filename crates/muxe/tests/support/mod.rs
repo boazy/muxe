@@ -27,6 +27,100 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const FORCEFUL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const MAX_UNIX_SOCKET_PATH: usize = 103;
+/// Bound on one owned Zellij CLI child (`kill-session`, `list-clients`):
+/// a hung CLI must never strand the retained server children it precedes
+/// in teardown.
+pub const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Short owned scratch root under `/tmp` (never ambient `TMPDIR`): keeps
+/// derived unix-socket paths inside `MAX_UNIX_SOCKET_PATH` with a stable
+/// prefix per caller.
+pub fn short_tempdir(prefix: &str) -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().prefix(prefix).tempdir_in("/tmp")
+}
+
+/// Runs one owned CLI command to completion inside `CLI_TIMEOUT` and
+/// returns its output. The child is a retained `OwnedChild`, so expiry
+/// kills with escalation in `terminate_and_reap` and fails closed with
+/// preserved diagnostics; drop-time `start_kill` covers the narrow abort
+/// window between spawn and the timeout arm. Pipe tails are bounded, so
+/// only small CLI outputs (status tables, not transcripts) belong here.
+pub async fn run_cli_bounded(tag: &str, command: &mut Command) -> io::Result<std::process::Output> {
+    let mut child = OwnedChild::spawn(tag, command)?;
+    let outcome = tokio::time::timeout(CLI_TIMEOUT, child.wait()).await;
+    match outcome {
+        Err(_) => {
+            let diagnostics = child.terminate_and_reap().await?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "owned CLI '{tag}' exceeded CLI_TIMEOUT:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    diagnostics.stdout_tail.lossy(),
+                    diagnostics.stderr_tail.lossy(),
+                ),
+            ));
+        }
+        Ok(Err(error)) => {
+            let diagnostics = child.terminate_and_reap().await?;
+            return Err(io::Error::other(format!(
+                "owned CLI '{tag}' wait failed: {error}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                diagnostics.stdout_tail.lossy(),
+                diagnostics.stderr_tail.lossy(),
+            )));
+        }
+        Ok(Ok(_)) => {}
+    }
+    let diagnostics = child.terminate_and_reap().await?;
+    let status = diagnostics.exit_status.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("owned CLI '{tag}' reaped with no exit status"),
+        )
+    })?;
+    Ok(std::process::Output {
+        status,
+        stdout: diagnostics.stdout_tail.bytes,
+        stderr: diagnostics.stderr_tail.bytes,
+    })
+}
+
+/// Runs the real public `muxe integration install zellij` against the
+/// owned host config under the scoped environment, so foreground startup
+/// reads managed autoload nodes and activation preflight finds
+/// receipt-owned stable bytes. Runs BEFORE the first foreground server
+/// starts and BEFORE the permission grant (the bridge loads at startup).
+/// Fixed production argv (`--always-configure` with the explicit owned
+/// config); the real stdout report returns as evidence. Nothing is
+/// fabricated: receipt, stable bytes, and KDL nodes are all written by
+/// the installed binary itself.
+pub async fn install_zellij_integration(
+    tag: &str,
+    muxe_binary: &Path,
+    host: &OwnedZellijHost,
+    scoped_root: &Path,
+) -> io::Result<String> {
+    let mut command = Command::new(muxe_binary);
+    command
+        .arg("integration")
+        .arg("install")
+        .arg("zellij")
+        .arg("--always-configure")
+        .arg("--zellij-config")
+        .arg(host.config_file());
+    host.apply_host_scoped_env(&mut command, scoped_root);
+    command.current_dir(scoped_root);
+    let output = run_cli_bounded(&format!("{tag}-integration-install"), &mut command).await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{tag}: public integration install failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )));
+    }
+    let report = String::from_utf8_lossy(&output.stdout).into_owned();
+    eprintln!("[{tag}] integration install report:\n{report}");
+    Ok(report)
+}
 
 /// Startup handshake budget for one owned host server.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
@@ -336,7 +430,7 @@ pub async fn validate_installation(dir: &Path) -> PathBuf {
     );
     // Probes run before any case TempDir exists: hold an owned TempDir
     // for cwd so the child never inherits repo/user cwd.
-    let probe_root = tempfile::tempdir().expect("owned probe TempDir");
+    let probe_root = short_tempdir("muxe-live-probe-").expect("owned probe TempDir");
     let output = Command::new(&binary)
         .arg("compatibility")
         .arg("--json")
@@ -824,6 +918,13 @@ impl OwnedZellijHost {
         &self.workdir
     }
 
+    /// Owned Zellij config file, passed explicitly to every CLI child
+    /// and to the public integration install.
+    #[must_use]
+    pub fn config_file(&self) -> &Path {
+        &self.config_file
+    }
+
     /// Installs one more retained foreground server child spawned against
     /// [`OwnedZellijHost::session_socket_path`]. [`OwnedZellijHost::shutdown`]
     /// reaps every server in install order.
@@ -996,7 +1097,7 @@ impl OwnedZellijHost {
     pub async fn kill_session(&self, session: &str) {
         let mut command = self.base_command();
         command.arg("kill-session").arg(session);
-        let _ = command.output().await;
+        let _ = run_cli_bounded(&format!("kill-session-{session}"), &mut command).await;
     }
 
     /// Lists current client IDs for one session via the pinned CLI
@@ -1011,7 +1112,7 @@ impl OwnedZellijHost {
             .arg(session)
             .arg("action")
             .arg("list-clients");
-        let output = command.output().await?;
+        let output = run_cli_bounded(&format!("list-clients-{session}"), &mut command).await?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
                 "list-clients on session '{session}' failed: {}",
@@ -1754,7 +1855,7 @@ pub async fn await_session_ready(
 pub async fn installed_version(binary: &Path) -> io::Result<String> {
     // Probes run before any case TempDir exists: hold an owned TempDir
     // for cwd so the child never inherits repo/user cwd.
-    let probe_root = tempfile::tempdir()?;
+    let probe_root = short_tempdir("muxe-live-probe-")?;
     let output = Command::new(binary)
         .arg("compatibility")
         .arg("--json")
@@ -1790,7 +1891,7 @@ pub async fn installed_version(binary: &Path) -> io::Result<String> {
 /// builds fail closed elsewhere); the hex string is logged as evidence,
 /// never trusted from a sidecar.
 pub async fn installed_wasm_digest(binary: &Path) -> io::Result<Option<String>> {
-    let probe_root = tempfile::tempdir()?;
+    let probe_root = short_tempdir("muxe-live-probe-")?;
     let output = Command::new(binary)
         .arg("compatibility")
         .arg("--json")

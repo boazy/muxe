@@ -3582,6 +3582,60 @@ mod mixed_recovery_production_tests {
         }
     }
 
+    /// Asserts the shared resume-barrier boundary: the unit lock stays held, the
+    /// recorded bridge is restored, every target is durably retired, and exactly
+    /// the expected winner (if any) has recorded its resume ACK. Synchronous: the
+    /// loser's entry already causally follows the winner's ACK write and permit
+    /// release, so no polling is needed.
+    fn assert_resume_boundary(journal_path: &Path, cache_dir: &Path, expect_resumed: Option<&str>) {
+        assert!(
+            muxe::lifecycle::journal::acquire_unit_lock(
+                cache_dir,
+                &muxe::lifecycle::journal::UnitKind::Zellij {
+                    bridge_path_hash: "mixed-production".to_owned(),
+                },
+            )
+            .is_err(),
+            "unit lock remains held through local resume ACK barrier"
+        );
+        let journal = muxe::lifecycle::journal::read_journal(journal_path)
+            .expect("recovery journal remains readable at resume barrier");
+        assert!(
+            journal.bridge_restored,
+            "recorded bridge restores before any old resume"
+        );
+        assert!(
+            journal.target_members.iter().all(|target| matches!(
+                target.state,
+                muxe::lifecycle::journal::TargetTransition::Retired
+            )),
+            "every target retires before old resume ACKs: {:?}",
+            journal.target_members
+        );
+        let resumed: Vec<&str> = journal
+            .members
+            .iter()
+            .filter(|member| {
+                matches!(
+                    member.state,
+                    muxe::lifecycle::journal::MemberTransition::Resumed
+                )
+            })
+            .map(|member| member.host_identity.as_str())
+            .collect();
+        match expect_resumed {
+            None => assert!(
+                resumed.is_empty(),
+                "no old resume ACKs before the first release: {resumed:?}"
+            ),
+            Some(winner) => assert_eq!(
+                resumed,
+                [winner],
+                "only the released winner ACKs before the second release"
+            ),
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "host-free mixed recovery proof keeps child lifecycle, retained sessions, journal permits, and artifact witnesses in one auditable scenario"
@@ -3836,35 +3890,25 @@ mod mixed_recovery_production_tests {
         // the test never deadlocks itself against the other gate.
         let first = tokio::time::timeout(Duration::from_mins(1), async {
             tokio::select! {
-                _ = resume_gate_a.entered.notified() => true,
-                _ = resume_gate_b.entered.notified() => false,
+                () = resume_gate_a.entered.notified() => true,
+                () = resume_gate_b.entered.notified() => false,
             }
         })
         .await;
-        let a_first = match first {
-            Ok(a_first) => a_first,
-            Err(_) => panic!(
+        let Ok(a_first) = first else {
+            panic!(
                 "old resume barrier entered: {:?}",
                 muxe::lifecycle::journal::read_journal(&journal_path)
-            ),
+            );
         };
-        assert!(
-            muxe::lifecycle::journal::acquire_unit_lock(
-                &cache_dir,
-                &muxe::lifecycle::journal::UnitKind::Zellij {
-                    bridge_path_hash: "mixed-production".to_owned(),
-                },
-            )
-            .is_err(),
-            "unit lock remains held through local resume ACK barrier"
-        );
+        assert_resume_boundary(&journal_path, &cache_dir, None);
         if a_first {
             resume_gate_a.release.notify_one();
             wait_for_old_status(endpoint_old_a.socket(), "old-a", &old_record).await;
             tokio::time::timeout(Duration::from_secs(5), resume_gate_b.entered.notified())
                 .await
                 .expect("old B resume barrier entered");
-            assert!(journal_path.exists(), "journal remains until old B ACK");
+            assert_resume_boundary(&journal_path, &cache_dir, Some("old-a"));
             resume_gate_b.release.notify_one();
             wait_for_old_status(endpoint_old_b.socket(), "old-b", &old_record).await;
         } else {
@@ -3873,7 +3917,7 @@ mod mixed_recovery_production_tests {
             tokio::time::timeout(Duration::from_secs(5), resume_gate_a.entered.notified())
                 .await
                 .expect("old A resume barrier entered");
-            assert!(journal_path.exists(), "journal remains until old A ACK");
+            assert_resume_boundary(&journal_path, &cache_dir, Some("old-b"));
             resume_gate_a.release.notify_one();
             wait_for_old_status(endpoint_old_a.socket(), "old-a", &old_record).await;
         }

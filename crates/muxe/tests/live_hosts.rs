@@ -70,9 +70,9 @@ use sha2::{Digest, Sha256};
 use support::{
     ContinuityGuard, OwnedChild, OwnedHerdrServer, OwnedZellijHost, ServedBroker,
     assert_broker_serving, assert_no_preserved_journals, await_activate, await_session_ready,
-    await_target_ready, drive_activate, init_shared_dirs, input_path, installed_version,
-    installed_wasm_digest, poll_until, read_broker_record, retire_broker, spawn_activate,
-    spawn_serve_herdr, spawn_serve_zellij, validate_installation,
+    await_target_ready, drive_activate, init_shared_dirs, input_path, install_zellij_integration,
+    installed_version, installed_wasm_digest, poll_until, read_broker_record, retire_broker,
+    short_tempdir, spawn_activate, spawn_serve_herdr, spawn_serve_zellij, validate_installation,
 };
 
 /// Bounded wait for one barrier file to appear.
@@ -215,11 +215,12 @@ impl Rig {
 /// client count.
 #[expect(
     clippy::too_many_arguments,
-    reason = "rig builder threads every explicit typed input (case label, six pinned binaries/dirs, session table) with absolute paths and no command hook; bundling would hide the typed-input surface the live gate documents"
+    reason = "rig builder threads every explicit typed input (case label, init plus install binaries, five pinned binaries/dirs, session table) with absolute paths and no command hook; bundling would hide the typed-input surface the live gate documents"
 )]
 async fn bring_hosts(
     case: &str,
     init_bin: &Path,
+    install_bin: &Path,
     herdr_binary: &Path,
     zellij_binary: &Path,
     foreground: &Path,
@@ -227,7 +228,7 @@ async fn bring_hosts(
     seeder: &Path,
     sessions: &[(&str, usize)],
 ) -> io::Result<Rig> {
-    let root = tempfile::tempdir()?;
+    let root = short_tempdir(&format!("muxe-live-{case}-"))?;
     let scoped_root = root.path().join("scoped");
     let (config_file, cache_dir) = init_shared_dirs(init_bin, &scoped_root).await?;
 
@@ -240,6 +241,24 @@ async fn bring_hosts(
     }
 
     let mut host = OwnedZellijHost::prepare(zellij_binary, root.path(), case)?;
+    // Receipt-owned pre-state before any startup: the real public
+    // install writes stable bytes, receipt, and autoload KDL nodes, so
+    // foreground startup loads the managed bridge and activation
+    // preflight finds receipt-owned bytes. `install_bin` selects the
+    // pre-state generation (old for upgrade rehearsal, target for smoke).
+    install_zellij_integration(case, install_bin, &host, &scoped_root).await?;
+    // Scoped permission grant for the managed bridge location: the exact
+    // stable path the coordinator will load (bare path, matching the
+    // pinned `Display for RunPluginLocation::File`), seeded with the
+    // pinned cache code before the bridge loads at startup. The test
+    // guard approval alone never implies this grant; both are explicit.
+    let stable = muxe::integration::stable_bridge_path(
+        config_file
+            .parent()
+            .ok_or_else(|| io::Error::other(format!("{case}: config file has no parent")))?,
+    );
+    host.run_permission_seed(seeder, &stable.display().to_string(), &scoped_root)
+        .await?;
     for (session, _) in sessions {
         host.serve_foreground(foreground, bootstrap, session, &scoped_root)
             .await?;
@@ -250,19 +269,6 @@ async fn bring_hosts(
         )));
     }
     host.check_servers_alive()?;
-
-    // Scoped permission grant for the managed bridge location: the exact
-    // stable path the coordinator will load (bare path, matching the
-    // pinned `Display for RunPluginLocation::File`), seeded with the
-    // pinned cache code before any bridge requests. The test guard
-    // approval alone never implies this grant; both are explicit.
-    let stable = muxe::integration::stable_bridge_path(
-        config_file
-            .parent()
-            .ok_or_else(|| io::Error::other(format!("{case}: config file has no parent")))?,
-    );
-    host.run_permission_seed(seeder, &stable.display().to_string(), &scoped_root)
-        .await?;
 
     let workdir = host.workdir().to_path_buf();
     let mut clients = Vec::new();
@@ -469,6 +475,7 @@ async fn run_target_only_smoke() -> io::Result<()> {
     let mut rig = bring_hosts(
         "smoke",
         &target_bin,
+        &target_bin,
         &herdr_binary,
         &zellij_binary,
         &foreground,
@@ -556,6 +563,21 @@ async fn transfer_to(
     }
     Ok(())
 }
+async fn assert_group_serving(
+    endpoints: &[PathBuf],
+    expected_records: &[CompatibilityRecord],
+    sessions: &[&str],
+) -> io::Result<()> {
+    for (endpoint, expected, session) in endpoints
+        .iter()
+        .zip(expected_records)
+        .zip(sessions)
+        .map(|((endpoint, expected), session)| (endpoint, expected, session))
+    {
+        assert_serving_record(endpoint, "matrix", expected, session).await?;
+    }
+    Ok(())
+}
 
 async fn run_upgrade_and_rollback() -> io::Result<()> {
     let old_bin = validate_installation(&input_path("MUXE_OLD_INSTALLATION")).await;
@@ -582,6 +604,7 @@ async fn run_upgrade_and_rollback() -> io::Result<()> {
     let mut rig = bring_hosts(
         "matrix",
         &target_bin,
+        &old_bin,
         &herdr_binary,
         &zellij_binary,
         &foreground,
@@ -619,17 +642,7 @@ async fn run_upgrade_and_rollback() -> io::Result<()> {
         )
         .await?;
         assert_serving_record(&herdr_endpoint, "matrix", &old_herdr, &rig.discovery).await?;
-        // Pre-state group proof: every session serves its old record, so
-        // the complete group (all members) is live before selection, and
-        // no preserved journal can contaminate the transfer.
-        for (endpoint, expected, session) in zellij_endpoints
-            .iter()
-            .zip(&old_sessions)
-            .zip(sessions)
-            .map(|((endpoint, expected), session)| (endpoint, expected, session))
-        {
-            assert_serving_record(endpoint, "matrix", expected, session).await?;
-        }
+        assert_group_serving(&zellij_endpoints, &old_sessions, &sessions).await?;
         assert_no_preserved_journals(&rig.cache_dir, "matrix-pre")?;
         transfer_to(
             &rig,
@@ -642,8 +655,7 @@ async fn run_upgrade_and_rollback() -> io::Result<()> {
             "upgrade",
         )
         .await?;
-        // Post-commit group hygiene: the commit cleaned up, nothing
-        // preserved for the rollback to inherit.
+        // Post-commit group hygiene: the commit cleaned up before rollback.
         assert_no_preserved_journals(&rig.cache_dir, "matrix-upgraded")?;
         transfer_to(
             &rig,
@@ -700,6 +712,7 @@ async fn run_final_session_reload_failure() -> io::Result<()> {
     let mut rig = bring_hosts(
         "fault",
         &target_bin,
+        &old_bin,
         &herdr_binary,
         &zellij_binary,
         &foreground,

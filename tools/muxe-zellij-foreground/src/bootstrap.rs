@@ -237,6 +237,11 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
                     let _ = evidence_tx.send(Ok(content.len()));
                     return;
                 }
+                // The route thread unblocks the client input thread after
+                // every handled instruction, including
+                // `FirstClientConnected`, so this routinely precedes the
+                // screen thread's first render: keep waiting for it.
+                Ok((ServerToClientMsg::UnblockInputThread, _)) => continue,
                 Ok((other, _)) => {
                     let _ =
                         evidence_tx.send(Err(format!("got {other:?} before any session render")));
@@ -265,3 +270,4 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
         Err(_) => Err("no session render inside the timeout".to_owned()),
     }
 }
+
