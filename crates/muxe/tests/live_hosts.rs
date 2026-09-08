@@ -90,7 +90,7 @@ const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
 /// Bounded wait for one transfer target to report ready.
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
 /// Bounded wait for one addressed duo origin round (release plus snapshot).
-const DUO_ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const DUO_ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 /// Bounded wait to reap one owned duo pipe child after kill.
 const DUO_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bounded wait for one owned duo pipe child's stderr drain at shutdown.
@@ -518,7 +518,7 @@ struct DuoPipe {
 /// existing scoped spawn path. `SubprocessChannel::launch` is deliberately
 /// not used: it inherits the test process env, which is not the owned
 /// Rig's host/scoped env.
-async fn spawn_duo_pipe(
+fn spawn_duo_pipe(
     host: &OwnedZellijHost,
     scoped_root: &Path,
     zellij_binary: &Path,
@@ -710,7 +710,7 @@ fn duo_request_id(counter: u64) -> [u8; 16] {
 /// Simultaneous two-client regression on a second fresh Rig: two real PTY
 /// clients on one session, exact-two authoritative census before admission,
 /// two anchor-bound bridge Registers, then sequential typed read-only
-/// origin queries each addressed to one (client_id, registration). No
+/// origin queries each addressed to one (`client_id`, registration). No
 /// broker serves this session, so this scenario owns the only event-pipe
 /// subscription and every answer is bridge-direct. Read-only throughout:
 /// no capture, dispatch, or bridge retirement is ever sent.
@@ -769,8 +769,7 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
             &request_name,
             None,
             "duo-request",
-        )
-        .await?;
+        )?;
         let mut event = match spawn_duo_pipe(
             host,
             &rig.scoped_root,
@@ -781,9 +780,7 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
                 "{{\"muxe\":\"subscribe\",\"protocol\":{BRIDGE_PROTOCOL_VERSION}}}"
             )),
             "duo-event",
-        )
-        .await
-        {
+        ) {
             Ok(event) => event,
             Err(error) => {
                 let shutdown = shutdown_duo_pipe(&mut request).await;
@@ -805,7 +802,7 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
 /// Census coverage plus addressed routing for the duo scenario. First awaits
 /// fresh compatible Registers covering exactly the anchor members (foreign
 /// IDs are stale native coverage and ignored); then sends one sequential
-/// read-only origin query per member addressed to its (client_id, registration)
+/// read-only origin query per member addressed to its (`client_id`, registration)
 /// and requires both the transport release and the origin snapshot to agree
 /// on the owner. Release and snapshot may arrive in either order; duplicates,
 /// wrong owners, wrong requests, and UI-session mismatches all fail closed.
@@ -814,6 +811,15 @@ async fn duo_probe_rounds(
     request: &mut DuoPipe,
     event: &mut DuoPipe,
 ) -> io::Result<()> {
+    let registrations = duo_collect_registrations(anchor, event).await?;
+    let targets = duo_route_targets(anchor, &registrations, request, event).await?;
+    duo_drain_route_heartbeats(anchor, &registrations, &targets, event).await
+}
+
+async fn duo_collect_registrations(
+    anchor: &[String],
+    event: &mut DuoPipe,
+) -> io::Result<BTreeMap<String, ([u8; 16], String)>> {
     let coverage_deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     let mut registrations: BTreeMap<String, ([u8; 16], String)> = BTreeMap::new();
     while registrations.len() < anchor.len() {
@@ -835,6 +841,7 @@ async fn duo_probe_rounds(
             )
         })?;
         match frame.event {
+            PipeEventKind::Register { client_id, .. } if !anchor.contains(&client_id) => {}
             PipeEventKind::Register {
                 client_id,
                 current_pane,
@@ -842,9 +849,6 @@ async fn duo_probe_rounds(
                 identity,
                 ..
             } => {
-                if !anchor.contains(&client_id) {
-                    continue;
-                }
                 if registration == [0; 16] {
                     return Err(io::Error::other(format!(
                         "duo: zero registration for client {client_id:?}"
@@ -878,11 +882,7 @@ async fn duo_probe_rounds(
                 }
                 registrations.insert(client_id, (registration, current_pane));
             }
-            PipeEventKind::Heartbeat { client_id, .. } => {
-                if !anchor.contains(&client_id) {
-                    continue;
-                }
-            }
+            PipeEventKind::Heartbeat { .. } => {}
             other => {
                 return Err(io::Error::other(format!(
                     "duo: unexpected event while awaiting census coverage: {other:?}"
@@ -890,6 +890,14 @@ async fn duo_probe_rounds(
             }
         }
     }
+    Ok(registrations)
+}
+async fn duo_route_targets(
+    anchor: &[String],
+    registrations: &BTreeMap<String, ([u8; 16], String)>,
+    request: &mut DuoPipe,
+    event: &mut DuoPipe,
+) -> io::Result<Vec<(String, [u8; 16])>> {
     let targets: Vec<(String, [u8; 16])> = anchor
         .iter()
         .map(|client| {
@@ -914,149 +922,213 @@ async fn duo_probe_rounds(
     );
 
     for (index, (client_id, registration)) in targets.iter().enumerate() {
-        let (_, current_pane) = registrations.get(client_id).ok_or_else(|| {
-            io::Error::other(format!(
-                "duo: anchor member {client_id:?} lost its pane anchor"
-            ))
+        duo_route_one(
+            anchor,
+            registrations,
+            request,
+            event,
+            index,
+            client_id,
+            *registration,
+        )
+        .await?;
+    }
+    Ok(targets)
+}
+async fn duo_route_one(
+    anchor: &[String],
+    registrations: &BTreeMap<String, ([u8; 16], String)>,
+    request: &mut DuoPipe,
+    event: &mut DuoPipe,
+    index: usize,
+    client_id: &str,
+    registration: [u8; 16],
+) -> io::Result<()> {
+    let (_, current_pane) = registrations.get(client_id).ok_or_else(|| {
+        io::Error::other(format!(
+            "duo: anchor member {client_id:?} lost its pane anchor"
+        ))
+    })?;
+    let request_id = duo_request_id(index as u64 + 1);
+    let ui_session = format!("duo-route-{client_id}");
+    let outbound = PipeRequest {
+        protocol: BRIDGE_PROTOCOL_VERSION,
+        request_id,
+        channel_generation: 1,
+        target: BridgeTarget {
+            client_id: client_id.to_owned(),
+            registration,
+        },
+        payload: BridgeRequest::RequestOrigin {
+            ui_session: ui_session.clone(),
+            ui_pane: current_pane.clone(),
+        },
+    };
+    let line = encode_request_line(&outbound)
+        .map_err(|error| io::Error::other(format!("duo: cannot encode origin request: {error}")))?;
+    let round_deadline = tokio::time::Instant::now() + DUO_ROUTE_TIMEOUT;
+    let send_remaining = round_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let send_result = tokio::time::timeout(send_remaining, duo_send_request_line(request, &line))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("duo: timed out sending routed origin for client {client_id:?}"),
+            )
         })?;
-        let request_id = duo_request_id(index as u64 + 1);
-        let ui_session = format!("duo-route-{client_id}");
-        let outbound = PipeRequest {
-            protocol: BRIDGE_PROTOCOL_VERSION,
-            request_id,
-            channel_generation: 1,
-            target: BridgeTarget {
-                client_id: client_id.clone(),
-                registration: *registration,
-            },
-            payload: BridgeRequest::RequestOrigin {
-                ui_session: ui_session.clone(),
-                ui_pane: current_pane.clone(),
-            },
-        };
-        let line = encode_request_line(&outbound).map_err(|error| {
-            io::Error::other(format!("duo: cannot encode origin request: {error}"))
-        })?;
-        let round_deadline = tokio::time::Instant::now() + DUO_ROUTE_TIMEOUT;
-        let send_remaining = round_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let send_result =
-            tokio::time::timeout(send_remaining, duo_send_request_line(request, &line))
-                .await
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("duo: timed out sending routed origin for client {client_id:?}"),
-                    )
-                })?;
-        send_result?;
-        let mut released = false;
-        let mut snapshot = false;
-        while !(released && snapshot) {
-            let remaining = round_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "duo: timed out awaiting routed origin for client {client_id:?} (released={released}, snapshot={snapshot})"
-                    ),
-                ));
+    send_result?;
+    let mut state = DuoRouteState {
+        anchor,
+        request_id,
+        registration,
+        ui_session: &ui_session,
+        current_pane,
+        client_id,
+        released: false,
+        round_deadline,
+        snapshot: false,
+    };
+    duo_await_route_response(event, &mut state).await?;
+    eprintln!("[duo] routed origin for client {client_id:?}: release plus snapshot agree");
+    Ok(())
+}
+struct DuoRouteState<'a> {
+    anchor: &'a [String],
+    request_id: [u8; 16],
+    registration: [u8; 16],
+    ui_session: &'a str,
+    current_pane: &'a str,
+    client_id: &'a str,
+    round_deadline: tokio::time::Instant,
+    released: bool,
+    snapshot: bool,
+}
+
+impl DuoRouteState<'_> {
+    fn apply(&mut self, event: PipeEventKind) -> io::Result<()> {
+        match event {
+            PipeEventKind::RequestReleased {
+                request_id,
+                channel_generation,
+                registration,
+            } => {
+                if request_id != self.request_id {
+                    return Err(io::Error::other(format!(
+                        "duo: release for wrong request {request_id:?} while routing client {:?}",
+                        self.client_id
+                    )));
+                }
+                if registration != self.registration {
+                    return Err(io::Error::other(format!(
+                        "duo: release from wrong owner {registration:?} for client {:?}",
+                        self.client_id
+                    )));
+                }
+                if channel_generation != 1 {
+                    return Err(io::Error::other(format!(
+                        "duo: release on wrong generation {channel_generation} for client {:?}",
+                        self.client_id
+                    )));
+                }
+                if self.released {
+                    return Err(io::Error::other(format!(
+                        "duo: duplicate release for client {:?}",
+                        self.client_id
+                    )));
+                }
+                self.released = true;
             }
-            let line = duo_next_event_line(event, remaining).await?;
-            let frame = decode_event_line(&line).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("duo: cannot decode event line: {error}"),
-                )
-            })?;
-            match frame.event {
-                PipeEventKind::RequestReleased {
-                    request_id: got,
-                    channel_generation,
-                    registration: got_registration,
-                } => {
-                    if got != request_id {
-                        return Err(io::Error::other(format!(
-                            "duo: release for wrong request {got:?} while routing client {client_id:?}"
-                        )));
-                    }
-                    if got_registration != *registration {
-                        return Err(io::Error::other(format!(
-                            "duo: release from wrong owner {got_registration:?} for client {client_id:?}"
-                        )));
-                    }
-                    if channel_generation != 1 {
-                        return Err(io::Error::other(format!(
-                            "duo: release on wrong generation {channel_generation} for client {client_id:?}"
-                        )));
-                    }
-                    if released {
-                        return Err(io::Error::other(format!(
-                            "duo: duplicate release for client {client_id:?}"
-                        )));
-                    }
-                    released = true;
-                }
-                PipeEventKind::OriginSnapshot {
-                    ui_session: got_session,
-                    origin,
-                } => {
-                    if got_session != ui_session {
-                        return Err(io::Error::other(format!(
-                            "duo: snapshot for wrong UI session {got_session:?} while routing client {client_id:?}"
-                        )));
-                    }
-                    if origin.client_id != *client_id {
-                        return Err(io::Error::other(format!(
-                            "duo: snapshot for wrong client {:?} while routing client {client_id:?}",
-                            origin.client_id
-                        )));
-                    }
-                    if origin.ui_pane_id != *current_pane {
-                        return Err(io::Error::other(format!(
-                            "duo: snapshot echoes wrong UI pane {:?} for client {client_id:?}",
-                            origin.ui_pane_id
-                        )));
-                    }
-                    if snapshot {
-                        return Err(io::Error::other(format!(
-                            "duo: duplicate snapshot for client {client_id:?}"
-                        )));
-                    }
-                    snapshot = true;
-                }
-                PipeEventKind::OriginDeclined {
-                    ui_session: got_session,
-                    request_id: got,
-                    registration: got_registration,
-                } => {
+            PipeEventKind::OriginSnapshot { ui_session, origin } => {
+                if ui_session != self.ui_session {
                     return Err(io::Error::other(format!(
-                        "duo: owner declined its own pane (session {got_session:?}, request {got:?}, owner {got_registration:?}) for client {client_id:?}"
+                        "duo: snapshot for wrong UI session {ui_session:?} while routing client {:?}",
+                        self.client_id
                     )));
                 }
-                PipeEventKind::Heartbeat {
-                    client_id: beat, ..
-                } => {
-                    if !anchor.contains(&beat) {
-                        continue;
-                    }
-                }
-                PipeEventKind::Register { client_id: re, .. } => {
-                    if !anchor.contains(&re) {
-                        continue;
-                    }
+                if origin.client_id != self.client_id {
                     return Err(io::Error::other(format!(
-                        "duo: unexpected re-registration for client {re:?} while routing client {client_id:?}"
+                        "duo: snapshot for wrong client {:?} while routing client {:?}",
+                        origin.client_id, self.client_id
                     )));
                 }
-                other => {
+                if origin.ui_pane_id != self.current_pane {
                     return Err(io::Error::other(format!(
-                        "duo: unexpected event while routing client {client_id:?}: {other:?}"
+                        "duo: snapshot echoes wrong UI pane {:?} for client {:?}",
+                        origin.ui_pane_id, self.client_id
                     )));
                 }
+                if self.snapshot {
+                    return Err(io::Error::other(format!(
+                        "duo: duplicate snapshot for client {:?}",
+                        self.client_id
+                    )));
+                }
+                self.snapshot = true;
+            }
+            PipeEventKind::OriginDeclined {
+                ui_session,
+                request_id,
+                registration,
+            } => {
+                return Err(io::Error::other(format!(
+                    "duo: owner declined its own pane (session {ui_session:?}, request {request_id:?}, owner {registration:?}) for client {:?}",
+                    self.client_id
+                )));
+            }
+            PipeEventKind::Heartbeat { .. } => {}
+            PipeEventKind::Register { client_id, .. } => {
+                if self.anchor.contains(&client_id) {
+                    return Err(io::Error::other(format!(
+                        "duo: unexpected re-registration for client {client_id:?} while routing client {:?}",
+                        self.client_id
+                    )));
+                }
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "duo: unexpected event while routing client {:?}: {other:?}",
+                    self.client_id
+                )));
             }
         }
-        eprintln!("[duo] routed origin for client {client_id:?}: release plus snapshot agree");
+        Ok(())
     }
+}
+
+async fn duo_await_route_response(
+    event: &mut DuoPipe,
+    state: &mut DuoRouteState<'_>,
+) -> io::Result<()> {
+    while !(state.released && state.snapshot) {
+        let remaining = state
+            .round_deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "duo: timed out awaiting routed origin for client {:?} (released={}, snapshot={})",
+                    state.client_id, state.released, state.snapshot
+                ),
+            ));
+        }
+        let line = duo_next_event_line(event, remaining).await?;
+        let frame = decode_event_line(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duo: cannot decode event line: {error}"),
+            )
+        })?;
+        state.apply(frame.event)?;
+    }
+    Ok(())
+}
+async fn duo_drain_route_heartbeats(
+    anchor: &[String],
+    registrations: &BTreeMap<String, ([u8; 16], String)>,
+    targets: &[(String, [u8; 16])],
+    event: &mut DuoPipe,
+) -> io::Result<()> {
     // Let the protocol drain through the next heartbeat from both active
     // anchors. This catches queued duplicate replies after the final route
     // while keeping the boundary bounded by the existing route timeout.
@@ -1082,23 +1154,22 @@ async fn duo_probe_rounds(
                 client_id,
                 registration,
             } => {
-                if !anchor.contains(&client_id) {
-                    continue;
-                }
-                let Some((active_registration, _)) = registrations.get(&client_id) else {
-                    continue;
-                };
-                if registration == *active_registration {
+                if anchor.contains(&client_id)
+                    && registrations
+                        .get(&client_id)
+                        .is_some_and(|(active_registration, _)| {
+                            registration == *active_registration
+                        })
+                {
                     heartbeats.insert(client_id);
                 }
             }
             PipeEventKind::Register { client_id, .. } => {
-                if !anchor.contains(&client_id) {
-                    continue;
+                if anchor.contains(&client_id) {
+                    return Err(io::Error::other(format!(
+                        "duo: unexpected re-registration for active client {client_id:?} after routing"
+                    )));
                 }
-                return Err(io::Error::other(format!(
-                    "duo: unexpected re-registration for active client {client_id:?} after routing"
-                )));
             }
             PipeEventKind::OriginSnapshot { .. }
             | PipeEventKind::RequestReleased { .. }
@@ -1117,7 +1188,6 @@ async fn duo_probe_rounds(
     eprintln!("[duo] post-route heartbeats observed for both active anchors");
     Ok(())
 }
-
 async fn run_target_only_smoke() -> io::Result<()> {
     let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
     let target_version = installed_version(&target_bin).await?;
