@@ -1,6 +1,0 @@
-task:
-  agentAdvisor:
-    task: "on"
-    sonic: "off"
-advisor:
-  syncBacklog: 1
