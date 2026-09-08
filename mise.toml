@@ -1,6 +1,11 @@
 [tools]
 rust = { version = "1.97.1", targets = ["wasm32-wasip1"], components = ["rustfmt", "clippy"] }
 "cargo:cargo-codspeed" = "5.0.1"
+uv = "0.12.10"
+jj = "0.45.1"
+gh = "2.100.0"
+git-cliff = "2.14.1"
+"cargo:cargo-release" = "1.1.5"
 
 [tasks.fmt]
 description = "Check Rust formatting on the pinned toolchain"
@@ -99,3 +104,7 @@ done
 [tasks.bench-codspeed]
 description = "Build CodSpeed comparisons with the pinned runner"
 run = "cargo codspeed build --locked"
+
+[tasks.release]
+description = "Release the current main commit with cargo-release and Jujutsu"
+run = "uv run --script tools/release/release.py"

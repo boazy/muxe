@@ -1,0 +1,8 @@
+# Jujutsu owns release commits, tags, and pushes. cargo-release has no
+# commit=false setting, so tools/release/release.py invokes only its version
+# and publish steps instead of the all-in-one release pipeline.
+allow-branch = ["*"]
+consolidate-commits = true
+tag = false
+push = false
+tag-name = "v{{version}}"
