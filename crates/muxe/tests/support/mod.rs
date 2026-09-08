@@ -2046,6 +2046,7 @@ pub fn activate_command(
     extra_env: &[(&str, &str)],
 ) -> Command {
     let mut command = Command::new(binary);
+    command.arg("activate");
     match zellij_host {
         Some(host) => host.apply_host_scoped_env(&mut command, scoped_root),
         None => apply_scoped_env(&mut command, scoped_root),

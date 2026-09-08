@@ -172,6 +172,7 @@ enum PermissionGate {
 pub struct Bridge {
     client_id: Option<String>,
     plugin_id: Option<u32>,
+    plugin_client_id: Option<u16>,
     focused_pane: Option<String>,
     permission_gate: PermissionGate,
     event_cli_id: Option<String>,
@@ -193,6 +194,7 @@ impl Default for Bridge {
         Self {
             client_id: None,
             plugin_id: None,
+            plugin_client_id: None,
             focused_pane: None,
             permission_gate: PermissionGate::Pending,
             event_cli_id: None,
@@ -228,7 +230,9 @@ impl Bridge {
             EventType::ActionComplete,
             EventType::Timer,
         ]);
-        self.plugin_id = Some(effects.plugin_ids().plugin_id);
+        let ids = effects.plugin_ids();
+        self.plugin_id = Some(ids.plugin_id);
+        self.plugin_client_id = Some(ids.client_id);
         effects.arm_timer(HEARTBEAT_SECS);
     }
 
@@ -243,22 +247,26 @@ impl Bridge {
             Event::Timer(_) => self.on_timer(effects),
             Event::PermissionRequestResult(status) => {
                 match status {
-                    // Idempotent: only the transition into Granted issues
-                    // the deferred identity query, so repeats never
-                    // duplicate it. A later grant after denial (user
-                    // answers the host prompt) legitimately queries once.
+                    // Permission results are directed to the receiving
+                    // plugin on the live path, while cached replay can reach
+                    // connected instances of the same plugin ID. Query every
+                    // Granted event while identity remains unverified; once
+                    // an anchor-matching census confirms identity, keep the
+                    // confirmed gate without repeating the privileged query.
                     PermissionStatus::Granted => {
-                        if self.permission_gate != PermissionGate::Granted {
-                            self.permission_gate = PermissionGate::Granted;
+                        self.permission_gate = PermissionGate::Granted;
+                        if self.client_id.is_none() {
                             eprintln!("muxe bridge: permission granted; querying clients");
                             effects.list_clients();
                         }
                     }
                     PermissionStatus::Denied => {
-                        if self.permission_gate != PermissionGate::Denied {
-                            eprintln!("muxe bridge: permission denied");
+                        if self.client_id.is_none() {
+                            if self.permission_gate != PermissionGate::Denied {
+                                eprintln!("muxe bridge: permission denied");
+                            }
+                            self.permission_gate = PermissionGate::Denied;
                         }
-                        self.permission_gate = PermissionGate::Denied;
                     }
                 }
             }
@@ -310,31 +318,37 @@ impl Bridge {
 
     fn on_list_clients(&mut self, clients: &[ClientInfo], effects: &mut dyn HostEffects) {
         let mut current_client_present = false;
-        for client in clients {
-            if client.is_current_client {
-                current_client_present = true;
-                self.client_id = Some(client.client_id.to_string());
-                let focused = format!("{}", client.pane_id);
-                // Focus history advances only while no menu owns capture and
-                // only for panes outside the known MUXE set: a focused pane
-                // during capture, or a known menu pane, is never origin.
-                if self.active.is_none()
-                    && self.pending.is_none()
-                    && !self.muxe_panes.contains(&focused)
-                    && self.focused_pane.as_deref() != Some(focused.as_str())
-                {
-                    self.last_non_muxe_pane = Some(focused.clone());
+        if let Some(anchor_client_id) = self.plugin_client_id {
+            for client in clients {
+                if client.is_current_client && client.client_id == anchor_client_id {
+                    current_client_present = true;
+                    self.client_id = Some(client.client_id.to_string());
+                    let focused = format!("{}", client.pane_id);
+                    // Focus history advances only while no menu owns capture and
+                    // only for panes outside the known MUXE set: a focused pane
+                    // during capture, or a known menu pane, is never origin.
+                    if self.active.is_none()
+                        && self.pending.is_none()
+                        && !self.muxe_panes.contains(&focused)
+                        && self.focused_pane.as_deref() != Some(focused.as_str())
+                    {
+                        self.last_non_muxe_pane = Some(focused.clone());
+                    }
+                    self.focused_pane = Some(focused);
+                    break;
                 }
-                self.focused_pane = Some(focused);
-                break;
             }
         }
         if current_client_present {
             eprintln!("muxe bridge: client census current client present");
+            // An anchor-matching census is proof that this instance's
+            // privileged query was authorized. Keep that proof across later
+            // broadcast PermissionRequestResult events.
+            self.permission_gate = PermissionGate::Granted;
+            self.try_register(effects);
         } else {
             eprintln!("muxe bridge: client census current client absent");
         }
-        self.try_register(effects);
     }
 
     fn on_mode_update(&mut self, mode: &ModeInfo, effects: &mut dyn HostEffects) {
@@ -1004,6 +1018,8 @@ mod tests {
         focused: Vec<PaneId>,
         timers: u32,
         lists: u32,
+        list_clients_ready: bool,
+        list_response_pending: bool,
         plugin_id: u32,
         cwd: BTreeMap<String, String>,
         random: VecDeque<[u8; 16]>,
@@ -1020,6 +1036,8 @@ mod tests {
                 focused: Vec::new(),
                 timers: 0,
                 lists: 0,
+                list_clients_ready: false,
+                list_response_pending: false,
                 plugin_id: 41,
                 cwd: BTreeMap::new(),
                 random: VecDeque::from([[7u8; 16], [8u8; 16], [9u8; 16]]),
@@ -1035,12 +1053,27 @@ mod tests {
                 })
                 .collect()
         }
+        fn register_client_ids(&self, cli_id: &str) -> Vec<String> {
+            self.outputs
+                .iter()
+                .filter(|(target, _)| target == cli_id)
+                .filter_map(|(_, line)| decode_event_line(line).ok())
+                .filter_map(|frame| match frame.event {
+                    PipeEventKind::Register { client_id, .. } => Some(client_id),
+                    _ => None,
+                })
+                .collect()
+        }
 
         fn last_event(&self) -> (u64, PipeEventKind) {
             self.events().pop().expect("at least one event")
         }
         fn pipe_state(&self, cli_id: &str) -> Option<FakePipeState> {
             self.pipe_states.get(cli_id).copied()
+        }
+
+        fn take_list_response(&mut self) -> bool {
+            std::mem::take(&mut self.list_response_pending)
         }
     }
 
@@ -1049,13 +1082,16 @@ mod tests {
         fn subscribe(&mut self, _events: &[EventType]) {}
         fn list_clients(&mut self) {
             self.lists += 1;
+            if self.list_clients_ready {
+                self.list_response_pending = true;
+            }
         }
         fn plugin_ids(&mut self) -> PluginIds {
             PluginIds {
                 plugin_id: self.plugin_id,
                 zellij_pid: 1000,
                 initial_cwd: PathBuf::from("/tmp"),
-                client_id: 3,
+                client_id: 5,
             }
         }
         fn pane_cwd(&mut self, pane: PaneId) -> Option<PathBuf> {
@@ -1097,16 +1133,21 @@ mod tests {
 
     const EVENT_NAME: &str = "muxe-event-alpha";
     const EVENT_CLI: &str = "event-cli-uuid-1";
+    const EVENT_CLI_TWO: &str = "event-cli-uuid-2";
     const REQUEST_NAME: &str = "muxe-request-alpha";
     const REQUEST_CLI: &str = "request-cli-uuid-9";
 
-    fn clients_current(pane: PaneId) -> Vec<ClientInfo> {
+    fn clients_for(client_id: u16, pane: PaneId) -> Vec<ClientInfo> {
         vec![ClientInfo {
-            client_id: 5,
+            client_id,
             pane_id: pane,
             running_command: String::new(),
             is_current_client: true,
         }]
+    }
+
+    fn clients_current(pane: PaneId) -> Vec<ClientInfo> {
+        clients_for(5, pane)
     }
 
     fn mode_info(mode: InputMode) -> ModeInfo {
@@ -1143,14 +1184,18 @@ mod tests {
         }
     }
 
-    fn subscribe_msg() -> PipeMessage {
+    fn subscribe_msg_for(cli_id: &str) -> PipeMessage {
         PipeMessage {
-            source: PipeSource::Cli(EVENT_CLI.to_owned()),
+            source: PipeSource::Cli(cli_id.to_owned()),
             name: EVENT_NAME.to_owned(),
             payload: Some("{\"muxe\":\"subscribe\"}".to_owned()),
             args: BTreeMap::new(),
             is_private: false,
         }
+    }
+
+    fn subscribe_msg() -> PipeMessage {
+        subscribe_msg_for(EVENT_CLI)
     }
 
     /// Full startup through the real host sequence: load (no privileged
@@ -1229,12 +1274,8 @@ mod tests {
         let mut host = FakeHost::new();
         bridge.load(&mut host);
         assert_eq!(host.lists, 0);
-        // Identity data and subscription arrive, but without a grant no
-        // query issues and nothing registers.
-        bridge.update(
-            Event::ListClients(clients_current(PaneId::Terminal(2))),
-            &mut host,
-        );
+        // A subscription alone cannot register without an authorized
+        // anchor-matching census.
         bridge.pipe(subscribe_msg(), &mut host);
         assert_eq!(host.lists, 0);
         assert_eq!(bridge.active_registration(), None);
@@ -1242,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn denied_grant_never_queries_or_registers() {
+    fn denied_grant_without_identity_never_registers() {
         let mut bridge = Bridge::default();
         let mut host = FakeHost::new();
         bridge.load(&mut host);
@@ -1250,10 +1291,6 @@ mod tests {
             Event::PermissionRequestResult(PermissionStatus::Denied),
             &mut host,
         );
-        bridge.update(
-            Event::ListClients(clients_current(PaneId::Terminal(2))),
-            &mut host,
-        );
         bridge.pipe(subscribe_msg(), &mut host);
         assert_eq!(host.lists, 0);
         assert_eq!(bridge.active_registration(), None);
@@ -1261,19 +1298,68 @@ mod tests {
     }
 
     #[test]
-    fn repeated_grant_queries_exactly_once() {
+    fn foreign_grant_and_census_cannot_register_before_anchor_match() {
         let mut bridge = Bridge::default();
         let mut host = FakeHost::new();
         bridge.load(&mut host);
+        bridge.pipe(subscribe_msg(), &mut host);
+
+        // Two consecutive grants arrive while this plugin's identity is
+        // unverified. The first query is unavailable; the second must still
+        // query after the host makes the actual permission usable.
         bridge.update(
             Event::PermissionRequestResult(PermissionStatus::Granted),
             &mut host,
         );
+        assert!(!host.take_list_response());
+        host.list_clients_ready = true;
         bridge.update(
             Event::PermissionRequestResult(PermissionStatus::Granted),
             &mut host,
         );
-        assert_eq!(host.lists, 1);
+        assert!(host.take_list_response());
+
+        // A later foreign denial cannot erase the actual query's pending
+        // authorization; the anchor-matching census below confirms it.
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Denied),
+            &mut host,
+        );
+
+        // A replayed census for another client is ignored, even though it
+        // marks that client current in its own plugin instance.
+        bridge.update(
+            Event::ListClients(clients_for(6, PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert_eq!(bridge.client_identity(), None);
+        assert_eq!(bridge.active_registration(), None);
+        assert!(host.outputs.is_empty());
+
+        // Only this plugin's anchored client census authorizes registration.
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.active_registration(), Some([7; 16]));
+        assert_eq!(host.register_client_ids(EVENT_CLI), vec!["5".to_owned()]);
+    }
+
+    #[test]
+    fn verified_identity_survives_foreign_denial_for_new_subscription() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Denied),
+            &mut host,
+        );
+        bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
+        assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.active_registration(), Some([8; 16]));
+        assert_eq!(
+            host.register_client_ids(EVENT_CLI_TWO),
+            vec!["5".to_owned()]
+        );
     }
 
     #[test]
