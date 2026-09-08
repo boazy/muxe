@@ -75,6 +75,8 @@ pub trait HostEffects {
     fn pane_cwd(&mut self, pane: PaneId) -> Option<PathBuf>;
     /// Writes one event line to the CLI child with this source UUID.
     fn pipe_output(&mut self, cli_id: &str, line: &str);
+    /// Blocks the CLI child with this source UUID until an explicit release.
+    fn block_pipe(&mut self, cli_id: &str);
     /// Unblocks the CLI child with this source UUID.
     fn unblock_pipe(&mut self, cli_id: &str);
     /// Requests a host input-mode change.
@@ -114,6 +116,9 @@ impl HostEffects for ShimEffects {
 
     fn pipe_output(&mut self, cli_id: &str, line: &str) {
         cli_pipe_output(cli_id, line);
+    }
+    fn block_pipe(&mut self, cli_id: &str) {
+        block_cli_pipe_input(cli_id);
     }
 
     fn unblock_pipe(&mut self, cli_id: &str) {
@@ -470,6 +475,7 @@ impl Bridge {
         }
         self.pending = None;
         self.pending_actions.clear();
+        effects.block_pipe(&cli_id);
         self.event_cli_id = Some(cli_id);
         self.pending_subscribe = true;
         self.try_register(effects);
@@ -975,6 +981,8 @@ mod tests {
     struct FakeHost {
         outputs: Vec<(String, String)>,
         unblocks: Vec<String>,
+        output_states: Vec<(String, Option<FakePipeState>)>,
+        pipe_states: BTreeMap<String, FakePipeState>,
         modes: Vec<InputMode>,
         focused: Vec<PaneId>,
         timers: u32,
@@ -989,6 +997,8 @@ mod tests {
             Self {
                 outputs: Vec::new(),
                 unblocks: Vec::new(),
+                output_states: Vec::new(),
+                pipe_states: BTreeMap::new(),
                 modes: Vec::new(),
                 focused: Vec::new(),
                 timers: 0,
@@ -1012,6 +1022,9 @@ mod tests {
         fn last_event(&self) -> (u64, PipeEventKind) {
             self.events().pop().expect("at least one event")
         }
+        fn pipe_state(&self, cli_id: &str) -> Option<FakePipeState> {
+            self.pipe_states.get(cli_id).copied()
+        }
     }
 
     impl HostEffects for FakeHost {
@@ -1033,9 +1046,17 @@ mod tests {
         }
         fn pipe_output(&mut self, cli_id: &str, line: &str) {
             self.outputs.push((cli_id.to_owned(), line.to_owned()));
+            self.output_states
+                .push((cli_id.to_owned(), self.pipe_state(cli_id)));
+        }
+        fn block_pipe(&mut self, cli_id: &str) {
+            self.pipe_states
+                .insert(cli_id.to_owned(), FakePipeState::Blocked);
         }
         fn unblock_pipe(&mut self, cli_id: &str) {
             self.unblocks.push(cli_id.to_owned());
+            self.pipe_states
+                .insert(cli_id.to_owned(), FakePipeState::Released);
         }
         fn switch_mode(&mut self, mode: InputMode) {
             self.modes.push(mode);
@@ -1472,5 +1493,62 @@ mod tests {
         let (_, event) = host.last_event();
         assert!(matches!(event, PipeEventKind::Heartbeat { .. }));
         assert!(host.timers >= 2);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakePipeState {
+        Blocked,
+        Released,
+    }
+
+    #[test]
+    fn event_pipe_stays_blocked_across_later_output() {
+        let (mut bridge, mut host) = boot();
+        assert_eq!(host.pipe_state(EVENT_CLI), Some(FakePipeState::Blocked));
+        host.outputs.clear();
+
+        bridge.update(Event::Timer(5.0), &mut host);
+
+        assert!(
+            host.outputs.iter().any(|(target, line)| {
+                target == EVENT_CLI
+                    && matches!(
+                        decode_event_line(line)
+                            .expect("typed heartbeat frame")
+                            .event,
+                        PipeEventKind::Heartbeat { .. }
+                    )
+            }),
+            "later heartbeat output must target the held event source"
+        );
+        assert!(
+            host.output_states
+                .iter()
+                .filter(|(target, _)| target == EVENT_CLI)
+                .all(|(_, state)| *state == Some(FakePipeState::Blocked)),
+            "event output must be emitted only after its source is blocked"
+        );
+        assert_eq!(host.pipe_state(EVENT_CLI), Some(FakePipeState::Blocked));
+        assert!(
+            host.unblocks.is_empty(),
+            "later event output must not release the event source"
+        );
+    }
+
+    #[test]
+    fn request_release_does_not_release_event_pipe() {
+        let (mut bridge, mut host) = boot();
+
+        bridge.pipe(
+            request_msg(BridgeRequest::Dispatch {
+                execution: "request-release".to_owned(),
+                command: RawNativeCommand::CloseFocus,
+            }),
+            &mut host,
+        );
+
+        assert_eq!(host.pipe_state(REQUEST_CLI), Some(FakePipeState::Released));
+        assert_eq!(host.pipe_state(EVENT_CLI), Some(FakePipeState::Blocked));
+        assert_eq!(host.unblocks.as_slice(), [REQUEST_CLI]);
     }
 }

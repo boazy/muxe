@@ -70,9 +70,10 @@ use sha2::{Digest, Sha256};
 use support::{
     ContinuityGuard, OwnedChild, OwnedHerdrServer, OwnedZellijHost, ServedBroker,
     assert_broker_serving, assert_no_preserved_journals, await_activate, await_session_ready,
-    await_target_ready, drive_activate, init_shared_dirs, input_path, install_zellij_integration,
-    installed_version, installed_wasm_digest, poll_until, read_broker_record, retire_broker,
-    short_tempdir, spawn_activate, spawn_serve_herdr, spawn_serve_zellij, validate_installation,
+    await_target_ready, drive_activate, emit_owned_host_log_tails, init_shared_dirs, input_path,
+    install_zellij_integration, installed_version, installed_wasm_digest, poll_until,
+    read_broker_record, retire_broker, short_tempdir, spawn_activate, spawn_serve_herdr,
+    spawn_serve_zellij, validate_installation,
 };
 
 /// Bounded wait for one barrier file to appear.
@@ -197,6 +198,7 @@ impl Rig {
                 Err(error) => note(error),
             }
         }
+        emit_owned_host_log_tails(context, &self.cache_dir, &self.scoped_root.join("tmp"));
         if errors.is_empty() {
             Ok(())
         } else {

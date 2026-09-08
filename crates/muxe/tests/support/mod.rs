@@ -11,7 +11,7 @@
 
 mod scoped_env;
 pub use scoped_env::{apply_scoped_env, ensure_scoped_dirs, scoped_env_vec};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -205,6 +205,89 @@ impl PipeTail {
     pub fn lossy(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
+}
+
+/// Emits bounded tails from the owned native audit log and pinned Zellij host
+/// log before the caller drops its `TempDir`. Missing logs are normal; symlinks,
+/// non-regular files, and paths resolving outside the supplied owned roots are
+/// ignored.
+pub fn emit_owned_host_log_tails(context: &str, cache_dir: &Path, scoped_tmp: &Path) {
+    let mut emitted = false;
+    let native_log = cache_dir.join("logs").join("muxe.jsonl");
+    if let Some(tail) = read_owned_log_tail(&native_log, cache_dir) {
+        emitted = true;
+        eprintln!(
+            "[{context}] --- native audit log tail ({}) ---\n{tail}",
+            native_log.display()
+        );
+    }
+
+    if let Ok(entries) = std::fs::read_dir(scoped_tmp) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("zellij-") {
+                continue;
+            }
+            let zellij_log = path.join("zellij-log").join("zellij.log");
+            if let Some(tail) = read_owned_log_tail(&zellij_log, scoped_tmp) {
+                emitted = true;
+                eprintln!(
+                    "[{context}] --- Zellij host log tail ({}) ---\n{tail}",
+                    zellij_log.display()
+                );
+            }
+        }
+    }
+
+    if !emitted {
+        eprintln!(
+            "[{context}] owned native/Zellij log tails: no readable logs under {} and {}",
+            cache_dir.display(),
+            scoped_tmp.display()
+        );
+    }
+}
+
+fn read_owned_log_tail(path: &Path, root: &Path) -> Option<String> {
+    let root_metadata = std::fs::symlink_metadata(root).ok()?;
+    if root_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let relative = path.strip_prefix(root).ok()?;
+    let mut current = root.to_owned();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current).ok()?;
+        if metadata.file_type().is_symlink() {
+            return None;
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let max_bytes = u64::try_from(MAX_DIAGNOSTIC_BYTES).ok()?;
+    let max_offset = i64::try_from(MAX_DIAGNOSTIC_BYTES).ok()?;
+    let length = file.metadata().ok()?.len();
+    if length > max_bytes {
+        file.seek(SeekFrom::End(-max_offset)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Post-reap evidence for one owned child.
