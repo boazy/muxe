@@ -61,11 +61,19 @@
 #[path = "support/mod.rs"]
 mod support;
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
+use muxe_adapter_zellij::channel_names;
 use muxe_protocol::control::CompatibilityRecord;
+use muxe_zellij_protocol::{
+    BRIDGE_PROTOCOL_VERSION, BridgeRequest, BridgeTarget, MAX_PIPE_LINE_LEN, PipeEventKind,
+    PipeRequest, bridge_build_id, bridge_protocol_fingerprint, decode_event_line,
+    encode_request_line, generated_action_fingerprint, pinned_source_revision,
+};
 use sha2::{Digest, Sha256};
 use support::{
     ContinuityGuard, OwnedChild, OwnedHerdrServer, OwnedZellijHost, ServedBroker,
@@ -75,11 +83,18 @@ use support::{
     read_broker_record, retire_broker, short_tempdir, spawn_activate, spawn_serve_herdr,
     spawn_serve_zellij, validate_installation,
 };
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// Bounded wait for one barrier file to appear.
 const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
 /// Bounded wait for one transfer target to report ready.
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
+/// Bounded wait for one addressed duo origin round (release plus snapshot).
+const DUO_ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounded wait to reap one owned duo pipe child after kill.
+const DUO_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bounded wait for one owned duo pipe child's stderr drain at shutdown.
+const DUO_STDERR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Explicit human approval for live hosts. Checked before any spawn,
 /// installation probe, or host launch: without exactly `true` the test
@@ -485,6 +500,624 @@ fn stable_digest(config_file: &Path) -> io::Result<String> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
+/// One owned `zellij pipe` child for the duo scenario: retained tokio child
+/// with split stdio, spawned through the existing host-scoped environment
+/// (never the test process env, never a global). The request child carries
+/// typed outbound frames; the event child carries the single subscription.
+/// Both children are reaped before the owning Rig finishes on every path.
+struct DuoPipe {
+    tag: String,
+    child: tokio::process::Child,
+    reader: BufReader<tokio::process::ChildStdout>,
+    stdin: tokio::process::ChildStdin,
+    stderr: Option<tokio::task::JoinHandle<Vec<u8>>>,
+}
+
+/// Spawns one owned pipe child with the production argv shape
+/// (`zellij --session <s> pipe --name <pipe> [-- payload]`) under the
+/// existing scoped spawn path. `SubprocessChannel::launch` is deliberately
+/// not used: it inherits the test process env, which is not the owned
+/// Rig's host/scoped env.
+async fn spawn_duo_pipe(
+    host: &OwnedZellijHost,
+    scoped_root: &Path,
+    zellij_binary: &Path,
+    session: &str,
+    pipe_name: &str,
+    initial_payload: Option<&str>,
+    tag: &str,
+) -> io::Result<DuoPipe> {
+    let mut command = tokio::process::Command::new(zellij_binary);
+    command
+        .arg("--session")
+        .arg(session)
+        .arg("pipe")
+        .arg("--name")
+        .arg(pipe_name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(payload) = initial_payload {
+        command.arg("--").arg(payload);
+    }
+    host.apply_host_scoped_env(&mut command, scoped_root);
+    command.current_dir(scoped_root);
+    let mut child = command.spawn().map_err(|error| {
+        io::Error::other(format!("{tag}: cannot spawn zellij pipe child: {error}"))
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other(format!("{tag}: pipe child has no stdin")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other(format!("{tag}: pipe child has no stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other(format!("{tag}: pipe child has no stderr")))?;
+    // Continuously drained fixed-cap tail: no stream buffer grows without
+    // bound, mirroring the production stderr tail cap.
+    let stderr_drain = tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut tail: VecDeque<u8> = VecDeque::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Err(_) | Ok(0) => break,
+                Ok(count) => {
+                    tail.extend(chunk[..count].iter().copied());
+                    while tail.len() > 4096 {
+                        tail.pop_front();
+                    }
+                }
+            }
+        }
+        tail.into_iter().collect::<Vec<u8>>()
+    });
+    Ok(DuoPipe {
+        tag: tag.to_owned(),
+        child,
+        reader: BufReader::new(stdout),
+        stdin,
+        stderr: Some(stderr_drain),
+    })
+}
+
+/// Sends one typed request frame on the owned request pipe.
+async fn duo_send_request_line(pipe: &mut DuoPipe, line: &str) -> io::Result<()> {
+    // The encoded frame is already newline-terminated; a second newline
+    // would send a blank request no bridge unblocks.
+    let tag = pipe.tag.as_str();
+    pipe.stdin
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|error| io::Error::other(format!("{tag}: request pipe write failed: {error}")))?;
+    pipe.stdin
+        .flush()
+        .await
+        .map_err(|error| io::Error::other(format!("{tag}: request pipe flush failed: {error}")))?;
+    Ok(())
+}
+/// Reads one newline-delimited event under the protocol's per-line bound.
+/// `fill_buf`/`consume` preserves coalesced lines in `BufReader` while the
+/// accumulated current line remains bounded before every read.
+async fn duo_next_event_line(
+    pipe: &mut DuoPipe,
+    timeout: std::time::Duration,
+) -> io::Result<String> {
+    let tag = pipe.tag.as_str();
+    tokio::time::timeout(timeout, async {
+        let mut line = Vec::new();
+        loop {
+            let available = pipe.reader.fill_buf().await?;
+            if available.is_empty() {
+                return Err(io::Error::other(format!("{tag}: event pipe child exited")));
+            }
+            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                if line.len() + newline + 1 > MAX_PIPE_LINE_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{tag}: event line exceeds bound"),
+                    ));
+                }
+                line.extend_from_slice(&available[..newline]);
+                pipe.reader.consume(newline + 1);
+                return String::from_utf8(line).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{tag}: event line is not UTF-8: {error}"),
+                    )
+                });
+            }
+            if line.len() + available.len() + 1 > MAX_PIPE_LINE_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{tag}: event line exceeds bound before any newline"),
+                ));
+            }
+            let count = available.len();
+            line.extend_from_slice(available);
+            pipe.reader.consume(count);
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{tag}: timed out waiting for an event line"),
+        )
+    })?
+}
+
+/// Reaps one owned pipe child: kill, bounded wait, then the bounded stderr
+/// tail for diagnostics. Production close discipline, owned here so no
+/// global pipe state is touched.
+async fn shutdown_duo_pipe(pipe: &mut DuoPipe) -> io::Result<()> {
+    let tag = pipe.tag.as_str();
+    let _ = pipe.child.start_kill();
+    let reap = match tokio::time::timeout(DUO_REAP_TIMEOUT, pipe.child.wait()).await {
+        Ok(Ok(status)) => {
+            eprintln!("[{tag}] reaped pipe child ({status})");
+            Ok(())
+        }
+        Ok(Err(error)) => Err(io::Error::other(format!(
+            "{tag}: pipe child reap failed: {error}"
+        ))),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{tag}: pipe child did not exit within {DUO_REAP_TIMEOUT:?}"),
+        )),
+    };
+    let stderr = match pipe.stderr.take() {
+        None => Ok(()),
+        Some(mut task) => match tokio::time::timeout(DUO_STDERR_TIMEOUT, &mut task).await {
+            Ok(Ok(tail)) => {
+                if !tail.is_empty() {
+                    // The drain already caps at 4096 bytes; convert the bytes whole so
+                    // no char-boundary slicing can panic before Rig teardown.
+                    eprintln!("[{tag}] stderr tail:\n{}", String::from_utf8_lossy(&tail));
+                }
+                Ok(())
+            }
+            Ok(Err(error)) => Err(io::Error::other(format!(
+                "{tag}: stderr drain failed: {error}"
+            ))),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{tag}: stderr drain did not exit within {DUO_STDERR_TIMEOUT:?}"),
+                ))
+            }
+        },
+    };
+    combine_body_and_cleanup(reap, stderr)
+}
+
+/// Deterministic, scenario-unique correlation IDs for waiter routing.
+/// These IDs are protocol correlation values, not security entropy.
+fn duo_request_id(counter: u64) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(b"duoroute");
+    id[8..].copy_from_slice(&counter.to_be_bytes());
+    id
+}
+
+/// Simultaneous two-client regression on a second fresh Rig: two real PTY
+/// clients on one session, exact-two authoritative census before admission,
+/// two anchor-bound bridge Registers, then sequential typed read-only
+/// origin queries each addressed to one (client_id, registration). No
+/// broker serves this session, so this scenario owns the only event-pipe
+/// subscription and every answer is bridge-direct. Read-only throughout:
+/// no capture, dispatch, or bridge retirement is ever sent.
+async fn run_simultaneous_two_clients() -> io::Result<()> {
+    let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
+    let herdr_binary = input_path("MUXE_HERDR_BINARY");
+    let zellij_binary = input_path("MUXE_ZELLIJ_BINARY");
+    let foreground = input_path("MUXE_ZELLIJ_FOREGROUND_BINARY");
+    let bootstrap = input_path("MUXE_ZELLIJ_BOOTSTRAP_BINARY");
+    let seeder = input_path("MUXE_ZELLIJ_PERMISSION_SEEDER");
+
+    let mut rig = bring_hosts(
+        "duo",
+        &target_bin,
+        &target_bin,
+        &herdr_binary,
+        &zellij_binary,
+        &foreground,
+        &bootstrap,
+        &seeder,
+        &[("duo", 2)],
+    )
+    .await?;
+    let result = async {
+        let Some(host) = rig.zellij.as_ref() else {
+            return Err(io::Error::other("duo: zellij host is gone"));
+        };
+        // Authoritative anchor first: exactly two live clients, never one.
+        // A one-client snapshot is a poll retry, never admission.
+        let census_deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        let anchor = loop {
+            let census = host.list_clients("duo").await.map_err(|error| {
+                io::Error::other(format!("duo: list-clients query failed: {error}"))
+            })?;
+            if census.len() == 2 {
+                break census;
+            }
+            if tokio::time::Instant::now() >= census_deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "duo: timed out waiting for exact two-client census, last saw {census:?}"
+                    ),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        eprintln!("[duo] authoritative census: {anchor:?}");
+
+        let (request_name, event_name) = channel_names("duo");
+        let mut request = spawn_duo_pipe(
+            host,
+            &rig.scoped_root,
+            &zellij_binary,
+            "duo",
+            &request_name,
+            None,
+            "duo-request",
+        )
+        .await?;
+        let mut event = match spawn_duo_pipe(
+            host,
+            &rig.scoped_root,
+            &zellij_binary,
+            "duo",
+            &event_name,
+            Some(&format!(
+                "{{\"muxe\":\"subscribe\",\"protocol\":{BRIDGE_PROTOCOL_VERSION}}}"
+            )),
+            "duo-event",
+        )
+        .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                let shutdown = shutdown_duo_pipe(&mut request).await;
+                return combine_body_and_cleanup(Err(error), shutdown);
+            }
+        };
+
+        let body = duo_probe_rounds(&anchor, &mut request, &mut event).await;
+        let shutdown = combine_body_and_cleanup(
+            shutdown_duo_pipe(&mut request).await,
+            shutdown_duo_pipe(&mut event).await,
+        );
+        combine_body_and_cleanup(body, shutdown)
+    }
+    .await;
+    rig.finish("duo", result).await
+}
+
+/// Census coverage plus addressed routing for the duo scenario. First awaits
+/// fresh compatible Registers covering exactly the anchor members (foreign
+/// IDs are stale native coverage and ignored); then sends one sequential
+/// read-only origin query per member addressed to its (client_id, registration)
+/// and requires both the transport release and the origin snapshot to agree
+/// on the owner. Release and snapshot may arrive in either order; duplicates,
+/// wrong owners, wrong requests, and UI-session mismatches all fail closed.
+async fn duo_probe_rounds(
+    anchor: &[String],
+    request: &mut DuoPipe,
+    event: &mut DuoPipe,
+) -> io::Result<()> {
+    let coverage_deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    let mut registrations: BTreeMap<String, ([u8; 16], String)> = BTreeMap::new();
+    while registrations.len() < anchor.len() {
+        let remaining = coverage_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "duo: timed out awaiting census coverage, anchor is {anchor:?}, registered {:?}",
+                    registrations.keys().collect::<Vec<_>>(),
+                ),
+            ));
+        }
+        let line = duo_next_event_line(event, remaining).await?;
+        let frame = decode_event_line(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duo: cannot decode event line: {error}"),
+            )
+        })?;
+        match frame.event {
+            PipeEventKind::Register {
+                client_id,
+                current_pane,
+                registration,
+                identity,
+                ..
+            } => {
+                if !anchor.contains(&client_id) {
+                    continue;
+                }
+                if registration == [0; 16] {
+                    return Err(io::Error::other(format!(
+                        "duo: zero registration for client {client_id:?}"
+                    )));
+                }
+                if !(identity.bridge_build_id == Some(bridge_build_id())
+                    && identity.source_revision == pinned_source_revision()
+                    && identity.action_fingerprint == generated_action_fingerprint().0
+                    && identity.protocol_fingerprint == bridge_protocol_fingerprint().0)
+                {
+                    return Err(io::Error::other(format!(
+                        "duo: incompatible bridge handshake for client {client_id:?}"
+                    )));
+                }
+                if identity.muxe_version != env!("CARGO_PKG_VERSION") {
+                    return Err(io::Error::other(format!(
+                        "duo: bridge version {:?} does not match target {:?} for client {client_id:?}",
+                        identity.muxe_version,
+                        env!("CARGO_PKG_VERSION"),
+                    )));
+                }
+                let Some(current_pane) = current_pane else {
+                    return Err(io::Error::other(format!(
+                        "duo: no focused-pane anchor for client {client_id:?}, cannot address an origin query"
+                    )));
+                };
+                if let Some((previous, _)) = registrations.get(&client_id) {
+                    eprintln!(
+                        "[duo] superseding registration for client {client_id:?} (previous {previous:?})"
+                    );
+                }
+                registrations.insert(client_id, (registration, current_pane));
+            }
+            PipeEventKind::Heartbeat { client_id, .. } => {
+                if !anchor.contains(&client_id) {
+                    continue;
+                }
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "duo: unexpected event while awaiting census coverage: {other:?}"
+                )));
+            }
+        }
+    }
+    let targets: Vec<(String, [u8; 16])> = anchor
+        .iter()
+        .map(|client| {
+            let (registration, _) = registrations.get(client).ok_or_else(|| {
+                io::Error::other(format!("duo: anchor member {client:?} never registered"))
+            })?;
+            Ok((client.clone(), *registration))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if targets[0].1 == targets[1].1 {
+        return Err(io::Error::other(format!(
+            "duo: both clients share registration {:?}",
+            targets[0].1
+        )));
+    }
+    eprintln!(
+        "[duo] census covered: {:?}",
+        targets
+            .iter()
+            .map(|(client, registration)| format!("{client}={registration:?}"))
+            .collect::<Vec<_>>(),
+    );
+
+    for (index, (client_id, registration)) in targets.iter().enumerate() {
+        let (_, current_pane) = registrations.get(client_id).ok_or_else(|| {
+            io::Error::other(format!(
+                "duo: anchor member {client_id:?} lost its pane anchor"
+            ))
+        })?;
+        let request_id = duo_request_id(index as u64 + 1);
+        let ui_session = format!("duo-route-{client_id}");
+        let outbound = PipeRequest {
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            request_id,
+            channel_generation: 1,
+            target: BridgeTarget {
+                client_id: client_id.clone(),
+                registration: *registration,
+            },
+            payload: BridgeRequest::RequestOrigin {
+                ui_session: ui_session.clone(),
+                ui_pane: current_pane.clone(),
+            },
+        };
+        let line = encode_request_line(&outbound).map_err(|error| {
+            io::Error::other(format!("duo: cannot encode origin request: {error}"))
+        })?;
+        let round_deadline = tokio::time::Instant::now() + DUO_ROUTE_TIMEOUT;
+        let send_remaining = round_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let send_result =
+            tokio::time::timeout(send_remaining, duo_send_request_line(request, &line))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("duo: timed out sending routed origin for client {client_id:?}"),
+                    )
+                })?;
+        send_result?;
+        let mut released = false;
+        let mut snapshot = false;
+        while !(released && snapshot) {
+            let remaining = round_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "duo: timed out awaiting routed origin for client {client_id:?} (released={released}, snapshot={snapshot})"
+                    ),
+                ));
+            }
+            let line = duo_next_event_line(event, remaining).await?;
+            let frame = decode_event_line(&line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("duo: cannot decode event line: {error}"),
+                )
+            })?;
+            match frame.event {
+                PipeEventKind::RequestReleased {
+                    request_id: got,
+                    channel_generation,
+                    registration: got_registration,
+                } => {
+                    if got != request_id {
+                        return Err(io::Error::other(format!(
+                            "duo: release for wrong request {got:?} while routing client {client_id:?}"
+                        )));
+                    }
+                    if got_registration != *registration {
+                        return Err(io::Error::other(format!(
+                            "duo: release from wrong owner {got_registration:?} for client {client_id:?}"
+                        )));
+                    }
+                    if channel_generation != 1 {
+                        return Err(io::Error::other(format!(
+                            "duo: release on wrong generation {channel_generation} for client {client_id:?}"
+                        )));
+                    }
+                    if released {
+                        return Err(io::Error::other(format!(
+                            "duo: duplicate release for client {client_id:?}"
+                        )));
+                    }
+                    released = true;
+                }
+                PipeEventKind::OriginSnapshot {
+                    ui_session: got_session,
+                    origin,
+                } => {
+                    if got_session != ui_session {
+                        return Err(io::Error::other(format!(
+                            "duo: snapshot for wrong UI session {got_session:?} while routing client {client_id:?}"
+                        )));
+                    }
+                    if origin.client_id != *client_id {
+                        return Err(io::Error::other(format!(
+                            "duo: snapshot for wrong client {:?} while routing client {client_id:?}",
+                            origin.client_id
+                        )));
+                    }
+                    if origin.ui_pane_id != *current_pane {
+                        return Err(io::Error::other(format!(
+                            "duo: snapshot echoes wrong UI pane {:?} for client {client_id:?}",
+                            origin.ui_pane_id
+                        )));
+                    }
+                    if snapshot {
+                        return Err(io::Error::other(format!(
+                            "duo: duplicate snapshot for client {client_id:?}"
+                        )));
+                    }
+                    snapshot = true;
+                }
+                PipeEventKind::OriginDeclined {
+                    ui_session: got_session,
+                    request_id: got,
+                    registration: got_registration,
+                } => {
+                    return Err(io::Error::other(format!(
+                        "duo: owner declined its own pane (session {got_session:?}, request {got:?}, owner {got_registration:?}) for client {client_id:?}"
+                    )));
+                }
+                PipeEventKind::Heartbeat {
+                    client_id: beat, ..
+                } => {
+                    if !anchor.contains(&beat) {
+                        continue;
+                    }
+                }
+                PipeEventKind::Register { client_id: re, .. } => {
+                    if !anchor.contains(&re) {
+                        continue;
+                    }
+                    return Err(io::Error::other(format!(
+                        "duo: unexpected re-registration for client {re:?} while routing client {client_id:?}"
+                    )));
+                }
+                other => {
+                    return Err(io::Error::other(format!(
+                        "duo: unexpected event while routing client {client_id:?}: {other:?}"
+                    )));
+                }
+            }
+        }
+        eprintln!("[duo] routed origin for client {client_id:?}: release plus snapshot agree");
+    }
+    // Let the protocol drain through the next heartbeat from both active
+    // anchors. This catches queued duplicate replies after the final route
+    // while keeping the boundary bounded by the existing route timeout.
+    let heartbeat_deadline = tokio::time::Instant::now() + DUO_ROUTE_TIMEOUT;
+    let mut heartbeats = BTreeSet::new();
+    while heartbeats.len() < targets.len() {
+        let remaining = heartbeat_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("duo: timed out awaiting post-route heartbeats, observed {heartbeats:?}"),
+            ));
+        }
+        let line = duo_next_event_line(event, remaining).await?;
+        let frame = decode_event_line(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duo: cannot decode post-route event line: {error}"),
+            )
+        })?;
+        match frame.event {
+            PipeEventKind::Heartbeat {
+                client_id,
+                registration,
+            } => {
+                if !anchor.contains(&client_id) {
+                    continue;
+                }
+                let Some((active_registration, _)) = registrations.get(&client_id) else {
+                    continue;
+                };
+                if registration == *active_registration {
+                    heartbeats.insert(client_id);
+                }
+            }
+            PipeEventKind::Register { client_id, .. } => {
+                if !anchor.contains(&client_id) {
+                    continue;
+                }
+                return Err(io::Error::other(format!(
+                    "duo: unexpected re-registration for active client {client_id:?} after routing"
+                )));
+            }
+            PipeEventKind::OriginSnapshot { .. }
+            | PipeEventKind::RequestReleased { .. }
+            | PipeEventKind::OriginDeclined { .. } => {
+                return Err(io::Error::other(
+                    "duo: unexpected duplicate routed response after final origin",
+                ));
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "duo: unexpected event while awaiting post-route heartbeats: {other:?}"
+                )));
+            }
+        }
+    }
+    eprintln!("[duo] post-route heartbeats observed for both active anchors");
+    Ok(())
+}
+
 async fn run_target_only_smoke() -> io::Result<()> {
     let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
     let target_version = installed_version(&target_bin).await?;
@@ -543,7 +1176,11 @@ async fn run_target_only_smoke() -> io::Result<()> {
         Ok(())
     }
     .await;
-    rig.finish("smoke", result).await
+    // The one-client activation scenario above is unchanged; the same exact
+    // test then runs the simultaneous two-client regression on a second
+    // fresh Rig under its own case label.
+    rig.finish("smoke", result).await?;
+    run_simultaneous_two_clients().await
 }
 
 /// Drives one public-`activate` transfer and asserts every endpoint serves

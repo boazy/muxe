@@ -208,7 +208,9 @@ jobs:
         # explicit-endpoint smoke runner (live_hosts::target_only_smoke,
         # both pinned hosts, real foreground bootstrap plus scoped PTY
         # clients) runs here with complete typed inputs against the staged
-        # installation above. Authorization comes from the
+        # installation above. The test first proves one-client activation,
+        # then runs the two-client read-only routing regression on a fresh
+        # owned Rig. Authorization comes from the
         # ALLOW_LIVE_HOST_MATRIX guard at the top of this job; this step
         # adds no approval of its own. The runner determines pass or fail:
         # installs above never pass the gate alone, and any missing
@@ -238,7 +240,7 @@ jobs:
           MUXE_ZELLIJ_BOOTSTRAP_BINARY="$fx/muxe-zellij-bootstrap" \
           MUXE_ZELLIJ_PERMISSION_SEEDER="$fx/muxe-zellij-permit" \
           MUXE_LIVE_HOSTS_APPROVED=true \
-          mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
+          mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke --show-output
 
   benches:
     name: benchmarks (non-blocking)
@@ -413,8 +415,10 @@ jobs:
         # The repo-owned retained-child explicit-endpoint smoke runner
         # (live_hosts::target_only_smoke, both pinned hosts, real
         # foreground bootstrap plus scoped PTY clients) runs here with
-        # complete typed inputs. This job's own environment expresses
-        # the intended authorization (MUXE_LIVE_HOSTS_APPROVED=true);
+        # complete typed inputs. The test first proves one-client
+        # activation, then runs the two-client read-only routing regression
+        # on a fresh owned Rig. This job's environment expresses the
+        # intended authorization (MUXE_LIVE_HOSTS_APPROVED=true);
         # any missing capability or input fails, never skips green.
         # No predecessor belongs in PR smoke: the preceding-to-target
         # upgrade matrix is release scope (release.yml live-upgrade).
@@ -438,4 +442,4 @@ jobs:
           MUXE_ZELLIJ_FOREGROUND_BINARY="$fx/muxe-zellij-foreground" \
           MUXE_ZELLIJ_BOOTSTRAP_BINARY="$fx/muxe-zellij-bootstrap" \
           MUXE_ZELLIJ_PERMISSION_SEEDER="$fx/muxe-zellij-permit" \
-          mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
+          mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke --show-output
