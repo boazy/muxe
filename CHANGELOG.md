@@ -2,5 +2,8 @@
 
 ## Unreleased
 
-- Fix Zellij bridge permission replay and client census handling so grants are anchored to the receiving plugin client and foreign client records cannot authorize registration.
-- Fix simultaneous Zellij client routing by requiring each origin response to match both its client ID and registration.
+- Preserve line-delimited Zellij event frames and keep subscribed CLI pipes held for their lifetime so event streams are not truncated or released prematurely.
+- Subscribe to cached permission results and confirm the active bridge client from `PluginIds.client_id` census data before registration.
+- Share the full 11-permission fixture grant contract between the protocol and live runner.
+- Fix fixture activation to invoke the public `muxe activate` subcommand.
+- Add two-client target-only read-only routing coverage and owned failure-log capture.

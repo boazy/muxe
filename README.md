@@ -425,9 +425,9 @@ Test suites and their required inputs:
 
 The target-only smoke covers two current-target scenarios:
 
-- A one-client activation starts one client on each pinned host, activates the same-version target installation, and checks the resulting Herdr and Zellij broker identities.
+- A one-client activation starts both pinned hosts and one Zellij PTY client, invokes same-version `muxe activate`, and checks both broker identities.
 - A fresh two-client Zellij rig performs read-only typed origin routing. It verifies exact two-client census coverage, routes requests by `(client_id, registration)`, matches each release with its origin snapshot, and observes post-route heartbeats from both clients.
 
 CI supplies the pinned host binaries and the explicit `MUXE_LIVE_HOSTS_APPROVED=true` authorization for these live checks. They are not part of the default local test command and must not use local default host state.
 
-CI runs `target_only_smoke` as a real target-only smoke on Linux pull requests and as a required current-target gate on all four release architectures. Missing inputs or approvals fail the gate. The real cross-release upgrade, rollback, and fault matrix remains deferred until the first genuine published predecessor; see [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Passing fixture-only suites never stand in for the required target-only live run.
+CI runs `target_only_smoke` as a real target-only smoke on Linux pull requests. Manual dispatches and the weekly schedule run the full matrix on Ubuntu and macOS. The release workflow runs the current-target gate on all four release architectures. Missing inputs or approvals fail the gate. The real cross-release upgrade, rollback, and fault matrix remains deferred until the first genuine published predecessor; see [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Passing fixture-only suites never stand in for the required target-only live run.
