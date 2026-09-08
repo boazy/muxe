@@ -42,7 +42,7 @@ PROMPT_STYLE: Final = questionary.Style(
         ("answer", "fg:#5fffd7 bold"),
         ("pointer", "fg:#ffaf5f bold"),
         ("highlighted", "fg:#0b0f14 bg:#5fffd7 bold"),
-        ("selected", "fg:#5fffd7"),
+        ("selected", "fg:#f0f0f0"),
         ("instruction", "fg:#808080 italic"),
         ("text", "fg:#f0f0f0"),
     ]
@@ -151,7 +151,6 @@ def choose_bump(version: str) -> str:
             Choice(f"mi[n]or  →  {versions['minor']}", value="minor"),
             Choice(f"[p]atch  →  {versions['patch']}", value="patch"),
         ],
-        default="patch",
         use_arrow_keys=True,
         instruction="(Use arrow keys + Enter, or m/n/p)",
         style=PROMPT_STYLE,
@@ -269,30 +268,66 @@ def github_action_checks(repository: str, commit: str) -> list[dict[str, Any]]:
     return checks
 
 
+def confirm_ci_override(failing_checks: list[str]) -> None:
+    summary = Text("CI checks are not green: ", style="bold yellow")
+    summary.append(", ".join(failing_checks))
+    CONSOLE.print(
+        Panel.fit(
+            summary,
+            title=Text("Release gate failed", style="bold red"),
+            border_style="yellow",
+            padding=(1, 2),
+        )
+    )
+    if not sys.stdin.isatty():
+        fail("CI override requires an interactive terminal")
+
+    decision = questionary.select(
+        "Continue despite the CI result?",
+        choices=[
+            Choice("Stop", value="stop"),
+            Choice("Continue", value="continue"),
+        ],
+        default="stop",
+        use_arrow_keys=True,
+        instruction="(Default: Stop)",
+        style=PROMPT_STYLE,
+    ).ask()
+    if decision != "continue":
+        fail("Release stopped because GitHub Actions checks are not green")
+    CONSOLE.print(
+        "[bold yellow]⚠[/] Continuing despite non-green GitHub Actions checks"
+    )
+
+
 def verify_github_actions(repository: str, commit: str) -> None:
     checks = github_action_checks(repository, commit)
-    if not checks:
-        fail(f"No GitHub Actions checks exist for trunk commit {commit[:12]}")
 
     table = Table(title=f"GitHub Actions · {commit[:12]}", border_style="bright_blue")
     table.add_column("Check", style="cyan")
     table.add_column("Status")
     table.add_column("Conclusion")
-    failing: list[dict[str, Any]] = []
+    failing: list[str] = []
+    if not checks:
+        table.add_row(
+            Text("No GitHub Actions checks found"),
+            Text("missing"),
+            Text("missing", style="red"),
+        )
+        failing.append("no GitHub Actions checks found")
     for check in sorted(checks, key=lambda item: str(item.get("name", ""))):
+        name = str(check.get("name") or "unnamed")
         status = str(check.get("status") or "unknown")
         conclusion = str(check.get("conclusion") or "pending")
         accepted = status == "completed" and conclusion in {"success", "skipped"}
         color = "green" if accepted else "red"
-        table.add_row(
-            str(check.get("name") or "unnamed"), status, f"[{color}]{conclusion}[/]"
-        )
+        table.add_row(Text(name), Text(status), Text(conclusion, style=color))
         if not accepted:
-            failing.append(check)
+            failing.append(name)
     CONSOLE.print(table)
     if failing:
-        names = ", ".join(str(check.get("name") or "unnamed") for check in failing)
-        fail(f"GitHub Actions checks are not all green or skipped: {names}")
+        confirm_ci_override(failing)
+        return
     CONSOLE.print(
         "[green]✓[/] Every GitHub Actions check on trunk() is green or skipped"
     )
