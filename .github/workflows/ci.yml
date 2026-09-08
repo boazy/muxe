@@ -299,6 +299,19 @@ jobs:
       - uses: jdx/mise-action@v2
         with:
           install: true
+      - name: live-host approval opt-in (before host install)
+        # This PR job exercises the approved owned-host smoke only after the
+        # recorded repository-variable approval. The guard does not grant
+        # additional Zellij permissions or auto-accept host prompts.
+        env:
+          ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
+        run: |
+          set -euo pipefail
+          test "${ALLOW_LIVE_HOST_MATRIX:-}" = "true" || {
+            echo "BLOCKED: realhost-smoke requires recorded user approval." >&2
+            echo "Set the ALLOW_LIVE_HOST_MATRIX repository variable to \"true\" only after approval." >&2
+            exit 1
+          }
       - name: trust project tasks and assert pinned toolchain
         run: |
           set -euo pipefail
