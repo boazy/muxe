@@ -216,10 +216,7 @@ impl Rig {
     }
 }
 
-fn combine_body_and_cleanup(
-    body: io::Result<()>,
-    cleanup: io::Result<()>,
-) -> io::Result<()> {
+fn combine_body_and_cleanup(body: io::Result<()>, cleanup: io::Result<()>) -> io::Result<()> {
     match (body, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(body), Ok(())) => Err(body),
