@@ -288,7 +288,6 @@ def confirm_ci_override(failing_checks: list[str]) -> None:
             Choice("Stop", value="stop"),
             Choice("Continue", value="continue"),
         ],
-        default="stop",
         use_arrow_keys=True,
         instruction="(Default: Stop)",
         style=PROMPT_STYLE,
