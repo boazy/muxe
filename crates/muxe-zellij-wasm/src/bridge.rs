@@ -936,7 +936,11 @@ impl Bridge {
             event,
         };
         if let Ok(line) = encode_event_line(&frame) {
-            effects.pipe_output(&event_cli_id, line.trim_end());
+            // The encoded line carries its `\n` terminator: the pinned host
+            // relays `CliPipeOutput` bytes verbatim to the CLI child and the
+            // native reader frames on `\n`, so stripping it would leave every
+            // event buffered unreadably. Pass the wire bytes through intact.
+            effects.pipe_output(&event_cli_id, &line);
         }
     }
 }
@@ -1132,6 +1136,53 @@ mod tests {
         assert_eq!(bridge.client_identity(), Some("5"));
         assert_eq!(bridge.active_registration(), Some([7; 16]));
         (bridge, host)
+    }
+
+    /// The emitted Register must survive the real wire path: the pinned host
+    /// relays `CliPipeOutput` bytes verbatim (no added newline) and the
+    /// native reader only yields a line at `\n`. Stream the exact emitted
+    /// bytes through an incremental newline framer with no EOF, in odd-sized
+    /// chunks, and require the Register frame to emerge decodable. Decoding
+    /// the recorded strings whole would hide a missing terminator.
+    #[test]
+    fn emitted_register_frames_without_eof() {
+        let (_bridge, host) = boot();
+        assert!(!host.outputs.is_empty());
+        for (target, _) in &host.outputs {
+            assert_eq!(target, EVENT_CLI);
+        }
+        let stream: Vec<u8> = host
+            .outputs
+            .iter()
+            .flat_map(|(_, line)| line.bytes())
+            .collect();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut frames: Vec<String> = Vec::new();
+        for chunk in stream.chunks(7) {
+            pending.extend_from_slice(chunk);
+            while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
+                let raw: Vec<u8> = pending.drain(..=pos).collect();
+                frames.push(
+                    String::from_utf8(raw[..raw.len() - 1].to_vec()).expect("frame is UTF-8"),
+                );
+            }
+        }
+        assert!(
+            !frames.is_empty(),
+            "emitted event bytes never framed a line without EOF"
+        );
+        let first = decode_event_line(&frames[0]).expect("framed line decodes");
+        match first.event {
+            PipeEventKind::Register {
+                client_id,
+                registration,
+                ..
+            } => {
+                assert_eq!(client_id, "5");
+                assert_eq!(registration, [7; 16]);
+            }
+            other => panic!("first framed event is not Register: {other:?}"),
+        }
     }
 
     #[test]
