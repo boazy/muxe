@@ -79,7 +79,9 @@ def command(
                 CONSOLE.print(error.stdout.rstrip())
             if error.stderr:
                 CONSOLE.print(error.stderr.rstrip(), style="red")
-        fail(f"Command failed with exit code {error.returncode}: {shlex.join(arguments)}")
+        fail(
+            f"Command failed with exit code {error.returncode}: {shlex.join(arguments)}"
+        )
     return result.stdout if capture else ""
 
 
@@ -91,7 +93,9 @@ def workspace_version() -> str:
     except (KeyError, TypeError):
         fail("Cargo.toml does not define workspace.package.version")
     if not isinstance(version, str) or SEMVER_PATTERN.fullmatch(version) is None:
-        fail(f"Expected a stable MAJOR.MINOR.PATCH workspace version, found {version!r}")
+        fail(
+            f"Expected a stable MAJOR.MINOR.PATCH workspace version, found {version!r}"
+        )
     return version
 
 
@@ -112,9 +116,13 @@ def bumped_version(version: str, level: str) -> str:
 
 
 def choose_bump(version: str) -> str:
-    versions = {level: bumped_version(version, level) for level in ("major", "minor", "patch")}
+    versions = {
+        level: bumped_version(version, level) for level in ("major", "minor", "patch")
+    }
 
-    table = Table(show_header=True, header_style="bold bright_magenta", border_style="bright_blue")
+    table = Table(
+        show_header=True, header_style="bold bright_magenta", border_style="bright_blue"
+    )
     table.add_column("Hotkey", justify="center", style="bold yellow")
     table.add_column("Bump", style="bold")
     table.add_column("Result", style="bright_cyan")
@@ -132,7 +140,9 @@ def choose_bump(version: str) -> str:
     )
 
     if not sys.stdin.isatty():
-        fail("Choose a bump explicitly with --major, --minor, or --patch when stdin is not a TTY")
+        fail(
+            "Choose a bump explicitly with --major, --minor, or --patch when stdin is not a TTY"
+        )
 
     selected = questionary.select(
         "Which version should be released?",
@@ -154,9 +164,27 @@ def choose_bump(version: str) -> str:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     bump = parser.add_mutually_exclusive_group()
-    bump.add_argument("--major", dest="level", action="store_const", const="major", help="bump to the next major version")
-    bump.add_argument("--minor", dest="level", action="store_const", const="minor", help="bump to the next minor version")
-    bump.add_argument("--patch", dest="level", action="store_const", const="patch", help="bump to the next patch version")
+    bump.add_argument(
+        "--major",
+        dest="level",
+        action="store_const",
+        const="major",
+        help="bump to the next major version",
+    )
+    bump.add_argument(
+        "--minor",
+        dest="level",
+        action="store_const",
+        const="minor",
+        help="bump to the next minor version",
+    )
+    bump.add_argument(
+        "--patch",
+        dest="level",
+        action="store_const",
+        const="patch",
+        help="bump to the next patch version",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -168,14 +196,22 @@ def parse_arguments() -> argparse.Namespace:
 def verify_clean_worktree() -> None:
     diff = command(["jj", "diff", "-r", "trunk()..@"], capture=True)
     if diff.strip():
-        CONSOLE.print(Panel(diff.rstrip(), title="[bold red]trunk()..@ is not empty[/]", border_style="red"))
-        fail("Release must start from trunk() with no working-copy changes; empty commits are allowed")
+        CONSOLE.print(
+            Panel(
+                diff.rstrip(),
+                title="[bold red]trunk()..@ is not empty[/]",
+                border_style="red",
+            )
+        )
+        fail(
+            "Release must start from trunk() with no working-copy changes; empty commits are allowed"
+        )
     CONSOLE.print("[green]✓[/] Working copy has no changes relative to trunk()")
 
 
 def trunk_commit() -> str:
     commit = command(
-        ["jj", "log", "-r", "trunk()", "--no-graph", "-T", "commit_id ++ \"\\n\""],
+        ["jj", "log", "-r", "trunk()", "--no-graph", "-T", 'commit_id ++ "\\n"'],
         capture=True,
     ).strip()
     if re.fullmatch(r"[0-9a-f]{40,64}", commit) is None:
@@ -215,7 +251,11 @@ def github_action_checks(repository: str, commit: str) -> list[dict[str, Any]]:
             fail("GitHub returned an invalid check-runs response")
         if not isinstance(page_checks, list) or not isinstance(total, int):
             fail("GitHub returned an invalid check-runs response")
-        checks.extend(check for check in page_checks if check.get("app", {}).get("slug") == "github-actions")
+        checks.extend(
+            check
+            for check in page_checks
+            if check.get("app", {}).get("slug") == "github-actions"
+        )
         if len(page_checks) < 100:
             break
         page += 1
@@ -237,14 +277,18 @@ def verify_github_actions(repository: str, commit: str) -> None:
         conclusion = str(check.get("conclusion") or "pending")
         accepted = status == "completed" and conclusion in {"success", "skipped"}
         color = "green" if accepted else "red"
-        table.add_row(str(check.get("name") or "unnamed"), status, f"[{color}]{conclusion}[/]")
+        table.add_row(
+            str(check.get("name") or "unnamed"), status, f"[{color}]{conclusion}[/]"
+        )
         if not accepted:
             failing.append(check)
     CONSOLE.print(table)
     if failing:
         names = ", ".join(str(check.get("name") or "unnamed") for check in failing)
         fail(f"GitHub Actions checks are not all green or skipped: {names}")
-    CONSOLE.print("[green]✓[/] Every GitHub Actions check on trunk() is green or skipped")
+    CONSOLE.print(
+        "[green]✓[/] Every GitHub Actions check on trunk() is green or skipped"
+    )
 
 
 def cargo_release_version(level: str, *, execute: bool) -> None:
@@ -257,13 +301,17 @@ def cargo_release_version(level: str, *, execute: bool) -> None:
 def verify_release_changes(expected_version: str) -> None:
     actual_version = workspace_version()
     if actual_version != expected_version:
-        fail(f"cargo-release produced version {actual_version}, expected {expected_version}")
+        fail(
+            f"cargo-release produced version {actual_version}, expected {expected_version}"
+        )
 
     changed = set(command(["jj", "diff", "--name-only"], capture=True).splitlines())
     unexpected = changed - ALLOWED_RELEASE_FILES
     missing = ALLOWED_RELEASE_FILES - changed
     if unexpected:
-        fail(f"Release preparation changed unexpected files: {', '.join(sorted(unexpected))}")
+        fail(
+            f"Release preparation changed unexpected files: {', '.join(sorted(unexpected))}"
+        )
     if missing:
         fail(f"Release preparation did not update: {', '.join(sorted(missing))}")
 
@@ -281,7 +329,7 @@ def pre_release(level: str, expected_version: str) -> tuple[str, str, str]:
 
     command(["jj", "commit", "-m", f"release: {tag}"])
     bump_commit = command(
-        ["jj", "log", "-r", "@-", "--no-graph", "-T", "commit_id ++ \"\\n\""],
+        ["jj", "log", "-r", "@-", "--no-graph", "-T", 'commit_id ++ "\\n"'],
         capture=True,
     ).strip()
     if re.fullmatch(r"[0-9a-f]{40,64}", bump_commit) is None:
@@ -299,7 +347,9 @@ def cargo_release_publish() -> None:
 
 def wait_for_release_workflow(repository: str, commit: str) -> str:
     deadline = time.monotonic() + WORKFLOW_DISCOVERY_TIMEOUT_SECONDS
-    with CONSOLE.status("[bold cyan]Waiting for the release workflow to start…[/]", spinner="dots"):
+    with CONSOLE.status(
+        "[bold cyan]Waiting for the release workflow to start…[/]", spinner="dots"
+    ):
         while time.monotonic() < deadline:
             raw = command(
                 [
@@ -329,14 +379,22 @@ def wait_for_release_workflow(repository: str, commit: str) -> str:
             if not isinstance(runs, list):
                 fail("GitHub returned an invalid workflow-runs response")
             for run in runs:
-                if run.get("headSha") == commit and run.get("event") == "push" and run.get("url"):
+                if (
+                    run.get("headSha") == commit
+                    and run.get("event") == "push"
+                    and run.get("url")
+                ):
                     return str(run["url"])
             time.sleep(WORKFLOW_DISCOVERY_INTERVAL_SECONDS)
-    fail(f"Release workflow did not appear within {int(WORKFLOW_DISCOVERY_TIMEOUT_SECONDS)} seconds")
+    fail(
+        f"Release workflow did not appear within {int(WORKFLOW_DISCOVERY_TIMEOUT_SECONDS)} seconds"
+    )
 
 
 def post_release(repository: str, bump_commit: str, tag: str) -> str:
-    command(["jj", "git", "push", "--remote", "origin", "--bookmark", "main", "--tag", tag])
+    command(
+        ["jj", "git", "push", "--remote", "origin", "--bookmark", "main", "--tag", tag]
+    )
     workflow_url = wait_for_release_workflow(repository, bump_commit)
     CONSOLE.print(
         Panel.fit(
@@ -351,7 +409,9 @@ def post_release(repository: str, bump_commit: str, tag: str) -> str:
 def release(level: str, *, dry_run: bool) -> None:
     current_version = workspace_version()
     next_version = bumped_version(current_version, level)
-    CONSOLE.print(f"[bold]Release plan:[/] [dim]{current_version}[/] → [bold bright_cyan]{next_version}[/] ({level})")
+    CONSOLE.print(
+        f"[bold]Release plan:[/] [dim]{current_version}[/] → [bold bright_cyan]{next_version}[/] ({level})"
+    )
 
     if dry_run:
         verify_clean_worktree()
@@ -359,7 +419,9 @@ def release(level: str, *, dry_run: bool) -> None:
         repository = github_repository()
         verify_github_actions(repository, commit)
         cargo_release_version(level, execute=False)
-        CONSOLE.print("[bold green]Dry run complete.[/] No files, bookmarks, tags, or remotes were changed.")
+        CONSOLE.print(
+            "[bold green]Dry run complete.[/] No files, bookmarks, tags, or remotes were changed."
+        )
         return
 
     repository, bump_commit, tag = pre_release(level, next_version)
