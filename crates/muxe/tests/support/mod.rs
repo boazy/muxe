@@ -1283,14 +1283,15 @@ fn shell_quote(arg: &std::ffi::OsStr) -> std::ffi::OsString {
 ///
 /// One `events.subscribe` stream opens before the first broker spawns and
 /// stays open until after the final commit. A worker drains it
-/// continuously: every event counts, and the first EOF, error, or
-/// reconnect demand ends the stream as continuity loss with its message.
-/// There is no polling and no unbounded sample log — bounded evidence is
-/// the event count plus the first failure, if any. Combined with the
-/// retained foreground host child (checked live via its handle, never via
-/// PID signal, which misreports zombies) plus a final independent ping
-/// identity match, this proves the same server process served throughout.
-/// Socket device/inode comparison is rejected (inode reuse).
+/// continuously: every event counts, and the first EOF, malformed line,
+/// transport error, or reconnect demand ends the stream as continuity loss.
+/// A healthy filtered subscription may remain quiet indefinitely; bounded
+/// evidence is the event count plus the first failure, if any.
+/// Combined with the retained foreground host child (checked live via its
+/// handle, never via PID signal, which misreports zombies) plus a final
+/// independent ping identity match, this proves the same server process
+/// served throughout. Socket device/inode comparison is rejected (inode
+/// reuse).
 pub struct ContinuityGuard {
     tag: String,
     expected: String,
@@ -1306,9 +1307,8 @@ pub struct ContinuityReport {
     pub events: u64,
 }
 
-/// Production subscription bounds, mirrored for the witness stream.
+/// Initial subscription handshake deadline, mirrored for the witness stream.
 const WITNESS_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
-const WITNESS_MAX_SILENCE: Duration = Duration::from_secs(30);
 
 impl ContinuityGuard {
     /// Opens the retained subscription (initial handshake fails fast) and
@@ -1318,7 +1318,6 @@ impl ContinuityGuard {
         let config = muxe_adapter_herdr::SubscriptionConfig {
             params: serde_json::json!({ "subscriptions": [{ "type": "tab.focused" }] }),
             subscribe_timeout: WITNESS_SUBSCRIBE_TIMEOUT,
-            max_silence: WITNESS_MAX_SILENCE,
         };
         let (subscription, _) = muxe_adapter_herdr::EventSubscription::connect(&client, config)
             .await

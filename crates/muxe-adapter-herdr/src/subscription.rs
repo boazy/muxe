@@ -3,18 +3,16 @@
 //! Ordinary Herdr requests are one unary exchange per fresh connection (see
 //! [`HerdrSocketClient`](crate::transport::HerdrSocketClient)). The event
 //! subscription is the single exception: after its initial `events.subscribe`
-//! request the connection stays open and the server multiplexes heartbeat and
-//! event lines onto it. This module owns exactly that long-lived stream. No
+//! request the connection stays open and the server pushes matching event lines
+//! onto it. This module owns exactly that long-lived stream. No
 //! ordinary request is ever multiplexed onto it, and no mutation is ever
 //! replayed through it: reconnecting re-sends only the retained subscribe
 //! request on a fresh connection, which establishes a subscription rather than
 //! changing host state.
 //!
-//! Liveness needs no heartbeat wire-shape knowledge: every received line,
-//! heartbeat or event, restarts the caller-configured silence deadline. An
-//! expired deadline is a transport wait bound, not a Muxe detach, and every
-//! post-flush failure already reports `MayHaveReachedHost` so the broker
-//! surfaces `outcome_unknown` instead of retrying.
+//! Liveness is defined by stream behavior: EOF, malformed JSON, and transport
+//! errors are reported as continuity loss. A valid subscription may remain
+//! quiet indefinitely until its next matching event.
 
 use std::time::Duration;
 
@@ -34,15 +32,13 @@ use crate::{
 };
 
 /// Configuration for one retained subscription. The `params` value is the exact
-/// `events.subscribe` params retained for reconnects; timeouts are transport
-/// wait bounds, never Muxe detach signals.
+/// `events.subscribe` params retained for reconnects; the initial subscribe
+/// response deadline is a transport wait bound, not a Muxe detach signal.
 #[derive(Clone, Debug)]
 pub struct SubscriptionConfig {
     pub params: Value,
     /// Bound on the initial subscribe response on a fresh connection.
     pub subscribe_timeout: Duration,
-    /// Silence bound restarted by every received line, heartbeat or event.
-    pub max_silence: Duration,
 }
 
 /// One opaque line received on the subscription stream.
@@ -57,7 +53,6 @@ pub struct EventSubscription {
     reader: BufReader<UnixStream>,
     request_id: String,
     params: Value,
-    max_silence: Duration,
 }
 
 impl EventSubscription {
@@ -106,7 +101,6 @@ impl EventSubscription {
                     reader,
                     request_id: id,
                     params: config.params,
-                    max_silence: config.max_silence,
                 },
                 result,
             )),
@@ -119,21 +113,14 @@ impl EventSubscription {
         }
     }
 
-    /// Waits for the next stream line until [`SubscriptionConfig::max_silence`]
-    /// elapses. Every received line restarts the bound on the following call; an
-    /// expired bound reports `MayHaveReachedHost` so the broker treats a lost
-    /// subscription as continuity loss, never as a detach or a replayable request.
+    /// Waits for the next stream line.
     ///
     /// # Errors
     ///
-    /// Returns `SocketError` when the silence bound expires or the next line is
-    /// not valid JSON.
+    /// Returns [`SocketError`] when the stream closes, transport fails, or the
+    /// next line is not valid JSON.
     pub async fn next_event(&mut self) -> Result<SubscriptionEvent, SocketError> {
-        let line = timeout(self.max_silence, read_response_line(&mut self.reader))
-            .await
-            .map_err(|_| SocketError::Timeout {
-                delivery: DeliveryState::MayHaveReachedHost,
-            })??;
+        let line = read_response_line(&mut self.reader).await?;
         let event = serde_json::from_slice(&line).map_err(|source| SocketError::InvalidJson {
             delivery: DeliveryState::MayHaveReachedHost,
             source,
@@ -203,7 +190,6 @@ mod tests {
         SubscriptionConfig {
             params: json!({"subscriptions": [{"type": "tab.focused"}]}),
             subscribe_timeout: Duration::from_secs(5),
-            max_silence: Duration::from_secs(30),
         }
     }
 
@@ -233,10 +219,6 @@ mod tests {
                 .await
                 .unwrap();
             reader
-                .write_all(b"{\"type\":\"heartbeat\"}\n")
-                .await
-                .unwrap();
-            reader
                 .write_all(b"{\"type\":\"tab.focused\",\"tab_id\":\"t1\"}\n")
                 .await
                 .unwrap();
@@ -248,10 +230,6 @@ mod tests {
         assert_eq!(
             subscription.params(),
             &json!({"subscriptions": [{"type": "tab.focused"}]})
-        );
-        assert_eq!(
-            subscription.next_event().await.unwrap(),
-            SubscriptionEvent::Event(json!({"type": "heartbeat"}))
         );
         assert_eq!(
             subscription.next_event().await.unwrap(),
@@ -304,11 +282,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silence_deadline_reports_unknown_outcome_not_detach() {
+    async fn quiet_stream_survives_old_silence_bound_then_reports_malformed_line() {
         tokio::time::pause();
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("herdr.sock");
         let listener = UnixListener::bind(&path).unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (mut reader, id, _params) = read_subscribe_line(stream).await;
@@ -316,21 +295,36 @@ mod tests {
                 .write_all(format!("{{\"id\":\"{id}\",\"result\":{{}}}}\n").as_bytes())
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_hours(1)).await;
+            release_rx.await.unwrap();
+            reader
+                .write_all(b"{\"type\":\"tab.focused\",\"tab_id\":\"t1\"}\n")
+                .await
+                .unwrap();
+            reader.write_all(b"{not-json}\n").await.unwrap();
         });
         let client = HerdrSocketClient::new(&path);
-        let short = SubscriptionConfig {
-            max_silence: Duration::from_millis(50),
-            ..config()
-        };
-        let (mut subscription, _) = EventSubscription::connect(&client, short).await.unwrap();
-        let waiting = tokio::spawn(async move { subscription.next_event().await });
+        let (mut subscription, _) = EventSubscription::connect(&client, config()).await.unwrap();
+        let waiting = tokio::spawn(async move {
+            let event = subscription.next_event().await;
+            let malformed = subscription.next_event().await;
+            (event, malformed)
+        });
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(200)).await;
-        let error = waiting.await.unwrap().unwrap_err();
-        server.abort();
-        assert!(matches!(error, SocketError::Timeout { .. }));
-        assert_eq!(error.delivery(), DeliveryState::MayHaveReachedHost);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        release_tx.send(()).unwrap();
+        let (event, malformed) = waiting.await.unwrap();
+        assert_eq!(
+            event.unwrap(),
+            SubscriptionEvent::Event(json!({"type": "tab.focused", "tab_id": "t1"}))
+        );
+        assert!(matches!(
+            malformed,
+            Err(SocketError::InvalidJson {
+                delivery: DeliveryState::MayHaveReachedHost,
+                ..
+            })
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -33,7 +33,6 @@ use crate::{
 };
 
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
-const SUBSCRIPTION_SILENCE: Duration = Duration::from_secs(30);
 const RECONNECT_RETRY: Duration = Duration::from_secs(1);
 
 pub struct HerdrAdapter {
@@ -887,7 +886,6 @@ fn subscription_config() -> SubscriptionConfig {
     SubscriptionConfig {
         params: json!({ "subscriptions": [{ "type": "tab.focused" }] }),
         subscribe_timeout: SUBSCRIBE_TIMEOUT,
-        max_silence: SUBSCRIPTION_SILENCE,
     }
 }
 
