@@ -144,18 +144,25 @@ def choose_bump(version: str) -> str:
             "Choose a bump explicitly with --major, --minor, or --patch when stdin is not a TTY"
         )
 
-    selected = questionary.select(
+    prompt = questionary.select(
         "Which version should be released?",
         choices=[
-            Choice(f"Major  →  {versions['major']}", value="major", shortcut_key="m"),
-            Choice(f"Minor  →  {versions['minor']}", value="minor", shortcut_key="n"),
-            Choice(f"Patch  →  {versions['patch']}", value="patch", shortcut_key="p"),
+            Choice(f"[m]ajor  →  {versions['major']}", value="major"),
+            Choice(f"mi[n]or  →  {versions['minor']}", value="minor"),
+            Choice(f"[p]atch  →  {versions['patch']}", value="patch"),
         ],
         default="patch",
         use_arrow_keys=True,
-        use_shortcuts=True,
+        instruction="(Use arrow keys + Enter, or m/n/p)",
         style=PROMPT_STYLE,
-    ).ask()
+    )
+    for hotkey, level in (("m", "major"), ("n", "minor"), ("p", "patch")):
+
+        def accept_hotkey(event: Any, selected_level: str = level) -> None:
+            event.app.exit(result=selected_level)
+
+        prompt.application.key_bindings.add(hotkey, eager=True)(accept_hotkey)
+    selected = prompt.ask()
     if selected is None:
         fail("Release cancelled")
     return selected
