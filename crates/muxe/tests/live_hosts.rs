@@ -108,16 +108,15 @@ struct Rig {
 }
 
 impl Rig {
-    /// Best-effort reverse-order teardown, returning the first failure.
+    /// Reverse-order teardown, preserving every failure.
     /// Brokers retire first so they exit orderly; witnesses close while
     /// hosts still run; hosts reap last with diagnostics logged.
     async fn close(&mut self, context: &str) -> io::Result<()> {
         eprintln!("[{context}] teardown under {}", self.root.path().display());
-        let mut first: Option<io::Error> = None;
+        let mut errors = Vec::new();
         let mut note = |error: io::Error| {
-            if first.is_none() {
-                first = Some(error);
-            }
+            eprintln!("[{context}] teardown error: {error}");
+            errors.push(error);
         };
         for broker in std::mem::take(&mut self.brokers) {
             if let Err(error) = retire_broker(&broker.endpoint, &broker.tag).await {
@@ -198,10 +197,36 @@ impl Rig {
                 Err(error) => note(error),
             }
         }
-        match first {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let details = errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(io::Error::other(format!(
+                "[{context}] teardown failures: {details}"
+            )))
         }
+    }
+    async fn finish(&mut self, context: &str, body: io::Result<()>) -> io::Result<()> {
+        let cleanup = self.close(context).await;
+        combine_body_and_cleanup(body, cleanup)
+    }
+}
+
+fn combine_body_and_cleanup(
+    body: io::Result<()>,
+    cleanup: io::Result<()>,
+) -> io::Result<()> {
+    match (body, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(body), Ok(())) => Err(body),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(body), Err(cleanup)) => Err(io::Error::other(format!(
+            "operation failed: {body}; teardown failed: {cleanup}"
+        ))),
     }
 }
 
@@ -519,8 +544,7 @@ async fn run_target_only_smoke() -> io::Result<()> {
         Ok(())
     }
     .await;
-    rig.close("smoke").await?;
-    result
+    rig.finish("smoke", result).await
 }
 
 /// Drives one public-`activate` transfer and asserts every endpoint serves
@@ -672,8 +696,7 @@ async fn run_upgrade_and_rollback() -> io::Result<()> {
         Ok(())
     }
     .await;
-    rig.close("matrix").await?;
-    result
+    rig.finish("matrix", result).await
 }
 
 #[expect(
@@ -904,8 +927,7 @@ async fn run_final_session_reload_failure() -> io::Result<()> {
         Ok(())
     }
     .await;
-    rig.close("fault").await?;
-    result
+    rig.finish("fault", result).await
 }
 
 #[tokio::test]
@@ -932,5 +954,21 @@ async fn final_session_reload_failure() {
     require_live_approval();
     if let Err(error) = run_final_session_reload_failure().await {
         panic!("final-session reload failure case failed: {error}");
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_preserves_body_and_cleanup_errors() {
+        let error = combine_body_and_cleanup(
+            Err(io::Error::other("body failure")),
+            Err(io::Error::other("teardown failure")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("body failure"));
+        assert!(error.contains("teardown failure"));
     }
 }
