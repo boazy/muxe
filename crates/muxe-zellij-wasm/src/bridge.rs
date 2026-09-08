@@ -256,15 +256,11 @@ impl Bridge {
                     PermissionStatus::Granted => {
                         self.permission_gate = PermissionGate::Granted;
                         if self.client_id.is_none() {
-                            eprintln!("muxe bridge: permission granted; querying clients");
                             effects.list_clients();
                         }
                     }
                     PermissionStatus::Denied => {
                         if self.client_id.is_none() {
-                            if self.permission_gate != PermissionGate::Denied {
-                                eprintln!("muxe bridge: permission denied");
-                            }
                             self.permission_gate = PermissionGate::Denied;
                         }
                     }
@@ -340,14 +336,11 @@ impl Bridge {
             }
         }
         if current_client_present {
-            eprintln!("muxe bridge: client census current client present");
             // An anchor-matching census is proof that this instance's
             // privileged query was authorized. Keep that proof across later
             // broadcast PermissionRequestResult events.
             self.permission_gate = PermissionGate::Granted;
             self.try_register(effects);
-        } else {
-            eprintln!("muxe bridge: client census current client absent");
         }
     }
 
@@ -502,7 +495,6 @@ impl Bridge {
         effects.block_pipe(&cli_id);
         self.event_cli_id = Some(cli_id);
         self.pending_subscribe = true;
-        eprintln!("muxe bridge: event subscription pending");
         self.try_register(effects);
     }
 
@@ -519,14 +511,11 @@ impl Bridge {
         };
         let mut registration = [0u8; 16];
         if !effects.fill_random(&mut registration) {
-            eprintln!("muxe bridge: registration random unavailable");
             return;
         }
         if registration == [0; 16] {
-            eprintln!("muxe bridge: registration random zero");
             return;
         }
-        eprintln!("muxe bridge: registration random ready");
         self.registration = registration;
         self.pending_subscribe = false;
         self.emit(

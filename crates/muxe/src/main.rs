@@ -849,12 +849,6 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     }
     // inherent input API directly, while the broker shares the same Arc as a
     // trait object after load.
-    serve_event(
-        &logger,
-        "zellij",
-        "broker-serve",
-        "startup phase: adapter connect begin",
-    );
     let adapter = std::sync::Arc::new(
         muxe_adapter_zellij::ZellijAdapter::connect(muxe_adapter_zellij::ZellijAdapterConfig {
             session_name: command.session.clone(),
@@ -862,12 +856,6 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         })
         .await
         .wrap_err("could not connect the pinned Zellij session for broker startup")?,
-    );
-    serve_event(
-        &logger,
-        "zellij",
-        "broker-serve",
-        "startup phase: adapter connect complete",
     );
     // Load and authorize before binding. The initial census round splits by
     // bootstrap kind: ordinary Running has no broker-side UI latch (adapter
@@ -877,21 +865,9 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     // before the coordinator swaps the bridge; its round runs concurrently
     // with serving below.
     let adapter_object: std::sync::Arc<dyn muxe_adapter_api::HostAdapter> = adapter.clone();
-    serve_event(
-        &logger,
-        "zellij",
-        "broker-serve",
-        "startup phase: broker load begin",
-    );
     let broker = muxe_broker::Broker::load(adapter_object, &command.config)
         .await
         .wrap_err("could not load the broker configuration")?;
-    serve_event(
-        &logger,
-        "zellij",
-        "broker-serve",
-        "startup phase: broker load complete",
-    );
     let live_server = broker
         .live_identity()
         .await
@@ -985,12 +961,6 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         // bounded round completes here: after bind every attach already
         // observes readiness. Exhausting the budget fails startup closed.
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
-        serve_event(
-            &logger,
-            "zellij",
-            "broker-serve",
-            "startup phase: initial census begin",
-        );
         if let Err(error) = establish_initial_round_until(&adapter, deadline, &logger).await {
             serve_event(
                 &logger,
@@ -1000,12 +970,6 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
             );
             return Err(error).wrap_err("Zellij initial census round never established");
         }
-        serve_event(
-            &logger,
-            "zellij",
-            "broker-serve",
-            "initial census round established",
-        );
     }
     let registry = muxe::lifecycle::Registry::open(&command.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
@@ -1089,12 +1053,6 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
-        serve_event(
-            &logger,
-            "zellij",
-            "broker-serve",
-            "startup phase: initial census begin",
-        );
         if let Err(error) = establish_initial_round_until(&adapter, deadline, &logger).await {
             serve_event(
                 &logger,
@@ -1107,12 +1065,6 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
             let _ = registry.unregister(&registration);
             return Err(error).wrap_err("Zellij initial census round never established");
         }
-        serve_event(
-            &logger,
-            "zellij",
-            "broker-serve",
-            "initial census round established",
-        );
         let joined = server_handle.await;
         let _ = registry.unregister(&registration);
         serve_event(&logger, "zellij", "broker-serve", "stopped");

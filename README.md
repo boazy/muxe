@@ -423,4 +423,11 @@ Test suites and their required inputs:
 - `target_only_smoke`: Verifies the current target installation against live fixtures. Requires `MUXE_TARGET_INSTALLATION`, `MUXE_HERDR_BINARY`, `MUXE_ZELLIJ_BINARY`, `MUXE_ZELLIJ_FOREGROUND_BINARY`, `MUXE_ZELLIJ_BOOTSTRAP_BINARY`, and `MUXE_ZELLIJ_PERMISSION_SEEDER`. No predecessor release is required.
 - `upgrade_and_rollback` and `final_session_reload_failure`: Add `MUXE_OLD_INSTALLATION` and `MUXE_ZELLIJ_FAULT_INJECTOR`. The fault test also replays a real downgrade failure.
 
-CI runs `target_only_smoke` as a real target-only smoke on Linux pull requests and as a required current-target gate on all four release architectures. Missing inputs or approvals fail the gate. The real cross-release upgrade, rollback, and fault matrix is deferred until the first genuine published predecessor; see [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Passing fixture-only suites never stand in for the required target-only live run.
+The target-only smoke covers two current-target scenarios:
+
+- A one-client activation starts one client on each pinned host, activates the same-version target installation, and checks the resulting Herdr and Zellij broker identities.
+- A fresh two-client Zellij rig performs read-only typed origin routing. It verifies exact two-client census coverage, routes requests by `(client_id, registration)`, matches each release with its origin snapshot, and observes post-route heartbeats from both clients.
+
+CI supplies the pinned host binaries and the explicit `MUXE_LIVE_HOSTS_APPROVED=true` authorization for these live checks. They are not part of the default local test command and must not use local default host state.
+
+CI runs `target_only_smoke` as a real target-only smoke on Linux pull requests and as a required current-target gate on all four release architectures. Missing inputs or approvals fail the gate. The real cross-release upgrade, rollback, and fault matrix remains deferred until the first genuine published predecessor; see [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Passing fixture-only suites never stand in for the required target-only live run.

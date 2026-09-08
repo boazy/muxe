@@ -88,22 +88,6 @@ const MEMBERSHIP_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// bound. A table larger than a single pipe line cannot be a genuine
 /// client census, so the read fails closed instead of buffering it.
 const MEMBERSHIP_OUTPUT_CAP: usize = MAX_PIPE_LINE_LEN;
-/// Caps diagnostic client-ID lists while preserving their total count.
-const CENSUS_DIAGNOSTIC_ID_LIMIT: usize = 16;
-
-fn bounded_numeric_ids<'a, I>(ids: I) -> (usize, Vec<u16>)
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    let mut values: Vec<u16> = ids
-        .into_iter()
-        .filter_map(|id| id.parse::<u16>().ok())
-        .collect();
-    values.sort_unstable();
-    let count = values.len();
-    values.truncate(CENSUS_DIAGNOSTIC_ID_LIMIT);
-    (count, values)
-}
 type CaptureReady = Result<String, AdapterError>;
 /// Pending capture waiters keyed by lease, each tagged with the owning
 /// client so lease expiry can release only that client's waiters.
@@ -672,7 +656,7 @@ impl ZellijAdapter {
             }
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                self.census_coverage_error(epoch, channel, &snapshot).await,
+                "Zellij initial census did not observe fresh registrations for the current membership",
             ));
         }
         if self.inner.shutdown.load(Ordering::Relaxed) {
@@ -1260,43 +1244,6 @@ impl ZellijAdapter {
             ));
         }
         Ok(())
-    }
-    async fn census_coverage_error(&self, epoch: u64, channel: u64, snapshot: &[String]) -> String {
-        let registry = self.inner.registry.lock().await;
-        let stamps = self.inner.register_epoch.lock().await;
-        let fresh_ids: Vec<&str> = stamps
-            .iter()
-            .filter(|(_, stamped)| **stamped == (epoch, channel))
-            .map(|(client, _)| client.as_str())
-            .collect();
-        let mut compatible_ids = HashSet::new();
-        let mut incompatible_ids = HashSet::new();
-        for client in &fresh_ids {
-            if registry.get(client).is_some_and(|record| record.compatible) {
-                compatible_ids.insert(*client);
-            } else {
-                incompatible_ids.insert(*client);
-            }
-        }
-        let missing_ids: Vec<&str> = snapshot
-            .iter()
-            .map(String::as_str)
-            .filter(|client| !compatible_ids.contains(client))
-            .collect();
-        let (member_count, member_ids) = bounded_numeric_ids(snapshot.iter().map(String::as_str));
-        let (registered_count, registered_ids) = bounded_numeric_ids(fresh_ids.iter().copied());
-        let (compatible_count, compatible_ids) =
-            bounded_numeric_ids(compatible_ids.iter().copied());
-        let (incompatible_count, incompatible_ids) =
-            bounded_numeric_ids(incompatible_ids.iter().copied());
-        let (missing_count, missing_ids) = bounded_numeric_ids(missing_ids);
-        format!(
-            "Zellij initial census coverage failed (epoch={epoch}, channel={channel}, \
-             members={member_count}:{member_ids:?}, registered={registered_count}:{registered_ids:?}, \
-             compatible={compatible_count}:{compatible_ids:?}, \
-             incompatible={incompatible_count}:{incompatible_ids:?}, \
-             missing={missing_count}:{missing_ids:?})"
-        )
     }
     /// Reports whether current-attempt fresh compatible registrations cover
     /// the authoritative membership snapshot for (`epoch`, `channel`). Every
