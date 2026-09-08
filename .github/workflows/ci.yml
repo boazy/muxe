@@ -71,7 +71,7 @@ jobs:
 
   full-matrix:
     name: full matrix (${{ matrix.os }})
-    if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
