@@ -40,7 +40,7 @@ run = "cargo run --locked -p codegen-completions"
 
 [tasks.wasm-build]
 description = "Build the pinned Zellij bridge WASM (release) and stage dist-wasm/muxe-zellij.wasm"
-run = "cargo build --locked --release -p muxe-zellij-wasm --target wasm32-wasip1 && mkdir -p dist-wasm && cp target/wasm32-wasip1/release/muxe_zellij_wasm.wasm dist-wasm/muxe-zellij.wasm"
+run = "cargo build --locked --release -p muxe-zellij-wasm --target wasm32-wasip1 && mkdir -p dist-wasm && cp target/wasm32-wasip1/release/muxe-zellij-wasm.wasm dist-wasm/muxe-zellij.wasm"
 
 [tasks.wasm-build-previous]
 description = "Build a distinct same-source debug WASM artifact for rollback ownership smoke"
@@ -82,7 +82,7 @@ file_digest() {
 }
 export MUXE_WASM_SHA256="$(file_digest dist-wasm/muxe-zellij.wasm)"
 export MUXE_TEST_PACKAGED_WASM="$PWD/dist-wasm/muxe-zellij.wasm"
-export MUXE_TEST_PREVIOUS_WASM="$PWD/target/wasm32-wasip1/debug/muxe_zellij_wasm.wasm"
+export MUXE_TEST_PREVIOUS_WASM="$PWD/target/wasm32-wasip1/debug/muxe-zellij-wasm.wasm"
 for test_name in \
   lifecycle::activate::tests::zellij_fast_path_requires_verified_stable_bridge_bytes \
   lifecycle::activate::tests::zellij_stale_receipt_owned_bridge_transacts_despite_target_record \

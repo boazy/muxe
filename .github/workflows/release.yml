@@ -150,9 +150,9 @@ jobs:
             file_arch: aarch64
             static: true
           - asset: macos-x64
-            os: macos-15
+            os: macos-15-intel
             target: x86_64-apple-darwin
-            uname_arch: arm64
+            uname_arch: x86_64
             file_arch: x86_64
             static: false
           - asset: macos-arm64
@@ -176,9 +176,8 @@ jobs:
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
       - name: runner architecture assert
-        # macOS x64 is cross-compiled from the arm64 runner; the binary-arch
-        # assert below covers the artifact. The runner itself must still be
-        # the pinned image, never an implicit latest.
+        # Each macOS asset builds on its native runner architecture; the
+        # binary-arch assert below is an independent artifact check.
         run: |
           set -euo pipefail
           test "$(uname -m)" = "${{ matrix.uname_arch }}"

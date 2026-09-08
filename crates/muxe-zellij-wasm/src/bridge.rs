@@ -168,13 +168,29 @@ struct ActiveCapture {
     prior: InputMode,
 }
 
+/// Permission gate for privileged host queries: the bridge requests
+/// permissions at load but issues no privileged query before the host's
+/// explicit grant event. The pinned host delivers
+/// `PermissionRequestResult` regardless of subscription
+/// (`wasm_bridge.rs`, event fan-out exempts it), so no subscription entry
+/// is needed for the grant to arrive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PermissionGate {
+    /// `request_permissions` sent, no grant event observed yet.
+    Pending,
+    /// Host delivered `PermissionRequestResult(Granted)`.
+    Granted,
+    /// Host delivered `PermissionRequestResult(Denied)`.
+    Denied,
+}
+
 /// Bridge state for one Zellij client. Identity fields stay empty until
 /// verified host data arrives; no registration emits before that.
 pub struct Bridge {
     client_id: Option<String>,
     plugin_id: Option<u32>,
     focused_pane: Option<String>,
-    permissions_denied: bool,
+    permission_gate: PermissionGate,
     event_cli_id: Option<String>,
     pending_subscribe: bool,
     registration: [u8; 16],
@@ -195,7 +211,7 @@ impl Default for Bridge {
             client_id: None,
             plugin_id: None,
             focused_pane: None,
-            permissions_denied: false,
+            permission_gate: PermissionGate::Pending,
             event_cli_id: None,
             pending_subscribe: false,
             registration: [0; 16],
@@ -213,8 +229,11 @@ impl Default for Bridge {
 }
 
 impl Bridge {
-    /// Initial plugin load: permissions, control subscriptions, identity
-    /// query, and the first heartbeat timer.
+    /// Initial plugin load: permission request, control subscriptions,
+    /// plugin IDs, and the first heartbeat timer. The privileged identity
+    /// query stays deferred until the host's explicit grant event: the
+    /// grant arrives asynchronously after the request, and a pre-grant
+    /// query is denied by the host.
     pub fn load(&mut self, effects: &mut dyn HostEffects) {
         effects.request_permissions(&required_permissions());
         effects.subscribe(&[
@@ -226,7 +245,6 @@ impl Bridge {
             EventType::Timer,
         ]);
         self.plugin_id = Some(effects.plugin_ids().plugin_id);
-        effects.list_clients();
         effects.arm_timer(HEARTBEAT_SECS);
     }
 
@@ -240,8 +258,20 @@ impl Bridge {
             Event::ActionComplete(_, _, context) => self.on_action_complete(&context, effects),
             Event::Timer(_) => self.on_timer(effects),
             Event::PermissionRequestResult(status) => {
-                if status == PermissionStatus::Denied {
-                    self.permissions_denied = true;
+                match status {
+                    // Idempotent: only the transition into Granted issues
+                    // the deferred identity query, so repeats never
+                    // duplicate it. A later grant after denial (user
+                    // answers the host prompt) legitimately queries once.
+                    PermissionStatus::Granted => {
+                        if self.permission_gate != PermissionGate::Granted {
+                            self.permission_gate = PermissionGate::Granted;
+                            effects.list_clients();
+                        }
+                    }
+                    PermissionStatus::Denied => {
+                        self.permission_gate = PermissionGate::Denied;
+                    }
                 }
             }
             Event::BeforeClose => self.on_before_close(effects),
@@ -465,11 +495,12 @@ impl Bridge {
         self.try_register(effects);
     }
 
-    /// Emits a registration once verified identity and randomness both hold.
-    /// Without a verified client, with denied permissions, or without OS
-    /// randomness, nothing emits — never an empty-identity fallback.
+    /// Emits a registration once the permission grant, verified identity,
+    /// and randomness all hold. Pending or denied permissions, missing
+    /// identity, or missing randomness emit nothing — never an
+    /// empty-identity fallback.
     fn try_register(&mut self, effects: &mut dyn HostEffects) {
-        if !self.pending_subscribe || self.permissions_denied {
+        if !self.pending_subscribe || self.permission_gate != PermissionGate::Granted {
             return;
         }
         let Some(client_id) = self.client_id.clone() else {
@@ -1100,10 +1131,19 @@ mod tests {
         }
     }
 
+    /// Full startup through the real host sequence: load (no privileged
+    /// query), explicit grant (exactly one identity query), identity
+    /// event, then event-channel subscription driving registration.
     fn boot() -> (Bridge, FakeHost) {
         let mut bridge = Bridge::default();
         let mut host = FakeHost::new();
         bridge.load(&mut host);
+        assert_eq!(host.lists, 0);
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Granted),
+            &mut host,
+        );
+        assert_eq!(host.lists, 1);
         bridge.update(
             Event::ListClients(clients_current(PaneId::Terminal(2))),
             &mut host,
@@ -1115,16 +1155,75 @@ mod tests {
     }
 
     #[test]
-    fn registration_needs_verified_identity_and_randomness() {
+    fn no_privileged_query_before_grant() {
         let mut bridge = Bridge::default();
         let mut host = FakeHost::new();
         bridge.load(&mut host);
-        // Subscribe before any ListClients: nothing emits without identity.
+        assert_eq!(host.lists, 0);
+        // Identity data and subscription arrive, but without a grant no
+        // query issues and nothing registers.
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        bridge.pipe(subscribe_msg(), &mut host);
+        assert_eq!(host.lists, 0);
+        assert_eq!(bridge.active_registration(), None);
+        assert!(host.outputs.is_empty());
+    }
+
+    #[test]
+    fn denied_grant_never_queries_or_registers() {
+        let mut bridge = Bridge::default();
+        let mut host = FakeHost::new();
+        bridge.load(&mut host);
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Denied),
+            &mut host,
+        );
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        bridge.pipe(subscribe_msg(), &mut host);
+        assert_eq!(host.lists, 0);
+        assert_eq!(bridge.active_registration(), None);
+        assert!(host.outputs.is_empty());
+    }
+
+    #[test]
+    fn repeated_grant_queries_exactly_once() {
+        let mut bridge = Bridge::default();
+        let mut host = FakeHost::new();
+        bridge.load(&mut host);
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Granted),
+            &mut host,
+        );
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Granted),
+            &mut host,
+        );
+        assert_eq!(host.lists, 1);
+    }
+
+    #[test]
+    fn registration_needs_grant_identity_and_randomness() {
+        let mut bridge = Bridge::default();
+        let mut host = FakeHost::new();
+        bridge.load(&mut host);
+        // Subscribe before grant and identity: nothing emits.
         bridge.pipe(subscribe_msg(), &mut host);
         assert_eq!(bridge.active_registration(), None);
         assert!(host.outputs.is_empty());
-        // Identity without randomness still emits nothing.
+        // Grant issues the identity query but randomness is gone: still
+        // nothing emits.
         host.random.clear();
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Granted),
+            &mut host,
+        );
+        assert_eq!(host.lists, 1);
         bridge.update(
             Event::ListClients(clients_current(PaneId::Terminal(2))),
             &mut host,

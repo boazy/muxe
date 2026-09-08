@@ -27,7 +27,7 @@ const INPUTS: &[&str] = &[
     "crates/muxe-zellij-wasm/src/bridge.rs",
     "crates/muxe-zellij-wasm/src/dispatcher.rs",
     "crates/muxe-zellij-wasm/src/focus.rs",
-    "crates/muxe-zellij-wasm/src/lib.rs",
+    "crates/muxe-zellij-wasm/src/main.rs",
     "crates/muxe-zellij-wasm/src/outcome.rs",
     "fixtures/zellij/0.46.0/action-converters.policy",
     "fixtures/zellij/0.46.0/action-inventory.rs",
