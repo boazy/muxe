@@ -76,9 +76,9 @@ def command(
     except subprocess.CalledProcessError as error:
         if capture:
             if error.stdout:
-                CONSOLE.print(error.stdout.rstrip())
+                CONSOLE.print(Text(error.stdout.rstrip()))
             if error.stderr:
-                CONSOLE.print(error.stderr.rstrip(), style="red")
+                CONSOLE.print(Text(error.stderr.rstrip(), style="red"))
         fail(
             f"Command failed with exit code {error.returncode}: {shlex.join(arguments)}"
         )
@@ -205,8 +205,8 @@ def verify_clean_worktree() -> None:
     if diff.strip():
         CONSOLE.print(
             Panel(
-                diff.rstrip(),
-                title="[bold red]trunk()..@ is not empty[/]",
+                Text(diff.rstrip()),
+                title=Text("trunk()..@ is not empty", style="bold red"),
                 border_style="red",
             )
         )

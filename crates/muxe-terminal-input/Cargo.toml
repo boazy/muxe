@@ -3,6 +3,7 @@ name = "muxe-terminal-input"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dev-dependencies]
 proptest.workspace = true
