@@ -40,8 +40,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use muxe_zellij_protocol::{
-    BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, CaptureEndReason, CaptureLostReason,
-    CommandOutcome, PipeEvent, PipeEventKind, ZellijOrigin, bridge_build_id,
+    BRIDGE_PERMISSIONS, BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, CaptureEndReason,
+    CaptureLostReason, CommandOutcome, PipeEvent, PipeEventKind, ZellijOrigin, bridge_build_id,
     bridge_protocol_fingerprint, decode_request_line, encode_event_line,
     generated::RawNativeCommand, generated_action_fingerprint, pinned_source_revision,
 };
@@ -51,26 +51,6 @@ use crate::{
     dispatcher::{ReadyDispatch, completion_execution, execute_sync, prepare},
     focus::{PaneGeometry, PaneInventory},
 };
-
-/// Requested permissions: every permission required by the exposed command set
-/// plus the bridge lifecycle operations, from the pinned permission map
-/// (`zellij-server/src/plugins/zellij_exports.rs`, `check_command_permission`).
-/// Writing this list grants nothing by itself; the host prompts the user.
-fn required_permissions() -> Vec<PermissionType> {
-    vec![
-        PermissionType::ReadApplicationState,
-        PermissionType::ChangeApplicationState,
-        PermissionType::RunActionsAsUser,
-        PermissionType::OpenFiles,
-        PermissionType::OpenTerminalsOrPlugins,
-        PermissionType::RunCommands,
-        PermissionType::WriteToStdin,
-        PermissionType::WriteToClipboard,
-        PermissionType::Reconfigure,
-        PermissionType::FullHdAccess,
-        PermissionType::ReadCliPipes,
-    ]
-}
 
 /// Pipe-name prefixes separating the two channels by role.
 const REQUEST_PREFIX: &str = "muxe-request-";
@@ -235,7 +215,7 @@ impl Bridge {
     /// grant arrives asynchronously after the request, and a pre-grant
     /// query is denied by the host.
     pub fn load(&mut self, effects: &mut dyn HostEffects) {
-        effects.request_permissions(&required_permissions());
+        effects.request_permissions(&BRIDGE_PERMISSIONS);
         effects.subscribe(&[
             EventType::ListClients,
             EventType::ModeUpdate,

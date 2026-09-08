@@ -132,14 +132,12 @@ pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
 /// size inside its own PTY and never mutates the parent terminal.
 pub const BOOTSTRAP_ROWS: usize = 30;
 pub const BOOTSTRAP_COLS: usize = 120;
-/// Exact permissions the managed WASM bridge requests, granted only for
-/// its exact location string in the owned permission cache. Parsed by
-/// the pinned `PermissionType`, never retyped.
-pub const BRIDGE_PERMISSIONS: [&str; 3] = [
-    "ReadApplicationState",
-    "ChangeApplicationState",
-    "ReadCliPipes",
-];
+// Authoritative bridge permission contract: the seeder grant must match
+// exactly what the WASM bridge requests. The runner passes each entry's
+// canonical `ToString` variant name as one `--permission` argv to the
+// fixture seeder, which parses it with the pinned `PermissionType`;
+// permission names are never retyped here.
+use muxe_zellij_protocol::BRIDGE_PERMISSIONS;
 
 /// Pinned session-socket contract directory: `<socket-dir>/contract_version_1/<session>`.
 /// Derived from `CLIENT_SERVER_CONTRACT_DIR` in the pinned zellij-utils
@@ -856,7 +854,7 @@ impl OwnedZellijHost {
         let mut command = Command::new(seeder);
         command.arg("--plugin").arg(plugin_location);
         for permission in BRIDGE_PERMISSIONS {
-            command.arg("--permission").arg(permission);
+            command.arg("--permission").arg(permission.to_string());
         }
         apply_scoped_env(&mut command, scoped_root);
         command.current_dir(scoped_root);

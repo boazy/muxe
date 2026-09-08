@@ -1,21 +1,26 @@
-//! Host-free smoke for the permission seeder: exact key plus exact
-//! permission names land in the pinned-default cache file, merges
-//! preserve other keys, and unknown inputs fail closed. No hosts, no
-//! sockets, no approval: the seeder child runs under a TempDir-scoped
-//! environment and the pinned code computes its own cache path, which
-//! the test only locates from the binary's own report.
+//! Host-free smoke for the permission seeder: exact per-key grants land in
+//! the pinned-default cache file, merges preserve other keys without
+//! overgrant, and unknown inputs fail closed. No hosts, no sockets, no
+//! approval: the seeder child runs under a TempDir-scoped environment and
+//! the test discovers the resulting cache file beneath that owned root.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant};
 
+use zellij_utils::data::PermissionType;
+
 const CASE_TIMEOUT: Duration = Duration::from_mins(1);
-const PLUGIN_KEY: &str = "/tmp/owned-fixture/muxe-zellij.wasm";
-const PERMISSIONS: [&str; 3] = [
-    "ReadApplicationState",
-    "ChangeApplicationState",
-    "ReadCliPipes",
-];
+/// Deliberately small generic input sets, distinct from the production
+/// bridge contract: this test proves seeder/cache semantics (exact grants,
+/// merge preservation, no overgrant), never the production list. Production
+/// coverage lives in the `crates/muxe` runner, which passes the shared
+/// `muxe_zellij_protocol::BRIDGE_PERMISSIONS` constant itself; this fixture
+/// crate keeps its separate lockfile and stays decoupled.
+const FIRST_KEY: &str = "/tmp/owned-fixture/plugin-a.wasm";
+const FIRST_PERMISSIONS: [&str; 2] = ["OpenFiles", "WriteToStdin"];
+const SECOND_KEY: &str = "/other/plugin.wasm";
+const SECOND_PERMISSIONS: [&str; 1] = ["RunCommands"];
 
 fn seeder_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_muxe-zellij-permit"))
@@ -45,7 +50,7 @@ fn scoped_env(root: &std::path::Path) -> Vec<(String, String)> {
     ]
 }
 
-fn run_seeder(root: &std::path::Path, argv: &[&str]) -> Output {
+fn run_seeder(root: &Path, argv: &[&str]) -> Output {
     use std::process::Stdio;
     let mut command = std::process::Command::new(seeder_bin());
     command.env_clear();
@@ -64,17 +69,50 @@ fn run_seeder(root: &std::path::Path, argv: &[&str]) -> Output {
         if child.try_wait().expect("poll seeder").is_some() {
             break;
         }
-        assert!(Instant::now() < deadline, "seeder hung");
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("seeder hung");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     child.wait_with_output().expect("reap seeder")
 }
 
+/// Finds the pinned cache file beneath the owned root without depending on
+/// platform-specific directory rules or seeder output wording.
+fn cache_path(root: &Path) -> PathBuf {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("read owned cache root") {
+            let entry = entry.expect("read owned cache entry");
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "permissions.kdl") {
+                return path;
+            }
+            if entry.file_type().expect("inspect owned cache entry").is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    panic!("seeder did not create permissions.kdl under owned root");
+}
+
+/// Canonical grant names in a stable order: the pinned cache round-trip
+/// does not preserve insertion order, and only membership is contractual.
+fn grant_names(grants: &[PermissionType]) -> Vec<String> {
+    let mut names: Vec<String> = grants.iter().map(ToString::to_string).collect();
+    names.sort_unstable();
+    names
+}
+
 #[test]
-fn seeds_exact_key_and_permissions_in_scoped_cache() {
+fn seeds_exact_per_key_grants_in_scoped_cache() {
+    use zellij_utils::input::permission::PermissionCache;
+
     let root = case_root("seed");
-    let mut argv = vec!["--plugin", PLUGIN_KEY];
-    for permission in PERMISSIONS {
+    let mut argv = vec!["--plugin", FIRST_KEY];
+    for permission in FIRST_PERMISSIONS {
         argv.push("--permission");
         argv.push(permission);
     }
@@ -84,47 +122,49 @@ fn seeds_exact_key_and_permissions_in_scoped_cache() {
         "seeder failed: {}",
         String::from_utf8_lossy(&output.stderr),
     );
-    let report = String::from_utf8_lossy(&output.stdout).into_owned();
-    let path = report
-        .strip_prefix(&format!("permitted {PLUGIN_KEY} (3 permissions) at "))
-        .unwrap_or_else(|| panic!("unexpected seeder report: {report:?}"))
-        .trim()
-        .to_owned();
+    let path = cache_path(&root);
     assert!(
-        PathBuf::from(&path).starts_with(&root),
+        path.starts_with(&root),
         "seeder cache escaped the owned root: {path:?}",
     );
-    let body = std::fs::read_to_string(&path).expect("pinned cache file exists");
-    assert!(body.contains(PLUGIN_KEY), "cache names no plugin key");
-    for permission in PERMISSIONS {
-        assert!(
-            body.contains(permission),
-            "cache names no {permission} grant"
-        );
-    }
-    // Idempotent merge: a second seed for another plugin preserves ours.
-    let output = run_seeder(
-        &root,
-        &[
-            "--plugin",
-            "/other/plugin.wasm",
-            "--permission",
-            "OpenFiles",
-        ],
+    let cache = PermissionCache::from_path_or_default(Some(path.clone()));
+    assert_eq!(
+        grant_names(cache.get_permissions(FIRST_KEY.to_owned()).expect("first grant stored")),
+        vec!["OpenFiles", "WriteToStdin"],
+        "first key holds no exact grant",
     );
-    assert!(output.status.success());
-    let body = std::fs::read_to_string(&path).expect("cache survives merge");
-    assert!(body.contains(PLUGIN_KEY));
-    assert!(body.contains("OpenFiles"));
+    // Merge: a second seed for another plugin preserves ours exactly.
+    let mut argv = vec!["--plugin", SECOND_KEY];
+    for permission in SECOND_PERMISSIONS {
+        argv.push("--permission");
+        argv.push(permission);
+    }
+    let output = run_seeder(&root, &argv);
+    assert!(
+        output.status.success(),
+        "merge seed failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let cache = PermissionCache::from_path_or_default(Some(path));
+    assert_eq!(
+        grant_names(cache.get_permissions(SECOND_KEY.to_owned()).expect("other grant stored")),
+        vec!["RunCommands"],
+        "merge dropped the other grant",
+    );
+    assert_eq!(
+        grant_names(cache.get_permissions(FIRST_KEY.to_owned()).expect("first grant kept")),
+        vec!["OpenFiles", "WriteToStdin"],
+        "merge altered our grant",
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
 fn rejects_unknown_permission_and_missing_inputs() {
     let root = case_root("reject");
-    let denied = run_seeder(&root, &["--plugin", PLUGIN_KEY, "--permission", "Bogus"]);
+    let denied = run_seeder(&root, &["--plugin", FIRST_KEY, "--permission", "Bogus"]);
     assert_eq!(denied.status.code(), Some(2));
-    let missing = run_seeder(&root, &["--permission", PERMISSIONS[0]]);
+    let missing = run_seeder(&root, &["--permission", FIRST_PERMISSIONS[0]]);
     assert_eq!(missing.status.code(), Some(2));
     let bare = run_seeder(&root, &[]);
     assert_eq!(bare.status.code(), Some(2));

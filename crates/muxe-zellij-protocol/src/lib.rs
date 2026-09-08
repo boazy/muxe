@@ -25,3 +25,32 @@ pub use pipe::{
     NeighborDirection, PipeError, PipeEvent, PipeEventKind, PipeRequest, ZellijOrigin,
     decode_event_line, decode_request_line, encode_event_line, encode_request_line,
 };
+
+/// Authoritative Zellij permission contract for the managed WASM bridge.
+///
+/// Every permission required by the exposed command set plus the bridge
+/// lifecycle operations, from the pinned permission map
+/// (`zellij-server/src/plugins/zellij_exports.rs`, `check_command_permission`).
+/// DESIGN requires the plugin to request the whole exposed set even when the
+/// effective configuration references only some of its commands, so this is a
+/// fixed upfront superset: never trim it to a basic-menu minimum and never
+/// extend it with functional scope. Only membership is contractual; the
+/// listing order is preserved unchanged from the original bridge request.
+/// Writing this list grants nothing by itself; the host prompts the user.
+///
+/// The canonical wire name of each entry is its variant name via [`ToString`]
+/// (the pinned `PermissionType` derives `Display` plus `EnumString`), not the
+/// human-label `display_name`.
+pub const BRIDGE_PERMISSIONS: [zellij_utils::data::PermissionType; 11] = [
+    zellij_utils::data::PermissionType::ReadApplicationState,
+    zellij_utils::data::PermissionType::ChangeApplicationState,
+    zellij_utils::data::PermissionType::RunActionsAsUser,
+    zellij_utils::data::PermissionType::OpenFiles,
+    zellij_utils::data::PermissionType::OpenTerminalsOrPlugins,
+    zellij_utils::data::PermissionType::RunCommands,
+    zellij_utils::data::PermissionType::WriteToStdin,
+    zellij_utils::data::PermissionType::WriteToClipboard,
+    zellij_utils::data::PermissionType::Reconfigure,
+    zellij_utils::data::PermissionType::FullHdAccess,
+    zellij_utils::data::PermissionType::ReadCliPipes,
+];

@@ -416,7 +416,7 @@ Integration tests use isolated fixture processes under a fresh temporary directo
 Running live-host tests requires explicit environment approval:
 
 - `MUXE_LIVE_HOSTS_APPROVED=true`: Required before any fixture process launches. Any other value fails the test immediately.
-- Zellij permission grants: The test runner seeds three permissions (`ReadApplicationState`, `ChangeApplicationState`, and `ReadCliPipes`) directly into an isolated Zellij permission cache for the managed bridge path.
+- Zellij permission grants: The test runner seeds the bridge's full 11-permission contract (`ReadApplicationState`, `ChangeApplicationState`, `RunActionsAsUser`, `OpenFiles`, `OpenTerminalsOrPlugins`, `RunCommands`, `WriteToStdin`, `WriteToClipboard`, `Reconfigure`, `FullHdAccess`, and `ReadCliPipes`) directly into an isolated Zellij permission cache for the managed bridge path. The contract lives once in `muxe-zellij-protocol`; the runner passes it, never a retyped subset.
 
 Test suites and their required inputs:
 

@@ -19,12 +19,13 @@
 //! supplies only the exact managed-bridge location string (the bare
 //! absolute path: `Display for RunPluginLocation::File` writes the path
 //! with no `file:` prefix, and `parse` applies no normalization beyond
-//! percent-decode/shellexpand) and exactly the three permissions the
-//! bridge requests (`ReadApplicationState`, `ChangeApplicationState`,
-//! `ReadCliPipes`). Existing grants for other plugins merge through
-//! untouched. This is a scoped, URL-pinned, workflow-authorized grant
-//! for the isolated fixture only — not a broad approval, and the test
-//! guard `MUXE_LIVE_HOSTS_APPROVED` alone never implies it.
+//! percent-decode/shellexpand) and one `--permission` per entry of the
+//! bridge permission contract (`muxe_zellij_protocol::BRIDGE_PERMISSIONS`:
+//! the exact 11 permissions the bridge requests, in order). Existing grants
+//! for other plugins merge through untouched. This is a scoped, URL-pinned,
+//! workflow-authorized grant for the isolated fixture only — not a broad
+//! approval, and the test guard `MUXE_LIVE_HOSTS_APPROVED` alone never
+//! implies it.
 //!
 //! Typed inputs only: one `--plugin` location string plus one or more
 //! `--permission` names (parsed by the pinned `PermissionType`). There
