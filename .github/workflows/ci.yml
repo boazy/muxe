@@ -243,7 +243,6 @@ jobs:
   benches:
     name: benchmarks (non-blocking)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -283,10 +282,11 @@ jobs:
         # scope); this step only invokes the task, never installs ad hoc.
         run: mise run bench-codspeed
       - name: CodSpeed comparison upload
-        # Published for pull requests without failing the build: no blanket
-        # regression threshold. Crate-local benchmark entrypoints remain owned
-        # by their source owners; this step only uploads comparisons. The run
-        # command matches the runner help (`run`, not `bench`).
+        # The benchmark build and normal cargo bench above remain blocking.
+        # Only external CodSpeed comparison/reporting is advisory: auth or
+        # service availability must stay visible in this step without turning
+        # the required benchmark job red.
+        continue-on-error: true
         uses: CodSpeedHQ/action@v3
         with:
           run: mise exec -- cargo codspeed run
