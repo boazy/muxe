@@ -96,10 +96,17 @@ fn cache_path(root: &Path) -> PathBuf {
         for entry in std::fs::read_dir(&directory).expect("read owned cache root") {
             let entry = entry.expect("read owned cache entry");
             let path = entry.path();
-            if path.file_name().is_some_and(|name| name == "permissions.kdl") {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "permissions.kdl")
+            {
                 return path;
             }
-            if entry.file_type().expect("inspect owned cache entry").is_dir() {
+            if entry
+                .file_type()
+                .expect("inspect owned cache entry")
+                .is_dir()
+            {
                 pending.push(path);
             }
         }
@@ -138,7 +145,11 @@ fn seeds_exact_per_key_grants_in_scoped_cache() {
     );
     let cache = PermissionCache::from_path_or_default(Some(path.clone()));
     assert_eq!(
-        grant_names(cache.get_permissions(FIRST_KEY.to_owned()).expect("first grant stored")),
+        grant_names(
+            cache
+                .get_permissions(FIRST_KEY.to_owned())
+                .expect("first grant stored")
+        ),
         vec!["OpenFiles", "WriteToStdin"],
         "first key holds no exact grant",
     );
@@ -156,12 +167,20 @@ fn seeds_exact_per_key_grants_in_scoped_cache() {
     );
     let cache = PermissionCache::from_path_or_default(Some(path));
     assert_eq!(
-        grant_names(cache.get_permissions(SECOND_KEY.to_owned()).expect("other grant stored")),
+        grant_names(
+            cache
+                .get_permissions(SECOND_KEY.to_owned())
+                .expect("other grant stored")
+        ),
         vec!["RunCommands"],
         "merge dropped the other grant",
     );
     assert_eq!(
-        grant_names(cache.get_permissions(FIRST_KEY.to_owned()).expect("first grant kept")),
+        grant_names(
+            cache
+                .get_permissions(FIRST_KEY.to_owned())
+                .expect("first grant kept")
+        ),
         vec!["OpenFiles", "WriteToStdin"],
         "merge altered our grant",
     );
