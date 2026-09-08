@@ -293,25 +293,17 @@ jobs:
           token: ${{ secrets.CODSPEED_TOKEN }}
   realhost-smoke:
     name: small Linux real-host smoke
+    # PRs run this owned-host smoke only with explicit recorded approval.
+    # Without approval, the job is skipped rather than counted as acceptance.
+    if: vars.ALLOW_LIVE_HOST_MATRIX == 'true'
     runs-on: ubuntu-latest
+    env:
+      MUXE_LIVE_HOSTS_APPROVED: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
         with:
           install: true
-      - name: live-host approval opt-in (before host install)
-        # This PR job exercises the approved owned-host smoke only after the
-        # recorded repository-variable approval. The guard does not grant
-        # additional Zellij permissions or auto-accept host prompts.
-        env:
-          ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
-        run: |
-          set -euo pipefail
-          test "${ALLOW_LIVE_HOST_MATRIX:-}" = "true" || {
-            echo "BLOCKED: realhost-smoke requires recorded user approval." >&2
-            echo "Set the ALLOW_LIVE_HOST_MATRIX repository variable to \"true\" only after approval." >&2
-            exit 1
-          }
       - name: trust project tasks and assert pinned toolchain
         run: |
           set -euo pipefail
@@ -446,5 +438,4 @@ jobs:
           MUXE_ZELLIJ_FOREGROUND_BINARY="$fx/muxe-zellij-foreground" \
           MUXE_ZELLIJ_BOOTSTRAP_BINARY="$fx/muxe-zellij-bootstrap" \
           MUXE_ZELLIJ_PERMISSION_SEEDER="$fx/muxe-zellij-permit" \
-          MUXE_LIVE_HOSTS_APPROVED=true \
           mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
