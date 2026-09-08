@@ -21,7 +21,7 @@
 //! with no `file:` prefix, and `parse` applies no normalization beyond
 //! percent-decode/shellexpand) and one `--permission` per entry of the
 //! bridge permission contract (`muxe_zellij_protocol::BRIDGE_PERMISSIONS`:
-//! the exact 11 permissions the bridge requests, in order). Existing grants
+//! the exact 11 permissions the bridge requests). Existing grants
 //! for other plugins merge through untouched. This is a scoped, URL-pinned,
 //! workflow-authorized grant for the isolated fixture only — not a broad
 //! approval, and the test guard `MUXE_LIVE_HOSTS_APPROVED` alone never

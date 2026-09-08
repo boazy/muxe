@@ -70,9 +70,18 @@ fn run_seeder(root: &Path, argv: &[&str]) -> Output {
             break;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("seeder hung");
+            let kill_result = child.kill();
+            match child.wait_with_output() {
+                Ok(output) => panic!(
+                    "seeder hung; kill result: {kill_result:?}; stdout: {:?}; stderr: {:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                ),
+                Err(wait_error) => panic!(
+                    "seeder hung; kill result: {kill_result:?}; \
+                     wait_with_output failed: {wait_error}",
+                ),
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -163,10 +172,28 @@ fn seeds_exact_per_key_grants_in_scoped_cache() {
 fn rejects_unknown_permission_and_missing_inputs() {
     let root = case_root("reject");
     let denied = run_seeder(&root, &["--plugin", FIRST_KEY, "--permission", "Bogus"]);
-    assert_eq!(denied.status.code(), Some(2));
+    assert_eq!(
+        denied.status.code(),
+        Some(2),
+        "unknown permission seeder failure:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&denied.stdout),
+        String::from_utf8_lossy(&denied.stderr),
+    );
     let missing = run_seeder(&root, &["--permission", FIRST_PERMISSIONS[0]]);
-    assert_eq!(missing.status.code(), Some(2));
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "missing plugin seeder failure:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&missing.stdout),
+        String::from_utf8_lossy(&missing.stderr),
+    );
     let bare = run_seeder(&root, &[]);
-    assert_eq!(bare.status.code(), Some(2));
+    assert_eq!(
+        bare.status.code(),
+        Some(2),
+        "empty invocation seeder failure:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&bare.stdout),
+        String::from_utf8_lossy(&bare.stderr),
+    );
     std::fs::remove_dir_all(&root).ok();
 }
