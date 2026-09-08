@@ -155,10 +155,8 @@ struct ActiveCapture {
 
 /// Permission gate for privileged host queries: the bridge requests
 /// permissions at load but issues no privileged query before the host's
-/// explicit grant event. The pinned host delivers
-/// `PermissionRequestResult` regardless of subscription
-/// (`wasm_bridge.rs`, event fan-out exempts it), so no subscription entry
-/// is needed for the grant to arrive.
+/// explicit grant event. The grant is subscribed explicitly because the
+/// pinned host replays cached events only for subscribed event types.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PermissionGate {
     /// `request_permissions` sent, no grant event observed yet.
@@ -222,6 +220,7 @@ impl Bridge {
     pub fn load(&mut self, effects: &mut dyn HostEffects) {
         effects.request_permissions(&BRIDGE_PERMISSIONS);
         effects.subscribe(&[
+            EventType::PermissionRequestResult,
             EventType::ListClients,
             EventType::ModeUpdate,
             EventType::PaneUpdate,
