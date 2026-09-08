@@ -99,7 +99,8 @@ async fn handle_herdr_connection(stream: UnixStream) {
         return;
     }
     if method == "events.subscribe" {
-        let _ = stream.write_all(b"{\"type\":\"heartbeat\"}\n").await;
+        // Real Herdr keeps a filtered lifecycle stream quiet until a matching
+        // event; the client must not require fabricated heartbeat traffic.
         let mut discarded = Vec::new();
         let _ = stream.read_to_end(&mut discarded).await;
     }
