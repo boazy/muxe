@@ -1618,7 +1618,7 @@ These developer-time dependencies produce checked-in output.
 
 ### Supported platforms and fixtures
 
-V1 supports Linux and macOS. A future Windows port remains possible, and platform-neutral interfaces must not prevent it. That port may replace Unix sockets and process groups with Windows-native equivalents. It will require a modern ANSI-capable terminal; Muxe will not add a ConPTY-specific backend or support older Windows 10 terminal behavior.
+V1 supports Linux on x64 and arm64, and macOS on Apple Silicon. A future Windows port remains possible, and platform-neutral interfaces must not prevent it. That port may replace Unix sockets and process groups with Windows-native equivalents. It will require a modern ANSI-capable terminal; Muxe will not add a ConPTY-specific backend or support older Windows 10 terminal behavior.
 
 Tests use checked-in, minimized fixtures for pinned Zellij source, Herdr schemas, Muxe configuration, protocol messages, ANSI streams, and host context. Deterministic mutations of those fixtures cover valid extensions, incompatible changes, malformed input, and parser edge cases. Tests that run installed multiplexer versions supplement these fixtures; they do not replace them.
 
@@ -1639,7 +1639,7 @@ Continuous integration uses three levels:
 
 1. Every change runs deterministic unit, property, snapshot, fixture, code-generation, and fake-adapter conformance tests.
 2. Each pull request runs a small real-host smoke suite on Linux against the newest verified Zellij and Herdr versions.
-3. Scheduled and release workflows run the full minimum/latest host matrix on Linux and macOS.
+3. Scheduled and release workflows run the full minimum/latest host matrix on Linux and macOS Apple Silicon.
 
 One parameterized adapter-contract suite runs against the fake, Herdr, and Zellij adapter implementations without launching a multiplexer. It verifies shared discovery, server identity, capability reporting, context capture, request validation, dispatch correlation, completion and error normalization, reconnection, and lifecycle semantics using recorded host messages. Separate adapter tests cover only host-specific behavior, including Herdr schema/socket handling and Zellij pipes, bridge registration, and capture leases.
 
@@ -1818,7 +1818,6 @@ Release tags use `v{major}.{minor}.{patch}`. Asset names use `muxe-v{version}-{o
 
 - `linux-x64`;
 - `linux-arm64`;
-- `macos-x64`;
 - `macos-arm64`.
 
 These names allow mise's platform autodetection without a custom asset pattern. Linux archives target musl for static distribution. If either Linux architecture cannot pass the host integration matrix with musl, the release is blocked and the target decision is reopened. A differently linked artifact must not be silently published under the same name.
