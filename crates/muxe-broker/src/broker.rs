@@ -779,6 +779,13 @@ impl Broker {
         &self,
         request: muxe_protocol::PrepareUiLaunch,
     ) -> Result<RequestResult, BrokerError> {
+        let config = self.config.snapshot().await.config;
+        if config
+            .menu(&muxe_core::MenuId::new(request.root.as_str()))
+            .is_none()
+        {
+            return Err(BrokerError::UnknownMenu(request.root));
+        }
         let (pending, replaced, replaced_pending, replaced_session) = {
             let mut tokens = self.token_source.lock().await;
             let mut state = self.state.lock().await;
@@ -2749,6 +2756,22 @@ menus:
             .await
             .expect("launcher registers the host pane");
         token
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_unknown_menu_before_launching_a_pane() {
+        let (_adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let result = broker
+            .prepare(muxe_protocol::PrepareUiLaunch {
+                modal_scope: muxe_protocol::ModalScopeId::new("unknown-root"),
+                root: muxe_protocol::MenuId::new("missing"),
+                lease_millis: 60_000,
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(BrokerError::UnknownMenu(menu)) if menu.as_str() == "missing"
+        ));
     }
 
     #[tokio::test]
