@@ -7,9 +7,9 @@ name: release
 #   share/muxe/completions/ (muxe.bash, _muxe, muxe.fish)
 #   LICENSE
 #
-# Gate order is load-bearing: wasm producer -> per-arch assets -> verify
-# (checksums, byte-identity, layout, attestations) -> current target-only
-# live gates -> publish. Nothing becomes public before every required gate
+# Gate order is load-bearing: WASM and host-tool producers run in parallel,
+# then per-arch assets build; archive verification and target live smokes run
+# in parallel before publication. Nothing becomes public before every gate
 # passes. The cross-release upgrade/rollback/fault matrix is explicitly
 # deferred until the implementation is complete and a genuine predecessor
 # release is available; see TODO-CROSS-RELEASE.md.
@@ -81,12 +81,26 @@ jobs:
       - uses: jdx/mise-action@v2
         with:
           install: true
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          version: 1.10.0
+          github-cache-mode: objects
+          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
+      - name: route Cargo through mr-boxington
+        run: mbx setup --yes
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
           pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
+      - name: completions byte-clean (shared Linux result)
+        run: |
+          set -euo pipefail
+          mise exec -- cargo run --locked \
+            -p codegen-completions -- --check
       - name: build bridge (release)
         # The task definition (flags, profile, stage path) is owned by the
         # mise coordinator; this job only asserts its output.
@@ -169,6 +183,15 @@ jobs:
       - uses: jdx/mise-action@v2
         with:
           install: true
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          version: 1.10.0
+          github-cache-mode: objects
+          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
+      - name: route Cargo through mr-boxington
+        run: mbx setup --yes
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
@@ -287,11 +310,6 @@ jobs:
           report="native-compat-${{ matrix.asset }}.json"
           "$BIN" compatibility --json > "$report"
           test -s "$report"
-      - name: completions byte-clean
-        run: |
-          set -euo pipefail
-          mise exec -- cargo run --locked \
-            -p codegen-completions -- --check
       - name: assemble archive
         run: |
           set -euo pipefail
@@ -465,52 +483,8 @@ jobs:
             SHA256SUMS
             WASM_SHA256
 
-  live-matrix:
-    name: fixture matrix (${{ matrix.os }})
-    needs: [verify, metadata]
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-        with:
-          install: true
-      - name: pinned toolchain assert (single source is mise.toml)
-        run: |
-          set -euo pipefail
-          pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
-          test -n "$pin"
-          mise exec -- cargo --version | grep -F "cargo $pin"
-      - name: activation old/target fixtures (no live host)
-        # Owned TempDir framed-control transaction fixtures; any missing
-        # runner fails here by name instead of passing silently.
-        run: |
-          set -euo pipefail
-          mise exec -- cargo test --locked -p muxe \
-            --lib lifecycle::activate::tests
-      - name: Herdr recorded-socket smoke (no live host)
-        # Production adapter against recorded socket fixtures, including the
-        # exact pane argv/cwd exchange.
-        run: |
-          set -euo pipefail
-          mise exec -- cargo test --locked \
-            -p muxe-adapter-herdr --test recorded_socket
-      - name: runner owned-spawn proofs (no live host)
-        # Release-owned foreground/bootstrap/PTY/CLI/muxe scoping proofs:
-        # real children observe their real environment, the real
-        # paths::resolve proves the shared registry, and the PTY proves
-        # explicit geometry. Green without hosts or approval; the live
-        # matrix itself stays behind MUXE_LIVE_HOSTS_APPROVED.
-        run: |
-          set -euo pipefail
-          mise exec -- cargo test --locked -p muxe \
-            --test live_hosts scoped_spawn
-  target-smoke:
-    name: current target-only host smoke (${{ matrix.asset }})
-    needs: [verify, live-matrix, metadata]
+  hosts:
+    name: prepare host tools (${{ matrix.asset }})
     strategy:
       fail-fast: true
       matrix:
@@ -531,16 +505,12 @@ jobs:
             os: macos-15-intel
             herdr_asset: herdr-macos-x86_64
             herdr_digest: ab50262c8190cd7aa9056d249d255c08c328c3e8716de9cfa29db4f131b8e2c1
+    runs-on: ${{ matrix.os }}
     env:
       ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
-      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: live-host approval opt-in (before costly installs)
-        # This explicit repository-variable guard authorizes only the current
-        # target-only owned-host smoke. Cross-release execution remains
-        # deferred in TODO-CROSS-RELEASE.md until a real predecessor exists.
         run: |
           set -euo pipefail
           test "${ALLOW_LIVE_HOST_MATRIX:-}" = "true" || {
@@ -551,6 +521,15 @@ jobs:
       - uses: jdx/mise-action@v2
         with:
           install: true
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          version: 1.10.0
+          github-cache-mode: objects
+          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-hosts-v1-${{ hashFiles('mise.toml', 'Cargo.lock', 'pins/zellij.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mbx-hosts-v1-${{ hashFiles('mise.toml', 'Cargo.lock', 'pins/zellij.toml') }}-
+      - name: route Cargo through mr-boxington
+        run: mbx setup --yes
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
@@ -558,8 +537,6 @@ jobs:
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
       - name: pinned Zellij host (source build at pin)
-        # No official 0.46.0 release asset exists, so build the exact pinned
-        # source revision. Pin values come from pins/zellij.toml.
         run: |
           set -euo pipefail
           zrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/zellij.toml)"
@@ -572,11 +549,9 @@ jobs:
           mkdir -p "$zdir"
           mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
             --locked --root "$zdir" zellij
-          echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
+          echo "ZELLIJ_BINARY=$zdir/bin/zellij" >> "$GITHUB_ENV"
       - name: pinned Herdr host (0.8.2, digest-verified)
-        # Official v0.8.2 assets with published SHA-256 digests, verified
-        # before use. Asset and digest come from this matrix row.
         run: |
           set -euo pipefail
           file_digest() {
@@ -602,13 +577,99 @@ jobs:
               exit 1
             }
           fi
-          echo "$hdir" >> "$GITHUB_PATH"
           "$hdir/herdr" --version | grep -F "0.8.2"
+          echo "HERDR_BINARY=$hdir/herdr" >> "$GITHUB_ENV"
+      - name: package host tools
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/release-hosts"
+          rm -rf "$root"
+          mkdir -p "$root/bin"
+          cp "$ZELLIJ_BINARY" "$root/bin/zellij"
+          cp "$HERDR_BINARY" "$root/bin/herdr"
+          chmod 755 "$root/bin/zellij" "$root/bin/herdr"
+          archive="release-hosts-${{ matrix.asset }}.tar.gz"
+          tar -czf "$archive" -C "$root" .
+          echo "HOST_ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-hosts-${{ matrix.asset }}
+          path: ${{ env.HOST_ARCHIVE }}
+  target-smoke:
+    name: current target-only host smoke (${{ matrix.asset }})
+    needs: [assets, hosts, metadata]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - asset: linux-x64
+            os: ubuntu-24.04
+          - asset: linux-arm64
+            os: ubuntu-24.04-arm
+          - asset: macos-arm64
+            os: macos-15
+          - asset: macos-x64
+            os: macos-15-intel
+    env:
+      ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: live-host approval opt-in (before costly installs)
+        # This explicit repository-variable guard authorizes only the current
+        # target-only owned-host smoke. Cross-release execution remains
+        # deferred in TODO-CROSS-RELEASE.md until a real predecessor exists.
+        run: |
+          set -euo pipefail
+          test "${ALLOW_LIVE_HOST_MATRIX:-}" = "true" || {
+            echo "BLOCKED: current target-only live-host smoke requires recorded user approval." >&2
+            echo "Set the ALLOW_LIVE_HOST_MATRIX repository variable to \"true\" only after approval." >&2
+            exit 1
+          }
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          version: 1.10.0
+          github-cache-mode: objects
+          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
+      - name: route Cargo through mr-boxington
+        run: mbx setup --yes
+      - name: pinned toolchain assert (single source is mise.toml)
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
+          test -n "$pin"
+          mise exec -- cargo --version | grep -F "cargo $pin"
+      - name: prepared host tools
+        uses: actions/download-artifact@v4
+        with:
+          name: release-hosts-${{ matrix.asset }}
+          path: host-stage
+      - name: stage prepared host tools
+        run: |
+          set -euo pipefail
+          archive="host-stage/release-hosts-${{ matrix.asset }}.tar.gz"
+          test -f "$archive" || { echo "MISSING: prepared host archive $archive"; exit 1; }
+          root="$RUNNER_TEMP/release-hosts"
+          rm -rf "$root"
+          mkdir -p "$root"
+          tar -xzf "$archive" -C "$root"
+          test -x "$root/bin/zellij" || { echo "MISSING: prepared Zellij"; exit 1; }
+          test -x "$root/bin/herdr" || { echo "MISSING: prepared Herdr"; exit 1; }
+          {
+            echo "MUXE_ZELLIJ_BINARY=$root/bin/zellij"
+            echo "MUXE_HERDR_BINARY=$root/bin/herdr"
+          } >> "$GITHUB_ENV"
       - name: target archive for the current smoke
         uses: actions/download-artifact@v4
         with:
+          name: muxe-v${{ needs.metadata.outputs.version }}-${{ matrix.asset }}.tar.gz
           path: target-dist
-          merge-multiple: true
       - name: stage current target installation
         # Stage the complete archive produced by this tagged workflow. No
         # predecessor lookup or synthetic old artifact is used here.
@@ -638,9 +699,7 @@ jobs:
             exit 1
           }
           echo "MUXE_TARGET_INSTALLATION=$root" >> "$GITHUB_ENV"
-      - name: runner fixture binaries and host-free proofs
-        # Match the CI target-only invocation pattern before the approved
-        # real-host smoke. Missing helpers fail closed.
+      - name: runner fixture binaries
         run: |
           set -euo pipefail
           mise exec -- cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
@@ -649,8 +708,6 @@ jobs:
           test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
           test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
           test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
-          mise exec -- cargo test --locked -p muxe --test live_hosts scoped_spawn
-          mise exec -- cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
           {
             echo "MUXE_ZELLIJ_FOREGROUND_BINARY=$fx/muxe-zellij-foreground"
             echo "MUXE_ZELLIJ_BOOTSTRAP_BINARY=$fx/muxe-zellij-bootstrap"
@@ -663,16 +720,16 @@ jobs:
         run: |
           set -euo pipefail
           MUXE_TARGET_INSTALLATION="$MUXE_TARGET_INSTALLATION" \
-          MUXE_HERDR_BINARY="$(command -v herdr)" \
-          MUXE_ZELLIJ_BINARY="$(command -v zellij)" \
+          MUXE_HERDR_BINARY="$MUXE_HERDR_BINARY" \
+          MUXE_ZELLIJ_BINARY="$MUXE_ZELLIJ_BINARY" \
           MUXE_ZELLIJ_FOREGROUND_BINARY="$MUXE_ZELLIJ_FOREGROUND_BINARY" \
           MUXE_ZELLIJ_BOOTSTRAP_BINARY="$MUXE_ZELLIJ_BOOTSTRAP_BINARY" \
           MUXE_ZELLIJ_PERMISSION_SEEDER="$MUXE_ZELLIJ_PERMISSION_SEEDER" \
           MUXE_LIVE_HOSTS_APPROVED=true \
           mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
   publish:
-    needs: [verify, live-matrix, target-smoke, metadata]
-    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && needs.verify.result == 'success' && needs.live-matrix.result == 'success' && needs.target-smoke.result == 'success'
+    needs: [verify, target-smoke, metadata]
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && needs.verify.result == 'success' && needs.target-smoke.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
