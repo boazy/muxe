@@ -795,10 +795,13 @@ impl OwnedZellijHost {
         }
         let mut child = self.spawn_foreground_server(helper, session, scoped_root)?;
         let outcome: io::Result<PathBuf> = async {
-            // The socket proves the listener bound; only the bootstrap
-            // render proves the session initialized.
+            // The socket proves the listener bound; the bootstrap render
+            // proves initialization, and the CLI poll proves a subsequent
+            // `attach` can discover the initialized session. Zellij publishes
+            // that registry state asynchronously after the bootstrap exits.
             self.wait_for_session(session).await?;
             self.run_bootstrap(bootstrap, session, scoped_root).await?;
+            self.wait_for_cli_session(session).await?;
             // The bootstrap closes detach-style, so the server must still
             // be alive with the session retained for the real clients.
             // (`child` is not yet attached; the caller asserts the full
@@ -1152,6 +1155,29 @@ impl OwnedZellijHost {
                 ));
             }
             tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Waits until the pinned CLI can address the initialized session.
+    /// Bootstrap render and socket presence precede this registry state on
+    /// loaded CI runners, so retry the real scoped CLI within the startup
+    /// budget and retain its last diagnostic on failure.
+    async fn wait_for_cli_session(&self, session: &str) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            match self.list_clients(session).await {
+                Ok(_) => return Ok(()),
+                Err(error) if tokio::time::Instant::now() >= deadline => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "Zellij CLI did not discover session '{session}' inside the startup budget; \
+                             last attempt: {error}"
+                        ),
+                    ));
+                }
+                Err(_) => tokio::time::sleep(POLL_INTERVAL).await,
+            }
         }
     }
 
@@ -2181,6 +2207,18 @@ mod scoped_spawn_tests {
                      (stty size > \"$MARKER.size\" 2>/dev/null || echo stty-failed > \"$MARKER.size\");\n\
                      exec sleep 30",
                 "clients" => ": > \"$MARKER\" || exit 3;\nprintf 'CLIENT_ID\\ntest-client-1\\n'",
+                "clients-after-retry" =>
+                    "count_file=\"$MARKER.count\"\n\
+                     count=0\n\
+                     [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\n\
+                     count=$((count + 1))\n\
+                     printf '%s' \"$count\" > \"$count_file\" || exit 3\n\
+                     if [ \"$count\" -lt 2 ]; then\n\
+                       echo \"No session with the requested name found!\" >&2\n\
+                       exit 1\n\
+                     fi\n\
+                     : > \"$MARKER\" || exit 3\n\
+                     printf 'CLIENT_ID\\ntest-client-1\\n'",
                 "evidence" =>
                     ": > \"$MARKER\" || exit 3;\n\
                      echo \"bootstrapped session: first render evidence (7 bytes)\"",
@@ -2315,6 +2353,34 @@ mod scoped_spawn_tests {
             .expect("list-clients through scoped env");
         assert_eq!(clients, vec!["test-client-1".to_owned()]);
         assert!(marker.is_file(), "CLI child left no owned marker");
+    }
+
+    #[tokio::test]
+    async fn cli_session_readiness_retries_transient_discovery_failure() {
+        let case = case_dir("cli-readiness");
+        let marker = case.path().join("cli-readiness.marker");
+        let fake = write_fake(
+            case.path(),
+            "fake-zellij",
+            case.path(),
+            CLI_VARS,
+            false,
+            &marker,
+            "clients-after-retry",
+        );
+        let host = OwnedZellijHost::prepare(&fake, case.path(), "scope").expect("prepare host");
+        host.wait_for_cli_session("scope-sess")
+            .await
+            .expect("session becomes discoverable");
+        assert!(
+            marker.is_file(),
+            "readiness poll never reached a successful CLI call"
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker.with_extension("marker.count"))
+                .expect("read readiness attempt count"),
+            "2",
+        );
     }
 
     #[tokio::test]
