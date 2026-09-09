@@ -1,4 +1,20 @@
-## [0.1.0] - 2026-09-08
+## [0.1.1] - 2026-09-09
+
+### 🐛 Bug Fixes
+
+- *(zellij)* Invalidate replaced registration
+- *(herdr)* Reject unknown menu before launch
+- *(test)* Avoid Linux proof exec race
+- *(ui)* Isolate terminal input nonblocking mode
+
+### 📚 Documentation
+
+- Align supported release platforms
+
+### ⚡ Performance
+
+- *(ci)* Cache external Zellij builds
+## [0.1.0] - 2026-09-09
 
 ### 🐛 Bug Fixes
 
@@ -6,11 +22,25 @@
 - Preserve quiet Herdr subscriptions
 - *(release)* Correct prompts and allow CI override
 - *(release)* Keep Stop as cursor-only default
+- *(ci)* Tolerate absent macOS quarantine attribute
+- *(ci)* Wait for Zellij session discovery
+- *(ci)* Preserve Zellij client identity
+- *(zellij)* Refresh missed startup subscriptions
+- *(zellij)* Report initial census identities
+- *(zellij)* Revalidate bridge subscriptions
+- *(release)* Drop Intel macOS artifacts
 
 ### 📚 Documentation
 
 - Host-support menu:open distinguishes portable menu from source-proven zellij launcher path; reference regenerated
 - Rewrite README for clarity and new user onboarding
+
+### ⚡ Performance
+
+- *(ci)* Shorten release critical path
+- *(ci)* Parallelize deterministic gates
+- *(ci)* Use native target caching
+- *(ci)* Cache divergent cargo targets
 
 ### 🎨 Styling
 
@@ -43,3 +73,4 @@
 - Final lifecycle acceptance
 - Use zellij vendored curl for static musl
 - Scope vendored curl to musl
+- V0.1.0
