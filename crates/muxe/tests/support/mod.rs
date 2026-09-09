@@ -1023,10 +1023,24 @@ impl OwnedZellijHost {
     /// shared muxe config/cache/runtime roots survive; calling the
     /// host-base [`OwnedZellijHost::apply_host_env`] here instead would
     /// wipe them (and the reverse order would drop the socket identity).
-    /// PATH passes through for system tool lookup.
+    /// The pinned binary directory leads PATH so public Muxe commands resolve
+    /// the exact host under test rather than an ambient installation.
     pub fn apply_host_scoped_env(&self, command: &mut Command, scoped_root: &Path) {
         apply_scoped_env(command, scoped_root);
         self.apply_host_env_overlay(command);
+        self.prepend_pinned_binary_dir(command);
+    }
+
+    fn prepend_pinned_binary_dir(&self, command: &mut Command) {
+        let Some(directory) = self.zellij_binary.parent() else {
+            return;
+        };
+        let physical_directory =
+            std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+        let mut path = physical_directory.into_os_string();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        command.env("PATH", path);
     }
 
     /// Additive Zellij session identity for muxe-scoped children: socket,
@@ -1158,15 +1172,37 @@ impl OwnedZellijHost {
         }
     }
 
-    /// Waits until the pinned CLI can address the initialized session.
-    /// Bootstrap render and socket presence precede this registry state on
-    /// loaded CI runners, so retry the real scoped CLI within the startup
-    /// budget and retain its last diagnostic on failure.
+    /// Waits until the pinned CLI's global registry lists the initialized
+    /// session. Bootstrap render and socket presence precede this state on
+    /// loaded CI runners. `list-sessions` never attaches to the session, so
+    /// this readiness check cannot consume the client identity that the
+    /// retained PTY and its bridge registration must share.
     async fn wait_for_cli_session(&self, session: &str) -> io::Result<()> {
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
-            match self.list_clients(session).await {
-                Ok(_) => return Ok(()),
+            let mut command = self.base_command();
+            command.arg("list-sessions").arg("--short");
+            let attempt = run_cli_bounded(&format!("list-sessions-{session}"), &mut command).await;
+            let result = attempt.and_then(|output| {
+                if !output.status.success() {
+                    return Err(io::Error::other(format!(
+                        "list-sessions failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
+                }
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|listed| listed.trim() == session)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("session '{session}' is absent from list-sessions"),
+                        )
+                    })
+            });
+            match result {
+                Ok(()) => return Ok(()),
                 Err(error) if tokio::time::Instant::now() >= deadline => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -2150,9 +2186,11 @@ mod scoped_spawn_tests {
     /// over-scoped spawn can never touch ambient user dirs through this
     /// fake. Modes: `linger` (marker, then sleep for reap), `pty`
     /// (marker plus the owned PTY's real `stty size`, then sleep),
-    /// `clients` (marker plus a `list-clients` table), `evidence`
-    /// (marker plus a bootstrap render report), `permit` (marker plus a
-    /// fixed grant report naming the plugin location), `ok` (marker,
+    /// `clients` (marker plus a `list-clients` table),
+    /// `sessions-after-retry` (one discovery failure, then a session name),
+    /// `resolve-zellij` (marker after PATH resolves the owned pinned binary),
+    /// `evidence` (marker plus a bootstrap render report), `permit` (marker
+    /// plus a fixed grant report naming the plugin location), `ok` (marker,
     /// exit 0).
     fn write_fake(
         dir: &Path,
@@ -2207,18 +2245,22 @@ mod scoped_spawn_tests {
                      (stty size > \"$MARKER.size\" 2>/dev/null || echo stty-failed > \"$MARKER.size\");\n\
                      exec sleep 30",
                 "clients" => ": > \"$MARKER\" || exit 3;\nprintf 'CLIENT_ID\\ntest-client-1\\n'",
-                "clients-after-retry" =>
+                "sessions-after-retry" =>
                     "count_file=\"$MARKER.count\"\n\
                      count=0\n\
                      [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\n\
                      count=$((count + 1))\n\
                      printf '%s' \"$count\" > \"$count_file\" || exit 3\n\
                      if [ \"$count\" -lt 2 ]; then\n\
-                       echo \"No session with the requested name found!\" >&2\n\
+                       echo \"No active zellij sessions found.\" >&2\n\
                        exit 1\n\
                      fi\n\
                      : > \"$MARKER\" || exit 3\n\
-                     printf 'CLIENT_ID\\ntest-client-1\\n'",
+                     printf 'scope-sess\\n'",
+                "resolve-zellij" =>
+                    "resolved=$(command -v zellij) || fail 'zellij is absent from PATH'\n\
+                     [ \"$resolved\" = \"$EXPECTED_ROOT/zellij\" ] || fail \"zellij resolved to $resolved\"\n\
+                     : > \"$MARKER\" || exit 3",
                 "evidence" =>
                     ": > \"$MARKER\" || exit 3;\n\
                      echo \"bootstrapped session: first render evidence (7 bytes)\"",
@@ -2366,7 +2408,7 @@ mod scoped_spawn_tests {
             CLI_VARS,
             false,
             &marker,
-            "clients-after-retry",
+            "sessions-after-retry",
         );
         let host = OwnedZellijHost::prepare(&fake, case.path(), "scope").expect("prepare host");
         host.wait_for_cli_session("scope-sess")
@@ -2450,7 +2492,7 @@ mod scoped_spawn_tests {
         );
         let fake_zellij = write_fake(
             case.path(),
-            "fake-muxe-zellij",
+            "zellij",
             case.path(),
             &format!(
                 "{MUXE_VARS} ZELLIJ_SOCKET_DIR ZELLIJ_CONFIG_FILE ZELLIJ_CONFIG_DIR ZELLIJ_DATA_DIR"
@@ -2468,7 +2510,7 @@ mod scoped_spawn_tests {
             ),
             false,
             &marker_activate,
-            "ok",
+            "resolve-zellij",
         );
         let host =
             OwnedZellijHost::prepare(&fake_zellij, case.path(), "scope").expect("prepare host");
