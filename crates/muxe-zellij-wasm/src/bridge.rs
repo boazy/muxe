@@ -214,13 +214,12 @@ impl Default for Bridge {
 }
 
 impl Bridge {
-    /// Initial plugin load: permission request, control subscriptions,
-    /// plugin IDs, and the first heartbeat timer. The privileged identity
-    /// query stays deferred until the host's explicit grant event: the
-    /// grant arrives asynchronously after the request, and a pre-grant
-    /// query is denied by the host.
+    /// Initial plugin load: control subscriptions, permission request,
+    /// plugin IDs, and the first heartbeat timer. Subscribe before requesting
+    /// permissions because the host can replay a cached grant synchronously;
+    /// the privileged identity query still waits for that explicit grant
+    /// event, so a pre-grant query is never attempted.
     pub fn load(&mut self, effects: &mut dyn HostEffects) {
-        effects.request_permissions(&BRIDGE_PERMISSIONS);
         effects.subscribe(&[
             EventType::PermissionRequestResult,
             EventType::ListClients,
@@ -230,6 +229,7 @@ impl Bridge {
             EventType::ActionComplete,
             EventType::Timer,
         ]);
+        effects.request_permissions(&BRIDGE_PERMISSIONS);
         let ids = effects.plugin_ids();
         self.plugin_id = Some(ids.plugin_id);
         self.plugin_client_id = Some(ids.client_id);
@@ -495,7 +495,9 @@ impl Bridge {
         effects.block_pipe(&cli_id);
         self.event_cli_id = Some(cli_id);
         self.pending_subscribe = true;
-        self.try_register(effects);
+        if self.permission_gate == PermissionGate::Granted {
+            effects.list_clients();
+        }
     }
 
     /// Emits a registration once the permission grant, verified identity,
@@ -1007,6 +1009,7 @@ mod tests {
         focused: Vec<PaneId>,
         timers: u32,
         lists: u32,
+        effect_order: Vec<&'static str>,
         list_clients_ready: bool,
         list_response_pending: bool,
         plugin_id: u32,
@@ -1025,6 +1028,7 @@ mod tests {
                 focused: Vec::new(),
                 timers: 0,
                 lists: 0,
+                effect_order: Vec::new(),
                 list_clients_ready: false,
                 list_response_pending: false,
                 plugin_id: 41,
@@ -1067,8 +1071,12 @@ mod tests {
     }
 
     impl HostEffects for FakeHost {
-        fn request_permissions(&mut self, _permissions: &[PermissionType]) {}
-        fn subscribe(&mut self, _events: &[EventType]) {}
+        fn request_permissions(&mut self, _permissions: &[PermissionType]) {
+            self.effect_order.push("request_permissions");
+        }
+        fn subscribe(&mut self, _events: &[EventType]) {
+            self.effect_order.push("subscribe");
+        }
         fn list_clients(&mut self) {
             self.lists += 1;
             if self.list_clients_ready {
@@ -1188,8 +1196,9 @@ mod tests {
     }
 
     /// Full startup through the real host sequence: load (no privileged
-    /// query), explicit grant (exactly one identity query), identity
-    /// event, then event-channel subscription driving registration.
+    /// query), explicit grant (one identity query), initial identity event,
+    /// then event-channel subscription and a fresh identity event driving
+    /// registration.
     fn boot() -> (Bridge, FakeHost) {
         let mut bridge = Bridge::default();
         let mut host = FakeHost::new();
@@ -1205,6 +1214,12 @@ mod tests {
             &mut host,
         );
         bridge.pipe(subscribe_msg(), &mut host);
+        assert_eq!(host.lists, 2);
+        assert_eq!(bridge.active_registration(), None);
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
         assert_eq!(bridge.client_identity(), Some("5"));
         assert_eq!(bridge.active_registration(), Some([7; 16]));
         (bridge, host)
@@ -1262,6 +1277,11 @@ mod tests {
         let mut bridge = Bridge::default();
         let mut host = FakeHost::new();
         bridge.load(&mut host);
+        assert_eq!(
+            host.effect_order,
+            ["subscribe", "request_permissions"],
+            "load must subscribe before requesting a replayable permission result"
+        );
         assert_eq!(host.lists, 0);
         // A subscription alone cannot register without an authorized
         // anchor-matching census.
@@ -1334,14 +1354,30 @@ mod tests {
     }
 
     #[test]
-    fn verified_identity_survives_foreign_denial_for_new_subscription() {
+    fn new_subscription_revalidates_identity_after_foreign_denial() {
         let (mut bridge, mut host) = boot();
         bridge.update(
             Event::PermissionRequestResult(PermissionStatus::Denied),
             &mut host,
         );
+        let before = host.outputs.len();
         bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
+        assert_eq!(host.lists, 3);
         assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.active_registration(), Some([7; 16]));
+        assert!(host.outputs[before..].is_empty());
+
+        bridge.update(
+            Event::ListClients(clients_for(6, PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert_eq!(bridge.client_identity(), Some("5"));
+        assert!(host.register_client_ids(EVENT_CLI_TWO).is_empty());
+
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
         assert_eq!(bridge.active_registration(), Some([8; 16]));
         assert_eq!(
             host.register_client_ids(EVENT_CLI_TWO),

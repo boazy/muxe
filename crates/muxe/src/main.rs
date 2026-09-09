@@ -957,9 +957,9 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     };
     if !is_target {
         // Ordinary Running admits UI the moment the endpoint binds (adapter
-        // health is broadcast-only, never a broker-side latch), so the single
-        // bounded round completes here: after bind every attach already
-        // observes readiness. Exhausting the budget fails startup closed.
+        // health is broadcast-only, never a broker-side latch), so bounded
+        // census attempts complete before bind. Exhausting the shared budget
+        // fails startup closed.
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
         if let Err(error) = establish_initial_round_until(&adapter, deadline, &logger).await {
             serve_event(
@@ -1045,11 +1045,11 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     if is_target {
         // The endpoint is already bound and serving TargetGated status with
         // ready=None, so the coordinator observes the target before the
-        // bridge swap. The round runs concurrently with serving: retry on
-        // Err with the transport intact, while the outer deadline bounds even
-        // a hanging call. Expiry requests shutdown, awaits the owned service
-        // (whose run epilogue unlinks the endpoint), unregisters the owned
-        // entry, and propagates the round failure.
+        // bridge swap. Census attempts run concurrently with serving; each
+        // failed attempt replaces only the event subscription while the
+        // outer deadline bounds even a hanging call. Expiry requests
+        // shutdown, awaits the owned service (whose run epilogue unlinks the
+        // endpoint), unregisters the owned entry, and propagates the failure.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
