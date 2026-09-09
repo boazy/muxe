@@ -1,7 +1,8 @@
 use std::{
     collections::VecDeque,
+    fs::OpenOptions,
     io,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    os::fd::{AsFd, OwnedFd},
     time::Duration,
 };
 
@@ -14,7 +15,7 @@ use muxe_protocol::{
 };
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
-    unistd::{dup, read as read_fd},
+    unistd::{read as read_fd, ttyname},
 };
 use ratatui::layout::Rect;
 use thiserror::Error;
@@ -111,47 +112,53 @@ impl SignalHandlers {
     }
 }
 
-/// A duplicated stdin descriptor whose nonblocking flag is restored before it closes.
-struct NonblockingStdinFd {
-    fd: OwnedFd,
-    original_flags: OFlag,
-}
-
-impl AsRawFd for NonblockingStdinFd {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.fd.as_raw_fd()
-    }
-}
-
-impl AsFd for NonblockingStdinFd {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
-    }
-}
-
-impl Drop for NonblockingStdinFd {
-    fn drop(&mut self) {
-        let _ = fcntl(&self.fd, FcntlArg::F_SETFL(self.original_flags));
-    }
-}
-
 /// A readiness-backed, cancellable raw terminal reader.
 ///
-/// The duplicated descriptor shares the terminal's open-file description, so setting
-/// `O_NONBLOCK` is restored by the descriptor's drop guard before the UI returns.
+/// Reopening stdin's concrete terminal path creates an independent open-file
+/// description. Using a duplicated stdin descriptor here would share
+/// `O_NONBLOCK` with stdout and stderr in PTY hosts that dup one slave
+/// descriptor across all three streams; a subsequent render could then fail
+/// with `EAGAIN`.
 struct NonblockingStdin {
-    fd: AsyncFd<NonblockingStdinFd>,
+    fd: AsyncFd<OwnedFd>,
 }
 
 impl NonblockingStdin {
     fn open() -> io::Result<Self> {
-        let fd = dup(io::stdin()).map_err(nix_io)?;
-        let original_flags =
-            OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL).map_err(nix_io)?);
-        fcntl(&fd, FcntlArg::F_SETFL(original_flags | OFlag::O_NONBLOCK)).map_err(nix_io)?;
-        let fd = NonblockingStdinFd { fd, original_flags };
+        let tty_path = ttyname(io::stdin().as_fd())
+            .map_err(nix_io)
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("resolve stdin terminal: {error}"))
+            })?;
+        let tty = OpenOptions::new()
+            .read(true)
+            .open(&tty_path)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("open stdin terminal {}: {error}", tty_path.display()),
+                )
+            })?;
+        let fd = OwnedFd::from(tty);
+        let flags =
+            OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL).map_err(nix_io).map_err(
+                |error| io::Error::new(error.kind(), format!("read stdin terminal flags: {error}")),
+            )?);
+        fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+            .map_err(nix_io)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("set stdin terminal nonblocking: {error}"),
+                )
+            })?;
         Ok(Self {
-            fd: AsyncFd::new(fd)?,
+            fd: AsyncFd::new(fd).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("register stdin terminal readiness: {error}"),
+                )
+            })?,
         })
     }
 

@@ -76,12 +76,12 @@ use muxe_zellij_protocol::{
 };
 use sha2::{Digest, Sha256};
 use support::{
-    ContinuityGuard, OwnedChild, OwnedHerdrServer, OwnedZellijHost, ServedBroker,
+    ContinuityGuard, OwnedChild, OwnedHerdrServer, OwnedZellijHost, ServedBroker, apply_scoped_env,
     assert_broker_serving, assert_no_preserved_journals, await_activate, await_session_ready,
     await_target_ready, drive_activate, emit_owned_host_log_tails, init_shared_dirs, input_path,
     install_zellij_integration, installed_version, installed_wasm_digest, poll_until,
-    read_broker_record, retire_broker, short_tempdir, spawn_activate, spawn_serve_herdr,
-    spawn_serve_zellij, validate_installation,
+    read_broker_record, retire_broker, short_tempdir, spawn_activate, spawn_herdr_client,
+    spawn_serve_herdr, spawn_serve_zellij, validate_installation,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -271,7 +271,7 @@ async fn bring_hosts(
     let scoped_root = root.path().join("scoped");
     let (config_file, cache_dir) = init_shared_dirs(init_bin, &scoped_root).await?;
 
-    let mut herdr = OwnedHerdrServer::start(herdr_binary, root.path(), case).await?;
+    let mut herdr = OwnedHerdrServer::start(herdr_binary, root.path(), &scoped_root, case).await?;
     let discovery = herdr.discovery_key().to_owned();
     if herdr.try_wait()?.is_some() {
         return Err(io::Error::other(format!(
@@ -1188,9 +1188,200 @@ async fn duo_drain_route_heartbeats(
     eprintln!("[duo] post-route heartbeats observed for both active anchors");
     Ok(())
 }
+async fn prepare_herdr_menu_origin(
+    rig: &mut Rig,
+    herdr_binary: &Path,
+) -> io::Result<(
+    PathBuf,
+    muxe_adapter_herdr::HerdrRuntime,
+    muxe_adapter_herdr::FocusedPane,
+    PathBuf,
+)> {
+    let socket = rig
+        .herdr
+        .as_ref()
+        .ok_or_else(|| io::Error::other("smoke: Herdr server is gone"))?
+        .socket()
+        .to_path_buf();
+    let runtime =
+        muxe_adapter_herdr::HerdrRuntime::connect(muxe_adapter_herdr::HerdrAdapterConfig {
+            socket_path: socket.clone(),
+            herdr_binary: herdr_binary.to_path_buf(),
+            cache_dir: rig.cache_dir.clone(),
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("smoke: connect Herdr runtime: {error}")))?;
+    let workspace_method = muxe_adapter_herdr::generated::method_metadata("workspace.create")
+        .ok_or_else(|| io::Error::other("smoke: bundled Herdr metadata lacks workspace.create"))?;
+    match runtime
+        .client()
+        .unary(
+            workspace_method,
+            serde_json::json!({
+                "cwd": rig.workdir,
+                "env": {},
+                "focus": true,
+                "label": "muxe-live-smoke",
+            }),
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("smoke: create Herdr workspace: {error}")))?
+    {
+        muxe_adapter_herdr::HerdrResponse::Success(_) => {}
+        muxe_adapter_herdr::HerdrResponse::Error { code, message } => {
+            return Err(io::Error::other(format!(
+                "smoke: Herdr rejected origin workspace with {code}: {message}"
+            )));
+        }
+    }
+    let typescript = rig.root.path().join("smoke-herdr.typescript");
+    let client = spawn_herdr_client(
+        "smoke-menu",
+        herdr_binary,
+        &socket,
+        &rig.scoped_root,
+        &rig.workdir,
+        &typescript,
+    )
+    .await?;
+    rig.pty_clients.push(client);
+    let origin = poll_until(
+        "focused Herdr origin pane",
+        std::time::Duration::from_secs(5),
+        async || {
+            muxe_adapter_herdr::focused_pane(runtime.client(), runtime.schema())
+                .await
+                .map_err(|error| error.to_string())
+        },
+    )
+    .await?;
+    Ok((socket, runtime, origin, typescript))
+}
+
+async fn assert_herdr_menu_stays_open(
+    rig: &mut Rig,
+    target_bin: &Path,
+    herdr_binary: &Path,
+) -> io::Result<()> {
+    let (socket, runtime, origin, typescript) =
+        prepare_herdr_menu_origin(rig, herdr_binary).await?;
+    let mut command = tokio::process::Command::new(target_bin);
+    command.args([
+        "menu",
+        "open",
+        "--pane-type",
+        "split",
+        "--direction",
+        "down",
+        "--height",
+        "30%",
+        "main",
+    ]);
+    apply_scoped_env(&mut command, &rig.scoped_root);
+    command
+        .env("HERDR_SOCKET_PATH", &socket)
+        .env("HERDR_ACTIVE_WORKSPACE_ID", origin.workspace.as_str())
+        .env("HERDR_ACTIVE_TAB_ID", origin.tab.as_str())
+        .env("HERDR_ACTIVE_PANE_ID", origin.pane.as_str())
+        .current_dir(&origin.cwd);
+    let output = command.output().await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "smoke: Herdr menu launcher failed (status {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pane = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("opened "))
+        .ok_or_else(|| io::Error::other(format!("smoke: launcher reported no pane: {stdout}")))?;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    muxe_adapter_herdr::pane_by_id(runtime.client(), runtime.schema(), pane)
+        .await
+        .map_err(|error| {
+            let transcript = std::fs::read(&typescript).map_or_else(
+                |read_error| format!("(transcript unreadable: {read_error})"),
+                |bytes| {
+                    let start = bytes.len().saturating_sub(16 * 1024);
+                    String::from_utf8_lossy(&bytes[start..]).into_owned()
+                },
+            );
+            io::Error::other(format!(
+                "smoke: valid Herdr menu pane {pane} exited immediately: {error}\n\
+                 --- attached Herdr transcript ---\n{transcript}"
+            ))
+        })?;
+    eprintln!("[smoke] Herdr menu pane {pane} remained live after launcher exit");
+    Ok(())
+}
+
+async fn run_herdr_menu_smoke() -> io::Result<()> {
+    let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
+    let target_version = installed_version(&target_bin).await?;
+    let herdr_binary = input_path("MUXE_HERDR_BINARY");
+    let root = short_tempdir("muxe-live-herdr-menu-")?;
+    let scoped_root = root.path().join("scoped");
+    let (config_file, cache_dir) = init_shared_dirs(&target_bin, &scoped_root).await?;
+    let workdir = root.path().join("work");
+    std::fs::create_dir_all(&workdir)?;
+    let mut herdr =
+        OwnedHerdrServer::start(&herdr_binary, root.path(), &scoped_root, "herdr-menu").await?;
+    let discovery = herdr.discovery_key().to_owned();
+    if herdr.try_wait()?.is_some() {
+        return Err(io::Error::other(
+            "herdr-menu: Herdr server exited on startup",
+        ));
+    }
+    let continuity = ContinuityGuard::watch_herdr(
+        "herdr-menu",
+        herdr.socket().to_path_buf(),
+        discovery.clone(),
+    )
+    .await?;
+    let mut rig = Rig {
+        root,
+        scoped_root,
+        workdir,
+        config_file,
+        cache_dir,
+        herdr: Some(herdr),
+        discovery: discovery.clone(),
+        zellij: None,
+        pty_clients: Vec::new(),
+        brokers: Vec::new(),
+        continuity: Some(continuity),
+    };
+    let result = async {
+        let server = rig
+            .herdr
+            .as_ref()
+            .ok_or_else(|| io::Error::other("herdr-menu: Herdr server is gone"))?;
+        let broker = spawn_serve_herdr(
+            "herdr-menu",
+            &target_bin,
+            &herdr_binary,
+            server.socket(),
+            &discovery,
+            &rig.scoped_root,
+            &rig.config_file,
+            &rig.cache_dir,
+        )
+        .await?;
+        let endpoint = broker.endpoint.clone();
+        rig.brokers.push(broker);
+        assert_broker_serving(&endpoint, "herdr-menu", &target_version).await?;
+        assert_herdr_menu_stays_open(&mut rig, &target_bin, &herdr_binary).await
+    }
+    .await;
+    rig.finish("herdr-menu", result).await
+}
 async fn run_target_only_smoke() -> io::Result<()> {
     let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
     let target_version = installed_version(&target_bin).await?;
+
     let target_digest = installed_wasm_digest(&target_bin).await?;
     eprintln!("[smoke] target {target_version} packaged_wasm.sha256={target_digest:?}");
     let herdr_binary = input_path("MUXE_HERDR_BINARY");
@@ -1243,6 +1434,7 @@ async fn run_target_only_smoke() -> io::Result<()> {
                 "smoke: zellij serving identity is {session_live:?}, want session \"smoke\""
             )));
         }
+        assert_herdr_menu_stays_open(&mut rig, &target_bin, &herdr_binary).await?;
         Ok(())
     }
     .await;
@@ -1634,6 +1826,15 @@ async fn run_final_session_reload_failure() -> io::Result<()> {
     }
     .await;
     rig.finish("fault", result).await
+}
+
+#[tokio::test]
+#[ignore = "live Herdr: needs a staged install, Herdr binary, and MUXE_LIVE_HOSTS_APPROVED=true"]
+async fn herdr_menu_stays_open() {
+    require_live_approval();
+    if let Err(error) = run_herdr_menu_smoke().await {
+        panic!("Herdr menu smoke failed: {error}");
+    }
 }
 
 #[tokio::test]

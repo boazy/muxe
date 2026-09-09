@@ -19,7 +19,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt as _;
 
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::task::JoinHandle;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -305,6 +305,7 @@ pub struct ChildDiagnostics {
 pub struct OwnedChild {
     tag: String,
     child: Option<Child>,
+    _stdin: Option<ChildStdin>,
     stdout: Option<JoinHandle<Vec<u8>>>,
     stderr: Option<JoinHandle<Vec<u8>>>,
 }
@@ -324,6 +325,28 @@ impl OwnedChild {
         Ok(Self {
             tag: tag.to_owned(),
             child: Some(child),
+            _stdin: None,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Spawns a retained child with a writable stdin handle kept open for
+    /// interactive PTY wrappers. No input is sent; retaining the writer avoids
+    /// synthesizing EOF into the nested terminal.
+    pub fn spawn_with_open_stdin(tag: &str, command: &mut Command) -> io::Result<Self> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().map(PipeTail::drain);
+        let stderr = child.stderr.take().map(PipeTail::drain);
+        Ok(Self {
+            tag: tag.to_owned(),
+            child: Some(child),
+            _stdin: stdin,
             stdout,
             stderr,
         })
@@ -549,8 +572,15 @@ pub struct OwnedHerdrServer {
 
 impl OwnedHerdrServer {
     /// Starts exactly one Herdr server from an absolute binary path. The
-    /// server lives under `root/{name}` and nowhere else.
-    pub async fn start(herdr_binary: &Path, root: &Path, name: &str) -> io::Result<Self> {
+    /// explicit socket stays under `root`; the server shares the test's fresh
+    /// scoped environment so panes resolve the same Muxe config and cache as
+    /// their launcher, matching a real user's Herdr session.
+    pub async fn start(
+        herdr_binary: &Path,
+        root: &Path,
+        scoped_root: &Path,
+        name: &str,
+    ) -> io::Result<Self> {
         if !herdr_binary.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -560,14 +590,6 @@ impl OwnedHerdrServer {
                 ),
             ));
         }
-        let home = root.join(format!("{name}-herdr-home"));
-        let config_home = root.join(format!("{name}-herdr-config"));
-        let cache_home = root.join(format!("{name}-herdr-cache"));
-        let tmp = root.join(format!("{name}-herdr-tmp"));
-        std::fs::create_dir_all(&home)?;
-        std::fs::create_dir_all(&config_home)?;
-        std::fs::create_dir_all(&cache_home)?;
-        std::fs::create_dir_all(&tmp)?;
         let socket = root.join(format!("{name}-herdr.sock"));
         #[cfg(unix)]
         if socket.as_os_str().len() > MAX_UNIX_SOCKET_PATH {
@@ -577,15 +599,9 @@ impl OwnedHerdrServer {
             ));
         }
         let mut command = Command::new(herdr_binary);
-        command
-            .arg("server")
-            .env_clear()
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &config_home)
-            .env("XDG_CACHE_HOME", &cache_home)
-            .env("TMPDIR", &tmp)
-            .env("HERDR_SOCKET_PATH", &socket);
-        command.current_dir(root);
+        command.arg("server").env_clear();
+        apply_scoped_env(&mut command, scoped_root);
+        command.env("HERDR_SOCKET_PATH", &socket).current_dir(root);
         let mut child = OwnedChild::spawn(&format!("{name}-herdr-server"), &mut command)?;
         let outcome = wait_for_herdr_handshake(&socket).await;
         if let Err(error) = outcome {
@@ -627,6 +643,63 @@ impl OwnedHerdrServer {
     pub async fn shutdown(&mut self) -> io::Result<ChildDiagnostics> {
         self.child.terminate_and_reap().await
     }
+}
+/// Spawns one retained Herdr TUI client inside an owned PTY against the
+/// explicit test socket. The client's HOME/XDG/TMP state and transcript stay
+/// under the caller's fresh root; it never discovers or starts a user server.
+pub async fn spawn_herdr_client(
+    tag: &str,
+    herdr_binary: &Path,
+    socket: &Path,
+    scoped_root: &Path,
+    workdir: &Path,
+    typescript: &Path,
+) -> io::Result<OwnedChild> {
+    let size_prefix = format!("stty rows {BOOTSTRAP_ROWS} cols {BOOTSTRAP_COLS}; ");
+    let mut shell = std::ffi::OsString::from(size_prefix);
+    shell.push("exec ");
+    shell.push(shell_quote(herdr_binary.as_os_str()));
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("script");
+        command
+            .arg("-q")
+            .arg(typescript)
+            .arg("sh")
+            .arg("-c")
+            .arg(shell);
+        command
+    } else {
+        let mut command = Command::new("script");
+        command.arg("-qec").arg(shell).arg(typescript);
+        command
+    };
+    apply_scoped_env(&mut command, scoped_root);
+    command
+        .env("HERDR_SOCKET_PATH", socket)
+        .env("TERM", "xterm-256color")
+        .current_dir(workdir);
+    let mut child =
+        OwnedChild::spawn_with_open_stdin(&format!("{tag}-herdr-pty-client"), &mut command)?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if child.try_wait()?.is_some() {
+        let diagnostics = child.terminate_and_reap().await?;
+        let typescript_tail = std::fs::read(typescript).map_or_else(
+            |error| format!("(typescript unreadable: {error})"),
+            |bytes| {
+                let tail = bytes
+                    .len()
+                    .saturating_sub(MAX_DIAGNOSTIC_BYTES)
+                    .min(bytes.len());
+                String::from_utf8_lossy(&bytes[tail..]).into_owned()
+            },
+        );
+        return Err(io::Error::other(format!(
+            "{tag} Herdr PTY client exited during the grace window:\n--- child stdout ---\n{}\n--- child stderr ---\n{}\n--- typescript ---\n{typescript_tail}",
+            diagnostics.stdout_tail.lossy(),
+            diagnostics.stderr_tail.lossy(),
+        )));
+    }
+    Ok(child)
 }
 
 /// Polls for the socket file, then proves liveness with a ping handshake
