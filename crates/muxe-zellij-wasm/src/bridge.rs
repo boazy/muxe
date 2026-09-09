@@ -492,6 +492,7 @@ impl Bridge {
         }
         self.pending = None;
         self.pending_actions.clear();
+        self.registration = [0; 16];
         effects.block_pipe(&cli_id);
         self.event_cli_id = Some(cli_id);
         self.pending_subscribe = true;
@@ -1364,14 +1365,27 @@ mod tests {
         bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
         assert_eq!(host.lists, 3);
         assert_eq!(bridge.client_identity(), Some("5"));
-        assert_eq!(bridge.active_registration(), Some([7; 16]));
+        assert_eq!(bridge.active_registration(), None);
         assert!(host.outputs[before..].is_empty());
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: "stale-ui".to_owned(),
+                ui_pane: "terminal_2".to_owned(),
+            }),
+            &mut host,
+        );
+        assert!(
+            host.outputs[before..].is_empty(),
+            "replacement channel must not heartbeat or accept the displaced registration"
+        );
 
         bridge.update(
             Event::ListClients(clients_for(6, PaneId::Terminal(2))),
             &mut host,
         );
         assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.active_registration(), None);
         assert!(host.register_client_ids(EVENT_CLI_TWO).is_empty());
 
         bridge.update(
