@@ -22,6 +22,11 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
+        with:
+          # These concurrent checks intentionally use distinct target roots.
+          github-cache-mode: objects
+      - name: route divergent Cargo targets through mr-boxington
+        run: mbx setup --yes
       - name: trust project tasks and assert pinned toolchain
         # The Rust pin lives only in mise.toml; no step repeats the version.
         run: |
@@ -115,8 +120,9 @@ jobs:
           test -n "$zver"
           zdir="$RUNNER_TEMP/zellij-host"
           mkdir -p "$zdir"
-          mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
-            --locked --root "$zdir" zellij
+          CARGO_TARGET_DIR=target/zellij-install \
+            mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
+              --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
       - name: pinned Herdr host (0.8.2, digest-verified)
@@ -324,8 +330,9 @@ jobs:
           test -n "$zver"
           zdir="$RUNNER_TEMP/zellij-host"
           mkdir -p "$zdir"
-          mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
-            --locked --root "$zdir" zellij
+          CARGO_TARGET_DIR=target/zellij-install \
+            mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
+              --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
       - name: pinned Herdr host (0.8.2, digest-verified)

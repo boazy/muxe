@@ -535,8 +535,9 @@ jobs:
           test -n "$zver"
           zdir="$RUNNER_TEMP/zellij-host"
           mkdir -p "$zdir"
-          mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
-            --locked --root "$zdir" zellij
+          CARGO_TARGET_DIR=target/zellij-install \
+            mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
+              --locked --root "$zdir" zellij
           "$zdir/bin/zellij" --version | grep -F "$zver"
           echo "ZELLIJ_BINARY=$zdir/bin/zellij" >> "$GITHUB_ENV"
       - name: pinned Herdr host (0.8.2, digest-verified)
