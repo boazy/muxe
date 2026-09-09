@@ -571,9 +571,10 @@ jobs:
             exit 1
           }
           chmod 755 "$hdir/herdr"
-          if [ "$(uname)" = "Darwin" ]; then
+          if [ "$(uname)" = "Darwin" ] \
+            && xattr -p com.apple.quarantine "$hdir/herdr" >/dev/null 2>&1; then
             xattr -d com.apple.quarantine "$hdir/herdr" || {
-              echo "MISSING: cannot clear macOS quarantine on $hdir/herdr"
+              echo "release failure: cannot clear macOS quarantine on $hdir/herdr"
               exit 1
             }
           fi
