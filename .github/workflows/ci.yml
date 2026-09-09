@@ -22,14 +22,6 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
-        with:
-          version: 1.10.0
-          github-cache-mode: objects
-          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
-      - name: route Cargo through mr-boxington
-        run: mbx setup --yes
       - name: trust project tasks and assert pinned toolchain
         # The Rust pin lives only in mise.toml; no step repeats the version.
         run: |
@@ -85,14 +77,6 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
-        with:
-          version: 1.10.0
-          github-cache-mode: objects
-          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
-      - name: route Cargo through mr-boxington
-        run: mbx setup --yes
       - name: trust project tasks and assert pinned toolchain
         run: |
           set -euo pipefail
@@ -263,14 +247,6 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
-        with:
-          version: 1.10.0
-          github-cache-mode: objects
-          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
-      - name: route Cargo through mr-boxington
-        run: mbx setup --yes
       - name: trust project tasks and assert pinned toolchain
         run: |
           set -euo pipefail
@@ -328,14 +304,6 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
-        with:
-          version: 1.10.0
-          github-cache-mode: objects
-          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-hosts-v1-${{ hashFiles('mise.toml', 'Cargo.lock', 'pins/zellij.toml') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mbx-hosts-v1-${{ hashFiles('mise.toml', 'Cargo.lock', 'pins/zellij.toml') }}-
-      - name: route Cargo through mr-boxington
-        run: mbx setup --yes
       - name: trust project tasks and assert pinned toolchain
         run: |
           set -euo pipefail

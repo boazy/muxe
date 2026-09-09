@@ -1,6 +1,5 @@
 [tools]
 rust = { version = "1.97.1", targets = ["wasm32-wasip1"], components = ["rustfmt", "clippy"] }
-"cargo:cargo-codspeed" = "5.0.1"
 
 [tasks.fmt]
 description = "Check Rust formatting on the pinned toolchain"
@@ -98,6 +97,7 @@ done
 
 [tasks.bench-codspeed]
 description = "Build CodSpeed comparisons with the pinned runner"
+tools = { "cargo:cargo-codspeed" = "5.0.1" }
 run = "cargo codspeed build --locked"
 
 [tasks.release]

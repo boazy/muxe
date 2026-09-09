@@ -7,10 +7,10 @@ name: release
 #   share/muxe/completions/ (muxe.bash, _muxe, muxe.fish)
 #   LICENSE
 #
-# Gate order is load-bearing: WASM and host-tool producers run in parallel,
-# then per-arch assets build; archive verification and target live smokes run
-# in parallel before publication. Nothing becomes public before every gate
-# passes. The cross-release upgrade/rollback/fault matrix is explicitly
+# Gate order is load-bearing: WASM, shared checks, and host-tool producers run
+# in parallel, then per-arch assets build; archive verification and target live
+# smokes run in parallel before publication. Nothing becomes public before
+# every gate passes. The cross-release upgrade/rollback/fault matrix is
 # deferred until the implementation is complete and a genuine predecessor
 # release is available; see TODO-CROSS-RELEASE.md.
 #
@@ -72,6 +72,23 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  shared-checks:
+    name: shared release checks
+    needs: [metadata]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - uses: jdx/mr-boxington-action@v1
+      - name: completions byte-clean
+        run: |
+          set -euo pipefail
+          mise trust
+          mise exec -- cargo run --locked \
+            -p codegen-completions -- --check
+
   wasm:
     name: wasm bridge producer (single source of bytes)
     needs: [metadata]
@@ -82,25 +99,12 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
-        with:
-          version: 1.10.0
-          github-cache-mode: objects
-          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
-      - name: route Cargo through mr-boxington
-        run: mbx setup --yes
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
           pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
-      - name: completions byte-clean (shared Linux result)
-        run: |
-          set -euo pipefail
-          mise exec -- cargo run --locked \
-            -p codegen-completions -- --check
       - name: build bridge (release)
         # The task definition (flags, profile, stage path) is owned by the
         # mise coordinator; this job only asserts its output.
@@ -184,14 +188,6 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
-        with:
-          version: 1.10.0
-          github-cache-mode: objects
-          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
-      - name: route Cargo through mr-boxington
-        run: mbx setup --yes
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
@@ -522,14 +518,6 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
-        with:
-          version: 1.10.0
-          github-cache-mode: objects
-          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-hosts-v1-${{ hashFiles('mise.toml', 'Cargo.lock', 'pins/zellij.toml') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mbx-hosts-v1-${{ hashFiles('mise.toml', 'Cargo.lock', 'pins/zellij.toml') }}-
-      - name: route Cargo through mr-boxington
-        run: mbx setup --yes
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
@@ -632,14 +620,6 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
-        with:
-          version: 1.10.0
-          github-cache-mode: objects
-          cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mbx-build-v1-${{ hashFiles('mise.toml', 'Cargo.lock') }}-
-      - name: route Cargo through mr-boxington
-        run: mbx setup --yes
       - name: pinned toolchain assert (single source is mise.toml)
         run: |
           set -euo pipefail
@@ -666,6 +646,7 @@ jobs:
             echo "MUXE_ZELLIJ_BINARY=$root/bin/zellij"
             echo "MUXE_HERDR_BINARY=$root/bin/herdr"
           } >> "$GITHUB_ENV"
+          echo "$root/bin" >> "$GITHUB_PATH"
       - name: target archive for the current smoke
         uses: actions/download-artifact@v4
         with:
@@ -729,8 +710,8 @@ jobs:
           MUXE_LIVE_HOSTS_APPROVED=true \
           mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke
   publish:
-    needs: [verify, target-smoke, metadata]
-    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && needs.verify.result == 'success' && needs.target-smoke.result == 'success'
+    needs: [verify, target-smoke, shared-checks, metadata]
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && needs.verify.result == 'success' && needs.target-smoke.result == 'success' && needs.shared-checks.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
