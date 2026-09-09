@@ -1080,18 +1080,51 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
 }
 
 /// Retries the inherent initial census round until success or the outer
-/// deadline. Each attempt is bounded by the remaining budget, so even a
-/// hanging call cannot outlive `deadline`; `Err` retries after a short pause
-/// with the transport intact (no churn, no park). Cancellation-safe: dropping
-/// a timed-out attempt leaves partial stamps for the next retry, and an
-/// established adapter returns immediately.
+/// deadline. After an unsuccessful round, the next attempt first replaces
+/// the event child and reissues its one-shot subscription. This recovers when
+/// a bridge loaded after the prior broadcast while preserving freshness:
+/// registrations from the displaced child carry an older install epoch and
+/// cannot cover the retried census. Every establish or refresh call remains
+/// bounded by the outer deadline.
 async fn establish_initial_round_until(
     adapter: &std::sync::Arc<muxe_adapter_zellij::ZellijAdapter>,
     deadline: std::time::Instant,
     logger: &muxe::logging::Logger,
 ) -> Result<()> {
     let mut last_error = String::from("startup budget elapsed before the first attempt");
+    let mut retrying = false;
     loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if retrying {
+            match tokio::time::timeout(remaining, adapter.refresh_initial_subscription()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let error = error.to_string();
+                    if last_error != error {
+                        serve_event(
+                            logger,
+                            "zellij",
+                            "broker-serve",
+                            &format!("initial subscription refresh failed: {error}"),
+                        );
+                    }
+                    last_error = error;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(_) => {
+                    last_error = String::from(
+                        "initial subscription refresh stalled past the startup budget",
+                    );
+                    serve_event(logger, "zellij", "broker-serve", &last_error);
+                    break;
+                }
+            }
+        }
+        retrying = true;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             break;
@@ -1112,16 +1145,13 @@ async fn establish_initial_round_until(
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(_) => {
-                let error = String::from("initial census round stalled past the startup budget");
-                if last_error != error {
-                    serve_event(
-                        logger,
-                        "zellij",
-                        "broker-serve",
-                        &format!("initial census attempt failed: {error}"),
-                    );
-                }
-                last_error = error;
+                last_error = String::from("initial census round stalled past the startup budget");
+                serve_event(
+                    logger,
+                    "zellij",
+                    "broker-serve",
+                    &format!("initial census attempt failed: {last_error}"),
+                );
                 break;
             }
         }

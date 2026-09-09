@@ -672,6 +672,36 @@ impl ZellijAdapter {
         .await;
         Ok(())
     }
+
+    /// Reinstalls the event subscription before retrying an unsuccessful
+    /// initial census. A bridge loaded after the prior one-shot broadcast
+    /// receives the subscription from the fresh child and re-registers.
+    /// The event-channel install epoch changes, so registrations observed
+    /// before this refresh cannot satisfy the next census.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] when the adapter is shut down or suspended,
+    /// or when the event child cannot be replaced.
+    pub async fn refresh_initial_subscription(&self) -> Result<(), AdapterError> {
+        if self.inner.shutdown.load(Ordering::Relaxed) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Zellij adapter is shut down; initial subscription cannot be refreshed",
+            ));
+        }
+        if self.inner.suspended.load(Ordering::SeqCst) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij adapter is suspended; activation resume owns the subscription",
+            ));
+        }
+        self.inner
+            .event
+            .respawn()
+            .await
+            .map_err(|error| transport_error(&error))
+    }
     /// Fresh compatible census for the readiness hook: client IDs holding a
     /// compatible record in the current evidence generation. Private; the
     /// typed `activation_readiness` hook is the only consumer surface.
@@ -3411,6 +3441,55 @@ mod tests {
         assert_eq!(membership.query_count(), 1);
         adapter.shutdown().await.expect("shutdown");
     }
+    /// A failed initial census retry reinstalls the event subscription.
+    /// Registrations from the displaced event child cannot satisfy the new
+    /// channel epoch; a bridge registration delivered after refresh can.
+    #[tokio::test]
+    async fn activation_initial_round_refreshes_missed_subscription() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        let displaced_channel = event.install_epoch().await.expect("initial event channel");
+
+        adapter
+            .refresh_initial_subscription()
+            .await
+            .expect("refresh event subscription");
+        assert!(
+            event
+                .install_epoch()
+                .await
+                .is_some_and(|channel| channel > displaced_channel),
+            "subscription refresh must install a new event-channel epoch"
+        );
+
+        let pending = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.establish_initial_round().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while membership.query_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refreshed census query runs bounded");
+        assert!(
+            !pending.is_finished(),
+            "a registration from the displaced subscription satisfied the refreshed census"
+        );
+        push_register(&event, "client-1", [8; 16], env!("CARGO_PKG_VERSION"));
+        tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("fresh registration completes the census")
+            .expect("census task joins")
+            .expect("refreshed census succeeds");
+        adapter.shutdown().await.expect("shutdown");
+    }
+
     /// Shutdown fails an in-flight initial census promptly instead of
     /// stalling to the census deadline: the waiter wakes on the shutdown
     /// notify and maps to `Shutdown`, retaining no success round.
