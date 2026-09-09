@@ -82,6 +82,10 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
+        with:
+          # Zellij is an external source install, so target pruning would
+          # discard it; retain completed mbx command objects instead.
+          github-cache-mode: objects
       - name: trust project tasks and assert pinned toolchain
         run: |
           set -euo pipefail
@@ -121,7 +125,7 @@ jobs:
           zdir="$RUNNER_TEMP/zellij-host"
           mkdir -p "$zdir"
           CARGO_TARGET_DIR=target/zellij-install \
-            mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
+            mise exec -- mbx install --git "$zrepo" --rev "$zrev" \
               --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
@@ -310,6 +314,9 @@ jobs:
         with:
           install: true
       - uses: jdx/mr-boxington-action@v1
+        with:
+          # Share the external source install with release host preparation.
+          github-cache-mode: objects
       - name: trust project tasks and assert pinned toolchain
         run: |
           set -euo pipefail
@@ -331,7 +338,7 @@ jobs:
           zdir="$RUNNER_TEMP/zellij-host"
           mkdir -p "$zdir"
           CARGO_TARGET_DIR=target/zellij-install \
-            mise exec -- cargo install --git "$zrepo" --rev "$zrev" \
+            mise exec -- mbx install --git "$zrepo" --rev "$zrev" \
               --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
