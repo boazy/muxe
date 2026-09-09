@@ -18,7 +18,7 @@ name: release
 # records both the SHA-256 of the bytes it built and the generated shared
 # bridge-build-ID witness from that exact producer build. Each asset job
 # re-verifies the bytes, exports both identities, and runs its native
-# compatibility CLI. Verify aggregates all four reports and requires every
+# compatibility CLI. Verify aggregates all three reports and requires every
 # native bridge ID to equal the single WASM build witness; byte SHA checks
 # remain a separate assertion.
 #
@@ -167,12 +167,6 @@ jobs:
             uname_arch: aarch64
             file_arch: aarch64
             static: true
-          - asset: macos-x64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            uname_arch: x86_64
-            file_arch: x86_64
-            static: false
           - asset: macos-arm64
             os: macos-15
             target: aarch64-apple-darwin
@@ -232,7 +226,7 @@ jobs:
         # from a repo sidecar: it is the SHA-256 of the staged bytes checked
         # two steps above. The native build (core-owned build.rs) consumes
         # MUXE_WASM_SHA256 and bakes it into the compatibility record; release
-        # builds fail closed without it. All four archives embed the same
+        # builds fail closed without it. All three archives embed the same
         # producer bytes.
         run: |
           set -euo pipefail
@@ -342,11 +336,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: all four archives present
+      - name: all three archives present
         run: |
           set -euo pipefail
           archives=(dist/muxe-v*.tar.gz)
-          test "${#archives[@]}" -eq 4
+          test "${#archives[@]}" -eq 3
           printf '%s\n' "${archives[@]}"
       - name: checksums (missing checksum fails the release)
         run: |
@@ -423,7 +417,7 @@ jobs:
           test "$bridge_build_id" != "$(printf '%064d' 0)"
           expected_sha="$(cut -d' ' -f1 producer/muxe-zellij.sha256)"
           reports=(dist/native-compat-*.json)
-          test "${#reports[@]}" -eq 4
+          test "${#reports[@]}" -eq 3
           for report in "${reports[@]}"; do
             report_id="$(jq -r '.hosts.zellij.bridge_build_id' "$report")"
             test "$report_id" = "$bridge_build_id" || {
@@ -497,10 +491,6 @@ jobs:
             os: macos-15
             herdr_asset: herdr-macos-aarch64
             herdr_digest: a5d4f4d504d8b309c91f811050559300faba31258425f53c50852fc96f6ae574
-          - asset: macos-x64
-            os: macos-15-intel
-            herdr_asset: herdr-macos-x86_64
-            herdr_digest: ab50262c8190cd7aa9056d249d255c08c328c3e8716de9cfa29db4f131b8e2c1
     runs-on: ${{ matrix.os }}
     env:
       ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
@@ -598,8 +588,6 @@ jobs:
             os: ubuntu-24.04-arm
           - asset: macos-arm64
             os: macos-15
-          - asset: macos-x64
-            os: macos-15-intel
     env:
       ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
       RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
@@ -729,7 +717,7 @@ jobs:
             else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
           }
           archives=(dist/muxe-v*.tar.gz)
-          test "${#archives[@]}" -eq 4
+          test "${#archives[@]}" -eq 3
           test -f dist/SHA256SUMS
           manifest_check SHA256SUMS dist
       - name: create release (archives plus checksums, attestations already made)

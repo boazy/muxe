@@ -28,9 +28,8 @@ Before enabling the matrix, confirm all of the following:
   endpoints, minimal permissions, and preserved diagnostics. It must never use a
   default user host, ambient socket, process-name cleanup, or global cleanup.
 - The pinned Zellij 0.46.0 and Herdr 0.8.2 host inputs are available with their
-  verified digests. The four release rows remain Linux x64 (musl), Linux arm64
-  (musl), macOS Intel, and macOS arm64:
-  `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15-intel`, and `macos-15`.
+  verified digests. The three release rows remain Linux x64 (musl), Linux arm64
+  (musl), and macOS arm64: `ubuntu-24.04`, `ubuntu-24.04-arm`, and `macos-15`.
 
 ## Deferred live cases
 
@@ -79,7 +78,7 @@ The existing test names and typed inputs are the implementation to reuse:
   release pass.
 - The current target-only release job follows the staging and invocation pattern
   in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The release rows
-  retain the four native architectures, pinned hosts, verified digests, explicit
+  retain the three native architectures, pinned hosts, verified digests, explicit
   approval guard, and fail-closed input checks.
 
 See the [README live-host test gates](README.md#live-host-test-gates) for the

@@ -3,9 +3,9 @@
 #
 # Usage:
 #   live-upgrade.sh <PREV_TAG> <TARGET_TAG> <TARGET_ARCHIVES_DIR> <WORK_DIR> <ASSET>
-# ASSET is the release matrix asset name (linux-x64, linux-arm64,
-# macos-arm64, macos-x64); both stacks must carry that asset or the
-# driver fails naming it.
+# ASSET is the release matrix asset name (linux-x64, linux-arm64, or
+# macos-arm64); both stacks must carry that asset or the driver fails
+# naming it.
 #
 # Phase 1 records the target stack built by this workflow (per-asset archive
 #   extracted from TARGET_ARCHIVES_DIR).

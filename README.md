@@ -79,7 +79,6 @@ Release tags follow `v{major}.{minor}.{patch}`. Archive filenames follow `muxe-v
 
 - `linux-x64` (statically linked with musl)
 - `linux-arm64` (statically linked with musl)
-- `macos-x64` (macOS Intel)
 - `macos-arm64` (macOS Apple Silicon)
 
 Each archive contains a complete installation:
@@ -122,7 +121,7 @@ export PATH="$HOME/.local/muxe/current:$PATH"
 
 When updating a direct-archive installation, keep the previous versioned directory until `muxe activate` commits. After activation succeeds, remove the prior directory. If you install through mise, retain the previous tool version until `muxe activate` commits before running `mise prune`.
 
-Release publication requires the current target-only real-host verification on all four release architectures. The real cross-release upgrade, rollback, and fault matrix is deferred until the implementation is complete and a first genuine published release is available as the live predecessor. See [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). This documentation does not claim that any live check has passed.
+Release publication requires the current target-only real-host verification on all three release architectures. The real cross-release upgrade, rollback, and fault matrix is deferred until the implementation is complete and a first genuine published release is available as the live predecessor. See [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). This documentation does not claim that any live check has passed.
 
 ## Configuration
 
@@ -430,4 +429,4 @@ The target-only smoke covers two current-target scenarios:
 
 CI supplies the pinned host binaries and the explicit `MUXE_LIVE_HOSTS_APPROVED=true` authorization for these live checks. They are not part of the default local test command and must not use local default host state.
 
-CI runs `target_only_smoke` as a real target-only smoke on Linux pull requests. Manual dispatches and the weekly schedule run the full matrix on Ubuntu and macOS. The release workflow runs the current-target gate on all four release architectures. Missing inputs or approvals fail the gate. The real cross-release upgrade, rollback, and fault matrix remains deferred until the first genuine published predecessor; see [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Passing fixture-only suites never stand in for the required target-only live run.
+CI runs `target_only_smoke` as a real target-only smoke on Linux pull requests. Manual dispatches and the weekly schedule run the full matrix on Ubuntu and macOS. The release workflow runs the current-target gate on all three release architectures. Missing inputs or approvals fail the gate. The real cross-release upgrade, rollback, and fault matrix remains deferred until the first genuine published predecessor; see [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Passing fixture-only suites never stand in for this live matrix.
