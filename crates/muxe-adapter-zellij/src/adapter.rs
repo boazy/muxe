@@ -654,9 +654,13 @@ impl ZellijAdapter {
                     "Zellij adapter shut down while awaiting the initial census",
                 ));
             }
+            let registered = self.fresh_census().await;
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Zellij initial census did not observe fresh registrations for the current membership",
+                format!(
+                    "Zellij initial census did not observe fresh registrations for the current membership \
+                     (members={snapshot:?}, registered={registered:?})"
+                ),
             ));
         }
         if self.inner.shutdown.load(Ordering::Relaxed) {
