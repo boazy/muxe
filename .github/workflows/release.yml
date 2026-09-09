@@ -106,10 +106,12 @@ jobs:
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
       - name: build bridge (release)
-        # The task definition (flags, profile, stage path) is owned by the
-        # mise coordinator; this job only asserts its output.
+        # Objects-mode caches may restore prior build-script hash directories.
+        # Remove only this generated witness producer before rebuilding so the
+        # next step has exactly one output from the tagged source.
         run: |
           set -euo pipefail
+          rm -rf target/wasm32-wasip1/release/build/muxe-zellij-protocol-*
           mise trust
           mise run wasm-build
       - name: stage bridge build identity witness
