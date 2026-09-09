@@ -2633,7 +2633,8 @@ mod scoped_spawn_tests {
         std::fs::set_permissions(&script, permissions).expect("chmod proof");
         let mut pairs = scoped_env_vec(&scoped);
         pairs.extend(host.host_env_overlay_vec());
-        let mut command = Command::new(&script);
+        let mut command = Command::new("/bin/sh");
+        command.arg(&script);
         command.env_clear();
         for (name, value) in &pairs {
             command.env(name, value);
