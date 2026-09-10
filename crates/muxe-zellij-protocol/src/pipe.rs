@@ -370,14 +370,7 @@ trait ValidateBridgeRequest {
 impl ValidateBridgeRequest for BridgeRequest {
     fn validate(&self) -> Result<(), PipeError> {
         match self {
-            Self::Dispatch { execution, request } => {
-                require_non_empty("execution ID", execution)?;
-                match request {
-                    ZellijDispatchRequest::Command(_) => Ok(()),
-                    ZellijDispatchRequest::FocusPaneByIndex { .. } => Ok(()),
-                    ZellijDispatchRequest::FocusPaneNeighbor { .. } => Ok(()),
-                }
-            }
+            Self::Dispatch { execution, .. } => require_non_empty("execution ID", execution),
             Self::BeginCapture { lease, ui_session } => {
                 validate_lease(lease)?;
                 require_non_empty("UI session", ui_session)

@@ -923,7 +923,6 @@ impl ZellijAdapter {
                         )
                         .await;
                     }
-                    PipeEventKind::Response(BridgeResponse::DispatchAccepted { .. }) => {}
                     PipeEventKind::Response(BridgeResponse::DispatchCompleted {
                         execution,
                         outcome,
@@ -1013,12 +1012,16 @@ impl ZellijAdapter {
                             now,
                         );
                     }
-                    PipeEventKind::Event(BridgeEvent::Register { .. })
-                    | PipeEventKind::Event(BridgeEvent::Health { .. })
-                    | PipeEventKind::Event(BridgeEvent::Retire)
-                    | PipeEventKind::Event(BridgeEvent::Shutdown)
-                    | PipeEventKind::Event(BridgeEvent::Host(_))
-                    | PipeEventKind::Response(BridgeResponse::Host(_)) => {}
+                    PipeEventKind::Response(
+                        BridgeResponse::DispatchAccepted { .. } | BridgeResponse::Host(_),
+                    )
+                    | PipeEventKind::Event(
+                        BridgeEvent::Register { .. }
+                        | BridgeEvent::Health { .. }
+                        | BridgeEvent::Retire
+                        | BridgeEvent::Shutdown
+                        | BridgeEvent::Host(_),
+                    ) => {}
                 }
             }
         }

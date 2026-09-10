@@ -37,9 +37,10 @@ use muxe_core::{
     PaneId, PortableAction, ServerId, SourceId, SourceSpan,
 };
 use muxe_zellij_protocol::{
-    BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, ChannelGeneration, CommandOutcome,
-    PipeEvent, PipeEventKind, RegistrationId, bridge_build_id, bridge_protocol_fingerprint,
-    decode_request_line, encode_event_line, generated_action_fingerprint, pinned_source_revision,
+    BRIDGE_PROTOCOL_VERSION, BridgeEvent, BridgeIdentity, BridgeRequest, BridgeResponse,
+    ChannelGeneration, CommandOutcome, PipeEvent, PipeEventKind, RegistrationId,
+    ZellijRegistration, bridge_build_id, bridge_protocol_fingerprint, decode_request_line,
+    encode_event_line, generated_action_fingerprint, pinned_source_revision,
 };
 use support::production_connect::ProductionConnectFixture;
 use tokio::sync::Notify;
@@ -394,18 +395,20 @@ fn register_event(
     event_for(
         registration(registration_id[0]),
         None,
-        PipeEventKind::Register {
-            client_id: "client-1".to_owned(),
-            current_pane: Some("terminal_2".to_owned()),
-            plugin_id: Some(3),
-            identity: BridgeIdentity {
-                muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
-                source_revision: pinned_source_revision().to_owned(),
-                action_fingerprint: generated_action_fingerprint().0,
-                protocol_fingerprint: bridge_protocol_fingerprint().0,
-                bridge_build_id: Some(build_id),
+        PipeEventKind::Event(BridgeEvent::Register {
+            registration: ZellijRegistration {
+                client_id: "client-1".to_owned(),
+                current_pane: Some("terminal_2".to_owned()),
+                plugin_id: Some(3),
+                identity: BridgeIdentity {
+                    muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    source_revision: pinned_source_revision().to_owned(),
+                    action_fingerprint: generated_action_fingerprint().0,
+                    protocol_fingerprint: bridge_protocol_fingerprint().0,
+                    bridge_build_id: Some(build_id),
+                },
             },
-        },
+        }),
     )
 }
 
@@ -751,13 +754,13 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
 
     let frame = decode_request_line(&next_outbound(&request).await).expect("typed request frame");
     assert_eq!(frame.target.client_id, "client-1");
-    assert_eq!(frame.target.registration, registration(7));
+    assert_eq!(frame.registration, registration(7));
     assert!(matches!(frame.payload, BridgeRequest::Dispatch { .. }));
     event.push_line(
         encode_event_line(&event_for(
             registration(7),
             Some(frame.request_id),
-            PipeEventKind::RequestReleased,
+            PipeEventKind::Response(BridgeResponse::RequestReleased),
         ))
         .expect("release encodes"),
     );
@@ -765,10 +768,10 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
         encode_event_line(&event_for(
             registration(7),
             Some(frame.request_id),
-            PipeEventKind::DispatchCompleted {
+            PipeEventKind::Response(BridgeResponse::DispatchCompleted {
                 execution: execution.0.to_string(),
                 outcome: CommandOutcome::succeeded(),
-            },
+            }),
         ))
         .expect("completion encodes"),
     );

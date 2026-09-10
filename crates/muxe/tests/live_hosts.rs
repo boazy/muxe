@@ -70,10 +70,10 @@ use std::process::Stdio;
 use muxe_adapter_zellij::channel_names;
 use muxe_protocol::control::CompatibilityRecord;
 use muxe_zellij_protocol::{
-    BRIDGE_PROTOCOL_VERSION, BridgeRequest, BridgeTarget, ChannelGeneration, MAX_PIPE_LINE_LEN,
-    PipeEvent, PipeEventKind, PipeRequest, RegistrationId, RequestId, bridge_build_id,
-    bridge_protocol_fingerprint, decode_event_line, encode_request_line,
-    generated_action_fingerprint, pinned_source_revision,
+    BRIDGE_PROTOCOL_VERSION, BridgeEvent, BridgeRequest, BridgeResponse, BridgeTarget,
+    ChannelGeneration, MAX_PIPE_LINE_LEN, PipeEvent, PipeEventKind, PipeRequest, RegistrationId,
+    RequestId, ZellijOriginRequest, bridge_build_id, bridge_protocol_fingerprint,
+    decode_event_line, encode_request_line, generated_action_fingerprint, pinned_source_revision,
 };
 use sha2::{Digest, Sha256};
 use support::{
@@ -839,13 +839,15 @@ async fn duo_collect_registrations(
         })?;
         let registration = frame.registration;
         match frame.event {
-            PipeEventKind::Register { client_id, .. } if !anchor.contains(&client_id) => {}
-            PipeEventKind::Register {
-                client_id,
-                current_pane,
-                identity,
-                ..
-            } => {
+            PipeEventKind::Event(BridgeEvent::Register {
+                registration: details,
+            }) if !anchor.contains(&details.client_id) => {}
+            PipeEventKind::Event(BridgeEvent::Register {
+                registration: details,
+            }) => {
+                let client_id = details.client_id;
+                let current_pane = details.current_pane;
+                let identity = details.identity;
                 if !(identity.bridge_build_id == Some(bridge_build_id())
                     && identity.source_revision == pinned_source_revision()
                     && identity.action_fingerprint == generated_action_fingerprint().0
@@ -874,7 +876,7 @@ async fn duo_collect_registrations(
                 }
                 registrations.insert(client_id, (registration, current_pane));
             }
-            PipeEventKind::Heartbeat => {}
+            PipeEventKind::Event(BridgeEvent::Heartbeat) => {}
             other => {
                 return Err(io::Error::other(format!(
                     "duo: unexpected event while awaiting census coverage: {other:?}"
@@ -946,14 +948,16 @@ async fn duo_route_one(
     let outbound = PipeRequest {
         protocol: BRIDGE_PROTOCOL_VERSION,
         request_id,
+        registration,
         channel_generation: ChannelGeneration::INITIAL,
         target: BridgeTarget {
             client_id: client_id.to_owned(),
-            registration,
         },
         payload: BridgeRequest::RequestOrigin {
             ui_session: ui_session.clone(),
-            ui_pane: current_pane.clone(),
+            request: ZellijOriginRequest {
+                ui_pane: current_pane.clone(),
+            },
         },
     };
     let line = encode_request_line(&outbound)
@@ -1000,9 +1004,11 @@ impl DuoRouteState<'_> {
     fn apply(&mut self, frame: PipeEvent) -> io::Result<()> {
         let solicited = matches!(
             &frame.event,
-            PipeEventKind::RequestReleased
-                | PipeEventKind::OriginSnapshot { .. }
-                | PipeEventKind::OriginDeclined { .. }
+            PipeEventKind::Response(
+                BridgeResponse::RequestReleased
+                    | BridgeResponse::OriginSnapshot { .. }
+                    | BridgeResponse::OriginDeclined { .. }
+            )
         );
         if solicited {
             if frame.request_id != Some(self.request_id) {
@@ -1025,7 +1031,7 @@ impl DuoRouteState<'_> {
             }
         }
         match frame.event {
-            PipeEventKind::RequestReleased => {
+            PipeEventKind::Response(BridgeResponse::RequestReleased) => {
                 if self.released {
                     return Err(io::Error::other(format!(
                         "duo: duplicate release for client {:?}",
@@ -1034,7 +1040,7 @@ impl DuoRouteState<'_> {
                 }
                 self.released = true;
             }
-            PipeEventKind::OriginSnapshot { ui_session, origin } => {
+            PipeEventKind::Response(BridgeResponse::OriginSnapshot { ui_session, origin }) => {
                 if ui_session != self.ui_session {
                     return Err(io::Error::other(format!(
                         "duo: snapshot for wrong UI session {ui_session:?} while routing client {:?}",
@@ -1061,18 +1067,20 @@ impl DuoRouteState<'_> {
                 }
                 self.snapshot = true;
             }
-            PipeEventKind::OriginDeclined { ui_session } => {
+            PipeEventKind::Response(BridgeResponse::OriginDeclined { ui_session }) => {
                 return Err(io::Error::other(format!(
                     "duo: owner declined its own pane (session {ui_session:?}, request {:?}, owner {:?}) for client {:?}",
                     frame.request_id, frame.registration, self.client_id
                 )));
             }
-            PipeEventKind::Heartbeat => {}
-            PipeEventKind::Register { client_id, .. } => {
-                if self.anchor.contains(&client_id) {
+            PipeEventKind::Event(BridgeEvent::Heartbeat) => {}
+            PipeEventKind::Event(BridgeEvent::Register {
+                registration: details,
+            }) => {
+                if self.anchor.contains(&details.client_id) {
                     return Err(io::Error::other(format!(
-                        "duo: unexpected re-registration for client {client_id:?} while routing client {:?}",
-                        self.client_id
+                        "duo: unexpected re-registration for client {:?} while routing client {:?}",
+                        details.client_id, self.client_id
                     )));
                 }
             }
@@ -1143,7 +1151,7 @@ async fn duo_drain_route_heartbeats(
         })?;
         let registration = frame.registration;
         match frame.event {
-            PipeEventKind::Heartbeat => {
+            PipeEventKind::Event(BridgeEvent::Heartbeat) => {
                 if let Some((client_id, _)) =
                     registrations.iter().find(|(client_id, (active, _))| {
                         anchor.contains(client_id) && *active == registration
@@ -1152,16 +1160,21 @@ async fn duo_drain_route_heartbeats(
                     heartbeats.insert(client_id.clone());
                 }
             }
-            PipeEventKind::Register { client_id, .. } => {
-                if anchor.contains(&client_id) {
+            PipeEventKind::Event(BridgeEvent::Register {
+                registration: details,
+            }) => {
+                if anchor.contains(&details.client_id) {
                     return Err(io::Error::other(format!(
-                        "duo: unexpected re-registration for active client {client_id:?} after routing"
+                        "duo: unexpected re-registration for active client {:?} after routing",
+                        details.client_id
                     )));
                 }
             }
-            PipeEventKind::OriginSnapshot { .. }
-            | PipeEventKind::RequestReleased
-            | PipeEventKind::OriginDeclined { .. } => {
+            PipeEventKind::Response(
+                BridgeResponse::OriginSnapshot { .. }
+                | BridgeResponse::RequestReleased
+                | BridgeResponse::OriginDeclined { .. },
+            ) => {
                 return Err(io::Error::other(
                     "duo: unexpected duplicate routed response after final origin",
                 ));
