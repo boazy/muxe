@@ -619,7 +619,7 @@ mod tests {
             channel_generation: ChannelGeneration::try_from(3).expect("generation"),
             target: sample_target(),
             payload: BridgeRequest::EndCapture {
-                lease: [9; 16],
+                lease: muxe_protocol::CaptureLeaseId([9; 16]),
                 reason: CaptureEndReason::UiDismissed,
             },
         };
@@ -660,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn event_envelope_enforces_request_correlation_and_capture_lease() {
+    fn event_envelope_enforces_request_correlation_and_unsolicited_set() {
         let unsolicited = PipeEvent {
             protocol: BRIDGE_PROTOCOL_VERSION,
             request_id: None,
@@ -683,12 +683,18 @@ mod tests {
         let zero_lease = PipeEvent {
             request_id: None,
             event: PipeEventKind::Event(BridgeEvent::CaptureLost {
-                lease: [0; 16],
+                lease: muxe_protocol::CaptureLeaseId([0; 16]),
                 reason: CaptureLostReason::UserModeChanged,
             }),
             ..unexpected_request
         };
         assert!(zero_lease.validate().is_err());
+        let unsupported = PipeEvent {
+            event: PipeEventKind::Event(BridgeEvent::Health { detail: None }),
+            ..zero_lease
+        };
+        let line = serde_json::to_string(&unsupported).expect("health event serializes");
+        assert!(decode_event_line(&line).is_err());
     }
 
     #[test]
