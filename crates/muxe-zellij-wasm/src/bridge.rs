@@ -40,11 +40,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use muxe_zellij_protocol::{
-    BRIDGE_PERMISSIONS, BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, CaptureEndReason,
-    CaptureLostReason, ChannelGeneration, CommandOutcome, PipeEvent, PipeEventKind, RegistrationId,
-    RequestId, ZellijOrigin, bridge_build_id, bridge_protocol_fingerprint,
-    decode_event_subscription, decode_request_line, encode_event_line, generated::RawNativeCommand,
-    generated_action_fingerprint, pinned_source_revision,
+    BRIDGE_PERMISSIONS, BRIDGE_PROTOCOL_VERSION, BridgeEvent, BridgeIdentity, BridgeRequest,
+    BridgeResponse, CaptureEndReason, CaptureLostReason, ChannelGeneration, CommandOutcome,
+    PipeEvent, PipeEventKind, RegistrationId, RequestId, ZellijCaptureState, ZellijDispatchRequest,
+    ZellijOrigin, ZellijOriginRequest, ZellijRegistration, bridge_build_id,
+    bridge_protocol_fingerprint, decode_event_subscription, decode_request_line, encode_event_line,
+    generated::RawNativeCommand, generated_action_fingerprint, pinned_source_revision,
 };
 use zellij_tile::prelude::*;
 
@@ -380,9 +381,11 @@ impl Bridge {
                 self.emit_for_request(
                     pending.request_id,
                     pending.channel_generation,
-                    PipeEventKind::CaptureReady {
+                    BridgeResponse::CaptureReady {
                         lease,
-                        prior_mode: format!("{prior:?}"),
+                        state: ZellijCaptureState {
+                            prior_mode: format!("{prior:?}"),
+                        },
                     },
                     effects,
                 );
@@ -402,7 +405,7 @@ impl Bridge {
         // dismiss without restoring the older snapshot.
         if let Some(active) = self.active.take() {
             self.emit_unsolicited(
-                PipeEventKind::CaptureLost {
+                BridgeEvent::CaptureLost {
                     lease: active.lease,
                     reason: CaptureLostReason::UserModeChanged,
                 },
@@ -449,7 +452,7 @@ impl Bridge {
             self.emit_for_request(
                 pending.request_id,
                 pending.channel_generation,
-                PipeEventKind::DispatchCompleted {
+                BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
                     outcome: CommandOutcome::succeeded(),
                 },
@@ -461,7 +464,7 @@ impl Bridge {
     fn on_timer(&mut self, effects: &mut dyn HostEffects) {
         // Heartbeats renew the broker-side heartbeat lease; without them an
         // idle healthy bridge would be expired by the registry.
-        self.emit_unsolicited(PipeEventKind::Heartbeat, effects);
+        self.emit_unsolicited(BridgeEvent::Heartbeat, effects);
         effects.arm_timer(HEARTBEAT_SECS);
     }
 
@@ -473,7 +476,7 @@ impl Bridge {
         {
             effects.switch_mode(active.prior);
             self.emit_unsolicited(
-                PipeEventKind::CaptureLost {
+                BridgeEvent::CaptureLost {
                     lease: active.lease,
                     reason: CaptureLostReason::BridgeUnloading,
                 },
@@ -489,7 +492,7 @@ impl Bridge {
             self.emit_for_request(
                 pending.request_id,
                 pending.channel_generation,
-                PipeEventKind::DispatchCompleted {
+                BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
                     outcome: CommandOutcome::failed("bridge unloading".to_owned()),
                 },
@@ -546,16 +549,18 @@ impl Bridge {
         self.registration = Some(registration);
         self.pending_subscribe = false;
         self.emit_unsolicited(
-            PipeEventKind::Register {
-                client_id,
-                current_pane: self.focused_pane.clone(),
-                plugin_id: self.plugin_id,
-                identity: BridgeIdentity {
-                    muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
-                    source_revision: pinned_source_revision().to_owned(),
-                    action_fingerprint: generated_action_fingerprint().0,
-                    protocol_fingerprint: bridge_protocol_fingerprint().0,
-                    bridge_build_id: Some(bridge_build_id()),
+            BridgeEvent::Register {
+                registration: ZellijRegistration {
+                    client_id,
+                    current_pane: self.focused_pane.clone(),
+                    plugin_id: self.plugin_id,
+                    identity: BridgeIdentity {
+                        muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        source_revision: pinned_source_revision().to_owned(),
+                        action_fingerprint: generated_action_fingerprint().0,
+                        protocol_fingerprint: bridge_protocol_fingerprint().0,
+                        bridge_build_id: Some(bridge_build_id()),
+                    },
                 },
             },
             effects,
@@ -580,7 +585,7 @@ impl Bridge {
         // other instance drops the frame silently so exactly one bridge
         // unblocks the request child.
         if request.target.client_id != *client_id
-            || Some(request.target.registration) != self.registration
+            || Some(request.registration) != self.registration
             || Some(request.channel_generation) != self.channel_generation
         {
             return;
@@ -590,15 +595,32 @@ impl Bridge {
         {
             eprintln!(
                 "muxe bridge: request ID {} followed by {} for registration {}",
-                previous, request.request_id, request.target.registration
+                previous, request.request_id, request.registration
             );
         }
         self.last_request_id = Some(request.request_id);
         let request_id = request.request_id;
         let generation = request.channel_generation;
         match request.payload {
-            BridgeRequest::Dispatch { execution, command } => {
+            BridgeRequest::Dispatch {
+                execution,
+                request: ZellijDispatchRequest::Command(command),
+            } => {
                 self.dispatch_command(cli_id, request_id, generation, execution, command, effects);
+            }
+            BridgeRequest::Dispatch {
+                execution,
+                request: ZellijDispatchRequest::FocusPaneByIndex { index },
+            } => {
+                self.focus_by_index(cli_id, request_id, generation, execution, index, effects);
+            }
+            BridgeRequest::Dispatch {
+                execution,
+                request: ZellijDispatchRequest::FocusPaneNeighbor { direction },
+            } => {
+                self.focus_neighbor(
+                    cli_id, request_id, generation, execution, direction, effects,
+                );
             }
             BridgeRequest::BeginCapture { lease, ui_session } => {
                 self.begin_capture(cli_id, request_id, generation, lease, ui_session, effects);
@@ -608,24 +630,14 @@ impl Bridge {
             }
             BridgeRequest::RequestOrigin {
                 ui_session,
-                ui_pane,
+                request: ZellijOriginRequest { ui_pane },
             } => {
                 self.request_origin(cli_id, request_id, generation, ui_session, ui_pane, effects);
             }
-            BridgeRequest::FocusPaneByIndex { execution, index } => {
-                self.focus_by_index(cli_id, request_id, generation, execution, index, effects);
-            }
-            BridgeRequest::FocusPaneNeighbor {
-                execution,
-                direction,
-            } => {
-                self.focus_neighbor(
-                    cli_id, request_id, generation, execution, direction, effects,
-                );
-            }
-            BridgeRequest::RetireBridge => {
+            BridgeRequest::Retire | BridgeRequest::Shutdown => {
                 self.retire(cli_id, request_id, generation, effects);
             }
+            BridgeRequest::Host(_) => {}
         }
     }
 
@@ -649,7 +661,7 @@ impl Bridge {
                 self.emit_for_request(
                     request_id,
                     generation,
-                    PipeEventKind::DispatchAccepted {
+                    BridgeResponse::DispatchAccepted {
                         execution: execution.clone(),
                     },
                     effects,
@@ -657,7 +669,7 @@ impl Bridge {
                 self.emit_for_request(
                     request_id,
                     generation,
-                    PipeEventKind::DispatchCompleted {
+                    BridgeResponse::DispatchCompleted {
                         execution,
                         outcome: CommandOutcome::failed(format!("invalid command: {message}")),
                     },
@@ -673,7 +685,7 @@ impl Bridge {
                 self.emit_for_request(
                     request_id,
                     generation,
-                    PipeEventKind::DispatchAccepted {
+                    BridgeResponse::DispatchAccepted {
                         execution: execution.clone(),
                     },
                     effects,
@@ -681,7 +693,7 @@ impl Bridge {
                 self.emit_for_request(
                     request_id,
                     generation,
-                    PipeEventKind::DispatchCompleted { execution, outcome },
+                    BridgeResponse::DispatchCompleted { execution, outcome },
                     effects,
                 );
             }
@@ -704,7 +716,7 @@ impl Bridge {
                 self.emit_for_request(
                     request_id,
                     generation,
-                    PipeEventKind::DispatchAccepted { execution },
+                    BridgeResponse::DispatchAccepted { execution },
                     effects,
                 );
             }
@@ -728,9 +740,11 @@ impl Bridge {
             self.emit_for_request(
                 request_id,
                 generation,
-                PipeEventKind::CaptureReady {
+                BridgeResponse::CaptureReady {
                     lease,
-                    prior_mode: format!("{prior:?}"),
+                    state: ZellijCaptureState {
+                        prior_mode: format!("{prior:?}"),
+                    },
                 },
                 effects,
             );
@@ -757,9 +771,11 @@ impl Bridge {
             self.emit_for_request(
                 request_id,
                 generation,
-                PipeEventKind::CaptureReady {
+                BridgeResponse::CaptureReady {
                     lease,
-                    prior_mode: format!("{:?}", InputMode::Locked),
+                    state: ZellijCaptureState {
+                        prior_mode: format!("{:?}", InputMode::Locked),
+                    },
                 },
                 effects,
             );
@@ -831,7 +847,7 @@ impl Bridge {
             self.emit_for_request(
                 request_id,
                 generation,
-                PipeEventKind::OriginDeclined { ui_session },
+                BridgeResponse::OriginDeclined { ui_session },
                 effects,
             );
             return;
@@ -850,7 +866,7 @@ impl Bridge {
         self.emit_for_request(
             request_id,
             generation,
-            PipeEventKind::OriginSnapshot {
+            BridgeResponse::OriginSnapshot {
                 ui_session,
                 origin: ZellijOrigin {
                     client_id: self.client_id.clone().unwrap_or_default(),
@@ -884,7 +900,7 @@ impl Bridge {
         self.emit_for_request(
             request_id,
             generation,
-            PipeEventKind::DispatchAccepted {
+            BridgeResponse::DispatchAccepted {
                 execution: execution.clone(),
             },
             effects,
@@ -892,7 +908,7 @@ impl Bridge {
         self.emit_for_request(
             request_id,
             generation,
-            PipeEventKind::DispatchCompleted { execution, outcome },
+            BridgeResponse::DispatchCompleted { execution, outcome },
             effects,
         );
     }
@@ -922,7 +938,7 @@ impl Bridge {
         self.emit_for_request(
             request_id,
             generation,
-            PipeEventKind::DispatchAccepted {
+            BridgeResponse::DispatchAccepted {
                 execution: execution.clone(),
             },
             effects,
@@ -930,7 +946,7 @@ impl Bridge {
         self.emit_for_request(
             request_id,
             generation,
-            PipeEventKind::DispatchCompleted { execution, outcome },
+            BridgeResponse::DispatchCompleted { execution, outcome },
             effects,
         );
     }
@@ -959,7 +975,7 @@ impl Bridge {
             self.emit_for_request(
                 pending.request_id,
                 pending.channel_generation,
-                PipeEventKind::DispatchCompleted {
+                BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
                     outcome: CommandOutcome::failed("bridge retiring".to_owned()),
                 },
@@ -982,23 +998,33 @@ impl Bridge {
         self.emit_for_request(
             request_id,
             generation,
-            PipeEventKind::RequestReleased,
+            BridgeResponse::RequestReleased,
             effects,
         );
     }
 
-    fn emit_unsolicited(&self, event: PipeEventKind, effects: &mut dyn HostEffects) {
-        self.emit(None, self.channel_generation, event, effects);
+    fn emit_unsolicited(&self, event: BridgeEvent, effects: &mut dyn HostEffects) {
+        self.emit(
+            None,
+            self.channel_generation,
+            PipeEventKind::Event(event),
+            effects,
+        );
     }
 
     fn emit_for_request(
         &self,
         request_id: RequestId,
         generation: ChannelGeneration,
-        event: PipeEventKind,
+        response: BridgeResponse,
         effects: &mut dyn HostEffects,
     ) {
-        self.emit(Some(request_id), Some(generation), event, effects);
+        self.emit(
+            Some(request_id),
+            Some(generation),
+            PipeEventKind::Response(response),
+            effects,
+        );
     }
 
     fn emit(
@@ -1112,7 +1138,9 @@ mod tests {
                 .filter(|(target, _)| target == cli_id)
                 .filter_map(|(_, line)| decode_event_line(line).ok())
                 .filter_map(|frame| match frame.event {
-                    PipeEventKind::Register { client_id, .. } => Some(client_id),
+                    PipeEventKind::Event(BridgeEvent::Register { registration }) => {
+                        Some(registration.client_id)
+                    }
                     _ => None,
                 })
                 .collect()
@@ -1228,10 +1256,10 @@ mod tests {
         let frame = PipeRequest {
             protocol: BRIDGE_PROTOCOL_VERSION,
             request_id,
+            registration: target_reg,
             channel_generation: ChannelGeneration::INITIAL,
             target: BridgeTarget {
                 client_id: "5".to_owned(),
-                registration: target_reg,
             },
             payload,
         };
@@ -1350,8 +1378,8 @@ mod tests {
         let first = decode_event_line(&frames[0]).expect("framed line decodes");
         assert_eq!(first.registration, registration(7));
         match first.event {
-            PipeEventKind::Register { client_id, .. } => {
-                assert_eq!(client_id, "5");
+            PipeEventKind::Event(BridgeEvent::Register { registration }) => {
+                assert_eq!(registration.client_id, "5");
             }
             other => panic!("first framed event is not Register: {other:?}"),
         }
@@ -1455,7 +1483,9 @@ mod tests {
         bridge.pipe(
             request_msg(BridgeRequest::RequestOrigin {
                 ui_session: "stale-ui".to_owned(),
-                ui_pane: "terminal_2".to_owned(),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_2".to_owned(),
+                },
             }),
             &mut host,
         );
@@ -1515,7 +1545,7 @@ mod tests {
         bridge.pipe(
             request_msg(BridgeRequest::Dispatch {
                 execution: "e1".to_owned(),
-                command: RawNativeCommand::CloseFocus,
+                request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
             }),
             &mut host,
         );
@@ -1530,10 +1560,10 @@ mod tests {
             .events()
             .into_iter()
             .map(|(_, event)| match event {
-                PipeEventKind::Register { .. } => "register",
-                PipeEventKind::RequestReleased => "released",
-                PipeEventKind::DispatchAccepted { .. } => "accepted",
-                PipeEventKind::DispatchCompleted { .. } => "completed",
+                PipeEventKind::Event(BridgeEvent::Register { .. }) => "register",
+                PipeEventKind::Response(BridgeResponse::RequestReleased) => "released",
+                PipeEventKind::Response(BridgeResponse::DispatchAccepted { .. }) => "accepted",
+                PipeEventKind::Response(BridgeResponse::DispatchCompleted { .. }) => "completed",
                 _ => "other",
             })
             .collect();
@@ -1550,7 +1580,7 @@ mod tests {
             registration(9),
             BridgeRequest::Dispatch {
                 execution: "e2".to_owned(),
-                command: RawNativeCommand::CloseFocus,
+                request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
             },
         );
         line.push('\n');
@@ -1603,7 +1633,8 @@ mod tests {
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
-            PipeEventKind::CaptureReady { lease, .. } if lease == [11; 16]
+            PipeEventKind::Response(BridgeResponse::CaptureReady { lease, .. })
+                if lease == [11; 16]
         ));
     }
 
@@ -1635,10 +1666,8 @@ mod tests {
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
-            PipeEventKind::CaptureReady {
-                lease,
-                prior_mode
-            } if lease == [31; 16] && prior_mode == "Normal"
+            PipeEventKind::Response(BridgeResponse::CaptureReady { lease, state })
+                if lease == [31; 16] && state.prior_mode == "Normal"
         ));
     }
 
@@ -1675,7 +1704,10 @@ mod tests {
             &mut host,
         );
 
-        assert_eq!(host.modes.as_slice(), [InputMode::Locked, InputMode::Normal]);
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal]
+        );
         assert_eq!(bridge.capture_state(), (Some([42; 16]), None));
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
         assert_eq!(bridge.capture_state(), (Some([42; 16]), None));
@@ -1689,10 +1721,8 @@ mod tests {
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
-            PipeEventKind::CaptureReady {
-                lease,
-                prior_mode
-            } if lease == [42; 16] && prior_mode == "Normal"
+            PipeEventKind::Response(BridgeResponse::CaptureReady { lease, state })
+                if lease == [42; 16] && state.prior_mode == "Normal"
         ));
     }
 
@@ -1706,7 +1736,7 @@ mod tests {
                     RequestId::try_from(id).expect("nonzero request"),
                     BridgeRequest::Dispatch {
                         execution: format!("e{id}"),
-                        command: RawNativeCommand::CloseFocus,
+                        request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
                     },
                 ),
                 &mut host,
@@ -1718,8 +1748,11 @@ mod tests {
             .iter()
             .filter_map(|(_, line)| decode_event_line(line).ok())
             .filter_map(|frame| {
-                matches!(frame.event, PipeEventKind::DispatchCompleted { .. })
-                    .then_some(frame.request_id)
+                matches!(
+                    frame.event,
+                    PipeEventKind::Response(BridgeResponse::DispatchCompleted { .. })
+                )
+                .then_some(frame.request_id)
             })
             .collect();
         assert!(completed.contains(&Some(RequestId::try_from(3).expect("three"))));
@@ -1757,10 +1790,8 @@ mod tests {
         );
         assert!(matches!(
             event,
-            PipeEventKind::CaptureReady {
-                lease,
-                prior_mode
-            } if lease == [21; 16] && prior_mode == "Normal"
+            PipeEventKind::Response(BridgeResponse::CaptureReady { lease, state })
+                if lease == [21; 16] && state.prior_mode == "Normal"
         ));
         bridge.pipe(
             request_msg_with_id(
@@ -1781,10 +1812,10 @@ mod tests {
         bridge.pipe(
             request_msg(BridgeRequest::Dispatch {
                 execution: "old".to_owned(),
-                command: RawNativeCommand::RunAction {
+                request: ZellijDispatchRequest::Command(RawNativeCommand::RunAction {
                     action: muxe_zellij_protocol::generated::raw::Action::CloseFocus,
                     context: Vec::new(),
-                },
+                }),
             }),
             &mut host,
         );
@@ -1800,10 +1831,10 @@ mod tests {
                 RequestId::INITIAL,
                 BridgeRequest::Dispatch {
                     execution: "new".to_owned(),
-                    command: RawNativeCommand::RunAction {
+                    request: ZellijDispatchRequest::Command(RawNativeCommand::RunAction {
                         action: muxe_zellij_protocol::generated::raw::Action::CloseFocus,
                         context: Vec::new(),
-                    },
+                    }),
                 },
             ),
             &mut host,
@@ -1838,7 +1869,8 @@ mod tests {
         assert_eq!(request_id, Some(RequestId::INITIAL));
         assert!(matches!(
             event,
-            PipeEventKind::DispatchCompleted { execution, .. } if execution == "new"
+            PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, .. })
+                if execution == "new"
         ));
     }
 
@@ -1863,10 +1895,10 @@ mod tests {
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
-            PipeEventKind::CaptureLost {
+            PipeEventKind::Event(BridgeEvent::CaptureLost {
                 reason: CaptureLostReason::UserModeChanged,
                 ..
-            }
+            })
         ));
     }
 
@@ -1888,7 +1920,9 @@ mod tests {
                     registration(7),
                     BridgeRequest::RequestOrigin {
                         ui_session: "ui-9".to_owned(),
-                        ui_pane: "terminal_2".to_owned(),
+                        request: ZellijOriginRequest {
+                            ui_pane: "terminal_2".to_owned(),
+                        },
                     },
                 )),
                 args: BTreeMap::new(),
@@ -1898,7 +1932,7 @@ mod tests {
         );
         let (_, event) = host.last_event();
         match event {
-            PipeEventKind::OriginSnapshot { origin, .. } => {
+            PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
                 assert_eq!(origin.prior_pane_id.as_deref(), Some("terminal_2"));
             }
             _ => panic!("expected snapshot, got decline"),
@@ -1921,22 +1955,23 @@ mod tests {
         bridge.pipe(
             request_msg(BridgeRequest::Dispatch {
                 execution: "e9".to_owned(),
-                command: RawNativeCommand::RunAction {
+                request: ZellijDispatchRequest::Command(RawNativeCommand::RunAction {
                     action: muxe_zellij_protocol::generated::raw::Action::CloseFocus,
                     context: Vec::new(),
-                },
+                }),
             }),
             &mut host,
         );
         host.modes.clear();
-        bridge.pipe(request_msg(BridgeRequest::RetireBridge), &mut host);
+        bridge.pipe(request_msg(BridgeRequest::Retire), &mut host);
         // Guarded restore ran (still Locked, owned lease) and the pending
         // async completion failed instead of dangling.
         assert_eq!(host.modes.as_slice(), [InputMode::Normal]);
         let failed = host.events().into_iter().any(|(_, event)| {
             matches!(
                 event,
-                PipeEventKind::DispatchCompleted { execution, .. } if execution == "e9"
+                PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, .. })
+                    if execution == "e9"
             )
         });
         assert!(failed);
@@ -1950,7 +1985,10 @@ mod tests {
         bridge.update(Event::Timer(5.0), &mut host);
         assert!(host.outputs.len() > before);
         let (_, event) = host.last_event();
-        assert!(matches!(event, PipeEventKind::Heartbeat));
+        assert!(matches!(
+            event,
+            PipeEventKind::Event(BridgeEvent::Heartbeat)
+        ));
         assert!(host.timers >= 2);
     }
 
@@ -1975,7 +2013,7 @@ mod tests {
                         decode_event_line(line)
                             .expect("typed heartbeat frame")
                             .event,
-                        PipeEventKind::Heartbeat
+                        PipeEventKind::Event(BridgeEvent::Heartbeat)
                     )
             }),
             "later heartbeat output must target the held event source"
@@ -2001,7 +2039,7 @@ mod tests {
         bridge.pipe(
             request_msg(BridgeRequest::Dispatch {
                 execution: "request-release".to_owned(),
-                command: RawNativeCommand::CloseFocus,
+                request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
             }),
             &mut host,
         );

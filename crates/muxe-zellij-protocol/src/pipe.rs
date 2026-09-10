@@ -17,9 +17,9 @@ use thiserror::Error;
 
 use crate::generated::RawNativeCommand;
 
+use crate::{ChannelGeneration, ProtocolVersion};
 #[cfg(test)]
-use crate::RequestId;
-use crate::{ChannelGeneration, ProtocolVersion, RegistrationId};
+use crate::{RegistrationId, RequestId};
 
 /// Pipe protocol version implemented by this build.
 pub const BRIDGE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::CURRENT;
@@ -98,184 +98,101 @@ pub fn decode_event_subscription(payload: &str) -> Result<EventSubscription, Pip
     Ok(subscription)
 }
 
-/// Targeted delivery: Zellij broadcasts pipe messages to every bridge instance,
-/// so only the active registration named here may act on a request.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Zellij broadcast target for one common bridge request envelope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BridgeTarget {
     /// Zellij client ID owning the target bridge, as reported by `list_clients`.
     pub client_id: String,
-    /// Active bridge registration ID for that client.
-    pub registration: RegistrationId,
 }
 
-/// One broker-to-bridge frame on the request pipe.
-pub type PipeRequest = BridgeRequestEnvelope<BridgeTarget, BridgeRequest>;
-
-/// Typed broker-to-bridge payloads. Dispatch payloads carry generated raw mirrors
-/// so the bridge performs the same `Raw -> Validated -> upstream` conversion the
-/// native adapter used at configuration load.
+/// Zellij-specific dispatch operation carried by the common dispatch lifecycle.
 #[expect(
     clippy::large_enum_variant,
-    reason = "dispatch carries its typed raw command inline to avoid a heap allocation on every broker-to-bridge request"
+    reason = "native commands stay inline to avoid a heap allocation on every request"
 )]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum BridgeRequest {
-    /// Dispatch one validated-at-load native command through the target bridge.
-    Dispatch {
-        /// Broker execution ID, echoed in acceptance and completion events.
-        execution: String,
-        /// Raw command; the bridge revalidates before dispatching.
-        command: RawNativeCommand,
-    },
-    /// Snapshot the client's current input mode and enter Zellij Locked mode.
-    BeginCapture {
-        /// Capture lease minted by the broker for one modal scope.
-        lease: [u8; 16],
-        /// Broker UI session the capture serves.
-        ui_session: String,
-    },
-    /// Release a capture lease with guarded restoration of the prior mode.
-    EndCapture {
-        /// Lease that must still own capture for restoration to happen.
-        lease: [u8; 16],
-        /// Why capture ends; user-driven mode changes are never restored over.
-        reason: CaptureEndReason,
-    },
-    /// Snapshot the last focused non-Muxe pane for origin-context capture.
-    RequestOrigin {
-        /// Broker UI session the snapshot serves.
-        ui_session: String,
-        /// The Muxe UI's own pane ID, used to exclude it from focus history.
-        ui_pane: String,
-    },
-    /// Focus the indexed pane of the active tab through the bridge's tracked
-    /// pane inventory (`PaneUpdate` manifest order). No pinned primitive takes
-    /// a positional pane target, so the bridge resolves the index against its
-    /// live inventory and focuses by ID; an out-of-range index completes Failed.
-    FocusPaneByIndex {
-        /// Broker execution ID, echoed in acceptance and completion events.
-        execution: String,
-        /// Position in the active tab's manifest pane order.
-        index: u32,
-    },
-    /// Focus the nearest pane from the origin pane in one cardinal direction
-    /// through the bridge's tracked geometry. Directional `MoveFocus` acts
-    /// from the currently focused (menu) pane, so it cannot honor the
-    /// immutable origin; the bridge computes the neighbor from the origin
-    /// pane's tracked geometry and focuses by ID. No neighbor completes Failed.
-    FocusPaneNeighbor {
-        /// Broker execution ID, echoed in acceptance and completion events.
-        execution: String,
-        /// Cardinal direction from the origin pane.
-        direction: NeighborDirection,
-    },
-    /// Best-effort retirement notice; correctness never depends on its delivery.
-    RetireBridge,
+pub enum ZellijDispatchRequest {
+    Command(RawNativeCommand),
+    FocusPaneByIndex { index: u32 },
+    FocusPaneNeighbor { direction: NeighborDirection },
 }
 
-/// Why broker-side capture ends. Mirrors the adapter's release reasons without
-/// importing async adapter types into this transport crate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CaptureEndReason {
-    /// Menu dismissed normally; restore the captured mode while it is still ours.
-    UiDismissed,
-    /// A replacement menu takes the modal scope; ordered release then recapture.
-    Replaced,
-    /// The broker lease expired; the bridge keeps user-owned modes untouched.
-    LeaseExpired,
-    /// The user changed modes; the newer mode is authoritative, never restored over.
-    UserModeChanged,
-    /// Broker shutdown; restore only Muxe-owned Locked mode.
-    AdapterShutdown,
+/// Zellij data required to resolve a generic origin request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ZellijOriginRequest {
+    pub ui_pane: String,
 }
+
+/// No additional Zellij request lifecycle exists outside the common contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ZellijRequestExtension {}
+
+/// Typed broker-to-bridge lifecycle request.
+pub type BridgeRequest = muxe_protocol::BridgeRequest<
+    ZellijDispatchRequest,
+    ZellijOriginRequest,
+    ZellijRequestExtension,
+>;
+
+/// One broker-to-bridge frame. Channel generation and broadcast targeting use
+/// Zellij-owned types while the common envelope owns protocol correlation.
+pub type PipeRequest = BridgeRequestEnvelope<ChannelGeneration, BridgeTarget, BridgeRequest>;
+
+/// Why broker-side capture ends.
+pub type CaptureEndReason = muxe_protocol::BridgeCaptureEndReason;
 
 /// Cardinal direction for bridge-resolved neighbor focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NeighborDirection {
-    /// Pane to the left of the origin pane.
     Left,
-    /// Pane to the right of the origin pane.
     Right,
-    /// Pane above the origin pane.
     Up,
-    /// Pane below the origin pane.
     Down,
 }
-/// One bridge-to-broker frame on the event pipe.
-pub type PipeEvent = BridgeEventEnvelope<PipeEventKind>;
 
-/// Typed bridge-to-broker payloads.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PipeEventKind {
-    /// Fresh registration on a new event channel, including after plugin reload
-    /// or event-pipe replacement. Supersedes any previous registration for the
-    /// client; the broker retires the displaced ID.
-    Register {
-        /// Zellij client ID selected from the entry marked `is_current_client`.
-        client_id: String,
-        /// Currently focused pane from the bridge's perspective, if known.
-        current_pane: Option<String>,
-        /// Zellij plugin ID for diagnostics only; never a Muxe identity.
-        plugin_id: Option<u32>,
-        /// Version and fingerprint handshake material.
-        identity: BridgeIdentity,
-    },
-    /// Transport acknowledgement: the target bridge validated the request and
-    /// asked Zellij to unblock the request pipe. This is not action success;
-    /// dispatch acceptance and completion are separate events.
-    RequestReleased,
-    /// The bridge accepted a dispatch request after revalidation.
-    DispatchAccepted {
-        /// Broker execution ID from the request.
-        execution: String,
-    },
-    /// Final outcome for one accepted dispatch.
-    DispatchCompleted {
-        /// Broker execution ID from the request.
-        execution: String,
-        /// Typed outcome; see [`CommandOutcome`].
-        outcome: CommandOutcome,
-    },
-    /// Origin snapshot answering a [`BridgeRequest::RequestOrigin`].
-    OriginSnapshot {
-        /// Broker UI session from the request.
-        ui_session: String,
-        /// Snapshot of the last focused non-Muxe pane and its context.
-        origin: ZellijOrigin,
-    },
-    /// The UI pane in a [`BridgeRequest::RequestOrigin`] does not belong to
-    /// this bridge's client. The adapter moves on to the next client; no unique
-    /// match fails the bootstrap rather than guessing.
-    OriginDeclined {
-        /// Broker UI session from the request, for waiter routing.
-        ui_session: String,
-    },
-    /// Locked-mode capture confirmed with the snapshotted prior mode.
-    CaptureReady {
-        /// Lease that now owns capture.
-        lease: [u8; 16],
-        /// Input mode to restore on guarded release, as a Zellij mode name.
-        prior_mode: String,
-    },
-    /// Capture ended without broker request, or a release was refused.
-    CaptureLost {
-        /// Lease that lost capture.
-        lease: [u8; 16],
-        /// Why capture was lost.
-        reason: CaptureLostReason,
-    },
-    /// Periodic liveness for the heartbeat lease owned by one registration.
-    Heartbeat,
+/// Zellij registration data advertised through the common registration event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ZellijRegistration {
+    pub client_id: String,
+    pub current_pane: Option<String>,
+    pub plugin_id: Option<u32>,
+    pub identity: BridgeIdentity,
 }
+
+/// Zellij state returned when Locked-mode capture becomes active.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ZellijCaptureState {
+    pub prior_mode: String,
+}
+
+/// No additional Zellij response lifecycle exists outside the common contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ZellijResponseExtension {}
+
+/// Typed solicited bridge response.
+pub type BridgeResponse = muxe_protocol::BridgeResponse<
+    CommandOutcome,
+    ZellijOrigin,
+    ZellijCaptureState,
+    ZellijResponseExtension,
+>;
+
+/// No additional Zellij unsolicited lifecycle exists outside the common contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ZellijEventExtension {}
+
+/// Typed unsolicited bridge event.
+pub type BridgeEvent = muxe_protocol::BridgeEvent<ZellijRegistration, ZellijEventExtension>;
 
 /// Why the bridge stopped owning capture outside the broker-driven path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CaptureLostReason {
-    /// The user (or another plugin) changed modes; the new mode is authoritative.
-    UserModeChanged,
-    /// The bridge is unloading; the broker must invalidate the registration.
-    BridgeUnloading,
-}
+pub type CaptureLostReason = muxe_protocol::BridgeCaptureLostReason;
+
+/// Response or unsolicited lifecycle payload on the Zellij event pipe.
+pub type PipeEventKind = muxe_protocol::BridgeOutput<BridgeResponse, BridgeEvent>;
+
+/// Every event-pipe frame carries the full provenance envelope. Unsolicited
+/// payloads encode `request_id` as JSON `null`.
+pub type PipeEvent = BridgeEventEnvelope<ChannelGeneration, PipeEventKind>;
 
 /// Typed synchronous outcome for one dispatched native command.
 ///
@@ -417,8 +334,17 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), PipeError> 
     Ok(())
 }
 
+fn validate_lease(lease: &[u8; 16]) -> Result<(), PipeError> {
+    if lease == &[0; 16] {
+        Err(PipeError::Validation {
+            reason: "capture lease must not be zero".to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 trait ValidatePipeRequest {
-    /// Semantic validation before a bridge acts on a request.
     fn validate(&self) -> Result<(), PipeError>;
 }
 
@@ -437,49 +363,42 @@ impl ValidatePipeRequest for PipeRequest {
     }
 }
 
-impl BridgeRequest {
-    /// Semantic validation for a typed request payload.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PipeError::Validation`] when an ID is empty or overlong.
-    pub fn validate(&self) -> Result<(), PipeError> {
+trait ValidateBridgeRequest {
+    fn validate(&self) -> Result<(), PipeError>;
+}
+
+impl ValidateBridgeRequest for BridgeRequest {
+    fn validate(&self) -> Result<(), PipeError> {
         match self {
-            Self::Dispatch { execution, .. } => require_non_empty("execution ID", execution),
-            Self::BeginCapture { lease, ui_session } => {
-                if lease == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "capture lease must not be zero".to_owned(),
-                    });
+            Self::Dispatch { execution, request } => {
+                require_non_empty("execution ID", execution)?;
+                match request {
+                    ZellijDispatchRequest::Command(_) => Ok(()),
+                    ZellijDispatchRequest::FocusPaneByIndex { .. } => Ok(()),
+                    ZellijDispatchRequest::FocusPaneNeighbor { .. } => Ok(()),
                 }
+            }
+            Self::BeginCapture { lease, ui_session } => {
+                validate_lease(lease)?;
                 require_non_empty("UI session", ui_session)
             }
-            Self::EndCapture { lease, .. } => {
-                if lease == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "capture lease must not be zero".to_owned(),
-                    });
-                }
-                Ok(())
-            }
+            Self::EndCapture { lease, .. } => validate_lease(lease),
             Self::RequestOrigin {
                 ui_session,
-                ui_pane,
+                request,
             } => {
                 require_non_empty("UI session", ui_session)?;
-                require_non_empty("UI pane", ui_pane)
+                require_non_empty("UI pane", &request.ui_pane)
             }
-            Self::FocusPaneByIndex { execution, .. }
-            | Self::FocusPaneNeighbor { execution, .. } => {
-                require_non_empty("execution ID", execution)
-            }
-            Self::RetireBridge => Ok(()),
+            Self::Retire | Self::Shutdown => Ok(()),
+            Self::Host(_) => Err(PipeError::Validation {
+                reason: "unsupported Zellij request extension".to_owned(),
+            }),
         }
     }
 }
 
 trait ValidatePipeEvent {
-    /// Semantic validation before the broker routes an event.
     fn validate(&self) -> Result<(), PipeError>;
 }
 
@@ -493,42 +412,35 @@ impl ValidatePipeEvent for PipeEvent {
                 ),
             });
         }
-        let expects_request = !matches!(
-            self.event,
-            PipeEventKind::Register { .. }
-                | PipeEventKind::Heartbeat
-                | PipeEventKind::CaptureLost { .. }
-        );
-        if expects_request != self.request_id.is_some() {
-            return Err(PipeError::Validation {
-                reason: if expects_request {
-                    "solicited event requires a request ID".to_owned()
-                } else {
-                    "unsolicited event must not carry a request ID".to_owned()
-                },
-            });
+        match &self.event {
+            PipeEventKind::Response(response) => {
+                if self.request_id.is_none() {
+                    return Err(PipeError::Validation {
+                        reason: "solicited response requires a request ID".to_owned(),
+                    });
+                }
+                response.validate()
+            }
+            PipeEventKind::Event(event) => {
+                if self.request_id.is_some() {
+                    return Err(PipeError::Validation {
+                        reason: "unsolicited event must not carry a request ID".to_owned(),
+                    });
+                }
+                event.validate()
+            }
         }
-        self.event.validate()
     }
 }
 
-impl PipeEventKind {
-    /// Semantic validation for a typed event payload.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PipeError::Validation`] when IDs, fingerprints, or details are invalid.
-    pub fn validate(&self) -> Result<(), PipeError> {
+trait ValidateBridgeResponse {
+    fn validate(&self) -> Result<(), PipeError>;
+}
+
+impl ValidateBridgeResponse for BridgeResponse {
+    fn validate(&self) -> Result<(), PipeError> {
         match self {
-            Self::Register {
-                client_id,
-                identity,
-                ..
-            } => {
-                require_non_empty("client ID", client_id)?;
-                identity.validate()
-            }
-            Self::RequestReleased | Self::Heartbeat => Ok(()),
+            Self::RequestReleased => Ok(()),
             Self::DispatchAccepted { execution } => require_non_empty("execution ID", execution),
             Self::DispatchCompleted { execution, outcome } => {
                 require_non_empty("execution ID", execution)?;
@@ -544,22 +456,38 @@ impl PipeEventKind {
                 origin.validate()
             }
             Self::OriginDeclined { ui_session } => require_non_empty("UI session", ui_session),
-            Self::CaptureReady { lease, prior_mode } => {
-                if lease == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "capture lease must not be zero".to_owned(),
-                    });
-                }
-                require_non_empty("prior input mode", prior_mode)
+            Self::CaptureReady { lease, state } => {
+                validate_lease(lease)?;
+                require_non_empty("prior input mode", &state.prior_mode)
             }
-            Self::CaptureLost { lease, .. } => {
-                if lease == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "capture lease must not be zero".to_owned(),
-                    });
-                }
-                Ok(())
+            Self::Host(_) => Err(PipeError::Validation {
+                reason: "unsupported Zellij response extension".to_owned(),
+            }),
+        }
+    }
+}
+
+trait ValidateBridgeEvent {
+    fn validate(&self) -> Result<(), PipeError>;
+}
+
+impl ValidateBridgeEvent for BridgeEvent {
+    fn validate(&self) -> Result<(), PipeError> {
+        match self {
+            Self::Register { registration } => {
+                require_non_empty("client ID", &registration.client_id)?;
+                registration.identity.validate()
             }
+            Self::CaptureLost { lease, .. } => validate_lease(lease),
+            Self::Heartbeat | Self::Retire | Self::Shutdown => Ok(()),
+            Self::Health { detail } => detail
+                .as_deref()
+                .map(|detail| require_non_empty("health detail", detail))
+                .transpose()
+                .map(|_| ()),
+            Self::Host(_) => Err(PipeError::Validation {
+                reason: "unsupported Zellij event extension".to_owned(),
+            }),
         }
     }
 }
@@ -689,7 +617,6 @@ mod tests {
     fn sample_target() -> BridgeTarget {
         BridgeTarget {
             client_id: "client-1".to_owned(),
-            registration: registration(7),
         }
     }
 
@@ -698,6 +625,7 @@ mod tests {
         let request = PipeRequest {
             protocol: BRIDGE_PROTOCOL_VERSION,
             request_id: RequestId::INITIAL,
+            registration: registration(7),
             channel_generation: ChannelGeneration::try_from(3).expect("generation"),
             target: sample_target(),
             payload: BridgeRequest::EndCapture {
@@ -715,9 +643,10 @@ mod tests {
         let mut request = PipeRequest {
             protocol: ProtocolVersion::try_from(2).expect("version two"),
             request_id: RequestId::INITIAL,
+            registration: registration(7),
             channel_generation: ChannelGeneration::INITIAL,
             target: sample_target(),
-            payload: BridgeRequest::RetireBridge,
+            payload: BridgeRequest::Retire,
         };
         assert!(request.validate().is_err());
         request.protocol = BRIDGE_PROTOCOL_VERSION;
@@ -747,25 +676,29 @@ mod tests {
             request_id: None,
             channel_generation: ChannelGeneration::INITIAL,
             registration: registration(2),
-            event: PipeEventKind::Heartbeat,
+            event: PipeEventKind::Event(BridgeEvent::Heartbeat),
         };
         assert!(unsolicited.validate().is_ok());
         let missing_request = PipeEvent {
-            event: PipeEventKind::RequestReleased,
+            event: PipeEventKind::Response(BridgeResponse::RequestReleased),
             ..unsolicited
         };
         assert!(missing_request.validate().is_err());
         let unexpected_request = PipeEvent {
             request_id: Some(RequestId::INITIAL),
-            event: PipeEventKind::Heartbeat,
+            event: PipeEventKind::Event(BridgeEvent::Heartbeat),
             ..missing_request
         };
         assert!(unexpected_request.validate().is_err());
-        let lost = PipeEventKind::CaptureLost {
-            lease: [0; 16],
-            reason: CaptureLostReason::UserModeChanged,
+        let zero_lease = PipeEvent {
+            request_id: None,
+            event: PipeEventKind::Event(BridgeEvent::CaptureLost {
+                lease: [0; 16],
+                reason: CaptureLostReason::UserModeChanged,
+            }),
+            ..unexpected_request
         };
-        assert!(lost.validate().is_err());
+        assert!(zero_lease.validate().is_err());
     }
 
     #[test]

@@ -1,10 +1,70 @@
 //! Shared bridge identifiers specialized by the Zellij protocol.
 
+use std::fmt;
+use std::num::NonZeroU64;
+
+use serde::{Deserialize, Serialize};
+
 pub use muxe_protocol::{
-    BridgeChannelGeneration as ChannelGeneration, BridgeProtocolScalarError as ProtocolScalarError,
-    BridgeProtocolVersion as ProtocolVersion, BridgeRegistrationId as RegistrationId,
-    BridgeRequestId as RequestId,
+    BridgeProtocolScalarError as ProtocolScalarError, BridgeProtocolVersion as ProtocolVersion,
+    BridgeRegistrationId as RegistrationId, BridgeRequestId as RequestId,
 };
+
+/// One installed generation of the Zellij CLI-pipe pair.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChannelGeneration(NonZeroU64);
+
+impl ChannelGeneration {
+    /// Initial installed generation.
+    pub const INITIAL: Self = Self(NonZeroU64::MIN);
+
+    /// Advances to a fresh generation without wraparound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolScalarError::Exhausted`] at `u64::MAX`.
+    pub fn advance(&mut self) -> Result<Self, ProtocolScalarError> {
+        let next = self
+            .0
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(ProtocolScalarError::Exhausted {
+                field: "channel generation",
+            })?;
+        self.0 = next;
+        Ok(*self)
+    }
+
+    /// Raw wire value for the subprocess subscription boundary.
+    #[must_use]
+    pub const fn wire_value(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl Default for ChannelGeneration {
+    fn default() -> Self {
+        Self::INITIAL
+    }
+}
+
+impl TryFrom<u64> for ChannelGeneration {
+    type Error = ProtocolScalarError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(ProtocolScalarError::ZeroChannelGeneration)
+    }
+}
+
+impl fmt::Display for ChannelGeneration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 #[cfg(test)]
 mod tests {

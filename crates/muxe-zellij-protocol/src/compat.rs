@@ -101,12 +101,14 @@ pub fn generated_action_fingerprint() -> SchemaFingerprint {
 /// any pipe-shape edit change the handshake automatically.
 #[must_use]
 pub fn bridge_protocol_fingerprint() -> SchemaFingerprint {
+    const COMMON_BRIDGE_SCHEMA_SOURCE: &[u8] = include_bytes!("../../muxe-protocol/src/bridge.rs");
     const PIPE_SCHEMA_SOURCE: &[u8] = include_bytes!("pipe.rs");
     const IDENTIFIER_SCHEMA_SOURCE: &[u8] = include_bytes!("ids.rs");
     const LIB_SCHEMA_SOURCE: &[u8] = include_bytes!("lib.rs");
     fingerprint_for(
         b"muxe-zellij-pipe/v1;",
         &[
+            COMMON_BRIDGE_SCHEMA_SOURCE,
             PIPE_SCHEMA_SOURCE,
             IDENTIFIER_SCHEMA_SOURCE,
             LIB_SCHEMA_SOURCE,

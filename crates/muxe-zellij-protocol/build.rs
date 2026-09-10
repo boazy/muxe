@@ -13,6 +13,7 @@ const INPUTS: &[&str] = &[
     "Cargo.lock",
     "Cargo.toml",
     "crates/muxe-protocol/Cargo.toml",
+    "crates/muxe-protocol/src/bridge.rs",
     "crates/muxe-protocol/src/control.rs",
     "crates/muxe-protocol/src/frame.rs",
     "crates/muxe-protocol/src/lib.rs",

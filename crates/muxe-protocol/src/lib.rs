@@ -10,8 +10,9 @@ pub mod control;
 pub mod frame;
 pub mod wire;
 pub use bridge::{
-    BridgeChannelGeneration, BridgeEventEnvelope, BridgeProtocolScalarError, BridgeProtocolVersion,
-    BridgeRegistrationId, BridgeRequestEnvelope, BridgeRequestId,
+    BridgeCaptureEndReason, BridgeCaptureLostReason, BridgeEvent, BridgeEventEnvelope,
+    BridgeOutput, BridgeProtocolScalarError, BridgeProtocolVersion, BridgeRegistrationId,
+    BridgeRequest, BridgeRequestEnvelope, BridgeRequestId, BridgeResponse, BridgeResponseEnvelope,
 };
 
 pub use control::{

@@ -70,62 +70,6 @@ impl fmt::Display for BridgeProtocolVersion {
     }
 }
 
-/// One installed generation of a bridge transport channel.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct BridgeChannelGeneration(NonZeroU64);
-
-impl BridgeChannelGeneration {
-    /// Initial installed generation.
-    pub const INITIAL: Self = Self(NonZeroU64::MIN);
-
-    /// Advances to a fresh generation without wraparound.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BridgeProtocolScalarError::Exhausted`] at `u64::MAX`.
-    pub fn advance(&mut self) -> Result<Self, BridgeProtocolScalarError> {
-        let next = self
-            .0
-            .get()
-            .checked_add(1)
-            .and_then(NonZeroU64::new)
-            .ok_or(BridgeProtocolScalarError::Exhausted {
-                field: "channel generation",
-            })?;
-        self.0 = next;
-        Ok(*self)
-    }
-
-    /// Raw wire value.
-    #[must_use]
-    pub const fn wire_value(self) -> u64 {
-        self.0.get()
-    }
-}
-
-impl Default for BridgeChannelGeneration {
-    fn default() -> Self {
-        Self::INITIAL
-    }
-}
-
-impl TryFrom<u64> for BridgeChannelGeneration {
-    type Error = BridgeProtocolScalarError;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        NonZeroU64::new(value)
-            .map(Self)
-            .ok_or(BridgeProtocolScalarError::ZeroChannelGeneration)
-    }
-}
-
-impl fmt::Display for BridgeChannelGeneration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 /// Request identity scoped to one bridge registration.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -259,32 +203,112 @@ impl Validate for BridgeRegistrationId {
     }
 }
 
-/// One host-adapter request carrying a concrete, typed host payload.
+/// Why broker-owned input capture ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BridgeCaptureEndReason {
+    UiDismissed,
+    Replaced,
+    LeaseExpired,
+    UserModeChanged,
+    AdapterShutdown,
+}
+
+/// Why a bridge stopped owning input capture without a broker request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BridgeCaptureLostReason {
+    UserModeChanged,
+    BridgeUnloading,
+    AdapterHealth,
+}
+
+/// Host-independent broker-to-bridge lifecycle with typed host extensions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BridgeRequestEnvelope<T, P> {
-    /// Bridge protocol version.
+pub enum BridgeRequest<D, O, H> {
+    Dispatch {
+        execution: String,
+        request: D,
+    },
+    BeginCapture {
+        lease: [u8; 16],
+        ui_session: String,
+    },
+    EndCapture {
+        lease: [u8; 16],
+        reason: BridgeCaptureEndReason,
+    },
+    RequestOrigin {
+        ui_session: String,
+        request: O,
+    },
+    Retire,
+    Shutdown,
+    Host(H),
+}
+
+/// Host-independent solicited bridge result with typed host result payloads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BridgeResponse<D, O, C, H> {
+    RequestReleased,
+    DispatchAccepted { execution: String },
+    DispatchCompleted { execution: String, outcome: D },
+    OriginSnapshot { ui_session: String, origin: O },
+    OriginDeclined { ui_session: String },
+    CaptureReady { lease: [u8; 16], state: C },
+    Host(H),
+}
+
+/// Host-independent unsolicited bridge lifecycle with typed registration data.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BridgeEvent<R, H> {
+    Register {
+        registration: R,
+    },
+    CaptureLost {
+        lease: [u8; 16],
+        reason: BridgeCaptureLostReason,
+    },
+    Heartbeat,
+    Health {
+        detail: Option<String>,
+    },
+    Retire,
+    Shutdown,
+    Host(H),
+}
+
+/// One host-adapter request with generic transport provenance and typed payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BridgeRequestEnvelope<G, T, P> {
     pub protocol: BridgeProtocolVersion,
-    /// Request identity within the target registration.
     pub request_id: BridgeRequestId,
-    /// Request-channel generation.
-    pub channel_generation: BridgeChannelGeneration,
-    /// Host-defined broadcast or direct target.
+    pub registration: BridgeRegistrationId,
+    pub channel_generation: G,
     pub target: T,
-    /// Concrete typed host request.
     pub payload: P,
 }
 
-/// One host-adapter event carrying a concrete, typed host payload.
+/// One solicited bridge response for transports with a dedicated response path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BridgeEventEnvelope<P> {
-    /// Bridge protocol version.
+pub struct BridgeResponseEnvelope<P> {
     pub protocol: BridgeProtocolVersion,
-    /// Causal request, or `None` for an unsolicited event.
-    pub request_id: Option<BridgeRequestId>,
-    /// Event-channel generation.
-    pub channel_generation: BridgeChannelGeneration,
-    /// Registration that produced the event.
     pub registration: BridgeRegistrationId,
-    /// Concrete typed host event.
+    pub request_id: BridgeRequestId,
+    pub response: P,
+}
+
+/// One event-channel frame. `request_id` is `None` only for unsolicited payloads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BridgeEventEnvelope<G, P> {
+    pub protocol: BridgeProtocolVersion,
+    pub request_id: Option<BridgeRequestId>,
+    pub registration: BridgeRegistrationId,
+    pub channel_generation: G,
     pub event: P,
+}
+
+/// Direction of one payload on a combined response/event transport.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BridgeOutput<R, E> {
+    Response(R),
+    Event(E),
 }

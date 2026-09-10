@@ -22,11 +22,12 @@ pub use compat::{
 };
 pub use ids::{ChannelGeneration, ProtocolScalarError, ProtocolVersion, RegistrationId, RequestId};
 pub use pipe::{
-    BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, BridgeTarget, CaptureEndReason,
-    CaptureLostReason, CommandOutcome, CommandStatus, EventSubscription, MAX_DETAIL_LEN,
-    MAX_PIPE_LINE_LEN, NeighborDirection, PipeError, PipeEvent, PipeEventKind, PipeRequest,
-    ZellijOrigin, decode_event_line, decode_event_subscription, decode_request_line,
-    encode_event_line, encode_event_subscription, encode_request_line,
+    BRIDGE_PROTOCOL_VERSION, BridgeEvent, BridgeIdentity, BridgeRequest, BridgeResponse,
+    BridgeTarget, CaptureEndReason, CaptureLostReason, CommandOutcome, CommandStatus,
+    EventSubscription, MAX_DETAIL_LEN, MAX_PIPE_LINE_LEN, NeighborDirection, PipeError, PipeEvent,
+    PipeEventKind, PipeRequest, ZellijCaptureState, ZellijDispatchRequest, ZellijOrigin,
+    ZellijOriginRequest, ZellijRegistration, decode_event_line, decode_event_subscription,
+    decode_request_line, encode_event_line, encode_event_subscription, encode_request_line,
 };
 
 /// Authoritative Zellij permission contract for the managed WASM bridge.
