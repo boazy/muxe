@@ -11,7 +11,9 @@
 //! This module supplies the Zellij-specific payloads: they are plain typed
 //! structs with no `serde_json::Value` anywhere on the path between crates.
 
-use muxe_protocol::{BridgeEventEnvelope, BridgeRequestEnvelope, SchemaFingerprint};
+use muxe_protocol::{
+    BridgeEventEnvelope, BridgeRequestEnvelope, SchemaFingerprint, Validate,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -334,14 +336,10 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), PipeError> 
     Ok(())
 }
 
-fn validate_lease(lease: &[u8; 16]) -> Result<(), PipeError> {
-    if lease == &[0; 16] {
-        Err(PipeError::Validation {
-            reason: "capture lease must not be zero".to_owned(),
-        })
-    } else {
-        Ok(())
-    }
+fn validate_common(value: &impl Validate) -> Result<(), PipeError> {
+    value.validate().map_err(|error| PipeError::Validation {
+        reason: error.to_string(),
+    })
 }
 
 trait ValidatePipeRequest {
@@ -370,17 +368,17 @@ trait ValidateBridgeRequest {
 impl ValidateBridgeRequest for BridgeRequest {
     fn validate(&self) -> Result<(), PipeError> {
         match self {
-            Self::Dispatch { execution, .. } => require_non_empty("execution ID", execution),
+            Self::Dispatch { execution, .. } => validate_common(execution),
             Self::BeginCapture { lease, ui_session } => {
-                validate_lease(lease)?;
-                require_non_empty("UI session", ui_session)
+                validate_common(lease)?;
+                validate_common(ui_session)
             }
-            Self::EndCapture { lease, .. } => validate_lease(lease),
+            Self::EndCapture { lease, .. } => validate_common(lease),
             Self::RequestOrigin {
                 ui_session,
                 request,
             } => {
-                require_non_empty("UI session", ui_session)?;
+                validate_common(ui_session)?;
                 require_non_empty("UI pane", &request.ui_pane)
             }
             Self::Retire | Self::Shutdown => Ok(()),
@@ -434,9 +432,9 @@ impl ValidateBridgeResponse for BridgeResponse {
     fn validate(&self) -> Result<(), PipeError> {
         match self {
             Self::RequestReleased => Ok(()),
-            Self::DispatchAccepted { execution } => require_non_empty("execution ID", execution),
+            Self::DispatchAccepted { execution } => validate_common(execution),
             Self::DispatchCompleted { execution, outcome } => {
-                require_non_empty("execution ID", execution)?;
+                validate_common(execution)?;
                 if outcome.detail.len() > MAX_DETAIL_LEN {
                     return Err(PipeError::Validation {
                         reason: format!("outcome detail exceeds {MAX_DETAIL_LEN} bytes"),
@@ -445,12 +443,12 @@ impl ValidateBridgeResponse for BridgeResponse {
                 Ok(())
             }
             Self::OriginSnapshot { ui_session, origin } => {
-                require_non_empty("UI session", ui_session)?;
+                validate_common(ui_session)?;
                 origin.validate()
             }
-            Self::OriginDeclined { ui_session } => require_non_empty("UI session", ui_session),
+            Self::OriginDeclined { ui_session } => validate_common(ui_session),
             Self::CaptureReady { lease, state } => {
-                validate_lease(lease)?;
+                validate_common(lease)?;
                 require_non_empty("prior input mode", &state.prior_mode)
             }
             Self::Host(_) => Err(PipeError::Validation {
@@ -471,13 +469,12 @@ impl ValidateBridgeEvent for BridgeEvent {
                 require_non_empty("client ID", &registration.client_id)?;
                 registration.identity.validate()
             }
-            Self::CaptureLost { lease, .. } => validate_lease(lease),
-            Self::Heartbeat | Self::Retire | Self::Shutdown => Ok(()),
-            Self::Health { detail } => detail
-                .as_deref()
-                .map(|detail| require_non_empty("health detail", detail))
-                .transpose()
-                .map(|_| ()),
+            Self::CaptureLost { lease, .. } => validate_common(lease),
+            Self::Heartbeat => Ok(()),
+            Self::Health { .. } => Err(PipeError::Validation {
+                reason: "Zellij permits only Register, Heartbeat, and CaptureLost as unsolicited events"
+                    .to_owned(),
+            }),
             Self::Host(_) => Err(PipeError::Validation {
                 reason: "unsupported Zellij event extension".to_owned(),
             }),

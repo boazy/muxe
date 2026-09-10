@@ -231,6 +231,7 @@ nonce_id!(RequestId);
 nonce_id!(EventId);
 nonce_id!(PendingLaunchToken);
 nonce_id!(ExecutionId);
+nonce_id!(CaptureLeaseId);
 
 #[derive(
     Archive,

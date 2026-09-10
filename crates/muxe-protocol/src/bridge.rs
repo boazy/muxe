@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::wire::{SemanticError, Validate};
+use crate::wire::{CaptureLeaseId, ExecutionId, SemanticError, UiSessionId, Validate};
 
 /// Errors constructing or advancing a bridge protocol scalar.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -225,19 +225,19 @@ pub enum BridgeCaptureLostReason {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BridgeRequest<D, O, H> {
     Dispatch {
-        execution: String,
+        execution: ExecutionId,
         request: D,
     },
     BeginCapture {
-        lease: [u8; 16],
-        ui_session: String,
+        lease: CaptureLeaseId,
+        ui_session: UiSessionId,
     },
     EndCapture {
-        lease: [u8; 16],
+        lease: CaptureLeaseId,
         reason: BridgeCaptureEndReason,
     },
     RequestOrigin {
-        ui_session: String,
+        ui_session: UiSessionId,
         request: O,
     },
     Retire,
@@ -249,11 +249,11 @@ pub enum BridgeRequest<D, O, H> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BridgeResponse<D, O, C, H> {
     RequestReleased,
-    DispatchAccepted { execution: String },
-    DispatchCompleted { execution: String, outcome: D },
-    OriginSnapshot { ui_session: String, origin: O },
-    OriginDeclined { ui_session: String },
-    CaptureReady { lease: [u8; 16], state: C },
+    DispatchAccepted { execution: ExecutionId },
+    DispatchCompleted { execution: ExecutionId, outcome: D },
+    OriginSnapshot { ui_session: UiSessionId, origin: O },
+    OriginDeclined { ui_session: UiSessionId },
+    CaptureReady { lease: CaptureLeaseId, state: C },
     Host(H),
 }
 
@@ -264,15 +264,13 @@ pub enum BridgeEvent<R, H> {
         registration: R,
     },
     CaptureLost {
-        lease: [u8; 16],
+        lease: CaptureLeaseId,
         reason: BridgeCaptureLostReason,
     },
     Heartbeat,
     Health {
         detail: Option<String>,
     },
-    Retire,
-    Shutdown,
     Host(H),
 }
 
