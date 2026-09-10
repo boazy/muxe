@@ -1,3 +1,38 @@
+## [0.1.2] - 2026-09-10
+
+### 🐛 Bug Fixes
+
+- *(release)* Clear stale bridge identity outputs
+- *(zellij)* Harden registration turnover
+- *(zellij)* Preserve newer pending capture
+- *(zellij)* Await capture restoration before replacement
+- *(protocol)* Complete bridge contract cutover
+- *(zellij)* Close unsolicited event set
+- *(zellij)* Preserve restore barriers across resets
+- *(zellij)* Compensate canceled pending capture
+- *(test)* Encode typed live-host subscription
+
+### 🚜 Refactor
+
+- *(zellij)* Type pipe envelope identifiers
+- *(zellij)* Correlate requests by typed registration
+- *(protocol)* Share bridge envelopes and identifiers
+- *(protocol)* Complete shared bridge scalars
+- *(protocol)* Consolidate bridge lifecycle schema
+- *(protocol)* Type bridge lifecycle identifiers
+- *(zellij)* Migrate typed lifecycle callers
+
+### 🎨 Styling
+
+- *(zellij)* Format typed bridge lifecycle
+
+### 🧪 Testing
+
+- *(zellij)* Cover registration-scoped correlation
+
+### 💼 Other
+
+- *(zellij)* Disable unused ULID generator features
 ## [0.1.1] - 2026-09-09
 
 ### 🐛 Bug Fixes
@@ -14,6 +49,10 @@
 ### ⚡ Performance
 
 - *(ci)* Cache external Zellij builds
+
+### 💼 Other
+
+- V0.1.1
 ## [0.1.0] - 2026-09-09
 
 ### 🐛 Bug Fixes
