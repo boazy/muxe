@@ -11,7 +11,9 @@
 //! This module supplies the Zellij-specific payloads: they are plain typed
 //! structs with no `serde_json::Value` anywhere on the path between crates.
 
-use muxe_protocol::SchemaFingerprint;
+use muxe_protocol::{
+    BridgeEventEnvelope, BridgeRequestEnvelope, SchemaFingerprint,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -107,19 +109,7 @@ pub struct BridgeTarget {
 }
 
 /// One broker-to-bridge frame on the request pipe.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PipeRequest {
-    /// Must equal [`BRIDGE_PROTOCOL_VERSION`].
-    pub protocol: ProtocolVersion,
-    /// Request identity within the target registration.
-    pub request_id: RequestId,
-    /// Request-channel generation; stale generations are ignored after restart.
-    pub channel_generation: ChannelGeneration,
-    /// Only the named registration acts; every other instance drops the frame.
-    pub target: BridgeTarget,
-    /// Typed host payload. Raw mirrors are revalidated by the bridge before dispatch.
-    pub payload: BridgeRequest,
-}
+pub type PipeRequest = BridgeRequestEnvelope<BridgeTarget, BridgeRequest>;
 
 /// Typed broker-to-bridge payloads. Dispatch payloads carry generated raw mirrors
 /// so the bridge performs the same `Raw -> Validated -> upstream` conversion the
@@ -212,19 +202,7 @@ pub enum NeighborDirection {
     Down,
 }
 /// One bridge-to-broker frame on the event pipe.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PipeEvent {
-    /// Must equal [`BRIDGE_PROTOCOL_VERSION`].
-    pub protocol: ProtocolVersion,
-    /// Request that caused this event, or `None` for unsolicited events.
-    pub request_id: Option<RequestId>,
-    /// Installed pipe generation that produced this event.
-    pub channel_generation: ChannelGeneration,
-    /// Bridge registration that produced this event.
-    pub registration: RegistrationId,
-    /// Typed event payload.
-    pub event: PipeEventKind,
-}
+pub type PipeEvent = BridgeEventEnvelope<PipeEventKind>;
 
 /// Typed bridge-to-broker payloads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,13 +417,13 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), PipeError> 
     Ok(())
 }
 
-impl PipeRequest {
+trait ValidatePipeRequest {
     /// Semantic validation before a bridge acts on a request.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PipeError::Validation`] when the version, IDs, or payload are invalid.
-    pub fn validate(&self) -> Result<(), PipeError> {
+    fn validate(&self) -> Result<(), PipeError>;
+}
+
+impl ValidatePipeRequest for PipeRequest {
+    fn validate(&self) -> Result<(), PipeError> {
         if self.protocol != BRIDGE_PROTOCOL_VERSION {
             return Err(PipeError::Validation {
                 reason: format!(
@@ -500,14 +478,13 @@ impl BridgeRequest {
     }
 }
 
-impl PipeEvent {
+trait ValidatePipeEvent {
     /// Semantic validation before the broker routes an event.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PipeError::Validation`] when protocol provenance, request
-    /// correlation, or payload semantics are invalid.
-    pub fn validate(&self) -> Result<(), PipeError> {
+    fn validate(&self) -> Result<(), PipeError>;
+}
+
+impl ValidatePipeEvent for PipeEvent {
+    fn validate(&self) -> Result<(), PipeError> {
         if self.protocol != BRIDGE_PROTOCOL_VERSION {
             return Err(PipeError::Validation {
                 reason: format!(

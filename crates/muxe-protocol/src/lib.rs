@@ -5,9 +5,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge;
 pub mod control;
 pub mod frame;
 pub mod wire;
+pub use bridge::{
+    BridgeChannelGeneration, BridgeEventEnvelope, BridgeProtocolScalarError,
+    BridgeProtocolVersion, BridgeRegistrationId, BridgeRequestEnvelope, BridgeRequestId,
+};
 
 pub use control::{
     ActivationStatus, CompatibilityRecord, ControlDecoder, ControlDirection, ControlMessage,
