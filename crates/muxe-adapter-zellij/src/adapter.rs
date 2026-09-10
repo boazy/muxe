@@ -25,7 +25,7 @@
 //! than guessing.
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
@@ -48,8 +48,9 @@ use muxe_core::{
     NativeActionCandidate, OriginContext, PaneId, PortableAction, SourceSpan,
 };
 use muxe_zellij_protocol::{
-    BridgeRequest, CaptureEndReason, MAX_PIPE_LINE_LEN, PipeEventKind, PipeRequest, ZellijOrigin,
-    bridge_build_id, bridge_protocol_fingerprint, decode_event_line, encode_request_line,
+    BridgeRequest, CaptureEndReason, ChannelGeneration, EventSubscription, MAX_PIPE_LINE_LEN,
+    PipeEventKind, PipeRequest, RegistrationId, RequestId, ZellijOrigin, bridge_build_id,
+    bridge_protocol_fingerprint, decode_event_line, encode_event_subscription, encode_request_line,
     generated::{RawNativeCommand, ValidatedNativeCommand},
     generated_action_fingerprint, pinned_source_revision,
 };
@@ -89,9 +90,23 @@ const MEMBERSHIP_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// client census, so the read fails closed instead of buffering it.
 const MEMBERSHIP_OUTPUT_CAP: usize = MAX_PIPE_LINE_LEN;
 type CaptureReady = Result<String, AdapterError>;
+
+struct PendingReply<T> {
+    request: Option<RequestProvenance>,
+    sender: T,
+}
+
+fn subscription_payload(generation: ChannelGeneration) -> Result<String, AdapterError> {
+    encode_event_subscription(EventSubscription::new(generation))
+        .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string()))
+}
+
 /// Pending capture waiters keyed by lease, each tagged with the owning
 /// client so lease expiry can release only that client's waiters.
-type CaptureWaiters = BTreeMap<[u8; 16], (String, oneshot::Sender<CaptureReady>)>;
+type CaptureWaiters =
+    BTreeMap<[u8; 16], (String, PendingReply<oneshot::Sender<CaptureReady>>)>;
+type OriginWaiters =
+    BTreeMap<String, PendingReply<oneshot::Sender<Result<ZellijOrigin, OriginError>>>>;
 
 /// Static adapter configuration. Live-server identity beyond the session name
 /// is verified against bridge registrations, never assumed.
@@ -394,22 +409,81 @@ fn find_zellij_in_dirs(directories: impl Iterator<Item = PathBuf>) -> Option<Pat
 }
 
 /// One queued pipe payload. Dispatches carry an execution for completion
-/// correlation; lifecycle lines (capture, origin) correlate through their own
-/// waiters instead.
+/// correlation; lifecycle lines correlate through their own waiters. Request
+/// identity is allocated only after the active registration is re-resolved at
+/// send time.
 struct QueuedItem {
-    request_id: [u8; 16],
     execution: Option<ExecutionId>,
     client_id: String,
     /// Taken for encoding; restored on retry so no clone is needed.
     payload: Option<BridgeRequest>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendItemResult {
+    Accepted,
+    Continue,
+    RestartWhole,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RequestProvenance {
+    request_id: RequestId,
+    registration: RegistrationId,
+}
+
 struct InFlight {
-    request_id: [u8; 16],
-    generation: u64,
-    registration: [u8; 16],
+    request: RequestProvenance,
+    generation: ChannelGeneration,
     execution: Option<ExecutionId>,
 }
+
+struct AtomicChannelGeneration(AtomicU64);
+
+impl AtomicChannelGeneration {
+    fn new() -> Self {
+        Self(AtomicU64::new(ChannelGeneration::INITIAL.wire_value()))
+    }
+
+    fn current(&self) -> ChannelGeneration {
+        ChannelGeneration::try_from(self.0.load(Ordering::Acquire))
+            .expect("stored channel generation is always nonzero")
+    }
+
+    fn advance(&self) -> Result<ChannelGeneration, AdapterError> {
+        let previous = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .map_err(|_| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Zellij channel generation exhausted",
+                )
+            })?;
+        ChannelGeneration::try_from(previous + 1).map_err(|error| {
+            AdapterError::new(AdapterErrorKind::Unavailable, error.to_string())
+        })
+    }
+}
+struct LocalTokenSource(AtomicU64);
+
+impl LocalTokenSource {
+    fn new() -> Self {
+        Self(AtomicU64::new(1))
+    }
+
+    fn mint(&self) -> [u8; 16] {
+        let counter = self.0.fetch_add(1, Ordering::Relaxed);
+        let mut id = [0_u8; 16];
+        id[..8].copy_from_slice(&counter.to_le_bytes());
+        id[8..].copy_from_slice(&counter.to_be_bytes());
+        if id == [0; 16] {
+            id[0] = 1;
+        }
+        id
+    }
+}
+
 
 struct AdapterInner {
     config: ZellijAdapterConfig,
@@ -417,18 +491,21 @@ struct AdapterInner {
     request: Arc<dyn PipeChannel>,
     event: Arc<dyn PipeChannel>,
     registry: Mutex<ZellijRegistry>,
+    /// Serializes registration publication with request allocation and sends.
+    registration_transition: Mutex<()>,
+    scheduler_cursor: Mutex<Option<String>>,
+    pending_origin: Mutex<OriginWaiters>,
     captures: Mutex<CaptureTable>,
     queues: Mutex<BTreeMap<String, VecDeque<QueuedItem>>>,
     in_flight: Mutex<Option<InFlight>>,
-    live_executions: Mutex<HashSet<u64>>,
-    pending_origin: Mutex<BTreeMap<String, oneshot::Sender<Result<ZellijOrigin, OriginError>>>>,
+    live_executions: Mutex<BTreeMap<u64, Option<RequestProvenance>>>,
     pending_capture: Mutex<CaptureWaiters>,
     pane_claims: Mutex<BTreeMap<String, String>>,
-    pending_leases: Mutex<BTreeMap<String, (String, [u8; 16])>>,
+    pending_leases: Mutex<BTreeMap<String, (String, RegistrationId)>>,
     snapshots: Mutex<BTreeMap<String, ZellijOrigin>>,
-    generation: AtomicU64,
-    next_id: AtomicU64,
+    generation: AtomicChannelGeneration,
     next_correlation: AtomicU64,
+    local_tokens: LocalTokenSource,
     events_tx: mpsc::Sender<AdapterHealthEvent>,
     events_rx: Mutex<mpsc::Receiver<AdapterHealthEvent>>,
     shutdown: AtomicBool,
@@ -441,13 +518,10 @@ struct AdapterInner {
     /// generation, so evidence never combines across attempts.
     resume_epoch: AtomicU64,
     /// Freshness stamp of the last registration per client: the observing
-    /// resume generation plus the event-channel install epoch that
-    /// delivered it, captured at receipt. Coverage requires both to match
-    /// the current attempt, so a line already read from a displaced child
-    /// can never be mistaken for post-respawn evidence, while a still-live
-    /// bridge re-emitting its pre-suspend ID on the new channel stays
-    /// accepted: freshness comes from the transport boundary, never from
-    /// assuming bridge IDs rotate.
+    /// resume generation plus the event-channel install epoch that delivered
+    /// it. Coverage requires both to match the current attempt. Registration
+    /// identities also rotate on every new event channel; transport freshness
+    /// never permits reuse of a retired identity.
     register_epoch: Mutex<BTreeMap<String, (u64, u64)>>,
     /// Authoritative membership snapshot of the last successful resume
     /// attempt: the exact round coverage was proven against. Feeds the
@@ -510,18 +584,20 @@ impl ZellijAdapter {
                 request,
                 event,
                 registry: Mutex::new(ZellijRegistry::new()),
+                registration_transition: Mutex::new(()),
                 captures: Mutex::new(CaptureTable::new()),
+                scheduler_cursor: Mutex::new(None),
                 queues: Mutex::new(BTreeMap::new()),
                 in_flight: Mutex::new(None),
-                live_executions: Mutex::new(HashSet::new()),
+                live_executions: Mutex::new(BTreeMap::new()),
                 pending_origin: Mutex::new(BTreeMap::new()),
                 snapshots: Mutex::new(BTreeMap::new()),
                 pending_capture: Mutex::new(BTreeMap::new()),
                 pane_claims: Mutex::new(BTreeMap::new()),
                 pending_leases: Mutex::new(BTreeMap::new()),
-                generation: AtomicU64::new(1),
-                next_id: AtomicU64::new(1),
+                generation: AtomicChannelGeneration::new(),
                 next_correlation: AtomicU64::new(1),
+                local_tokens: LocalTokenSource::new(),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
                 shutdown: AtomicBool::new(false),
@@ -560,10 +636,7 @@ impl ZellijAdapter {
         )
         .await
         .map_err(|error| transport_error(&error))?;
-        let subscribe = format!(
-            "{{\"muxe\":\"subscribe\",\"protocol\":{}}}",
-            muxe_zellij_protocol::BRIDGE_PROTOCOL_VERSION
-        );
+        let subscribe = subscription_payload(ChannelGeneration::INITIAL)?;
         let event = SubprocessChannel::launch(
             config.zellij_exe.clone(),
             config.session_name.clone(),
@@ -700,12 +773,20 @@ impl ZellijAdapter {
                 "Zellij adapter is suspended; activation resume owns the subscription",
             ));
         }
+        let _transition = self.inner.registration_transition.lock().await;
+        let generation = self.inner.generation.advance()?;
+        self.invalidate_all_registrations(
+            "Zellij event subscription was replaced before completion",
+        )
+        .await;
+        self.inner.register_epoch.lock().await.clear();
         self.inner
             .event
-            .respawn()
+            .respawn_with_payload(subscription_payload(generation)?)
             .await
             .map_err(|error| transport_error(&error))
     }
+
     /// Fresh compatible census for the readiness hook: client IDs holding a
     /// compatible record in the current evidence generation. Private; the
     /// typed `activation_readiness` hook is the only consumer surface.
@@ -724,16 +805,6 @@ impl ZellijAdapter {
         census
     }
 
-    fn mint_id(&self) -> [u8; 16] {
-        let counter = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut id = [0u8; 16];
-        id[..8].copy_from_slice(&counter.to_le_bytes());
-        id[8..].copy_from_slice(&counter.to_be_bytes());
-        if id == [0; 16] {
-            id[0] = 1;
-        }
-        id
-    }
 
     /// Milliseconds elapsed on the monotonic adapter clock, for lease times.
     fn clock_millis(&self) -> u64 {
@@ -746,6 +817,10 @@ impl ZellijAdapter {
     }
     async fn emit(&self, event: AdapterHealthEvent) {
         let _ = self.inner.events_tx.send(event).await;
+    }
+
+    fn mint_local_id(&self) -> [u8; 16] {
+        self.inner.local_tokens.mint()
     }
 
     fn correlation(&self) -> ExecutionCorrelationId {
@@ -794,103 +869,154 @@ impl ZellijAdapter {
     }
 
     async fn handle_event_line(&self, channel: u64, line: &str) {
-        let Ok(event) = decode_event_line(line) else {
+        let Ok(frame) = decode_event_line(line) else {
             self.restart_whole_pipe().await;
             return;
         };
-        match event.event {
+        if frame.channel_generation != self.inner.generation.current() {
+            return;
+        }
+        let request_id = frame.request_id;
+        let registration = frame.registration;
+        match frame.event {
             PipeEventKind::Register {
                 client_id,
                 current_pane,
-                registration,
                 identity,
                 ..
             } => {
-                self.on_register(channel, client_id, current_pane, registration, identity)
-                    .await;
-            }
-            PipeEventKind::RequestReleased {
-                request_id,
-                channel_generation,
-                registration,
-            } => {
-                self.on_released(request_id, channel_generation, registration)
-                    .await;
-            }
-            PipeEventKind::DispatchAccepted { .. } => {}
-            PipeEventKind::DispatchCompleted {
-                request_id,
-                execution,
-                outcome,
-            } => {
-                self.on_completed(request_id, execution, outcome).await;
-            }
-            PipeEventKind::OriginSnapshot { ui_session, origin } => {
-                if let Some(sender) = self.inner.pending_origin.lock().await.remove(&ui_session) {
-                    let _ = sender.send(Ok(origin));
-                }
-            }
-            PipeEventKind::OriginDeclined { ui_session, .. } => {
-                if let Some(sender) = self.inner.pending_origin.lock().await.remove(&ui_session) {
-                    let _ = sender.send(Err(OriginError::InvalidId {
-                        field: "ui-pane",
-                        reason: "bridge declined ownership of the pane",
-                    }));
-                }
-            }
-            PipeEventKind::CaptureReady { lease, prior_mode } => {
-                if let Some((_, sender)) = self.inner.pending_capture.lock().await.remove(&lease) {
-                    let _ = sender.send(Ok(prior_mode));
-                }
-            }
-            PipeEventKind::CaptureLost { lease, reason } => {
-                self.inner.pending_capture.lock().await.remove(&lease);
-                let loss = match reason {
-                    muxe_zellij_protocol::CaptureLostReason::UserModeChanged => {
-                        muxe_adapter_api::CaptureLossReason::UserModeChanged
-                    }
-                    muxe_zellij_protocol::CaptureLostReason::BridgeUnloading => {
-                        muxe_adapter_api::CaptureLossReason::AdapterHealth
-                    }
-                };
-                self.emit(AdapterHealthEvent::CaptureLost {
-                    lease: ApiCaptureLease {
-                        id: CaptureLeaseId::new(hex_id(&lease)),
-                        ui_session: UiSessionId::new("unknown"),
-                        modal_scope: ModalScopeId::new("unknown"),
-                    },
-                    reason: loss,
-                })
+                self.on_register(
+                    channel,
+                    frame.channel_generation,
+                    client_id,
+                    current_pane,
+                    registration,
+                    identity,
+                )
                 .await;
             }
-            PipeEventKind::Heartbeat {
-                registration,
-                client_id,
-            } => {
-                let now = self.clock_millis();
-                let _ = self
+            event => {
+                let client_id = self
                     .inner
                     .registry
                     .lock()
                     .await
-                    .heartbeat(&client_id, registration, now);
+                    .client_for_registration(registration)
+                    .map(str::to_owned);
+                let Some(client_id) = client_id else {
+                    return;
+                };
+                match event {
+                    PipeEventKind::Register { .. } => unreachable!("handled above"),
+                    PipeEventKind::RequestReleased => {
+                        self.on_released(
+                            request_id.expect("validated solicited event"),
+                            frame.channel_generation,
+                            registration,
+                        )
+                        .await;
+                    }
+                    PipeEventKind::DispatchAccepted { .. } => {}
+                    PipeEventKind::DispatchCompleted { execution, outcome } => {
+                        self.on_completed(
+                            request_id.expect("validated solicited event"),
+                            registration,
+                            execution,
+                            outcome,
+                        )
+                        .await;
+                    }
+                    PipeEventKind::OriginSnapshot { ui_session, origin } => {
+                        let request = RequestProvenance {
+                            request_id: request_id.expect("validated solicited event"),
+                            registration,
+                        };
+                        let mut pending = self.inner.pending_origin.lock().await;
+                        if pending
+                            .get(&ui_session)
+                            .is_some_and(|reply| reply.request == Some(request))
+                            && let Some(reply) = pending.remove(&ui_session)
+                        {
+                            let _ = reply.sender.send(Ok(origin));
+                        }
+                    }
+                    PipeEventKind::OriginDeclined { ui_session } => {
+                        let request = RequestProvenance {
+                            request_id: request_id.expect("validated solicited event"),
+                            registration,
+                        };
+                        let mut pending = self.inner.pending_origin.lock().await;
+                        if pending
+                            .get(&ui_session)
+                            .is_some_and(|reply| reply.request == Some(request))
+                            && let Some(reply) = pending.remove(&ui_session)
+                        {
+                            let _ = reply.sender.send(Err(OriginError::InvalidId {
+                                field: "ui-pane",
+                                reason: "bridge declined ownership of the pane",
+                            }));
+                        }
+                    }
+                    PipeEventKind::CaptureReady { lease, prior_mode } => {
+                        let request = RequestProvenance {
+                            request_id: request_id.expect("validated solicited event"),
+                            registration,
+                        };
+                        let mut pending = self.inner.pending_capture.lock().await;
+                        if pending
+                            .get(&lease)
+                            .is_some_and(|(_, reply)| reply.request == Some(request))
+                            && let Some((_, reply)) = pending.remove(&lease)
+                        {
+                            let _ = reply.sender.send(Ok(prior_mode));
+                        }
+                    }
+                    PipeEventKind::CaptureLost { lease, reason } => {
+                        self.inner.pending_capture.lock().await.remove(&lease);
+                        let loss = match reason {
+                            muxe_zellij_protocol::CaptureLostReason::UserModeChanged => {
+                                muxe_adapter_api::CaptureLossReason::UserModeChanged
+                            }
+                            muxe_zellij_protocol::CaptureLostReason::BridgeUnloading => {
+                                muxe_adapter_api::CaptureLossReason::AdapterHealth
+                            }
+                        };
+                        self.emit(AdapterHealthEvent::CaptureLost {
+                            lease: ApiCaptureLease {
+                                id: CaptureLeaseId::new(hex_id(&lease)),
+                                ui_session: UiSessionId::new("unknown"),
+                                modal_scope: ModalScopeId::new("unknown"),
+                            },
+                            reason: loss,
+                        })
+                        .await;
+                    }
+                    PipeEventKind::Heartbeat => {
+                        let now = self.clock_millis();
+                        let _ = self.inner.registry.lock().await.heartbeat(
+                            &client_id,
+                            registration,
+                            now,
+                        );
+                    }
+                }
             }
         }
     }
 
-    /// Records one bridge registration, stamped with the observing resume
-    /// generation and the event-channel install epoch that delivered it,
-    /// captured at receipt by the event loop. Freshness is a transport
-    /// property: a line already read from a displaced child keeps its older
-    /// channel tag even when processed after a respawn, while a still-live
-    /// bridge re-emitting its pre-suspend ID on the new channel is current
-    /// evidence. No registration ID is ever rejected for looking old.
+    /// Records one fresh bridge registration, stamped with the observing
+    /// resume generation and event-channel install epoch captured at receipt.
+    ///
+    /// Registrations retired by channel replacement are rejected even if
+    /// replayed on the new delivery boundary: every event subscription requires
+    /// the bridge to mint a new unpredictable identity.
     async fn on_register(
         &self,
         channel: u64,
+        channel_generation: ChannelGeneration,
         client_id: String,
         current_pane: Option<String>,
-        registration: [u8; 16],
+        registration: RegistrationId,
         identity: muxe_zellij_protocol::BridgeIdentity,
     ) {
         let compatible = identity.bridge_build_id == Some(bridge_build_id())
@@ -898,8 +1024,14 @@ impl ZellijAdapter {
             && identity.action_fingerprint == generated_action_fingerprint().0
             && identity.protocol_fingerprint == bridge_protocol_fingerprint().0
             && identity.muxe_version == env!("CARGO_PKG_VERSION");
+        let transition = self.inner.registration_transition.lock().await;
+        if channel_generation != self.inner.generation.current()
+            || self.inner.event.install_epoch().await != Some(channel)
+        {
+            return;
+        }
         let now = self.clock_millis();
-        let displaced = self.inner.registry.lock().await.register(
+        let registered = self.inner.registry.lock().await.register(
             &client_id,
             registration,
             current_pane,
@@ -907,8 +1039,16 @@ impl ZellijAdapter {
             compatible,
             now,
         );
-        if displaced.is_err() {
+        let Ok(displaced) = registered else {
             return;
+        };
+        if let Some(displaced) = displaced {
+            self.retire_registration_state(
+                &client_id,
+                displaced,
+                "Zellij bridge registration was replaced before completion",
+            )
+            .await;
         }
         // Stamp receipt, not execution: `channel` was fixed when the line
         // arrived, so coverage can require current-attempt evidence per
@@ -921,6 +1061,7 @@ impl ZellijAdapter {
             .insert(client_id.clone(), (epoch, channel));
         // Wake a resume awaiting fresh post-suspend registrations.
         self.inner.registry_notify.notify_waiters();
+        drop(transition);
         if compatible {
             self.emit(AdapterHealthEvent::Healthy {
                 identity: self.host_identity(),
@@ -941,9 +1082,9 @@ impl ZellijAdapter {
 
     async fn on_released(
         &self,
-        request_id: [u8; 16],
-        channel_generation: u64,
-        registration: [u8; 16],
+        request_id: RequestId,
+        channel_generation: ChannelGeneration,
+        registration: RegistrationId,
     ) {
         let matches = self
             .inner
@@ -952,9 +1093,9 @@ impl ZellijAdapter {
             .await
             .as_ref()
             .is_some_and(|pending| {
-                pending.request_id == request_id
+                pending.request.request_id == request_id
                     && pending.generation == channel_generation
-                    && pending.registration == registration
+                    && pending.request.registration == registration
             });
         if !matches {
             // Late acknowledgement from a restarted channel: ignore.
@@ -966,22 +1107,31 @@ impl ZellijAdapter {
 
     async fn on_completed(
         &self,
-        request_id: [u8; 16],
+        request_id: RequestId,
+        registration: RegistrationId,
         execution: String,
         outcome: muxe_zellij_protocol::CommandOutcome,
     ) {
-        let _ = request_id;
         let execution_id: u64 = execution.parse().unwrap_or(u64::MAX);
-        if !self
+        let expected = self
             .inner
             .live_executions
             .lock()
             .await
-            .remove(&execution_id)
-        {
-            // Completion for a forgotten execution (restart cleared it): ignore.
+            .get(&execution_id)
+            .copied()
+            .flatten();
+        if !expected.is_some_and(|provenance| {
+            provenance.request_id == request_id && provenance.registration == registration
+        }) {
+            // Completion for an unsent, forgotten, or displaced request.
             return;
         }
+        self.inner
+            .live_executions
+            .lock()
+            .await
+            .remove(&execution_id);
         let completion = match outcome.status {
             muxe_zellij_protocol::CommandStatus::Succeeded => DispatchCompletion::Succeeded {
                 execution: ExecutionId(execution_id),
@@ -995,9 +1145,132 @@ impl ZellijAdapter {
             .await;
     }
 
+    async fn retire_registration_state(
+        &self,
+        client_id: &str,
+        registration: RegistrationId,
+        reason: &str,
+    ) {
+        {
+            let mut in_flight = self.inner.in_flight.lock().await;
+            if in_flight
+                .as_ref()
+                .is_some_and(|pending| pending.request.registration == registration)
+            {
+                *in_flight = None;
+            }
+        }
+
+        let executions = {
+            let mut live = self.inner.live_executions.lock().await;
+            let executions: Vec<u64> = live
+                .iter()
+                .filter_map(|(execution, request)| {
+                    request
+                        .is_some_and(|request| request.registration == registration)
+                        .then_some(*execution)
+                })
+                .collect();
+            for execution in &executions {
+                live.remove(execution);
+            }
+            executions
+        };
+        for execution in executions {
+            self.emit(AdapterHealthEvent::DispatchCompleted(
+                DispatchCompletion::OutcomeUnknown {
+                    execution: ExecutionId(execution),
+                    error: AdapterError::new(AdapterErrorKind::OutcomeUnknown, reason),
+                },
+            ))
+            .await;
+        }
+
+        self.inner.pending_origin.lock().await.retain(|_, reply| {
+            !reply
+                .request
+                .is_some_and(|request| request.registration == registration)
+        });
+        let beginning_lease = match self.inner.captures.lock().await.state(client_id) {
+            crate::capture::CaptureState::Beginning { lease, .. } => Some(*lease),
+            crate::capture::CaptureState::Idle
+            | crate::capture::CaptureState::Captured(_) => None,
+        };
+        let preserve_capture = {
+            let mut preserve = false;
+            self.inner
+                .pending_capture
+                .lock()
+                .await
+                .retain(|lease, (owner, reply)| {
+                    if reply
+                        .request
+                        .is_some_and(|request| request.registration == registration)
+                    {
+                        return false;
+                    }
+                    if owner != client_id {
+                        return true;
+                    }
+                    let keep = reply.request.is_none() && beginning_lease == Some(*lease);
+                    preserve |= keep;
+                    keep
+                });
+            preserve
+        };
+        self.inner
+            .pending_leases
+            .lock()
+            .await
+            .retain(|_, (_, owner)| *owner != registration);
+        self.inner
+            .pane_claims
+            .lock()
+            .await
+            .retain(|_, owner| owner != client_id);
+
+        let displaced = if preserve_capture {
+            None
+        } else {
+            self.inner.captures.lock().await.invalidate_client(client_id)
+        };
+        let capture = displaced.and_then(|state| match state {
+            crate::capture::CaptureState::Beginning { ui_session, lease } => {
+                Some((ui_session, lease))
+            }
+            crate::capture::CaptureState::Captured(record) => {
+                Some((record.ui_session, record.lease))
+            }
+            crate::capture::CaptureState::Idle => None,
+        });
+        if let Some((ui_session, lease)) = capture {
+            self.emit(AdapterHealthEvent::CaptureLost {
+                lease: ApiCaptureLease {
+                    id: CaptureLeaseId::new(hex_id(&lease)),
+                    ui_session: UiSessionId::new(ui_session),
+                    modal_scope: Self::scope_for_client(client_id),
+                },
+                reason: muxe_adapter_api::CaptureLossReason::AdapterHealth,
+            })
+            .await;
+        }
+    }
+
+    async fn invalidate_all_registrations(&self, reason: &str) {
+        let displaced = self.inner.registry.lock().await.invalidate_all();
+        for (client_id, registration) in displaced {
+            self.retire_registration_state(&client_id, registration, reason)
+                .await;
+        }
+    }
+
     async fn enqueue(&self, item: QueuedItem) {
         if let Some(execution) = item.execution {
-            self.inner.live_executions.lock().await.insert(execution.0);
+            self.inner
+                .live_executions
+                .lock()
+                .await
+                .insert(execution.0, None);
         }
         self.inner
             .queues
@@ -1010,68 +1283,94 @@ impl ZellijAdapter {
     }
 
     async fn pump_all(&self) {
+        let transition = self.inner.registration_transition.lock().await;
         if self.inner.shutdown.load(Ordering::Relaxed)
             || self.inner.suspended.load(Ordering::SeqCst)
+            || self.inner.in_flight.lock().await.is_some()
         {
             return;
         }
-        if self.inner.in_flight.lock().await.is_some() {
-            return;
-        }
-        // Deterministic client order keeps simulation stable and prevents a
-        // busy client from starving another.
-        let order: Vec<String> = {
+        let mut order: Vec<String> = {
             let queues = self.inner.queues.lock().await;
-            let mut clients: Vec<String> = queues
+            queues
                 .iter()
                 .filter(|(_, queue)| !queue.is_empty())
                 .map(|(client, _)| client.clone())
-                .collect();
-            clients.sort();
-            clients
+                .collect()
         };
+        order.sort();
+        if let Some(last) = self.inner.scheduler_cursor.lock().await.as_ref()
+            && let Some(index) = order.iter().position(|client| client == last)
+            && !order.is_empty()
+        {
+            let start = (index + 1) % order.len();
+            order.rotate_left(start);
+        }
         for client in order {
-            if self.pump_one(&client).await {
-                return;
+            match self.pump_one(&client).await {
+                SendItemResult::Accepted => {
+                    *self.inner.scheduler_cursor.lock().await = Some(client);
+                    return;
+                }
+                SendItemResult::RestartWhole => {
+                    drop(transition);
+                    self.restart_whole_pipe().await;
+                    return;
+                }
+                SendItemResult::Continue => {}
             }
         }
     }
 
-    async fn pump_one(&self, client_id: &str) -> bool {
-        // One respawn retry inline: after replacing the child the same head
-        // item is attempted again without recursing through pump_all.
+    async fn pump_one(&self, client_id: &str) -> SendItemResult {
+        // One request-child respawn retry inline. Lifecycle payloads retry
+        // only when their semantics are idempotent; dispatch never replays.
         for _ in 0..2 {
-            let registration = {
-                let registry = self.inner.registry.lock().await;
-                match registry.get(client_id) {
-                    Some(record) if record.compatible => record.registration,
-                    _ => return false,
-                }
-            };
             let item = {
                 let mut queues = self.inner.queues.lock().await;
                 match queues.get_mut(client_id).and_then(VecDeque::pop_front) {
                     Some(item) => item,
-                    None => return false,
+                    None => return SendItemResult::Continue,
                 }
             };
-            if self.send_item(client_id, registration, item).await {
-                return true;
+            let request = self
+                .inner
+                .registry
+                .lock()
+                .await
+                .allocate_request(client_id);
+            let Ok((registration, request_id)) = request else {
+                self.inner
+                    .queues
+                    .lock()
+                    .await
+                    .entry(client_id.to_owned())
+                    .or_default()
+                    .push_front(item);
+                return SendItemResult::Continue;
+            };
+            let provenance = RequestProvenance {
+                request_id,
+                registration,
+            };
+            match self.send_item(client_id, provenance, item).await {
+                SendItemResult::Accepted => return SendItemResult::Accepted,
+                SendItemResult::RestartWhole => return SendItemResult::RestartWhole,
+                SendItemResult::Continue => {}
             }
         }
-        false
+        SendItemResult::Continue
     }
 
-    /// Sends one queued item; returns whether the pipe accepted it.
+    /// Sends one queued item and reports transport recovery needed by the scheduler.
     async fn send_item(
         &self,
         client_id: &str,
-        registration: [u8; 16],
+        request: RequestProvenance,
         mut item: QueuedItem,
-    ) -> bool {
+    ) -> SendItemResult {
         item.client_id = client_id.to_owned();
-        let generation = self.inner.generation.load(Ordering::Relaxed);
-        let request_id = item.request_id;
+        let generation = self.inner.generation.current();
         let Some(payload) = item.payload.take() else {
             self.emit(AdapterHealthEvent::Unhealthy {
                 modal_scope: Some(Self::scope_for_client(client_id)),
@@ -1081,19 +1380,36 @@ impl ZellijAdapter {
                 ),
             })
             .await;
-            return false;
+            return SendItemResult::Continue;
         };
-        let request = PipeRequest {
+        let replay_safe = !matches!(
+            &payload,
+            BridgeRequest::Dispatch { .. }
+                | BridgeRequest::FocusPaneByIndex { .. }
+                | BridgeRequest::FocusPaneNeighbor { .. }
+        );
+        if let BridgeRequest::BeginCapture { lease, .. } = &payload
+            && let Some((_, pending)) =
+                self.inner.pending_capture.lock().await.get_mut(lease)
+        {
+            pending.request = Some(request);
+        }
+        if let BridgeRequest::RequestOrigin { ui_session, .. } = &payload
+            && let Some(pending) = self.inner.pending_origin.lock().await.get_mut(ui_session)
+        {
+            pending.request = Some(request);
+        }
+        let frame = PipeRequest {
             protocol: muxe_zellij_protocol::BRIDGE_PROTOCOL_VERSION,
-            request_id,
+            request_id: request.request_id,
             channel_generation: generation,
             target: muxe_zellij_protocol::BridgeTarget {
                 client_id: client_id.to_owned(),
-                registration,
+                registration: request.registration,
             },
             payload,
         };
-        let line = match encode_request_line(&request) {
+        let line = match encode_request_line(&frame) {
             Ok(line) => line,
             Err(error) => {
                 self.emit(AdapterHealthEvent::Unhealthy {
@@ -1104,15 +1420,40 @@ impl ZellijAdapter {
                 if let Some(execution) = item.execution {
                     self.inner.live_executions.lock().await.remove(&execution.0);
                 }
-                return false;
+                return SendItemResult::Continue;
             }
         };
-        let PipeRequest { payload, .. } = request;
+        let PipeRequest { payload, .. } = frame;
         item.payload = Some(payload);
+        if let Some(execution) = item.execution {
+            self.inner
+                .live_executions
+                .lock()
+                .await
+                .insert(execution.0, Some(request));
+        }
+        *self.inner.in_flight.lock().await = Some(InFlight {
+            request,
+            generation,
+            execution: item.execution,
+        });
         if let Err(error) = self.inner.request.send_line(line).await {
-            // The line may still have reached the host: at-most-once means a
-            // dispatch becomes outcome_unknown here, never replayed. Lifecycle
-            // lines have their own waiters time out; the pipe is still replaced.
+            let matches = self
+                .inner
+                .in_flight
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.request.request_id == request.request_id
+                        && pending.request.registration == request.registration
+                });
+            if matches {
+                *self.inner.in_flight.lock().await = None;
+            }
+            // A state-changing dispatch may have reached the host and is never
+            // replayed. Lifecycle payloads retry only when their payload kind
+            // is explicitly classified as idempotent.
             if let Some(execution) = item.execution {
                 self.inner.live_executions.lock().await.remove(&execution.0);
                 self.emit(AdapterHealthEvent::DispatchCompleted(
@@ -1122,10 +1463,17 @@ impl ZellijAdapter {
                     },
                 ))
                 .await;
+            } else if !replay_safe {
+                self.emit(AdapterHealthEvent::Unhealthy {
+                    modal_scope: Some(Self::scope_for_client(client_id)),
+                    error: AdapterError::new(
+                        AdapterErrorKind::OutcomeUnknown,
+                        "Zellij dispatch write failed; action outcome is unknown",
+                    ),
+                })
+                .await;
             }
-            // Requeue the lifecycle head for the retry pass; dispatches already
-            // completed as unknown and must not replay.
-            if item.execution.is_none() {
+            if replay_safe {
                 self.inner
                     .queues
                     .lock()
@@ -1134,20 +1482,17 @@ impl ZellijAdapter {
                     .or_default()
                     .push_front(item);
             }
-            self.replace_request_child().await;
-            return false;
+            return if self.replace_request_child().await {
+                SendItemResult::Continue
+            } else {
+                SendItemResult::RestartWhole
+            };
         }
-        *self.inner.in_flight.lock().await = Some(InFlight {
-            request_id,
-            generation,
-            registration,
-            execution: item.execution,
-        });
-        self.watch_release(request_id, generation);
-        true
+        self.watch_release(request, generation);
+        SendItemResult::Accepted
     }
 
-    fn watch_release(&self, request_id: [u8; 16], generation: u64) {
+    fn watch_release(&self, request: RequestProvenance, generation: ChannelGeneration) {
         // A release deadline protects the global queue: a bridge that never
         // releases (crashed between receipt and acknowledgement) must not wedge
         // every client. Completions still arrive on the event pipe afterwards.
@@ -1161,7 +1506,9 @@ impl ZellijAdapter {
                 .await
                 .as_ref()
                 .is_some_and(|pending| {
-                    pending.request_id == request_id && pending.generation == generation
+                    pending.request.request_id == request.request_id
+                        && pending.request.registration == request.registration
+                        && pending.generation == generation
                 });
             if !stuck {
                 return;
@@ -1194,17 +1541,15 @@ impl ZellijAdapter {
         });
     }
 
-    async fn replace_request_child(&self) {
+    async fn replace_request_child(&self) -> bool {
         if self.inner.shutdown.load(Ordering::Relaxed)
             || self.inner.suspended.load(Ordering::SeqCst)
         {
-            return;
+            return false;
         }
         // No pump here: the caller's retry loop re-attempts the head item, so
         // replacing never recurses back through pump_all.
-        if self.inner.request.respawn().await.is_err() {
-            self.restart_whole_pipe().await;
-        }
+        self.inner.request.respawn().await.is_ok()
     }
 
     async fn restart_whole_pipe(&self) {
@@ -1213,7 +1558,18 @@ impl ZellijAdapter {
         {
             return;
         }
-        self.inner.generation.fetch_add(1, Ordering::Relaxed);
+        let _transition = self.inner.registration_transition.lock().await;
+        let Ok(generation) = self.inner.generation.advance() else {
+            self.emit(AdapterHealthEvent::Unhealthy {
+                modal_scope: None,
+                error: AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Zellij channel generation exhausted",
+                ),
+            })
+            .await;
+            return;
+        };
         // The in-flight request may have reached the host: outcome unknown, never replayed.
         if let Some(pending) = self.inner.in_flight.lock().await.take()
             && let Some(execution) = pending.execution
@@ -1230,12 +1586,16 @@ impl ZellijAdapter {
             ))
             .await;
         }
-        self.inner.registry.lock().await.invalidate_all();
+        self.invalidate_all_registrations("Zellij event pipe failed before completion")
+            .await;
         self.inner.captures.lock().await.invalidate_all_clients();
         self.inner.pane_claims.lock().await.clear();
         self.inner.snapshots.lock().await.clear();
         let request_ok = self.inner.request.respawn().await.is_ok();
-        let event_ok = self.inner.event.respawn().await.is_ok();
+        let event_ok = match subscription_payload(generation) {
+            Ok(payload) => self.inner.event.respawn_with_payload(payload).await.is_ok(),
+            Err(_) => false,
+        };
         if !request_ok || !event_ok {
             self.emit(AdapterHealthEvent::Unhealthy {
                 modal_scope: None,
@@ -1358,8 +1718,9 @@ impl ZellijAdapter {
             .ok_or_else(|| invalid_request("modal scope is not a Zellij client scope"))
     }
 
-    async fn active_registration(&self, client_id: &str) -> Result<[u8; 16], AdapterError> {
+    async fn active_registration(&self, client_id: &str) -> Result<RegistrationId, AdapterError> {
         self.sweep_expired_clients().await;
+        let _transition = self.inner.registration_transition.lock().await;
         let registry = self.inner.registry.lock().await;
         match registry.get(client_id) {
             Some(record) if record.compatible => Ok(record.registration),
@@ -1389,39 +1750,16 @@ impl ZellijAdapter {
         {
             return;
         }
+        let _transition = self.inner.registration_transition.lock().await;
         let now = self.clock_millis();
         let expired = self.inner.registry.lock().await.expire_leases(now);
-        if expired.is_empty() {
-            return;
-        }
-        let mut captures = self.inner.captures.lock().await;
-        let mut waiters = self.inner.pending_capture.lock().await;
-        for client in expired {
-            let displaced = captures.invalidate_client(&client);
-            // Dropping a waiter sender fails its receiver promptly through
-            // the existing capture timeout/else path; only this client's
-            // leases are released.
-            waiters.retain(|_, (owner, _)| owner != &client);
-            if let Some(state) = displaced {
-                let (ui_session, lease) = match state {
-                    crate::capture::CaptureState::Beginning { ui_session, lease } => {
-                        (ui_session, lease)
-                    }
-                    crate::capture::CaptureState::Captured(record) => {
-                        (record.ui_session, record.lease)
-                    }
-                    crate::capture::CaptureState::Idle => continue,
-                };
-                self.emit(AdapterHealthEvent::CaptureLost {
-                    lease: ApiCaptureLease {
-                        id: CaptureLeaseId::new(hex_id(&lease)),
-                        ui_session: UiSessionId::new(ui_session),
-                        modal_scope: Self::scope_for_client(&client),
-                    },
-                    reason: muxe_adapter_api::CaptureLossReason::AdapterHealth,
-                })
-                .await;
-            }
+        for (client, registration) in expired {
+            self.retire_registration_state(
+                &client,
+                registration,
+                "Zellij bridge heartbeat expired before completion",
+            )
+            .await;
             self.emit(AdapterHealthEvent::Unhealthy {
                 modal_scope: Some(Self::scope_for_client(&client)),
                 error: AdapterError::new(
@@ -1437,9 +1775,11 @@ impl ZellijAdapter {
     /// reports `Unhealthy` while staying suspended. Every resume failure
     /// funnels here so no partial adapter can overlap the next attempt.
     async fn fail_resume(&self, message: &str) -> AdapterError {
+        let _transition = self.inner.registration_transition.lock().await;
         self.inner.request.park().await;
         self.inner.event.park().await;
-        self.inner.registry.lock().await.invalidate_all();
+        self.invalidate_all_registrations("Zellij activation resume failed before completion")
+            .await;
         self.inner.register_epoch.lock().await.clear();
         *self.inner.success_snapshot.lock().await = None;
         self.emit(AdapterHealthEvent::Unhealthy {
@@ -1469,7 +1809,7 @@ impl ZellijAdapter {
         }
         let deadline = tokio::time::Instant::now() + BOOTSTRAP_TIMEOUT;
         loop {
-            let clients: Vec<(String, [u8; 16])> = {
+            let clients: Vec<(String, RegistrationId)> = {
                 let registry = self.inner.registry.lock().await;
                 registry
                     .client_ids()
@@ -1514,47 +1854,54 @@ impl ZellijAdapter {
     async fn request_origin_from(
         &self,
         client_id: &str,
-        registration: [u8; 16],
+        registration: RegistrationId,
         ui_session: &str,
         ui_pane: &str,
     ) -> Result<ZellijOrigin, OriginError> {
-        let pipe_request = PipeRequest {
-            protocol: muxe_zellij_protocol::BRIDGE_PROTOCOL_VERSION,
-            request_id: self.mint_id(),
-            channel_generation: self.inner.generation.load(Ordering::Relaxed),
-            target: muxe_zellij_protocol::BridgeTarget {
-                client_id: client_id.to_owned(),
-                registration,
-            },
-            payload: BridgeRequest::RequestOrigin {
-                ui_session: ui_session.to_owned(),
-                ui_pane: ui_pane.to_owned(),
-            },
-        };
-        let line = encode_request_line(&pipe_request).map_err(|_| OriginError::InvalidId {
-            field: "request",
-            reason: "could not encode origin request",
-        })?;
-        // Origin requests bypass the dispatch queue: they run during attach,
-        // before any UI session exists to order against. The single-flight
-        // rule still applies because attach is serialized per modal scope.
-        if self.inner.request.send_line(line).await.is_err() {
+        if self
+            .inner
+            .registry
+            .lock()
+            .await
+            .check(client_id, registration)
+            .is_err()
+        {
             return Err(OriginError::InvalidId {
-                field: "transport",
-                reason: "request pipe unavailable",
+                field: "registration",
+                reason: "bridge registration is not active",
             });
         }
         let (sender, receiver) = oneshot::channel();
-        self.inner
-            .pending_origin
-            .lock()
-            .await
-            .insert(ui_session.to_owned(), sender);
+        self.inner.pending_origin.lock().await.insert(
+            ui_session.to_owned(),
+            PendingReply {
+                request: None,
+                sender,
+            },
+        );
+        self.enqueue_lifecycle(
+            client_id.to_owned(),
+            BridgeRequest::RequestOrigin {
+                ui_session: ui_session.to_owned(),
+                ui_pane: ui_pane.to_owned(),
+            },
+        )
+        .await;
         let result = timeout(ORIGIN_ATTEMPT_TIMEOUT, receiver).await;
         self.inner.pending_origin.lock().await.remove(ui_session);
+        if let Some(queue) = self.inner.queues.lock().await.get_mut(client_id) {
+            queue.retain(|item| {
+                !matches!(
+                    item.payload.as_ref(),
+                    Some(BridgeRequest::RequestOrigin {
+                        ui_session: pending,
+                        ..
+                    }) if pending == ui_session
+                )
+            });
+        }
         match result {
             Ok(Ok(snapshot)) => {
-                // The bridge must still own this registration when answering.
                 if self
                     .inner
                     .registry
@@ -1603,32 +1950,29 @@ impl ZellijAdapter {
         client_id: String,
         commands: Vec<RawNativeCommand>,
     ) -> Result<DispatchAccepted, AdapterError> {
-        // Gate acceptance on a live compatible registration: pump re-resolves
-        // the registration at send time, but an unknown or incompatible
-        // client must fail here instead of queueing forever.
+        // Schema v1 mappings are one host request per execution. In
+        // particular, keyboard key bytes are concatenated before this layer.
+        let [raw]: [RawNativeCommand; 1] = commands.try_into().map_err(|_| {
+            AdapterError::new(
+                AdapterErrorKind::InvalidRequest,
+                "Zellij execution must resolve to exactly one host command",
+            )
+        })?;
+        // Gate acceptance on a live compatible registration. The queue mints
+        // its request ID only after re-resolving that registration at send time.
         self.active_registration(&client_id).await?;
-        for raw in commands {
-            // Mandatory immediate runtime validation of the fully resolved
-            // candidate. The single clone per command is structural: the typed
-            // pipe payload retains the raw mirror while the generated `TryFrom`
-            // conversion is the validation check, and both are needed.
-            ValidatedNativeCommand::try_from(raw.clone()).map_err(|error| {
-                AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
-            })?;
-            self.enqueue(QueuedItem {
-                request_id: self.mint_id(),
-                // Keystroke sequences share one broker execution across their
-                // ordered pipe requests; each request still completes
-                // individually on the event pipe.
-                execution: Some(execution),
-                client_id: client_id.clone(),
-                payload: Some(BridgeRequest::Dispatch {
-                    execution: execution.0.to_string(),
-                    command: raw,
-                }),
-            })
-            .await;
-        }
+        ValidatedNativeCommand::try_from(raw.clone()).map_err(|error| {
+            AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
+        })?;
+        self.enqueue(QueuedItem {
+            execution: Some(execution),
+            client_id,
+            payload: Some(BridgeRequest::Dispatch {
+                execution: execution.0.to_string(),
+                command: raw,
+            }),
+        })
+        .await;
         Ok(DispatchAccepted {
             correlation: self.correlation(),
             execution,
@@ -1669,7 +2013,7 @@ impl ZellijAdapter {
         let client_id = match target {
             crate::launch::LaunchTarget::Client(client) => client,
             crate::launch::LaunchTarget::UiPane(pane) => {
-                let probe = format!("launch-{}", hex_id(&self.mint_id()));
+                let probe = format!("launch-{}", hex_id(&self.mint_local_id()));
                 self.resolve_client_for_pane(&probe, pane.as_str()).await?
             }
         };
@@ -1679,7 +2023,6 @@ impl ZellijAdapter {
 
     async fn enqueue_lifecycle(&self, client_id: String, payload: BridgeRequest) {
         self.enqueue(QueuedItem {
-            request_id: self.mint_id(),
             execution: None,
             client_id,
             payload: Some(payload),
@@ -1813,7 +2156,7 @@ impl HostAdapter for ZellijAdapter {
         self.require_active()?;
         // A throwaway session namespace keeps the claim fan-out keyed without
         // allocating a broker session.
-        let probe_session = format!("claim-{}", hex_id(&self.mint_id()));
+        let probe_session = format!("claim-{}", hex_id(&self.mint_local_id()));
         let client = self
             .resolve_client_for_pane(&probe_session, ui_pane.as_str())
             .await?;
@@ -1828,7 +2171,7 @@ impl HostAdapter for ZellijAdapter {
         let client_id = Self::client_for_scope(&request.modal_scope)?;
         // Guard: a live compatible bridge must own the client before capture.
         let _registration = self.active_registration(&client_id).await?;
-        let lease = self.mint_id();
+        let lease = self.mint_local_id();
         {
             let mut captures = self.inner.captures.lock().await;
             captures
@@ -1842,7 +2185,16 @@ impl HostAdapter for ZellijAdapter {
             .pending_capture
             .lock()
             .await
-            .insert(lease, (client_id.clone(), sender));
+            .insert(
+                lease,
+                (
+                    client_id.clone(),
+                    PendingReply {
+                        request: None,
+                        sender,
+                    },
+                ),
+            );
         self.enqueue_lifecycle(
             client_id.clone(),
             BridgeRequest::BeginCapture {
@@ -1866,13 +2218,42 @@ impl HostAdapter for ZellijAdapter {
                 modal_scope: request.modal_scope,
             })
         } else {
-            self.inner.pending_capture.lock().await.remove(&lease);
+            let transition = self.inner.registration_transition.lock().await;
+            let sent = self
+                .inner
+                .pending_capture
+                .lock()
+                .await
+                .remove(&lease)
+                .is_some_and(|(_, reply)| reply.request.is_some());
+            if !sent
+                && let Some(queue) = self.inner.queues.lock().await.get_mut(&client_id)
+            {
+                queue.retain(|item| {
+                    !matches!(
+                        item.payload.as_ref(),
+                        Some(BridgeRequest::BeginCapture { lease: pending, .. })
+                            if *pending == lease
+                    )
+                });
+            }
             let _ = self
                 .inner
                 .captures
                 .lock()
                 .await
                 .release(&client_id, lease, false);
+            drop(transition);
+            if sent {
+                self.enqueue_lifecycle(
+                    client_id,
+                    BridgeRequest::EndCapture {
+                        lease,
+                        reason: CaptureEndReason::LeaseExpired,
+                    },
+                )
+                .await;
+            }
             Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
                 "timed out waiting for Zellij Locked-mode capture",
@@ -1955,9 +2336,7 @@ impl HostAdapter for ZellijAdapter {
             })?;
         let bridge_registration = self.active_registration(&client).await?;
         let id = format!(
-            "zellij:{}:{}:{}",
-            client,
-            hex_id(&bridge_registration),
+            "zellij:{client}:{bridge_registration}:{}",
             registration.pane
         );
         self.inner
@@ -2007,7 +2386,7 @@ impl HostAdapter for ZellijAdapter {
         self.enqueue_lifecycle(
             client.clone(),
             BridgeRequest::Dispatch {
-                execution: format!("cleanup-{}", hex_id(&self.mint_id())),
+                execution: format!("cleanup-{}", hex_id(&self.mint_local_id())),
                 command: RawNativeCommand::ClosePaneWithId { pane_id: pane },
             },
         )
@@ -2064,7 +2443,7 @@ impl HostAdapter for ZellijAdapter {
             if let Some(snapshot) = self.inner.snapshots.lock().await.get(&ui_pane).cloned() {
                 snapshot
             } else {
-                let ui_session = format!("origin-{}", hex_id(&self.mint_id()));
+                let ui_session = format!("origin-{}", hex_id(&self.mint_local_id()));
                 self.resolve_client_for_pane(&ui_session, &ui_pane).await?;
                 self.inner
                     .snapshots
@@ -2131,13 +2510,7 @@ impl HostAdapter for ZellijAdapter {
                         }
                     }
                 };
-                self.inner
-                    .live_executions
-                    .lock()
-                    .await
-                    .insert(request.execution.0);
                 self.enqueue(QueuedItem {
-                    request_id: self.mint_id(),
                     execution: Some(request.execution),
                     client_id,
                     payload: Some(payload),
@@ -2199,6 +2572,7 @@ impl HostAdapter for ZellijAdapter {
         if self.inner.suspended.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        let _transition = self.inner.registration_transition.lock().await;
         // Fail closed while the old pipes drain: stale registrations,
         // captures, claims, snapshots, queues, and waiters must never serve
         // a target release. Dropping the waiter senders releases their
@@ -2224,7 +2598,8 @@ impl HostAdapter for ZellijAdapter {
         // receivers immediately instead of hanging to timeout. Membership for
         // resume comes from a fresh authoritative query per attempt, never
         // from this pre-suspend registry, so nothing is snapshotted here.
-        self.inner.registry.lock().await.invalidate_all();
+        self.invalidate_all_registrations("Zellij adapter suspended before completion")
+            .await;
         self.inner.register_epoch.lock().await.clear();
         *self.inner.success_snapshot.lock().await = None;
         self.inner.captures.lock().await.invalidate_all_clients();
@@ -2269,6 +2644,7 @@ impl HostAdapter for ZellijAdapter {
                 "Zellij adapter is not suspended for activation; refusing to fabricate a resumed subscription",
             ));
         }
+        let transition = self.inner.registration_transition.lock().await;
         // Open a fresh evidence generation BEFORE touching the transport: only
         // registrations stamped with this generation count, so partial
         // evidence from an earlier attempt can never combine with this one.
@@ -2276,10 +2652,16 @@ impl HostAdapter for ZellijAdapter {
         // already read from the old pipe keeps its older channel tag at
         // receipt and can never satisfy the new channel boundary below.
         let epoch = self.inner.resume_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        self.inner.registry.lock().await.invalidate_all();
+        self.invalidate_all_registrations("Zellij adapter resumed before completion")
+            .await;
         self.inner.register_epoch.lock().await.clear();
+        let generation = self.inner.generation.advance()?;
         let request_ok = self.inner.request.respawn().await.is_ok();
-        let event_ok = self.inner.event.respawn().await.is_ok();
+        let event_ok = match subscription_payload(generation) {
+            Ok(payload) => self.inner.event.respawn_with_payload(payload).await.is_ok(),
+            Err(_) => false,
+        };
+        drop(transition);
         if !request_ok || !event_ok {
             return Err(self
                 .fail_resume(
@@ -2397,8 +2779,16 @@ mod tests {
     use crate::pipes::testing::ScriptedChannel;
     use muxe_zellij_protocol::{
         BridgeIdentity, CommandOutcome, PipeEvent, PipeEventKind, bridge_build_id,
-        decode_request_line, encode_event_line,
+        decode_event_subscription, decode_request_line, encode_event_line,
     };
+
+    fn registration_id(seed: u8) -> RegistrationId {
+        RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
+    }
+
+    fn registration_from_bytes(bytes: [u8; 16]) -> RegistrationId {
+        registration_id(bytes[0])
+    }
 
     fn register_event(
         registration: [u8; 16],
@@ -2418,12 +2808,15 @@ mod tests {
         bridge_build_id: Option<muxe_protocol::SchemaFingerprint>,
         muxe_version: &str,
     ) -> PipeEvent {
+        let registration = registration_from_bytes(registration);
         PipeEvent {
-            sequence: 1,
+            protocol: muxe_zellij_protocol::BRIDGE_PROTOCOL_VERSION,
+            request_id: None,
+            channel_generation: ChannelGeneration::INITIAL,
+            registration,
             event: PipeEventKind::Register {
                 client_id: client_id.to_owned(),
                 current_pane: Some("terminal_2".to_owned()),
-                registration,
                 plugin_id: Some(3),
                 identity: BridgeIdentity {
                     muxe_version: muxe_version.to_owned(),
@@ -2433,6 +2826,20 @@ mod tests {
                     bridge_build_id,
                 },
             },
+        }
+    }
+
+    fn pipe_event(
+        registration: [u8; 16],
+        request_id: Option<RequestId>,
+        event: PipeEventKind,
+    ) -> PipeEvent {
+        PipeEvent {
+            protocol: muxe_zellij_protocol::BRIDGE_PROTOCOL_VERSION,
+            request_id,
+            channel_generation: ChannelGeneration::INITIAL,
+            registration: registration_from_bytes(registration),
+            event,
         }
     }
     fn test_origin() -> OriginContext {
@@ -2644,7 +3051,7 @@ mod tests {
                 .lock()
                 .await
                 .get("client-1")
-                .is_some_and(|record| record.registration == [8; 16]);
+                .is_some_and(|record| record.registration == registration_id(8));
             if refreshed {
                 return;
             }
@@ -2690,15 +3097,18 @@ mod tests {
         registration: [u8; 16],
         muxe_version: &str,
     ) {
-        event.push_line(
-            encode_event_line(&register_event_for(
-                client,
-                registration,
-                Some(bridge_build_id()),
-                muxe_version,
-            ))
-            .expect("register encodes"),
+        let mut frame = register_event_for(
+            client,
+            registration,
+            Some(bridge_build_id()),
+            muxe_version,
         );
+        if let Some(payload) = event.initial_payload() {
+            frame.channel_generation = decode_event_subscription(&payload)
+                .expect("subscription payload")
+                .channel_generation();
+        }
+        event.push_line(encode_event_line(&frame).expect("register encodes"));
     }
 
     /// Starts one resume attempt: respawns the transport and waits for the
@@ -2744,25 +3154,18 @@ mod tests {
     /// Pushes a fingerprint-dishonest registration for the newcomer:
     /// observed by the attempt, never compatible.
     fn push_incompatible_newcomer(event: &ScriptedChannel) {
-        event.push_line(
-            encode_event_line(&PipeEvent {
-                sequence: 1,
-                event: PipeEventKind::Register {
-                    client_id: "new-client".to_owned(),
-                    current_pane: Some("terminal_2".to_owned()),
-                    registration: [20; 16],
-                    plugin_id: Some(3),
-                    identity: BridgeIdentity {
-                        muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
-                        source_revision: pinned_source_revision().to_owned(),
-                        action_fingerprint: generated_action_fingerprint().0,
-                        protocol_fingerprint: bridge_protocol_fingerprint().0,
-                        bridge_build_id: Some(muxe_protocol::SchemaFingerprint([1; 32])),
-                    },
-                },
-            })
-            .expect("incompatible newcomer encodes"),
+        let mut frame = register_event_for(
+            "new-client",
+            [20; 16],
+            Some(muxe_protocol::SchemaFingerprint([1; 32])),
+            env!("CARGO_PKG_VERSION"),
         );
+        if let Some(payload) = event.initial_payload() {
+            frame.channel_generation = decode_event_subscription(&payload)
+                .expect("subscription payload")
+                .channel_generation();
+        }
+        event.push_line(encode_event_line(&frame).expect("incompatible newcomer encodes"));
     }
     /// Seeds two registered clients, plants a stale capture lease, suspends,
     /// and replays one stale pre-suspend registration: the first resume
@@ -2796,7 +3199,7 @@ mod tests {
         ));
         // Seed an old capture lease: suspend must invalidate it and resume
         // must never restore it.
-        let stale_lease = adapter.mint_id();
+        let stale_lease = adapter.mint_local_id();
         adapter
             .inner
             .captures
@@ -2804,25 +3207,27 @@ mod tests {
             .await
             .begin("client-1", "session-9", stale_lease)
             .expect("old lease begins");
+        let old_channel = event.install_epoch().await.expect("event channel installed");
         adapter
             .suspend_for_activation()
             .await
             .expect("suspend succeeds");
         assert!(matches!(
             next_event(&adapter).await,
+            AdapterHealthEvent::CaptureLost { .. }
+        ));
+        assert!(matches!(
+            next_event(&adapter).await,
             AdapterHealthEvent::Unhealthy { .. }
         ));
         assert_suspended(&adapter).await;
-        // A late old-pipe Register carrying the pre-suspend ID is processed
-        // while suspended and stamped with the displaced channel. The next
-        // attempt clears the registry and fixes a newer channel boundary,
-        // so this evidence can never count toward it.
-        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
-        assert!(matches!(
-            next_event(&adapter).await,
-            AdapterHealthEvent::Healthy { .. }
-        ));
+        // A late old-pipe Register carrying the pre-suspend ID is rejected:
+        // its install epoch no longer names the active event channel, and its
+        // registration identity was retired during suspend.
+        let stale = encode_event_line(&register_event([7; 16], Some(bridge_build_id())))
+            .expect("stale register encodes");
+        adapter.handle_event_line(old_channel, &stale).await;
+        assert!(adapter.active_registration("client-1").await.is_err());
         (adapter, request, event, membership, stale_lease)
     }
 
@@ -2860,31 +3265,28 @@ mod tests {
         let line = poll_outbound(&request).await;
         let frame = decode_request_line(&line).expect("typed request frame");
         assert_eq!(frame.target.client_id, "client-1");
-        assert_eq!(frame.target.registration, [7; 16]);
+        assert_eq!(frame.target.registration, registration_id(7));
         let request_id = frame.request_id;
         assert!(matches!(frame.payload, BridgeRequest::Dispatch { .. }));
 
         // Transport release unblocks the pipe; completion follows on events.
         event.push_line(
-            encode_event_line(&PipeEvent {
-                sequence: 2,
-                event: PipeEventKind::RequestReleased {
-                    request_id,
-                    channel_generation: 1,
-                    registration: [7; 16],
-                },
-            })
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(request_id),
+                PipeEventKind::RequestReleased,
+            ))
             .expect("release encodes"),
         );
         event.push_line(
-            encode_event_line(&PipeEvent {
-                sequence: 3,
-                event: PipeEventKind::DispatchCompleted {
-                    request_id,
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(request_id),
+                PipeEventKind::DispatchCompleted {
                     execution: "7".to_owned(),
                     outcome: CommandOutcome::succeeded(),
                 },
-            })
+            ))
             .expect("completion encodes"),
         );
         // The first health event is the Healthy registration report; the
@@ -3158,18 +3560,14 @@ mod tests {
         adapter.shutdown().await.expect("shutdown");
     }
     /// Resume measures coverage against a fresh authoritative snapshot per
-    /// attempt, with registrations stamped at receipt on the attempt's
-    /// delivery channel. Two clients register pre-suspend; suspend parks
-    /// and fails closed. A late old-pipe Register processed before the
-    /// first attempt never counts (displaced channel tag). Attempt 1
-    /// snapshots both members but sees no fresh lines and fails; attempt 2
-    /// sees only client-1 fresh and fails, proving attempt 1 left no usable
-    /// evidence; attempt 3 snapshots only client-1 (client-2 detached
-    /// before the query) and succeeds on client-1 re-emitting its
-    /// pre-suspend ID on the new channel, proving detached members stop
-    /// blocking while a still-live bridge stays accepted. Readiness,
-    /// dispatch targeting, and old-lease invalidity prove the outcome;
-    /// every assertion is consumer observable.
+    /// attempt, with registrations stamped at receipt on that attempt's
+    /// delivery channel. Two clients register before suspend; a late Register
+    /// from the displaced channel is rejected. Attempt 1 sees no fresh lines
+    /// and fails. Attempt 2 sees only client-1 and fails, proving partial
+    /// evidence is not retained. Attempt 3 snapshots only client-1 after
+    /// client-2 detaches and succeeds when client-1 mints another registration.
+    /// Readiness, dispatch targeting, and old-lease invalidity prove both
+    /// membership handling and retired-ID rejection.
     #[tokio::test]
     async fn activation_resume_waits_for_fresh_member_registrations() {
         let (adapter, request, event, membership, stale_lease) =
@@ -3210,12 +3608,11 @@ mod tests {
         ));
         assert_eq!(membership.query_count(), 2);
         // Attempt 3: client-2 detached before the query, so the authoritative
-        // snapshot holds only client-1. It re-emits its pre-suspend ID on
-        // the new channel (still-live bridge after an abort before reload):
-        // freshness comes from the delivery boundary, so this counts and
-        // the resume succeeds.
+        // snapshot holds only client-1. Its bridge mints a new registration for
+        // this event channel; the retired pre-suspend and failed-attempt IDs
+        // remain invalid.
         membership.stage(vec!["client-1".to_owned()]).await;
-        resume_once(&adapter, &event, Some(("client-1", [7; 16])))
+        resume_once(&adapter, &event, Some(("client-1", [10; 16])))
             .await
             .expect("complete resume succeeds");
         assert!(matches!(
@@ -3240,7 +3637,7 @@ mod tests {
                 .active_registration("client-1")
                 .await
                 .expect("client-1 live"),
-            [7; 16]
+            registration_id(10)
         );
         // Observable dispatch now targets the fresh registration, proving
         // restored bridge readiness beyond the health event.
@@ -3258,7 +3655,7 @@ mod tests {
         let line = poll_outbound(&request).await;
         let frame = decode_request_line(&line).expect("typed request frame");
         assert_eq!(frame.target.client_id, "client-1");
-        assert_eq!(frame.target.registration, [7; 16]);
+        assert_eq!(frame.target.registration, registration_id(10));
         // The pre-suspend lease was never restored: the cleared table
         // reports no active capture for the old lease.
         assert!(
@@ -3281,7 +3678,7 @@ mod tests {
         let (adapter, _request, event, membership, _lease) = suspend_with_stale_evidence().await;
         membership.stage(vec!["client-1".to_owned()]).await;
         let pending = begin_resume_attempt(&adapter, &event).await;
-        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        push_register(&event, "client-1", [10; 16], env!("CARGO_PKG_VERSION"));
         // client-9 holds a compatible registration in this generation but
         // was never a snapshot member: the evidence must exclude it.
         push_register(&event, "client-9", [9; 16], env!("CARGO_PKG_VERSION"));
@@ -3378,10 +3775,10 @@ mod tests {
                 .expect("readiness query")
                 .is_none()
         );
-        // Attempt 2: the same bridge at the native compiled version covers.
+        // Attempt 2 uses fresh registration IDs at the native compiled version.
         let pending = begin_resume_attempt(&adapter, &event).await;
-        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
+        push_register(&event, "client-1", [9; 16], env!("CARGO_PKG_VERSION"));
+        push_register(&event, "client-2", [10; 16], env!("CARGO_PKG_VERSION"));
         finish_resume_attempt(pending)
             .await
             .expect("native-version round succeeds");
@@ -3640,7 +4037,12 @@ mod tests {
                 .confirm("client-1", lease, "normal".to_owned())
                 .expect("capture confirms");
         }
-        adapter.inner.live_executions.lock().await.insert(77);
+        adapter
+            .inner
+            .live_executions
+            .lock()
+            .await
+            .insert(77, None);
         adapter
             .inner
             .queues
@@ -3649,7 +4051,6 @@ mod tests {
             .entry("client-1".to_owned())
             .or_default()
             .push_back(QueuedItem {
-                request_id: [5; 16],
                 execution: Some(ExecutionId(77)),
                 client_id: "client-1".to_owned(),
                 payload: None,
@@ -3660,7 +4061,16 @@ mod tests {
             .pending_capture
             .lock()
             .await
-            .insert([10; 16], ("client-1".to_owned(), waiter_tx));
+            .insert(
+                [10; 16],
+                (
+                    "client-1".to_owned(),
+                    PendingReply {
+                        request: None,
+                        sender: waiter_tx,
+                    },
+                ),
+            );
         // Drain both registration health reports so only sweep reports
         // remain observable below.
         assert!(matches!(
@@ -3688,13 +4098,11 @@ mod tests {
         )
         .await;
         event.push_line(
-            encode_event_line(&PipeEvent {
-                sequence: 3,
-                event: PipeEventKind::Heartbeat {
-                    registration: [8; 16],
-                    client_id: "client-2".to_owned(),
-                },
-            })
+            encode_event_line(&pipe_event(
+                [8; 16],
+                None,
+                PipeEventKind::Heartbeat,
+            ))
             .expect("heartbeat encodes"),
         );
         // Barrier, not a sleep: the heartbeat renewal must land before the
@@ -3745,7 +4153,7 @@ mod tests {
                 .lock()
                 .await
                 .get("client-2")
-                .is_some_and(|record| record.registration == [8; 16]),
+                .is_some_and(|record| record.registration == registration_id(8)),
             "heartbeating registration survives with its ID"
         );
         assert!(
@@ -3815,7 +4223,12 @@ mod tests {
             "expired queue pauses instead of purging"
         );
         assert!(
-            adapter.inner.live_executions.lock().await.contains(&77),
+            adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&77),
             "paused execution never completes as unknown"
         );
         assert!(
@@ -4260,7 +4673,7 @@ done
         });
         let first = decode_request_line(&poll_outbound(&request).await).expect("origin frame");
         assert_eq!(first.target.client_id, "client-1");
-        assert_eq!(first.target.registration, [7; 16]);
+        assert_eq!(first.target.registration, registration_id(7));
         let (session, pane) = match &first.payload {
             BridgeRequest::RequestOrigin {
                 ui_session,
@@ -4272,46 +4685,40 @@ done
 
         // The bridge re-registers before answering: the stale answer below
         // must fail the registration check so the fan-out re-queries.
-        event.push_line(
-            encode_event_line(&PipeEvent {
-                sequence: 2,
-                event: PipeEventKind::Register {
-                    client_id: "client-1".to_owned(),
-                    current_pane: Some("plugin-9".to_owned()),
-                    registration: [8; 16],
-                    plugin_id: Some(3),
-                    identity: BridgeIdentity {
-                        muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
-                        source_revision: pinned_source_revision().to_owned(),
-                        action_fingerprint: generated_action_fingerprint().0,
-                        protocol_fingerprint: bridge_protocol_fingerprint().0,
-                        bridge_build_id: Some(bridge_build_id()),
-                    },
-                },
-            })
-            .expect("turnover encodes"),
-        );
+        let mut turnover =
+            register_event_for("client-1", [8; 16], Some(bridge_build_id()), env!("CARGO_PKG_VERSION"));
+        if let PipeEventKind::Register { current_pane, .. } = &mut turnover.event {
+            *current_pane = Some("plugin-9".to_owned());
+        }
+        event.push_line(encode_event_line(&turnover).expect("turnover encodes"));
         await_turnover_registration(&adapter).await;
 
-        let snapshot = |sequence| PipeEvent {
-            sequence,
-            event: PipeEventKind::OriginSnapshot {
-                ui_session: session.clone(),
-                origin: muxe_zellij_protocol::ZellijOrigin {
-                    client_id: "client-1".to_owned(),
-                    session_name: Some("session-alpha".to_owned()),
-                    prior_pane_id: Some("terminal_2".to_owned()),
-                    ui_pane_id: "plugin-9".to_owned(),
-                    prior_pane_cwd: Some("/work".to_owned()),
+        let snapshot = |registration, request_id| {
+            pipe_event(
+                registration,
+                Some(request_id),
+                PipeEventKind::OriginSnapshot {
+                    ui_session: session.clone(),
+                    origin: muxe_zellij_protocol::ZellijOrigin {
+                        client_id: "client-1".to_owned(),
+                        session_name: Some("session-alpha".to_owned()),
+                        prior_pane_id: Some("terminal_2".to_owned()),
+                        ui_pane_id: "plugin-9".to_owned(),
+                        prior_pane_cwd: Some("/work".to_owned()),
+                    },
                 },
-            },
+            )
         };
-        event.push_line(encode_event_line(&snapshot(3)).expect("snapshot encodes"));
+        event.push_line(
+            encode_event_line(&snapshot([7; 16], first.request_id)).expect("snapshot encodes"),
+        );
         // The refreshed bridge is re-queried with its current registration.
         let second = decode_request_line(&poll_outbound(&request).await).expect("origin frame");
         assert_eq!(second.target.client_id, "client-1");
-        assert_eq!(second.target.registration, [8; 16]);
-        event.push_line(encode_event_line(&snapshot(4)).expect("snapshot encodes"));
+        assert_eq!(second.target.registration, registration_id(8));
+        event.push_line(
+            encode_event_line(&snapshot([8; 16], second.request_id)).expect("snapshot encodes"),
+        );
         let origin = worker
             .await
             .expect("capture task")

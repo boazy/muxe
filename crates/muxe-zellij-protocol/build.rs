@@ -21,6 +21,7 @@ const INPUTS: &[&str] = &[
     "crates/muxe-zellij-protocol/build.rs",
     "crates/muxe-zellij-protocol/src/compat.rs",
     "crates/muxe-zellij-protocol/src/generated.rs",
+    "crates/muxe-zellij-protocol/src/ids.rs",
     "crates/muxe-zellij-protocol/src/lib.rs",
     "crates/muxe-zellij-protocol/src/pipe.rs",
     "crates/muxe-zellij-wasm/Cargo.toml",

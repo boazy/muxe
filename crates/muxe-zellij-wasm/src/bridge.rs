@@ -39,10 +39,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+
 use muxe_zellij_protocol::{
     BRIDGE_PERMISSIONS, BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, CaptureEndReason,
-    CaptureLostReason, CommandOutcome, PipeEvent, PipeEventKind, ZellijOrigin, bridge_build_id,
-    bridge_protocol_fingerprint, decode_request_line, encode_event_line,
+    CaptureLostReason, ChannelGeneration, CommandOutcome, PipeEvent, PipeEventKind, RegistrationId,
+    RequestId, ZellijOrigin, bridge_build_id, bridge_protocol_fingerprint,
+    decode_event_subscription, decode_request_line, encode_event_line,
     generated::RawNativeCommand, generated_action_fingerprint, pinned_source_revision,
 };
 use zellij_tile::prelude::*;
@@ -137,6 +139,7 @@ impl HostEffects for ShimEffects {
         getrandom::getrandom(bytes).is_ok()
     }
 
+
     fn arm_timer(&mut self, secs: f64) {
         set_timeout(secs);
     }
@@ -144,6 +147,8 @@ impl HostEffects for ShimEffects {
 
 struct PendingCapture {
     lease: [u8; 16],
+    request_id: RequestId,
+    channel_generation: ChannelGeneration,
     prior: Option<InputMode>,
     requested: bool,
 }
@@ -177,8 +182,9 @@ pub struct Bridge {
     permission_gate: PermissionGate,
     event_cli_id: Option<String>,
     pending_subscribe: bool,
-    registration: [u8; 16],
-    sequence: u64,
+    registration: Option<RegistrationId>,
+    channel_generation: Option<ChannelGeneration>,
+    last_request_id: Option<RequestId>,
     current_mode: Option<InputMode>,
     pending: Option<PendingCapture>,
     active: Option<ActiveCapture>,
@@ -186,7 +192,13 @@ pub struct Bridge {
     last_non_muxe_pane: Option<String>,
     origin_pane: Option<String>,
     inventory: PaneInventory,
-    pending_actions: BTreeMap<String, [u8; 16]>,
+    pending_actions: BTreeMap<String, PendingAction>,
+}
+
+struct PendingAction {
+    request_id: RequestId,
+    execution: String,
+    channel_generation: ChannelGeneration,
 }
 
 impl Default for Bridge {
@@ -199,8 +211,9 @@ impl Default for Bridge {
             permission_gate: PermissionGate::Pending,
             event_cli_id: None,
             pending_subscribe: false,
-            registration: [0; 16],
-            sequence: 0,
+            registration: None,
+            channel_generation: None,
+            last_request_id: None,
             current_mode: None,
             pending: None,
             active: None,
@@ -283,7 +296,7 @@ impl Bridge {
         match source {
             PipeSource::Cli(cli_id) => {
                 if name.starts_with(EVENT_PREFIX) {
-                    self.subscribe(cli_id, effects);
+                    self.subscribe(cli_id, payload.as_deref(), effects);
                 } else if name.starts_with(REQUEST_PREFIX) {
                     self.on_request(&cli_id, payload, effects);
                 }
@@ -299,8 +312,8 @@ impl Bridge {
 
     /// Test-visible active registration.
     #[cfg(test)]
-    pub fn active_registration(&self) -> Option<[u8; 16]> {
-        (self.registration != [0; 16]).then_some(self.registration)
+    pub fn active_registration(&self) -> Option<RegistrationId> {
+        self.registration
     }
 
     /// Test-visible capture state: pending lease, active lease, or none.
@@ -355,7 +368,9 @@ impl Bridge {
                 let prior = pending.prior.unwrap_or(InputMode::Locked);
                 let lease = pending.lease;
                 self.active = Some(ActiveCapture { lease, prior });
-                self.emit(
+                self.emit_for_request(
+                    pending.request_id,
+                    pending.channel_generation,
                     PipeEventKind::CaptureReady {
                         lease,
                         prior_mode: format!("{prior:?}"),
@@ -377,7 +392,7 @@ impl Bridge {
         // Away from Locked with an active capture is user-owned newer state:
         // dismiss without restoring the older snapshot.
         if let Some(active) = self.active.take() {
-            self.emit(
+            self.emit_unsolicited(
                 PipeEventKind::CaptureLost {
                     lease: active.lease,
                     reason: CaptureLostReason::UserModeChanged,
@@ -418,14 +433,15 @@ impl Bridge {
         context: &BTreeMap<String, String>,
         effects: &mut dyn HostEffects,
     ) {
-        let Some(execution) = completion_execution(context) else {
+        let Some(correlation) = completion_execution(context) else {
             return;
         };
-        if let Some(request_id) = self.pending_actions.remove(execution) {
-            self.emit(
+        if let Some(pending) = self.pending_actions.remove(correlation) {
+            self.emit_for_request(
+                pending.request_id,
+                pending.channel_generation,
                 PipeEventKind::DispatchCompleted {
-                    request_id,
-                    execution: execution.to_owned(),
+                    execution: pending.execution,
                     outcome: CommandOutcome::succeeded(),
                 },
                 effects,
@@ -436,17 +452,7 @@ impl Bridge {
     fn on_timer(&mut self, effects: &mut dyn HostEffects) {
         // Heartbeats renew the broker-side heartbeat lease; without them an
         // idle healthy bridge would be expired by the registry.
-        if self.registration != [0; 16]
-            && let Some(client_id) = self.client_id.clone()
-        {
-            self.emit(
-                PipeEventKind::Heartbeat {
-                    registration: self.registration,
-                    client_id,
-                },
-                effects,
-            );
-        }
+        self.emit_unsolicited(PipeEventKind::Heartbeat, effects);
         effects.arm_timer(HEARTBEAT_SECS);
     }
 
@@ -457,7 +463,7 @@ impl Bridge {
             && self.current_mode == Some(InputMode::Locked)
         {
             effects.switch_mode(active.prior);
-            self.emit(
+            self.emit_unsolicited(
                 PipeEventKind::CaptureLost {
                     lease: active.lease,
                     reason: CaptureLostReason::BridgeUnloading,
@@ -466,14 +472,15 @@ impl Bridge {
             );
         }
         self.pending = None;
-        let pending: Vec<(String, [u8; 16])> = std::mem::take(&mut self.pending_actions)
-            .into_iter()
+        let pending: Vec<PendingAction> = std::mem::take(&mut self.pending_actions)
+            .into_values()
             .collect();
-        for (execution, request_id) in pending {
-            self.emit(
+        for pending in pending {
+            self.emit_for_request(
+                pending.request_id,
+                pending.channel_generation,
                 PipeEventKind::DispatchCompleted {
-                    request_id,
-                    execution,
+                    execution: pending.execution,
                     outcome: CommandOutcome::failed("bridge unloading".to_owned()),
                 },
                 effects,
@@ -484,7 +491,16 @@ impl Bridge {
     /// New event channel: guarded-restore any still-owned Locked capture
     /// first, then reset epoch state so old completions can never reattach
     /// under the fresh registration below.
-    fn subscribe(&mut self, cli_id: String, effects: &mut dyn HostEffects) {
+    fn subscribe(
+        &mut self,
+        cli_id: String,
+        payload: Option<&str>,
+        effects: &mut dyn HostEffects,
+    ) {
+        let Some(subscription) = payload.and_then(|value| decode_event_subscription(value).ok())
+        else {
+            return;
+        };
         if let Some(active) = self.active.take()
             && self.current_mode == Some(InputMode::Locked)
         {
@@ -492,7 +508,9 @@ impl Bridge {
         }
         self.pending = None;
         self.pending_actions.clear();
-        self.registration = [0; 16];
+        self.registration = None;
+        self.channel_generation = Some(subscription.channel_generation());
+        self.last_request_id = None;
         effects.block_pipe(&cli_id);
         self.event_cli_id = Some(cli_id);
         self.pending_subscribe = true;
@@ -512,20 +530,19 @@ impl Bridge {
         let Some(client_id) = self.client_id.clone() else {
             return;
         };
-        let mut registration = [0u8; 16];
-        if !effects.fill_random(&mut registration) {
+        let mut random_bytes = [0_u8; 16];
+        if !effects.fill_random(&mut random_bytes) {
             return;
         }
-        if registration == [0; 16] {
+        let Ok(registration) = RegistrationId::from_random_bytes(random_bytes) else {
             return;
-        }
-        self.registration = registration;
+        };
+        self.registration = Some(registration);
         self.pending_subscribe = false;
-        self.emit(
+        self.emit_unsolicited(
             PipeEventKind::Register {
                 client_id,
                 current_pane: self.focused_pane.clone(),
-                registration: self.registration,
                 plugin_id: self.plugin_id,
                 identity: BridgeIdentity {
                     muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -553,30 +570,26 @@ impl Bridge {
         let Some(client_id) = &self.client_id else {
             return;
         };
-        // Only the named active registration acts; every other instance drops
-        // the frame silently so exactly one bridge unblocks the request child.
+        // Only the named active registration and pipe generation act; every
+        // other instance drops the frame silently so exactly one bridge
+        // unblocks the request child.
         if request.target.client_id != *client_id
-            || request.target.registration != self.registration
+            || Some(request.target.registration) != self.registration
+            || Some(request.channel_generation) != self.channel_generation
         {
             return;
         }
-        if request.protocol != BRIDGE_PROTOCOL_VERSION {
-            let execution = match &request.payload {
-                BridgeRequest::Dispatch { execution, .. }
-                | BridgeRequest::FocusPaneByIndex { execution, .. }
-                | BridgeRequest::FocusPaneNeighbor { execution, .. } => Some(execution.clone()),
-                _ => None,
-            };
-            self.fail(
-                cli_id,
-                request.request_id,
-                request.channel_generation,
-                execution,
-                "unsupported bridge protocol",
-                effects,
+        if let Some(previous) = self.last_request_id
+            && previous
+                .next()
+                .map_or(true, |expected| expected != request.request_id)
+        {
+            eprintln!(
+                "muxe bridge: request ID {} followed by {} for registration {}",
+                previous, request.request_id, request.target.registration
             );
-            return;
         }
+        self.last_request_id = Some(request.request_id);
         let request_id = request.request_id;
         let generation = request.channel_generation;
         match request.payload {
@@ -615,26 +628,32 @@ impl Bridge {
     fn dispatch_command(
         &mut self,
         cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
+        request_id: RequestId,
+        generation: ChannelGeneration,
         execution: String,
         command: RawNativeCommand,
         effects: &mut dyn HostEffects,
     ) {
-        let ready = match prepare(command, &execution) {
+        let Some(registration) = self.registration else {
+            return;
+        };
+        let correlation = format!("{registration}:{request_id}");
+        let ready = match prepare(command, &correlation) {
             Ok(ready) => ready,
             Err(message) => {
                 self.release(cli_id, request_id, generation, effects);
-                self.emit(
+                self.emit_for_request(
+                    request_id,
+                    generation,
                     PipeEventKind::DispatchAccepted {
-                        request_id,
                         execution: execution.clone(),
                     },
                     effects,
                 );
-                self.emit(
+                self.emit_for_request(
+                    request_id,
+                    generation,
                     PipeEventKind::DispatchCompleted {
-                        request_id,
                         execution,
                         outcome: CommandOutcome::failed(format!("invalid command: {message}")),
                     },
@@ -647,19 +666,18 @@ impl Bridge {
             ReadyDispatch::Sync(dispatch) => {
                 let outcome = execute_sync(dispatch);
                 self.release(cli_id, request_id, generation, effects);
-                self.emit(
+                self.emit_for_request(
+                    request_id,
+                    generation,
                     PipeEventKind::DispatchAccepted {
-                        request_id,
                         execution: execution.clone(),
                     },
                     effects,
                 );
-                self.emit(
-                    PipeEventKind::DispatchCompleted {
-                        request_id,
-                        execution,
-                        outcome,
-                    },
+                self.emit_for_request(
+                    request_id,
+                    generation,
+                    PipeEventKind::DispatchCompleted { execution, outcome },
                     effects,
                 );
             }
@@ -667,16 +685,22 @@ impl Bridge {
                 dispatch,
                 execution: correlated,
             } => {
-                self.pending_actions.insert(correlated, request_id);
+                self.pending_actions.insert(
+                    correlated,
+                    PendingAction {
+                        request_id,
+                        execution: execution.clone(),
+                        channel_generation: generation,
+                    },
+                );
                 // run_action queues host dispatch on another thread and
                 // returns immediately; the ActionComplete echo completes it.
                 let _ = execute_sync(dispatch);
                 self.release(cli_id, request_id, generation, effects);
-                self.emit(
-                    PipeEventKind::DispatchAccepted {
-                        request_id,
-                        execution,
-                    },
+                self.emit_for_request(
+                    request_id,
+                    generation,
+                    PipeEventKind::DispatchAccepted { execution },
                     effects,
                 );
             }
@@ -686,12 +710,36 @@ impl Bridge {
     fn begin_capture(
         &mut self,
         cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
+        request_id: RequestId,
+        generation: ChannelGeneration,
         lease: [u8; 16],
         _ui_session: String,
         effects: &mut dyn HostEffects,
     ) {
+        if let Some(active) = &self.active
+            && active.lease == lease
+        {
+            let prior = active.prior;
+            self.release(cli_id, request_id, generation, effects);
+            self.emit_for_request(
+                request_id,
+                generation,
+                PipeEventKind::CaptureReady {
+                    lease,
+                    prior_mode: format!("{prior:?}"),
+                },
+                effects,
+            );
+            return;
+        }
+        if let Some(pending) = &mut self.pending
+            && pending.lease == lease
+        {
+            pending.request_id = request_id;
+            pending.channel_generation = generation;
+            self.release(cli_id, request_id, generation, effects);
+            return;
+        }
         // Snapshot from actually observed mode only; with no observation yet,
         // the first ModeUpdate snapshots before any Locked request goes out.
         // The pipe releases immediately either way so the broker can queue
@@ -702,7 +750,9 @@ impl Bridge {
                 prior: InputMode::Locked,
             });
             self.release(cli_id, request_id, generation, effects);
-            self.emit(
+            self.emit_for_request(
+                request_id,
+                generation,
                 PipeEventKind::CaptureReady {
                     lease,
                     prior_mode: format!("{:?}", InputMode::Locked),
@@ -714,6 +764,8 @@ impl Bridge {
         let requested = self.current_mode.is_some();
         self.pending = Some(PendingCapture {
             lease,
+            request_id,
+            channel_generation: generation,
             prior: self.current_mode,
             requested,
         });
@@ -726,8 +778,8 @@ impl Bridge {
     fn end_capture(
         &mut self,
         cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
+        request_id: RequestId,
+        generation: ChannelGeneration,
         lease: [u8; 16],
         _reason: CaptureEndReason,
         effects: &mut dyn HostEffects,
@@ -751,8 +803,8 @@ impl Bridge {
     fn request_origin(
         &mut self,
         cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
+        request_id: RequestId,
+        generation: ChannelGeneration,
         ui_session: String,
         ui_pane: String,
         effects: &mut dyn HostEffects,
@@ -763,12 +815,10 @@ impl Bridge {
         // pane for origin.
         if self.focused_pane.as_deref() != Some(ui_pane.as_str()) {
             self.release(cli_id, request_id, generation, effects);
-            self.emit(
-                PipeEventKind::OriginDeclined {
-                    ui_session,
-                    request_id,
-                    registration: self.registration,
-                },
+            self.emit_for_request(
+                request_id,
+                generation,
+                PipeEventKind::OriginDeclined { ui_session },
                 effects,
             );
             return;
@@ -784,7 +834,9 @@ impl Bridge {
             self.origin_pane = Some(prior.clone());
         }
         self.release(cli_id, request_id, generation, effects);
-        self.emit(
+        self.emit_for_request(
+            request_id,
+            generation,
             PipeEventKind::OriginSnapshot {
                 ui_session,
                 origin: ZellijOrigin {
@@ -802,8 +854,8 @@ impl Bridge {
     fn focus_by_index(
         &mut self,
         cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
+        request_id: RequestId,
+        generation: ChannelGeneration,
         execution: String,
         index: u32,
         effects: &mut dyn HostEffects,
@@ -816,19 +868,18 @@ impl Bridge {
             None => CommandOutcome::failed(format!("no pane at manifest index {index}")),
         };
         self.release(cli_id, request_id, generation, effects);
-        self.emit(
+        self.emit_for_request(
+            request_id,
+            generation,
             PipeEventKind::DispatchAccepted {
-                request_id,
                 execution: execution.clone(),
             },
             effects,
         );
-        self.emit(
-            PipeEventKind::DispatchCompleted {
-                request_id,
-                execution,
-                outcome,
-            },
+        self.emit_for_request(
+            request_id,
+            generation,
+            PipeEventKind::DispatchCompleted { execution, outcome },
             effects,
         );
     }
@@ -836,8 +887,8 @@ impl Bridge {
     fn focus_neighbor(
         &mut self,
         cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
+        request_id: RequestId,
+        generation: ChannelGeneration,
         execution: String,
         direction: muxe_zellij_protocol::NeighborDirection,
         effects: &mut dyn HostEffects,
@@ -855,19 +906,18 @@ impl Bridge {
             None => CommandOutcome::failed("no tracked neighbor in that direction".to_owned()),
         };
         self.release(cli_id, request_id, generation, effects);
-        self.emit(
+        self.emit_for_request(
+            request_id,
+            generation,
             PipeEventKind::DispatchAccepted {
-                request_id,
                 execution: execution.clone(),
             },
             effects,
         );
-        self.emit(
-            PipeEventKind::DispatchCompleted {
-                request_id,
-                execution,
-                outcome,
-            },
+        self.emit_for_request(
+            request_id,
+            generation,
+            PipeEventKind::DispatchCompleted { execution, outcome },
             effects,
         );
     }
@@ -875,8 +925,8 @@ impl Bridge {
     fn retire(
         &mut self,
         cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
+        request_id: RequestId,
+        generation: ChannelGeneration,
         effects: &mut dyn HostEffects,
     ) {
         // Retirement releases capture through the same guarded restore, then
@@ -887,15 +937,16 @@ impl Bridge {
             effects.switch_mode(active.prior);
         }
         self.pending = None;
-        let pending: Vec<(String, [u8; 16])> = std::mem::take(&mut self.pending_actions)
-            .into_iter()
+        let pending: Vec<PendingAction> = std::mem::take(&mut self.pending_actions)
+            .into_values()
             .collect();
         self.release(cli_id, request_id, generation, effects);
-        for (execution, pending_id) in pending {
-            self.emit(
+        for pending in pending {
+            self.emit_for_request(
+                pending.request_id,
+                pending.channel_generation,
                 PipeEventKind::DispatchCompleted {
-                    request_id: pending_id,
-                    execution,
+                    execution: pending.execution,
                     outcome: CommandOutcome::failed("bridge retiring".to_owned()),
                 },
                 effects,
@@ -909,59 +960,53 @@ impl Bridge {
     fn release(
         &mut self,
         cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
+        request_id: RequestId,
+        generation: ChannelGeneration,
         effects: &mut dyn HostEffects,
     ) {
         effects.unblock_pipe(cli_id);
-        self.emit(
-            PipeEventKind::RequestReleased {
-                request_id,
-                channel_generation: generation,
-                registration: self.registration,
-            },
+        self.emit_for_request(
+            request_id,
+            generation,
+            PipeEventKind::RequestReleased,
             effects,
         );
     }
 
-    fn fail(
-        &mut self,
-        cli_id: &str,
-        request_id: [u8; 16],
-        generation: u64,
-        execution: Option<String>,
-        message: &str,
+
+    fn emit_unsolicited(&self, event: PipeEventKind, effects: &mut dyn HostEffects) {
+        self.emit(None, self.channel_generation, event, effects);
+    }
+
+    fn emit_for_request(
+        &self,
+        request_id: RequestId,
+        generation: ChannelGeneration,
+        event: PipeEventKind,
         effects: &mut dyn HostEffects,
     ) {
-        let Some(execution) = execution else {
-            self.release(cli_id, request_id, generation, effects);
-            return;
-        };
-        self.release(cli_id, request_id, generation, effects);
-        self.emit(
-            PipeEventKind::DispatchAccepted {
-                request_id,
-                execution: execution.clone(),
-            },
-            effects,
-        );
-        self.emit(
-            PipeEventKind::DispatchCompleted {
-                request_id,
-                execution,
-                outcome: CommandOutcome::failed(message.to_owned()),
-            },
-            effects,
-        );
+        self.emit(Some(request_id), Some(generation), event, effects);
     }
 
-    fn emit(&mut self, event: PipeEventKind, effects: &mut dyn HostEffects) {
-        let Some(event_cli_id) = self.event_cli_id.clone() else {
+    fn emit(
+        &self,
+        request_id: Option<RequestId>,
+        channel_generation: Option<ChannelGeneration>,
+        event: PipeEventKind,
+        effects: &mut dyn HostEffects,
+    ) {
+        let (Some(event_cli_id), Some(channel_generation), Some(registration)) = (
+            self.event_cli_id.as_deref(),
+            channel_generation,
+            self.registration,
+        ) else {
             return;
         };
-        self.sequence += 1;
         let frame = PipeEvent {
-            sequence: self.sequence,
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            request_id,
+            channel_generation,
+            registration,
             event,
         };
         if let Ok(line) = encode_event_line(&frame) {
@@ -969,7 +1014,7 @@ impl Bridge {
             // relays `CliPipeOutput` bytes verbatim to the CLI child and the
             // native reader frames on `\n`, so stripping it would leave every
             // event buffered unreadably. Pass the wire bytes through intact.
-            effects.pipe_output(&event_cli_id, &line);
+            effects.pipe_output(event_cli_id, &line);
         }
     }
 }
@@ -1034,19 +1079,20 @@ mod tests {
                 list_response_pending: false,
                 plugin_id: 41,
                 cwd: BTreeMap::new(),
-                random: VecDeque::from([[7u8; 16], [8u8; 16], [9u8; 16]]),
+                random: VecDeque::from([[7_u8; 16], [8_u8; 16], [9_u8; 16]]),
             }
         }
 
-        fn events(&self) -> Vec<(u64, PipeEventKind)> {
+        fn events(&self) -> Vec<(Option<RequestId>, PipeEventKind)> {
             self.outputs
                 .iter()
                 .map(|(_, line)| {
                     let frame = decode_event_line(line).expect("typed event frame");
-                    (frame.sequence, frame.event)
+                    (frame.request_id, frame.event)
                 })
                 .collect()
         }
+
         fn register_client_ids(&self, cli_id: &str) -> Vec<String> {
             self.outputs
                 .iter()
@@ -1059,9 +1105,10 @@ mod tests {
                 .collect()
         }
 
-        fn last_event(&self) -> (u64, PipeEventKind) {
+        fn last_event(&self) -> (Option<RequestId>, PipeEventKind) {
             self.events().pop().expect("at least one event")
         }
+
         fn pipe_state(&self, cli_id: &str) -> Option<FakePipeState> {
             self.pipe_states.get(cli_id).copied()
         }
@@ -1095,6 +1142,7 @@ mod tests {
         fn pane_cwd(&mut self, pane: PaneId) -> Option<PathBuf> {
             self.cwd.get(&format!("{pane}")).map(PathBuf::from)
         }
+
         fn pipe_output(&mut self, cli_id: &str, line: &str) {
             self.outputs.push((cli_id.to_owned(), line.to_owned()));
             self.output_states
@@ -1134,6 +1182,10 @@ mod tests {
     const EVENT_CLI_TWO: &str = "event-cli-uuid-2";
     const REQUEST_NAME: &str = "muxe-request-alpha";
     const REQUEST_CLI: &str = "request-cli-uuid-9";
+    fn registration(seed: u8) -> RegistrationId {
+        RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
+    }
+
 
     fn clients_for(client_id: u16, pane: PaneId) -> Vec<ClientInfo> {
         vec![ClientInfo {
@@ -1155,12 +1207,12 @@ mod tests {
         }
     }
 
-    fn request_line(target_reg: [u8; 16], payload: BridgeRequest) -> String {
+    fn request_line(target_reg: RegistrationId, payload: BridgeRequest) -> String {
         use muxe_zellij_protocol::{BridgeTarget, PipeRequest};
         let frame = PipeRequest {
             protocol: BRIDGE_PROTOCOL_VERSION,
-            request_id: [1; 16],
-            channel_generation: 1,
+            request_id: RequestId::INITIAL,
+            channel_generation: ChannelGeneration::INITIAL,
             target: BridgeTarget {
                 client_id: "5".to_owned(),
                 registration: target_reg,
@@ -1176,17 +1228,21 @@ mod tests {
         PipeMessage {
             source: PipeSource::Cli(REQUEST_CLI.to_owned()),
             name: REQUEST_NAME.to_owned(),
-            payload: Some(request_line([7; 16], payload)),
+            payload: Some(request_line(registration(7), payload)),
             args: BTreeMap::new(),
             is_private: false,
         }
     }
 
     fn subscribe_msg_for(cli_id: &str) -> PipeMessage {
+        let subscription = muxe_zellij_protocol::encode_event_subscription(
+            muxe_zellij_protocol::EventSubscription::new(ChannelGeneration::INITIAL),
+        )
+        .expect("subscription encodes");
         PipeMessage {
             source: PipeSource::Cli(cli_id.to_owned()),
             name: EVENT_NAME.to_owned(),
-            payload: Some("{\"muxe\":\"subscribe\"}".to_owned()),
+            payload: Some(subscription),
             args: BTreeMap::new(),
             is_private: false,
         }
@@ -1222,7 +1278,7 @@ mod tests {
             &mut host,
         );
         assert_eq!(bridge.client_identity(), Some("5"));
-        assert_eq!(bridge.active_registration(), Some([7; 16]));
+        assert_eq!(bridge.active_registration(), Some(registration(7)));
         (bridge, host)
     }
 
@@ -1260,14 +1316,10 @@ mod tests {
             "emitted event bytes never framed a line without EOF"
         );
         let first = decode_event_line(&frames[0]).expect("framed line decodes");
+        assert_eq!(first.registration, registration(7));
         match first.event {
-            PipeEventKind::Register {
-                client_id,
-                registration,
-                ..
-            } => {
+            PipeEventKind::Register { client_id, .. } => {
                 assert_eq!(client_id, "5");
-                assert_eq!(registration, [7; 16]);
             }
             other => panic!("first framed event is not Register: {other:?}"),
         }
@@ -1392,7 +1444,7 @@ mod tests {
             Event::ListClients(clients_current(PaneId::Terminal(2))),
             &mut host,
         );
-        assert_eq!(bridge.active_registration(), Some([8; 16]));
+        assert_eq!(bridge.active_registration(), Some(registration(8)));
         assert_eq!(
             host.register_client_ids(EVENT_CLI_TWO),
             vec!["5".to_owned()]
@@ -1463,7 +1515,7 @@ mod tests {
         let before_outputs = host.outputs.len();
         // Wrong registration: silent drop, no unblock, no output.
         let mut line = request_line(
-            [9; 16],
+            registration(9),
             BridgeRequest::Dispatch {
                 execution: "e2".to_owned(),
                 command: RawNativeCommand::CloseFocus,
@@ -1566,7 +1618,7 @@ mod tests {
                 source: PipeSource::Cli(REQUEST_CLI.to_owned()),
                 name: REQUEST_NAME.to_owned(),
                 payload: Some(request_line(
-                    [7; 16],
+                    registration(7),
                     BridgeRequest::RequestOrigin {
                         ui_session: "ui-9".to_owned(),
                         ui_pane: "terminal_2".to_owned(),

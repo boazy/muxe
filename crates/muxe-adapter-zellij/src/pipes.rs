@@ -157,6 +157,12 @@ pub trait PipeChannel: Send + Sync {
     async fn respawn(&self) -> Result<(), PipeTransportError> {
         Ok(())
     }
+    /// Replaces the backing child and atomically installs the payload used by
+    /// that child and every later plain respawn. Scripted channels without
+    /// children treat this like [`PipeChannel::respawn`].
+    async fn respawn_with_payload(&self, _payload: String) -> Result<(), PipeTransportError> {
+        self.respawn().await
+    }
 }
 /// Production channel backed by a live `zellij pipe` child.
 pub struct SubprocessChannel {
@@ -177,7 +183,7 @@ pub struct SubprocessChannel {
     zellij_exe: PathBuf,
     session: String,
     pipe_name: String,
-    initial_payload: Option<String>,
+    initial_payload: Mutex<Option<String>>,
 }
 
 impl SubprocessChannel {
@@ -202,9 +208,9 @@ impl SubprocessChannel {
             zellij_exe,
             session,
             pipe_name,
-            initial_payload,
+            initial_payload: Mutex::new(initial_payload),
         });
-        channel.respawn_inner().await?;
+        channel.respawn_inner(None).await?;
         Ok(channel)
     }
 
@@ -215,13 +221,30 @@ impl SubprocessChannel {
     /// Returns [`PipeTransportError`] when the old child cannot be reaped or
     /// the replacement cannot start; the retained stderr tail is included.
     pub async fn respawn(&self) -> Result<(), PipeTransportError> {
-        self.respawn_inner().await
+        self.respawn_inner(None).await
     }
 
-    async fn respawn_inner(&self) -> Result<(), PipeTransportError> {
+    /// Replaces the child while updating its initial payload under the same
+    /// lifecycle lock that owns termination and installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipeTransportError`] when the old child cannot be reaped or
+    /// the replacement cannot start.
+    pub async fn respawn_with_payload(&self, payload: String) -> Result<(), PipeTransportError> {
+        self.respawn_inner(Some(payload)).await
+    }
+
+    async fn respawn_inner(
+        &self,
+        replacement_payload: Option<String>,
+    ) -> Result<(), PipeTransportError> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.closed.load(Ordering::Relaxed) {
             return Err(PipeTransportError::Closed);
+        }
+        if let Some(payload) = replacement_payload {
+            *self.initial_payload.lock().await = Some(payload);
         }
         // Terminate and reap the previous child BEFORE starting its
         // replacement: exactly one owned child exists at any moment.
@@ -239,7 +262,7 @@ impl SubprocessChannel {
             return Err(error);
         }
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed) + 1;
-        let live = match self.spawn_epoch(epoch) {
+        let live = match self.spawn_epoch(epoch).await {
             Ok(live) => live,
             Err(error) => {
                 self.replacing.store(false, Ordering::SeqCst);
@@ -304,7 +327,7 @@ impl SubprocessChannel {
         true
     }
 
-    fn spawn_epoch(&self, epoch: u64) -> Result<LiveChild, PipeTransportError> {
+    async fn spawn_epoch(&self, epoch: u64) -> Result<LiveChild, PipeTransportError> {
         let mut command = Command::new(&self.zellij_exe);
         command
             .arg("--session")
@@ -316,7 +339,7 @@ impl SubprocessChannel {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(payload) = &self.initial_payload {
+        if let Some(payload) = self.initial_payload.lock().await.as_deref() {
             command.arg("--").arg(payload);
         }
         let mut child = command.spawn().map_err(|error| PipeTransportError::Spawn {
@@ -609,6 +632,10 @@ impl PipeChannel for SubprocessChannel {
     async fn respawn(&self) -> Result<(), PipeTransportError> {
         SubprocessChannel::respawn(self).await
     }
+
+    async fn respawn_with_payload(&self, payload: String) -> Result<(), PipeTransportError> {
+        SubprocessChannel::respawn_with_payload(self, payload).await
+    }
 }
 
 fn bounded(reason: String) -> String {
@@ -649,6 +676,7 @@ pub mod testing {
         inbound_tx: StdMutex<Option<mpsc::UnboundedSender<TaggedLine>>>,
         inbound_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<TaggedLine>>,
         epoch: AtomicU64,
+        initial_payload: StdMutex<Option<String>>,
     }
 
     impl ScriptedChannel {
@@ -660,6 +688,7 @@ pub mod testing {
                 outbound: StdMutex::new(Vec::new()),
                 inbound_tx: StdMutex::new(Some(inbound_tx)),
                 inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+                initial_payload: StdMutex::new(None),
                 epoch: AtomicU64::new(0),
             })
         }
@@ -718,6 +747,15 @@ pub mod testing {
                 .map(|mut guard| std::mem::take(&mut *guard))
                 .unwrap_or_default()
         }
+
+        /// Latest initial payload installed by a respawn.
+        #[must_use]
+        pub fn initial_payload(&self) -> Option<String> {
+            self.initial_payload
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+        }
     }
 
     impl Default for ScriptedChannel {
@@ -728,6 +766,7 @@ pub mod testing {
                 inbound_tx: StdMutex::new(Some(inbound_tx)),
                 inbound_rx: tokio::sync::Mutex::new(inbound_rx),
                 epoch: AtomicU64::new(0),
+                initial_payload: StdMutex::new(None),
             }
         }
     }
@@ -759,6 +798,17 @@ pub mod testing {
         async fn respawn(&self) -> Result<(), PipeTransportError> {
             self.epoch.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn respawn_with_payload(
+            &self,
+            payload: String,
+        ) -> Result<(), PipeTransportError> {
+            *self
+                .initial_payload
+                .lock()
+                .map_err(|_| PipeTransportError::Closed)? = Some(payload);
+            self.respawn().await
         }
 
         async fn close(&self) {

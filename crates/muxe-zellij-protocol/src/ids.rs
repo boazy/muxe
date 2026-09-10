@@ -23,9 +23,6 @@ pub enum ProtocolScalarError {
         /// Counter whose value space was exhausted.
         field: &'static str,
     },
-    /// The ULID timestamp must fit its standard 48-bit field.
-    #[error("registration timestamp exceeds the ULID 48-bit range")]
-    RegistrationTimestampOutOfRange,
     /// The nil ULID is reserved and never identifies a registration.
     #[error("registration ID must not be the nil ULID")]
     NilRegistration,
@@ -175,37 +172,21 @@ impl fmt::Display for RequestId {
 }
 
 /// Fresh non-monotonic ULID identifying one bridge registration epoch.
+///
+/// All 128 value bits come directly from a CSPRNG. The ULID wrapper supplies
+/// canonical 26-character Crockford Base32 text without imposing timestamp or
+/// monotonic-generation semantics on registration identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RegistrationId(Ulid);
 
 impl RegistrationId {
-    /// Constructs a ULID from a wall-clock timestamp and 80 independent random bits.
-    ///
-    /// This constructor never increments a prior ULID. Registrations created in
-    /// the same millisecond therefore retain independent random ordering.
+    /// Constructs a registration ULID from 128 independent random bits.
     ///
     /// # Errors
     ///
-    /// Returns an error when the timestamp exceeds ULID's 48-bit field or the
-    /// resulting value is the reserved nil ULID.
-    pub fn from_parts(
-        timestamp_millis: u64,
-        randomness: [u8; 10],
-    ) -> Result<Self, ProtocolScalarError> {
-        const MAX_ULID_TIMESTAMP: u64 = (1_u64 << 48) - 1;
-        if timestamp_millis > MAX_ULID_TIMESTAMP {
-            return Err(ProtocolScalarError::RegistrationTimestampOutOfRange);
-        }
-        let mut random_bytes = [0_u8; 16];
-        random_bytes[6..].copy_from_slice(&randomness);
-        let value = Ulid::from_parts(timestamp_millis, u128::from_be_bytes(random_bytes));
-        Self::try_from(value)
-    }
-
-    /// Millisecond Unix timestamp encoded by this registration.
-    #[must_use]
-    pub fn timestamp_millis(self) -> u64 {
-        self.0.timestamp_ms()
+    /// Returns an error when the random value is the reserved nil ULID.
+    pub fn from_random_bytes(bytes: [u8; 16]) -> Result<Self, ProtocolScalarError> {
+        Self::try_from(Ulid::from_bytes(bytes))
     }
 }
 
@@ -261,14 +242,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registration_uses_canonical_ulid_text_and_time_ordering() {
-        let older = RegistrationId::from_parts(1_000, [9; 10]).expect("older registration");
-        let newer = RegistrationId::from_parts(1_001, [1; 10]).expect("newer registration");
-        assert_eq!(older.to_string().len(), 26);
-        assert!(older < newer);
-        let encoded = serde_json::to_string(&older).expect("registration serializes");
+    fn registration_uses_canonical_ulid_text_with_all_random_bits() {
+        let registration =
+            RegistrationId::from_random_bytes([0xA5; 16]).expect("registration");
+        assert_eq!(registration.to_string().len(), 26);
+        let encoded = serde_json::to_string(&registration).expect("registration serializes");
         assert_eq!(encoded.len(), 28);
-        assert_eq!(serde_json::from_str::<RegistrationId>(&encoded), Ok(older));
+        assert_eq!(
+            serde_json::from_str::<RegistrationId>(&encoded).expect("registration deserializes"),
+            registration
+        );
+        assert!(RegistrationId::from_random_bytes([0; 16]).is_err());
     }
 
     #[test]

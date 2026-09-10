@@ -13,10 +13,12 @@
 //! This is a pure state machine with an injected clock so the adapter-contract
 //! suite can simulate registration churn deterministically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use thiserror::Error;
+use muxe_zellij_protocol::{RegistrationId, RequestId};
+
 
 /// Heartbeat lease duration: a registration that goes quiet this long is stale.
 pub const HEARTBEAT_LEASE: Duration = Duration::from_secs(15);
@@ -27,7 +29,7 @@ pub struct BridgeRecord {
     /// Zellij client ID.
     pub client_id: String,
     /// Active registration ID; displaced IDs are rejected.
-    pub registration: [u8; 16],
+    pub registration: RegistrationId,
     /// Last focused pane reported by the bridge, if any.
     pub current_pane: Option<String>,
     /// Muxe version from the handshake.
@@ -36,6 +38,8 @@ pub struct BridgeRecord {
     pub last_event_millis: u64,
     /// Whether the handshake fingerprints matched the compiled record.
     pub compatible: bool,
+    /// Next request identity allocated within this registration.
+    next_request_id: RequestId,
 }
 
 /// Registration table errors.
@@ -47,15 +51,30 @@ pub enum RegistryError {
         /// Client that sent the event.
         client_id: String,
     },
-    /// Registration attempted with a zero ID.
-    #[error("registration ID must not be zero")]
-    ZeroRegistration,
+    /// The registration exhausted its sequential request ID space.
+    #[error("request ID space exhausted for client '{client_id}'")]
+    RequestIdExhausted {
+        /// Client whose active registration exhausted its request IDs.
+        client_id: String,
+    },
+    /// The active registration failed its compatibility handshake.
+    #[error("incompatible registration for client '{client_id}'")]
+    Incompatible {
+        /// Client whose registration cannot accept requests.
+        client_id: String,
+    },
+    /// A bridge reused an identity retired by an earlier registration epoch.
+    #[error("retired registration reused for client '{client_id}'")]
+    RetiredRegistration {
+        /// Client attempting to reuse the retired registration.
+        client_id: String,
+    },
 }
 
-/// Per-client active registration table.
 #[derive(Clone, Debug, Default)]
 pub struct ZellijRegistry {
     records: BTreeMap<String, BridgeRecord>,
+    retired: BTreeSet<RegistrationId>,
 }
 
 impl ZellijRegistry {
@@ -66,35 +85,33 @@ impl ZellijRegistry {
     }
 
     /// Registers a fresh bridge, atomically superseding any previous
-    /// registration for the client. Returns the displaced registration ID, if any,
-    /// so the caller can send a best-effort retirement notice.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistryError::ZeroRegistration`] when `registration` is all zeros.
+    /// registration for the client. Returns the displaced registration ID, if any.
     pub fn register(
         &mut self,
         client_id: &str,
-        registration: [u8; 16],
+        registration: RegistrationId,
         current_pane: Option<String>,
         muxe_version: String,
         compatible: bool,
         now_millis: u64,
-    ) -> Result<Option<[u8; 16]>, RegistryError> {
-        if registration == [0; 16] {
-            return Err(RegistryError::ZeroRegistration);
-        }
+    ) -> Result<Option<RegistrationId>, RegistryError> {
         let displaced = self
             .records
             .get(client_id)
             .map(|record| record.registration);
-        // A re-registration of the already-active ID only renews the lease.
+        // A duplicate Register on the same live channel renews the lease
+        // without resetting request correlation.
         if displaced == Some(registration) {
             if let Some(record) = self.records.get_mut(client_id) {
                 record.last_event_millis = now_millis;
                 record.current_pane = current_pane;
             }
             return Ok(None);
+        }
+        if self.retired.contains(&registration) {
+            return Err(RegistryError::RetiredRegistration {
+                client_id: client_id.to_owned(),
+            });
         }
         self.records.insert(
             client_id.to_owned(),
@@ -105,8 +122,12 @@ impl ZellijRegistry {
                 muxe_version,
                 last_event_millis: now_millis,
                 compatible,
+                next_request_id: RequestId::INITIAL,
             },
         );
+        if let Some(displaced) = displaced {
+            self.retired.insert(displaced);
+        }
         Ok(displaced)
     }
     /// Deterministically ordered active client IDs, for origin fan-out.
@@ -127,7 +148,7 @@ impl ZellijRegistry {
     pub fn heartbeat(
         &mut self,
         client_id: &str,
-        registration: [u8; 16],
+        registration: RegistrationId,
         now_millis: u64,
     ) -> Result<(), RegistryError> {
         match self.records.get_mut(client_id) {
@@ -150,7 +171,7 @@ impl ZellijRegistry {
     pub fn check(
         &self,
         client_id: &str,
-        registration: [u8; 16],
+        registration: RegistrationId,
     ) -> Result<&BridgeRecord, RegistryError> {
         match self.records.get(client_id) {
             Some(record) if record.registration == registration => Ok(record),
@@ -160,11 +181,56 @@ impl ZellijRegistry {
         }
     }
 
+    /// Allocates the next request identity from the active registration.
+    ///
+    /// A new registration starts at [`RequestId::INITIAL`]. Re-registering the
+    /// same ID preserves its counter, so a duplicate Register cannot alias an
+    /// in-flight request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Stale`] when the client has no active
+    /// registration, [`RegistryError::Incompatible`] when its handshake failed,
+    /// and [`RegistryError::RequestIdExhausted`] before the counter could wrap.
+    pub fn allocate_request(
+        &mut self,
+        client_id: &str,
+    ) -> Result<(RegistrationId, RequestId), RegistryError> {
+        let record = self
+            .records
+            .get_mut(client_id)
+            .ok_or_else(|| RegistryError::Stale {
+                client_id: client_id.to_owned(),
+            })?;
+        if !record.compatible {
+            return Err(RegistryError::Incompatible {
+                client_id: client_id.to_owned(),
+            });
+        }
+        let allocated = record.next_request_id;
+        record.next_request_id =
+            allocated
+                .next()
+                .map_err(|_| RegistryError::RequestIdExhausted {
+                    client_id: client_id.to_owned(),
+                })?;
+        Ok((record.registration, allocated))
+    }
+
     /// Returns the active record for a client, if any.
     #[must_use]
     pub fn get(&self, client_id: &str) -> Option<&BridgeRecord> {
         self.records.get(client_id)
     }
+    /// Resolves an active client by registration identity.
+    #[must_use]
+    pub fn client_for_registration(&self, registration: RegistrationId) -> Option<&str> {
+        self.records
+            .values()
+            .find(|record| record.registration == registration)
+            .map(|record| record.client_id.as_str())
+    }
+
 
     /// Resolves the unique client owning a pane through active registrations.
     /// Fails rather than guessing when no unique client owns the pane.
@@ -179,11 +245,11 @@ impl ZellijRegistry {
     }
 
     /// Invalidates registrations whose heartbeat lease expired as of `now`.
-    /// Returns the invalidated client IDs; their queues pause until fresh
-    /// registrations arrive.
-    pub fn expire_leases(&mut self, now_millis: u64) -> Vec<String> {
+    /// Returns each invalidated client and registration; their queues pause
+    /// until fresh registrations arrive.
+    pub fn expire_leases(&mut self, now_millis: u64) -> Vec<(String, RegistrationId)> {
         let lease_millis: u64 = HEARTBEAT_LEASE.as_millis().try_into().unwrap_or(u64::MAX);
-        let expired: Vec<String> = self
+        let expired_clients: Vec<String> = self
             .records
             .iter()
             .filter(|(_, record)| {
@@ -191,23 +257,34 @@ impl ZellijRegistry {
             })
             .map(|(client, _)| client.clone())
             .collect();
-        for client in &expired {
-            self.records.remove(client);
+        let mut expired = Vec::with_capacity(expired_clients.len());
+        for client in expired_clients {
+            if let Some(record) = self.records.remove(&client) {
+                self.retired.insert(record.registration);
+                expired.push((client, record.registration));
+            }
         }
         expired
     }
-
-    /// Invalidates every registration, for whole-pipe replacement. Queues pause
-    /// until fresh registrations arrive on the new channel.
-    pub fn invalidate_all(&mut self) {
-        self.records.clear();
+    /// Invalidates every registration, retires each identity, and returns
+    /// the displaced client/registration pairs for pending-work cleanup.
+    pub fn invalidate_all(&mut self) -> Vec<(String, RegistrationId)> {
+        let records = std::mem::take(&mut self.records);
+        let displaced: Vec<_> = records
+            .into_values()
+            .map(|record| (record.client_id, record.registration))
+            .collect();
+        self.retired
+            .extend(displaced.iter().map(|(_, registration)| *registration));
+        displaced
     }
 
     /// Removes one client's registration after an orderly bridge shutdown.
-    pub fn remove(&mut self, client_id: &str, registration: [u8; 16]) -> bool {
+    pub fn remove(&mut self, client_id: &str, registration: RegistrationId) -> bool {
         match self.records.get(client_id) {
             Some(record) if record.registration == registration => {
-                self.records.remove(client_id);
+                let record = self.records.remove(client_id).expect("record existed");
+                self.retired.insert(record.registration);
                 true
             }
             _ => false,
@@ -233,45 +310,64 @@ mod tests {
 
     const NOW: u64 = 1_000_000;
 
-    #[test]
-    fn registration_supersedes_atomically() {
-        let mut table = ZellijRegistry::new();
-        let displaced = table
-            .register("a", [1; 16], None, "0.1.0".to_owned(), true, NOW)
-            .expect("registers");
-        assert_eq!(displaced, None);
-        let displaced = table
-            .register("a", [2; 16], None, "0.1.0".to_owned(), true, NOW)
-            .expect("re-registers");
-        assert_eq!(displaced, Some([1; 16]));
-        // Late events from the displaced registration are rejected.
-        assert!(matches!(
-            table.heartbeat("a", [1; 16], NOW),
-            Err(RegistryError::Stale { .. })
-        ));
-        assert!(table.heartbeat("a", [2; 16], NOW).is_ok());
+    fn registration(seed: u8) -> RegistrationId {
+        RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
+    }
+
+    fn register(table: &mut ZellijRegistry, client: &str, seed: u8) -> Option<RegistrationId> {
+        table
+            .register(
+                client,
+                registration(seed),
+                None,
+                "0.1.0".to_owned(),
+                true,
+                NOW,
+            )
+            .expect("registration accepted")
     }
 
     #[test]
-    fn same_id_reregistration_renews_without_displacement() {
+    fn registration_supersedes_atomically() {
         let mut table = ZellijRegistry::new();
+        assert_eq!(register(&mut table, "a", 1), None);
+        assert_eq!(register(&mut table, "a", 2), Some(registration(1)));
+        assert!(matches!(
+            table.heartbeat("a", registration(1), NOW),
+            Err(RegistryError::Stale { .. })
+        ));
+        assert!(table.heartbeat("a", registration(2), NOW).is_ok());
+    }
+
+    #[test]
+    fn request_counter_resets_only_for_new_registration() {
+        let mut table = ZellijRegistry::new();
+        register(&mut table, "a", 1);
+        assert_eq!(
+            table.allocate_request("a"),
+            Ok((registration(1), RequestId::INITIAL))
+        );
         table
-            .register("a", [1; 16], None, "0.1.0".to_owned(), true, NOW)
-            .expect("registers");
-        let displaced = table
             .register(
                 "a",
-                [1; 16],
+                registration(1),
                 Some("pane-1".to_owned()),
                 "0.1.0".to_owned(),
                 true,
                 NOW + 1,
             )
-            .expect("renews");
-        assert_eq!(displaced, None);
+            .expect("same registration renews");
         assert_eq!(
-            table.get("a").expect("present").current_pane.as_deref(),
-            Some("pane-1")
+            table.allocate_request("a"),
+            Ok((
+                registration(1),
+                RequestId::INITIAL.next().expect("second request")
+            ))
+        );
+        register(&mut table, "a", 2);
+        assert_eq!(
+            table.allocate_request("a"),
+            Ok((registration(2), RequestId::INITIAL))
         );
     }
 
@@ -281,7 +377,7 @@ mod tests {
         table
             .register(
                 "a",
-                [1; 16],
+                registration(1),
                 Some("pane-1".to_owned()),
                 "0.1.0".to_owned(),
                 true,
@@ -291,7 +387,7 @@ mod tests {
         table
             .register(
                 "b",
-                [2; 16],
+                registration(2),
                 Some("pane-2".to_owned()),
                 "0.1.0".to_owned(),
                 true,
@@ -312,38 +408,23 @@ mod tests {
     #[test]
     fn expired_lease_invalidates_only_that_client() {
         let mut table = ZellijRegistry::new();
+        register(&mut table, "a", 1);
+        register(&mut table, "b", 2);
         table
-            .register("a", [1; 16], None, "0.1.0".to_owned(), true, NOW)
-            .expect("a");
-        table
-            .register("b", [2; 16], None, "0.1.0".to_owned(), true, NOW)
-            .expect("b");
-        table
-            .heartbeat("b", [2; 16], NOW + 5_000)
+            .heartbeat("b", registration(2), NOW + 5_000)
             .expect("b renews");
         let expired = table.expire_leases(NOW + 15_001);
-        assert_eq!(expired, vec!["a".to_owned()]);
+        assert_eq!(expired, vec![("a".to_owned(), registration(1))]);
         assert!(table.get("a").is_none());
         assert!(table.get("b").is_some());
     }
 
     #[test]
-    fn zero_registration_is_rejected() {
-        let mut table = ZellijRegistry::new();
-        assert!(matches!(
-            table.register("a", [0; 16], None, "0.1.0".to_owned(), true, NOW),
-            Err(RegistryError::ZeroRegistration)
-        ));
-    }
-
-    #[test]
     fn orderly_removal_needs_active_id() {
         let mut table = ZellijRegistry::new();
-        table
-            .register("a", [1; 16], None, "0.1.0".to_owned(), true, NOW)
-            .expect("a");
-        assert!(!table.remove("a", [9; 16]));
-        assert!(table.remove("a", [1; 16]));
+        register(&mut table, "a", 1);
+        assert!(!table.remove("a", registration(9)));
+        assert!(table.remove("a", registration(1)));
         assert!(table.is_empty());
     }
 }

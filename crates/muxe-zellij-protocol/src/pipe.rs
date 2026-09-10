@@ -25,6 +25,77 @@ pub const BRIDGE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::CURRENT;
 pub const MAX_PIPE_LINE_LEN: usize = 64 * 1024;
 /// Maximum length of a human-facing detail or diagnostic string.
 pub const MAX_DETAIL_LEN: usize = 4 * 1024;
+/// Typed initial payload that installs one event-pipe generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventSubscription {
+    muxe: SubscriptionMarker,
+    protocol: ProtocolVersion,
+    channel_generation: ChannelGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum SubscriptionMarker {
+    #[serde(rename = "subscribe")]
+    Subscribe,
+}
+
+impl EventSubscription {
+    /// Creates a subscription for the current protocol and supplied generation.
+    #[must_use]
+    pub const fn new(channel_generation: ChannelGeneration) -> Self {
+        Self {
+            muxe: SubscriptionMarker::Subscribe,
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            channel_generation,
+        }
+    }
+
+    /// Installed generation carried by this subscription.
+    #[must_use]
+    pub const fn channel_generation(self) -> ChannelGeneration {
+        self.channel_generation
+    }
+
+    /// Whether the subscription uses the protocol implemented by this build.
+    #[must_use]
+    pub const fn is_current(self) -> bool {
+        self.protocol.is_current()
+    }
+}
+
+/// Encodes an event subscription as the exact JSON payload passed to `zellij pipe`.
+///
+/// # Errors
+///
+/// Returns [`PipeError::Encode`] when JSON serialization fails.
+pub fn encode_event_subscription(subscription: EventSubscription) -> Result<String, PipeError> {
+    serde_json::to_string(&subscription).map_err(|error| PipeError::Encode {
+        reason: bounded_reason(error.to_string()),
+    })
+}
+
+/// Decodes and validates an event subscription payload.
+///
+/// # Errors
+///
+/// Returns [`PipeError::InvalidFrame`] for malformed JSON and
+/// [`PipeError::Validation`] for an unsupported protocol.
+pub fn decode_event_subscription(payload: &str) -> Result<EventSubscription, PipeError> {
+    let subscription: EventSubscription =
+        serde_json::from_str(payload).map_err(|error| PipeError::InvalidFrame {
+            reason: bounded_reason(error.to_string()),
+        })?;
+    if !subscription.is_current() {
+        return Err(PipeError::Validation {
+            reason: format!(
+                "unsupported bridge protocol {}; expected {BRIDGE_PROTOCOL_VERSION}",
+                subscription.protocol
+            ),
+        });
+    }
+    Ok(subscription)
+}
+
 
 /// Targeted delivery: Zellij broadcasts pipe messages to every bridge instance,
 /// so only the active registration named here may act on a request.
@@ -645,8 +716,7 @@ pub fn decode_event_line(line: &str) -> Result<PipeEvent, PipeError> {
 mod tests {
     use super::*;
     fn registration(seed: u8) -> RegistrationId {
-        RegistrationId::from_parts(1_700_000_000_000, [seed; 10])
-            .expect("test registration")
+        RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
     }
 
 

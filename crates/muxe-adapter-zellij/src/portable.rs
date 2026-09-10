@@ -79,11 +79,11 @@ use crate::keyboard::{KeyboardError, map_canonical_key};
 pub enum PortableMapping {
     /// Handled entirely by the broker (menu state, config reload, supervised commands).
     BrokerOwned,
-    /// Dispatch through the typed `run_action` path. Keystroke sequences carry
-    /// one command per key; the adapter enqueues them in order on the
-    /// per-client FIFO, which preserves that order onto the request pipe.
+    /// Dispatch through the typed `run_action` path. A keyboard key list is
+    /// concatenated into one `WriteToPaneId` command because schema v1 defines
+    /// no timing or key-boundary semantics.
     HostAction {
-        /// Generated raw mirrors; the bridge validates each before dispatch.
+        /// Generated raw mirrors; current portable mappings produce one command.
         commands: Vec<RawNativeCommand>,
     },
     /// Resolve bridge-side against the tracked pane inventory.
@@ -606,25 +606,22 @@ fn map_keyboard_action(
             }))
         }
         KeyboardAction::SendKeys(keys) => {
+            if keys.is_empty() {
+                return Err(PortableError::InvalidScalar {
+                    action: "keyboard:send",
+                    parameter: "keys",
+                    reason: "expected at least one key",
+                });
+            }
             let pane = origin_pane("keyboard:send", origin)?;
-            let mut commands = Vec::with_capacity(keys.len());
+            let mut bytes = Vec::new();
             for key in keys {
                 let text = scalar_string("keyboard:send", "keys", key)?;
                 let mapped = map_canonical_key(&text)
                     .map_err(|error| keyboard_error("keyboard:send", &error))?;
-                commands.push(RawNativeCommand::RunAction {
-                    // Pinned WriteToPaneId carries bytes only: the mapped
-                    // identity above proves those bytes encode the pressed key
-                    // (text, C0 control, ESC-meta, or standard sequence)
-                    // rather than arbitrary output.
-                    action: raw::Action::WriteToPaneId {
-                        bytes: mapped.bytes,
-                        pane_id: pane.clone(),
-                    },
-                    context: Vec::new(),
-                });
+                bytes.extend_from_slice(&mapped.bytes);
             }
-            Ok(PortableMapping::HostAction { commands })
+            Ok(wrap(raw::Action::WriteToPaneId { bytes, pane_id: pane }))
         }
     }
 }
@@ -1101,12 +1098,15 @@ mod tests {
         else {
             panic!("expected host action");
         };
-        assert_eq!(commands.len(), 2);
-        for command in commands {
-            assert!(matches!(command, RawNativeCommand::RunAction { .. }));
-        }
+        assert_eq!(commands.len(), 1);
+        let RawNativeCommand::RunAction { action, .. } = &commands[0] else {
+            panic!("expected run action");
+        };
+        assert!(matches!(
+            action,
+            raw::Action::WriteToPaneId { bytes, .. } if bytes == b"a\x03"
+        ));
     }
-
     #[test]
     fn unmappable_keys_fail_precisely() {
         let error = map(&PortableAction::Keyboard(KeyboardAction::SendKeys(vec![
