@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use muxe_protocol::{CaptureLeaseId, ExecutionId, UiSessionId};
 use muxe_zellij_protocol::{
     BRIDGE_PERMISSIONS, BRIDGE_PROTOCOL_VERSION, BridgeEvent, BridgeIdentity, BridgeRequest,
     BridgeResponse, CaptureEndReason, CaptureLostReason, ChannelGeneration, CommandOutcome,
@@ -145,7 +146,7 @@ impl HostEffects for ShimEffects {
 }
 
 struct PendingCapture {
-    lease: [u8; 16],
+    lease: CaptureLeaseId,
     request_id: RequestId,
     channel_generation: ChannelGeneration,
     prior: Option<InputMode>,
@@ -153,7 +154,7 @@ struct PendingCapture {
 }
 
 struct ActiveCapture {
-    lease: [u8; 16],
+    lease: CaptureLeaseId,
     prior: InputMode,
 }
 
@@ -197,7 +198,7 @@ pub struct Bridge {
 
 struct PendingAction {
     request_id: RequestId,
-    execution: String,
+    execution: ExecutionId,
     channel_generation: ChannelGeneration,
 }
 
@@ -321,8 +322,8 @@ impl Bridge {
     #[cfg(test)]
     pub fn capture_state(&self) -> (Option<[u8; 16]>, Option<[u8; 16]>) {
         (
-            self.pending.as_ref().map(|p| p.lease),
-            self.active.as_ref().map(|a| a.lease),
+            self.pending.as_ref().map(|p| p.lease.0),
+            self.active.as_ref().map(|a| a.lease.0),
         )
     }
 
@@ -468,13 +469,29 @@ impl Bridge {
         effects.arm_timer(HEARTBEAT_SECS);
     }
 
+    /// Takes the active capture and issues the guarded restore while the
+    /// client is still in Muxe-owned Locked mode. A non-Locked prior arms the
+    /// restoring barrier so a replacement capture waits for the restore
+    /// observation instead of inheriting stale Locked state.
+    fn take_active_for_restore(&mut self, effects: &mut dyn HostEffects) -> Option<ActiveCapture> {
+        let active = self.active.take()?;
+        if self.current_mode == Some(InputMode::Locked) {
+            if active.prior != InputMode::Locked {
+                self.restoring_mode = Some(active.prior);
+            }
+            effects.switch_mode(active.prior);
+        }
+        Some(active)
+    }
+
     fn on_before_close(&mut self, effects: &mut dyn HostEffects) {
         // Unloading with owned Locked capture restores the guarded prior;
-        // pending async completions fail instead of dangling.
-        if let Some(active) = self.active.take()
-            && self.current_mode == Some(InputMode::Locked)
+        // pending async completions fail instead of dangling. Only unload
+        // discards the restoring barrier.
+        let restore = self.current_mode == Some(InputMode::Locked);
+        if let Some(active) = self.take_active_for_restore(effects)
+            && restore
         {
-            effects.switch_mode(active.prior);
             self.emit_unsolicited(
                 BridgeEvent::CaptureLost {
                     lease: active.lease,
@@ -509,13 +526,11 @@ impl Bridge {
         else {
             return;
         };
-        if let Some(active) = self.active.take()
-            && self.current_mode == Some(InputMode::Locked)
-        {
-            effects.switch_mode(active.prior);
-        }
+        // A replacement channel restores any still-owned capture through the
+        // shared guard, but preserves the restoring barrier until a
+        // non-Locked ModeUpdate is observed.
+        self.take_active_for_restore(effects);
         self.pending = None;
-        self.restoring_mode = None;
         self.pending_actions.clear();
         self.registration = None;
         self.channel_generation = Some(subscription.channel_generation());
@@ -646,7 +661,7 @@ impl Bridge {
         cli_id: &str,
         request_id: RequestId,
         generation: ChannelGeneration,
-        execution: String,
+        execution: ExecutionId,
         command: RawNativeCommand,
         effects: &mut dyn HostEffects,
     ) {
@@ -728,8 +743,8 @@ impl Bridge {
         cli_id: &str,
         request_id: RequestId,
         generation: ChannelGeneration,
-        lease: [u8; 16],
-        _ui_session: String,
+        lease: CaptureLeaseId,
+        _ui_session: UiSessionId,
         effects: &mut dyn HostEffects,
     ) {
         if let Some(active) = &self.active
@@ -800,7 +815,7 @@ impl Bridge {
         cli_id: &str,
         request_id: RequestId,
         generation: ChannelGeneration,
-        lease: [u8; 16],
+        lease: CaptureLeaseId,
         _reason: CaptureEndReason,
         effects: &mut dyn HostEffects,
     ) {
@@ -811,20 +826,14 @@ impl Bridge {
         {
             self.pending = None;
         }
-        // Guarded restore: only the owning lease, and only while the client
-        // is still in Muxe-owned Locked mode. A stale lease leaves the
-        // current owner untouched.
-        if let Some(active) = self.active.take() {
-            if active.lease == lease {
-                if self.current_mode == Some(InputMode::Locked) {
-                    if active.prior != InputMode::Locked {
-                        self.restoring_mode = Some(active.prior);
-                    }
-                    effects.switch_mode(active.prior);
-                }
-            } else {
-                self.active = Some(active);
-            }
+        // Guarded restore: only the owning lease restores through the shared
+        // guard. A stale lease leaves the current owner untouched.
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.lease == lease)
+        {
+            self.take_active_for_restore(effects);
         }
         self.release(cli_id, request_id, generation, effects);
     }
@@ -834,7 +843,7 @@ impl Bridge {
         cli_id: &str,
         request_id: RequestId,
         generation: ChannelGeneration,
-        ui_session: String,
+        ui_session: UiSessionId,
         ui_pane: String,
         effects: &mut dyn HostEffects,
     ) {
@@ -885,7 +894,7 @@ impl Bridge {
         cli_id: &str,
         request_id: RequestId,
         generation: ChannelGeneration,
-        execution: String,
+        execution: ExecutionId,
         index: u32,
         effects: &mut dyn HostEffects,
     ) {
@@ -918,7 +927,7 @@ impl Bridge {
         cli_id: &str,
         request_id: RequestId,
         generation: ChannelGeneration,
-        execution: String,
+        execution: ExecutionId,
         direction: muxe_zellij_protocol::NeighborDirection,
         effects: &mut dyn HostEffects,
     ) {
@@ -959,14 +968,11 @@ impl Bridge {
         effects: &mut dyn HostEffects,
     ) {
         // Retirement releases capture through the same guarded restore, then
-        // fails every pending async completion instead of dangling it.
-        if let Some(active) = self.active.take()
-            && self.current_mode == Some(InputMode::Locked)
-        {
-            effects.switch_mode(active.prior);
-        }
+        // fails every pending async completion instead of dangling it. The
+        // restoring barrier is preserved until a non-Locked ModeUpdate is
+        // observed.
+        self.take_active_for_restore(effects);
         self.pending = None;
-        self.restoring_mode = None;
         let pending: Vec<PendingAction> = std::mem::take(&mut self.pending_actions)
             .into_values()
             .collect();
@@ -1226,6 +1232,15 @@ mod tests {
     fn registration(seed: u8) -> RegistrationId {
         RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
     }
+    fn lease(seed: u8) -> CaptureLeaseId {
+        CaptureLeaseId([seed; 16])
+    }
+    fn session(name: &str) -> UiSessionId {
+        UiSessionId::new(name)
+    }
+    fn exec(seed: u8) -> ExecutionId {
+        ExecutionId([seed; 16])
+    }
 
     fn clients_for(client_id: u16, pane: PaneId) -> Vec<ClientInfo> {
         vec![ClientInfo {
@@ -1482,7 +1497,7 @@ mod tests {
         bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
         bridge.pipe(
             request_msg(BridgeRequest::RequestOrigin {
-                ui_session: "stale-ui".to_owned(),
+                ui_session: session("stale-ui"),
                 request: ZellijOriginRequest {
                     ui_pane: "terminal_2".to_owned(),
                 },
@@ -1544,7 +1559,7 @@ mod tests {
         let before = host.outputs.len();
         bridge.pipe(
             request_msg(BridgeRequest::Dispatch {
-                execution: "e1".to_owned(),
+                execution: exec(1),
                 request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
             }),
             &mut host,
@@ -1579,7 +1594,7 @@ mod tests {
         let mut line = request_line(
             registration(9),
             BridgeRequest::Dispatch {
-                execution: "e2".to_owned(),
+                execution: exec(2),
                 request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
             },
         );
@@ -1617,8 +1632,8 @@ mod tests {
         // Begin with no observed mode: no Locked request yet.
         bridge.pipe(
             request_msg(BridgeRequest::BeginCapture {
-                lease: [11; 16],
-                ui_session: "ui-1".to_owned(),
+                lease: lease(11),
+                ui_session: session("ui-1"),
             }),
             &mut host,
         );
@@ -1633,8 +1648,10 @@ mod tests {
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
-            PipeEventKind::Response(BridgeResponse::CaptureReady { lease, .. })
-                if lease == [11; 16]
+            PipeEventKind::Response(BridgeResponse::CaptureReady {
+                lease: actual_lease,
+                ..
+            }) if actual_lease == lease(11)
         ));
     }
 
@@ -1644,8 +1661,8 @@ mod tests {
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         bridge.pipe(
             request_msg(BridgeRequest::BeginCapture {
-                lease: [31; 16],
-                ui_session: "ui-1".to_owned(),
+                lease: lease(31),
+                ui_session: session("ui-1"),
             }),
             &mut host,
         );
@@ -1653,7 +1670,7 @@ mod tests {
             request_msg_with_id(
                 RequestId::try_from(2).expect("second request"),
                 BridgeRequest::EndCapture {
-                    lease: [30; 16],
+                    lease: lease(30),
                     reason: CaptureEndReason::LeaseExpired,
                 },
             ),
@@ -1666,8 +1683,10 @@ mod tests {
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
-            PipeEventKind::Response(BridgeResponse::CaptureReady { lease, state })
-                if lease == [31; 16] && state.prior_mode == "Normal"
+            PipeEventKind::Response(BridgeResponse::CaptureReady {
+                lease: actual_lease,
+                state
+            }) if actual_lease == lease(31) && state.prior_mode == "Normal"
         ));
     }
 
@@ -1677,8 +1696,8 @@ mod tests {
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         bridge.pipe(
             request_msg(BridgeRequest::BeginCapture {
-                lease: [41; 16],
-                ui_session: "ui-1".to_owned(),
+                lease: lease(41),
+                ui_session: session("ui-1"),
             }),
             &mut host,
         );
@@ -1687,7 +1706,7 @@ mod tests {
             request_msg_with_id(
                 RequestId::try_from(2).expect("second request"),
                 BridgeRequest::EndCapture {
-                    lease: [41; 16],
+                    lease: lease(41),
                     reason: CaptureEndReason::Replaced,
                 },
             ),
@@ -1697,8 +1716,8 @@ mod tests {
             request_msg_with_id(
                 RequestId::try_from(3).expect("third request"),
                 BridgeRequest::BeginCapture {
-                    lease: [42; 16],
-                    ui_session: "ui-2".to_owned(),
+                    lease: lease(42),
+                    ui_session: session("ui-2"),
                 },
             ),
             &mut host,
@@ -1721,8 +1740,81 @@ mod tests {
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
-            PipeEventKind::Response(BridgeResponse::CaptureReady { lease, state })
-                if lease == [42; 16] && state.prior_mode == "Normal"
+            PipeEventKind::Response(BridgeResponse::CaptureReady {
+                lease: actual_lease,
+                state
+            }) if actual_lease == lease(42) && state.prior_mode == "Normal"
+        ));
+    }
+    #[test]
+    fn resubscription_restores_before_replacement_completes() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: lease(51),
+                ui_session: session("ui-1"),
+            }),
+            &mut host,
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([51; 16])));
+        // A new event subscription restores the active capture through the
+        // shared guard, arming the barrier with the observed Normal prior.
+        bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal]
+        );
+        assert_eq!(bridge.capture_state(), (None, None));
+        // Re-registration lands before the restore ModeUpdate is observed.
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert_eq!(bridge.active_registration(), Some(registration(8)));
+        // Begin B while the barrier holds stays pending without a Locked
+        // request: the host still reports the stale Locked mode.
+        bridge.pipe(
+            request_msg_for(
+                registration(8),
+                RequestId::INITIAL,
+                BridgeRequest::BeginCapture {
+                    lease: lease(52),
+                    ui_session: session("ui-2"),
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(bridge.capture_state(), (Some([52; 16]), None));
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal]
+        );
+        // Stale Locked is ignored until the restore observation arrives.
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (Some([52; 16]), None));
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal]
+        );
+        // The restore observation clears the barrier and requests Locked;
+        // its confirmation completes the replacement with the true prior.
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal, InputMode::Locked]
+        );
+        assert_eq!(bridge.capture_state(), (Some([52; 16]), None));
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([52; 16])));
+        let (_, event) = host.last_event();
+        assert!(matches!(
+            event,
+            PipeEventKind::Response(BridgeResponse::CaptureReady {
+                lease: actual_lease,
+                state
+            }) if actual_lease == lease(52) && state.prior_mode == "Normal"
         ));
     }
 
@@ -1735,7 +1827,7 @@ mod tests {
                 request_msg_with_id(
                     RequestId::try_from(id).expect("nonzero request"),
                     BridgeRequest::Dispatch {
-                        execution: format!("e{id}"),
+                        execution: exec(id as u8),
                         request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
                     },
                 ),
@@ -1765,8 +1857,8 @@ mod tests {
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         bridge.pipe(
             request_msg(BridgeRequest::BeginCapture {
-                lease: [21; 16],
-                ui_session: "ui-1".to_owned(),
+                lease: lease(21),
+                ui_session: session("ui-1"),
             }),
             &mut host,
         );
@@ -1776,8 +1868,8 @@ mod tests {
             request_msg_with_id(
                 RequestId::try_from(3).expect("third request"),
                 BridgeRequest::BeginCapture {
-                    lease: [21; 16],
-                    ui_session: "ui-1".to_owned(),
+                    lease: lease(21),
+                    ui_session: session("ui-1"),
                 },
             ),
             &mut host,
@@ -1790,14 +1882,16 @@ mod tests {
         );
         assert!(matches!(
             event,
-            PipeEventKind::Response(BridgeResponse::CaptureReady { lease, state })
-                if lease == [21; 16] && state.prior_mode == "Normal"
+            PipeEventKind::Response(BridgeResponse::CaptureReady {
+                lease: actual_lease,
+                state
+            }) if actual_lease == lease(21) && state.prior_mode == "Normal"
         ));
         bridge.pipe(
             request_msg_with_id(
                 RequestId::try_from(4).expect("fourth request"),
                 BridgeRequest::EndCapture {
-                    lease: [21; 16],
+                    lease: lease(21),
                     reason: CaptureEndReason::LeaseExpired,
                 },
             ),
@@ -1811,7 +1905,7 @@ mod tests {
         let (mut bridge, mut host) = boot();
         bridge.pipe(
             request_msg(BridgeRequest::Dispatch {
-                execution: "old".to_owned(),
+                execution: exec(60),
                 request: ZellijDispatchRequest::Command(RawNativeCommand::RunAction {
                     action: muxe_zellij_protocol::generated::raw::Action::CloseFocus,
                     context: Vec::new(),
@@ -1830,7 +1924,7 @@ mod tests {
                 registration(8),
                 RequestId::INITIAL,
                 BridgeRequest::Dispatch {
-                    execution: "new".to_owned(),
+                    execution: exec(61),
                     request: ZellijDispatchRequest::Command(RawNativeCommand::RunAction {
                         action: muxe_zellij_protocol::generated::raw::Action::CloseFocus,
                         context: Vec::new(),
@@ -1870,7 +1964,7 @@ mod tests {
         assert!(matches!(
             event,
             PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, .. })
-                if execution == "new"
+                if execution == exec(61)
         ));
     }
 
@@ -1880,8 +1974,8 @@ mod tests {
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         bridge.pipe(
             request_msg(BridgeRequest::BeginCapture {
-                lease: [12; 16],
-                ui_session: "ui-1".to_owned(),
+                lease: lease(12),
+                ui_session: session("ui-1"),
             }),
             &mut host,
         );
@@ -1919,7 +2013,7 @@ mod tests {
                 payload: Some(request_line(
                     registration(7),
                     BridgeRequest::RequestOrigin {
-                        ui_session: "ui-9".to_owned(),
+                        ui_session: session("ui-9"),
                         request: ZellijOriginRequest {
                             ui_pane: "terminal_2".to_owned(),
                         },
@@ -1945,8 +2039,8 @@ mod tests {
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         bridge.pipe(
             request_msg(BridgeRequest::BeginCapture {
-                lease: [13; 16],
-                ui_session: "ui-1".to_owned(),
+                lease: lease(13),
+                ui_session: session("ui-1"),
             }),
             &mut host,
         );
@@ -1954,7 +2048,7 @@ mod tests {
         // Queue an async run_action without completing it.
         bridge.pipe(
             request_msg(BridgeRequest::Dispatch {
-                execution: "e9".to_owned(),
+                execution: exec(9),
                 request: ZellijDispatchRequest::Command(RawNativeCommand::RunAction {
                     action: muxe_zellij_protocol::generated::raw::Action::CloseFocus,
                     context: Vec::new(),
@@ -1971,7 +2065,7 @@ mod tests {
             matches!(
                 event,
                 PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, .. })
-                    if execution == "e9"
+                    if execution == exec(9)
             )
         });
         assert!(failed);
@@ -2038,7 +2132,7 @@ mod tests {
 
         bridge.pipe(
             request_msg(BridgeRequest::Dispatch {
-                execution: "request-release".to_owned(),
+                execution: exec(70),
                 request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
             }),
             &mut host,
