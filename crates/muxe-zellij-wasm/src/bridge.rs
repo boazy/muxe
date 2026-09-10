@@ -775,7 +775,13 @@ impl Bridge {
         _reason: CaptureEndReason,
         effects: &mut dyn HostEffects,
     ) {
-        self.pending = None;
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.lease == lease)
+        {
+            self.pending = None;
+        }
         // Guarded restore: only the owning lease, and only while the client
         // is still in Muxe-owned Locked mode. A stale lease leaves the
         // current owner untouched.
@@ -1581,6 +1587,41 @@ mod tests {
         assert!(matches!(
             event,
             PipeEventKind::CaptureReady { lease, .. } if lease == [11; 16]
+        ));
+    }
+
+    #[test]
+    fn stale_end_does_not_cancel_a_new_pending_capture() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: [31; 16],
+                ui_session: "ui-1".to_owned(),
+            }),
+            &mut host,
+        );
+        bridge.pipe(
+            request_msg_with_id(
+                RequestId::try_from(2).expect("second request"),
+                BridgeRequest::EndCapture {
+                    lease: [30; 16],
+                    reason: CaptureEndReason::LeaseExpired,
+                },
+            ),
+            &mut host,
+        );
+
+        assert_eq!(bridge.capture_state(), (Some([31; 16]), None));
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([31; 16])));
+        let (_, event) = host.last_event();
+        assert!(matches!(
+            event,
+            PipeEventKind::CaptureReady {
+                lease,
+                prior_mode
+            } if lease == [31; 16] && prior_mode == "Normal"
         ));
     }
 
