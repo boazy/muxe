@@ -223,7 +223,7 @@ impl Serialize for RegistrationId {
     where
         S: Serializer,
     {
-        self.0.serialize(serializer)
+        serializer.collect_str(self)
     }
 }
 
@@ -232,8 +232,8 @@ impl<'de> Deserialize<'de> for RegistrationId {
     where
         D: Deserializer<'de>,
     {
-        let value = Ulid::deserialize(deserializer)?;
-        Self::try_from(value).map_err(D::Error::custom)
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(D::Error::custom)
     }
 }
 
