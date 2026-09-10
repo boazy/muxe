@@ -836,8 +836,7 @@ menus:
     assert!(
         diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code
-                == muxe_core::DiagnosticCode::InvalidActionArguments)
+            .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidActionArguments)
     );
 }
 

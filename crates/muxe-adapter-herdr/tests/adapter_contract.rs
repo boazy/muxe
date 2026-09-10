@@ -113,6 +113,14 @@ impl PipeChannel for RecordedPipeChannel {
         }
     }
 
+    async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
+        self.next_line().await.map(|line| (0, line))
+    }
+
+    async fn install_epoch(&self) -> Option<u64> {
+        Some(0)
+    }
+
     async fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.available.notify_waiters();
@@ -379,7 +387,10 @@ fn event_for(
     }
 }
 
-fn register_event(registration_id: [u8; 16], build_id: muxe_protocol::SchemaFingerprint) -> PipeEvent {
+fn register_event(
+    registration_id: [u8; 16],
+    build_id: muxe_protocol::SchemaFingerprint,
+) -> PipeEvent {
     event_for(
         registration(registration_id[0]),
         None,

@@ -96,7 +96,6 @@ pub fn decode_event_subscription(payload: &str) -> Result<EventSubscription, Pip
     Ok(subscription)
 }
 
-
 /// Targeted delivery: Zellij broadcasts pipe messages to every bridge instance,
 /// so only the active registration named here may act on a request.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -542,10 +541,6 @@ impl PipeEventKind {
     /// # Errors
     ///
     /// Returns [`PipeError::Validation`] when IDs, fingerprints, or details are invalid.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the exhaustive event wire contract remains co-located so every variant is reviewed together"
-    )]
     pub fn validate(&self) -> Result<(), PipeError> {
         match self {
             Self::Register {
@@ -556,10 +551,8 @@ impl PipeEventKind {
                 require_non_empty("client ID", client_id)?;
                 identity.validate()
             }
-            Self::RequestReleased => Ok(()),
-            Self::DispatchAccepted { execution } => {
-                require_non_empty("execution ID", execution)
-            }
+            Self::RequestReleased | Self::Heartbeat => Ok(()),
+            Self::DispatchAccepted { execution } => require_non_empty("execution ID", execution),
             Self::DispatchCompleted { execution, outcome } => {
                 require_non_empty("execution ID", execution)?;
                 if outcome.detail.len() > MAX_DETAIL_LEN {
@@ -573,9 +566,7 @@ impl PipeEventKind {
                 require_non_empty("UI session", ui_session)?;
                 origin.validate()
             }
-            Self::OriginDeclined { ui_session } => {
-                require_non_empty("UI session", ui_session)
-            }
+            Self::OriginDeclined { ui_session } => require_non_empty("UI session", ui_session),
             Self::CaptureReady { lease, prior_mode } => {
                 if lease == &[0; 16] {
                     return Err(PipeError::Validation {
@@ -592,7 +583,6 @@ impl PipeEventKind {
                 }
                 Ok(())
             }
-            Self::Heartbeat => Ok(()),
         }
     }
 }
@@ -719,7 +709,6 @@ mod tests {
         RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
     }
 
-
     fn sample_target() -> BridgeTarget {
         BridgeTarget {
             client_id: "client-1".to_owned(),
@@ -786,12 +775,13 @@ mod tests {
         assert!(unsolicited.validate().is_ok());
         let missing_request = PipeEvent {
             event: PipeEventKind::RequestReleased,
-            ..unsolicited.clone()
+            ..unsolicited
         };
         assert!(missing_request.validate().is_err());
         let unexpected_request = PipeEvent {
             request_id: Some(RequestId::INITIAL),
-            ..unsolicited
+            event: PipeEventKind::Heartbeat,
+            ..missing_request
         };
         assert!(unexpected_request.validate().is_err());
         let lost = PipeEventKind::CaptureLost {

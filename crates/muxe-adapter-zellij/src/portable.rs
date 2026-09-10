@@ -621,7 +621,10 @@ fn map_keyboard_action(
                     .map_err(|error| keyboard_error("keyboard:send", &error))?;
                 bytes.extend_from_slice(&mapped.bytes);
             }
-            Ok(wrap(raw::Action::WriteToPaneId { bytes, pane_id: pane }))
+            Ok(wrap(raw::Action::WriteToPaneId {
+                bytes,
+                pane_id: pane,
+            }))
         }
     }
 }

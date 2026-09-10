@@ -874,7 +874,7 @@ async fn duo_collect_registrations(
                 }
                 registrations.insert(client_id, (registration, current_pane));
             }
-            PipeEventKind::Heartbeat { .. } => {}
+            PipeEventKind::Heartbeat => {}
             other => {
                 return Err(io::Error::other(format!(
                     "duo: unexpected event while awaiting census coverage: {other:?}"
@@ -1144,9 +1144,8 @@ async fn duo_drain_route_heartbeats(
         let registration = frame.registration;
         match frame.event {
             PipeEventKind::Heartbeat => {
-                if let Some((client_id, _)) = registrations
-                    .iter()
-                    .find(|(client_id, (active, _))| {
+                if let Some((client_id, _)) =
+                    registrations.iter().find(|(client_id, (active, _))| {
                         anchor.contains(client_id) && *active == registration
                     })
                 {

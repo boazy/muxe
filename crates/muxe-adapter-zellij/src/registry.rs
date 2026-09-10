@@ -16,9 +16,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use thiserror::Error;
 use muxe_zellij_protocol::{RegistrationId, RequestId};
-
+use thiserror::Error;
 
 /// Heartbeat lease duration: a registration that goes quiet this long is stale.
 pub const HEARTBEAT_LEASE: Duration = Duration::from_secs(15);
@@ -86,6 +85,11 @@ impl ZellijRegistry {
 
     /// Registers a fresh bridge, atomically superseding any previous
     /// registration for the client. Returns the displaced registration ID, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::RetiredRegistration`] when the supplied ID
+    /// belonged to an earlier registration epoch.
     pub fn register(
         &mut self,
         client_id: &str,
@@ -231,7 +235,6 @@ impl ZellijRegistry {
             .map(|record| record.client_id.as_str())
     }
 
-
     /// Resolves the unique client owning a pane through active registrations.
     /// Fails rather than guessing when no unique client owns the pane.
     #[must_use]
@@ -281,14 +284,18 @@ impl ZellijRegistry {
 
     /// Removes one client's registration after an orderly bridge shutdown.
     pub fn remove(&mut self, client_id: &str, registration: RegistrationId) -> bool {
-        match self.records.get(client_id) {
-            Some(record) if record.registration == registration => {
-                let record = self.records.remove(client_id).expect("record existed");
-                self.retired.insert(record.registration);
-                true
-            }
-            _ => false,
+        if self
+            .records
+            .get(client_id)
+            .is_none_or(|record| record.registration != registration)
+        {
+            return false;
         }
+        let Some(record) = self.records.remove(client_id) else {
+            return false;
+        };
+        self.retired.insert(record.registration);
+        true
     }
 
     /// Number of active registrations.

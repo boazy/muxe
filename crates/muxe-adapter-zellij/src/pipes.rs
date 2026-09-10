@@ -800,10 +800,7 @@ pub mod testing {
             Ok(())
         }
 
-        async fn respawn_with_payload(
-            &self,
-            payload: String,
-        ) -> Result<(), PipeTransportError> {
+        async fn respawn_with_payload(&self, payload: String) -> Result<(), PipeTransportError> {
             *self
                 .initial_payload
                 .lock()

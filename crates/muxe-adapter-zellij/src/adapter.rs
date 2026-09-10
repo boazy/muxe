@@ -96,6 +96,10 @@ struct PendingReply<T> {
     sender: T,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the fixed public adapter error returned across this module"
+)]
 fn subscription_payload(generation: ChannelGeneration) -> Result<String, AdapterError> {
     encode_event_subscription(EventSubscription::new(generation))
         .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string()))
@@ -103,8 +107,7 @@ fn subscription_payload(generation: ChannelGeneration) -> Result<String, Adapter
 
 /// Pending capture waiters keyed by lease, each tagged with the owning
 /// client so lease expiry can release only that client's waiters.
-type CaptureWaiters =
-    BTreeMap<[u8; 16], (String, PendingReply<oneshot::Sender<CaptureReady>>)>;
+type CaptureWaiters = BTreeMap<[u8; 16], (String, PendingReply<oneshot::Sender<CaptureReady>>)>;
 type OriginWaiters =
     BTreeMap<String, PendingReply<oneshot::Sender<Result<ZellijOrigin, OriginError>>>>;
 
@@ -450,19 +453,24 @@ impl AtomicChannelGeneration {
             .expect("stored channel generation is always nonzero")
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the fixed public adapter error returned across this module"
+    )]
     fn advance(&self) -> Result<ChannelGeneration, AdapterError> {
         let previous = self
             .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
             .map_err(|_| {
                 AdapterError::new(
                     AdapterErrorKind::Unavailable,
                     "Zellij channel generation exhausted",
                 )
             })?;
-        ChannelGeneration::try_from(previous + 1).map_err(|error| {
-            AdapterError::new(AdapterErrorKind::Unavailable, error.to_string())
-        })
+        ChannelGeneration::try_from(previous + 1)
+            .map_err(|error| AdapterError::new(AdapterErrorKind::Unavailable, error.to_string()))
     }
 }
 struct LocalTokenSource(AtomicU64);
@@ -483,7 +491,6 @@ impl LocalTokenSource {
         id
     }
 }
-
 
 struct AdapterInner {
     config: ZellijAdapterConfig,
@@ -805,7 +812,6 @@ impl ZellijAdapter {
         census
     }
 
-
     /// Milliseconds elapsed on the monotonic adapter clock, for lease times.
     fn clock_millis(&self) -> u64 {
         self.inner
@@ -868,6 +874,10 @@ impl ZellijAdapter {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive event/provenance dispatch stays co-located for protocol review"
+    )]
     async fn handle_event_line(&self, channel: u64, line: &str) {
         let Ok(frame) = decode_event_line(line) else {
             self.restart_whole_pipe().await;
@@ -1145,6 +1155,10 @@ impl ZellijAdapter {
             .await;
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "registration retirement is one serialized cleanup transaction"
+    )]
     async fn retire_registration_state(
         &self,
         client_id: &str,
@@ -1187,14 +1201,13 @@ impl ZellijAdapter {
         }
 
         self.inner.pending_origin.lock().await.retain(|_, reply| {
-            !reply
+            reply
                 .request
-                .is_some_and(|request| request.registration == registration)
+                .is_none_or(|request| request.registration != registration)
         });
         let beginning_lease = match self.inner.captures.lock().await.state(client_id) {
             crate::capture::CaptureState::Beginning { lease, .. } => Some(*lease),
-            crate::capture::CaptureState::Idle
-            | crate::capture::CaptureState::Captured(_) => None,
+            crate::capture::CaptureState::Idle | crate::capture::CaptureState::Captured(_) => None,
         };
         let preserve_capture = {
             let mut preserve = false;
@@ -1232,7 +1245,11 @@ impl ZellijAdapter {
         let displaced = if preserve_capture {
             None
         } else {
-            self.inner.captures.lock().await.invalidate_client(client_id)
+            self.inner
+                .captures
+                .lock()
+                .await
+                .invalidate_client(client_id)
         };
         let capture = displaced.and_then(|state| match state {
             crate::capture::CaptureState::Beginning { ui_session, lease } => {
@@ -1333,12 +1350,7 @@ impl ZellijAdapter {
                     None => return SendItemResult::Continue,
                 }
             };
-            let request = self
-                .inner
-                .registry
-                .lock()
-                .await
-                .allocate_request(client_id);
+            let request = self.inner.registry.lock().await.allocate_request(client_id);
             let Ok((registration, request_id)) = request else {
                 self.inner
                     .queues
@@ -1363,6 +1375,10 @@ impl ZellijAdapter {
     }
 
     /// Sends one queued item and reports transport recovery needed by the scheduler.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request framing, provenance publication, and ambiguous-write handling are one transaction"
+    )]
     async fn send_item(
         &self,
         client_id: &str,
@@ -1389,8 +1405,7 @@ impl ZellijAdapter {
                 | BridgeRequest::FocusPaneNeighbor { .. }
         );
         if let BridgeRequest::BeginCapture { lease, .. } = &payload
-            && let Some((_, pending)) =
-                self.inner.pending_capture.lock().await.get_mut(lease)
+            && let Some((_, pending)) = self.inner.pending_capture.lock().await.get_mut(lease)
         {
             pending.request = Some(request);
         }
@@ -2181,20 +2196,16 @@ impl HostAdapter for ZellijAdapter {
                 })?;
         }
         let (sender, receiver) = oneshot::channel();
-        self.inner
-            .pending_capture
-            .lock()
-            .await
-            .insert(
-                lease,
-                (
-                    client_id.clone(),
-                    PendingReply {
-                        request: None,
-                        sender,
-                    },
-                ),
-            );
+        self.inner.pending_capture.lock().await.insert(
+            lease,
+            (
+                client_id.clone(),
+                PendingReply {
+                    request: None,
+                    sender,
+                },
+            ),
+        );
         self.enqueue_lifecycle(
             client_id.clone(),
             BridgeRequest::BeginCapture {
@@ -2226,9 +2237,7 @@ impl HostAdapter for ZellijAdapter {
                 .await
                 .remove(&lease)
                 .is_some_and(|(_, reply)| reply.request.is_some());
-            if !sent
-                && let Some(queue) = self.inner.queues.lock().await.get_mut(&client_id)
-            {
+            if !sent && let Some(queue) = self.inner.queues.lock().await.get_mut(&client_id) {
                 queue.retain(|item| {
                     !matches!(
                         item.payload.as_ref(),
@@ -3097,12 +3106,8 @@ mod tests {
         registration: [u8; 16],
         muxe_version: &str,
     ) {
-        let mut frame = register_event_for(
-            client,
-            registration,
-            Some(bridge_build_id()),
-            muxe_version,
-        );
+        let mut frame =
+            register_event_for(client, registration, Some(bridge_build_id()), muxe_version);
         if let Some(payload) = event.initial_payload() {
             frame.channel_generation = decode_event_subscription(&payload)
                 .expect("subscription payload")
@@ -3207,7 +3212,10 @@ mod tests {
             .await
             .begin("client-1", "session-9", stale_lease)
             .expect("old lease begins");
-        let old_channel = event.install_epoch().await.expect("event channel installed");
+        let old_channel = event
+            .install_epoch()
+            .await
+            .expect("event channel installed");
         adapter
             .suspend_for_activation()
             .await
@@ -3386,23 +3394,14 @@ mod tests {
         for _ in 0..3 {
             saw_unknown |= matches!(
                 next_event(&adapter).await,
-                AdapterHealthEvent::DispatchCompleted(
-                    DispatchCompletion::OutcomeUnknown {
-                        execution: ExecutionId(77),
-                        ..
-                    }
-                )
+                AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+                    execution: ExecutionId(77),
+                    ..
+                })
             );
         }
         assert!(saw_unknown);
-        assert!(
-            !adapter
-                .inner
-                .live_executions
-                .lock()
-                .await
-                .contains_key(&77)
-        );
+        assert!(!adapter.inner.live_executions.lock().await.contains_key(&77));
         adapter.shutdown().await.expect("shutdown");
     }
 
@@ -4125,12 +4124,7 @@ mod tests {
                 .confirm("client-1", lease, "normal".to_owned())
                 .expect("capture confirms");
         }
-        adapter
-            .inner
-            .live_executions
-            .lock()
-            .await
-            .insert(77, None);
+        adapter.inner.live_executions.lock().await.insert(77, None);
         adapter
             .inner
             .queues
@@ -4144,21 +4138,16 @@ mod tests {
                 payload: None,
             });
         let (waiter_tx, mut waiter_rx) = oneshot::channel();
-        adapter
-            .inner
-            .pending_capture
-            .lock()
-            .await
-            .insert(
-                [10; 16],
-                (
-                    "client-1".to_owned(),
-                    PendingReply {
-                        request: None,
-                        sender: waiter_tx,
-                    },
-                ),
-            );
+        adapter.inner.pending_capture.lock().await.insert(
+            [10; 16],
+            (
+                "client-1".to_owned(),
+                PendingReply {
+                    request: None,
+                    sender: waiter_tx,
+                },
+            ),
+        );
         // Drain both registration health reports so only sweep reports
         // remain observable below.
         assert!(matches!(
@@ -4186,12 +4175,8 @@ mod tests {
         )
         .await;
         event.push_line(
-            encode_event_line(&pipe_event(
-                [8; 16],
-                None,
-                PipeEventKind::Heartbeat,
-            ))
-            .expect("heartbeat encodes"),
+            encode_event_line(&pipe_event([8; 16], None, PipeEventKind::Heartbeat))
+                .expect("heartbeat encodes"),
         );
         // Barrier, not a sleep: the heartbeat renewal must land before the
         // clock moves past client-1's lease.
@@ -4311,12 +4296,7 @@ mod tests {
             "expired queue pauses instead of purging"
         );
         assert!(
-            adapter
-                .inner
-                .live_executions
-                .lock()
-                .await
-                .contains_key(&77),
+            adapter.inner.live_executions.lock().await.contains_key(&77),
             "paused execution never completes as unknown"
         );
         assert!(
@@ -4773,8 +4753,12 @@ done
 
         // The bridge re-registers before answering: the stale answer below
         // must fail the registration check so the fan-out re-queries.
-        let mut turnover =
-            register_event_for("client-1", [8; 16], Some(bridge_build_id()), env!("CARGO_PKG_VERSION"));
+        let mut turnover = register_event_for(
+            "client-1",
+            [8; 16],
+            Some(bridge_build_id()),
+            env!("CARGO_PKG_VERSION"),
+        );
         if let PipeEventKind::Register { current_pane, .. } = &mut turnover.event {
             *current_pane = Some("plugin-9".to_owned());
         }

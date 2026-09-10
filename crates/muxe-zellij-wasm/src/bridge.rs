@@ -39,13 +39,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-
 use muxe_zellij_protocol::{
     BRIDGE_PERMISSIONS, BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, CaptureEndReason,
     CaptureLostReason, ChannelGeneration, CommandOutcome, PipeEvent, PipeEventKind, RegistrationId,
     RequestId, ZellijOrigin, bridge_build_id, bridge_protocol_fingerprint,
-    decode_event_subscription, decode_request_line, encode_event_line,
-    generated::RawNativeCommand, generated_action_fingerprint, pinned_source_revision,
+    decode_event_subscription, decode_request_line, encode_event_line, generated::RawNativeCommand,
+    generated_action_fingerprint, pinned_source_revision,
 };
 use zellij_tile::prelude::*;
 
@@ -138,7 +137,6 @@ impl HostEffects for ShimEffects {
     fn fill_random(&mut self, bytes: &mut [u8]) -> bool {
         getrandom::getrandom(bytes).is_ok()
     }
-
 
     fn arm_timer(&mut self, secs: f64) {
         set_timeout(secs);
@@ -491,12 +489,7 @@ impl Bridge {
     /// New event channel: guarded-restore any still-owned Locked capture
     /// first, then reset epoch state so old completions can never reattach
     /// under the fresh registration below.
-    fn subscribe(
-        &mut self,
-        cli_id: String,
-        payload: Option<&str>,
-        effects: &mut dyn HostEffects,
-    ) {
+    fn subscribe(&mut self, cli_id: String, payload: Option<&str>, effects: &mut dyn HostEffects) {
         let Some(subscription) = payload.and_then(|value| decode_event_subscription(value).ok())
         else {
             return;
@@ -580,9 +573,7 @@ impl Bridge {
             return;
         }
         if let Some(previous) = self.last_request_id
-            && previous
-                .next()
-                .map_or(true, |expected| expected != request.request_id)
+            && previous.next() != Ok(request.request_id)
         {
             eprintln!(
                 "muxe bridge: request ID {} followed by {} for registration {}",
@@ -973,7 +964,6 @@ impl Bridge {
         );
     }
 
-
     fn emit_unsolicited(&self, event: PipeEventKind, effects: &mut dyn HostEffects) {
         self.emit(None, self.channel_generation, event, effects);
     }
@@ -1185,7 +1175,6 @@ mod tests {
     fn registration(seed: u8) -> RegistrationId {
         RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
     }
-
 
     fn clients_for(client_id: u16, pane: PaneId) -> Vec<ClientInfo> {
         vec![ClientInfo {
@@ -1519,7 +1508,7 @@ mod tests {
             .into_iter()
             .map(|(_, event)| match event {
                 PipeEventKind::Register { .. } => "register",
-                PipeEventKind::RequestReleased { .. } => "released",
+                PipeEventKind::RequestReleased => "released",
                 PipeEventKind::DispatchAccepted { .. } => "accepted",
                 PipeEventKind::DispatchCompleted { .. } => "completed",
                 _ => "other",
@@ -1650,7 +1639,10 @@ mod tests {
         );
         assert!(host.modes.is_empty());
         let (request_id, event) = host.last_event();
-        assert_eq!(request_id, Some(RequestId::try_from(3).expect("third request")));
+        assert_eq!(
+            request_id,
+            Some(RequestId::try_from(3).expect("third request"))
+        );
         assert!(matches!(
             event,
             PipeEventKind::CaptureReady {
@@ -1846,7 +1838,7 @@ mod tests {
         bridge.update(Event::Timer(5.0), &mut host);
         assert!(host.outputs.len() > before);
         let (_, event) = host.last_event();
-        assert!(matches!(event, PipeEventKind::Heartbeat { .. }));
+        assert!(matches!(event, PipeEventKind::Heartbeat));
         assert!(host.timers >= 2);
     }
 
@@ -1871,7 +1863,7 @@ mod tests {
                         decode_event_line(line)
                             .expect("typed heartbeat frame")
                             .event,
-                        PipeEventKind::Heartbeat { .. }
+                        PipeEventKind::Heartbeat
                     )
             }),
             "later heartbeat output must target the held event source"
