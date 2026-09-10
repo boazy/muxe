@@ -71,9 +71,10 @@ use muxe_adapter_zellij::channel_names;
 use muxe_protocol::control::CompatibilityRecord;
 use muxe_zellij_protocol::{
     BRIDGE_PROTOCOL_VERSION, BridgeEvent, BridgeRequest, BridgeResponse, BridgeTarget,
-    ChannelGeneration, MAX_PIPE_LINE_LEN, PipeEvent, PipeEventKind, PipeRequest, RegistrationId,
-    RequestId, ZellijOriginRequest, bridge_build_id, bridge_protocol_fingerprint,
-    decode_event_line, encode_request_line, generated_action_fingerprint, pinned_source_revision,
+    ChannelGeneration, EventSubscription, MAX_PIPE_LINE_LEN, PipeEvent, PipeEventKind, PipeRequest,
+    RegistrationId, RequestId, ZellijOriginRequest, bridge_build_id, bridge_protocol_fingerprint,
+    decode_event_line, decode_event_subscription, encode_event_subscription, encode_request_line,
+    generated_action_fingerprint, pinned_source_revision,
 };
 use sha2::{Digest, Sha256};
 use support::{
@@ -704,6 +705,13 @@ fn duo_request_id(counter: u64) -> RequestId {
     RequestId::try_from(counter).expect("duo request IDs start at one")
 }
 
+/// Produces the typed initial-generation payload consumed by the bridge's
+/// event-channel subscription decoder.
+fn duo_subscription_payload() -> io::Result<String> {
+    encode_event_subscription(EventSubscription::new(ChannelGeneration::INITIAL))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
 /// Simultaneous two-client regression on a second fresh Rig: two real PTY
 /// clients on one session, exact-two authoritative census before admission,
 /// two anchor-bound bridge Registers, then sequential typed read-only
@@ -758,6 +766,7 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
         eprintln!("[duo] authoritative census: {anchor:?}");
 
         let (request_name, event_name) = channel_names("duo");
+        let subscription = duo_subscription_payload()?;
         let mut request = spawn_duo_pipe(
             host,
             &rig.scoped_root,
@@ -773,9 +782,7 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
             &zellij_binary,
             "duo",
             &event_name,
-            Some(&format!(
-                "{{\"muxe\":\"subscribe\",\"protocol\":{BRIDGE_PROTOCOL_VERSION}}}"
-            )),
+            Some(&subscription),
             "duo-event",
         ) {
             Ok(event) => event,
@@ -1878,5 +1885,15 @@ mod tests {
         .to_string();
         assert!(error.contains("body failure"));
         assert!(error.contains("teardown failure"));
+    }
+
+    #[test]
+    fn duo_subscription_payload_carries_initial_generation() {
+        let payload = duo_subscription_payload().expect("subscription payload");
+        let subscription = decode_event_subscription(&payload).expect("valid subscription");
+        assert_eq!(
+            subscription.channel_generation(),
+            ChannelGeneration::INITIAL
+        );
     }
 }
