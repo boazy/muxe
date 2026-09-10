@@ -676,9 +676,7 @@ impl Bridge {
                 self.emit_for_request(
                     request_id,
                     generation,
-                    BridgeResponse::DispatchAccepted {
-                        execution: execution.clone(),
-                    },
+                    BridgeResponse::DispatchAccepted { execution },
                     effects,
                 );
                 self.emit_for_request(
@@ -700,9 +698,7 @@ impl Bridge {
                 self.emit_for_request(
                     request_id,
                     generation,
-                    BridgeResponse::DispatchAccepted {
-                        execution: execution.clone(),
-                    },
+                    BridgeResponse::DispatchAccepted { execution },
                     effects,
                 );
                 self.emit_for_request(
@@ -720,7 +716,7 @@ impl Bridge {
                     correlated,
                     PendingAction {
                         request_id,
-                        execution: execution.clone(),
+                        execution,
                         channel_generation: generation,
                     },
                 );
@@ -909,9 +905,7 @@ impl Bridge {
         self.emit_for_request(
             request_id,
             generation,
-            BridgeResponse::DispatchAccepted {
-                execution: execution.clone(),
-            },
+            BridgeResponse::DispatchAccepted { execution },
             effects,
         );
         self.emit_for_request(
@@ -947,9 +941,7 @@ impl Bridge {
         self.emit_for_request(
             request_id,
             generation,
-            BridgeResponse::DispatchAccepted {
-                execution: execution.clone(),
-            },
+            BridgeResponse::DispatchAccepted { execution },
             effects,
         );
         self.emit_for_request(
@@ -1827,7 +1819,7 @@ mod tests {
                 request_msg_with_id(
                     RequestId::try_from(id).expect("nonzero request"),
                     BridgeRequest::Dispatch {
-                        execution: exec(id as u8),
+                        execution: exec(u8::try_from(id).expect("small request ID")),
                         request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
                     },
                 ),
