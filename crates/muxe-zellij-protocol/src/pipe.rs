@@ -17,8 +17,10 @@ use thiserror::Error;
 
 use crate::generated::RawNativeCommand;
 
-/// Pipe protocol version. Bridges reject requests with any other version.
-pub const BRIDGE_PROTOCOL_VERSION: u16 = 1;
+use crate::{ChannelGeneration, ProtocolVersion, RegistrationId, RequestId};
+
+/// Pipe protocol version implemented by this build.
+pub const BRIDGE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::CURRENT;
 /// Maximum accepted JSON line length on either pipe, in bytes.
 pub const MAX_PIPE_LINE_LEN: usize = 64 * 1024;
 /// Maximum length of a human-facing detail or diagnostic string.
@@ -31,18 +33,18 @@ pub struct BridgeTarget {
     /// Zellij client ID owning the target bridge, as reported by `list_clients`.
     pub client_id: String,
     /// Active bridge registration ID for that client.
-    pub registration: [u8; 16],
+    pub registration: RegistrationId,
 }
 
 /// One broker-to-bridge frame on the request pipe.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PipeRequest {
     /// Must equal [`BRIDGE_PROTOCOL_VERSION`].
-    pub protocol: u16,
-    /// Unpredictable broker-issued correlation ID, echoed by every event for it.
-    pub request_id: [u8; 16],
+    pub protocol: ProtocolVersion,
+    /// Request identity within the target registration.
+    pub request_id: RequestId,
     /// Request-channel generation; stale generations are ignored after restart.
-    pub channel_generation: u64,
+    pub channel_generation: ChannelGeneration,
     /// Only the named registration acts; every other instance drops the frame.
     pub target: BridgeTarget,
     /// Typed host payload. Raw mirrors are revalidated by the bridge before dispatch.
@@ -142,8 +144,14 @@ pub enum NeighborDirection {
 /// One bridge-to-broker frame on the event pipe.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipeEvent {
-    /// Monotonic per-registration sequence starting at 1; gaps mark lost events.
-    pub sequence: u64,
+    /// Must equal [`BRIDGE_PROTOCOL_VERSION`].
+    pub protocol: ProtocolVersion,
+    /// Request that caused this event, or `None` for unsolicited events.
+    pub request_id: Option<RequestId>,
+    /// Installed pipe generation that produced this event.
+    pub channel_generation: ChannelGeneration,
+    /// Bridge registration that produced this event.
+    pub registration: RegistrationId,
     /// Typed event payload.
     pub event: PipeEventKind,
 }
@@ -159,8 +167,6 @@ pub enum PipeEventKind {
         client_id: String,
         /// Currently focused pane from the bridge's perspective, if known.
         current_pane: Option<String>,
-        /// Fresh unpredictable registration ID for this channel lifetime.
-        registration: [u8; 16],
         /// Zellij plugin ID for diagnostics only; never a Muxe identity.
         plugin_id: Option<u32>,
         /// Version and fingerprint handshake material.
@@ -169,25 +175,14 @@ pub enum PipeEventKind {
     /// Transport acknowledgement: the target bridge validated the request and
     /// asked Zellij to unblock the request pipe. This is not action success;
     /// dispatch acceptance and completion are separate events.
-    RequestReleased {
-        /// Request being released.
-        request_id: [u8; 16],
-        /// Channel generation the request was sent on; stale generations are ignored.
-        channel_generation: u64,
-        /// Registration that acted on it.
-        registration: [u8; 16],
-    },
+    RequestReleased,
     /// The bridge accepted a dispatch request after revalidation.
     DispatchAccepted {
-        /// Request that was accepted.
-        request_id: [u8; 16],
         /// Broker execution ID from the request.
         execution: String,
     },
     /// Final outcome for one accepted dispatch.
     DispatchCompleted {
-        /// Request that completed.
-        request_id: [u8; 16],
         /// Broker execution ID from the request.
         execution: String,
         /// Typed outcome; see [`CommandOutcome`].
@@ -206,10 +201,6 @@ pub enum PipeEventKind {
     OriginDeclined {
         /// Broker UI session from the request, for waiter routing.
         ui_session: String,
-        /// Request being declined.
-        request_id: [u8; 16],
-        /// Registration that declined it.
-        registration: [u8; 16],
     },
     /// Locked-mode capture confirmed with the snapshotted prior mode.
     CaptureReady {
@@ -226,12 +217,7 @@ pub enum PipeEventKind {
         reason: CaptureLostReason,
     },
     /// Periodic liveness for the heartbeat lease owned by one registration.
-    Heartbeat {
-        /// Registration renewing its lease.
-        registration: [u8; 16],
-        /// Client the registration serves.
-        client_id: String,
-    },
+    Heartbeat,
 }
 
 /// Why the bridge stopped owning capture outside the broker-driven path.
@@ -398,16 +384,6 @@ impl PipeRequest {
                 ),
             });
         }
-        if self.request_id == [0; 16] {
-            return Err(PipeError::Validation {
-                reason: "request ID must not be zero".to_owned(),
-            });
-        }
-        if self.target.registration == [0; 16] {
-            return Err(PipeError::Validation {
-                reason: "target registration must not be zero".to_owned(),
-            });
-        }
         require_non_empty("target client ID", &self.target.client_id)?;
         self.payload.validate()
     }
@@ -459,11 +435,30 @@ impl PipeEvent {
     ///
     /// # Errors
     ///
-    /// Returns [`PipeError::Validation`] when the sequence is zero or payload invalid.
+    /// Returns [`PipeError::Validation`] when protocol provenance, request
+    /// correlation, or payload semantics are invalid.
     pub fn validate(&self) -> Result<(), PipeError> {
-        if self.sequence == 0 {
+        if self.protocol != BRIDGE_PROTOCOL_VERSION {
             return Err(PipeError::Validation {
-                reason: "event sequence must not be zero".to_owned(),
+                reason: format!(
+                    "unsupported bridge protocol {}; expected {BRIDGE_PROTOCOL_VERSION}",
+                    self.protocol
+                ),
+            });
+        }
+        let expects_request = !matches!(
+            self.event,
+            PipeEventKind::Register { .. }
+                | PipeEventKind::Heartbeat
+                | PipeEventKind::CaptureLost { .. }
+        );
+        if expects_request != self.request_id.is_some() {
+            return Err(PipeError::Validation {
+                reason: if expects_request {
+                    "solicited event requires a request ID".to_owned()
+                } else {
+                    "unsolicited event must not carry a request ID".to_owned()
+                },
             });
         }
         self.event.validate()
@@ -484,51 +479,17 @@ impl PipeEventKind {
         match self {
             Self::Register {
                 client_id,
-                registration,
                 identity,
                 ..
             } => {
                 require_non_empty("client ID", client_id)?;
-                if registration == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "registration ID must not be zero".to_owned(),
-                    });
-                }
                 identity.validate()
             }
-            Self::RequestReleased {
-                request_id,
-                registration,
-                ..
-            } => {
-                if request_id == &[0; 16] || registration == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "release acknowledgement IDs must not be zero".to_owned(),
-                    });
-                }
-                Ok(())
-            }
-            Self::DispatchAccepted {
-                request_id,
-                execution,
-            } => {
-                if request_id == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "request ID must not be zero".to_owned(),
-                    });
-                }
+            Self::RequestReleased => Ok(()),
+            Self::DispatchAccepted { execution } => {
                 require_non_empty("execution ID", execution)
             }
-            Self::DispatchCompleted {
-                request_id,
-                execution,
-                outcome,
-            } => {
-                if request_id == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "request ID must not be zero".to_owned(),
-                    });
-                }
+            Self::DispatchCompleted { execution, outcome } => {
                 require_non_empty("execution ID", execution)?;
                 if outcome.detail.len() > MAX_DETAIL_LEN {
                     return Err(PipeError::Validation {
@@ -541,18 +502,8 @@ impl PipeEventKind {
                 require_non_empty("UI session", ui_session)?;
                 origin.validate()
             }
-            Self::OriginDeclined {
-                ui_session,
-                request_id,
-                registration,
-            } => {
-                require_non_empty("UI session", ui_session)?;
-                if request_id == &[0; 16] || registration == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "decline IDs must not be zero".to_owned(),
-                    });
-                }
-                Ok(())
+            Self::OriginDeclined { ui_session } => {
+                require_non_empty("UI session", ui_session)
             }
             Self::CaptureReady { lease, prior_mode } => {
                 if lease == &[0; 16] {
@@ -570,17 +521,7 @@ impl PipeEventKind {
                 }
                 Ok(())
             }
-            Self::Heartbeat {
-                registration,
-                client_id,
-            } => {
-                if registration == &[0; 16] {
-                    return Err(PipeError::Validation {
-                        reason: "registration ID must not be zero".to_owned(),
-                    });
-                }
-                require_non_empty("client ID", client_id)
-            }
+            Self::Heartbeat => Ok(()),
         }
     }
 }
@@ -703,11 +644,16 @@ pub fn decode_event_line(line: &str) -> Result<PipeEvent, PipeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn registration(seed: u8) -> RegistrationId {
+        RegistrationId::from_parts(1_700_000_000_000, [seed; 10])
+            .expect("test registration")
+    }
+
 
     fn sample_target() -> BridgeTarget {
         BridgeTarget {
             client_id: "client-1".to_owned(),
-            registration: [7; 16],
+            registration: registration(7),
         }
     }
 
@@ -715,8 +661,8 @@ mod tests {
     fn request_round_trip_preserves_typed_payload() {
         let request = PipeRequest {
             protocol: BRIDGE_PROTOCOL_VERSION,
-            request_id: [1; 16],
-            channel_generation: 3,
+            request_id: RequestId::INITIAL,
+            channel_generation: ChannelGeneration::try_from(3).expect("generation"),
             target: sample_target(),
             payload: BridgeRequest::EndCapture {
                 lease: [9; 16],
@@ -729,18 +675,20 @@ mod tests {
     }
 
     #[test]
-    fn wrong_protocol_version_is_rejected() {
+    fn wrong_protocol_version_and_zero_request_are_rejected() {
         let mut request = PipeRequest {
-            protocol: BRIDGE_PROTOCOL_VERSION + 1,
-            request_id: [1; 16],
-            channel_generation: 0,
+            protocol: ProtocolVersion::try_from(2).expect("version two"),
+            request_id: RequestId::INITIAL,
+            channel_generation: ChannelGeneration::INITIAL,
             target: sample_target(),
             payload: BridgeRequest::RetireBridge,
         };
         assert!(request.validate().is_err());
         request.protocol = BRIDGE_PROTOCOL_VERSION;
-        request.request_id = [0; 16];
-        assert!(request.validate().is_err());
+        let line = serde_json::to_string(&request)
+            .expect("request serializes")
+            .replace("\"request_id\":1", "\"request_id\":0");
+        assert!(decode_request_line(&line).is_err());
     }
 
     #[test]
@@ -757,15 +705,25 @@ mod tests {
     }
 
     #[test]
-    fn zero_sequence_and_zero_lease_are_rejected() {
-        let event = PipeEvent {
-            sequence: 0,
-            event: PipeEventKind::Heartbeat {
-                registration: [2; 16],
-                client_id: "c".to_owned(),
-            },
+    fn event_envelope_enforces_request_correlation_and_capture_lease() {
+        let unsolicited = PipeEvent {
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            request_id: None,
+            channel_generation: ChannelGeneration::INITIAL,
+            registration: registration(2),
+            event: PipeEventKind::Heartbeat,
         };
-        assert!(event.validate().is_err());
+        assert!(unsolicited.validate().is_ok());
+        let missing_request = PipeEvent {
+            event: PipeEventKind::RequestReleased,
+            ..unsolicited.clone()
+        };
+        assert!(missing_request.validate().is_err());
+        let unexpected_request = PipeEvent {
+            request_id: Some(RequestId::INITIAL),
+            ..unsolicited
+        };
+        assert!(unexpected_request.validate().is_err());
         let lost = PipeEventKind::CaptureLost {
             lease: [0; 16],
             reason: CaptureLostReason::UserModeChanged,

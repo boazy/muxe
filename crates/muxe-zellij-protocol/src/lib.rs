@@ -14,10 +14,14 @@
 
 pub mod compat;
 pub mod generated;
+pub mod ids;
 pub mod pipe;
 pub use compat::{
     bridge_build_id, bridge_build_id_hex, bridge_protocol_fingerprint,
     generated_action_fingerprint, pinned_source_revision, pinned_zellij_version,
+};
+pub use ids::{
+    ChannelGeneration, ProtocolScalarError, ProtocolVersion, RegistrationId, RequestId,
 };
 pub use pipe::{
     BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, BridgeTarget, CaptureEndReason,
