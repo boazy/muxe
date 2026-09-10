@@ -158,6 +158,10 @@ struct ActiveCapture {
     prior: InputMode,
 }
 
+struct RestoreBarrier {
+    locked_observed: bool,
+}
+
 /// Permission gate for privileged host queries: the bridge requests
 /// permissions at load but issues no privileged query before the host's
 /// explicit grant event. The grant is subscribed explicitly because the
@@ -188,7 +192,7 @@ pub struct Bridge {
     current_mode: Option<InputMode>,
     pending: Option<PendingCapture>,
     active: Option<ActiveCapture>,
-    restoring_mode: Option<InputMode>,
+    restoring_mode: Option<RestoreBarrier>,
     muxe_panes: BTreeSet<String>,
     last_non_muxe_pane: Option<String>,
     origin_pane: Option<String>,
@@ -362,11 +366,15 @@ impl Bridge {
     fn on_mode_update(&mut self, mode: &ModeInfo, effects: &mut dyn HostEffects) {
         let locked = mode.mode == InputMode::Locked;
         self.current_mode = Some(mode.mode);
-        // A restore request is asynchronous. Ignore repeated Locked updates
-        // until the host reports the restored (or another non-Locked) mode;
-        // otherwise a replacement capture could inherit stale Locked state.
-        if self.restoring_mode.is_some() {
+        // Active restoration has already observed Locked. Canceling a pending
+        // requested capture must first observe the queued Locked transition,
+        // then a later non-Locked restoration, before a replacement can start.
+        if let Some(restoring) = &mut self.restoring_mode {
             if locked {
+                restoring.locked_observed = true;
+                return;
+            }
+            if !restoring.locked_observed {
                 return;
             }
             self.restoring_mode = None;
@@ -469,15 +477,47 @@ impl Bridge {
         effects.arm_timer(HEARTBEAT_SECS);
     }
 
-    /// Takes the active capture and issues the guarded restore while the
-    /// client is still in Muxe-owned Locked mode. A non-Locked prior arms the
-    /// restoring barrier so a replacement capture waits for the restore
-    /// observation instead of inheriting stale Locked state.
-    fn take_active_for_restore(&mut self, effects: &mut dyn HostEffects) -> Option<ActiveCapture> {
-        let active = self.active.take()?;
+    /// Cancels matching capture state and compensates every queued Locked
+    /// transition before allowing another capture to inherit observed mode.
+    ///
+    /// `lease = None` cancels all capture state for channel reset/retirement.
+    /// A specific lease preserves newer, unrelated pending or active owners.
+    fn cancel_capture_for_restore(
+        &mut self,
+        lease: Option<CaptureLeaseId>,
+        effects: &mut dyn HostEffects,
+    ) -> Option<ActiveCapture> {
+        let pending_matches = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| lease.is_none_or(|lease| pending.lease == lease));
+        if pending_matches {
+            let pending = self.pending.take().expect("matching pending capture");
+            if pending.requested
+                && let Some(prior) = pending.prior
+            {
+                self.restoring_mode = Some(RestoreBarrier {
+                    locked_observed: false,
+                });
+                // Queued after the earlier Locked request, so the host applies
+                // Locked and then restores the observed prior mode.
+                effects.switch_mode(prior);
+            }
+        }
+
+        let active_matches = self
+            .active
+            .as_ref()
+            .is_some_and(|active| lease.is_none_or(|lease| active.lease == lease));
+        if !active_matches {
+            return None;
+        }
+        let active = self.active.take().expect("matching active capture");
         if self.current_mode == Some(InputMode::Locked) {
             if active.prior != InputMode::Locked {
-                self.restoring_mode = Some(active.prior);
+                self.restoring_mode = Some(RestoreBarrier {
+                    locked_observed: true,
+                });
             }
             effects.switch_mode(active.prior);
         }
@@ -489,7 +529,7 @@ impl Bridge {
         // pending async completions fail instead of dangling. Only unload
         // discards the restoring barrier.
         let restore = self.current_mode == Some(InputMode::Locked);
-        if let Some(active) = self.take_active_for_restore(effects)
+        if let Some(active) = self.cancel_capture_for_restore(None, effects)
             && restore
         {
             self.emit_unsolicited(
@@ -529,8 +569,7 @@ impl Bridge {
         // A replacement channel restores any still-owned capture through the
         // shared guard, but preserves the restoring barrier until a
         // non-Locked ModeUpdate is observed.
-        self.take_active_for_restore(effects);
-        self.pending = None;
+        self.cancel_capture_for_restore(None, effects);
         self.pending_actions.clear();
         self.registration = None;
         self.channel_generation = Some(subscription.channel_generation());
@@ -815,22 +854,9 @@ impl Bridge {
         _reason: CaptureEndReason,
         effects: &mut dyn HostEffects,
     ) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.lease == lease)
-        {
-            self.pending = None;
-        }
-        // Guarded restore: only the owning lease restores through the shared
-        // guard. A stale lease leaves the current owner untouched.
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.lease == lease)
-        {
-            self.take_active_for_restore(effects);
-        }
+        // Guarded cancellation restores only matching pending or active state.
+        // A stale lease leaves every newer owner untouched.
+        self.cancel_capture_for_restore(Some(lease), effects);
         self.release(cli_id, request_id, generation, effects);
     }
 
@@ -963,8 +989,7 @@ impl Bridge {
         // fails every pending async completion instead of dangling it. The
         // restoring barrier is preserved until a non-Locked ModeUpdate is
         // observed.
-        self.take_active_for_restore(effects);
-        self.pending = None;
+        self.cancel_capture_for_restore(None, effects);
         let pending: Vec<PendingAction> = std::mem::take(&mut self.pending_actions)
             .into_values()
             .collect();
@@ -1645,6 +1670,111 @@ mod tests {
                 ..
             }) if actual_lease == lease(11)
         ));
+    }
+
+    #[test]
+    fn ending_requested_pending_capture_compensates_delayed_locked() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: lease(61),
+                ui_session: session("ui-1"),
+            }),
+            &mut host,
+        );
+        assert_eq!(host.modes.as_slice(), [InputMode::Locked]);
+        bridge.pipe(
+            request_msg_with_id(
+                RequestId::try_from(2).expect("second request"),
+                BridgeRequest::EndCapture {
+                    lease: lease(61),
+                    reason: CaptureEndReason::UiDismissed,
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal]
+        );
+        assert_eq!(bridge.capture_state(), (None, None));
+
+        // A repeated pre-transition Normal observation cannot clear the
+        // barrier before the already queued Locked transition is observed.
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg_with_id(
+                RequestId::try_from(3).expect("third request"),
+                BridgeRequest::BeginCapture {
+                    lease: lease(62),
+                    ui_session: session("ui-2"),
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(bridge.capture_state(), (Some([62; 16]), None));
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal]
+        );
+
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (Some([62; 16]), None));
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal, InputMode::Locked]
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([62; 16])));
+    }
+
+    #[test]
+    fn resubscribing_requested_pending_capture_compensates_delayed_locked() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: lease(71),
+                ui_session: session("ui-1"),
+            }),
+            &mut host,
+        );
+        bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal]
+        );
+        assert_eq!(bridge.capture_state(), (None, None));
+
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert_eq!(bridge.active_registration(), Some(registration(8)));
+        bridge.pipe(
+            request_msg_for(
+                registration(8),
+                RequestId::INITIAL,
+                BridgeRequest::BeginCapture {
+                    lease: lease(72),
+                    ui_session: session("ui-2"),
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(bridge.capture_state(), (Some([72; 16]), None));
+
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (Some([72; 16]), None));
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        assert_eq!(
+            host.modes.as_slice(),
+            [InputMode::Locked, InputMode::Normal, InputMode::Locked]
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([72; 16])));
     }
 
     #[test]
