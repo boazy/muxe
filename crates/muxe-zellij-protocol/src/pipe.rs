@@ -11,15 +11,15 @@
 //! This module supplies the Zellij-specific payloads: they are plain typed
 //! structs with no `serde_json::Value` anywhere on the path between crates.
 
-use muxe_protocol::{
-    BridgeEventEnvelope, BridgeRequestEnvelope, SchemaFingerprint,
-};
+use muxe_protocol::{BridgeEventEnvelope, BridgeRequestEnvelope, SchemaFingerprint};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::generated::RawNativeCommand;
 
-use crate::{ChannelGeneration, ProtocolVersion, RegistrationId, RequestId};
+#[cfg(test)]
+use crate::RequestId;
+use crate::{ChannelGeneration, ProtocolVersion, RegistrationId};
 
 /// Pipe protocol version implemented by this build.
 pub const BRIDGE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::CURRENT;

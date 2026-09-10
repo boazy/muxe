@@ -41,6 +41,13 @@ pub struct BridgeProtocolVersion(NonZeroU16);
 impl BridgeProtocolVersion {
     /// Initial protocol version.
     pub const INITIAL: Self = Self(NonZeroU16::MIN);
+    /// Current v1 protocol version.
+    pub const CURRENT: Self = Self::INITIAL;
+    /// Whether this value names the protocol implemented by this build.
+    #[must_use]
+    pub const fn is_current(self) -> bool {
+        self.0.get() == Self::CURRENT.0.get()
+    }
 
     /// Raw wire value.
     #[must_use]
@@ -202,7 +209,7 @@ impl BridgeRegistrationId {
 
     /// Whether this is the reserved nil registration.
     #[must_use]
-    pub const fn is_zero(self) -> bool {
+    pub fn is_zero(self) -> bool {
         self.0 == [0; 16]
     }
 }

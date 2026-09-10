@@ -1,10 +1,8 @@
 //! Shared bridge identifiers specialized by the Zellij protocol.
 
 pub use muxe_protocol::{
-    BridgeChannelGeneration as ChannelGeneration,
-    BridgeProtocolScalarError as ProtocolScalarError,
-    BridgeProtocolVersion as ProtocolVersion,
-    BridgeRegistrationId as RegistrationId,
+    BridgeChannelGeneration as ChannelGeneration, BridgeProtocolScalarError as ProtocolScalarError,
+    BridgeProtocolVersion as ProtocolVersion, BridgeRegistrationId as RegistrationId,
     BridgeRequestId as RequestId,
 };
 

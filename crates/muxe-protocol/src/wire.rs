@@ -1,10 +1,10 @@
 use std::sync::LazyLock;
 
+use crate::bridge::BridgeRegistrationId;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use crate::bridge::BridgeRegistrationId;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024;
