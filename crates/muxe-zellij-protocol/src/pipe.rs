@@ -11,9 +11,7 @@
 //! This module supplies the Zellij-specific payloads: they are plain typed
 //! structs with no `serde_json::Value` anywhere on the path between crates.
 
-use muxe_protocol::{
-    BridgeEventEnvelope, BridgeRequestEnvelope, SchemaFingerprint, Validate,
-};
+use muxe_protocol::{BridgeEventEnvelope, BridgeRequestEnvelope, SchemaFingerprint, Validate};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -472,8 +470,9 @@ impl ValidateBridgeEvent for BridgeEvent {
             Self::CaptureLost { lease, .. } => validate_common(lease),
             Self::Heartbeat => Ok(()),
             Self::Health { .. } => Err(PipeError::Validation {
-                reason: "Zellij permits only Register, Heartbeat, and CaptureLost as unsolicited events"
-                    .to_owned(),
+                reason:
+                    "Zellij permits only Register, Heartbeat, and CaptureLost as unsolicited events"
+                        .to_owned(),
             }),
             Self::Host(_) => Err(PipeError::Validation {
                 reason: "unsupported Zellij event extension".to_owned(),
@@ -644,6 +643,28 @@ mod tests {
             .expect("request serializes")
             .replace("\"request_id\":1", "\"request_id\":0");
         assert!(decode_request_line(&line).is_err());
+    }
+
+    #[test]
+    fn common_lifecycle_identifiers_are_validated() {
+        let mut request = PipeRequest {
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            request_id: RequestId::INITIAL,
+            registration: registration(7),
+            channel_generation: ChannelGeneration::INITIAL,
+            target: sample_target(),
+            payload: BridgeRequest::Dispatch {
+                execution: muxe_protocol::ExecutionId([0; 16]),
+                request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
+            },
+        };
+        assert!(request.validate().is_err());
+
+        request.payload = BridgeRequest::BeginCapture {
+            lease: muxe_protocol::CaptureLeaseId([1; 16]),
+            ui_session: muxe_protocol::UiSessionId::new(""),
+        };
+        assert!(request.validate().is_err());
     }
 
     #[test]

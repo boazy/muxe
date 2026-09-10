@@ -47,6 +47,10 @@ use muxe_core::{
     ActionValidation, ActionValidator, ConfigDiagnostic, ExecutionCapabilities, ExecutionId,
     NativeActionCandidate, OriginContext, PaneId, PortableAction, SourceSpan,
 };
+use muxe_protocol::{
+    CaptureLeaseId as CommonCaptureLeaseId, ExecutionId as CommonExecutionId,
+    UiSessionId as CommonUiSessionId,
+};
 use muxe_zellij_protocol::{
     BridgeEvent, BridgeRequest, BridgeResponse, CaptureEndReason, ChannelGeneration,
     EventSubscription, MAX_PIPE_LINE_LEN, PipeEventKind, PipeRequest, RegistrationId, RequestId,
@@ -945,9 +949,9 @@ impl ZellijAdapter {
                         };
                         let mut pending = self.inner.pending_origin.lock().await;
                         if pending
-                            .get(&ui_session)
+                            .get(ui_session.as_str())
                             .is_some_and(|reply| reply.request == Some(request))
-                            && let Some(reply) = pending.remove(&ui_session)
+                            && let Some(reply) = pending.remove(ui_session.as_str())
                         {
                             let _ = reply.sender.send(Ok(origin));
                         }
@@ -959,9 +963,9 @@ impl ZellijAdapter {
                         };
                         let mut pending = self.inner.pending_origin.lock().await;
                         if pending
-                            .get(&ui_session)
+                            .get(ui_session.as_str())
                             .is_some_and(|reply| reply.request == Some(request))
-                            && let Some(reply) = pending.remove(&ui_session)
+                            && let Some(reply) = pending.remove(ui_session.as_str())
                         {
                             let _ = reply.sender.send(Err(OriginError::InvalidId {
                                 field: "ui-pane",
@@ -976,15 +980,15 @@ impl ZellijAdapter {
                         };
                         let mut pending = self.inner.pending_capture.lock().await;
                         if pending
-                            .get(&lease)
+                            .get(&lease.0)
                             .is_some_and(|(_, reply)| reply.request == Some(request))
-                            && let Some((_, reply)) = pending.remove(&lease)
+                            && let Some((_, reply)) = pending.remove(&lease.0)
                         {
                             let _ = reply.sender.send(Ok(state.prior_mode));
                         }
                     }
                     PipeEventKind::Event(BridgeEvent::CaptureLost { lease, reason }) => {
-                        self.inner.pending_capture.lock().await.remove(&lease);
+                        self.inner.pending_capture.lock().await.remove(&lease.0);
                         let loss = match reason {
                             muxe_zellij_protocol::CaptureLostReason::UserModeChanged => {
                                 muxe_adapter_api::CaptureLossReason::UserModeChanged
@@ -996,7 +1000,7 @@ impl ZellijAdapter {
                         };
                         self.emit(AdapterHealthEvent::CaptureLost {
                             lease: ApiCaptureLease {
-                                id: CaptureLeaseId::new(hex_id(&lease)),
+                                id: CaptureLeaseId::new(hex_id(&lease.0)),
                                 ui_session: UiSessionId::new("unknown"),
                                 modal_scope: ModalScopeId::new("unknown"),
                             },
@@ -1018,8 +1022,6 @@ impl ZellijAdapter {
                     | PipeEventKind::Event(
                         BridgeEvent::Register { .. }
                         | BridgeEvent::Health { .. }
-                        | BridgeEvent::Retire
-                        | BridgeEvent::Shutdown
                         | BridgeEvent::Host(_),
                     ) => {}
                 }
@@ -1132,16 +1134,19 @@ impl ZellijAdapter {
         &self,
         request_id: RequestId,
         registration: RegistrationId,
-        execution: String,
+        execution: CommonExecutionId,
         outcome: muxe_zellij_protocol::CommandOutcome,
     ) {
-        let execution_id: u64 = execution.parse().unwrap_or(u64::MAX);
+        let Some(execution) = common_to_core(&execution) else {
+            // Completion for an encoding no broker execution can own.
+            return;
+        };
         let expected = self
             .inner
             .live_executions
             .lock()
             .await
-            .get(&execution_id)
+            .get(&execution.0)
             .copied()
             .flatten();
         if !expected.is_some_and(|provenance| {
@@ -1150,24 +1155,19 @@ impl ZellijAdapter {
             // Completion for an unsent, forgotten, or displaced request.
             return;
         }
-        self.inner
-            .live_executions
-            .lock()
-            .await
-            .remove(&execution_id);
+        self.inner.live_executions.lock().await.remove(&execution.0);
         let completion = match outcome.status {
-            muxe_zellij_protocol::CommandStatus::Succeeded => DispatchCompletion::Succeeded {
-                execution: ExecutionId(execution_id),
-            },
+            muxe_zellij_protocol::CommandStatus::Succeeded => {
+                DispatchCompletion::Succeeded { execution }
+            }
             muxe_zellij_protocol::CommandStatus::Failed => DispatchCompletion::Failed {
-                execution: ExecutionId(execution_id),
+                execution,
                 error: AdapterError::new(AdapterErrorKind::DispatchFailed, outcome.detail),
             },
         };
         self.emit(AdapterHealthEvent::DispatchCompleted(completion))
             .await;
     }
-
     #[expect(
         clippy::too_many_lines,
         reason = "registration retirement is one serialized cleanup transaction"
@@ -1413,12 +1413,17 @@ impl ZellijAdapter {
         };
         let replay_safe = !matches!(&payload, BridgeRequest::Dispatch { .. });
         if let BridgeRequest::BeginCapture { lease, .. } = &payload
-            && let Some((_, pending)) = self.inner.pending_capture.lock().await.get_mut(lease)
+            && let Some((_, pending)) = self.inner.pending_capture.lock().await.get_mut(&lease.0)
         {
             pending.request = Some(request);
         }
         if let BridgeRequest::RequestOrigin { ui_session, .. } = &payload
-            && let Some(pending) = self.inner.pending_origin.lock().await.get_mut(ui_session)
+            && let Some(pending) = self
+                .inner
+                .pending_origin
+                .lock()
+                .await
+                .get_mut(ui_session.as_str())
         {
             pending.request = Some(request);
         }
@@ -1905,7 +1910,7 @@ impl ZellijAdapter {
         self.enqueue_lifecycle(
             client_id.to_owned(),
             BridgeRequest::RequestOrigin {
-                ui_session: ui_session.to_owned(),
+                ui_session: CommonUiSessionId::new(ui_session),
                 request: ZellijOriginRequest {
                     ui_pane: ui_pane.to_owned(),
                 },
@@ -1921,7 +1926,7 @@ impl ZellijAdapter {
                     Some(BridgeRequest::RequestOrigin {
                         ui_session: pending,
                         ..
-                    }) if pending == ui_session
+                    }) if pending.as_str() == ui_session
                 )
             });
         }
@@ -1993,7 +1998,7 @@ impl ZellijAdapter {
             execution: Some(execution),
             client_id,
             payload: Some(BridgeRequest::Dispatch {
-                execution: execution.0.to_string(),
+                execution: execution_to_common(execution),
                 request: ZellijDispatchRequest::Command(raw),
             }),
         })
@@ -2054,6 +2059,20 @@ impl ZellijAdapter {
         })
         .await;
     }
+}
+
+fn execution_to_common(execution: ExecutionId) -> CommonExecutionId {
+    let mut bytes = [0; 16];
+    bytes[8..].copy_from_slice(&execution.0.to_be_bytes());
+    CommonExecutionId(bytes)
+}
+
+fn common_to_core(execution: &CommonExecutionId) -> Option<ExecutionId> {
+    if execution.0[..8] != [0; 8] {
+        return None;
+    }
+    let bytes: [u8; 8] = execution.0[8..].try_into().ok()?;
+    Some(ExecutionId(u64::from_be_bytes(bytes)))
 }
 
 fn hex_id(id: &[u8; 16]) -> String {
@@ -2219,8 +2238,8 @@ impl HostAdapter for ZellijAdapter {
         self.enqueue_lifecycle(
             client_id.clone(),
             BridgeRequest::BeginCapture {
-                lease,
-                ui_session: request.ui_session.as_str().to_owned(),
+                lease: CommonCaptureLeaseId(lease),
+                ui_session: CommonUiSessionId::new(request.ui_session.as_str()),
             },
         )
         .await;
@@ -2252,7 +2271,7 @@ impl HostAdapter for ZellijAdapter {
                     !matches!(
                         item.payload.as_ref(),
                         Some(BridgeRequest::BeginCapture { lease: pending, .. })
-                            if *pending == lease
+                            if pending.0 == lease
                     )
                 });
             }
@@ -2267,7 +2286,7 @@ impl HostAdapter for ZellijAdapter {
                 self.enqueue_lifecycle(
                     client_id,
                     BridgeRequest::EndCapture {
-                        lease,
+                        lease: CommonCaptureLeaseId(lease),
                         reason: CaptureEndReason::LeaseExpired,
                     },
                 )
@@ -2320,7 +2339,7 @@ impl HostAdapter for ZellijAdapter {
             self.enqueue_lifecycle(
                 client_id,
                 BridgeRequest::EndCapture {
-                    lease: lease_id,
+                    lease: CommonCaptureLeaseId(lease_id),
                     reason: end_reason,
                 },
             )
@@ -2405,7 +2424,7 @@ impl HostAdapter for ZellijAdapter {
         self.enqueue_lifecycle(
             client.clone(),
             BridgeRequest::Dispatch {
-                execution: format!("cleanup-{}", hex_id(&self.mint_local_id())),
+                execution: CommonExecutionId(self.mint_local_id()),
                 request: ZellijDispatchRequest::Command(RawNativeCommand::ClosePaneWithId {
                     pane_id: pane,
                 }),
@@ -2521,11 +2540,11 @@ impl HostAdapter for ZellijAdapter {
                 self.active_registration(&client_id).await?;
                 let payload = match focus {
                     crate::FocusRequest::ByIndex { index } => BridgeRequest::Dispatch {
-                        execution: request.execution.0.to_string(),
+                        execution: execution_to_common(request.execution),
                         request: ZellijDispatchRequest::FocusPaneByIndex { index },
                     },
                     crate::FocusRequest::Neighbor { direction } => BridgeRequest::Dispatch {
-                        execution: request.execution.0.to_string(),
+                        execution: execution_to_common(request.execution),
                         request: ZellijDispatchRequest::FocusPaneNeighbor {
                             direction: direction.into_neighbor(),
                         },
@@ -2808,6 +2827,16 @@ mod tests {
 
     fn registration_from_bytes(bytes: [u8; 16]) -> RegistrationId {
         registration_id(bytes[0])
+    }
+
+    #[test]
+    fn common_execution_encoding_round_trips_and_rejects_foreign_space() {
+        let execution = ExecutionId(42);
+        assert_eq!(
+            common_to_core(&execution_to_common(execution)),
+            Some(execution)
+        );
+        assert_eq!(common_to_core(&CommonExecutionId([1; 16])), None);
     }
 
     fn register_event(
@@ -3304,7 +3333,7 @@ mod tests {
                 [7; 16],
                 Some(request_id),
                 PipeEventKind::Response(BridgeResponse::DispatchCompleted {
-                    execution: "7".to_owned(),
+                    execution: execution_to_common(ExecutionId(7)),
                     outcome: CommandOutcome::succeeded(),
                 }),
             ))
@@ -3575,7 +3604,7 @@ mod tests {
                 execution,
                 request: ZellijDispatchRequest::Command(command),
             } => {
-                assert_eq!(execution, "21");
+                assert_eq!(execution, execution_to_common(ExecutionId(21)));
                 let RawNativeCommand::RunAction { action, .. } = command else {
                     panic!("expected run-action wrap");
                 };

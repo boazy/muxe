@@ -373,6 +373,11 @@ fn candidate(type_name: &str) -> NativeActionCandidate {
 fn registration(seed: u8) -> RegistrationId {
     RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
 }
+fn common_execution(execution: ExecutionId) -> muxe_protocol::ExecutionId {
+    let mut bytes = [0; 16];
+    bytes[8..].copy_from_slice(&execution.0.to_be_bytes());
+    muxe_protocol::ExecutionId(bytes)
+}
 
 fn event_for(
     registration: RegistrationId,
@@ -769,7 +774,7 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
             registration(7),
             Some(frame.request_id),
             PipeEventKind::Response(BridgeResponse::DispatchCompleted {
-                execution: execution.0.to_string(),
+                execution: common_execution(execution),
                 outcome: CommandOutcome::succeeded(),
             }),
         ))

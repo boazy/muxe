@@ -954,7 +954,7 @@ async fn duo_route_one(
             client_id: client_id.to_owned(),
         },
         payload: BridgeRequest::RequestOrigin {
-            ui_session: ui_session.clone(),
+            ui_session: muxe_protocol::UiSessionId::new(ui_session.clone()),
             request: ZellijOriginRequest {
                 ui_pane: current_pane.clone(),
             },
@@ -1041,7 +1041,7 @@ impl DuoRouteState<'_> {
                 self.released = true;
             }
             PipeEventKind::Response(BridgeResponse::OriginSnapshot { ui_session, origin }) => {
-                if ui_session != self.ui_session {
+                if ui_session.as_str() != self.ui_session {
                     return Err(io::Error::other(format!(
                         "duo: snapshot for wrong UI session {ui_session:?} while routing client {:?}",
                         self.client_id
