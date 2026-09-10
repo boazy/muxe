@@ -1207,11 +1207,15 @@ mod tests {
         }
     }
 
-    fn request_line(target_reg: RegistrationId, payload: BridgeRequest) -> String {
+    fn request_line_with_id(
+        target_reg: RegistrationId,
+        request_id: RequestId,
+        payload: BridgeRequest,
+    ) -> String {
         use muxe_zellij_protocol::{BridgeTarget, PipeRequest};
         let frame = PipeRequest {
             protocol: BRIDGE_PROTOCOL_VERSION,
-            request_id: RequestId::INITIAL,
+            request_id,
             channel_generation: ChannelGeneration::INITIAL,
             target: BridgeTarget {
                 client_id: "5".to_owned(),
@@ -1224,14 +1228,30 @@ mod tests {
         line
     }
 
-    fn request_msg(payload: BridgeRequest) -> PipeMessage {
+    fn request_line(target_reg: RegistrationId, payload: BridgeRequest) -> String {
+        request_line_with_id(target_reg, RequestId::INITIAL, payload)
+    }
+
+    fn request_msg_for(
+        registration: RegistrationId,
+        request_id: RequestId,
+        payload: BridgeRequest,
+    ) -> PipeMessage {
         PipeMessage {
             source: PipeSource::Cli(REQUEST_CLI.to_owned()),
             name: REQUEST_NAME.to_owned(),
-            payload: Some(request_line(registration(7), payload)),
+            payload: Some(request_line_with_id(registration, request_id, payload)),
             args: BTreeMap::new(),
             is_private: false,
         }
+    }
+
+    fn request_msg(payload: BridgeRequest) -> PipeMessage {
+        request_msg_for(registration(7), RequestId::INITIAL, payload)
+    }
+
+    fn request_msg_with_id(request_id: RequestId, payload: BridgeRequest) -> PipeMessage {
+        request_msg_for(registration(7), request_id, payload)
     }
 
     fn subscribe_msg_for(cli_id: &str) -> PipeMessage {
@@ -1572,6 +1592,149 @@ mod tests {
         assert!(matches!(
             event,
             PipeEventKind::CaptureReady { lease, .. } if lease == [11; 16]
+        ));
+    }
+
+    #[test]
+    fn badly_ordered_request_ids_are_observed_but_not_rejected() {
+        let (mut bridge, mut host) = boot();
+        let before = host.unblocks.len();
+        for id in [3_u64, 2] {
+            bridge.pipe(
+                request_msg_with_id(
+                    RequestId::try_from(id).expect("nonzero request"),
+                    BridgeRequest::Dispatch {
+                        execution: format!("e{id}"),
+                        command: RawNativeCommand::CloseFocus,
+                    },
+                ),
+                &mut host,
+            );
+        }
+        assert_eq!(host.unblocks.len(), before + 2);
+        let completed: Vec<_> = host
+            .outputs
+            .iter()
+            .filter_map(|(_, line)| decode_event_line(line).ok())
+            .filter_map(|frame| {
+                matches!(frame.event, PipeEventKind::DispatchCompleted { .. })
+                    .then_some(frame.request_id)
+            })
+            .collect();
+        assert!(completed.contains(&Some(RequestId::try_from(3).expect("three"))));
+        assert!(completed.contains(&Some(RequestId::try_from(2).expect("two"))));
+    }
+
+    #[test]
+    fn retrying_active_capture_preserves_original_mode() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: [21; 16],
+                ui_session: "ui-1".to_owned(),
+            }),
+            &mut host,
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        host.modes.clear();
+        bridge.pipe(
+            request_msg_with_id(
+                RequestId::try_from(3).expect("third request"),
+                BridgeRequest::BeginCapture {
+                    lease: [21; 16],
+                    ui_session: "ui-1".to_owned(),
+                },
+            ),
+            &mut host,
+        );
+        assert!(host.modes.is_empty());
+        let (request_id, event) = host.last_event();
+        assert_eq!(request_id, Some(RequestId::try_from(3).expect("third request")));
+        assert!(matches!(
+            event,
+            PipeEventKind::CaptureReady {
+                lease,
+                prior_mode
+            } if lease == [21; 16] && prior_mode == "Normal"
+        ));
+        bridge.pipe(
+            request_msg_with_id(
+                RequestId::try_from(4).expect("fourth request"),
+                BridgeRequest::EndCapture {
+                    lease: [21; 16],
+                    reason: CaptureEndReason::LeaseExpired,
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(host.modes.as_slice(), [InputMode::Normal]);
+    }
+
+    #[test]
+    fn late_async_completion_cannot_cross_registration_reset() {
+        let (mut bridge, mut host) = boot();
+        bridge.pipe(
+            request_msg(BridgeRequest::Dispatch {
+                execution: "old".to_owned(),
+                command: RawNativeCommand::RunAction {
+                    action: muxe_zellij_protocol::generated::raw::Action::CloseFocus,
+                    context: Vec::new(),
+                },
+            }),
+            &mut host,
+        );
+        bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert_eq!(bridge.active_registration(), Some(registration(8)));
+        bridge.pipe(
+            request_msg_for(
+                registration(8),
+                RequestId::INITIAL,
+                BridgeRequest::Dispatch {
+                    execution: "new".to_owned(),
+                    command: RawNativeCommand::RunAction {
+                        action: muxe_zellij_protocol::generated::raw::Action::CloseFocus,
+                        context: Vec::new(),
+                    },
+                },
+            ),
+            &mut host,
+        );
+
+        let before = host.outputs.len();
+        bridge.update(
+            Event::ActionComplete(
+                zellij_utils::input::actions::Action::CloseFocus,
+                None,
+                BTreeMap::from([(
+                    crate::dispatcher::EXECUTION_CONTEXT_KEY.to_owned(),
+                    format!("{}:{}", registration(7), RequestId::INITIAL),
+                )]),
+            ),
+            &mut host,
+        );
+        assert_eq!(host.outputs.len(), before);
+
+        bridge.update(
+            Event::ActionComplete(
+                zellij_utils::input::actions::Action::CloseFocus,
+                None,
+                BTreeMap::from([(
+                    crate::dispatcher::EXECUTION_CONTEXT_KEY.to_owned(),
+                    format!("{}:{}", registration(8), RequestId::INITIAL),
+                )]),
+            ),
+            &mut host,
+        );
+        let (request_id, event) = host.last_event();
+        assert_eq!(request_id, Some(RequestId::INITIAL));
+        assert!(matches!(
+            event,
+            PipeEventKind::DispatchCompleted { execution, .. } if execution == "new"
         ));
     }
 

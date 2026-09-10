@@ -879,6 +879,16 @@ while IFS= read -r line; do
   esac
 done
 "#;
+    const PAYLOAD_SCRIPT: &str = r#"#!/bin/sh
+if [ "$1" != "--session" ] || [ "$3" != "pipe" ] || [ "$4" != "--name" ] || [ "$6" != "--" ]; then
+  echo "bad argv: $*" >&2
+  exit 3
+fi
+printf 'payload:%s\n' "$7"
+while IFS= read -r line; do
+  printf 'got:%s\n' "$line"
+done
+"#;
     // NOTE: `exec` is load-bearing: without it the shell leaves a `sleep`
     // grandchild holding the pipe ends, so killing the direct child neither
     // delivers stdout EOF to a blocked reader nor EPIPE to a blocked writer.
@@ -946,6 +956,32 @@ exec sleep 60
             channel.next_line().await,
             Err(PipeTransportError::Closed)
         ));
+        channel.close().await;
+    }
+
+    #[tokio::test]
+    async fn respawn_replaces_initial_payload_atomically() {
+        let (_dir, exe) = write_fake_zellij(PAYLOAD_SCRIPT);
+        let channel = SubprocessChannel::launch(
+            exe,
+            "test".to_owned(),
+            "pipe".to_owned(),
+            Some("generation-one".to_owned()),
+        )
+        .await
+        .expect("launches payload fake");
+        assert_eq!(
+            channel.next_line().await.expect("initial payload"),
+            "payload:generation-one"
+        );
+        channel
+            .respawn_with_payload("generation-two".to_owned())
+            .await
+            .expect("respawns with replacement payload");
+        assert_eq!(
+            channel.next_line().await.expect("replacement payload"),
+            "payload:generation-two"
+        );
         channel.close().await;
     }
     /// A `next_line` pending on a silent child must not deadlock `close`:

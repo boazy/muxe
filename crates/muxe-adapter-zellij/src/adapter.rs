@@ -3318,6 +3318,94 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn scheduler_rotates_after_each_released_request() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1", "client-2"]).await;
+
+        adapter
+            .enqueue_lifecycle("client-1".to_owned(), BridgeRequest::RetireBridge)
+            .await;
+        adapter
+            .enqueue_lifecycle("client-1".to_owned(), BridgeRequest::RetireBridge)
+            .await;
+        adapter
+            .enqueue_lifecycle("client-2".to_owned(), BridgeRequest::RetireBridge)
+            .await;
+        let first =
+            decode_request_line(&poll_outbound(&request).await).expect("first request frame");
+        assert_eq!(first.target.client_id, "client-1");
+        event.push_line(
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(first.request_id),
+                PipeEventKind::RequestReleased,
+            ))
+            .expect("release encodes"),
+        );
+        let second =
+            decode_request_line(&poll_outbound(&request).await).expect("second request frame");
+        assert_eq!(second.target.client_id, "client-2");
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn registration_turnover_finishes_sent_dispatch_as_unknown() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        adapter
+            .dispatch_native(NativeDispatchRequest {
+                execution: ExecutionId(77),
+                action: muxe_adapter_api::ResolvedNativeAction {
+                    candidate: candidate(),
+                },
+                origin: test_origin(),
+            })
+            .await
+            .expect("dispatch accepted");
+        let sent = decode_request_line(&poll_outbound(&request).await).expect("request frame");
+        event.push_line(
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(sent.request_id),
+                PipeEventKind::RequestReleased,
+            ))
+            .expect("release encodes"),
+        );
+        push_register(&event, "client-1", [8; 16], env!("CARGO_PKG_VERSION"));
+        await_turnover_registration(&adapter).await;
+
+        let mut saw_unknown = false;
+        for _ in 0..3 {
+            saw_unknown |= matches!(
+                next_event(&adapter).await,
+                AdapterHealthEvent::DispatchCompleted(
+                    DispatchCompletion::OutcomeUnknown {
+                        execution: ExecutionId(77),
+                        ..
+                    }
+                )
+            );
+        }
+        assert!(saw_unknown);
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&77)
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
     /// A mismatched `bridge_build_id` registration is contained: the bridge is
     /// recorded but flagged incompatible, so no dispatch line reaches the pipe.
     #[tokio::test]

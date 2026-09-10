@@ -815,6 +815,32 @@ menus:
     }));
 }
 
+#[test]
+fn keyboard_send_rejects_an_empty_key_sequence() {
+    let diagnostics = compile(
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      x:
+        label: empty
+        action:
+          type: keyboard:send
+          keys: []
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect_err("empty key sequence must be rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code
+                == muxe_core::DiagnosticCode::InvalidActionArguments)
+    );
+}
+
 fn origin_with_context_values() -> muxe_core::OriginContext {
     muxe_core::OriginContext {
         host_kind: muxe_core::OriginHostKind::Herdr,

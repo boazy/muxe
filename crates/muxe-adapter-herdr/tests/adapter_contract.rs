@@ -37,9 +37,9 @@ use muxe_core::{
     PaneId, PortableAction, ServerId, SourceId, SourceSpan,
 };
 use muxe_zellij_protocol::{
-    BridgeIdentity, BridgeRequest, CommandOutcome, PipeEvent, PipeEventKind, bridge_build_id,
-    bridge_protocol_fingerprint, decode_request_line, encode_event_line,
-    generated_action_fingerprint, pinned_source_revision,
+    BRIDGE_PROTOCOL_VERSION, BridgeIdentity, BridgeRequest, ChannelGeneration, CommandOutcome,
+    PipeEvent, PipeEventKind, RegistrationId, bridge_build_id, bridge_protocol_fingerprint,
+    decode_request_line, encode_event_line, generated_action_fingerprint, pinned_source_revision,
 };
 use support::production_connect::ProductionConnectFixture;
 use tokio::sync::Notify;
@@ -361,13 +361,31 @@ fn candidate(type_name: &str) -> NativeActionCandidate {
     }
 }
 
-fn register_event(registration: [u8; 16], build_id: muxe_protocol::SchemaFingerprint) -> PipeEvent {
+fn registration(seed: u8) -> RegistrationId {
+    RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
+}
+
+fn event_for(
+    registration: RegistrationId,
+    request_id: Option<muxe_zellij_protocol::RequestId>,
+    event: PipeEventKind,
+) -> PipeEvent {
     PipeEvent {
-        sequence: 1,
-        event: PipeEventKind::Register {
+        protocol: BRIDGE_PROTOCOL_VERSION,
+        request_id,
+        channel_generation: ChannelGeneration::INITIAL,
+        registration,
+        event,
+    }
+}
+
+fn register_event(registration_id: [u8; 16], build_id: muxe_protocol::SchemaFingerprint) -> PipeEvent {
+    event_for(
+        registration(registration_id[0]),
+        None,
+        PipeEventKind::Register {
             client_id: "client-1".to_owned(),
             current_pane: Some("terminal_2".to_owned()),
-            registration,
             plugin_id: Some(3),
             identity: BridgeIdentity {
                 muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -377,7 +395,7 @@ fn register_event(registration: [u8; 16], build_id: muxe_protocol::SchemaFingerp
                 bridge_build_id: Some(build_id),
             },
         },
-    }
+    )
 }
 
 async fn next_outbound(channel: &RecordedPipeChannel) -> String {
@@ -722,28 +740,25 @@ async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_
 
     let frame = decode_request_line(&next_outbound(&request).await).expect("typed request frame");
     assert_eq!(frame.target.client_id, "client-1");
-    assert_eq!(frame.target.registration, [7; 16]);
+    assert_eq!(frame.target.registration, registration(7));
     assert!(matches!(frame.payload, BridgeRequest::Dispatch { .. }));
     event.push_line(
-        encode_event_line(&PipeEvent {
-            sequence: 2,
-            event: PipeEventKind::RequestReleased {
-                request_id: frame.request_id,
-                channel_generation: 1,
-                registration: [7; 16],
-            },
-        })
+        encode_event_line(&event_for(
+            registration(7),
+            Some(frame.request_id),
+            PipeEventKind::RequestReleased,
+        ))
         .expect("release encodes"),
     );
     event.push_line(
-        encode_event_line(&PipeEvent {
-            sequence: 3,
-            event: PipeEventKind::DispatchCompleted {
-                request_id: frame.request_id,
+        encode_event_line(&event_for(
+            registration(7),
+            Some(frame.request_id),
+            PipeEventKind::DispatchCompleted {
                 execution: execution.0.to_string(),
                 outcome: CommandOutcome::succeeded(),
             },
-        })
+        ))
         .expect("completion encodes"),
     );
     let first = tokio::time::timeout(Duration::from_secs(2), adapter.next_health_event())

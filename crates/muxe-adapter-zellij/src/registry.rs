@@ -340,6 +340,28 @@ mod tests {
     }
 
     #[test]
+    fn event_channel_reset_rejects_retired_registration() {
+        let mut table = ZellijRegistry::new();
+        register(&mut table, "a", 1);
+        assert_eq!(
+            table.invalidate_all(),
+            vec![("a".to_owned(), registration(1))]
+        );
+        assert!(matches!(
+            table.register(
+                "a",
+                registration(1),
+                None,
+                "0.1.0".to_owned(),
+                true,
+                NOW + 1,
+            ),
+            Err(RegistryError::RetiredRegistration { .. })
+        ));
+        assert!(table.is_empty());
+    }
+
+    #[test]
     fn request_counter_resets_only_for_new_registration() {
         let mut table = ZellijRegistry::new();
         register(&mut table, "a", 1);

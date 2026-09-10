@@ -2218,6 +2218,13 @@ fn action_key_sequence(value: &ConfigValue) -> Result<Vec<ActionScalar>, Vec<Con
             value.span.clone(),
         )]);
     };
+    if values.is_empty() {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidActionArguments,
+            "keyboard:send `keys` must contain at least one key",
+            value.span.clone(),
+        )]);
+    }
     values
         .iter()
         .map(|value| {
