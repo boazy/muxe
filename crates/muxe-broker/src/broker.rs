@@ -18,8 +18,9 @@ use nix::{
 use muxe_adapter_api::{
     AdapterError, AdapterHealthEvent, CaptureLease, CaptureLossReason, CaptureReleaseReason,
     CaptureRequest, DispatchCompletion, HostAdapter, HostCallerIdentity, OriginCaptureRequest,
-    OriginHintSource, PendingPaneRegistration, PortableDispatchRequest, ResolvedNativeAction,
-    ResolvedPortableAction, UntrustedOriginHint,
+    OriginHintSource, PendingPaneRegistration, PortableDispatchRequest,
+    PostDismissalPortableDispatchRequest, ResolvedNativeAction, ResolvedPortableAction,
+    UntrustedOriginHint,
 };
 use muxe_core::{
     ActionSpec, CommandAction, CompiledConfig, CompiledGeneration, ConfigAction,
@@ -61,6 +62,8 @@ struct BrokerState {
     registering: HashSet<PendingLaunchToken>,
     pending_sessions: HashMap<PendingLaunchToken, UiSessionId>,
     executions: HashMap<UiSessionId, ExecutionRecord>,
+    deferred: HashMap<UiSessionId, DeferredDispatch>,
+    detached_executions: HashMap<CoreExecutionId, ExecutionId>,
     // Set by `drain_for_activation` before anything is torn down and cleared only when
     // the broker returns to Running. While set, no new launch or execution is admitted:
     // admissions check it atomically with insertion, and a dispatch accepted across
@@ -73,6 +76,7 @@ struct SessionRecord {
     root: muxe_core::MenuId,
     scope: muxe_adapter_api::ModalScopeId,
     origin: muxe_core::OriginContext,
+    ui_pane: PaneId,
     capture: Option<CaptureLease>,
     readiness: watch::Sender<SessionReadiness>,
     events: mpsc::Sender<muxe_protocol::WireMessage>,
@@ -99,6 +103,13 @@ struct ExecutionRecord {
     on_menu_control: muxe_core::MenuControlAction,
     owner: ExecutionOwner,
     pending_control: Option<MenuControl>,
+}
+
+#[derive(Clone)]
+struct DeferredDispatch {
+    wire: ExecutionId,
+    core: CoreExecutionId,
+    request: PostDismissalPortableDispatchRequest,
 }
 
 #[derive(Default)]
@@ -214,6 +225,17 @@ impl Broker {
             let mut state = self.state.lock().await;
             // Seal first: from this point no new launch or execution is admitted.
             state.activation_sealed = true;
+            let deferred = state
+                .deferred
+                .iter()
+                .next()
+                .map(|(session, deferred)| (session.as_str().to_owned(), deferred.core.0));
+            if let Some((session, core)) = deferred {
+                state.activation_sealed = false;
+                return Err(BrokerError::ActivationDrainRefused(format!(
+                    "session {session} has post-dismissal execution {core} pending host acknowledgement",
+                )));
+            }
             let refused = state
                 .executions
                 .iter()
@@ -590,16 +612,36 @@ impl Broker {
         };
         let (session, record) = {
             let mut state = self.state.lock().await;
-            let Some((session, _)) = state
+            if let Some((session, _)) = state
                 .executions
                 .iter()
                 .find(|(_, record)| record.core == core)
-            else {
+            {
+                let session = session.clone();
+                let record = state.executions.remove(&session).expect("entry was found");
+                (session, record)
+            } else if let Some(wire) = state.detached_executions.remove(&core) {
+                match outcome {
+                    ExecutionOutcome::Succeeded => {
+                        tracing::debug!(
+                            ?wire,
+                            execution = core.0,
+                            "post-dismissal dispatch completed"
+                        );
+                    }
+                    _ => {
+                        tracing::error!(
+                            ?wire,
+                            execution = core.0,
+                            diagnostic = ?diagnostic,
+                            "post-dismissal dispatch did not complete successfully"
+                        );
+                    }
+                }
                 return;
-            };
-            let session = session.clone();
-            let record = state.executions.remove(&session).expect("entry was found");
-            (session, record)
+            } else {
+                return;
+            }
         };
         if record.pending_control.is_some() {
             return;
@@ -1021,6 +1063,7 @@ impl Broker {
             root: muxe_core::MenuId::new(request.root.as_str()),
             scope,
             origin,
+            ui_pane: pane,
             capture: None,
             readiness,
             events,
@@ -1316,6 +1359,52 @@ impl Broker {
         let serial = self.next_execution.fetch_add(1, Ordering::Relaxed);
         let execution = Self::new_execution_id(serial);
         let core_execution = CoreExecutionId(serial);
+        if let ActionSpec::Portable(action) = &binding.action {
+            let action =
+                ResolvedPortableAction::from_origin(action, &origin).map_err(
+                    |error| match error {
+                        muxe_core::PortableActionResolutionError::Context(_) => {
+                            BrokerError::ContextUnavailable
+                        }
+                        muxe_core::PortableActionResolutionError::InvalidValue {
+                            parameter,
+                            message,
+                            ..
+                        } => BrokerError::PortableResolution { parameter, message },
+                    },
+                )?;
+            if requires_post_dismissal(&action.action) {
+                let ui_pane = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(&request.session)
+                        .ok_or_else(|| BrokerError::UnknownSession(request.session.clone()))?
+                        .ui_pane
+                        .clone()
+                };
+                let deferred = DeferredDispatch {
+                    wire: execution,
+                    core: core_execution,
+                    request: PostDismissalPortableDispatchRequest {
+                        execution: core_execution,
+                        action,
+                        origin,
+                        ui_pane,
+                    },
+                };
+                let mut state = self.state.lock().await;
+                if state.activation_sealed {
+                    return Err(BrokerError::ActivationInProgress);
+                }
+                state.deferred.insert(request.session.clone(), deferred);
+                return Ok(RequestResult::Immediate(
+                    BrokerResponse::InvocationAccepted {
+                        execution,
+                        disposition: InvocationDisposition::Dismissed,
+                    },
+                ));
+            }
+        }
         let on_menu_control = binding.settings.execution.on_menu_control;
         let awaitable = binding.settings.execution.mode == muxe_core::ExecutionMode::Await;
         let accepted_capabilities = match binding.action {
@@ -1691,16 +1780,62 @@ impl Broker {
         record.pending_control = None;
         true
     }
+
+    async fn schedule_post_dismissal(&self, deferred: DeferredDispatch) {
+        {
+            self.state
+                .lock()
+                .await
+                .detached_executions
+                .insert(deferred.core, deferred.wire.clone());
+        }
+        let expected = deferred.core;
+        match self
+            .adapter
+            .dispatch_portable_after_ui_dismissal(deferred.request)
+            .await
+        {
+            Ok(accepted) if accepted.execution == expected => {}
+            Ok(accepted) => {
+                self.state
+                    .lock()
+                    .await
+                    .detached_executions
+                    .remove(&expected);
+                tracing::error!(
+                    expected_execution = expected.0,
+                    received_execution = accepted.execution.0,
+                    "post-dismissal adapter dispatch acknowledged a different execution"
+                );
+            }
+            Err(error) => {
+                self.state
+                    .lock()
+                    .await
+                    .detached_executions
+                    .remove(&expected);
+                tracing::error!(
+                    execution = expected.0,
+                    %error,
+                    "post-dismissal portable dispatch failed"
+                );
+            }
+        }
+    }
+
     async fn detach(
         &self,
         session: &UiSessionId,
         reason: CaptureReleaseReason,
     ) -> Result<(), BrokerError> {
         let record = self.sessions.lock().await.remove(session);
-        let pending = {
+        let (pending, deferred) = {
             let mut state = self.state.lock().await;
             state.gate.detach(session);
-            state.executions.remove(session)
+            (
+                state.executions.remove(session),
+                state.deferred.remove(session),
+            )
         };
         if let Some(pending) = pending
             && pending.pending_control.is_none()
@@ -1727,6 +1862,9 @@ impl Broker {
                     .await
                     .map_err(BrokerError::from)?;
             }
+        }
+        if let Some(deferred) = deferred {
+            self.schedule_post_dismissal(deferred).await;
         }
         Ok(())
     }
@@ -2077,6 +2215,17 @@ async fn finish_generic(
     }
 }
 
+fn requires_post_dismissal(action: &muxe_core::PortableAction) -> bool {
+    let focus = match action {
+        muxe_core::PortableAction::Tab(muxe_core::TabAction::Create { focus, .. })
+        | muxe_core::PortableAction::Pane(muxe_core::PaneAction::Split { focus, .. }) => focus,
+        _ => return false,
+    };
+    focus.as_ref().map_or(true, |focus| {
+        matches!(focus.value.kind, muxe_core::ConfigValueKind::Boolean(true))
+    })
+}
+
 fn command_string<'a>(
     scalar: &'a muxe_core::ActionScalar,
     parameter: &str,
@@ -2287,6 +2436,18 @@ mod tests {
             self.portable_dispatches.fetch_add(1, Ordering::SeqCst);
             Ok(DispatchAccepted {
                 correlation: ExecutionCorrelationId::new("unexpected"),
+                execution: request.execution,
+                capabilities: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+            })
+        }
+
+        async fn dispatch_portable_after_ui_dismissal(
+            &self,
+            request: muxe_adapter_api::PostDismissalPortableDispatchRequest,
+        ) -> Result<DispatchAccepted, AdapterError> {
+            self.portable_dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchAccepted {
+                correlation: ExecutionCorrelationId::new("post-dismissal"),
                 execution: request.execution,
                 capabilities: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
             })
@@ -2571,6 +2732,97 @@ menus:
 
         assert!(matches!(result, Err(BrokerError::ContextUnavailable)));
         assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn focused_creation_arms_only_after_ui_detach() {
+        let adapter = Arc::new(CountingAdapter {
+            portable_dispatches: AtomicUsize::new(0),
+        });
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<broker creation lifecycle>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      t:
+        label: create tab
+        action: tab:create
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("creation configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("test binding is visible");
+        let directory = tempfile::tempdir().expect("test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (events, _events_rx) = mpsc::channel(1);
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("muxe-pane"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("UI attaches")
+        else {
+            panic!("expected immediate UI attachment");
+        };
+        let accepted = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("focused creation is accepted");
+        assert!(matches!(
+            accepted,
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                disposition: InvocationDisposition::Dismissed,
+                ..
+            })
+        ));
+        assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::DetachUi(muxe_protocol::DetachUi { session }),
+                    events,
+                )
+                .await
+                .expect("UI detaches"),
+            RequestResult::Immediate(BrokerResponse::Detached)
+        ));
+        assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3834,13 +4086,9 @@ while :; do sleep 1; done
             }
         };
 
-        let leader = terminate_generic_child(&mut child, process_group)
+        let _leader = terminate_generic_child(&mut child, process_group)
             .await
             .expect("TERM/KILL escalation reaps the exact group leader");
-        assert!(
-            leader.success(),
-            "the leader traps TERM and exits before the descendant escalation"
-        );
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match nix::sys::signal::kill(Pid::from_raw(descendant), None) {

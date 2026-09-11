@@ -302,6 +302,7 @@ impl UiSession {
         let disposition = match disposition {
             WireInvocationDisposition::Awaited => InvocationDisposition::Await,
             WireInvocationDisposition::Detached => InvocationDisposition::Detached,
+            WireInvocationDisposition::Dismissed => InvocationDisposition::Dismissed,
         };
         self.runtime
             .invocation_accepted(binding, execution, disposition, self.now())

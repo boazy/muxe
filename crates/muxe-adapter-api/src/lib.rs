@@ -227,6 +227,16 @@ pub struct PortableDispatchRequest {
     pub origin: OriginContext,
 }
 
+/// A portable host action that was accepted while a Muxe menu held focus and
+/// must not reach the host until that UI pane has disappeared.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PostDismissalPortableDispatchRequest {
+    pub execution: ExecutionId,
+    pub action: ResolvedPortableAction,
+    pub origin: OriginContext,
+    pub ui_pane: PaneId,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeDispatchRequest {
     pub execution: ExecutionId,
@@ -393,6 +403,21 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
         &self,
         request: PortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError>;
+
+    /// Queues a focus-sensitive creation action, then dispatches it only after
+    /// the named Muxe UI pane is gone and the captured origin is current again.
+    ///
+    /// The adapter owns the host-specific acknowledgement of pane disappearance.
+    /// A default error keeps hosts that cannot prove this ordering fail-closed.
+    async fn dispatch_portable_after_ui_dismissal(
+        &self,
+        _request: PostDismissalPortableDispatchRequest,
+    ) -> Result<DispatchAccepted, AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "this host adapter cannot dispatch a portable action after UI dismissal",
+        ))
+    }
 
     /// Dispatches a load-time validated action after the adapter performs mandatory immediate
     /// runtime validation of the fully resolved candidate.

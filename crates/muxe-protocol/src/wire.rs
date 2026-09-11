@@ -1388,6 +1388,9 @@ impl Validate for ProtocolDiagnostic {
 pub enum InvocationDisposition {
     Awaited = 1,
     Detached = 2,
+    /// The broker has queued a focus-sensitive action behind host-confirmed UI
+    /// dismissal. The UI must quit without applying the binding's after-action.
+    Dismissed = 3,
 }
 
 #[expect(

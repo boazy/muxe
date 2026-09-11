@@ -43,6 +43,9 @@ pub enum InvocationDisposition {
     Await,
     /// The configured post-action transition applies immediately.
     Detached,
+    /// A focus-sensitive action waits for host-confirmed UI disappearance.
+    /// It always quits the UI and ignores the binding's `after_action`.
+    Dismissed,
 }
 /// A fully rendered page derived from one checked archived attachment.
 pub struct PreparedMenu {
@@ -364,36 +367,44 @@ impl UiRuntime {
         at: SessionInstant,
     ) -> Result<UiCommand, UiError> {
         let policy = self.binding_policy(&binding)?;
-        if disposition == InvocationDisposition::Await {
-            if !matches!(self.menu_session.state(), MenuSessionState::Active)
-                || self.pending.is_some()
-            {
-                return Ok(UiCommand::Ignored);
-            }
-            self.next_execution = self
-                .next_execution
-                .checked_add(1)
-                .ok_or(UiError::ExecutionSequenceExhausted)?;
-            let core = CoreExecutionId(self.next_execution);
-            self.pending = Some(PendingExecution {
-                wire: execution,
-                core,
-                after_action: policy.after_action,
-            });
-            let output = self.menu_session.handle(MenuSessionEvent::ActionPending {
-                at,
-                execution: core,
-            });
-            Ok(self.menu_output(output.as_ref()))
-        } else {
-            let output = self
-                .menu_session
-                .handle(MenuSessionEvent::DetachedAccepted {
-                    at,
-                    execution: CoreExecutionId(0),
+        match disposition {
+            InvocationDisposition::Await => {
+                if !matches!(self.menu_session.state(), MenuSessionState::Active)
+                    || self.pending.is_some()
+                {
+                    return Ok(UiCommand::Ignored);
+                }
+                self.next_execution = self
+                    .next_execution
+                    .checked_add(1)
+                    .ok_or(UiError::ExecutionSequenceExhausted)?;
+                let core = CoreExecutionId(self.next_execution);
+                self.pending = Some(PendingExecution {
+                    wire: execution,
+                    core,
                     after_action: policy.after_action,
                 });
-            Ok(self.menu_output(output.as_ref()))
+                let output = self.menu_session.handle(MenuSessionEvent::ActionPending {
+                    at,
+                    execution: core,
+                });
+                Ok(self.menu_output(output.as_ref()))
+            }
+            InvocationDisposition::Detached | InvocationDisposition::Dismissed => {
+                let after_action = if disposition == InvocationDisposition::Dismissed {
+                    AfterAction::Quit
+                } else {
+                    policy.after_action
+                };
+                let output = self
+                    .menu_session
+                    .handle(MenuSessionEvent::DetachedAccepted {
+                        at,
+                        execution: CoreExecutionId(0),
+                        after_action,
+                    });
+                Ok(self.menu_output(output.as_ref()))
+            }
         }
     }
 
@@ -1598,6 +1609,47 @@ pub(crate) mod tests {
                 .expect("detached disposition applies immediately"),
             UiCommand::Detach
         );
+    }
+
+    #[test]
+    fn dismissed_creation_ignores_stay_and_return_after_actions() {
+        for after_action in [AfterAction::Stay, AfterAction::Return] {
+            let mut runtime = UiRuntime::attach_at(
+                profiled_attachment(
+                    KeyboardProfileWire::Vt100 {
+                        escape_timeout_millis: 25,
+                    },
+                    vec![binding_with_policy(
+                        1,
+                        "a",
+                        after_action,
+                        ExecutionMode::Await,
+                        None,
+                    )],
+                ),
+                at(0),
+            )
+            .expect("attachment attaches");
+            let binding = BindingId {
+                generation: 7,
+                ordinal: 1,
+            };
+            assert!(matches!(
+                runtime.handle_input_at(&press('a'), at(1)),
+                Ok(UiCommand::Invoke { .. })
+            ));
+            assert_eq!(
+                runtime
+                    .invocation_accepted(
+                        binding,
+                        muxe_protocol::ExecutionId([5; 16]),
+                        InvocationDisposition::Dismissed,
+                        at(2),
+                    )
+                    .expect("dismissed creation is accepted"),
+                UiCommand::Detach
+            );
+        }
     }
 
     #[test]
