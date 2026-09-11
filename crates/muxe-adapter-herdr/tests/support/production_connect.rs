@@ -66,7 +66,7 @@ impl ProductionConnectFixture {
     }
 
     /// The exact initial `HerdrAdapter::connect` transport sequence after its schema child:
-    /// one ping, raw endpoint probe, and one retained tab-focus subscription.
+    /// one ping, raw endpoint probe, and one retained tab-focus and pane-close subscription.
     pub fn initial_handshake() -> Vec<RecordedExchange> {
         vec![Self::ping_exchange(), Self::subscription_exchange()]
     }
@@ -87,7 +87,10 @@ impl ProductionConnectFixture {
         RecordedExchange {
             method: "events.subscribe",
             params: json!({
-                "subscriptions": [{ "type": "tab.focused" }],
+                "subscriptions": [
+                    { "type": "tab.focused" },
+                    { "type": "pane.closed" },
+                ],
             }),
             response: RecordedResponse::KeepOpen(json!({ "subscribed": true })),
         }
@@ -140,5 +143,10 @@ impl ProductionConnectFixture {
     /// production monitor must reconnect through later scripted ping/probe/subscribe exchanges.
     pub fn lose_retained_subscriptions(&self) {
         self.server.close_retained_streams();
+    }
+
+    /// Delivers one exact event through the retained production subscription.
+    pub fn send_retained_event(&self, event: Value) -> io::Result<()> {
+        self.server.send_retained_event(event)
     }
 }

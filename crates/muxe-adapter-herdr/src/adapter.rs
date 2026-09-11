@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,7 +14,7 @@ use muxe_adapter_api::{
     CaptureReleaseReason, CaptureRequest, DispatchAccepted, DispatchCompletion,
     ExecutionCorrelationId, HostAdapter, HostIdentity, KeyboardCapabilities, ModalScopeId,
     NativeDispatchRequest, OriginCaptureRequest, PendingPaneLease, PendingPaneLeaseId,
-    PendingPaneRegistration, PortableDispatchRequest,
+    PendingPaneRegistration, PortableDispatchRequest, PostDismissalPortableDispatchRequest,
 };
 use muxe_core::{
     ActionScalar, ActionValidation, ActionValidator, ConfigDiagnostic, ConfigValueKind,
@@ -27,7 +28,7 @@ use tokio::task::JoinHandle;
 use crate::{
     ApiSchema, ComparisonKey, DeliveryState, EventSubscription, HerdrAdapterConfig, HerdrCache,
     HerdrResponse, HerdrRuntime, HerdrSocketClient, SocketError, SubscriptionConfig,
-    fields_to_json,
+    SubscriptionEvent, fields_to_json,
     generated::{BUNDLED_REQUEST_SCHEMA_SHA256, method_metadata},
     validate_candidate,
 };
@@ -55,6 +56,7 @@ pub struct HerdrAdapter {
     // by the released adapter references.
     monitor: Mutex<Option<JoinHandle<()>>>,
     pending_leases: Mutex<HashMap<String, (u64, muxe_adapter_api::UiSessionId)>>,
+    post_dismissal: Mutex<HashMap<String, Vec<PostDismissalPortableDispatchRequest>>>,
 }
 struct ContinuityState {
     epoch: u64,
@@ -97,6 +99,7 @@ impl HerdrAdapter {
             suspended_ack: Notify::new(),
             resume_wake: Notify::new(),
             resume_slot: Mutex::new(None),
+            post_dismissal: Mutex::new(HashMap::new()),
             monitor: Mutex::new(None),
         });
         let _ = adapter
@@ -234,6 +237,9 @@ impl HerdrAdapter {
         action: &PortableAction,
     ) -> Result<ExecutionCapabilities, String> {
         let runtime = self.runtime();
+        if let Some(methods) = command_creation_methods(action) {
+            return validate_required_methods(&runtime, methods);
+        }
         let method = match action {
             PortableAction::Menu(_) | PortableAction::Config(_) => {
                 return Ok(ExecutionCapabilities::SYNCHRONOUS);
@@ -260,14 +266,7 @@ impl HerdrAdapter {
             }
             PortableAction::Tab(TabAction::Move(target)) if target_is_index(target) => "tab.move",
             PortableAction::Tab(TabAction::Swap(target)) if target_is_index(target) => {
-                for method in ["tab.list", "tab.move"] {
-                    if method_metadata(method).is_none() || runtime.schema().method(method).is_none() {
-                        return Err(format!(
-                            "active Herdr schema does not declare required method {method}"
-                        ));
-                    }
-                }
-                return Ok(ExecutionCapabilities::ASYNCHRONOUS);
+                return validate_required_methods(&runtime, &["tab.list", "tab.move"]);
             }
             PortableAction::Pane(PaneAction::Create) => {
                 return Err(
@@ -277,8 +276,11 @@ impl HerdrAdapter {
             }
             PortableAction::Pane(PaneAction::Split {
                 direction: Some(direction),
+                ..
             }) if split_direction_is_supported(direction) => "pane.split",
-            PortableAction::Pane(PaneAction::Split { direction: None }) => {
+            PortableAction::Pane(PaneAction::Split {
+                direction: None, ..
+            }) => {
                 return Err(
                     "Herdr pane.split requires an explicit right or down direction".to_owned(),
                 );
@@ -310,12 +312,7 @@ impl HerdrAdapter {
             PortableAction::Pane(PaneAction::Frame { .. }) => return Err("Herdr protocol 20 exposes no pane frame method".to_owned()),
             PortableAction::Session(_) => return Err("Herdr protocol 20 exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
         };
-        if method_metadata(method).is_none() || runtime.schema().method(method).is_none() {
-            return Err(format!(
-                "active Herdr schema does not declare required method {method}"
-            ));
-        }
-        Ok(ExecutionCapabilities::ASYNCHRONOUS)
+        validate_required_methods(&runtime, &[method])
     }
 
     #[expect(
@@ -449,6 +446,151 @@ impl HerdrAdapter {
         })
     }
 
+    fn post_dismissal_accepted(&self, execution: muxe_core::ExecutionId) -> DispatchAccepted {
+        DispatchAccepted {
+            correlation: ExecutionCorrelationId::new(format!(
+                "herdr-{}",
+                self.next_correlation.fetch_add(1, Ordering::Relaxed)
+            )),
+            execution,
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+        }
+    }
+
+    async fn ui_pane_is_live(&self, pane: &muxe_core::PaneId) -> Result<bool, AdapterError> {
+        let snapshot = self.invoke_unary("session.snapshot", json!({})).await?;
+        snapshot_contains_pane(&snapshot, pane)
+    }
+
+    async fn start_post_dismissal(
+        &self,
+        request: PostDismissalPortableDispatchRequest,
+    ) -> Result<DispatchAccepted, AdapterError> {
+        self.require_current_origin(&request.origin)?;
+        if creation_has_program(&request.action.action) {
+            return Ok(self.dispatch_command_creation(
+                request.execution,
+                &request.action.action,
+                &request.origin,
+            ));
+        }
+        let invocation = portable_invocation(&request.action.action, &request.origin)?;
+        self.dispatch(request.execution, invocation)
+    }
+
+    fn dispatch_command_creation(
+        &self,
+        execution: muxe_core::ExecutionId,
+        action: &PortableAction,
+        origin: &muxe_core::OriginContext,
+    ) -> DispatchAccepted {
+        let runtime = self.runtime();
+        let sender = self.events_tx.clone();
+        let action = action.clone();
+        let origin = origin.clone();
+        tokio::spawn(async move {
+            let completion = match perform_command_creation(
+                runtime.client(),
+                runtime.schema(),
+                &action,
+                &origin,
+            )
+            .await
+            {
+                Ok(()) => DispatchCompletion::Succeeded { execution },
+                Err(error) if error.kind == AdapterErrorKind::OutcomeUnknown => {
+                    DispatchCompletion::OutcomeUnknown { execution, error }
+                }
+                Err(error) => DispatchCompletion::Failed { execution, error },
+            };
+            let _ = sender
+                .send(AdapterHealthEvent::DispatchCompleted(completion))
+                .await;
+        });
+        self.post_dismissal_accepted(execution)
+    }
+    async fn dispatch_when_ui_is_gone(
+        &self,
+        request: PostDismissalPortableDispatchRequest,
+    ) -> Result<DispatchAccepted, AdapterError> {
+        self.require_current_origin(&request.origin)?;
+        let pane = request.ui_pane.as_str().to_owned();
+        let execution = request.execution;
+        self.post_dismissal
+            .lock()
+            .await
+            .entry(pane.clone())
+            .or_default()
+            .push(request);
+        let is_live = match self
+            .ui_pane_is_live(&muxe_core::PaneId::new(pane.clone()))
+            .await
+        {
+            Ok(is_live) => is_live,
+            Err(error) => {
+                let still_queued = snapshot_failure_reclaims_request(
+                    &mut *self.post_dismissal.lock().await,
+                    &pane,
+                    &execution,
+                );
+                if still_queued {
+                    return Err(error);
+                }
+                return Ok(self.post_dismissal_accepted(execution));
+            }
+        };
+        if is_live {
+            return Ok(self.post_dismissal_accepted(execution));
+        }
+        let queued = self.post_dismissal.lock().await.remove(&pane);
+        if let Some(queued) = queued {
+            self.start_post_dismissals(queued).await;
+        }
+        Ok(self.post_dismissal_accepted(execution))
+    }
+
+    async fn observe_subscription_event(&self, event: Value) {
+        if event.get("type").and_then(Value::as_str) != Some("pane_closed") {
+            return;
+        }
+        let Some(pane) = event.get("pane_id").and_then(Value::as_str) else {
+            return;
+        };
+        let queued = self.post_dismissal.lock().await.remove(pane);
+        if let Some(queued) = queued {
+            self.start_post_dismissals(queued).await;
+        }
+    }
+
+    async fn start_post_dismissals(&self, queued: Vec<PostDismissalPortableDispatchRequest>) {
+        for request in queued {
+            let execution = request.execution;
+            if let Err(error) = self.start_post_dismissal(request).await {
+                let _ = self
+                    .events_tx
+                    .send(AdapterHealthEvent::DispatchCompleted(
+                        DispatchCompletion::Failed { execution, error },
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    async fn fail_post_dismissals(&self, message: &str) {
+        let queued = std::mem::take(&mut *self.post_dismissal.lock().await);
+        for request in queued.into_values().flatten() {
+            let _ = self
+                .events_tx
+                .send(AdapterHealthEvent::DispatchCompleted(
+                    DispatchCompletion::Failed {
+                        execution: request.execution,
+                        error: AdapterError::new(AdapterErrorKind::Unavailable, message),
+                    },
+                ))
+                .await;
+        }
+    }
+
     async fn invoke_unary(&self, method: &str, params: Value) -> Result<Value, AdapterError> {
         self.require_continuity()?;
         let runtime = self.runtime();
@@ -474,6 +616,36 @@ impl HerdrAdapter {
             )),
         }
     }
+}
+
+fn command_creation_methods(action: &PortableAction) -> Option<&'static [&'static str]> {
+    match action {
+        PortableAction::Tab(TabAction::Create { command, .. }) if command.program.is_some() => {
+            Some(&["layout.apply"])
+        }
+        PortableAction::Pane(PaneAction::Split {
+            direction: Some(direction),
+            command,
+            ..
+        }) if command.program.is_some() && split_direction_is_supported(direction) => {
+            Some(&["session.snapshot", "layout.apply", "pane.move", "tab.close"])
+        }
+        _ => None,
+    }
+}
+
+fn validate_required_methods(
+    runtime: &HerdrRuntime,
+    methods: &[&str],
+) -> Result<ExecutionCapabilities, String> {
+    for method in methods {
+        if method_metadata(method).is_none() || runtime.schema().method(method).is_none() {
+            return Err(format!(
+                "active Herdr schema does not declare required method {method}"
+            ));
+        }
+    }
+    Ok(ExecutionCapabilities::ASYNCHRONOUS)
 }
 
 impl ActionValidator for HerdrAdapter {
@@ -713,8 +885,28 @@ impl HostAdapter for HerdrAdapter {
                 scalar_index(index)?,
             );
         }
+        if creation_requires_post_dismissal(&request.action.action)? {
+            return Err(AdapterError::new(
+                AdapterErrorKind::InvalidRequest,
+                "focused creation must use post-dismissal dispatch after the Muxe UI closes",
+            ));
+        }
+        if creation_has_program(&request.action.action) {
+            return Ok(self.dispatch_command_creation(
+                request.execution,
+                &request.action.action,
+                &request.origin,
+            ));
+        }
         let invocation = portable_invocation(&request.action.action, &request.origin)?;
         self.dispatch(request.execution, invocation)
+    }
+
+    async fn dispatch_portable_after_ui_dismissal(
+        &self,
+        request: PostDismissalPortableDispatchRequest,
+    ) -> Result<DispatchAccepted, AdapterError> {
+        self.dispatch_when_ui_is_gone(request).await
     }
 
     async fn dispatch_native(
@@ -868,6 +1060,8 @@ impl HostAdapter for HerdrAdapter {
     async fn shutdown(&self) -> Result<(), AdapterError> {
         self.shutdown.store(true, Ordering::Relaxed);
         self.pending_leases.lock().await.clear();
+        self.fail_post_dismissals("Herdr adapter shut down before UI dismissal completed")
+            .await;
         // Wake a monitor parked in event reads, reconnect backoff, or the
         // post-suspend resume wait so shutdown never wedges on a live stream.
         self.suspend_wake.notify_one();
@@ -881,10 +1075,14 @@ impl HostAdapter for HerdrAdapter {
         Ok(())
     }
 }
-
 fn subscription_config() -> SubscriptionConfig {
     SubscriptionConfig {
-        params: json!({ "subscriptions": [{ "type": "tab.focused" }] }),
+        params: json!({
+            "subscriptions": [
+                { "type": "tab.focused" },
+                { "type": "pane.closed" },
+            ],
+        }),
         subscribe_timeout: SUBSCRIBE_TIMEOUT,
     }
 }
@@ -922,7 +1120,13 @@ async fn monitor_subscription(adapter: Arc<HerdrAdapter>, mut subscription: Even
             return;
         }
         let failed = tokio::select! {
-            result = subscription.next_event() => result.is_err(),
+            result = subscription.next_event() => match result {
+                Ok(SubscriptionEvent::Event(event)) => {
+                    adapter.observe_subscription_event(event).await;
+                    false
+                }
+                Err(_) => true,
+            },
             () = adapter.suspend_wake.notified() => false,
         };
         if !failed {
@@ -938,6 +1142,9 @@ async fn monitor_subscription(adapter: Arc<HerdrAdapter>, mut subscription: Even
             continuity.healthy = false;
         }
         adapter.pending_leases.lock().await.clear();
+        adapter
+            .fail_post_dismissals("Herdr retained event-subscription continuity was lost")
+            .await;
         let _ = adapter
             .events_tx
             .send(AdapterHealthEvent::Unhealthy {
@@ -1073,6 +1280,49 @@ async fn take_resumed_subscription(adapter: &Arc<HerdrAdapter>) -> Option<EventS
     }
 }
 
+fn snapshot_contains_pane(
+    response: &Value,
+    pane: &muxe_core::PaneId,
+) -> Result<bool, AdapterError> {
+    let panes = response
+        .get("snapshot")
+        .and_then(|snapshot| snapshot.get("panes"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::DispatchFailed,
+                "Herdr session.snapshot response lacks a panes array; cannot prove Muxe UI dismissal",
+            )
+        })?;
+    Ok(panes
+        .iter()
+        .any(|candidate| candidate.get("pane_id").and_then(Value::as_str) == Some(pane.as_str())))
+}
+
+/// Removes exactly one waiting creation on a failed snapshot. A false result
+/// means a pane-close or terminal lifecycle path already claimed its request,
+/// so the snapshot error cannot retract work that may have begun.
+fn snapshot_failure_reclaims_request(
+    pending: &mut HashMap<String, Vec<PostDismissalPortableDispatchRequest>>,
+    pane: &str,
+    execution: &muxe_core::ExecutionId,
+) -> bool {
+    let Some(requests) = pending.get_mut(pane) else {
+        return false;
+    };
+    let Some(index) = requests
+        .iter()
+        .position(|request| &request.execution == execution)
+    else {
+        return false;
+    };
+    requests.remove(index);
+    if requests.is_empty() {
+        pending.remove(pane);
+    }
+    true
+}
+
 struct Invocation {
     method: &'static str,
     params: Value,
@@ -1096,10 +1346,27 @@ fn portable_invocation(
             method: "pane.send_text",
             params: json!({ "pane_id": pane, "text": scalar_string(text)? }),
         }),
-        PortableAction::Tab(TabAction::Create { workspace_id }) => Ok(Invocation {
-            method: "tab.create",
-            params: json!({ "workspace_id": workspace_id.as_ref().map(scalar_string).transpose()? }),
-        }),
+        PortableAction::Tab(TabAction::Create {
+            workspace_id,
+            name,
+            focus,
+            command,
+        }) => {
+            if command.program.is_some() {
+                return Err(incompatible(
+                    "Herdr command-bearing tab:create requires the ordered dismiss-and-dispatch lifecycle",
+                ));
+            }
+            Ok(Invocation {
+                method: "tab.create",
+                params: json!({
+                    "workspace_id": workspace_id.as_ref().map(scalar_string).transpose()?,
+                    "label": name.as_ref().map(scalar_string).transpose()?,
+                    "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                    "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+                }),
+            })
+        }
         PortableAction::Tab(TabAction::Close) => Ok(Invocation {
             method: "tab.close",
             params: json!({ "tab_id": origin_tab(origin)? }),
@@ -1126,11 +1393,27 @@ fn portable_invocation(
         )),
         PortableAction::Pane(PaneAction::Split {
             direction: Some(direction),
-        }) => Ok(Invocation {
-            method: "pane.split",
-            params: json!({ "target_pane_id": pane, "direction": scalar_split_direction(direction)? }),
-        }),
-        PortableAction::Pane(PaneAction::Split { direction: None }) => Err(incompatible(
+            focus,
+            command,
+        }) => {
+            if command.program.is_some() {
+                return Err(incompatible(
+                    "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle",
+                ));
+            }
+            Ok(Invocation {
+                method: "pane.split",
+                params: json!({
+                    "target_pane_id": pane,
+                    "direction": scalar_split_direction(direction)?,
+                    "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                    "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+                }),
+            })
+        }
+        PortableAction::Pane(PaneAction::Split {
+            direction: None, ..
+        }) => Err(incompatible(
             "Herdr pane.split requires an explicit right or down direction",
         )),
         PortableAction::Pane(PaneAction::Close) => Ok(Invocation {
@@ -1169,6 +1452,160 @@ struct OrderedTab {
     workspace: String,
     number: u64,
 }
+fn creation_has_program(action: &PortableAction) -> bool {
+    match action {
+        PortableAction::Tab(TabAction::Create { command, .. })
+        | PortableAction::Pane(PaneAction::Split { command, .. }) => command.program.is_some(),
+        _ => false,
+    }
+}
+
+fn creation_requires_post_dismissal(action: &PortableAction) -> Result<bool, AdapterError> {
+    match action {
+        PortableAction::Tab(TabAction::Create { focus, .. })
+        | PortableAction::Pane(PaneAction::Split { focus, .. }) => {
+            Ok(focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true))
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn perform_command_creation(
+    client: &HerdrSocketClient,
+    schema: &ApiSchema,
+    action: &PortableAction,
+    origin: &muxe_core::OriginContext,
+) -> Result<(), AdapterError> {
+    match action {
+        PortableAction::Tab(TabAction::Create {
+            workspace_id,
+            name,
+            focus,
+            command,
+        }) if command.program.is_some() => {
+            let workspace = workspace_id
+                .as_ref()
+                .map(scalar_string)
+                .transpose()?
+                .map(muxe_core::WorkspaceId::new)
+                .or_else(|| origin.workspace_id.clone())
+                .ok_or_else(|| {
+                    AdapterError::new(
+                        AdapterErrorKind::ContextUnavailable,
+                        "Herdr command tab creation requires the captured origin workspace",
+                    )
+                })?;
+            let label = name
+                .as_ref()
+                .map(scalar_string)
+                .transpose()?
+                .map(str::to_owned);
+            crate::open_command_tab(
+                client,
+                schema,
+                crate::CommandTabLaunch {
+                    workspace,
+                    label,
+                    cwd: creation_cwd(command, origin)?,
+                    argv: creation_argv(command)?,
+                    focus: focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                },
+            )
+            .await
+        }
+        PortableAction::Pane(PaneAction::Split {
+            direction: Some(direction),
+            focus,
+            command,
+        }) if command.program.is_some() => {
+            let workspace = origin.workspace_id.clone().ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::ContextUnavailable,
+                    "Herdr command pane creation requires the captured origin workspace",
+                )
+            })?;
+            let tab = origin.tab_id.clone().ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::ContextUnavailable,
+                    "Herdr command pane creation requires the captured origin tab",
+                )
+            })?;
+            let pane = origin.pane_id.clone().ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::ContextUnavailable,
+                    "Herdr command pane creation requires the captured origin pane",
+                )
+            })?;
+            let destination = crate::pane_by_identity(client, schema, workspace, tab, pane).await?;
+            let direction = match scalar_split_direction(direction)? {
+                "right" => crate::UiSplitDirection::Right,
+                "down" => crate::UiSplitDirection::Down,
+                _ => {
+                    unreachable!("scalar_split_direction validates the closed Herdr direction set")
+                }
+            };
+            crate::open_command_pane(
+                client,
+                schema,
+                crate::CommandPaneLaunch {
+                    origin: destination.clone(),
+                    destination,
+                    cwd: creation_cwd(command, origin)?,
+                    argv: creation_argv(command)?,
+                    direction,
+                    ratio: 0.5,
+                    focus: focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+        _ => Err(incompatible(
+            "post-dismissal command creation requires tab:create or pane:split with program",
+        )),
+    }
+}
+
+fn creation_argv(command: &muxe_core::CreateCommand) -> Result<Vec<String>, AdapterError> {
+    let program = command
+        .program
+        .as_ref()
+        .ok_or_else(|| incompatible("creation command requires program"))?;
+    let program = scalar_string(program)?;
+    if program.is_empty() {
+        return Err(incompatible("creation command program must not be empty"));
+    }
+    let mut argv = Vec::with_capacity(command.args.len().saturating_add(1));
+    argv.push(program.to_owned());
+    for argument in &command.args {
+        argv.push(scalar_string(argument)?.to_owned());
+    }
+    Ok(argv)
+}
+
+fn creation_cwd(
+    command: &muxe_core::CreateCommand,
+    origin: &muxe_core::OriginContext,
+) -> Result<PathBuf, AdapterError> {
+    let cwd = command
+        .cwd
+        .as_ref()
+        .map(scalar_string)
+        .transpose()?
+        .map(PathBuf::from)
+        .or_else(|| origin.pane_cwd.clone())
+        .ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::ContextUnavailable,
+                "creation command requires explicit cwd or captured origin pane cwd",
+            )
+        })?;
+    if !cwd.is_absolute() {
+        return Err(incompatible("creation command cwd must be absolute"));
+    }
+    Ok(cwd)
+}
+
 #[derive(Debug)]
 enum TabSwapError {
     Known(String),
@@ -1604,13 +2041,121 @@ mod tests {
         for action in [
             PortableAction::Tab(TabAction::Rename { name: None }),
             PortableAction::Pane(PaneAction::Create),
-            PortableAction::Pane(PaneAction::Split { direction: None }),
+            PortableAction::Pane(PaneAction::Split {
+                direction: None,
+                focus: None,
+                command: muxe_core::CreateCommand::default(),
+            }),
         ] {
             let Err(error) = portable_invocation(&action, &origin()) else {
                 panic!("form without a schema-defined Herdr mapping must fail");
             };
             assert_eq!(error.kind, AdapterErrorKind::Incompatible);
         }
+    }
+
+    #[test]
+    fn command_creations_require_every_helper_rpc_at_compile_time() {
+        let scalar = |value: &str| {
+            ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+                value.to_owned(),
+            )))
+        };
+        let command = || muxe_core::CreateCommand {
+            program: Some(scalar("tool")),
+            args: Vec::new(),
+            cwd: None,
+        };
+        let tab = PortableAction::Tab(TabAction::Create {
+            workspace_id: None,
+            name: None,
+            focus: None,
+            command: command(),
+        });
+        let split = PortableAction::Pane(PaneAction::Split {
+            direction: Some(scalar("right")),
+            focus: None,
+            command: command(),
+        });
+
+        assert_eq!(command_creation_methods(&tab), Some(&["layout.apply"][..]));
+        assert_eq!(
+            command_creation_methods(&split),
+            Some(&["session.snapshot", "layout.apply", "pane.move", "tab.close",][..])
+        );
+    }
+
+    fn deferred_request() -> PostDismissalPortableDispatchRequest {
+        PostDismissalPortableDispatchRequest {
+            execution: muxe_core::ExecutionId(1),
+            action: muxe_adapter_api::ResolvedPortableAction {
+                action: PortableAction::Tab(TabAction::Create {
+                    workspace_id: None,
+                    name: None,
+                    focus: None,
+                    command: muxe_core::CreateCommand::default(),
+                }),
+            },
+            origin: origin(),
+            ui_pane: muxe_core::PaneId::new("muxe-ui"),
+        }
+    }
+
+    #[test]
+    fn pane_close_claim_makes_later_snapshot_failure_nonrejecting() {
+        let request = deferred_request();
+        let mut pending =
+            HashMap::from([(request.ui_pane.as_str().to_owned(), vec![request.clone()])]);
+
+        let claimed = pending.remove(request.ui_pane.as_str());
+        assert_eq!(claimed, Some(vec![request.clone()]));
+        assert!(
+            !snapshot_failure_reclaims_request(
+                &mut pending,
+                request.ui_pane.as_str(),
+                &request.execution,
+            ),
+            "a later snapshot failure must not retract the pane-close dispatch"
+        );
+    }
+
+    #[test]
+    fn malformed_snapshot_does_not_prove_ui_dismissal() {
+        let error = snapshot_contains_pane(
+            &json!({ "snapshot": {} }),
+            &muxe_core::PaneId::new("muxe-ui"),
+        )
+        .expect_err("a snapshot without panes cannot prove the UI pane is gone");
+
+        assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
+    }
+
+    #[test]
+    fn only_focused_creations_require_post_dismissal_dispatch() {
+        let focused = PortableAction::Tab(TabAction::Create {
+            workspace_id: None,
+            name: None,
+            focus: None,
+            command: muxe_core::CreateCommand::default(),
+        });
+        let unfocused = PortableAction::Pane(PaneAction::Split {
+            direction: Some(ActionScalar::new(ConfigValue::synthetic(
+                ConfigValueKind::String("right".to_owned()),
+            ))),
+            focus: Some(ActionScalar::new(ConfigValue::synthetic(
+                ConfigValueKind::Boolean(false),
+            ))),
+            command: muxe_core::CreateCommand::default(),
+        });
+
+        assert!(
+            creation_requires_post_dismissal(&focused)
+                .expect("default tab creation focus is valid")
+        );
+        assert!(
+            !creation_requires_post_dismissal(&unfocused)
+                .expect("explicit unfocused split is valid")
+        );
     }
 
     #[test]

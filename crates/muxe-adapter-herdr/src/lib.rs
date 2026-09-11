@@ -21,9 +21,10 @@ pub use cache::{
     ComparisonKey, HerdrCache, hash_configured_request_refs, hash_configured_requests,
 };
 pub use launch::{
-    CommandPaneLaunch, CommandPanePlacement, FocusedPane, PreparedUiPane, UiPaneLaunch,
-    UiPanePlacement, UiSplitDirection, close_transient_tab, focused_pane, move_prepared_ui_pane,
-    open_command_pane, pane_by_id, pane_by_identity, prepare_ui_pane,
+    CommandPaneLaunch, CommandPanePlacement, CommandTabLaunch, FocusedPane, PreparedUiPane,
+    UiPaneLaunch, UiPanePlacement, UiSplitDirection, close_transient_tab, focused_pane,
+    move_prepared_ui_pane, open_command_pane, open_command_tab, pane_by_id, pane_by_identity,
+    prepare_ui_pane,
 };
 pub use runtime::{HerdrAdapterConfig, HerdrRuntime, probe_endpoint_identity, probe_live_identity};
 pub use schema::{

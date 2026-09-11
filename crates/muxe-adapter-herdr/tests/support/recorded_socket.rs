@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
-    sync::{Mutex, Notify, watch},
+    sync::{Mutex, Notify, broadcast, watch},
     task::{JoinHandle, JoinSet},
 };
 
@@ -29,18 +29,7 @@ pub struct RecordedExchange {
 #[derive(Clone, Debug)]
 pub enum RecordedResponse {
     Result(Value),
-    #[expect(
-        dead_code,
-        reason = "scripted error and close responses cover Herdr failure paths the current transport tests have not scripted yet"
-    )]
-    Error {
-        code: i64,
-        message: String,
-    },
-    #[expect(
-        dead_code,
-        reason = "scripted error and close responses cover Herdr failure paths the current transport tests have not scripted yet"
-    )]
+    Error { code: String, message: String },
     Close,
     KeepOpen(Value),
 }
@@ -56,6 +45,7 @@ pub struct RecordedUnixServer {
     requests: Arc<Mutex<Vec<Value>>>,
     requests_changed: Arc<Notify>,
     close_streams: watch::Sender<u64>,
+    retained_events: broadcast::Sender<Value>,
     task: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -89,12 +79,14 @@ impl RecordedUnixServer {
         let requests = Arc::new(Mutex::new(Vec::with_capacity(exchanges.len())));
         let requests_changed = Arc::new(Notify::new());
         let (close_streams, close_receiver) = watch::channel(0_u64);
+        let (retained_events, _) = broadcast::channel(16);
         let task = tokio::spawn(serve(
             listener,
             exchanges,
             Arc::clone(&requests),
             Arc::clone(&requests_changed),
             close_receiver,
+            retained_events.clone(),
             expect_endpoint_probe,
         ));
         Ok(Self {
@@ -103,6 +95,7 @@ impl RecordedUnixServer {
             requests,
             requests_changed,
             close_streams,
+            retained_events,
             task: Some(task),
         })
     }
@@ -134,6 +127,19 @@ impl RecordedUnixServer {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
+    /// Sends one exact host event to every retained subscription stream.
+    pub fn send_retained_event(&self, event: Value) -> io::Result<()> {
+        self.retained_events
+            .send(event)
+            .map(|_| ())
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("no retained event subscription accepted the event: {error}"),
+                )
+            })
+    }
+
     /// Waits for every finite scripted exchange and returns each complete raw request in order.
     /// Callers with a `KeepOpen` response must inspect [`Self::requests`] and then drop the
     /// fixture instead, because the retained stream intentionally does not complete.
@@ -159,6 +165,7 @@ async fn serve(
     requests: Arc<Mutex<Vec<Value>>>,
     requests_changed: Arc<Notify>,
     close_streams: watch::Receiver<u64>,
+    retained_events: broadcast::Sender<Value>,
     expect_endpoint_probe: bool,
 ) -> io::Result<()> {
     let mut retained_streams = JoinSet::new();
@@ -192,6 +199,7 @@ async fn serve(
             })?;
         let keep_open = matches!(&exchange.response, RecordedResponse::KeepOpen(_));
         let retained_generation = keep_open.then(|| *close_streams.borrow());
+        let retained_event_receiver = keep_open.then(|| retained_events.subscribe());
         match exchange.response {
             RecordedResponse::Result(result) | RecordedResponse::KeepOpen(result) => {
                 let response = json!({ "id": id, "result": result });
@@ -213,15 +221,35 @@ async fn serve(
         }
         requests.lock().await.push(request);
         requests_changed.notify_waiters();
-        if let Some(initial_generation) = retained_generation {
+        if let (Some(initial_generation), Some(mut event_receiver)) =
+            (retained_generation, retained_event_receiver)
+        {
             let mut retained_close_streams = close_streams.clone();
             retained_streams.spawn(async move {
-                let _retained = reader;
+                let mut retained = reader;
                 loop {
-                    if retained_close_streams.changed().await.is_err()
-                        || *retained_close_streams.borrow() != initial_generation
-                    {
-                        return;
+                    tokio::select! {
+                        changed = retained_close_streams.changed() => {
+                            if changed.is_err()
+                                || *retained_close_streams.borrow() != initial_generation
+                            {
+                                return;
+                            }
+                        }
+                        event = event_receiver.recv() => {
+                            let Ok(event) = event else {
+                                return;
+                            };
+                            if retained
+                                .get_mut()
+                                .write_all(format!("{event}\n").as_bytes())
+                                .await
+                                .is_err()
+                                || retained.get_mut().flush().await.is_err()
+                            {
+                                return;
+                            }
+                        }
                     }
                 }
             });

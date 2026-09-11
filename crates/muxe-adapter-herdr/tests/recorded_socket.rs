@@ -1,19 +1,25 @@
 mod support {
-    #[expect(
-        dead_code,
-        reason = "the transport tests share the complete production-connect surface with suspend and contract tests"
-    )]
     pub mod production_connect;
     pub mod recorded_socket;
 }
 
-use muxe_adapter_api::{AdapterHealthEvent, HostAdapter};
-use muxe_adapter_herdr::{
-    ApiSchema, CommandPaneLaunch, FocusedPane, HerdrAdapter, HerdrResponse, HerdrRuntime,
-    HerdrSocketClient, UiSplitDirection, focused_pane, generated::method_metadata,
-    open_command_pane,
+use std::time::Duration;
+
+use muxe_adapter_api::{
+    AdapterHealthEvent, DispatchCompletion, HostAdapter, HostCallerIdentity, OriginCaptureRequest,
+    OriginHintSource, PostDismissalPortableDispatchRequest, ResolvedPortableAction, UiSessionId,
+    UntrustedOriginHint,
 };
-use muxe_core::{ActionValidator, NativeActionCandidate, SourceId, SourceSpan};
+use muxe_adapter_herdr::{
+    ApiSchema, CommandPaneLaunch, CommandTabLaunch, FocusedPane, HerdrAdapter, HerdrResponse,
+    HerdrRuntime, HerdrSocketClient, UiSplitDirection, focused_pane, generated::method_metadata,
+    open_command_pane, open_command_tab,
+};
+use muxe_core::{
+    ActionScalar, ActionValidator, ConfigValue, ConfigValueKind, CreateCommand, ExecutionId,
+    NativeActionCandidate, PaneAction, PaneId, PortableAction, SourceId, SourceSpan, TabAction,
+    TabId, WorkspaceId,
+};
 use serde_json::json;
 use support::{
     production_connect::ProductionConnectFixture,
@@ -73,6 +79,402 @@ async fn connects_the_production_adapter_through_schema_ping_probe_and_retained_
         vec![json!("ping"), json!("events.subscribe")],
         "production connect must use its schema child, ping, raw probe, then retained subscription"
     );
+    drop(adapter);
+    drop(fixture);
+}
+
+fn lifecycle_snapshot() -> serde_json::Value {
+    json!({
+        "workspaces": [{ "workspace_id": "workspace-1" }],
+        "tabs": [{ "tab_id": "tab-1", "workspace_id": "workspace-1", "number": 0 }],
+        "panes": [
+            {
+                "pane_id": "pane-1",
+                "tab_id": "tab-1",
+                "workspace_id": "workspace-1",
+                "cwd": "/saved/origin",
+            },
+            {
+                "pane_id": "pane-2",
+                "tab_id": "tab-1",
+                "workspace_id": "workspace-1",
+                "cwd": "/ui/caller",
+            },
+        ],
+        "layouts": [{
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "panes": [{
+                "pane_id": "pane-1",
+                "rect": { "width": 80, "height": 24 },
+            }],
+        }],
+    })
+}
+
+fn lifecycle_capture_request() -> OriginCaptureRequest {
+    OriginCaptureRequest {
+        ui_session: UiSessionId::new("ui-lifecycle"),
+        ui_pane: PaneId::new("pane-2"),
+        origin_hint: Some(UntrustedOriginHint {
+            workspace_id: WorkspaceId::new("workspace-1"),
+            tab_id: TabId::new("tab-1"),
+            pane_id: PaneId::new("pane-1"),
+            cwd: Some("/saved/origin".into()),
+            source: OriginHintSource::LauncherBootstrap,
+        }),
+        caller_identity: Some(HostCallerIdentity {
+            workspace_id: WorkspaceId::new("workspace-1"),
+            tab_id: TabId::new("tab-1"),
+            pane_id: PaneId::new("pane-2"),
+            cwd: Some("/ui/caller".into()),
+        }),
+    }
+}
+
+fn lifecycle_scalar(value: &str) -> ActionScalar {
+    ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+        value.to_owned(),
+    )))
+}
+
+async fn wait_for_lifecycle_requests(
+    fixture: &ProductionConnectFixture,
+    minimum: usize,
+    stage: &str,
+) {
+    if tokio::time::timeout(Duration::from_secs(1), fixture.wait_for_requests(minimum))
+        .await
+        .is_err()
+    {
+        let methods = fixture
+            .requests()
+            .await
+            .into_iter()
+            .filter_map(|request| {
+                request
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        panic!("timed out waiting for {stage}; received {methods:?}");
+    }
+}
+
+#[tokio::test]
+async fn defers_focused_tab_creation_until_the_retained_ui_close_event() {
+    let snapshot = lifecycle_snapshot();
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(RecordedExchange {
+        method: "tab.create",
+        params: json!({
+            "workspace_id": "workspace-1",
+            "label": "logs",
+            "focus": true,
+            "cwd": null,
+        }),
+        response: RecordedResponse::Result(json!({
+            "type": "tab_created",
+            "tab_id": "logs-tab",
+            "workspace_id": "workspace-1",
+        })),
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned lifecycle fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures from the owned snapshot");
+    let execution = ExecutionId(71);
+    adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution,
+            action: ResolvedPortableAction {
+                action: PortableAction::Tab(TabAction::Create {
+                    workspace_id: Some(lifecycle_scalar("workspace-1")),
+                    name: Some(lifecycle_scalar("logs")),
+                    focus: None,
+                    command: CreateCommand::default(),
+                }),
+            },
+            origin,
+            ui_pane: PaneId::new("pane-2"),
+        })
+        .await
+        .expect("focused creation is armed while the UI pane is still live");
+
+    wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
+    let before_close = fixture.requests().await;
+    assert!(
+        before_close.iter().all(|request| {
+            !matches!(
+                request.get("method").and_then(serde_json::Value::as_str),
+                Some("tab.create" | "layout.apply")
+            )
+        }),
+        "no creation RPC may run while the UI pane remains in the snapshot"
+    );
+
+    fixture
+        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .expect("retained subscription accepts the UI close event");
+    wait_for_lifecycle_requests(&fixture, 5, "tab.create after pane_closed").await;
+    let requests = fixture.requests().await;
+    let creation = requests
+        .last()
+        .expect("creation request follows pane_closed");
+    assert_eq!(creation["method"], json!("tab.create"));
+    assert_eq!(
+        creation["params"],
+        json!({
+            "workspace_id": "workspace-1",
+            "label": "logs",
+            "focus": true,
+            "cwd": null,
+        })
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
+            .await
+            .expect("creation completion arrives")
+            .expect("adapter reports completion"),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
+            execution: completed,
+        }) if completed == execution
+    ));
+    adapter
+        .shutdown()
+        .await
+        .expect("adapter stops its retained monitor");
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn reports_unknown_outcome_when_command_tab_layout_closes_after_flush() {
+    let snapshot = lifecycle_snapshot();
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(RecordedExchange {
+        method: "layout.apply",
+        params: json!({
+            "focus": true,
+            "workspace_id": "workspace-1",
+            "tab_label": "logs",
+            "root": {
+                "type": "pane",
+                "command": ["tool", "--literal"],
+                "cwd": "/command",
+                "env": {},
+            },
+        }),
+        response: RecordedResponse::Close,
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned outcome fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures from the owned snapshot");
+    let execution = ExecutionId(72);
+    adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution,
+            action: ResolvedPortableAction {
+                action: PortableAction::Tab(TabAction::Create {
+                    workspace_id: Some(lifecycle_scalar("workspace-1")),
+                    name: Some(lifecycle_scalar("logs")),
+                    focus: None,
+                    command: CreateCommand {
+                        program: Some(lifecycle_scalar("tool")),
+                        args: vec![lifecycle_scalar("--literal")],
+                        cwd: Some(lifecycle_scalar("/command")),
+                    },
+                }),
+            },
+            origin,
+            ui_pane: PaneId::new("pane-2"),
+        })
+        .await
+        .expect("focused command creation is armed while the UI pane is live");
+
+    wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
+    fixture
+        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .expect("retained subscription accepts the UI close event");
+    wait_for_lifecycle_requests(&fixture, 5, "layout.apply after pane_closed").await;
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .last()
+            .and_then(|request| request.get("method"))
+            .cloned(),
+        Some(json!("layout.apply")),
+        "the layout request reached the host before its response socket closed"
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
+            .await
+            .expect("unknown completion arrives")
+            .expect("adapter reports completion"),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+            execution: completed,
+            ..
+        }) if completed == execution
+    ));
+    adapter
+        .shutdown()
+        .await
+        .expect("adapter stops its retained monitor");
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn reports_unknown_outcome_when_command_split_move_closes_and_cleanup_fails() {
+    let snapshot = lifecycle_snapshot();
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(RecordedExchange {
+        method: "layout.apply",
+        params: json!({
+            "focus": false,
+            "workspace_id": "workspace-1",
+            "root": {
+                "type": "pane",
+                "command": ["tool"],
+                "cwd": "/command",
+                "env": {},
+            },
+        }),
+        response: RecordedResponse::Result(json!({
+            "type": "layout_apply",
+            "layout": {
+                "workspace_id": "workspace-1",
+                "tab_id": "temporary-tab",
+                "zoomed": false,
+                "focused_pane_id": "new-pane",
+                "root": { "type": "pane", "pane_id": "new-pane" },
+            },
+        })),
+    });
+    script.push(RecordedExchange {
+        method: "pane.move",
+        params: json!({
+            "pane_id": "new-pane",
+            "focus": true,
+            "destination": {
+                "type": "tab",
+                "tab_id": "tab-1",
+                "target_pane_id": "pane-1",
+                "split": "right",
+                "ratio": 0.5,
+            },
+        }),
+        response: RecordedResponse::Close,
+    });
+    script.push(RecordedExchange {
+        method: "tab.close",
+        params: json!({ "tab_id": "temporary-tab" }),
+        response: RecordedResponse::Error {
+            code: "cleanup-failed".to_owned(),
+            message: "temporary tab remains".to_owned(),
+        },
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned outcome fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures from the owned snapshot");
+    let execution = ExecutionId(73);
+    adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution,
+            action: ResolvedPortableAction {
+                action: PortableAction::Pane(PaneAction::Split {
+                    direction: Some(lifecycle_scalar("right")),
+                    focus: None,
+                    command: CreateCommand {
+                        program: Some(lifecycle_scalar("tool")),
+                        args: Vec::new(),
+                        cwd: Some(lifecycle_scalar("/command")),
+                    },
+                }),
+            },
+            origin,
+            ui_pane: PaneId::new("pane-2"),
+        })
+        .await
+        .expect("focused command split is armed while the UI pane is live");
+
+    wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
+    fixture
+        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .expect("retained subscription accepts the UI close event");
+    wait_for_lifecycle_requests(&fixture, 8, "split cleanup after the lost move response").await;
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .last()
+            .and_then(|request| request.get("method"))
+            .cloned(),
+        Some(json!("tab.close")),
+        "the failed cleanup follows the post-flush pane.move request"
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
+            .await
+            .expect("unknown completion arrives")
+            .expect("adapter reports completion"),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+            execution: completed,
+            ..
+        }) if completed == execution
+    ));
+    adapter
+        .shutdown()
+        .await
+        .expect("adapter stops its retained monitor");
     drop(adapter);
     drop(fixture);
 }
@@ -386,5 +788,67 @@ async fn launches_an_exact_command_from_the_live_focused_origin() {
             .expect("all recorded requests complete")
             .len(),
         3
+    );
+}
+
+#[tokio::test]
+async fn launches_an_exact_command_as_a_labeled_unfocused_tab() {
+    let server = RecordedUnixServer::start(
+        tempfile::tempdir().expect("owned fixture directory"),
+        vec![RecordedExchange {
+            method: "layout.apply",
+            params: json!({
+                "focus": false,
+                "workspace_id": "workspace-1",
+                "tab_label": "logs",
+                "root": {
+                    "type": "pane",
+                    "command": ["tail", "--follow"],
+                    "cwd": "/captured/origin",
+                    "env": {},
+                },
+            }),
+            response: RecordedResponse::Result(json!({
+                "type": "layout_apply",
+                "layout": {
+                    "workspace_id": "workspace-1",
+                    "tab_id": "logs-tab",
+                    "zoomed": false,
+                    "focused_pane_id": "logs-pane",
+                    "root": { "type": "pane", "pane_id": "logs-pane" },
+                },
+            })),
+        }],
+    )
+    .expect("recorded server starts");
+    let client = HerdrSocketClient::new(server.socket());
+    let schema = ApiSchema::parse(
+        serde_json::from_str(include_str!(
+            "../../../fixtures/herdr/herdr-api.schema.json"
+        ))
+        .expect("bundled schema JSON"),
+    )
+    .expect("bundled schema parses");
+
+    open_command_tab(
+        &client,
+        &schema,
+        CommandTabLaunch {
+            workspace: muxe_core::WorkspaceId::new("workspace-1"),
+            label: Some("logs".to_owned()),
+            cwd: "/captured/origin".into(),
+            argv: vec!["tail".to_owned(), "--follow".to_owned()],
+            focus: false,
+        },
+    )
+    .await
+    .expect("exact tab command launches");
+    assert_eq!(
+        server
+            .finish()
+            .await
+            .expect("recorded request completes")
+            .len(),
+        1
     );
 }

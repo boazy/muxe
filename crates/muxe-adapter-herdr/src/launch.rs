@@ -86,6 +86,18 @@ pub struct CommandPanePlacement {
     pub pane: PaneId,
 }
 
+/// A direct command tab launch. The tab and its root pane are one
+/// `layout.apply` request so program, argv, cwd, label, workspace, and focus
+/// remain host-owned rather than relying on the transient current pane.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandTabLaunch {
+    pub workspace: WorkspaceId,
+    pub label: Option<String>,
+    pub cwd: PathBuf,
+    pub argv: Vec<String>,
+    pub focus: bool,
+}
+
 /// Reads one schema-validated snapshot and captures the focused workspace/tab/pane/cwd tuple.
 /// A direct launcher never substitutes a broker process cwd, home directory, or root directory
 /// when Herdr has no absolute current-pane directory.
@@ -342,7 +354,7 @@ pub async fn open_command_pane(
                 close_transient_tab(client, schema, &prepared.temporary_tab).await
             {
                 return Err(AdapterError::new(
-                    AdapterErrorKind::DispatchFailed,
+                    combined_move_error_kind(&move_error, &cleanup_error),
                     format!(
                         "Herdr command-pane move failed ({move_error}); closing its returned temporary tab also failed ({cleanup_error})"
                     ),
@@ -351,6 +363,46 @@ pub async fn open_command_pane(
             Err(move_error)
         }
     }
+}
+
+/// Opens one exact user command as the root pane of a new tab.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] when the command or cwd is invalid, or Herdr
+/// rejects the single `layout.apply` request.
+pub async fn open_command_tab(
+    client: &HerdrSocketClient,
+    schema: &ApiSchema,
+    launch: CommandTabLaunch,
+) -> Result<(), AdapterError> {
+    if !launch.cwd.is_absolute() {
+        return Err(invalid("Herdr command-tab cwd must be absolute"));
+    }
+    if launch.argv.first().is_none_or(String::is_empty) {
+        return Err(invalid(
+            "Herdr command-tab argv requires a nonempty program",
+        ));
+    }
+    let layout = invoke(
+        client,
+        schema,
+        "layout.apply",
+        json!({
+            "focus": launch.focus,
+            "workspace_id": launch.workspace.as_str(),
+            "tab_label": launch.label,
+            "root": {
+                "type": "pane",
+                "command": launch.argv,
+                "cwd": launch.cwd,
+                "env": {},
+            },
+        }),
+    )
+    .await?;
+    let _ = layout_apply_result(&layout)?;
+    Ok(())
 }
 
 /// Executes only trampoline step 2. The returned pane is still in the temporary tab and must be
@@ -450,7 +502,7 @@ pub async fn move_prepared_ui_pane(
                 close_transient_tab(client, schema, &prepared.temporary_tab).await
             {
                 return Err(AdapterError::new(
-                    AdapterErrorKind::DispatchFailed,
+                    combined_move_error_kind(&move_error, &cleanup_error),
                     format!(
                         "Herdr UI pane move failed ({move_error}); closing its returned temporary tab also failed ({cleanup_error})"
                     ),
@@ -679,6 +731,21 @@ fn changed(value: &Value, method: &str) -> Result<(), AdapterError> {
         })
 }
 
+/// A move whose outcome may be unknown outranks a follow-up cleanup failure:
+/// the caller must keep treating the host mutation as possibly applied.
+fn combined_move_error_kind(
+    move_error: &AdapterError,
+    cleanup_error: &AdapterError,
+) -> AdapterErrorKind {
+    if move_error.kind == AdapterErrorKind::OutcomeUnknown
+        || cleanup_error.kind == AdapterErrorKind::OutcomeUnknown
+    {
+        AdapterErrorKind::OutcomeUnknown
+    } else {
+        AdapterErrorKind::DispatchFailed
+    }
+}
+
 fn socket_error(error: &crate::SocketError) -> AdapterError {
     AdapterError::new(
         if error.delivery() == crate::DeliveryState::MayHaveReachedHost {
@@ -781,5 +848,29 @@ mod tests {
 
         env.insert("UNRELATED".to_owned(), "value".to_owned());
         assert!(validate_bootstrap_env(&env).is_err());
+    }
+
+    #[test]
+    fn combined_move_error_kind_never_downgrades_unknown_moves() {
+        let unknown = AdapterError::new(
+            AdapterErrorKind::OutcomeUnknown,
+            "move request closed after flush",
+        );
+        let failed = AdapterError::new(AdapterErrorKind::DispatchFailed, "cleanup rejected");
+
+        assert_eq!(
+            combined_move_error_kind(&unknown, &failed),
+            AdapterErrorKind::OutcomeUnknown,
+            "a possibly applied move must stay unknown when cleanup fails"
+        );
+        assert_eq!(
+            combined_move_error_kind(&failed, &unknown),
+            AdapterErrorKind::OutcomeUnknown,
+            "a possibly applied cleanup must keep the mutation unknown"
+        );
+        assert_eq!(
+            combined_move_error_kind(&failed, &failed),
+            AdapterErrorKind::DispatchFailed
+        );
     }
 }
