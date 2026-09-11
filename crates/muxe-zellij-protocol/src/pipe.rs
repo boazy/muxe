@@ -106,10 +106,6 @@ pub struct BridgeTarget {
 }
 
 /// Zellij-specific dispatch operation carried by the common dispatch lifecycle.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "native commands stay inline to avoid a heap allocation on every request"
-)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ZellijDispatchRequest {
     Command(RawNativeCommand),

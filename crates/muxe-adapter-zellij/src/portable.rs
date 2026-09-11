@@ -390,7 +390,7 @@ fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
             if let Some(name) = name {
                 check_concrete_string("tab:create", "name", name)?;
             }
-            check_create_focus("tab:create", focus)?;
+            check_create_focus("tab:create", focus.as_ref())?;
             check_create_command("tab:create", command, true)
         }
         TabAction::Close => Ok(()),
@@ -439,7 +439,7 @@ fn validate_pane_structure(pane: &PaneAction) -> Result<(), PortableError> {
             if let Some(direction) = direction {
                 Cardinal::parse("pane:split", direction).map(|_| ())?;
             }
-            check_create_focus("pane:split", focus)?;
+            check_create_focus("pane:split", focus.as_ref())?;
             check_create_command("pane:split", command, false)
         }
         PaneAction::Focus(target) => match target {
@@ -504,7 +504,7 @@ fn validate_session_structure(session: &SessionAction) -> Result<(), PortableErr
 
 fn check_create_focus(
     action: &'static str,
-    focus: &Option<ActionScalar>,
+    focus: Option<&ActionScalar>,
 ) -> Result<(), PortableError> {
     if let Some(focus) = focus {
         scalar_bool(action, "focus", focus)?;
@@ -666,7 +666,7 @@ pub fn map_post_dismissal_creation(
 ) -> Result<RawNativeCommand, PortableError> {
     match action {
         PortableAction::Tab(TabAction::Create { focus, .. }) => {
-            if !creation_focuses("tab:create", focus)? {
+            if !creation_focuses("tab:create", focus.as_ref())? {
                 return Err(PortableError::Incompatible {
                     action: "tab:create",
                     reason: "post-dismissal dispatch requires focus=true",
@@ -692,7 +692,7 @@ pub fn map_post_dismissal_creation(
             focus,
             command,
         }) => {
-            if !creation_focuses("pane:split", focus)? {
+            if !creation_focuses("pane:split", focus.as_ref())? {
                 return Err(PortableError::Incompatible {
                     action: "pane:split",
                     reason: "post-dismissal dispatch requires focus=true",
@@ -740,10 +740,10 @@ pub fn map_post_dismissal_creation(
 pub fn creation_requires_post_dismissal(action: &PortableAction) -> Result<bool, PortableError> {
     match action {
         PortableAction::Tab(TabAction::Create { focus, .. }) => {
-            creation_focuses("tab:create", focus)
+            creation_focuses("tab:create", focus.as_ref())
         }
         PortableAction::Pane(PaneAction::Split { focus, .. }) => {
-            creation_focuses("pane:split", focus)
+            creation_focuses("pane:split", focus.as_ref())
         }
         _ => Ok(false),
     }
@@ -751,10 +751,9 @@ pub fn creation_requires_post_dismissal(action: &PortableAction) -> Result<bool,
 
 fn creation_focuses(
     action: &'static str,
-    focus: &Option<ActionScalar>,
+    focus: Option<&ActionScalar>,
 ) -> Result<bool, PortableError> {
     focus
-        .as_ref()
         .map(|focus| scalar_bool(action, "focus", focus))
         .transpose()
         .map(|focus| focus.unwrap_or(true))
@@ -833,7 +832,7 @@ fn map_tab_action(
                 swap_floating_layouts: None,
                 tab_name: name,
                 should_change_focus_to_new_tab: focus,
-                cwd: cwd.clone(),
+                cwd,
                 initial_panes: command.map(|command| vec![raw::CommandOrPlugin::Command(command)]),
                 first_pane_unblock_condition: None,
             }))

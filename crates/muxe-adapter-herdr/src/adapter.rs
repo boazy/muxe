@@ -462,9 +462,13 @@ impl HerdrAdapter {
         snapshot_contains_pane(&snapshot, pane)
     }
 
-    async fn start_post_dismissal(
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
+    fn start_post_dismissal(
         &self,
-        request: PostDismissalPortableDispatchRequest,
+        request: &PostDismissalPortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
         self.require_current_origin(&request.origin)?;
         if creation_has_program(&request.action.action) {
@@ -531,7 +535,7 @@ impl HerdrAdapter {
                 let still_queued = snapshot_failure_reclaims_request(
                     &mut *self.post_dismissal.lock().await,
                     &pane,
-                    &execution,
+                    execution,
                 );
                 if still_queued {
                     return Err(error);
@@ -565,7 +569,7 @@ impl HerdrAdapter {
     async fn start_post_dismissals(&self, queued: Vec<PostDismissalPortableDispatchRequest>) {
         for request in queued {
             let execution = request.execution;
-            if let Err(error) = self.start_post_dismissal(request).await {
+            if let Err(error) = self.start_post_dismissal(&request) {
                 let _ = self
                     .events_tx
                     .send(AdapterHealthEvent::DispatchCompleted(
@@ -1280,6 +1284,10 @@ async fn take_resumed_subscription(adapter: &Arc<HerdrAdapter>) -> Option<EventS
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
 fn snapshot_contains_pane(
     response: &Value,
     pane: &muxe_core::PaneId,
@@ -1305,14 +1313,14 @@ fn snapshot_contains_pane(
 fn snapshot_failure_reclaims_request(
     pending: &mut HashMap<String, Vec<PostDismissalPortableDispatchRequest>>,
     pane: &str,
-    execution: &muxe_core::ExecutionId,
+    execution: muxe_core::ExecutionId,
 ) -> bool {
     let Some(requests) = pending.get_mut(pane) else {
         return false;
     };
     let Some(index) = requests
         .iter()
-        .position(|request| &request.execution == execution)
+        .position(|request| request.execution == execution)
     else {
         return false;
     };
@@ -1351,22 +1359,12 @@ fn portable_invocation(
             name,
             focus,
             command,
-        }) => {
-            if command.program.is_some() {
-                return Err(incompatible(
-                    "Herdr command-bearing tab:create requires the ordered dismiss-and-dispatch lifecycle",
-                ));
-            }
-            Ok(Invocation {
-                method: "tab.create",
-                params: json!({
-                    "workspace_id": workspace_id.as_ref().map(scalar_string).transpose()?,
-                    "label": name.as_ref().map(scalar_string).transpose()?,
-                    "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
-                    "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
-                }),
-            })
-        }
+        }) => creation_tab_invocation(
+            workspace_id.as_ref(),
+            name.as_ref(),
+            focus.as_ref(),
+            command,
+        ),
         PortableAction::Tab(TabAction::Close) => Ok(Invocation {
             method: "tab.close",
             params: json!({ "tab_id": origin_tab(origin)? }),
@@ -1392,30 +1390,10 @@ fn portable_invocation(
             "Herdr has no pane.create method; pane.split requires an explicit direction",
         )),
         PortableAction::Pane(PaneAction::Split {
-            direction: Some(direction),
+            direction,
             focus,
             command,
-        }) => {
-            if command.program.is_some() {
-                return Err(incompatible(
-                    "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle",
-                ));
-            }
-            Ok(Invocation {
-                method: "pane.split",
-                params: json!({
-                    "target_pane_id": pane,
-                    "direction": scalar_split_direction(direction)?,
-                    "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
-                    "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
-                }),
-            })
-        }
-        PortableAction::Pane(PaneAction::Split {
-            direction: None, ..
-        }) => Err(incompatible(
-            "Herdr pane.split requires an explicit right or down direction",
-        )),
+        }) => creation_split_invocation(pane, direction.as_ref(), focus.as_ref(), command),
         PortableAction::Pane(PaneAction::Close) => Ok(Invocation {
             method: "pane.close",
             params: json!({ "pane_id": pane }),
@@ -1446,6 +1424,66 @@ fn portable_invocation(
         )),
     }
 }
+
+/// Maps a tab creation that runs while the Muxe UI is still live.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
+fn creation_tab_invocation(
+    workspace_id: Option<&ActionScalar>,
+    name: Option<&ActionScalar>,
+    focus: Option<&ActionScalar>,
+    command: &muxe_core::CreateCommand,
+) -> Result<Invocation, AdapterError> {
+    if command.program.is_some() {
+        return Err(incompatible(
+            "Herdr command-bearing tab:create requires the ordered dismiss-and-dispatch lifecycle",
+        ));
+    }
+    Ok(Invocation {
+        method: "tab.create",
+        params: json!({
+            "workspace_id": workspace_id.map(scalar_string).transpose()?,
+            "label": name.map(scalar_string).transpose()?,
+            "focus": focus.map(scalar_bool).transpose()?.unwrap_or(true),
+            "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+        }),
+    })
+}
+
+/// Maps a split creation that runs while the Muxe UI is still live.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
+fn creation_split_invocation(
+    pane: &str,
+    direction: Option<&ActionScalar>,
+    focus: Option<&ActionScalar>,
+    command: &muxe_core::CreateCommand,
+) -> Result<Invocation, AdapterError> {
+    if command.program.is_some() {
+        return Err(incompatible(
+            "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle",
+        ));
+    }
+    let Some(direction) = direction else {
+        return Err(incompatible(
+            "Herdr pane.split requires an explicit right or down direction",
+        ));
+    };
+    Ok(Invocation {
+        method: "pane.split",
+        params: json!({
+            "target_pane_id": pane,
+            "direction": scalar_split_direction(direction)?,
+            "focus": focus.map(scalar_bool).transpose()?.unwrap_or(true),
+            "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+        }),
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OrderedTab {
     id: String,
@@ -1460,6 +1498,10 @@ fn creation_has_program(action: &PortableAction) -> bool {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
 fn creation_requires_post_dismissal(action: &PortableAction) -> Result<bool, AdapterError> {
     match action {
         PortableAction::Tab(TabAction::Create { focus, .. })
@@ -1566,6 +1608,10 @@ async fn perform_command_creation(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
 fn creation_argv(command: &muxe_core::CreateCommand) -> Result<Vec<String>, AdapterError> {
     let program = command
         .program
@@ -1583,6 +1629,10 @@ fn creation_argv(command: &muxe_core::CreateCommand) -> Result<Vec<String>, Adap
     Ok(argv)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
 fn creation_cwd(
     command: &muxe_core::CreateCommand,
     origin: &muxe_core::OriginContext,
@@ -2113,7 +2163,7 @@ mod tests {
             !snapshot_failure_reclaims_request(
                 &mut pending,
                 request.ui_pane.as_str(),
-                &request.execution,
+                request.execution,
             ),
             "a later snapshot failure must not retract the pane-close dispatch"
         );

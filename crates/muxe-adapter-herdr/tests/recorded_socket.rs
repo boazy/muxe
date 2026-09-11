@@ -3,6 +3,7 @@ mod support {
     pub mod recorded_socket;
 }
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use muxe_adapter_api::{
@@ -136,6 +137,87 @@ fn lifecycle_scalar(value: &str) -> ActionScalar {
     ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
         value.to_owned(),
     )))
+}
+
+/// Builds the production connect script with the given number of origin snapshots.
+fn lifecycle_script(snapshots: usize) -> Vec<RecordedExchange> {
+    let snapshot = lifecycle_snapshot();
+    let mut script = ProductionConnectFixture::initial_handshake();
+    for _ in 0..snapshots {
+        script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    }
+    script
+}
+
+/// Connects the production adapter to a scripted owned fixture and consumes its health event.
+async fn connected_lifecycle_fixture(
+    script: Vec<RecordedExchange>,
+) -> (ProductionConnectFixture, Arc<HerdrAdapter>) {
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned outcome fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    (fixture, adapter)
+}
+
+/// Scripts the focused command split whose move response never arrives and whose cleanup is rejected.
+fn command_split_outcome_script() -> Vec<RecordedExchange> {
+    let mut script = lifecycle_script(3);
+    script.push(RecordedExchange {
+        method: "layout.apply",
+        params: json!({
+            "focus": false,
+            "workspace_id": "workspace-1",
+            "root": {
+                "type": "pane",
+                "command": ["tool"],
+                "cwd": "/command",
+                "env": {},
+            },
+        }),
+        response: RecordedResponse::Result(json!({
+            "type": "layout_apply",
+            "layout": {
+                "workspace_id": "workspace-1",
+                "tab_id": "temporary-tab",
+                "zoomed": false,
+                "focused_pane_id": "new-pane",
+                "root": { "type": "pane", "pane_id": "new-pane" },
+            },
+        })),
+    });
+    script.push(RecordedExchange {
+        method: "pane.move",
+        params: json!({
+            "pane_id": "new-pane",
+            "focus": true,
+            "destination": {
+                "type": "tab",
+                "tab_id": "tab-1",
+                "target_pane_id": "pane-1",
+                "split": "right",
+                "ratio": 0.5,
+            },
+        }),
+        response: RecordedResponse::Close,
+    });
+    script.push(RecordedExchange {
+        method: "tab.close",
+        params: json!({ "tab_id": "temporary-tab" }),
+        response: RecordedResponse::Error {
+            code: "cleanup-failed".to_owned(),
+            message: "temporary tab remains".to_owned(),
+        },
+    });
+    script
 }
 
 async fn wait_for_lifecycle_requests(
@@ -358,69 +440,7 @@ async fn reports_unknown_outcome_when_command_tab_layout_closes_after_flush() {
 
 #[tokio::test]
 async fn reports_unknown_outcome_when_command_split_move_closes_and_cleanup_fails() {
-    let snapshot = lifecycle_snapshot();
-    let mut script = ProductionConnectFixture::initial_handshake();
-    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
-    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
-    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
-    script.push(RecordedExchange {
-        method: "layout.apply",
-        params: json!({
-            "focus": false,
-            "workspace_id": "workspace-1",
-            "root": {
-                "type": "pane",
-                "command": ["tool"],
-                "cwd": "/command",
-                "env": {},
-            },
-        }),
-        response: RecordedResponse::Result(json!({
-            "type": "layout_apply",
-            "layout": {
-                "workspace_id": "workspace-1",
-                "tab_id": "temporary-tab",
-                "zoomed": false,
-                "focused_pane_id": "new-pane",
-                "root": { "type": "pane", "pane_id": "new-pane" },
-            },
-        })),
-    });
-    script.push(RecordedExchange {
-        method: "pane.move",
-        params: json!({
-            "pane_id": "new-pane",
-            "focus": true,
-            "destination": {
-                "type": "tab",
-                "tab_id": "tab-1",
-                "target_pane_id": "pane-1",
-                "split": "right",
-                "ratio": 0.5,
-            },
-        }),
-        response: RecordedResponse::Close,
-    });
-    script.push(RecordedExchange {
-        method: "tab.close",
-        params: json!({ "tab_id": "temporary-tab" }),
-        response: RecordedResponse::Error {
-            code: "cleanup-failed".to_owned(),
-            message: "temporary tab remains".to_owned(),
-        },
-    });
-    let fixture =
-        ProductionConnectFixture::start_scripted(script).expect("owned outcome fixture starts");
-    let adapter = HerdrAdapter::connect(fixture.adapter_config())
-        .await
-        .expect("production adapter connects");
-    assert!(matches!(
-        adapter
-            .next_health_event()
-            .await
-            .expect("initial health event"),
-        AdapterHealthEvent::Healthy { .. }
-    ));
+    let (fixture, adapter) = connected_lifecycle_fixture(command_split_outcome_script()).await;
     let origin = adapter
         .capture_origin(lifecycle_capture_request())
         .await

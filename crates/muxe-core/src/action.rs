@@ -343,6 +343,10 @@ pub struct CreateCommand {
     pub cwd: Option<ActionScalar>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the compiled action model carries creation payloads inline; `Create` is the common case, and boxing `command` would heap-allocate for it while churning every construction and match site in the compiler, both adapters, the broker, and fixtures"
+)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum TabAction {
     Create {
@@ -905,6 +909,10 @@ impl NativeActionCandidate {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "portable is the dominant compiled form; boxing it would add indirection on every dispatch while churning each compiler, broker, and adapter site that builds or matches this enum for the smaller native alternative"
+)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ActionSpec {
     Portable(PortableAction),
