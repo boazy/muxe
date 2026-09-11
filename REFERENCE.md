@@ -34,14 +34,14 @@ action: tab:create workspace-id=$origin.workspace.id
 | `config:reload` | none | — | none | Core source only |
 | `keyboard:send` | exactly one of keys=[<canonical-key or $context>, …] or text=<string or $context> | await | awaitable, detachable | Core source only |
 | `command:execute` | program=<string or $context>; args=[<string or $context>, …]?; cwd=<path or $context>?; env={<string>: <string or $context>}? | detach | awaitable, detachable, cancellable | Core source only |
-| `tab:create` | workspace-id=<string or $context>? | await | awaitable, detachable | Core source only |
+| `tab:create` | workspace-id=<string or $context>?; name=<string or $context>?; focus=<boolean>? (default true); program=<string or $context>?; args=[<string or $context>, …]?; cwd=<path or $context>? | await | awaitable, detachable | Core source only |
 | `tab:close` | none | await | awaitable, detachable | Core source only |
 | `tab:rename` | name=<string or $context>? | await | awaitable, detachable | Core source only |
 | `tab:focus` | exactly one of index=<non-negative integer or $context> or direction=<direction or $context> | await | awaitable, detachable | Core source only |
 | `tab:move` | exactly one of index=<non-negative integer or $context> or direction=<direction or $context> | await | awaitable, detachable | Core source only |
 | `tab:swap` | exactly one of index=<non-negative integer or $context> or direction=<direction or $context> | await | awaitable, detachable | Core source only |
 | `pane:create` | none | await | awaitable, detachable | Core source only |
-| `pane:split` | direction=<direction or $context>? | await | awaitable, detachable | Core source only |
+| `pane:split` | direction=<direction or $context>?; focus=<boolean>? (default true); program=<string or $context>?; args=[<string or $context>, …]?; cwd=<path or $context>? | await | awaitable, detachable | Core source only |
 | `pane:close` | none | await | awaitable, detachable | Core source only |
 | `pane:focus` | exactly one of index=<non-negative integer or $context> or direction=<direction or $context> | await | awaitable, detachable | Core source only |
 | `pane:move` | exactly one of index=<non-negative integer or $context> or direction=<direction or $context> | await | awaitable, detachable | Core source only |
@@ -86,14 +86,14 @@ This rule applies to menu command execution. It does not define the omitted `mux
 | `config:reload` | Broker configuration control; no Zellij RPC | Broker configuration control; no Herdr RPC |
 | `keyboard:send` | Origin-targeted `WriteCharsToPaneId`/`WriteToPaneId`; finite bridge encoding supports text/C0/ESC-meta/VT100/CSI modifiers and rejects super/hyper/keypad/media/F13+ precisely | `pane.send_keys` or `pane.send_text` to the captured origin pane; keys/text must be strings |
 | `command:execute` | Broker-owned supervised local process; no Zellij RPC | Broker-owned supervised local process; no Herdr RPC |
-| `tab:create` | Bare action maps to `NewTab`; supplied `workspace-id` is rejected because Zellij has no workspaces | `tab.create(workspace_id or null)` |
+| `tab:create` | `NewTab` accepts `name`, `focus`, and exact `program`/`args`/`cwd`; `workspace-id` is rejected because Zellij has no workspaces. Focused creation waits for UI dismissal before bridge dispatch. | Without `program`, `tab.create` accepts `workspace-id`, `name` as `label`, `focus`, and `cwd`. Command tabs use `layout.apply`. Focused creation waits for the UI pane's retained `pane_closed` event. |
 | `tab:close` | `Action::CloseTab` or `close_focused_tab`; current focused tab only | `tab.close` on the captured origin tab |
 | `tab:rename` | Name plus captured origin tab index maps to `RenameTab`; bare rename is rejected because Zellij has no prompt variant | `tab.rename` on the captured origin tab only when `name` is supplied; bare rename is incompatible |
 | `tab:focus` | Partial: `GoToTab`, `GoToNextTab`, and `GoToPreviousTab`; only index and next/previous | Pending runtime candidate: resolve the requested target through captured-workspace `tab.list` before host focus; source mapping is not implemented |
 | `tab:move` | Direction maps to `MoveTab`; index is rejected because Zellij exposes no index destination primitive | Pending runtime candidate: resolve direction through captured-workspace `tab.list` before `tab.move`; source mapping is not implemented |
 | `tab:swap` | Pending runtime composition; no source-proven one-to-one Action or shim operation | Nonnegative index only: list captured workspace, make two direct moves, and verify ordering; partial failure has no replay and a lost move response is OutcomeUnknown |
 | `pane:create` | `Action::NewPane` or `new_pane`; placement is host-determined in the focused tab | Incompatible |
-| `pane:split` | `NewTiledPane` or `NewPane`; adapter must supply nonportable fields and uses the current tab | `pane.split(origin_pane_id, direction)` only for explicit `right` or `down`; no inferred direction |
+| `pane:split` | `NewTiledPane` accepts direction and exact `program`/`args`/`cwd`. Focused creation waits for UI dismissal before bridge dispatch; `focus: false` is rejected because Zellij cannot target the immutable origin while the menu is open. | Only explicit `right` or `down` directions are supported. Without `program`, `pane.split` also accepts `focus` and `cwd`. Command splits validate the origin with `session.snapshot`, then use `layout.apply` and `pane.move`. Focused creation waits for the UI pane's retained `pane_closed` event. |
 | `pane:close` | `CloseFocusByPaneId` on the captured origin pane | `pane.close` on the captured origin pane |
 | `pane:focus` | Direction uses bridge-tracked geometry and index uses bridge manifest order; neither falls back to menu-relative focus | Pending runtime candidate: resolve an index/direction through host pane state before focus; source mapping is not implemented |
 | `pane:move` | Direction maps to `MovePaneByPaneId` on the captured origin pane; index is rejected because no primitive exists | Pending runtime candidate: resolve destination through host pane state; source mapping is not implemented |
