@@ -5,9 +5,9 @@ use std::time::Duration;
 use regex::Regex;
 
 use crate::action::{
-    ActionKind, ActionScalar, ActionSpec, CommandAction, ConfigAction, IndexOrDirection,
-    KeyboardAction, MenuAction, MenuTarget, NativeActionCandidate, PaneAction, PortableAction,
-    PortableActionKind, SessionAction, TabAction,
+    ActionKind, ActionScalar, ActionSpec, CommandAction, ConfigAction, CreateCommand,
+    IndexOrDirection, KeyboardAction, MenuAction, MenuTarget, NativeActionCandidate, PaneAction,
+    PortableAction, PortableActionKind, SessionAction, TabAction,
 };
 use crate::condition::ConditionProgram;
 use crate::config::{
@@ -1195,7 +1195,10 @@ impl MenuCompiler<'_> {
                 })
             }
             PortableActionKind::TabCreate => {
-                ensure_action_fields(fields, &["workspace-id"])?;
+                ensure_action_fields(
+                    fields,
+                    &["workspace-id", "name", "focus", "program", "args", "cwd"],
+                )?;
                 let workspace_id = field_named(fields, "workspace-id")
                     .map(|field| {
                         action_string_scalar(
@@ -1205,7 +1208,21 @@ impl MenuCompiler<'_> {
                         )
                     })
                     .transpose()?;
-                PortableAction::Tab(TabAction::Create { workspace_id })
+                let name = field_named(fields, "name")
+                    .map(|field| {
+                        action_string_scalar(&field.value, "tab name", ContextAllowance::Textual)
+                    })
+                    .transpose()?;
+                let focus = field_named(fields, "focus")
+                    .map(|field| action_bool_scalar(&field.value, "tab focus"))
+                    .transpose()?;
+                let command = create_command(fields, "tab")?;
+                PortableAction::Tab(TabAction::Create {
+                    workspace_id,
+                    name,
+                    focus,
+                    command,
+                })
             }
             PortableActionKind::TabClose => {
                 ensure_action_fields(fields, &[])?;
@@ -1239,11 +1256,18 @@ impl MenuCompiler<'_> {
                 PortableAction::Pane(PaneAction::Create)
             }
             PortableActionKind::PaneSplit => {
-                ensure_action_fields(fields, &["direction"])?;
+                ensure_action_fields(fields, &["direction", "focus", "program", "args", "cwd"])?;
+                let direction = field_named(fields, "direction")
+                    .map(|field| action_direction_scalar(&field.value, "pane direction"))
+                    .transpose()?;
+                let focus = field_named(fields, "focus")
+                    .map(|field| action_bool_scalar(&field.value, "pane focus"))
+                    .transpose()?;
+                let command = create_command(fields, "pane")?;
                 PortableAction::Pane(PaneAction::Split {
-                    direction: field_named(fields, "direction")
-                        .map(|field| action_direction_scalar(&field.value, "pane direction"))
-                        .transpose()?,
+                    direction,
+                    focus,
+                    command,
                 })
             }
             PortableActionKind::PaneClose => {
@@ -2236,6 +2260,47 @@ fn action_key_sequence(value: &ConfigValue) -> Result<Vec<ActionScalar>, Vec<Con
             Ok(scalar)
         })
         .collect()
+}
+
+fn create_command(
+    fields: &[ConfigField],
+    action: &str,
+) -> Result<CreateCommand, Vec<ConfigDiagnostic>> {
+    let program = field_named(fields, "program")
+        .map(|field| {
+            action_string_scalar(
+                &field.value,
+                &format!("{action} program"),
+                ContextAllowance::Textual,
+            )
+        })
+        .transpose()?;
+    if field_named(fields, "args").is_some() && program.is_none() {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidActionArguments,
+            format!("{action} args requires `program`"),
+            field_named(fields, "args")
+                .expect("checked")
+                .value
+                .span
+                .clone(),
+        )]);
+    }
+    let args = action_string_sequence(
+        field_named(fields, "args").map(|field| &field.value),
+        &format!("{action} args"),
+        ContextAllowance::Textual,
+    )?;
+    let cwd = field_named(fields, "cwd")
+        .map(|field| {
+            action_string_scalar(
+                &field.value,
+                &format!("{action} cwd"),
+                ContextAllowance::AbsolutePath,
+            )
+        })
+        .transpose()?;
+    Ok(CreateCommand { program, args, cwd })
 }
 
 fn action_string_sequence(

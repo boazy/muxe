@@ -205,7 +205,7 @@ impl PortableActionKind {
                 ExecutionCapabilities::ASYNCHRONOUS,
             ),
             Self::TabCreate => (
-                "workspace-id=<string or $context>?",
+                "workspace-id=<string or $context>?; name=<string or $context>?; focus=<boolean>? (default true); program=<string or $context>?; args=[<string or $context>, …]?; cwd=<path or $context>?",
                 Some(ExecutionMode::Await),
                 ExecutionCapabilities::ASYNCHRONOUS,
             ),
@@ -225,7 +225,7 @@ impl PortableActionKind {
                 ExecutionCapabilities::ASYNCHRONOUS,
             ),
             Self::PaneSplit => (
-                "direction=<direction or $context>?",
+                "direction=<direction or $context>?; focus=<boolean>? (default true); program=<string or $context>?; args=[<string or $context>, …]?; cwd=<path or $context>?",
                 Some(ExecutionMode::Await),
                 ExecutionCapabilities::ASYNCHRONOUS,
             ),
@@ -335,11 +335,26 @@ pub struct CommandAction {
     pub env: BTreeMap<String, ActionScalar>,
 }
 
+/// Exact command-vector fields for a tab or split-pane creation action.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateCommand {
+    pub program: Option<ActionScalar>,
+    pub args: Vec<ActionScalar>,
+    pub cwd: Option<ActionScalar>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TabAction {
-    Create { workspace_id: Option<ActionScalar> },
+    Create {
+        workspace_id: Option<ActionScalar>,
+        name: Option<ActionScalar>,
+        focus: Option<ActionScalar>,
+        command: CreateCommand,
+    },
     Close,
-    Rename { name: Option<ActionScalar> },
+    Rename {
+        name: Option<ActionScalar>,
+    },
     Focus(IndexOrDirection),
     Move(IndexOrDirection),
     Swap(IndexOrDirection),
@@ -350,6 +365,8 @@ pub enum PaneAction {
     Create,
     Split {
         direction: Option<ActionScalar>,
+        focus: Option<ActionScalar>,
+        command: CreateCommand,
     },
     Close,
     Focus(IndexOrDirection),
@@ -521,7 +538,12 @@ impl PortableAction {
                     env,
                 })
             }
-            Self::Tab(TabAction::Create { workspace_id }) => {
+            Self::Tab(TabAction::Create {
+                workspace_id,
+                name,
+                focus,
+                command,
+            }) => {
                 let workspace_id = workspace_id
                     .as_ref()
                     .map(|workspace_id| {
@@ -530,7 +552,16 @@ impl PortableAction {
                         Ok(workspace_id)
                     })
                     .transpose()?;
-                Self::Tab(TabAction::Create { workspace_id })
+                let name = resolve_optional_string(name.as_ref(), origin, "tab.name")?;
+                let focus = resolve_optional_bool(focus.as_ref(), origin, "tab.focus")?;
+                let command =
+                    resolve_create_command(command, origin, "tab.program", "tab.args", "tab.cwd")?;
+                Self::Tab(TabAction::Create {
+                    workspace_id,
+                    name,
+                    focus,
+                    command,
+                })
             }
             Self::Tab(TabAction::Close) => Self::Tab(TabAction::Close),
             Self::Tab(TabAction::Rename { name }) => {
@@ -547,10 +578,26 @@ impl PortableAction {
                 Self::Tab(TabAction::Swap(resolve_target(target, origin)?))
             }
             Self::Pane(PaneAction::Create) => Self::Pane(PaneAction::Create),
-            Self::Pane(PaneAction::Split { direction }) => {
+            Self::Pane(PaneAction::Split {
+                direction,
+                focus,
+                command,
+            }) => {
                 let direction =
                     resolve_optional_direction(direction.as_ref(), origin, "pane.direction")?;
-                Self::Pane(PaneAction::Split { direction })
+                let focus = resolve_optional_bool(focus.as_ref(), origin, "pane.focus")?;
+                let command = resolve_create_command(
+                    command,
+                    origin,
+                    "pane.program",
+                    "pane.args",
+                    "pane.cwd",
+                )?;
+                Self::Pane(PaneAction::Split {
+                    direction,
+                    focus,
+                    command,
+                })
             }
             Self::Pane(PaneAction::Close) => Self::Pane(PaneAction::Close),
             Self::Pane(PaneAction::Focus(target)) => {
@@ -667,6 +714,48 @@ fn resolve_optional_direction(
             Ok(scalar)
         })
         .transpose()
+}
+
+fn resolve_create_command(
+    command: &CreateCommand,
+    origin: &OriginContext,
+    program_parameter: &'static str,
+    args_parameter: &'static str,
+    cwd_parameter: &'static str,
+) -> Result<CreateCommand, PortableActionResolutionError> {
+    let program = command
+        .program
+        .as_ref()
+        .map(|program| {
+            let program = resolve_scalar(program, origin)?;
+            ensure_string(&program, program_parameter)?;
+            Ok(program)
+        })
+        .transpose()?;
+    let args = command
+        .args
+        .iter()
+        .map(|argument| {
+            let argument = resolve_scalar(argument, origin)?;
+            ensure_string(&argument, args_parameter)?;
+            Ok(argument)
+        })
+        .collect::<Result<_, PortableActionResolutionError>>()?;
+    let cwd = command
+        .cwd
+        .as_ref()
+        .map(|cwd| {
+            let context_path = matches!(cwd.value.kind, ConfigValueKind::Context(_));
+            let cwd = resolve_scalar(cwd, origin)?;
+            if context_path {
+                ensure_absolute_path(&cwd, cwd_parameter)?;
+            } else {
+                ensure_string(&cwd, cwd_parameter)?;
+            }
+            Ok(cwd)
+        })
+        .transpose()?;
+    Ok(CreateCommand { program, args, cwd })
 }
 
 fn resolve_optional_bool(

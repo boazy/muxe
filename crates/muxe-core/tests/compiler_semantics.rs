@@ -642,6 +642,7 @@ impl muxe_core::ActionValidator for DirectionalHostValidator {
     ) -> Result<muxe_core::ActionValidation, muxe_core::ConfigDiagnostic> {
         if let muxe_core::PortableAction::Pane(muxe_core::PaneAction::Split {
             direction: Some(direction),
+            ..
         }) = action
             && direction.value.as_str() == Some("right")
         {
@@ -1007,6 +1008,7 @@ fn tab_and_keyboard_context_values_revalidate_to_their_declared_types() {
     let create_action = portable_main_action(&config, "w");
     let muxe_core::PortableAction::Tab(muxe_core::TabAction::Create {
         workspace_id: Some(workspace_id),
+        ..
     }) = create_action
         .resolve_context(&origin)
         .expect("workspace context resolves")
@@ -1159,6 +1161,122 @@ menus:
         KeyCapabilities::default(),
     )
     .expect("Kitty preserves the supplied key identities and modifiers");
+}
+
+#[test]
+fn creation_actions_preserve_named_focus_and_exact_command_vectors() {
+    let config = compile(
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      t:
+        label: logs
+        action:
+          type: tab:create
+          name: logs
+          focus: false
+          program: tail
+          args: [-f, app.log]
+          cwd: /srv/app
+      p:
+        label: monitor
+        action:
+          type: pane:split
+          direction: right
+          focus: true
+          program: htop
+          args: []
+          cwd: /srv/app
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect("creation actions accept their declared fields");
+    let tab = portable_main_action(&config, "t");
+    let muxe_core::PortableAction::Tab(muxe_core::TabAction::Create {
+        name,
+        focus,
+        command,
+        ..
+    }) = tab
+    else {
+        panic!("expected tab creation action");
+    };
+    assert_eq!(
+        name.as_ref().and_then(|value| value.value.as_str()),
+        Some("logs")
+    );
+    assert_eq!(
+        focus.as_ref().and_then(|value| value.value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        command
+            .program
+            .as_ref()
+            .and_then(|value| value.value.as_str()),
+        Some("tail")
+    );
+    assert_eq!(command.args.len(), 2);
+    assert_eq!(
+        command.cwd.as_ref().and_then(|value| value.value.as_str()),
+        Some("/srv/app")
+    );
+    let pane = portable_main_action(&config, "p");
+    let muxe_core::PortableAction::Pane(muxe_core::PaneAction::Split {
+        direction,
+        focus,
+        command,
+    }) = pane
+    else {
+        panic!("expected pane split action");
+    };
+    assert_eq!(
+        direction.as_ref().and_then(|value| value.value.as_str()),
+        Some("right")
+    );
+    assert_eq!(
+        focus.as_ref().and_then(|value| value.value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        command
+            .program
+            .as_ref()
+            .and_then(|value| value.value.as_str()),
+        Some("htop")
+    );
+    assert!(command.args.is_empty());
+    assert_eq!(
+        command.cwd.as_ref().and_then(|value| value.value.as_str()),
+        Some("/srv/app")
+    );
+}
+
+#[test]
+fn creation_args_require_a_program() {
+    let diagnostics = compile(
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      p:
+        label: bad
+        action:
+          type: pane:split
+          args: [--watch]
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect_err("args without a creation program must fail configuration");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == muxe_core::DiagnosticCode::InvalidActionArguments
+            && diagnostic.message.contains("args requires `program`")
+    }));
 }
 
 #[test]
