@@ -4040,14 +4040,18 @@ menus:
         let directory = tempfile::tempdir().expect("owned generic-process directory");
         let script = directory.path().join("term-resistant-group.sh");
         let descendant_pid = directory.path().join("descendant.pid");
+        let descendant_ready = directory.path().join("descendant.ready");
         std::fs::write(
             &script,
-            r#"(
-    trap '' TERM
+            r#"trap 'exit 0' TERM
+(
+    trap '' TERM HUP
+    : > "$2"
     while :; do sleep 1; done
 ) &
-printf '%s\n' "$!" > "$1"
-trap 'exit 0' TERM
+descendant="$!"
+while [ ! -e "$2" ]; do sleep 0.05; done
+printf '%s\n' "$descendant" > "$1"
 while :; do sleep 1; done
 "#,
         )
@@ -4057,6 +4061,7 @@ while :; do sleep 1; done
         command
             .arg(&script)
             .arg(&descendant_pid)
+            .arg(&descendant_ready)
             .current_dir(directory.path())
             .process_group(0)
             .stdin(Stdio::null())
@@ -4086,9 +4091,13 @@ while :; do sleep 1; done
             }
         };
 
-        let _leader = terminate_generic_child(&mut child, process_group)
+        let leader = terminate_generic_child(&mut child, process_group)
             .await
             .expect("TERM/KILL escalation reaps the exact group leader");
+        assert!(
+            leader.success(),
+            "the leader traps TERM and exits before the descendant escalation"
+        );
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match nix::sys::signal::kill(Pid::from_raw(descendant), None) {
