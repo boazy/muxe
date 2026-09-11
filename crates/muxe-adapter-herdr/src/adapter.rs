@@ -1337,6 +1337,10 @@ struct Invocation {
 }
 
 #[expect(
+    clippy::too_many_lines,
+    reason = "closed portable form mapping stays co-located so direction, command, and unsupported-form diagnostics keep one reviewable order"
+)]
+#[expect(
     clippy::result_large_err,
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
@@ -1359,12 +1363,22 @@ fn portable_invocation(
             name,
             focus,
             command,
-        }) => creation_tab_invocation(
-            workspace_id.as_ref(),
-            name.as_ref(),
-            focus.as_ref(),
-            command,
-        ),
+        }) => {
+            if command.program.is_some() {
+                return Err(incompatible(
+                    "Herdr command-bearing tab:create requires the ordered dismiss-and-dispatch lifecycle",
+                ));
+            }
+            Ok(Invocation {
+                method: "tab.create",
+                params: json!({
+                    "workspace_id": workspace_id.as_ref().map(scalar_string).transpose()?,
+                    "label": name.as_ref().map(scalar_string).transpose()?,
+                    "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                    "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+                }),
+            })
+        }
         PortableAction::Tab(TabAction::Close) => Ok(Invocation {
             method: "tab.close",
             params: json!({ "tab_id": origin_tab(origin)? }),
@@ -1390,10 +1404,30 @@ fn portable_invocation(
             "Herdr has no pane.create method; pane.split requires an explicit direction",
         )),
         PortableAction::Pane(PaneAction::Split {
-            direction,
+            direction: Some(direction),
             focus,
             command,
-        }) => creation_split_invocation(pane, direction.as_ref(), focus.as_ref(), command),
+        }) => {
+            if command.program.is_some() {
+                return Err(incompatible(
+                    "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle",
+                ));
+            }
+            Ok(Invocation {
+                method: "pane.split",
+                params: json!({
+                    "target_pane_id": pane,
+                    "direction": scalar_split_direction(direction)?,
+                    "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                    "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+                }),
+            })
+        }
+        PortableAction::Pane(PaneAction::Split {
+            direction: None, ..
+        }) => Err(incompatible(
+            "Herdr pane.split requires an explicit right or down direction",
+        )),
         PortableAction::Pane(PaneAction::Close) => Ok(Invocation {
             method: "pane.close",
             params: json!({ "pane_id": pane }),
@@ -1423,65 +1457,6 @@ fn portable_invocation(
             "portable action form is unavailable in Herdr protocol 20",
         )),
     }
-}
-
-/// Maps a tab creation that runs while the Muxe UI is still live.
-#[expect(
-    clippy::result_large_err,
-    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
-)]
-fn creation_tab_invocation(
-    workspace_id: Option<&ActionScalar>,
-    name: Option<&ActionScalar>,
-    focus: Option<&ActionScalar>,
-    command: &muxe_core::CreateCommand,
-) -> Result<Invocation, AdapterError> {
-    if command.program.is_some() {
-        return Err(incompatible(
-            "Herdr command-bearing tab:create requires the ordered dismiss-and-dispatch lifecycle",
-        ));
-    }
-    Ok(Invocation {
-        method: "tab.create",
-        params: json!({
-            "workspace_id": workspace_id.map(scalar_string).transpose()?,
-            "label": name.map(scalar_string).transpose()?,
-            "focus": focus.map(scalar_bool).transpose()?.unwrap_or(true),
-            "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
-        }),
-    })
-}
-
-/// Maps a split creation that runs while the Muxe UI is still live.
-#[expect(
-    clippy::result_large_err,
-    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
-)]
-fn creation_split_invocation(
-    pane: &str,
-    direction: Option<&ActionScalar>,
-    focus: Option<&ActionScalar>,
-    command: &muxe_core::CreateCommand,
-) -> Result<Invocation, AdapterError> {
-    if command.program.is_some() {
-        return Err(incompatible(
-            "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle",
-        ));
-    }
-    let Some(direction) = direction else {
-        return Err(incompatible(
-            "Herdr pane.split requires an explicit right or down direction",
-        ));
-    };
-    Ok(Invocation {
-        method: "pane.split",
-        params: json!({
-            "target_pane_id": pane,
-            "direction": scalar_split_direction(direction)?,
-            "focus": focus.map(scalar_bool).transpose()?.unwrap_or(true),
-            "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
-        }),
-    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2102,6 +2077,47 @@ mod tests {
             };
             assert_eq!(error.kind, AdapterErrorKind::Incompatible);
         }
+    }
+
+    #[test]
+    fn split_without_direction_reports_the_direction_diagnostic_before_any_command() {
+        let scalar = |value: &str| {
+            ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+                value.to_owned(),
+            )))
+        };
+        let command = muxe_core::CreateCommand {
+            program: Some(scalar("tool")),
+            args: Vec::new(),
+            cwd: None,
+        };
+
+        let missing_direction = PortableAction::Pane(PaneAction::Split {
+            direction: None,
+            focus: None,
+            command: command.clone(),
+        });
+        let Err(error) = portable_invocation(&missing_direction, &origin()) else {
+            panic!("split without a direction must fail");
+        };
+        assert_eq!(
+            error.to_string(),
+            "Herdr pane.split requires an explicit right or down direction",
+            "the direction diagnostic outranks the command-lifecycle diagnostic"
+        );
+
+        let command_bearing = PortableAction::Pane(PaneAction::Split {
+            direction: Some(scalar("right")),
+            focus: None,
+            command,
+        });
+        let Err(error) = portable_invocation(&command_bearing, &origin()) else {
+            panic!("command-bearing split must fail without the dismiss lifecycle");
+        };
+        assert_eq!(
+            error.to_string(),
+            "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle"
+        );
     }
 
     #[test]

@@ -1354,22 +1354,60 @@ impl Broker {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "invocation ordering stays co-located: portable resolution, post-dismissal deferral, reload and menu short-circuits, capability gating, and cross-drain admission form one auditable sequence"
+    )]
     async fn invoke(&self, request: InvokeBinding) -> Result<RequestResult, BrokerError> {
         let (origin, binding) = self.resolve_invoke_binding(&request).await?;
         let serial = self.next_execution.fetch_add(1, Ordering::Relaxed);
         let execution = Self::new_execution_id(serial);
         let core_execution = CoreExecutionId(serial);
-        if let Some(result) = self
-            .deferred_post_dismissal(
-                &request.session,
-                execution,
-                core_execution,
-                &binding.action,
-                &origin,
-            )
-            .await?
-        {
-            return Ok(result);
+        if let ActionSpec::Portable(action) = &binding.action {
+            let action =
+                ResolvedPortableAction::from_origin(action, &origin).map_err(
+                    |error| match error {
+                        muxe_core::PortableActionResolutionError::Context(_) => {
+                            BrokerError::ContextUnavailable
+                        }
+                        muxe_core::PortableActionResolutionError::InvalidValue {
+                            parameter,
+                            message,
+                            ..
+                        } => BrokerError::PortableResolution { parameter, message },
+                    },
+                )?;
+            if requires_post_dismissal(&action.action) {
+                let ui_pane = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(&request.session)
+                        .ok_or_else(|| BrokerError::UnknownSession(request.session.clone()))?
+                        .ui_pane
+                        .clone()
+                };
+                let deferred = DeferredDispatch {
+                    wire: execution,
+                    core: core_execution,
+                    request: PostDismissalPortableDispatchRequest {
+                        execution: core_execution,
+                        action,
+                        origin,
+                        ui_pane,
+                    },
+                };
+                let mut state = self.state.lock().await;
+                if state.activation_sealed {
+                    return Err(BrokerError::ActivationInProgress);
+                }
+                state.deferred.insert(request.session.clone(), deferred);
+                return Ok(RequestResult::Immediate(
+                    BrokerResponse::InvocationAccepted {
+                        execution,
+                        disposition: InvocationDisposition::Dismissed,
+                    },
+                ));
+            }
         }
         let on_menu_control = binding.settings.execution.on_menu_control;
         let awaitable = binding.settings.execution.mode == muxe_core::ExecutionMode::Await;
@@ -1454,67 +1492,6 @@ impl Broker {
                 disposition,
             },
         ))
-    }
-
-    /// Defers a focus-sensitive creation until the Muxe UI pane is gone.
-    ///
-    /// Returns `None` when the action dispatches inline.
-    async fn deferred_post_dismissal(
-        &self,
-        session: &UiSessionId,
-        execution: ExecutionId,
-        core_execution: CoreExecutionId,
-        action: &ActionSpec,
-        origin: &muxe_core::OriginContext,
-    ) -> Result<Option<RequestResult>, BrokerError> {
-        let ActionSpec::Portable(action) = action else {
-            return Ok(None);
-        };
-        let resolved =
-            ResolvedPortableAction::from_origin(action, origin).map_err(|error| match error {
-                muxe_core::PortableActionResolutionError::Context(_) => {
-                    BrokerError::ContextUnavailable
-                }
-                muxe_core::PortableActionResolutionError::InvalidValue {
-                    parameter,
-                    message,
-                    ..
-                } => BrokerError::PortableResolution { parameter, message },
-            })?;
-        if !requires_post_dismissal(&resolved.action) {
-            return Ok(None);
-        }
-        let ui_pane = {
-            let sessions = self.sessions.lock().await;
-            sessions
-                .get(session)
-                .ok_or_else(|| BrokerError::UnknownSession(session.clone()))?
-                .ui_pane
-                .clone()
-        };
-        let mut state = self.state.lock().await;
-        if state.activation_sealed {
-            return Err(BrokerError::ActivationInProgress);
-        }
-        state.deferred.insert(
-            session.clone(),
-            DeferredDispatch {
-                wire: execution,
-                core: core_execution,
-                request: PostDismissalPortableDispatchRequest {
-                    execution: core_execution,
-                    action: resolved,
-                    origin: origin.clone(),
-                    ui_pane,
-                },
-            },
-        );
-        Ok(Some(RequestResult::Immediate(
-            BrokerResponse::InvocationAccepted {
-                execution,
-                disposition: InvocationDisposition::Dismissed,
-            },
-        )))
     }
 
     /// Resolves the session config, immutable origin, and binding for one invocation.
