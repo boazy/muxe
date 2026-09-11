@@ -93,6 +93,12 @@ impl PaneInventory {
         self.active_tab = position;
     }
 
+    /// Whether at least one authoritative `PaneUpdate` manifest has been observed.
+    #[must_use]
+    pub fn has_manifest(&self) -> bool {
+        !self.panes.is_empty()
+    }
+
     /// Panes of the active tab in manifest order, if known.
     pub fn active_panes(&self) -> Option<&[PaneGeometry]> {
         self.active_tab
@@ -113,6 +119,12 @@ impl PaneInventory {
             .flatten()
             .find(|pane| pane.id == id && pane.is_plugin == is_plugin)
             .copied()
+    }
+
+    /// Whether the current manifest contains one exact terminal or plugin pane.
+    #[must_use]
+    pub fn contains(&self, id: u32, is_plugin: bool) -> bool {
+        self.find(id, is_plugin).is_some()
     }
 
     /// Computes the nearest neighbor of a base pane in one direction.

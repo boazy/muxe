@@ -113,10 +113,20 @@ pub struct BridgeTarget {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ZellijDispatchRequest {
     Command(RawNativeCommand),
-    FocusPaneByIndex { index: u32 },
-    FocusPaneNeighbor { direction: NeighborDirection },
+    FocusPaneByIndex {
+        index: u32,
+    },
+    FocusPaneNeighbor {
+        direction: NeighborDirection,
+    },
+    /// A focus-sensitive creation request held by the bridge until the Muxe UI
+    /// pane vanishes and its client reports the captured origin as focused.
+    PostDismissalCreation {
+        ui_pane: String,
+        origin_pane: String,
+        command: RawNativeCommand,
+    },
 }
-
 /// Zellij data required to resolve a generic origin request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ZellijOriginRequest {

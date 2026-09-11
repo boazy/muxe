@@ -198,12 +198,22 @@ pub struct Bridge {
     origin_pane: Option<String>,
     inventory: PaneInventory,
     pending_actions: BTreeMap<String, PendingAction>,
+    pending_post_dismissals: Vec<PendingPostDismissal>,
 }
 
 struct PendingAction {
     request_id: RequestId,
     execution: ExecutionId,
     channel_generation: ChannelGeneration,
+}
+
+struct PendingPostDismissal {
+    request_id: RequestId,
+    channel_generation: ChannelGeneration,
+    execution: ExecutionId,
+    ui_pane: String,
+    origin_pane: String,
+    command: RawNativeCommand,
 }
 
 impl Default for Bridge {
@@ -228,6 +238,7 @@ impl Default for Bridge {
             origin_pane: None,
             inventory: PaneInventory::new(),
             pending_actions: BTreeMap::new(),
+            pending_post_dismissals: Vec::new(),
         }
     }
 }
@@ -260,31 +271,23 @@ impl Bridge {
         match event {
             Event::ListClients(clients) => self.on_list_clients(&clients, effects),
             Event::ModeUpdate(mode) => self.on_mode_update(&mode, effects),
-            Event::PaneUpdate(manifest) => self.on_pane_update(&manifest),
+            Event::PaneUpdate(manifest) => self.on_pane_update(&manifest, effects),
             Event::TabUpdate(tabs) => self.on_tab_update(&tabs),
             Event::ActionComplete(_, _, context) => self.on_action_complete(&context, effects),
             Event::Timer(_) => self.on_timer(effects),
-            Event::PermissionRequestResult(status) => {
-                match status {
-                    // Permission results are directed to the receiving
-                    // plugin on the live path, while cached replay can reach
-                    // connected instances of the same plugin ID. Query every
-                    // Granted event while identity remains unverified; once
-                    // an anchor-matching census confirms identity, keep the
-                    // confirmed gate without repeating the privileged query.
-                    PermissionStatus::Granted => {
-                        self.permission_gate = PermissionGate::Granted;
-                        if self.client_id.is_none() {
-                            effects.list_clients();
-                        }
-                    }
-                    PermissionStatus::Denied => {
-                        if self.client_id.is_none() {
-                            self.permission_gate = PermissionGate::Denied;
-                        }
+            Event::PermissionRequestResult(status) => match status {
+                PermissionStatus::Granted => {
+                    self.permission_gate = PermissionGate::Granted;
+                    if self.client_id.is_none() {
+                        effects.list_clients();
                     }
                 }
-            }
+                PermissionStatus::Denied => {
+                    if self.client_id.is_none() {
+                        self.permission_gate = PermissionGate::Denied;
+                    }
+                }
+            },
             Event::BeforeClose => self.on_before_close(effects),
             _ => {}
         }
@@ -361,6 +364,7 @@ impl Bridge {
             self.permission_gate = PermissionGate::Granted;
             self.try_register(effects);
         }
+        self.try_post_dismissals(effects);
     }
 
     fn on_mode_update(&mut self, mode: &ModeInfo, effects: &mut dyn HostEffects) {
@@ -423,7 +427,7 @@ impl Bridge {
         }
     }
 
-    fn on_pane_update(&mut self, manifest: &PaneManifest) {
+    fn on_pane_update(&mut self, manifest: &PaneManifest, effects: &mut dyn HostEffects) {
         let mut panes = BTreeMap::new();
         for (tab, infos) in &manifest.panes {
             panes.insert(
@@ -442,6 +446,7 @@ impl Bridge {
             );
         }
         self.inventory.set_manifest(panes);
+        self.try_post_dismissals(effects);
     }
 
     fn on_tab_update(&mut self, tabs: &[TabInfo]) {
@@ -556,6 +561,21 @@ impl Bridge {
                 effects,
             );
         }
+        self.fail_post_dismissals("bridge unloading", effects);
+    }
+
+    fn fail_post_dismissals(&mut self, reason: &str, effects: &mut dyn HostEffects) {
+        for pending in std::mem::take(&mut self.pending_post_dismissals) {
+            self.emit_for_request(
+                pending.request_id,
+                pending.channel_generation,
+                BridgeResponse::DispatchCompleted {
+                    execution: pending.execution,
+                    outcome: CommandOutcome::failed(reason.to_owned()),
+                },
+                effects,
+            );
+        }
     }
 
     /// New event channel: guarded-restore any still-owned Locked capture
@@ -664,6 +684,26 @@ impl Bridge {
             }
             BridgeRequest::Dispatch {
                 execution,
+                request:
+                    ZellijDispatchRequest::PostDismissalCreation {
+                        ui_pane,
+                        origin_pane,
+                        command,
+                    },
+            } => {
+                self.defer_post_dismissal_creation(
+                    cli_id,
+                    request_id,
+                    generation,
+                    execution,
+                    ui_pane,
+                    origin_pane,
+                    command,
+                    effects,
+                );
+            }
+            BridgeRequest::Dispatch {
+                execution,
                 request: ZellijDispatchRequest::FocusPaneByIndex { index },
             } => {
                 self.focus_by_index(cli_id, request_id, generation, execution, index, effects);
@@ -769,6 +809,133 @@ impl Bridge {
                     BridgeResponse::DispatchAccepted { execution },
                     effects,
                 );
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the request fields are explicit protocol provenance, not an untyped payload"
+    )]
+    fn defer_post_dismissal_creation(
+        &mut self,
+        cli_id: &str,
+        request_id: RequestId,
+        generation: ChannelGeneration,
+        execution: ExecutionId,
+        ui_pane: String,
+        origin_pane: String,
+        command: RawNativeCommand,
+        effects: &mut dyn HostEffects,
+    ) {
+        self.release(cli_id, request_id, generation, effects);
+        self.emit_for_request(
+            request_id,
+            generation,
+            BridgeResponse::DispatchAccepted { execution },
+            effects,
+        );
+        self.pending_post_dismissals.push(PendingPostDismissal {
+            request_id,
+            channel_generation: generation,
+            execution,
+            ui_pane,
+            origin_pane,
+            command,
+        });
+        self.try_post_dismissals(effects);
+    }
+
+    fn try_post_dismissals(&mut self, effects: &mut dyn HostEffects) {
+        let pending = std::mem::take(&mut self.pending_post_dismissals);
+        let mut remaining = Vec::with_capacity(pending.len());
+        let mut refresh_client_focus = false;
+        for pending in pending {
+            if !self.inventory.has_manifest() {
+                remaining.push(pending);
+                continue;
+            }
+            let ui_pane = PaneId::from_str(&pending.ui_pane).ok();
+            let ui_is_live = ui_pane.is_some_and(|pane| match pane {
+                PaneId::Terminal(id) => self.inventory.contains(id, false),
+                PaneId::Plugin(id) => self.inventory.contains(id, true),
+            });
+            if ui_is_live {
+                remaining.push(pending);
+                continue;
+            }
+            if self.focused_pane.as_deref() != Some(pending.origin_pane.as_str()) {
+                refresh_client_focus = true;
+                remaining.push(pending);
+                continue;
+            }
+            self.dispatch_post_dismissal_creation(pending, effects);
+        }
+        self.pending_post_dismissals = remaining;
+        if refresh_client_focus {
+            effects.list_clients();
+        }
+    }
+
+    fn dispatch_post_dismissal_creation(
+        &mut self,
+        pending: PendingPostDismissal,
+        effects: &mut dyn HostEffects,
+    ) {
+        let Some(registration) = self.registration else {
+            self.emit_for_request(
+                pending.request_id,
+                pending.channel_generation,
+                BridgeResponse::DispatchCompleted {
+                    execution: pending.execution,
+                    outcome: CommandOutcome::failed("bridge registration disappeared".to_owned()),
+                },
+                effects,
+            );
+            return;
+        };
+        let correlation = format!("{registration}:{}", pending.request_id);
+        let ready = match prepare(pending.command, &correlation) {
+            Ok(ready) => ready,
+            Err(message) => {
+                self.emit_for_request(
+                    pending.request_id,
+                    pending.channel_generation,
+                    BridgeResponse::DispatchCompleted {
+                        execution: pending.execution,
+                        outcome: CommandOutcome::failed(format!("invalid command: {message}")),
+                    },
+                    effects,
+                );
+                return;
+            }
+        };
+        match ready {
+            ReadyDispatch::Sync(dispatch) => {
+                let outcome = execute_sync(dispatch);
+                self.emit_for_request(
+                    pending.request_id,
+                    pending.channel_generation,
+                    BridgeResponse::DispatchCompleted {
+                        execution: pending.execution,
+                        outcome,
+                    },
+                    effects,
+                );
+            }
+            ReadyDispatch::Async {
+                dispatch,
+                execution: correlated,
+            } => {
+                self.pending_actions.insert(
+                    correlated,
+                    PendingAction {
+                        request_id: pending.request_id,
+                        execution: pending.execution,
+                        channel_generation: pending.channel_generation,
+                    },
+                );
+                let _ = execute_sync(dispatch);
             }
         }
     }
@@ -1005,6 +1172,7 @@ impl Bridge {
                 effects,
             );
         }
+        self.fail_post_dismissals("bridge retiring", effects);
     }
 
     /// Validates the request, asks Zellij to unblock the request child by its
@@ -1372,6 +1540,65 @@ mod tests {
         assert_eq!(bridge.client_identity(), Some("5"));
         assert_eq!(bridge.active_registration(), Some(registration(7)));
         (bridge, host)
+    }
+
+    #[test]
+    fn post_dismissal_creation_waits_for_missing_ui_and_restored_origin_focus() {
+        let (mut bridge, mut host) = boot();
+        bridge.inventory.set_manifest(BTreeMap::from([(
+            0,
+            vec![PaneGeometry {
+                id: 7,
+                is_plugin: false,
+                x: 0,
+                y: 0,
+                columns: 80,
+                rows: 24,
+            }],
+        )]));
+        bridge.focused_pane = Some("terminal_7".to_owned());
+        let before = host.events().len();
+
+        bridge.defer_post_dismissal_creation(
+            REQUEST_CLI,
+            RequestId::INITIAL,
+            ChannelGeneration::INITIAL,
+            exec(42),
+            "terminal_7".to_owned(),
+            "terminal_2".to_owned(),
+            RawNativeCommand::CloseFocus,
+            &mut host,
+        );
+        assert!(
+            host.events()[before..].iter().all(|(_, event)| !matches!(
+                event,
+                PipeEventKind::Response(BridgeResponse::DispatchCompleted { .. })
+            )),
+            "request is accepted but must not dispatch while the UI pane is present"
+        );
+
+        bridge.inventory.set_manifest(BTreeMap::from([(
+            0,
+            vec![PaneGeometry {
+                id: 2,
+                is_plugin: false,
+                x: 0,
+                y: 0,
+                columns: 80,
+                rows: 24,
+            }],
+        )]));
+        bridge.on_list_clients(&clients_current(PaneId::Terminal(2)), &mut host);
+        assert!(matches!(
+            host.last_event(),
+            (
+                Some(RequestId::INITIAL),
+                PipeEventKind::Response(BridgeResponse::DispatchCompleted {
+                    execution,
+                    outcome,
+                }),
+            ) if execution == exec(42) && outcome.status == muxe_zellij_protocol::CommandStatus::Succeeded
+        ));
     }
 
     /// The emitted Register must survive the real wire path: the pinned host

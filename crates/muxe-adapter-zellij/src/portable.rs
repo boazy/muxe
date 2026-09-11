@@ -64,6 +64,8 @@
 //!   with it; that is the portable semantic, stated loudly.
 //! - `session:create` has no one-to-one plugin API.
 
+use std::path::PathBuf;
+
 use muxe_core::{
     ActionScalar, ConfigValueKind, ContextType, KeyboardAction, OriginContext, PaneAction,
     PortableAction, SessionAction, TabAction,
@@ -373,14 +375,23 @@ fn check_keyboard_key(key: &ActionScalar) -> Result<(), PortableError> {
 /// Validates the tab subgroup structurally.
 fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
     match tab {
-        TabAction::Create { workspace_id } => {
+        TabAction::Create {
+            workspace_id,
+            name,
+            focus,
+            command,
+        } => {
             if workspace_id.is_some() {
                 return Err(PortableError::Incompatible {
                     action: "tab:create",
                     reason: "Zellij 0.46 has no workspace concept; omit workspace-id to use host NewTab",
                 });
             }
-            Ok(())
+            if let Some(name) = name {
+                check_concrete_string("tab:create", "name", name)?;
+            }
+            check_create_focus("tab:create", focus)?;
+            check_create_command("tab:create", command, true)
         }
         TabAction::Close => Ok(()),
         TabAction::Rename { name } => {
@@ -420,11 +431,16 @@ fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
 fn validate_pane_structure(pane: &PaneAction) -> Result<(), PortableError> {
     match pane {
         PaneAction::Create | PaneAction::Close => Ok(()),
-        PaneAction::Split { direction } => {
+        PaneAction::Split {
+            direction,
+            focus,
+            command,
+        } => {
             if let Some(direction) = direction {
                 Cardinal::parse("pane:split", direction).map(|_| ())?;
             }
-            Ok(())
+            check_create_focus("pane:split", focus)?;
+            check_create_command("pane:split", command, false)
         }
         PaneAction::Focus(target) => match target {
             muxe_core::IndexOrDirection::Direction(direction) => {
@@ -484,6 +500,55 @@ fn validate_session_structure(session: &SessionAction) -> Result<(), PortableErr
             reason: "quit_zellij terminates the server; it is not a portable session quit",
         }),
     }
+}
+
+fn check_create_focus(
+    action: &'static str,
+    focus: &Option<ActionScalar>,
+) -> Result<(), PortableError> {
+    if let Some(focus) = focus {
+        scalar_bool(action, "focus", focus)?;
+    }
+    Ok(())
+}
+
+fn check_create_command(
+    action: &'static str,
+    command: &muxe_core::CreateCommand,
+    cwd_without_program: bool,
+) -> Result<(), PortableError> {
+    if let Some(program) = &command.program {
+        check_concrete_string(action, "program", program)?;
+    }
+    for argument in &command.args {
+        check_concrete_string(action, "args", argument)?;
+    }
+    if let Some(cwd) = &command.cwd {
+        check_marker(
+            action,
+            "cwd",
+            cwd,
+            &[ContextType::AbsolutePath, ContextType::String],
+            true,
+        )?;
+        if !is_marker(cwd) {
+            scalar_string(action, "cwd", cwd)?;
+        }
+        if command.program.is_none() && !cwd_without_program {
+            return Err(PortableError::Incompatible {
+                action,
+                reason: "Zellij can apply cwd to a split only when program is supplied",
+            });
+        }
+    }
+    if command.program.is_none() && !command.args.is_empty() {
+        return Err(PortableError::InvalidScalar {
+            action,
+            parameter: "args",
+            reason: "args requires program",
+        });
+    }
+    Ok(())
 }
 
 /// Accepts a context marker whose path type fits, else proves a concrete string.
@@ -591,6 +656,110 @@ pub fn map_portable(
     }
 }
 
+/// Maps a focused tab or split creation for bridge-held dispatch after the UI
+/// pane is absent. The tiled form deliberately uses `near_current_pane: false`:
+/// under the pinned route this selects the captured client rather than the
+/// bridge plugin pane, whose focus was never the immutable origin.
+pub fn map_post_dismissal_creation(
+    action: &PortableAction,
+    origin: &OriginContext,
+) -> Result<RawNativeCommand, PortableError> {
+    match action {
+        PortableAction::Tab(TabAction::Create { focus, .. }) => {
+            if !creation_focuses("tab:create", focus)? {
+                return Err(PortableError::Incompatible {
+                    action: "tab:create",
+                    reason: "post-dismissal dispatch requires focus=true",
+                });
+            }
+            let PortableMapping::HostAction { mut commands } = map_tab_action(
+                match action {
+                    PortableAction::Tab(tab) => tab,
+                    _ => unreachable!("outer tab match fixes the action kind"),
+                },
+                origin,
+            )?
+            else {
+                unreachable!("tab:create always maps to one host action")
+            };
+            commands.pop().ok_or(PortableError::Incompatible {
+                action: "tab:create",
+                reason: "tab:create produced no host action",
+            })
+        }
+        PortableAction::Pane(PaneAction::Split {
+            direction,
+            focus,
+            command,
+        }) => {
+            if !creation_focuses("pane:split", focus)? {
+                return Err(PortableError::Incompatible {
+                    action: "pane:split",
+                    reason: "post-dismissal dispatch requires focus=true",
+                });
+            }
+            let (command, cwd) = map_create_command("pane:split", command)?;
+            if command.is_none() && cwd.is_some() {
+                return Err(PortableError::Incompatible {
+                    action: "pane:split",
+                    reason: "Zellij can apply cwd to a split only when program is supplied",
+                });
+            }
+            let direction = direction
+                .as_ref()
+                .map(|direction| {
+                    Cardinal::parse("pane:split", direction).map(Cardinal::into_mirror)
+                })
+                .transpose()?;
+            Ok(RawNativeCommand::RunAction {
+                action: raw::Action::NewTiledPane {
+                    direction,
+                    command,
+                    pane_name: None,
+                    near_current_pane: false,
+                    no_focus: false,
+                    borderless: None,
+                    tab_id: None,
+                },
+                context: Vec::new(),
+            })
+        }
+        _ => Err(PortableError::Incompatible {
+            action: "creation",
+            reason: "post-dismissal dispatch is only valid for tab:create or pane:split",
+        }),
+    }
+}
+
+/// Whether a portable creation must be held until the Muxe UI is gone.
+///
+/// This predicate deliberately does no host mapping. The broker calls the
+/// post-dismissal adapter path for these actions; the ordinary adapter path
+/// rejects them so a future caller cannot route focus-relative creation from
+/// the bridge plugin pane.
+pub fn creation_requires_post_dismissal(action: &PortableAction) -> Result<bool, PortableError> {
+    match action {
+        PortableAction::Tab(TabAction::Create { focus, .. }) => {
+            creation_focuses("tab:create", focus)
+        }
+        PortableAction::Pane(PaneAction::Split { focus, .. }) => {
+            creation_focuses("pane:split", focus)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn creation_focuses(
+    action: &'static str,
+    focus: &Option<ActionScalar>,
+) -> Result<bool, PortableError> {
+    focus
+        .as_ref()
+        .map(|focus| scalar_bool(action, "focus", focus))
+        .transpose()
+        .map(|focus| focus.unwrap_or(true))
+}
+
 /// Maps keyboard actions against the origin pane.
 fn map_keyboard_action(
     keyboard: &KeyboardAction,
@@ -635,22 +804,37 @@ fn map_tab_action(
     origin: &OriginContext,
 ) -> Result<PortableMapping, PortableError> {
     match tab {
-        TabAction::Create { workspace_id } => {
+        TabAction::Create {
+            workspace_id,
+            name,
+            focus,
+            command,
+        } => {
             if workspace_id.is_some() {
                 return Err(PortableError::Incompatible {
                     action: "tab:create",
                     reason: "Zellij 0.46 has no workspace concept; omit workspace-id to use host NewTab",
                 });
             }
+            let name = name
+                .as_ref()
+                .map(|name| scalar_string("tab:create", "name", name))
+                .transpose()?;
+            let focus = focus
+                .as_ref()
+                .map(|focus| scalar_bool("tab:create", "focus", focus))
+                .transpose()?
+                .unwrap_or(true);
+            let (command, cwd) = map_create_command("tab:create", command)?;
             Ok(wrap(raw::Action::NewTab {
                 tiled_layout: None,
                 floating_layouts: Vec::new(),
                 swap_tiled_layouts: None,
                 swap_floating_layouts: None,
-                tab_name: None,
-                should_change_focus_to_new_tab: true,
-                cwd: None,
-                initial_panes: None,
+                tab_name: name,
+                should_change_focus_to_new_tab: focus,
+                cwd: cwd.clone(),
+                initial_panes: command.map(|command| vec![raw::CommandOrPlugin::Command(command)]),
                 first_pane_unblock_condition: None,
             }))
         }
@@ -714,6 +898,42 @@ fn map_tab_action(
     }
 }
 
+fn map_create_command(
+    action: &'static str,
+    command: &muxe_core::CreateCommand,
+) -> Result<(Option<raw::RunCommandAction>, Option<PathBuf>), PortableError> {
+    let cwd = command
+        .cwd
+        .as_ref()
+        .map(|cwd| scalar_string(action, "cwd", cwd).map(PathBuf::from))
+        .transpose()?;
+    let Some(program) = &command.program else {
+        if command.args.is_empty() {
+            return Ok((None, cwd));
+        }
+        return Err(PortableError::InvalidScalar {
+            action,
+            parameter: "args",
+            reason: "args requires program",
+        });
+    };
+    let command = raw::RunCommandAction {
+        command: PathBuf::from(scalar_string(action, "program", program)?),
+        args: command
+            .args
+            .iter()
+            .map(|argument| scalar_string(action, "args", argument))
+            .collect::<Result<_, _>>()?,
+        cwd: cwd.clone(),
+        direction: None,
+        hold_on_close: false,
+        hold_on_start: false,
+        originating_plugin: None,
+        use_terminal_title: false,
+    };
+    Ok((Some(command), cwd))
+}
+
 /// A plain new pane with no direction, name, or suppression.
 fn new_plain_pane() -> PortableMapping {
     wrap(raw::Action::NewPane {
@@ -750,14 +970,38 @@ fn map_pane_lifecycle(
 ) -> Result<PortableMapping, PortableError> {
     match pane {
         PaneAction::Create => Ok(new_plain_pane()),
-        PaneAction::Split { direction } => {
-            let Some(direction) = direction else {
-                return Ok(new_plain_pane());
-            };
-            let cardinal = Cardinal::parse("pane:split", direction)?;
+        PaneAction::Split {
+            direction,
+            focus,
+            command,
+        } => {
+            let (command, cwd) = map_create_command("pane:split", command)?;
+            if command.is_none() && cwd.is_some() {
+                return Err(PortableError::Incompatible {
+                    action: "pane:split",
+                    reason: "Zellij can apply cwd to a split only when program is supplied",
+                });
+            }
+            let focus = focus
+                .as_ref()
+                .map(|focus| scalar_bool("pane:split", "focus", focus))
+                .transpose()?
+                .unwrap_or(true);
+            if !focus {
+                return Err(PortableError::Incompatible {
+                    action: "pane:split",
+                    reason: "Zellij cannot place an unfocused split against the captured origin while the Muxe UI remains open",
+                });
+            }
+            let direction = direction
+                .as_ref()
+                .map(|direction| {
+                    Cardinal::parse("pane:split", direction).map(Cardinal::into_mirror)
+                })
+                .transpose()?;
             Ok(wrap(raw::Action::NewTiledPane {
-                direction: Some(cardinal.into_mirror()),
-                command: None,
+                direction,
+                command,
                 pane_name: None,
                 near_current_pane: true,
                 no_focus: false,
@@ -1129,14 +1373,23 @@ mod tests {
     fn tab_create_without_workspace_uses_host_new_tab() {
         let action = single_host(&PortableAction::Tab(TabAction::Create {
             workspace_id: None,
+            name: None,
+            focus: None,
+            command: muxe_core::CreateCommand::default(),
         }));
         assert!(matches!(action, raw::Action::NewTab { .. }));
         for action in [
             PortableAction::Tab(TabAction::Create {
                 workspace_id: Some(text("ws")),
+                name: None,
+                focus: None,
+                command: muxe_core::CreateCommand::default(),
             }),
             PortableAction::Tab(TabAction::Create {
                 workspace_id: Some(marker("origin.workspace.id")),
+                name: None,
+                focus: None,
+                command: muxe_core::CreateCommand::default(),
             }),
         ] {
             let error = map_portable(&action, &test_origin()).expect_err("no workspaces");
@@ -1149,6 +1402,68 @@ mod tests {
             ));
             assert!(validate_portable_structure(&action).is_err());
         }
+    }
+
+    #[test]
+    fn only_focused_creations_require_post_dismissal_dispatch() {
+        let focused = PortableAction::Tab(TabAction::Create {
+            workspace_id: None,
+            name: None,
+            focus: None,
+            command: muxe_core::CreateCommand::default(),
+        });
+        let unfocused = PortableAction::Pane(PaneAction::Split {
+            direction: Some(text("right")),
+            focus: Some(scalar(ConfigValueKind::Boolean(false))),
+            command: muxe_core::CreateCommand::default(),
+        });
+
+        assert!(
+            creation_requires_post_dismissal(&focused)
+                .expect("default tab creation focus is valid")
+        );
+        assert!(
+            !creation_requires_post_dismissal(&unfocused)
+                .expect("explicit unfocused split is valid")
+        );
+    }
+
+    #[test]
+    fn post_dismissal_split_uses_origin_client_and_exact_command_fields() {
+        let command = muxe_core::CreateCommand {
+            program: Some(text("tool")),
+            args: vec![text("--literal"), text("two words")],
+            cwd: Some(text("/workspace")),
+        };
+        let raw = map_post_dismissal_creation(
+            &PortableAction::Pane(PaneAction::Split {
+                direction: Some(text("right")),
+                focus: Some(scalar(ConfigValueKind::Boolean(true))),
+                command,
+            }),
+            &test_origin(),
+        )
+        .expect("focused split maps after dismissal");
+        let RawNativeCommand::RunAction {
+            action:
+                raw::Action::NewTiledPane {
+                    direction,
+                    command: Some(command),
+                    near_current_pane,
+                    no_focus,
+                    ..
+                },
+            ..
+        } = raw
+        else {
+            panic!("expected a tiled pane action");
+        };
+        assert_eq!(direction, Some(raw::Direction::Right));
+        assert!(!near_current_pane);
+        assert!(!no_focus);
+        assert_eq!(command.command, PathBuf::from("tool"));
+        assert_eq!(command.args, vec!["--literal", "two words"]);
+        assert_eq!(command.cwd, Some(PathBuf::from("/workspace")));
     }
 
     #[test]

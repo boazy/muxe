@@ -41,7 +41,7 @@ use muxe_adapter_api::{
     DispatchAccepted, DispatchCompletion, ExecutionCorrelationId, HostAdapter, HostIdentity,
     HostKind as ApiHostKind, KeyboardCapabilities, ModalScopeId, NativeDispatchRequest,
     OriginCaptureRequest, PendingPaneLease, PendingPaneLeaseId, PendingPaneRegistration,
-    PortableDispatchRequest, UiSessionId,
+    PortableDispatchRequest, PostDismissalPortableDispatchRequest, UiSessionId,
 };
 use muxe_core::{
     ActionValidation, ActionValidator, ConfigDiagnostic, ExecutionCapabilities, ExecutionId,
@@ -70,7 +70,10 @@ use crate::{
     origin::{OriginError, build_origin_context},
     parse::candidate_to_raw,
     pipes::{PipeChannel, PipeTransportError, RELEASE_TIMEOUT, channel_names},
-    portable::{PortableError, PortableMapping, map_portable},
+    portable::{
+        PortableError, PortableMapping, creation_requires_post_dismissal, map_portable,
+        map_post_dismissal_creation,
+    },
     registry::ZellijRegistry,
 };
 
@@ -2517,6 +2520,15 @@ impl HostAdapter for ZellijAdapter {
         request: PortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
         self.require_active()?;
+        match creation_requires_post_dismissal(&request.action.action) {
+            Ok(true) => {
+                return Err(invalid_request(
+                    "focused creation must use post-dismissal dispatch after the Muxe UI closes",
+                ));
+            }
+            Ok(false) => {}
+            Err(error) => return Err(invalid_request(error.to_string())),
+        }
         match map_portable(&request.action.action, &request.origin) {
             Ok(PortableMapping::BrokerOwned) => Err(invalid_request(
                 "broker-owned portable action must not reach the host adapter",
@@ -2568,6 +2580,65 @@ impl HostAdapter for ZellijAdapter {
             )),
             Err(error) => Err(invalid_request(error.to_string())),
         }
+    }
+
+    async fn dispatch_portable_after_ui_dismissal(
+        &self,
+        request: PostDismissalPortableDispatchRequest,
+    ) -> Result<DispatchAccepted, AdapterError> {
+        self.require_active()?;
+        let raw = map_post_dismissal_creation(&request.action.action, &request.origin).map_err(
+            |error| match error {
+                PortableError::Incompatible { reason, .. } => {
+                    AdapterError::new(AdapterErrorKind::Incompatible, reason)
+                }
+                error => invalid_request(error.to_string()),
+            },
+        )?;
+        ValidatedNativeCommand::try_from(raw.clone()).map_err(|error| {
+            AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
+        })?;
+        let client_id = request
+            .origin
+            .client_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned())
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::ContextUnavailable,
+                    "Zellij post-dismissal dispatch requires the captured origin client",
+                )
+            })?;
+        let origin_pane = request
+            .origin
+            .pane_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned())
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::ContextUnavailable,
+                    "Zellij post-dismissal dispatch requires the captured origin pane",
+                )
+            })?;
+        self.active_registration(&client_id).await?;
+        self.enqueue(QueuedItem {
+            execution: Some(request.execution),
+            client_id,
+            payload: Some(BridgeRequest::Dispatch {
+                execution: execution_to_common(request.execution),
+                request: ZellijDispatchRequest::PostDismissalCreation {
+                    ui_pane: request.ui_pane.as_str().to_owned(),
+                    origin_pane,
+                    command: raw,
+                },
+            }),
+        })
+        .await;
+        Ok(DispatchAccepted {
+            correlation: self.correlation(),
+            execution: request.execution,
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+        })
     }
 
     async fn dispatch_native(
