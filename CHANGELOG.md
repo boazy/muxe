@@ -1,3 +1,25 @@
+## [0.1.3] - 2026-09-11
+
+### 🚀 Features
+
+- *(core)* Define portable creation fields
+- *(broker)* Define the post-dismissal dispatch contract
+- *(zellij)* Add post-dismissal creation
+- *(herdr)* Add deferred creation and outcome certainty
+
+### 🐛 Bug Fixes
+
+- *(test)* Stabilize cancellation fixture readiness
+- Satisfy strict clippy across creation paths
+- Preserve creation diagnostics and origin ownership
+
+### 📚 Documentation
+
+- Document portable creation support
+
+### ⚙️ Miscellaneous Tasks
+
+- *(agents)* Update agent rules to reflect jj commit policy
 ## [0.1.2] - 2026-09-10
 
 ### 🐛 Bug Fixes
@@ -33,6 +55,7 @@
 ### 💼 Other
 
 - *(zellij)* Disable unused ULID generator features
+- V0.1.2
 ## [0.1.1] - 2026-09-09
 
 ### 🐛 Bug Fixes
