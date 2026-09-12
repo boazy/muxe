@@ -306,7 +306,7 @@ impl UiRuntime {
         }
     }
 
-    /// Resolves the visible binding selected by one key input on the current page.
+    /// Resolves the binding selected by one key input on the current page.
     fn select_current_binding(
         &self,
         input: &crate::ConvertedKeyEvent,
@@ -976,7 +976,7 @@ fn select_binding(
             continue;
         }
         let state = evaluate_archived_binding_state(binding, pages)?;
-        if !state.included || !state.shown || binding.hidden {
+        if !state.included {
             continue;
         }
         let binding_id = BindingId {
@@ -1408,6 +1408,72 @@ pub(crate) mod tests {
                 )
                 .expect("newer generations must not replace this attachment"),
             UiCommand::Ignored
+        );
+    }
+
+    #[test]
+    fn hidden_and_unshown_bindings_remain_executable() {
+        let mut escape = binding_with_policy(
+            1,
+            "esc",
+            AfterAction::Stay,
+            ExecutionMode::Await,
+            Some(muxe_protocol::LocalMenuActionWire::Control(
+                MenuControl::Quit,
+            )),
+        );
+        escape.hidden = true;
+        let mut runtime = UiRuntime::attach(profiled_attachment(
+            KeyboardProfileWire::Vt100 {
+                escape_timeout_millis: 25,
+            },
+            vec![escape],
+        ))
+        .expect("attachment attaches");
+
+        assert!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("hidden binding does not render")
+                .cells
+                .is_empty()
+        );
+        assert_eq!(
+            runtime
+                .handle_input(&parsed_input(b"\x1b"))
+                .expect("hidden escape binding remains executable"),
+            UiCommand::Detach
+        );
+
+        let mut unshown =
+            binding_with_policy(1, "x", AfterAction::Stay, ExecutionMode::Await, None);
+        unshown.conditions.show = Some(muxe_protocol::ConditionIrWire::Bool(false));
+        let mut runtime = UiRuntime::attach(profiled_attachment(
+            KeyboardProfileWire::Vt100 {
+                escape_timeout_millis: 25,
+            },
+            vec![unshown],
+        ))
+        .expect("attachment attaches");
+
+        assert!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("unshown binding does not render")
+                .cells
+                .is_empty()
+        );
+        assert_eq!(
+            runtime
+                .handle_input(&press('x'))
+                .expect("unshown binding remains executable"),
+            UiCommand::Invoke {
+                generation: 7,
+                binding: BindingId {
+                    generation: 7,
+                    ordinal: 1,
+                },
+            }
         );
     }
 
