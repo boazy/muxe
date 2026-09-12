@@ -3,10 +3,10 @@
 use std::{borrow::Cow, collections::BTreeSet, time::Duration};
 
 use muxe_core::{
-    ActionScalar, ActionSpec, AfterAction, BindingConditions, CompiledBinding, CompiledConfig,
-    CompiledMenu, ConfigValue, ConfigValueKind, CreateCommand, ExecutionMode, IndexOrDirection,
-    KeyboardAction, MenuAction, MenuControlAction, MenuId, MenuTarget, PaneAction, PortableAction,
-    SessionAction, TabAction, TimeoutAction,
+    ActionScalar, ActionSpec, AfterAction, BindingConditions, CommandAction, CompiledBinding,
+    CompiledConfig, CompiledMenu, ConfigValue, ConfigValueKind, CreateCommand, ExecutionMode,
+    IndexOrDirection, KeyboardAction, MenuAction, MenuControlAction, MenuId, MenuTarget,
+    PaneAction, PortableAction, SessionAction, TabAction, TimeoutAction,
 };
 use serde::{
     Serialize, Serializer,
@@ -100,7 +100,7 @@ fn menu_node<'a>(
     Ok(JsonNode::Object(vec![
         field(
             "title",
-            menu.title.as_deref().map(string).unwrap_or(JsonNode::Null),
+            menu.title.as_deref().map_or(JsonNode::Null, string),
         ),
         field(
             "tags",
@@ -152,11 +152,7 @@ fn binding_node<'a>(
     Ok(JsonNode::Object(vec![
         field(
             "label",
-            binding
-                .label
-                .as_deref()
-                .map(string)
-                .unwrap_or(JsonNode::Null),
+            binding.label.as_deref().map_or(JsonNode::Null, string),
         ),
         field("hidden", JsonNode::Bool(binding.hidden)),
         field("action", action_node(config, &binding.action)?),
@@ -205,10 +201,7 @@ fn settings_node(binding: &CompiledBinding) -> JsonNode<'_> {
         ),
         field(
             "repeat",
-            settings
-                .repeat
-                .map(JsonNode::Bool)
-                .unwrap_or(JsonNode::Null),
+            settings.repeat.map_or(JsonNode::Null, JsonNode::Bool),
         ),
     ])
 }
@@ -264,68 +257,108 @@ fn action_node<'a>(
     config: &'a CompiledConfig,
     action: &'a ActionSpec,
 ) -> Result<JsonNode<'a>, MenuDumpError> {
-    let ActionSpec::Portable(action) = action else {
-        let ActionSpec::Native(action) = action else {
-            unreachable!("action variants are exhaustive");
-        };
-        let mut fields = Vec::with_capacity(action.fields.len() + 1);
-        fields.push(field("type", string(&action.type_name)));
-        fields.extend(action.fields.iter().map(|field_value| {
-            (
-                Cow::Borrowed(field_value.name.as_str()),
-                config_value_node(&field_value.value),
-            )
-        }));
-        return Ok(JsonNode::Object(fields));
-    };
+    match action {
+        ActionSpec::Native(action) => {
+            let mut fields = Vec::with_capacity(action.fields.len() + 1);
+            fields.push(field("type", string(&action.type_name)));
+            fields.extend(action.fields.iter().map(|field_value| {
+                (
+                    Cow::Borrowed(field_value.name.as_str()),
+                    config_value_node(&field_value.value),
+                )
+            }));
+            Ok(JsonNode::Object(fields))
+        }
+        ActionSpec::Portable(action) => portable_action_node(config, action),
+    }
+}
 
+fn portable_action_node<'a>(
+    config: &'a CompiledConfig,
+    action: &'a PortableAction,
+) -> Result<JsonNode<'a>, MenuDumpError> {
     let mut fields = vec![field("type", string(action.kind().as_str()))];
     match action {
-        PortableAction::Menu(MenuAction::Open(MenuTarget::Named(target))) => {
+        PortableAction::Menu(action) => {
+            push_menu_action_fields(config, &mut fields, action)?;
+        }
+        PortableAction::Config(_) => {}
+        PortableAction::Keyboard(action) => push_keyboard_action_fields(&mut fields, action),
+        PortableAction::Command(action) => push_command_action_fields(&mut fields, action),
+        PortableAction::Tab(action) => push_tab_action_fields(&mut fields, action),
+        PortableAction::Pane(action) => push_pane_action_fields(&mut fields, action),
+        PortableAction::Session(action) => push_session_action_fields(&mut fields, action),
+    }
+    Ok(JsonNode::Object(fields))
+}
+
+fn push_menu_action_fields<'a>(
+    config: &'a CompiledConfig,
+    fields: &mut Vec<(Cow<'a, str>, JsonNode<'a>)>,
+    action: &'a MenuAction,
+) -> Result<(), MenuDumpError> {
+    match action {
+        MenuAction::Open(MenuTarget::Named(target)) => {
             fields.push(field("menu", string(target)));
         }
-        PortableAction::Menu(MenuAction::Open(MenuTarget::Inline(target))) => {
+        MenuAction::Open(MenuTarget::Inline(target)) => {
             let submenu = find_menu(config, target)
                 .ok_or_else(|| MenuDumpError::MissingInlineMenu(target.clone()))?;
             fields.push(field("submenu", menu_node(config, submenu)?));
         }
-        PortableAction::Menu(
-            MenuAction::Return | MenuAction::Quit | MenuAction::PagePrev | MenuAction::PageNext,
-        )
-        | PortableAction::Config(_) => {}
-        PortableAction::Keyboard(KeyboardAction::SendKeys(keys)) => {
+        MenuAction::Return | MenuAction::Quit | MenuAction::PagePrev | MenuAction::PageNext => {}
+    }
+    Ok(())
+}
+
+fn push_keyboard_action_fields<'a>(
+    fields: &mut Vec<(Cow<'a, str>, JsonNode<'a>)>,
+    action: &'a KeyboardAction,
+) {
+    match action {
+        KeyboardAction::SendKeys(keys) => {
             fields.push(field(
                 "keys",
                 JsonNode::Array(keys.iter().map(scalar_node).collect()),
             ));
         }
-        PortableAction::Keyboard(KeyboardAction::SendText(text)) => {
-            fields.push(field("text", scalar_node(text)));
-        }
-        PortableAction::Command(command) => {
-            fields.push(field("program", scalar_node(&command.program)));
-            fields.push(field(
-                "args",
-                JsonNode::Array(command.args.iter().map(scalar_node).collect()),
-            ));
-            fields.push(field("cwd", optional_scalar_node(command.cwd.as_ref())));
-            fields.push(field(
-                "env",
-                JsonNode::Object(
-                    command
-                        .env
-                        .iter()
-                        .map(|(name, value)| (Cow::Borrowed(name.as_str()), scalar_node(value)))
-                        .collect(),
-                ),
-            ));
-        }
-        PortableAction::Tab(TabAction::Create {
+        KeyboardAction::SendText(text) => fields.push(field("text", scalar_node(text))),
+    }
+}
+
+fn push_command_action_fields<'a>(
+    fields: &mut Vec<(Cow<'a, str>, JsonNode<'a>)>,
+    action: &'a CommandAction,
+) {
+    fields.push(field("program", scalar_node(&action.program)));
+    fields.push(field(
+        "args",
+        JsonNode::Array(action.args.iter().map(scalar_node).collect()),
+    ));
+    fields.push(field("cwd", optional_scalar_node(action.cwd.as_ref())));
+    fields.push(field(
+        "env",
+        JsonNode::Object(
+            action
+                .env
+                .iter()
+                .map(|(name, value)| (Cow::Borrowed(name.as_str()), scalar_node(value)))
+                .collect(),
+        ),
+    ));
+}
+
+fn push_tab_action_fields<'a>(
+    fields: &mut Vec<(Cow<'a, str>, JsonNode<'a>)>,
+    action: &'a TabAction,
+) {
+    match action {
+        TabAction::Create {
             workspace_id,
             name,
             focus,
             command,
-        }) => {
+        } => {
             fields.push(field(
                 "workspace-id",
                 optional_scalar_node(workspace_id.as_ref()),
@@ -333,68 +366,69 @@ fn action_node<'a>(
             fields.push(field("name", optional_scalar_node(name.as_ref())));
             fields.push(field(
                 "focus",
-                focus
-                    .as_ref()
-                    .map(scalar_node)
-                    .unwrap_or(JsonNode::Bool(true)),
+                focus.as_ref().map_or(JsonNode::Bool(true), scalar_node),
             ));
-            push_create_command_fields(&mut fields, command);
+            push_create_command_fields(fields, command);
         }
-        PortableAction::Tab(TabAction::Close) => {}
-        PortableAction::Tab(TabAction::Rename { name }) => {
+        TabAction::Close => {}
+        TabAction::Rename { name } => {
             fields.push(field("name", optional_scalar_node(name.as_ref())));
         }
-        PortableAction::Tab(TabAction::Focus(target))
-        | PortableAction::Tab(TabAction::Move(target))
-        | PortableAction::Tab(TabAction::Swap(target))
-        | PortableAction::Pane(PaneAction::Focus(target))
-        | PortableAction::Pane(PaneAction::Move(target))
-        | PortableAction::Pane(PaneAction::Swap(target)) => {
-            push_target_field(&mut fields, target);
+        TabAction::Focus(target) | TabAction::Move(target) | TabAction::Swap(target) => {
+            push_target_field(fields, target);
         }
-        PortableAction::Pane(PaneAction::Create | PaneAction::Close) => {}
-        PortableAction::Pane(PaneAction::Split {
+    }
+}
+
+fn push_pane_action_fields<'a>(
+    fields: &mut Vec<(Cow<'a, str>, JsonNode<'a>)>,
+    action: &'a PaneAction,
+) {
+    match action {
+        PaneAction::Create | PaneAction::Close => {}
+        PaneAction::Split {
             direction,
             focus,
             command,
-        }) => {
+        } => {
             fields.push(field("direction", optional_scalar_node(direction.as_ref())));
             fields.push(field(
                 "focus",
-                focus
-                    .as_ref()
-                    .map(scalar_node)
-                    .unwrap_or(JsonNode::Bool(true)),
+                focus.as_ref().map_or(JsonNode::Bool(true), scalar_node),
             ));
-            push_create_command_fields(&mut fields, command);
+            push_create_command_fields(fields, command);
         }
-        PortableAction::Pane(PaneAction::Resize { direction, amount }) => {
+        PaneAction::Focus(target) | PaneAction::Move(target) | PaneAction::Swap(target) => {
+            push_target_field(fields, target);
+        }
+        PaneAction::Resize { direction, amount } => {
             fields.push(field("direction", scalar_node(direction)));
             fields.push(field("amount", optional_scalar_node(amount.as_ref())));
         }
-        PortableAction::Pane(
-            PaneAction::Zoom { enabled }
-            | PaneAction::Fullscreen { enabled }
-            | PaneAction::Floating { enabled },
-        ) => {
+        PaneAction::Zoom { enabled }
+        | PaneAction::Fullscreen { enabled }
+        | PaneAction::Floating { enabled } => {
             fields.push(field("enabled", optional_scalar_node(enabled.as_ref())));
         }
-        PortableAction::Pane(PaneAction::Frame { visible }) => {
+        PaneAction::Frame { visible } => {
             fields.push(field("visible", optional_scalar_node(visible.as_ref())));
         }
-        PortableAction::Session(SessionAction::Attach { name })
-        | PortableAction::Session(SessionAction::Switch { name })
-        | PortableAction::Session(SessionAction::Rename { name }) => {
-            fields.push(field("name", scalar_node(name)));
-        }
-        PortableAction::Session(
-            SessionAction::Create
-            | SessionAction::Detach
-            | SessionAction::Quit
-            | SessionAction::Kill,
-        ) => {}
     }
-    Ok(JsonNode::Object(fields))
+}
+
+fn push_session_action_fields<'a>(
+    fields: &mut Vec<(Cow<'a, str>, JsonNode<'a>)>,
+    action: &'a SessionAction,
+) {
+    match action {
+        SessionAction::Attach { name }
+        | SessionAction::Switch { name }
+        | SessionAction::Rename { name } => fields.push(field("name", scalar_node(name))),
+        SessionAction::Create
+        | SessionAction::Detach
+        | SessionAction::Quit
+        | SessionAction::Kill => {}
+    }
 }
 
 fn push_create_command_fields<'a>(
@@ -425,7 +459,7 @@ fn push_target_field<'a>(
 }
 
 fn optional_scalar_node(value: Option<&ActionScalar>) -> JsonNode<'_> {
-    value.map(scalar_node).unwrap_or(JsonNode::Null)
+    value.map_or(JsonNode::Null, scalar_node)
 }
 
 fn scalar_node(value: &ActionScalar) -> JsonNode<'_> {
@@ -519,7 +553,7 @@ mod tests {
         compile_yaml(
             CompiledGeneration(1),
             SourceId::new("<menu dump test>"),
-            r#"
+            r"
 version: 1
 settings:
   timeout: 30s
@@ -565,7 +599,7 @@ inject:
     action:
       type: defaults
       tags: [injected]
-"#,
+",
             KeyCapabilities::default(),
             None,
         )
