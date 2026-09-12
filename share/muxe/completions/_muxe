@@ -36,6 +36,58 @@ _arguments "${_arguments_options[@]}" : \
 '--version[Print version]' \
 && ret=0
 ;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_muxe__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:muxe-config-command-$line[1]:"
+        case $line[1] in
+            (check)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_muxe__subcmd__config__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:muxe-config-help-command-$line[1]:"
+        case $line[1] in
+            (check)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
 (menu)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -559,6 +611,26 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+":: :_muxe__subcmd__help__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:muxe-help-config-command-$line[1]:"
+        case $line[1] in
+            (check)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (menu)
 _arguments "${_arguments_options[@]}" : \
 ":: :_muxe__subcmd__help__subcmd__menu_commands" \
@@ -736,6 +808,7 @@ esac
 _muxe_commands() {
     local commands; commands=(
 'init:Create the starter configuration without installing host integration' \
+'config:Validate configuration for every supported host' \
 'menu:Open a configured root menu through a host launcher' \
 'pane:Open a generic command pane' \
 'integration:Install or remove managed host integration' \
@@ -813,10 +886,42 @@ _muxe__subcmd__compatibility_commands() {
     local commands; commands=()
     _describe -t commands 'muxe compatibility commands' commands "$@"
 }
+(( $+functions[_muxe__subcmd__config_commands] )) ||
+_muxe__subcmd__config_commands() {
+    local commands; commands=(
+'check:Check the base configuration with each host override' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'muxe config commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__config__subcmd__check_commands] )) ||
+_muxe__subcmd__config__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'muxe config check commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__config__subcmd__help_commands] )) ||
+_muxe__subcmd__config__subcmd__help_commands() {
+    local commands; commands=(
+'check:Check the base configuration with each host override' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'muxe config help commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__config__subcmd__help__subcmd__check_commands] )) ||
+_muxe__subcmd__config__subcmd__help__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'muxe config help check commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__config__subcmd__help__subcmd__help_commands] )) ||
+_muxe__subcmd__config__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'muxe config help help commands' commands "$@"
+}
 (( $+functions[_muxe__subcmd__help_commands] )) ||
 _muxe__subcmd__help_commands() {
     local commands; commands=(
 'init:Create the starter configuration without installing host integration' \
+'config:Validate configuration for every supported host' \
 'menu:Open a configured root menu through a host launcher' \
 'pane:Open a generic command pane' \
 'integration:Install or remove managed host integration' \
@@ -862,6 +967,18 @@ _muxe__subcmd__help__subcmd__broker__subcmd__serve-zellij_commands() {
 _muxe__subcmd__help__subcmd__compatibility_commands() {
     local commands; commands=()
     _describe -t commands 'muxe help compatibility commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__help__subcmd__config_commands] )) ||
+_muxe__subcmd__help__subcmd__config_commands() {
+    local commands; commands=(
+'check:Check the base configuration with each host override' \
+    )
+    _describe -t commands 'muxe help config commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__help__subcmd__config__subcmd__check_commands] )) ||
+_muxe__subcmd__help__subcmd__config__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'muxe help config check commands' commands "$@"
 }
 (( $+functions[_muxe__subcmd__help__subcmd__help_commands] )) ||
 _muxe__subcmd__help__subcmd__help_commands() {

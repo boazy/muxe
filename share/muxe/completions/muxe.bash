@@ -25,6 +25,9 @@ _muxe() {
             muxe,compatibility)
                 cmd="muxe__subcmd__compatibility"
                 ;;
+            muxe,config)
+                cmd="muxe__subcmd__config"
+                ;;
             muxe,help)
                 cmd="muxe__subcmd__help"
                 ;;
@@ -70,6 +73,18 @@ _muxe() {
             muxe__subcmd__broker__subcmd__help,serve-zellij)
                 cmd="muxe__subcmd__broker__subcmd__help__subcmd__serve__subcmd__zellij"
                 ;;
+            muxe__subcmd__config,check)
+                cmd="muxe__subcmd__config__subcmd__check"
+                ;;
+            muxe__subcmd__config,help)
+                cmd="muxe__subcmd__config__subcmd__help"
+                ;;
+            muxe__subcmd__config__subcmd__help,check)
+                cmd="muxe__subcmd__config__subcmd__help__subcmd__check"
+                ;;
+            muxe__subcmd__config__subcmd__help,help)
+                cmd="muxe__subcmd__config__subcmd__help__subcmd__help"
+                ;;
             muxe__subcmd__help,activate)
                 cmd="muxe__subcmd__help__subcmd__activate"
                 ;;
@@ -78,6 +93,9 @@ _muxe() {
                 ;;
             muxe__subcmd__help,compatibility)
                 cmd="muxe__subcmd__help__subcmd__compatibility"
+                ;;
+            muxe__subcmd__help,config)
+                cmd="muxe__subcmd__help__subcmd__config"
                 ;;
             muxe__subcmd__help,help)
                 cmd="muxe__subcmd__help__subcmd__help"
@@ -108,6 +126,9 @@ _muxe() {
                 ;;
             muxe__subcmd__help__subcmd__broker,serve-zellij)
                 cmd="muxe__subcmd__help__subcmd__broker__subcmd__serve__subcmd__zellij"
+                ;;
+            muxe__subcmd__help__subcmd__config,check)
+                cmd="muxe__subcmd__help__subcmd__config__subcmd__check"
                 ;;
             muxe__subcmd__help__subcmd__integration,install)
                 cmd="muxe__subcmd__help__subcmd__integration__subcmd__install"
@@ -230,7 +251,7 @@ _muxe() {
 
     case "${cmd}" in
         muxe)
-            opts="-h -V --help --version init menu pane integration activate broker compatibility purge ui help"
+            opts="-h -V --help --version init config menu pane integration activate broker compatibility purge ui help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -461,8 +482,78 @@ _muxe() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        muxe__subcmd__config)
+            opts="-h -V --help --version check help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__config__subcmd__check)
+            opts="-h -V --help --version"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__config__subcmd__help)
+            opts="check help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__config__subcmd__help__subcmd__check)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__config__subcmd__help__subcmd__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         muxe__subcmd__help)
-            opts="init menu pane integration activate broker compatibility purge ui help"
+            opts="init config menu pane integration activate broker compatibility purge ui help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -548,6 +639,34 @@ _muxe() {
         muxe__subcmd__help__subcmd__compatibility)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__help__subcmd__config)
+            opts="check"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__help__subcmd__config__subcmd__check)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
