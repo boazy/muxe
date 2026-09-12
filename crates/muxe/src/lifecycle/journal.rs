@@ -90,6 +90,15 @@ pub struct UnitLock {
     _file: Flock<fs::File>,
 }
 
+/// Result of a nonblocking activation-unit lock attempt.
+#[derive(Debug)]
+pub enum UnitLockAttempt {
+    /// The caller exclusively owns the activation unit.
+    Acquired(UnitLock),
+    /// Another activation or recovery participant owns the unit.
+    Active,
+}
+
 /// Acquires the shared cache lifetime lease used by activation and recovery.
 ///
 /// # Errors
@@ -116,17 +125,56 @@ pub fn acquire_cache_purge_lock(cache_dir: &Path) -> Result<CacheLease, JournalE
 ///
 /// Returns a journal error when the cache/unit lock cannot be created or acquired.
 pub fn acquire_unit_lock(cache_dir: &Path, unit: &UnitKind) -> Result<UnitLock, JournalError> {
+    match try_acquire_unit_lock(cache_dir, unit)? {
+        UnitLockAttempt::Acquired(lock) => Ok(lock),
+        UnitLockAttempt::Active => Err(JournalError::Inconsistent(format!(
+            "activation unit is already owned by another process at {}",
+            activation_dir(cache_dir)
+                .join(unit.journal_name())
+                .with_extension("lock")
+                .display()
+        ))),
+    }
+}
+
+/// Tries to acquire one activation-unit lock without blocking.
+///
+/// # Errors
+///
+/// Returns a journal error for cache, directory, file, ownership, or lock
+/// failures other than contention.
+pub fn try_acquire_unit_lock(
+    cache_dir: &Path,
+    unit: &UnitKind,
+) -> Result<UnitLockAttempt, JournalError> {
     let cache = acquire_cache_lease(cache_dir)?;
     let directory = activation_dir(cache_dir);
     fsutil::ensure_owner_dir(&directory)?;
-    let file = acquire_lock_path(&directory.join(format!(
-        "{}.lock",
-        unit.journal_name().trim_end_matches(".json")
-    )))?;
-    Ok(UnitLock {
-        _cache: cache,
-        _file: file,
-    })
+    let path = directory.join(unit.journal_name()).with_extension("lock");
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    let file = options.open(&path).map_err(|source| {
+        JournalError::Inconsistent(format!(
+            "cannot open activation unit lock at {}: {source}",
+            path.display()
+        ))
+    })?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(file) => Ok(UnitLockAttempt::Acquired(UnitLock {
+            _cache: cache,
+            _file: file,
+        })),
+        Err((_, error)) if error == nix::errno::Errno::EWOULDBLOCK => Ok(UnitLockAttempt::Active),
+        Err((_, error)) => Err(JournalError::Inconsistent(format!(
+            "cannot acquire activation unit lock at {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 /// Acquires an existing journal lock with a kernel-blocking flock. Callers
@@ -215,28 +263,6 @@ fn acquire_cache_lock(cache_dir: &Path, mode: FlockArg) -> Result<CacheLease, Jo
         )),
     })?;
     Ok(CacheLease { _file: file })
-}
-
-fn acquire_lock_path(path: &Path) -> Result<Flock<fs::File>, JournalError> {
-    let mut options = fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
-    let file = options.open(path).map_err(|source| {
-        JournalError::Inconsistent(format!(
-            "cannot open activation unit lock at {}: {source}",
-            path.display()
-        ))
-    })?;
-    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, error)| {
-        JournalError::Inconsistent(format!(
-            "activation unit is already owned by another process at {}: {error}",
-            path.display()
-        ))
-    })
 }
 
 fn acquire_lock_path_blocking(path: &Path) -> Result<Flock<fs::File>, JournalError> {

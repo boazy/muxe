@@ -23,12 +23,14 @@ use std::{
 
 use muxe_broker::{RuntimeEndpoint, RuntimeError, ServeHerdrSpawn, ServeZellijSpawn};
 use muxe_protocol::control::{ActivationStatus, CompatibilityRecord};
+use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 use thiserror::Error;
 
 use super::{
     activate::{
         BrokerSpawner, ControlPort, ControlSession, HostReloader, SpawnRequest, TargetHandle,
     },
+    journal::{self, UnitKind, UnitLockAttempt},
     registry::{BrokerEntry, Registry, RegistryError},
 };
 use crate::integration;
@@ -122,35 +124,32 @@ pub enum ColdstartError {
     StartupTimeout,
 }
 
-/// Internal verification state for one candidate entry.
-enum Verification {
-    /// Control status verified: attach or activate (boxed: the outcome
-    /// carries the full status while the other variants are tiny).
-    Verified(Box<ColdstartOutcome>),
-    /// Candidate not verifiable yet (no entry, or transport not up).
-    NotReady,
-    /// Candidate verified as the wrong broker: fail closed at once.
-    Mismatched(ColdstartError),
+/// Registry liveness for the deterministic endpoint.
+enum EndpointRegistration {
+    Live(BrokerEntry),
+    Stale(BrokerEntry),
+    Absent,
 }
 
 /// Ensures one live broker for the expected host identity, cold-starting an
 /// ordinary broker when none answers.
 ///
 /// A pre-existing live broker is verified by control status before return: a
-/// wrong identity fails closed (never a second broker), a stale compiled
-/// record reports [`ColdstartOutcome::StaleRecord`] for activation. When no
-/// broker is live, the endpoint startup lock serializes concurrent starters;
-/// the winner rechecks liveness under the lock, spawns exactly one child,
-/// drops the lock, reloads the stable Zellij bridge when it spawned one, and
-/// awaits verified identity within `readiness_deadline`. A loser of the lock
-/// race awaits the winner's broker on the same bound. Expiry after spawning
-/// stops the spawned child before returning, so no orphaned host adapter
-/// owner survives a failed coldstart.
+/// wrong identity fails closed (never a second broker), and a stale compiled
+/// record reports [`ColdstartOutcome::StaleRecord`] for activation. A refused
+/// or missing recorded endpoint is replaceable only while this caller owns
+/// both its activation-unit and endpoint-startup locks and the recorded broker
+/// PID is provably dead. Active activation or startup ownership enters the
+/// bounded readiness wait instead of spawning a sibling adapter.
 ///
 /// # Errors
 ///
-/// Returns [`ColdstartError`] when the registry, lock, spawn, reload,
-/// identity, or the bounded wait fails.
+/// Returns [`ColdstartError`] when registry access, serialization, spawning,
+/// reload, identity verification, or the bounded wait fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "coldstart keeps unit-lock, endpoint-lock, PID authority, spawn, reload, and readiness ordering in one auditable transaction"
+)]
 pub async fn ensure_broker<S, C, R>(
     inputs: &ColdstartInputs<'_, S, C, R>,
 ) -> Result<ColdstartOutcome, ColdstartError>
@@ -159,19 +158,103 @@ where
     C: ControlPort,
     R: HostReloader,
 {
-    if let Some(found) = live_entry_for(inputs.cache_dir, &inputs.endpoint)? {
-        return verify_now(inputs.control, &found, inputs).await;
-    }
-    let lock = match inputs.endpoint.acquire_startup_lock() {
-        Ok(lock) => Some(lock),
-        Err(RuntimeError::StartupInProgress(_)) => None,
-        Err(error) => return Err(ColdstartError::Startup(error.to_string())),
-    };
+    let deadline = Instant::now() + inputs.readiness_deadline;
+    let unit = activation_unit(&inputs.host, inputs.config_file)?;
+    let mut unit_lock = None;
     let mut spawned: Option<TargetHandle> = None;
-    if lock.is_some() {
-        if let Some(found) = live_entry_for(inputs.cache_dir, &inputs.endpoint)? {
-            drop(lock);
-            return verify_now(inputs.control, &found, inputs).await;
+
+    loop {
+        if unit_lock.is_none() {
+            match journal::try_acquire_unit_lock(inputs.cache_dir, &unit)
+                .map_err(|error| ColdstartError::Startup(error.to_string()))?
+            {
+                UnitLockAttempt::Acquired(lock) => unit_lock = Some(lock),
+                UnitLockAttempt::Active => {
+                    wait_before_retry(inputs.spawner, &mut spawned, deadline, inputs.poll_interval)
+                        .await?;
+                    continue;
+                }
+            }
+        }
+
+        let registration = match endpoint_registration(inputs.cache_dir, &inputs.endpoint) {
+            Ok(registration) => registration,
+            Err(error) => {
+                stop_spawned(inputs.spawner, spawned.take());
+                return Err(error);
+            }
+        };
+        if let EndpointRegistration::Live(found) = registration {
+            if spawned.is_none() {
+                return verify_now(inputs.control, &found, inputs).await;
+            }
+            let Ok(status) = read_status(inputs.control, &found.socket).await else {
+                wait_before_retry(inputs.spawner, &mut spawned, deadline, inputs.poll_interval)
+                    .await?;
+                continue;
+            };
+            match classify(&found, status, inputs) {
+                Ok(outcome) => {
+                    // The child is now the serving broker daemon; dropping
+                    // its handle leaves it running under supervision.
+                    drop(spawned.take());
+                    drop(unit_lock.take());
+                    return Ok(outcome);
+                }
+                Err(error) => {
+                    stop_spawned(inputs.spawner, spawned.take());
+                    return Err(error);
+                }
+            }
+        }
+        if spawned.is_some() {
+            wait_before_retry(inputs.spawner, &mut spawned, deadline, inputs.poll_interval).await?;
+            continue;
+        }
+
+        let startup_lock = match inputs.endpoint.acquire_startup_lock() {
+            Ok(lock) => lock,
+            Err(RuntimeError::StartupInProgress(_)) => {
+                drop(unit_lock.take());
+                wait_before_retry(inputs.spawner, &mut spawned, deadline, inputs.poll_interval)
+                    .await?;
+                continue;
+            }
+            Err(error) => return Err(ColdstartError::Startup(error.to_string())),
+        };
+        let registration = endpoint_registration(inputs.cache_dir, &inputs.endpoint)?;
+        match registration {
+            EndpointRegistration::Live(_) => {
+                drop(startup_lock);
+                continue;
+            }
+            EndpointRegistration::Stale(found) => {
+                if !recorded_process_is_dead(found.server_pid)? {
+                    return Err(ColdstartError::Startup(format!(
+                        "recorded broker PID {} is still alive while {} refuses connections",
+                        found.server_pid,
+                        found.socket.display()
+                    )));
+                }
+            }
+            EndpointRegistration::Absent => {}
+        }
+
+        let journal_path = journal::activation_dir(inputs.cache_dir).join(unit.journal_name());
+        match std::fs::symlink_metadata(&journal_path) {
+            Ok(_) => {
+                return Err(ColdstartError::Startup(format!(
+                    "activation recovery is pending at {}",
+                    journal_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ColdstartError::Startup(format!(
+                    "could not inspect activation recovery at {}: {error}",
+                    journal_path.display()
+                )));
+            }
         }
         let request = coldstart_spawn_request(inputs).map_err(ColdstartError::Spawn)?;
         spawned = Some(
@@ -180,7 +263,7 @@ where
                 .spawn_target(&request)
                 .map_err(|error| ColdstartError::Spawn(error.to_string()))?,
         );
-        drop(lock);
+        drop(startup_lock);
         if let ColdstartHost::Zellij { session, .. } = &inputs.host {
             let config_dir = parent_of(inputs.config_file)?;
             let bridge_url =
@@ -193,49 +276,26 @@ where
                 return Err(ColdstartError::Reload(error.to_string()));
             }
         }
-    }
-    let deadline = Instant::now() + inputs.readiness_deadline;
-    loop {
-        match poll_once(inputs).await? {
-            Verification::Verified(outcome) => {
-                // The spawned child (if any) is now the serving broker daemon;
-                // dropping its handle leaves it running under supervision.
-                drop(spawned.take());
-                return Ok(*outcome);
-            }
-            Verification::Mismatched(error) => {
-                stop_spawned(inputs.spawner, spawned.take());
-                return Err(error);
-            }
-            Verification::NotReady => {
-                if Instant::now() >= deadline {
-                    stop_spawned(inputs.spawner, spawned.take());
-                    return Err(ColdstartError::StartupTimeout);
-                }
-                tokio::time::sleep(inputs.poll_interval).await;
-            }
-        }
+        wait_before_retry(inputs.spawner, &mut spawned, deadline, inputs.poll_interval).await?;
     }
 }
 
-/// One readiness poll: no registry entry or no control transport yet reads as
-/// not ready; a wrong identity fails closed at once.
-async fn poll_once<S, C, R>(
-    inputs: &ColdstartInputs<'_, S, C, R>,
-) -> Result<Verification, ColdstartError>
+/// Waits before the next ownership/readiness check, stopping an owned child on timeout.
+async fn wait_before_retry<S>(
+    spawner: &S,
+    child: &mut Option<TargetHandle>,
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<(), ColdstartError>
 where
-    C: ControlPort,
+    S: BrokerSpawner,
 {
-    let Some(found) = live_entry_for(inputs.cache_dir, &inputs.endpoint)? else {
-        return Ok(Verification::NotReady);
-    };
-    let Ok(status) = read_status(inputs.control, &found.socket).await else {
-        return Ok(Verification::NotReady);
-    };
-    match classify(&found, status, inputs) {
-        Ok(outcome) => Ok(Verification::Verified(Box::new(outcome))),
-        Err(error) => Ok(Verification::Mismatched(error)),
+    if Instant::now() >= deadline {
+        stop_spawned(spawner, child.take());
+        return Err(ColdstartError::StartupTimeout);
     }
+    tokio::time::sleep(poll_interval).await;
+    Ok(())
 }
 
 /// Verifies a pre-existing entry without polling: a silent transport is a
@@ -343,19 +403,63 @@ fn coldstart_spawn_request<S, C, R>(
     })
 }
 
-/// Finds the registry entry for this endpoint socket, if any.
-fn live_entry_for(
+/// Classifies the matching registry entry by owner-only socket liveness.
+fn endpoint_registration(
     cache_dir: &Path,
     endpoint: &RuntimeEndpoint,
-) -> Result<Option<BrokerEntry>, ColdstartError> {
-    let registry = Registry::open(cache_dir)?;
+) -> Result<EndpointRegistration, ColdstartError> {
     let socket = endpoint.socket();
-    for entry in registry.entries()? {
-        if entry.socket == socket {
-            return Ok(Some(entry));
+    let liveness = Registry::open(cache_dir)?.probe()?;
+    if let Some(entry) = liveness
+        .live
+        .into_iter()
+        .find(|entry| entry.socket == socket)
+    {
+        return Ok(EndpointRegistration::Live(entry));
+    }
+    if let Some(entry) = liveness
+        .stale
+        .into_iter()
+        .find(|entry| entry.socket == socket)
+    {
+        return Ok(EndpointRegistration::Stale(entry));
+    }
+    Ok(EndpointRegistration::Absent)
+}
+
+/// Derives the activation-unit lock shared with replacement and recovery.
+fn activation_unit(host: &ColdstartHost, config_file: &Path) -> Result<UnitKind, ColdstartError> {
+    match host {
+        ColdstartHost::Herdr { discovery_key, .. } => Ok(UnitKind::Herdr {
+            host_hash: journal::unit_hash(discovery_key),
+        }),
+        ColdstartHost::Zellij { .. } => {
+            let config_dir = parent_of(config_file)?;
+            let bridge = integration::stable_bridge_path(config_dir);
+            Ok(UnitKind::Zellij {
+                bridge_path_hash: journal::unit_hash(&bridge.display().to_string()),
+            })
         }
     }
-    Ok(None)
+}
+
+/// Returns true only when the registry PID is valid and no process owns it.
+fn recorded_process_is_dead(server_pid: u32) -> Result<bool, ColdstartError> {
+    let pid = i32::try_from(server_pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            ColdstartError::Startup(format!(
+                "registry carries invalid broker PID {server_pid}; refusing replacement"
+            ))
+        })?;
+    match kill(Pid::from_raw(pid), None) {
+        Err(Errno::ESRCH) => Ok(true),
+        Ok(()) | Err(Errno::EPERM) => Ok(false),
+        Err(error) => Err(ColdstartError::Startup(format!(
+            "could not probe recorded broker PID {server_pid}: {error}"
+        ))),
+    }
 }
 
 /// Expected control identity for one coldstart host.
@@ -388,6 +492,7 @@ where
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -485,6 +590,7 @@ mod tests {
         session: String,
         control: Arc<FakeControl>,
         record: CompatibilityRecord,
+        listener: Mutex<Option<UnixListener>>,
     }
 
     impl BrokerSpawner for FakeSpawner {
@@ -499,6 +605,9 @@ mod tests {
                 "coldstart carries no activation handoff"
             );
             if self.auto_register {
+                let _ = std::fs::remove_file(&self.socket);
+                let listener = UnixListener::bind(&self.socket).expect("fake broker socket binds");
+                *self.listener.lock().expect("fake listener is writable") = Some(listener);
                 let mut entry =
                     BrokerEntry::now("zellij", &self.session, self.socket.clone(), 4242);
                 entry.live_server = Some(self.session.clone());
@@ -578,6 +687,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: true,
+            listener: Mutex::new(None),
             cache_dir: cache.clone(),
             socket: endpoint_in(temp.path()).socket().to_path_buf(),
             session: "session-test".to_owned(),
@@ -626,6 +736,370 @@ mod tests {
             .expect("test endpoint derives")
     }
 
+    /// A registry entry whose socket refuses connections is stale: one
+    /// serialized coldstart replaces it and returns the verified broker.
+    #[tokio::test]
+    async fn refused_registered_socket_is_replaced_by_one_coldstart() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.yml");
+        let endpoint = endpoint_in(temp.path());
+        endpoint
+            .ensure_owner_directory()
+            .expect("runtime directory exists");
+        let stale_listener = UnixListener::bind(endpoint.socket()).expect("stale socket binds");
+        drop(stale_listener);
+        let error = UnixStream::connect(endpoint.socket()).expect_err("stale socket refuses");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        let mut exited = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("stale broker process starts");
+        let stale_pid = exited.id();
+        assert!(
+            exited
+                .wait()
+                .expect("stale broker process is reaped")
+                .success()
+        );
+
+        let mut stale = BrokerEntry::now(
+            "zellij",
+            "session-test",
+            endpoint.socket().to_path_buf(),
+            stale_pid,
+        );
+        stale.live_server = Some("old-server".to_owned());
+        Registry::open(temp.path())
+            .expect("registry opens")
+            .register(stale)
+            .expect("stale broker registers");
+
+        let control = Arc::new(FakeControl {
+            statuses: Mutex::new(HashMap::new()),
+        });
+        let spawner = FakeSpawner {
+            spawns: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            auto_register: true,
+            listener: Mutex::new(None),
+            cache_dir: temp.path().to_path_buf(),
+            socket: endpoint.socket().to_path_buf(),
+            session: "session-test".to_owned(),
+            control: Arc::clone(&control),
+            record: test_record("9.9.9"),
+        };
+        let reloader = OkReloader;
+        let inputs = zellij_inputs(
+            temp.path(),
+            &config,
+            endpoint,
+            &spawner,
+            &control,
+            Some(&reloader),
+            test_record("9.9.9"),
+        );
+
+        let ColdstartOutcome::Ready(live) =
+            ensure_broker(&inputs).await.expect("stale socket recovers")
+        else {
+            panic!("replacement broker uses the current record");
+        };
+        assert_eq!(live.entry.server_pid, 4242, "new registration wins");
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.stops.load(Ordering::SeqCst), 0);
+    }
+
+    /// A refused endpoint whose recorded broker PID is still live is
+    /// ambiguous authority and must never be replaced.
+    #[tokio::test]
+    async fn refused_socket_with_live_recorded_pid_fails_closed() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.yml");
+        let endpoint = endpoint_in(temp.path());
+        endpoint
+            .ensure_owner_directory()
+            .expect("runtime directory exists");
+        let stale_listener = UnixListener::bind(endpoint.socket()).expect("stale socket binds");
+        drop(stale_listener);
+
+        let mut entry = BrokerEntry::now(
+            "zellij",
+            "session-test",
+            endpoint.socket().to_path_buf(),
+            std::process::id(),
+        );
+        entry.live_server = Some("server-test".to_owned());
+        Registry::open(temp.path())
+            .expect("registry opens")
+            .register(entry)
+            .expect("live owner registers");
+        let control = Arc::new(FakeControl {
+            statuses: Mutex::new(HashMap::new()),
+        });
+        let spawner = FakeSpawner {
+            spawns: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            auto_register: false,
+            listener: Mutex::new(None),
+            cache_dir: temp.path().to_path_buf(),
+            socket: endpoint.socket().to_path_buf(),
+            session: "session-test".to_owned(),
+            control: Arc::clone(&control),
+            record: test_record("9.9.9"),
+        };
+        let reloader = OkReloader;
+        let inputs = zellij_inputs(
+            temp.path(),
+            &config,
+            endpoint,
+            &spawner,
+            &control,
+            Some(&reloader),
+            test_record("9.9.9"),
+        );
+
+        let error = ensure_broker(&inputs)
+            .await
+            .expect_err("live recorded process blocks replacement");
+        let ColdstartError::Startup(message) = error else {
+            panic!("live recorded process is a startup-serialization error: {error}");
+        };
+        assert!(message.contains("is still alive"), "{message}");
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    /// Any directory entry at the activation-journal authority path blocks
+    /// ordinary startup, including a dangling symlink.
+    #[tokio::test]
+    async fn dangling_activation_journal_fails_closed() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.yml");
+        let endpoint = endpoint_in(temp.path());
+        let unit = activation_unit(
+            &ColdstartHost::Zellij {
+                session: "session-test".to_owned(),
+                zellij_exe: PathBuf::from("/bin/false"),
+            },
+            &config,
+        )
+        .expect("activation unit derives");
+        let activation_dir = journal::activation_dir(temp.path());
+        crate::fsutil::ensure_owner_dir(&activation_dir).expect("activation directory exists");
+        let journal_path = activation_dir.join(unit.journal_name());
+        std::os::unix::fs::symlink(temp.path().join("missing-journal"), &journal_path)
+            .expect("dangling journal authority exists");
+
+        let control = Arc::new(FakeControl {
+            statuses: Mutex::new(HashMap::new()),
+        });
+        let spawner = FakeSpawner {
+            spawns: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            auto_register: false,
+            listener: Mutex::new(None),
+            cache_dir: temp.path().to_path_buf(),
+            socket: endpoint.socket().to_path_buf(),
+            session: "session-test".to_owned(),
+            control: Arc::clone(&control),
+            record: test_record("9.9.9"),
+        };
+        let reloader = OkReloader;
+        let inputs = zellij_inputs(
+            temp.path(),
+            &config,
+            endpoint,
+            &spawner,
+            &control,
+            Some(&reloader),
+            test_record("9.9.9"),
+        );
+
+        let error = ensure_broker(&inputs)
+            .await
+            .expect_err("journal authority blocks ordinary startup");
+        let ColdstartError::Startup(message) = error else {
+            panic!("journal authority is a startup-serialization error: {error}");
+        };
+        assert!(
+            message.contains("activation recovery is pending"),
+            "{message}"
+        );
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    /// A refused registration owned by the current startup-lock holder is not
+    /// stale authority: another caller waits for that broker and never spawns.
+    #[tokio::test]
+    async fn refused_registered_herdr_startup_waits_for_lock_holder() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.yml");
+        let discovery = "herdr-test";
+        let endpoint = RuntimeEndpoint::in_runtime_dir(temp.path(), HostKind::Herdr, discovery)
+            .expect("Herdr endpoint derives");
+        endpoint
+            .ensure_owner_directory()
+            .expect("runtime directory exists");
+        let stale_listener = UnixListener::bind(endpoint.socket()).expect("stale socket binds");
+        drop(stale_listener);
+        let error = UnixStream::connect(endpoint.socket()).expect_err("stale socket refuses");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+
+        let startup_lock = endpoint
+            .acquire_startup_lock()
+            .expect("winner holds startup lock");
+        let mut entry = BrokerEntry::now("herdr", discovery, endpoint.socket().to_path_buf(), 73);
+        entry.live_server = Some("server-test".to_owned());
+        Registry::open(temp.path())
+            .expect("registry opens")
+            .register(entry)
+            .expect("starting broker registers");
+
+        let record = test_record("9.9.9");
+        let control = Arc::new(FakeControl {
+            statuses: Mutex::new(HashMap::new()),
+        });
+        let winner_socket = endpoint.socket().to_path_buf();
+        let winner_control = Arc::clone(&control);
+        let winner_record = record.clone();
+        let winner = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            std::fs::remove_file(&winner_socket).expect("winner removes stale socket");
+            let listener = UnixListener::bind(&winner_socket).expect("winner binds endpoint");
+            let mut status = test_status(discovery, winner_record);
+            status.live_server.host = HostKind::Herdr;
+            winner_control
+                .statuses
+                .lock()
+                .expect("fake control is writable")
+                .insert(winner_socket, status);
+            drop(startup_lock);
+            listener
+        });
+        let spawner = FakeSpawner {
+            spawns: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            auto_register: false,
+            listener: Mutex::new(None),
+            cache_dir: temp.path().to_path_buf(),
+            socket: endpoint.socket().to_path_buf(),
+            session: discovery.to_owned(),
+            control: Arc::clone(&control),
+            record: record.clone(),
+        };
+        let inputs = ColdstartInputs {
+            cache_dir: temp.path(),
+            config_file: &config,
+            executable: Path::new("/bin/false"),
+            endpoint,
+            host: ColdstartHost::Herdr {
+                discovery_key: discovery.to_owned(),
+                herdr_binary: PathBuf::from("/bin/false"),
+                herdr_socket: temp.path().join("herdr.sock"),
+            },
+            current_record: record,
+            spawner: &spawner,
+            control: control.as_ref(),
+            reloader: None::<&OkReloader>,
+            readiness_deadline: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(5),
+        };
+
+        let ColdstartOutcome::Ready(live) =
+            ensure_broker(&inputs).await.expect("loser awaits winner")
+        else {
+            panic!("winner uses the current record");
+        };
+        let _listener = winner.await.expect("winner completes");
+        assert_eq!(live.entry.server_pid, 73, "winner registration remains");
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(spawner.stops.load(Ordering::SeqCst), 0);
+    }
+
+    /// A bound activation target remains gated until the activation-unit
+    /// owner releases its full transaction lock.
+    #[tokio::test]
+    async fn gated_herdr_target_waits_for_activation_unit_release() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.yml");
+        let discovery = "herdr-gated";
+        let endpoint = RuntimeEndpoint::in_runtime_dir(temp.path(), HostKind::Herdr, discovery)
+            .expect("Herdr endpoint derives");
+        endpoint
+            .ensure_owner_directory()
+            .expect("runtime directory exists");
+        let unit = UnitKind::Herdr {
+            host_hash: journal::unit_hash(discovery),
+        };
+        let activation_lock =
+            journal::acquire_unit_lock(temp.path(), &unit).expect("activation owns unit");
+        let _listener = UnixListener::bind(endpoint.socket()).expect("target endpoint binds");
+
+        let mut entry = BrokerEntry::now(
+            "herdr",
+            discovery,
+            endpoint.socket().to_path_buf(),
+            std::process::id(),
+        );
+        entry.live_server = Some("target-server".to_owned());
+        Registry::open(temp.path())
+            .expect("registry opens")
+            .register(entry)
+            .expect("target broker registers");
+        let mut status = test_status(discovery, test_record("9.9.9"));
+        status.live_server.host = HostKind::Herdr;
+        let control = Arc::new(FakeControl {
+            statuses: Mutex::new(HashMap::from([(endpoint.socket().to_path_buf(), status)])),
+        });
+        let spawner = FakeSpawner {
+            spawns: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            auto_register: false,
+            listener: Mutex::new(None),
+            cache_dir: temp.path().to_path_buf(),
+            socket: endpoint.socket().to_path_buf(),
+            session: discovery.to_owned(),
+            control: Arc::clone(&control),
+            record: test_record("9.9.9"),
+        };
+        let inputs = ColdstartInputs {
+            cache_dir: temp.path(),
+            config_file: &config,
+            executable: Path::new("/bin/false"),
+            endpoint,
+            host: ColdstartHost::Herdr {
+                discovery_key: discovery.to_owned(),
+                herdr_binary: PathBuf::from("/bin/false"),
+                herdr_socket: temp.path().join("herdr.sock"),
+            },
+            current_record: test_record("9.9.9"),
+            spawner: &spawner,
+            control: control.as_ref(),
+            reloader: None::<&OkReloader>,
+            readiness_deadline: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(5),
+        };
+
+        let mut pending = Box::pin(ensure_broker(&inputs));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "gated target cannot become attachable while activation owns the unit"
+        );
+        assert_eq!(
+            spawner.spawns.load(Ordering::SeqCst),
+            0,
+            "coldstart never creates an ordinary sibling"
+        );
+        drop(activation_lock);
+        let ColdstartOutcome::Ready(live) =
+            pending.await.expect("target verifies after activation")
+        else {
+            panic!("target carries the current record");
+        };
+        assert_eq!(live.entry.discovery_key, discovery);
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 0);
+    }
+
     /// A live broker for another identity never gains a sibling: fail closed
     /// with no spawn.
     #[tokio::test]
@@ -633,6 +1107,10 @@ mod tests {
         let temp = owner_temp();
         let config = temp.path().join("config.yml");
         let endpoint = endpoint_in(temp.path());
+        endpoint
+            .ensure_owner_directory()
+            .expect("runtime directory exists");
+        let _listener = UnixListener::bind(endpoint.socket()).expect("live broker socket binds");
         let mut entry = BrokerEntry::now(
             "zellij",
             "other-session",
@@ -654,6 +1132,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: true,
+            listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
             session: "session-test".to_owned(),
@@ -689,6 +1168,10 @@ mod tests {
         let temp = owner_temp();
         let config = temp.path().join("config.yml");
         let endpoint = endpoint_in(temp.path());
+        endpoint
+            .ensure_owner_directory()
+            .expect("runtime directory exists");
+        let _listener = UnixListener::bind(endpoint.socket()).expect("live broker socket binds");
         let mut entry = BrokerEntry::now(
             "zellij",
             "session-test",
@@ -710,6 +1193,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: false,
+            listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
             session: "session-test".to_owned(),
@@ -752,6 +1236,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: false,
+            listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
             session: "session-test".to_owned(),
