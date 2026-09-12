@@ -1,9 +1,30 @@
-## [Unreleased]
+## [0.1.4] - 2026-09-12
 
 ### 🚀 Features
 
-- *(cli)* Dump fully compiled effective menus as JSON
+- Add effective menu dump command
+- *(config)* Check all host configurations
 
+### 🐛 Bug Fixes
+
+- *(broker)* Recover dead coldstart endpoints safely
+- *(ui)* Execute hidden menu bindings
+- *(ci)* Satisfy strict menu dump lints
+- *(cli)* Refresh config check completions
+
+### 📚 Documentation
+
+- Add menu dump changelog entry
+
+### 🧪 Testing
+
+- *(herdr)* Cover dead stale broker recovery
+- *(coldstart)* Stabilize stale socket setup
+
+### ⚙️ Miscellaneous Tasks
+
+- Regenerate menu dump completions
+- Remove crate publishing on release
 ## [0.1.3] - 2026-09-11
 
 ### 🚀 Features
@@ -26,6 +47,10 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(agents)* Update agent rules to reflect jj commit policy
+
+### 💼 Other
+
+- V0.1.3
 ## [0.1.2] - 2026-09-10
 
 ### 🐛 Bug Fixes
