@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use muxe_adapter_api::HostAdapter;
+use muxe_adapter_api::{HostAdapter, HostKind as AdapterHostKind};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -51,6 +51,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Purge(command) => purge(&command),
         Command::Menu(menu) => match menu.command {
             MenuSubcommand::Open(open) => Box::pin(launch_menu(open)).await,
+            MenuSubcommand::Dump(dump) => Box::pin(dump_menu(dump)).await,
         },
         Command::Pane(pane) => match pane.command {
             PaneSubcommand::Open(open) => Box::pin(launch_pane(open)).await,
@@ -83,6 +84,53 @@ fn compatibility(command: &CompatibilityCommand) -> Result<()> {
     } else {
         print!("{}", muxe::compatibility::render_human(&record));
     }
+    Ok(())
+}
+
+async fn dump_menu(command: muxe::cli::MenuDump) -> Result<()> {
+    let paths = muxe::paths::resolve()?;
+    let host = autodetected_host().ok_or_else(|| {
+        color_eyre::eyre::eyre!("could not detect a supported host for menu dump")
+    })?;
+    let config_file = paths.config_file();
+    let config = match host {
+        HostSelector::Zellij => muxe_broker::load_effective_config(
+            &config_file,
+            AdapterHostKind::Zellij,
+            muxe_core::KeyCapabilities::default(),
+            &muxe_adapter_zellij::ZellijValidator,
+        )
+        .wrap_err("could not compile the effective Zellij configuration for dump")?,
+        HostSelector::Herdr => {
+            let herdr_binary = herdr_binary_from_path()?;
+            let validator =
+                muxe_adapter_herdr::HerdrConfigValidator::load(&herdr_binary, &paths.cache_dir)
+                    .await
+                    .wrap_err("could not load the installed Herdr schema for menu dump")?;
+            muxe_broker::load_effective_config(
+                &config_file,
+                AdapterHostKind::Herdr,
+                muxe_core::KeyCapabilities::default(),
+                &validator,
+            )
+            .wrap_err("could not compile the effective Herdr configuration for dump")?
+        }
+        HostSelector::Auto => unreachable!("automatic host selection is resolved"),
+    };
+    let requested = if command.all {
+        None
+    } else {
+        Some(muxe_core::MenuId::new(
+            command
+                .menu
+                .expect("clap requires a menu unless --all is present"),
+        ))
+    };
+    let selection = requested.as_ref().map_or(
+        muxe::menu_dump::MenuDumpSelection::All,
+        muxe::menu_dump::MenuDumpSelection::Menu,
+    );
+    println!("{}", muxe::menu_dump::render(&config, selection)?);
     Ok(())
 }
 
@@ -2287,16 +2335,22 @@ async fn best_effort_notify(client: &muxe_adapter_herdr::HerdrSocketClient, text
         .await;
 }
 
+fn autodetected_host() -> Option<HostSelector> {
+    if env::var_os("HERDR_SOCKET_PATH").is_some() {
+        Some(HostSelector::Herdr)
+    } else if env::var_os("ZELLIJ_SESSION_NAME").is_some_and(|value| !value.is_empty()) {
+        Some(HostSelector::Zellij)
+    } else {
+        None
+    }
+}
+
 fn selected_host(requested: HostSelector) -> Result<HostSelector> {
     match requested {
         HostSelector::Herdr | HostSelector::Zellij => Ok(requested),
-        HostSelector::Auto if env::var_os("HERDR_SOCKET_PATH").is_some() => Ok(HostSelector::Herdr),
-        HostSelector::Auto
-            if env::var_os("ZELLIJ_SESSION_NAME").is_some_and(|value| !value.is_empty()) =>
-        {
-            Ok(HostSelector::Zellij)
-        }
-        HostSelector::Auto => bail!("could not detect a supported host for muxe pane open"),
+        HostSelector::Auto => autodetected_host().ok_or_else(|| {
+            color_eyre::eyre::eyre!("could not detect a supported host for muxe pane open")
+        }),
     }
 }
 

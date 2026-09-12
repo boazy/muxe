@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -57,6 +57,26 @@ pub struct HerdrAdapter {
     monitor: Mutex<Option<JoinHandle<()>>>,
     pending_leases: Mutex<HashMap<String, (u64, muxe_adapter_api::UiSessionId)>>,
     post_dismissal: Mutex<HashMap<String, Vec<PostDismissalPortableDispatchRequest>>>,
+}
+
+/// Transport-free validator for inspecting configuration against the exact
+/// installed Herdr request schema.
+pub struct HerdrConfigValidator {
+    schema: Arc<ApiSchema>,
+}
+
+impl HerdrConfigValidator {
+    /// Loads the installed schema through the bounded owned-child path without
+    /// probing or subscribing to a Herdr socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] when the schema command, cache, protocol check,
+    /// or schema parser fails.
+    pub async fn load(binary: &Path, cache_dir: &Path) -> Result<Self, AdapterError> {
+        let (schema, _) = crate::runtime::load_installed_schema(binary, cache_dir).await?;
+        Ok(Self { schema })
+    }
 }
 struct ContinuityState {
     epoch: u64,
@@ -237,82 +257,7 @@ impl HerdrAdapter {
         action: &PortableAction,
     ) -> Result<ExecutionCapabilities, String> {
         let runtime = self.runtime();
-        if let Some(methods) = command_creation_methods(action) {
-            return validate_required_methods(&runtime, methods);
-        }
-        let method = match action {
-            PortableAction::Menu(_) | PortableAction::Config(_) => {
-                return Ok(ExecutionCapabilities::SYNCHRONOUS);
-            }
-            // Commands run in the broker, not the host adapter. Their ownership and capability
-            // contract must therefore remain independent of Herdr's RPC inventory.
-            PortableAction::Command(_) => {
-                return Ok(ExecutionCapabilities {
-                    awaitable: true,
-                    detachable: true,
-                    cancellable: true,
-                });
-            }
-            PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(_)) => "pane.send_keys",
-            PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(_)) => "pane.send_text",
-            PortableAction::Tab(TabAction::Create { .. }) => "tab.create",
-            PortableAction::Tab(TabAction::Close) => "tab.close",
-            PortableAction::Tab(TabAction::Rename { name: Some(_) }) => "tab.rename",
-            PortableAction::Tab(TabAction::Rename { name: None }) => {
-                return Err(
-                    "Herdr tab.rename requires `label`; the portable bare `tab:rename` has no specified Herdr prompt mapping"
-                        .to_owned(),
-                );
-            }
-            PortableAction::Tab(TabAction::Move(target)) if target_is_index(target) => "tab.move",
-            PortableAction::Tab(TabAction::Swap(target)) if target_is_index(target) => {
-                return validate_required_methods(&runtime, &["tab.list", "tab.move"]);
-            }
-            PortableAction::Pane(PaneAction::Create) => {
-                return Err(
-                    "Herdr has no pane.create method; pane.split requires an explicit right or down direction"
-                        .to_owned(),
-                );
-            }
-            PortableAction::Pane(PaneAction::Split {
-                direction: Some(direction),
-                ..
-            }) if split_direction_is_supported(direction) => "pane.split",
-            PortableAction::Pane(PaneAction::Split {
-                direction: None, ..
-            }) => {
-                return Err(
-                    "Herdr pane.split requires an explicit right or down direction".to_owned(),
-                );
-            }
-            PortableAction::Pane(PaneAction::Split { .. }) => {
-                return Err("Herdr pane.split supports only right or down directions".to_owned());
-            }
-            PortableAction::Pane(PaneAction::Close) => "pane.close",
-            PortableAction::Pane(PaneAction::Focus(target))
-                if target_is_cardinal_direction(target) =>
-            {
-                "pane.focus_direction"
-            }
-            PortableAction::Pane(PaneAction::Swap(target))
-                if target_is_cardinal_direction(target) =>
-            {
-                "pane.swap"
-            }
-            PortableAction::Pane(PaneAction::Resize { .. }) => "pane.resize",
-            PortableAction::Pane(PaneAction::Zoom { .. }) => "pane.zoom",
-            PortableAction::Tab(TabAction::Focus(_)) => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that protocol 20 does not expose as a typed action".to_owned()),
-            PortableAction::Tab(TabAction::Move(_)) => return Err("Herdr tab.move supports only a concrete insert index".to_owned()),
-            PortableAction::Tab(TabAction::Swap(_)) => return Err("Herdr tab:swap supports only an index; the schema offers tab.list plus tab.move, not directional tab targeting".to_owned()),
-            PortableAction::Pane(PaneAction::Focus(_)) => return Err("Herdr pane.focus supports only cardinal directions".to_owned()),
-            PortableAction::Pane(PaneAction::Move(_)) => return Err("Herdr pane.move requires an explicit tab/new-tab destination, not a portable index or direction".to_owned()),
-            PortableAction::Pane(PaneAction::Swap(_)) => return Err("Herdr pane.swap supports only cardinal directions".to_owned()),
-            PortableAction::Pane(PaneAction::Fullscreen { .. }) => return Err("Herdr protocol 20 exposes no pane fullscreen method".to_owned()),
-            PortableAction::Pane(PaneAction::Floating { .. }) => return Err("Herdr protocol 20 exposes no pane floating method".to_owned()),
-            PortableAction::Pane(PaneAction::Frame { .. }) => return Err("Herdr protocol 20 exposes no pane frame method".to_owned()),
-            PortableAction::Session(_) => return Err("Herdr protocol 20 exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
-        };
-        validate_required_methods(&runtime, &[method])
+        portable_compile_validation(runtime.schema(), action)
     }
 
     #[expect(
@@ -622,6 +567,86 @@ impl HerdrAdapter {
     }
 }
 
+fn portable_compile_validation(
+    schema: &ApiSchema,
+    action: &PortableAction,
+) -> Result<ExecutionCapabilities, String> {
+    if let Some(methods) = command_creation_methods(action) {
+        return validate_required_methods(schema, methods);
+    }
+    let method = match action {
+        PortableAction::Menu(_) | PortableAction::Config(_) => {
+            return Ok(ExecutionCapabilities::SYNCHRONOUS);
+        }
+        // Commands run in the broker, not the host adapter. Their ownership and capability
+        // contract must therefore remain independent of Herdr's RPC inventory.
+        PortableAction::Command(_) => {
+            return Ok(ExecutionCapabilities {
+                awaitable: true,
+                detachable: true,
+                cancellable: true,
+            });
+        }
+        PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(_)) => "pane.send_keys",
+        PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(_)) => "pane.send_text",
+        PortableAction::Tab(TabAction::Create { .. }) => "tab.create",
+        PortableAction::Tab(TabAction::Close) => "tab.close",
+        PortableAction::Tab(TabAction::Rename { name: Some(_) }) => "tab.rename",
+        PortableAction::Tab(TabAction::Rename { name: None }) => {
+            return Err(
+                "Herdr tab.rename requires `label`; the portable bare `tab:rename` has no specified Herdr prompt mapping"
+                    .to_owned(),
+            );
+        }
+        PortableAction::Tab(TabAction::Move(target)) if target_is_index(target) => "tab.move",
+        PortableAction::Tab(TabAction::Swap(target)) if target_is_index(target) => {
+            return validate_required_methods(schema, &["tab.list", "tab.move"]);
+        }
+        PortableAction::Pane(PaneAction::Create) => {
+            return Err(
+                "Herdr has no pane.create method; pane.split requires an explicit right or down direction"
+                    .to_owned(),
+            );
+        }
+        PortableAction::Pane(PaneAction::Split {
+            direction: Some(direction),
+            ..
+        }) if split_direction_is_supported(direction) => "pane.split",
+        PortableAction::Pane(PaneAction::Split {
+            direction: None, ..
+        }) => {
+            return Err("Herdr pane.split requires an explicit right or down direction".to_owned());
+        }
+        PortableAction::Pane(PaneAction::Split { .. }) => {
+            return Err("Herdr pane.split supports only right or down directions".to_owned());
+        }
+        PortableAction::Pane(PaneAction::Close) => "pane.close",
+        PortableAction::Pane(PaneAction::Focus(target))
+            if target_is_cardinal_direction(target) =>
+        {
+            "pane.focus_direction"
+        }
+        PortableAction::Pane(PaneAction::Swap(target))
+            if target_is_cardinal_direction(target) =>
+        {
+            "pane.swap"
+        }
+        PortableAction::Pane(PaneAction::Resize { .. }) => "pane.resize",
+        PortableAction::Pane(PaneAction::Zoom { .. }) => "pane.zoom",
+        PortableAction::Tab(TabAction::Focus(_)) => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that protocol 20 does not expose as a typed action".to_owned()),
+        PortableAction::Tab(TabAction::Move(_)) => return Err("Herdr tab.move supports only a concrete insert index".to_owned()),
+        PortableAction::Tab(TabAction::Swap(_)) => return Err("Herdr tab:swap supports only an index; the schema offers tab.list plus tab.move, not directional tab targeting".to_owned()),
+        PortableAction::Pane(PaneAction::Focus(_)) => return Err("Herdr pane.focus supports only cardinal directions".to_owned()),
+        PortableAction::Pane(PaneAction::Move(_)) => return Err("Herdr pane.move requires an explicit tab/new-tab destination, not a portable index or direction".to_owned()),
+        PortableAction::Pane(PaneAction::Swap(_)) => return Err("Herdr pane.swap supports only cardinal directions".to_owned()),
+        PortableAction::Pane(PaneAction::Fullscreen { .. }) => return Err("Herdr protocol 20 exposes no pane fullscreen method".to_owned()),
+        PortableAction::Pane(PaneAction::Floating { .. }) => return Err("Herdr protocol 20 exposes no pane floating method".to_owned()),
+        PortableAction::Pane(PaneAction::Frame { .. }) => return Err("Herdr protocol 20 exposes no pane frame method".to_owned()),
+        PortableAction::Session(_) => return Err("Herdr protocol 20 exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
+    };
+    validate_required_methods(schema, &[method])
+}
+
 fn command_creation_methods(action: &PortableAction) -> Option<&'static [&'static str]> {
     match action {
         PortableAction::Tab(TabAction::Create { command, .. }) if command.program.is_some() => {
@@ -639,17 +664,54 @@ fn command_creation_methods(action: &PortableAction) -> Option<&'static [&'stati
 }
 
 fn validate_required_methods(
-    runtime: &HerdrRuntime,
+    schema: &ApiSchema,
     methods: &[&str],
 ) -> Result<ExecutionCapabilities, String> {
     for method in methods {
-        if method_metadata(method).is_none() || runtime.schema().method(method).is_none() {
+        if method_metadata(method).is_none() || schema.method(method).is_none() {
             return Err(format!(
                 "active Herdr schema does not declare required method {method}"
             ));
         }
     }
     Ok(ExecutionCapabilities::ASYNCHRONOUS)
+}
+
+impl ActionValidator for HerdrConfigValidator {
+    fn validate_portable(
+        &self,
+        action: &PortableAction,
+        action_span: &muxe_core::SourceSpan,
+    ) -> Result<ActionValidation, ConfigDiagnostic> {
+        portable_compile_validation(&self.schema, action)
+            .map(|execution| ActionValidation { execution })
+            .map_err(|message| {
+                ConfigDiagnostic::error(DiagnosticCode::InvalidAction, message, action_span.clone())
+            })
+    }
+
+    fn validate_native_batch(
+        &self,
+        candidates: &[&NativeActionCandidate],
+    ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+        let mut validations = Vec::with_capacity(candidates.len());
+        let mut diagnostics = Vec::new();
+        for candidate in candidates {
+            match validate_candidate(&self.schema, candidate) {
+                Ok(_) => validations.push(ActionValidation {
+                    execution: ExecutionCapabilities::ASYNCHRONOUS,
+                }),
+                Err(error) => {
+                    diagnostics.push(native_diagnostic(candidate, &error.error.to_string()));
+                }
+            }
+        }
+        if diagnostics.is_empty() {
+            Ok(validations)
+        } else {
+            Err(diagnostics)
+        }
+    }
 }
 
 impl ActionValidator for HerdrAdapter {

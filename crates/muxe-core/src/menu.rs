@@ -162,6 +162,8 @@ pub struct CompiledMenu {
     pub id: MenuId,
     pub title: Option<String>,
     pub tags: Vec<String>,
+    /// Effective inactivity timeout after global and menu settings are applied.
+    pub inactivity_timeout: Option<Duration>,
     pub bindings: Vec<CompiledBinding>,
     pub layout: LayoutSettings,
 }

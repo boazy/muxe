@@ -16,7 +16,7 @@ mod wire;
 
 pub use broker::{Broker, BrokerError, PendingAttachment, RequestResult};
 pub use client::{BrokerClient, ClientError};
-pub use config::{ConfigError, ConfigSnapshot, ConfigStore};
+pub use config::{ConfigError, ConfigSnapshot, ConfigStore, load_effective_config};
 pub use gate::{
     AttachDisposition, GateError, LaunchGate, OsTokenSource, PendingLaunch, PreparedLaunch,
     RegisteredPane, ScopeOwner, TokenSource,

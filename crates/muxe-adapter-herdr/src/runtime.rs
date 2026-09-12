@@ -1,4 +1,9 @@
-use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use muxe_adapter_api::{AdapterError, AdapterErrorKind, HostIdentity, HostKind};
 use serde_json::{Map, Value};
@@ -52,38 +57,14 @@ impl HerdrRuntime {
     /// schema is incompatible, the cache cannot be updated, or the server cannot
     /// be probed.
     pub async fn connect(config: HerdrAdapterConfig) -> Result<Self, AdapterError> {
-        let raw_schema = runtime_schema(&config.herdr_binary).await?;
-        let (protocol, schema_version) = ApiSchema::metadata(&raw_schema).map_err(|error| {
-            incompatible(format!("installed Herdr API schema is invalid: {error}"))
-        })?;
-        if protocol != BUNDLED_PROTOCOL {
-            return Err(incompatible(format!(
-                "Herdr protocol {protocol} is incompatible with required protocol {BUNDLED_PROTOCOL}"
-            )));
-        }
-        let (normalized_request, schema_cache_hit) = HerdrCache::new(&config.cache_dir)
-            .normalized_schema(protocol, schema_version, &raw_schema)
-            .map_err(|error| {
-                AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    format!("could not update Herdr runtime-schema cache: {error}"),
-                )
-            })?;
-        let normalized_request = serde_json::from_slice(&normalized_request).map_err(|error| {
-            incompatible(format!(
-                "Herdr runtime-schema cache returned an invalid normalized request representation: {error}"
-            ))
-        })?;
-        let schema =
-            ApiSchema::parse_with_request(raw_schema, &normalized_request).map_err(|error| {
-                incompatible(format!("installed Herdr API schema is invalid: {error}"))
-            })?;
+        let (schema, schema_cache_hit) =
+            load_installed_schema(&config.herdr_binary, &config.cache_dir).await?;
 
         let client = Arc::new(HerdrSocketClient::new(config.socket_path.clone()));
         let (identity, endpoint) = probe_endpoint_identity(&client).await?;
         Ok(Self {
             client,
-            schema: Arc::new(schema),
+            schema,
             schema_cache_hit,
             identity,
             endpoint,
@@ -125,12 +106,44 @@ impl HerdrRuntime {
     }
 }
 
-async fn runtime_schema(binary: &PathBuf) -> Result<Value, AdapterError> {
+/// Loads and normalizes the exact installed Herdr request schema without
+/// opening the configured host socket.
+pub(crate) async fn load_installed_schema(
+    binary: &Path,
+    cache_dir: &Path,
+) -> Result<(Arc<ApiSchema>, bool), AdapterError> {
+    let raw_schema = runtime_schema(binary).await?;
+    let (protocol, schema_version) = ApiSchema::metadata(&raw_schema)
+        .map_err(|error| incompatible(format!("installed Herdr API schema is invalid: {error}")))?;
+    if protocol != BUNDLED_PROTOCOL {
+        return Err(incompatible(format!(
+            "Herdr protocol {protocol} is incompatible with required protocol {BUNDLED_PROTOCOL}"
+        )));
+    }
+    let (normalized_request, schema_cache_hit) = HerdrCache::new(cache_dir)
+        .normalized_schema(protocol, schema_version, &raw_schema)
+        .map_err(|error| {
+            AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                format!("could not update Herdr runtime-schema cache: {error}"),
+            )
+        })?;
+    let normalized_request = serde_json::from_slice(&normalized_request).map_err(|error| {
+        incompatible(format!(
+            "Herdr runtime-schema cache returned an invalid normalized request representation: {error}"
+        ))
+    })?;
+    let schema = ApiSchema::parse_with_request(raw_schema, &normalized_request)
+        .map_err(|error| incompatible(format!("installed Herdr API schema is invalid: {error}")))?;
+    Ok((Arc::new(schema), schema_cache_hit))
+}
+
+async fn runtime_schema(binary: &Path) -> Result<Value, AdapterError> {
     runtime_schema_with_timeouts(binary, SCHEMA_TIMEOUT, REAP_TIMEOUT).await
 }
 
 async fn runtime_schema_with_timeouts(
-    binary: &PathBuf,
+    binary: &Path,
     schema_timeout: Duration,
     reap_timeout: Duration,
 ) -> Result<Value, AdapterError> {

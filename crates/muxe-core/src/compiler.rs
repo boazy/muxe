@@ -935,6 +935,7 @@ impl MenuCompiler<'_> {
             id: MenuId::new(field.name.clone()),
             title,
             tags,
+            inactivity_timeout: settings.timeout,
             bindings: compiled,
             layout,
         })

@@ -16,7 +16,7 @@ mod schema;
 mod subscription;
 mod transport;
 mod validation;
-pub use adapter::HerdrAdapter;
+pub use adapter::{HerdrAdapter, HerdrConfigValidator};
 pub use cache::{
     ComparisonKey, HerdrCache, hash_configured_request_refs, hash_configured_requests,
 };

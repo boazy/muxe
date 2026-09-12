@@ -45,6 +45,8 @@ pub struct MenuCommand {
 pub enum MenuSubcommand {
     /// Open a root menu as a focused modal UI.
     Open(MenuOpen),
+    /// Print the effective contents of one or every configured menu as JSON.
+    Dump(MenuDump),
 }
 
 /// Arguments for `muxe menu open`.
@@ -60,6 +62,17 @@ pub struct MenuOpen {
     pub color_scheme: Option<String>,
     /// The configured root menu ID.
     pub root: String,
+}
+
+/// Arguments for `muxe menu dump`.
+#[derive(Debug, Args)]
+pub struct MenuDump {
+    /// Dump every named menu in an object keyed by menu ID.
+    #[arg(long)]
+    pub all: bool,
+    /// The configured menu ID. Ignored when `--all` is present.
+    #[arg(required_unless_present = "all")]
+    pub menu: Option<String>,
 }
 
 /// Commands that launch a generic command pane.
@@ -572,6 +585,44 @@ mod tests {
         assert_eq!(command.placement.width, Some(Dimension::Percent(80)));
         assert_eq!(command.placement.height, Some(Dimension::Cells(12)));
         assert_eq!(command.placement.position, Some(Position { x: 3, y: 4 }));
+    }
+
+    #[test]
+    fn menu_dump_requires_one_selector_and_all_ignores_a_supplied_menu() {
+        let cli =
+            Cli::try_parse_from(["muxe", "menu", "dump", "main"]).expect("one menu dump parses");
+        let Command::Menu(MenuCommand {
+            command: MenuSubcommand::Dump(command),
+        }) = cli.command
+        else {
+            panic!("expected menu dump");
+        };
+        assert!(!command.all);
+        assert_eq!(command.menu.as_deref(), Some("main"));
+
+        let cli = Cli::try_parse_from(["muxe", "menu", "dump", "--all"])
+            .expect("all-menu dump needs no menu");
+        let Command::Menu(MenuCommand {
+            command: MenuSubcommand::Dump(command),
+        }) = cli.command
+        else {
+            panic!("expected all-menu dump");
+        };
+        assert!(command.all);
+        assert_eq!(command.menu, None);
+
+        let cli = Cli::try_parse_from(["muxe", "menu", "dump", "--all", "ignored"])
+            .expect("all-menu dump accepts and ignores a menu argument");
+        let Command::Menu(MenuCommand {
+            command: MenuSubcommand::Dump(command),
+        }) = cli.command
+        else {
+            panic!("expected all-menu dump");
+        };
+        assert!(command.all);
+        assert_eq!(command.menu.as_deref(), Some("ignored"));
+
+        assert!(Cli::try_parse_from(["muxe", "menu", "dump"]).is_err());
     }
 
     #[test]

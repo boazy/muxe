@@ -205,6 +205,43 @@ impl ConfigStore {
     }
 }
 
+/// Loads and validates one host-specific effective configuration without
+/// constructing a host transport.
+///
+/// This is the inspection boundary for commands that need the same built-in,
+/// base, host-override, injection, asset, and action validation pipeline as a
+/// broker without claiming the host adapter's live channels.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when input discovery, file loading, parsing, or
+/// compilation against `action_validator` fails.
+#[expect(
+    clippy::result_large_err,
+    reason = "ConfigError is the public cold-path error API; boxing it would add allocation and churn callers"
+)]
+pub fn load_effective_config(
+    path: impl Into<PathBuf>,
+    host: AdapterHostKind,
+    key_capabilities: KeyCapabilities,
+    action_validator: &dyn ActionValidator,
+) -> Result<CompiledConfig, ConfigError> {
+    let inputs = ConfigInputs::for_host(path, host)?;
+    let loaded = read_config_inputs(&inputs)?;
+    compile_loaded_inputs(
+        loaded,
+        CompiledGeneration(1),
+        key_capabilities,
+        action_validator,
+    )
+}
+
+struct LoadedConfigInputs {
+    base: ConfigDocument,
+    host_override: Option<ConfigDocument>,
+    theme_assets: ThemeAssets,
+}
+
 impl ConfigInputs {
     fn watch_spec(&self, settings: ReloadSettings) -> ConfigWatchSpec {
         let mut inputs = vec![
@@ -228,6 +265,22 @@ async fn compile_inputs(
     generation: CompiledGeneration,
     adapter: &dyn HostAdapter,
 ) -> Result<CompiledConfig, ConfigError> {
+    let loaded = read_config_inputs(inputs)?;
+    let capabilities = adapter.capabilities().await.map_err(ConfigError::Adapter)?;
+    let validator = AdapterValidator(adapter);
+    compile_loaded_inputs(
+        loaded,
+        generation,
+        key_capabilities(&capabilities),
+        &validator,
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "ConfigError is the shared cold-path error type; boxing private stages would add allocation without reducing the public API"
+)]
+fn read_config_inputs(inputs: &ConfigInputs) -> Result<LoadedConfigInputs, ConfigError> {
     let path = inputs.base();
     let source = SourceId::new(path.display().to_string());
     let yaml = fs::read_to_string(path).map_err(|source_error| ConfigError::Read {
@@ -240,18 +293,33 @@ async fn compile_inputs(
         None => None,
     };
     let theme_assets = load_theme_assets(path)?;
-    let capabilities = adapter.capabilities().await.map_err(ConfigError::Adapter)?;
-    let validator = AdapterValidator(adapter);
+    Ok(LoadedConfigInputs {
+        base,
+        host_override,
+        theme_assets,
+    })
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "ConfigError is the shared cold-path error type; boxing private stages would add allocation without reducing the public API"
+)]
+fn compile_loaded_inputs(
+    loaded: LoadedConfigInputs,
+    generation: CompiledGeneration,
+    key_capabilities: KeyCapabilities,
+    action_validator: &dyn ActionValidator,
+) -> Result<CompiledConfig, ConfigError> {
     Compiler
         .compile(
             CompileInput {
                 generation,
-                base,
-                host_override,
-                key_capabilities: key_capabilities(&capabilities),
-                theme_assets,
+                base: loaded.base,
+                host_override: loaded.host_override,
+                key_capabilities,
+                theme_assets: loaded.theme_assets,
             },
-            Some(&validator),
+            Some(action_validator),
         )
         .map_err(ConfigError::Diagnostics)
 }

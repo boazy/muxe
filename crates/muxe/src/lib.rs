@@ -21,6 +21,7 @@ pub mod compatibility;
 pub mod integration;
 pub mod lifecycle;
 pub mod logging;
+pub mod menu_dump;
 pub mod paths;
 pub mod purge;
 
