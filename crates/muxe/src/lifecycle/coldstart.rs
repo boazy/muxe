@@ -523,6 +523,32 @@ mod tests {
         .expect("owner-only test dir");
         temp
     }
+    fn bind_stale_socket(path: &Path) {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("current test executable resolves"),
+        )
+        .args([
+            "--exact",
+            "lifecycle::coldstart::tests::stale_socket_fixture_child",
+            "--nocapture",
+        ])
+        .env("MUXE_STALE_SOCKET_TEST_PATH", path)
+        .status()
+        .expect("stale socket fixture child starts");
+        assert!(status.success(), "stale socket fixture child succeeds");
+
+        let error = UnixStream::connect(path).expect_err("stale socket refuses");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn stale_socket_fixture_child() {
+        let Some(path) = std::env::var_os("MUXE_STALE_SOCKET_TEST_PATH") else {
+            return;
+        };
+        let listener = UnixListener::bind(path).expect("stale socket binds");
+        drop(listener);
+    }
 
     fn test_status(discovery: &str, record: CompatibilityRecord) -> ActivationStatus {
         ActivationStatus {
@@ -756,10 +782,7 @@ mod tests {
         endpoint
             .ensure_owner_directory()
             .expect("runtime directory exists");
-        let stale_listener = UnixListener::bind(endpoint.socket()).expect("stale socket binds");
-        drop(stale_listener);
-        let error = UnixStream::connect(endpoint.socket()).expect_err("stale socket refuses");
-        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        bind_stale_socket(endpoint.socket());
         let mut exited = std::process::Command::new("/usr/bin/true")
             .spawn()
             .expect("stale broker process starts");
@@ -836,8 +859,7 @@ mod tests {
         endpoint
             .ensure_owner_directory()
             .expect("runtime directory exists");
-        let stale_listener = UnixListener::bind(endpoint.socket()).expect("stale socket binds");
-        drop(stale_listener);
+        bind_stale_socket(endpoint.socket());
 
         let mut entry = BrokerEntry::now(
             "zellij",
@@ -958,10 +980,7 @@ mod tests {
         endpoint
             .ensure_owner_directory()
             .expect("runtime directory exists");
-        let stale_listener = UnixListener::bind(endpoint.socket()).expect("stale socket binds");
-        drop(stale_listener);
-        let error = UnixStream::connect(endpoint.socket()).expect_err("stale socket refuses");
-        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        bind_stale_socket(endpoint.socket());
 
         let startup_lock = endpoint
             .acquire_startup_lock()
