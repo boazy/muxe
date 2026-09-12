@@ -121,6 +121,9 @@ _muxe() {
             muxe__subcmd__help__subcmd__integration__subcmd__uninstall,zellij)
                 cmd="muxe__subcmd__help__subcmd__integration__subcmd__uninstall__subcmd__zellij"
                 ;;
+            muxe__subcmd__help__subcmd__menu,dump)
+                cmd="muxe__subcmd__help__subcmd__menu__subcmd__dump"
+                ;;
             muxe__subcmd__help__subcmd__menu,open)
                 cmd="muxe__subcmd__help__subcmd__menu__subcmd__open"
                 ;;
@@ -178,11 +181,17 @@ _muxe() {
             muxe__subcmd__integration__subcmd__uninstall__subcmd__help,zellij)
                 cmd="muxe__subcmd__integration__subcmd__uninstall__subcmd__help__subcmd__zellij"
                 ;;
+            muxe__subcmd__menu,dump)
+                cmd="muxe__subcmd__menu__subcmd__dump"
+                ;;
             muxe__subcmd__menu,help)
                 cmd="muxe__subcmd__menu__subcmd__help"
                 ;;
             muxe__subcmd__menu,open)
                 cmd="muxe__subcmd__menu__subcmd__open"
+                ;;
+            muxe__subcmd__menu__subcmd__help,dump)
+                cmd="muxe__subcmd__menu__subcmd__help__subcmd__dump"
                 ;;
             muxe__subcmd__menu__subcmd__help,help)
                 cmd="muxe__subcmd__menu__subcmd__help__subcmd__help"
@@ -649,8 +658,22 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__help__subcmd__menu)
-            opts="open"
+            opts="open dump"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__help__subcmd__menu__subcmd__dump)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1007,7 +1030,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__menu)
-            opts="-h -V --help --version open help"
+            opts="-h -V --help --version open dump help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1020,9 +1043,37 @@ _muxe() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        muxe__subcmd__menu__subcmd__help)
-            opts="open help"
+        muxe__subcmd__menu__subcmd__dump)
+            opts="-h -V --all --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__menu__subcmd__help)
+            opts="open dump help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__menu__subcmd__help__subcmd__dump)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

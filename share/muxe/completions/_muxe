@@ -70,6 +70,16 @@ _arguments "${_arguments_options[@]}" : \
 ':root -- The configured root menu ID:_default' \
 && ret=0
 ;;
+(dump)
+_arguments "${_arguments_options[@]}" : \
+'--all[Dump every named menu in an object keyed by menu ID]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+'::menu -- The configured menu ID. Ignored when `--all` is present:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_muxe__subcmd__menu__subcmd__help_commands" \
@@ -83,6 +93,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:muxe-menu-help-command-$line[1]:"
         case $line[1] in
             (open)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(dump)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -561,6 +575,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(dump)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -891,8 +909,14 @@ _muxe__subcmd__help__subcmd__integration__subcmd__uninstall__subcmd__zellij_comm
 _muxe__subcmd__help__subcmd__menu_commands() {
     local commands; commands=(
 'open:Open a root menu as a focused modal UI' \
+'dump:Print the effective contents of one or every configured menu as JSON' \
     )
     _describe -t commands 'muxe help menu commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__help__subcmd__menu__subcmd__dump_commands] )) ||
+_muxe__subcmd__help__subcmd__menu__subcmd__dump_commands() {
+    local commands; commands=()
+    _describe -t commands 'muxe help menu dump commands' commands "$@"
 }
 (( $+functions[_muxe__subcmd__help__subcmd__menu__subcmd__open_commands] )) ||
 _muxe__subcmd__help__subcmd__menu__subcmd__open_commands() {
@@ -1046,17 +1070,29 @@ _muxe__subcmd__integration__subcmd__uninstall__subcmd__zellij_commands() {
 _muxe__subcmd__menu_commands() {
     local commands; commands=(
 'open:Open a root menu as a focused modal UI' \
+'dump:Print the effective contents of one or every configured menu as JSON' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'muxe menu commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__menu__subcmd__dump_commands] )) ||
+_muxe__subcmd__menu__subcmd__dump_commands() {
+    local commands; commands=()
+    _describe -t commands 'muxe menu dump commands' commands "$@"
 }
 (( $+functions[_muxe__subcmd__menu__subcmd__help_commands] )) ||
 _muxe__subcmd__menu__subcmd__help_commands() {
     local commands; commands=(
 'open:Open a root menu as a focused modal UI' \
+'dump:Print the effective contents of one or every configured menu as JSON' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'muxe menu help commands' commands "$@"
+}
+(( $+functions[_muxe__subcmd__menu__subcmd__help__subcmd__dump_commands] )) ||
+_muxe__subcmd__menu__subcmd__help__subcmd__dump_commands() {
+    local commands; commands=()
+    _describe -t commands 'muxe menu help dump commands' commands "$@"
 }
 (( $+functions[_muxe__subcmd__menu__subcmd__help__subcmd__help_commands] )) ||
 _muxe__subcmd__menu__subcmd__help__subcmd__help_commands() {
