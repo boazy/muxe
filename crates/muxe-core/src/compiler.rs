@@ -93,8 +93,10 @@ pub(crate) fn compile_effective(
     let builtin =
         ConfigDocument::parse(SourceId::new("<muxe built-in>"), Arc::<str>::from(BUILTINS))
             .map_err(|diagnostic| vec![diagnostic])?;
+    let base_root_span = base.root.span.clone();
     let mut root = builtin.root;
     merge_values(&mut root, base.root);
+    root.span = base_root_span;
     if let Some(override_document) = host_override {
         if let Some(version) = override_document.root.field("version") {
             return Err(vec![ConfigDiagnostic::error(
@@ -1010,6 +1012,7 @@ impl MenuCompiler<'_> {
             key,
             label,
             hidden,
+            action_span: action_value.value.span.clone(),
             action,
             settings: BindingSettings {
                 after_action: settings.after_action,
@@ -1165,7 +1168,7 @@ impl MenuCompiler<'_> {
             PortableActionKind::CommandExecute => {
                 ensure_action_fields(fields, &["program", "args", "cwd", "env"])?;
                 let program = action_string_scalar(
-                    &required_action_field(fields, "program")?.value,
+                    &required_action_field(fields, "program", &span)?.value,
                     "command program",
                     ContextAllowance::Textual,
                 )?;
@@ -1244,13 +1247,13 @@ impl MenuCompiler<'_> {
                 })
             }
             PortableActionKind::TabFocus => {
-                PortableAction::Tab(TabAction::Focus(index_or_direction(fields)?))
+                PortableAction::Tab(TabAction::Focus(index_or_direction(fields, &span)?))
             }
             PortableActionKind::TabMove => {
-                PortableAction::Tab(TabAction::Move(index_or_direction(fields)?))
+                PortableAction::Tab(TabAction::Move(index_or_direction(fields, &span)?))
             }
             PortableActionKind::TabSwap => {
-                PortableAction::Tab(TabAction::Swap(index_or_direction(fields)?))
+                PortableAction::Tab(TabAction::Swap(index_or_direction(fields, &span)?))
             }
             PortableActionKind::PaneCreate => {
                 ensure_action_fields(fields, &[])?;
@@ -1276,18 +1279,18 @@ impl MenuCompiler<'_> {
                 PortableAction::Pane(PaneAction::Close)
             }
             PortableActionKind::PaneFocus => {
-                PortableAction::Pane(PaneAction::Focus(index_or_direction(fields)?))
+                PortableAction::Pane(PaneAction::Focus(index_or_direction(fields, &span)?))
             }
             PortableActionKind::PaneMove => {
-                PortableAction::Pane(PaneAction::Move(index_or_direction(fields)?))
+                PortableAction::Pane(PaneAction::Move(index_or_direction(fields, &span)?))
             }
             PortableActionKind::PaneSwap => {
-                PortableAction::Pane(PaneAction::Swap(index_or_direction(fields)?))
+                PortableAction::Pane(PaneAction::Swap(index_or_direction(fields, &span)?))
             }
             PortableActionKind::PaneResize => {
                 ensure_action_fields(fields, &["direction", "amount"])?;
                 let direction = action_direction_scalar(
-                    &required_action_field(fields, "direction")?.value,
+                    &required_action_field(fields, "direction", &span)?.value,
                     "pane direction",
                 )?;
                 let amount = field_named(fields, "amount")
@@ -1317,13 +1320,13 @@ impl MenuCompiler<'_> {
                 PortableAction::Session(SessionAction::Create)
             }
             PortableActionKind::SessionAttach => PortableAction::Session(SessionAction::Attach {
-                name: required_string_action_field(fields, "name", "session name")?,
+                name: required_string_action_field(fields, "name", "session name", &span)?,
             }),
             PortableActionKind::SessionSwitch => PortableAction::Session(SessionAction::Switch {
-                name: required_string_action_field(fields, "name", "session name")?,
+                name: required_string_action_field(fields, "name", "session name", &span)?,
             }),
             PortableActionKind::SessionRename => PortableAction::Session(SessionAction::Rename {
-                name: required_string_action_field(fields, "name", "session name")?,
+                name: required_string_action_field(fields, "name", "session name", &span)?,
             }),
             PortableActionKind::SessionDetach => {
                 ensure_action_fields(fields, &[])?;
@@ -1996,7 +1999,7 @@ fn validate_menu_cycles(menus: &[CompiledMenu]) -> Result<(), Vec<ConfigDiagnost
                 .filter_map(|binding| match &binding.action {
                     ActionSpec::Portable(PortableAction::Menu(MenuAction::Open(
                         MenuTarget::Named(target) | MenuTarget::Inline(target),
-                    ))) => Some(target.clone()),
+                    ))) => Some((target.clone(), binding.action_span.clone())),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -2006,11 +2009,11 @@ fn validate_menu_cycles(menus: &[CompiledMenu]) -> Result<(), Vec<ConfigDiagnost
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
     for node in graph.keys() {
-        if detect_cycle(node, &graph, &mut visiting, &mut visited) {
+        if let Some(span) = detect_cycle(node, &graph, &mut visiting, &mut visited) {
             return Err(vec![ConfigDiagnostic::error(
                 DiagnosticCode::MenuCycle,
                 format!("menu reference cycle includes `{node}`"),
-                SourceSpan::new(SourceId::new("<compiled configuration>"), 0, 0),
+                span,
             )]);
         }
     }
@@ -2019,20 +2022,22 @@ fn validate_menu_cycles(menus: &[CompiledMenu]) -> Result<(), Vec<ConfigDiagnost
 
 fn detect_cycle(
     node: &str,
-    graph: &BTreeMap<String, Vec<String>>,
+    graph: &BTreeMap<String, Vec<(String, SourceSpan)>>,
     visiting: &mut HashSet<String>,
     visited: &mut HashSet<String>,
-) -> bool {
+) -> Option<SourceSpan> {
     if visited.contains(node) {
-        return false;
+        return None;
     }
-    if !visiting.insert(node.to_owned()) {
-        return true;
-    }
-    let cycle = graph.get(node).is_some_and(|edges| {
-        edges
-            .iter()
-            .any(|edge| detect_cycle(edge, graph, visiting, visited))
+    visiting.insert(node.to_owned());
+    let cycle = graph.get(node).and_then(|edges| {
+        edges.iter().find_map(|(edge, span)| {
+            if visiting.contains(edge) {
+                Some(span.clone())
+            } else {
+                detect_cycle(edge, graph, visiting, visited)
+            }
+        })
     });
     visiting.remove(node);
     visited.insert(node.to_owned());
@@ -2203,7 +2208,10 @@ fn action_index_scalar(value: &ConfigValue) -> Result<ActionScalar, Vec<ConfigDi
         )]),
     }
 }
-fn index_or_direction(fields: &[ConfigField]) -> Result<IndexOrDirection, Vec<ConfigDiagnostic>> {
+fn index_or_direction(
+    fields: &[ConfigField],
+    fallback_span: &SourceSpan,
+) -> Result<IndexOrDirection, Vec<ConfigDiagnostic>> {
     ensure_action_fields(fields, &["index", "direction"])?;
     match (
         field_named(fields, "index"),
@@ -2217,10 +2225,9 @@ fn index_or_direction(fields: &[ConfigField]) -> Result<IndexOrDirection, Vec<Co
         _ => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
             "action requires exactly one of `index` or `direction`",
-            fields.first().map_or_else(
-                || SourceSpan::new(SourceId::new("<compact action>"), 0, 0),
-                |field| field.value.span.clone(),
-            ),
+            fields
+                .first()
+                .map_or_else(|| fallback_span.clone(), |field| field.value.span.clone()),
         )]),
     }
 }
@@ -2457,15 +2464,15 @@ fn required_field_mut<'a>(
 fn required_action_field<'a>(
     fields: &'a [ConfigField],
     name: &str,
+    fallback_span: &SourceSpan,
 ) -> Result<&'a ConfigField, Vec<ConfigDiagnostic>> {
     field_named(fields, name).ok_or_else(|| {
         vec![ConfigDiagnostic::error(
             DiagnosticCode::MissingField,
             format!("action requires `{name}`"),
-            fields.first().map_or_else(
-                || SourceSpan::new(SourceId::new("<compact action>"), 0, 0),
-                |field| field.value.span.clone(),
-            ),
+            fields
+                .first()
+                .map_or_else(|| fallback_span.clone(), |field| field.value.span.clone()),
         )]
     })
 }
@@ -2474,10 +2481,11 @@ fn required_string_action_field(
     fields: &[ConfigField],
     name: &str,
     parameter: &str,
+    fallback_span: &SourceSpan,
 ) -> Result<ActionScalar, Vec<ConfigDiagnostic>> {
     ensure_action_fields(fields, &[name])?;
     action_string_scalar(
-        &required_action_field(fields, name)?.value,
+        &required_action_field(fields, name, fallback_span)?.value,
         parameter,
         ContextAllowance::Textual,
     )

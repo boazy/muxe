@@ -1844,6 +1844,7 @@ dependencies = [
 name = "muxe"
 version = "0.1.3"
 dependencies = [
+ "ariadne",
  "async-trait",
  "clap",
  "color-eyre",

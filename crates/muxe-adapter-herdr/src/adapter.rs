@@ -26,9 +26,9 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::{
-    ApiSchema, ComparisonKey, DeliveryState, EventSubscription, HerdrAdapterConfig, HerdrCache,
-    HerdrResponse, HerdrRuntime, HerdrSocketClient, SocketError, SubscriptionConfig,
-    SubscriptionEvent, fields_to_json,
+    ApiSchema, CandidateValidationError, ComparisonKey, DeliveryState, EventSubscription,
+    HerdrAdapterConfig, HerdrCache, HerdrResponse, HerdrRuntime, HerdrSocketClient, SocketError,
+    SubscriptionConfig, SubscriptionEvent, fields_to_json,
     generated::{BUNDLED_REQUEST_SCHEMA_SHA256, method_metadata},
     validate_candidate,
 };
@@ -702,7 +702,7 @@ impl ActionValidator for HerdrConfigValidator {
                     execution: ExecutionCapabilities::ASYNCHRONOUS,
                 }),
                 Err(error) => {
-                    diagnostics.push(native_diagnostic(candidate, &error.error.to_string()));
+                    diagnostics.push(native_candidate_diagnostic(candidate, &error));
                 }
             }
         }
@@ -2054,6 +2054,25 @@ fn scalar_split_direction(value: &ActionScalar) -> Result<&str, AdapterError> {
             "Herdr pane split direction must be right or down",
         )),
     }
+}
+
+fn native_candidate_diagnostic(
+    candidate: &NativeActionCandidate,
+    error: &CandidateValidationError,
+) -> ConfigDiagnostic {
+    let span = error
+        .field
+        .as_deref()
+        .and_then(|name| candidate.fields.iter().find(|field| field.name == name))
+        .map_or_else(
+            || candidate.type_span.clone(),
+            |field| field.value.span.clone(),
+        );
+    ConfigDiagnostic::error(
+        DiagnosticCode::NativeActionRejected,
+        error.error.to_string(),
+        span,
+    )
 }
 
 fn native_diagnostic(candidate: &NativeActionCandidate, message: &str) -> ConfigDiagnostic {

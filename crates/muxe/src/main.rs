@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod config_check;
 mod init;
 
 use std::{
@@ -27,8 +28,9 @@ use muxe_protocol::{
 
 use muxe::cli::{
     BrokerServeHerdrCommand, BrokerServeZellijCommand, Cli, Command, CompatibilityCommand,
-    HostScope, HostSelector, IntegrationSubcommand, MenuSubcommand, PaneOpen, PaneSubcommand,
-    PaneType, ParentPane, PurgeCommand, SplitDirection, UiMenuCommand, UiSubcommand,
+    ConfigSubcommand, HostScope, HostSelector, IntegrationSubcommand, MenuSubcommand, PaneOpen,
+    PaneSubcommand, PaneType, ParentPane, PurgeCommand, SplitDirection, UiMenuCommand,
+    UiSubcommand,
 };
 
 #[tokio::main]
@@ -47,6 +49,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             println!("created {}", result.color_schemes_directory.display());
             Ok(())
         }
+        Command::Config(command) => match command.command {
+            ConfigSubcommand::Check => Box::pin(check_configuration()).await,
+        },
         Command::Compatibility(command) => compatibility(&command),
         Command::Purge(command) => purge(&command),
         Command::Menu(menu) => match menu.command {
@@ -74,6 +79,25 @@ async fn dispatch(cli: Cli) -> Result<()> {
             muxe::cli::BrokerSubcommand::ServeHerdr(command) => serve_herdr_broker(command).await,
             muxe::cli::BrokerSubcommand::ServeZellij(command) => serve_zellij_broker(command).await,
         },
+    }
+}
+
+async fn check_configuration() -> Result<()> {
+    let paths = muxe::paths::resolve()?;
+    let herdr_binary = herdr_binary_from_path()?;
+    let mut output = io::stderr().lock();
+    if config_check::check(
+        &paths.config_file(),
+        &herdr_binary,
+        &paths.cache_dir,
+        &mut output,
+    )
+    .await?
+    {
+        println!("configuration is valid for zellij and herdr");
+        Ok(())
+    } else {
+        bail!("configuration check failed")
     }
 }
 

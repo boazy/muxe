@@ -15,6 +15,8 @@ pub struct Cli {
 pub enum Command {
     /// Create the starter configuration without installing host integration.
     Init,
+    /// Validate configuration for every supported host.
+    Config(ConfigCommand),
     /// Open a configured root menu through a host launcher.
     Menu(MenuCommand),
     /// Open a generic command pane.
@@ -31,6 +33,20 @@ pub enum Command {
     Purge(PurgeCommand),
     /// Run the native terminal UI.
     Ui(UiCommand),
+}
+
+/// Commands that validate Muxe configuration.
+#[derive(Debug, Args)]
+pub struct ConfigCommand {
+    #[command(subcommand)]
+    pub command: ConfigSubcommand,
+}
+
+/// Configuration validation subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ConfigSubcommand {
+    /// Check the base configuration with each host override.
+    Check,
 }
 
 /// Commands that start a configured menu.
@@ -507,6 +523,17 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::*;
+
+    #[test]
+    fn config_check_command_parses() {
+        let cli = Cli::try_parse_from(["muxe", "config", "check"]).expect("config check parses");
+        assert!(matches!(
+            cli.command,
+            Command::Config(ConfigCommand {
+                command: ConfigSubcommand::Check,
+            })
+        ));
+    }
 
     #[test]
     fn pane_command_retains_an_exact_argv_after_double_dash() {

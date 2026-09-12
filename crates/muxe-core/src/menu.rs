@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::action::{ActionSpec, MenuAction, MenuTarget, PortableAction};
 use crate::condition::{ConditionEvaluationError, ConditionProgram, PagesContext};
 use crate::config::{KeyboardProfile, ThemeSelection};
+use crate::diagnostic::SourceSpan;
 use crate::execution::{AfterAction, ExecutionPolicy, MenuControl};
 use crate::key::CanonicalKey;
 use crate::theme::CompiledTheme;
@@ -78,6 +79,7 @@ pub struct CompiledBinding {
     pub label: Option<String>,
     pub hidden: bool,
     pub action: ActionSpec,
+    pub action_span: SourceSpan,
     pub settings: BindingSettings,
     pub conditions: BindingConditions,
 }
