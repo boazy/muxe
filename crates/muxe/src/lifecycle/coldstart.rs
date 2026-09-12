@@ -585,6 +585,7 @@ mod tests {
         spawns: AtomicUsize,
         stops: AtomicUsize,
         auto_register: bool,
+        host: HostKind,
         cache_dir: PathBuf,
         socket: PathBuf,
         session: String,
@@ -596,9 +597,13 @@ mod tests {
     impl BrokerSpawner for FakeSpawner {
         fn spawn_target(&self, request: &SpawnRequest) -> Result<TargetHandle, ActivateError> {
             self.spawns.fetch_add(1, Ordering::SeqCst);
+            let expected_serve = match self.host {
+                HostKind::Zellij => "serve-zellij",
+                HostKind::Herdr => "serve-herdr",
+            };
             assert!(
-                request.args.iter().any(|arg| arg == "serve-zellij"),
-                "coldstart spawns the ordinary broker child"
+                request.args.iter().any(|arg| arg == expected_serve),
+                "coldstart spawns the expected ordinary broker child"
             );
             assert!(
                 !request.args.iter().any(|arg| arg == "--handoff"),
@@ -608,21 +613,23 @@ mod tests {
                 let _ = std::fs::remove_file(&self.socket);
                 let listener = UnixListener::bind(&self.socket).expect("fake broker socket binds");
                 *self.listener.lock().expect("fake listener is writable") = Some(listener);
-                let mut entry =
-                    BrokerEntry::now("zellij", &self.session, self.socket.clone(), 4242);
+                let host = match self.host {
+                    HostKind::Zellij => "zellij",
+                    HostKind::Herdr => "herdr",
+                };
+                let mut entry = BrokerEntry::now(host, &self.session, self.socket.clone(), 4242);
                 entry.live_server = Some(self.session.clone());
                 Registry::open(&self.cache_dir)
                     .expect("fake registry opens")
                     .register(entry)
                     .expect("fake child registers");
+                let mut status = test_status(&self.session, self.record.clone());
+                status.live_server.host = self.host;
                 self.control
                     .statuses
                     .lock()
                     .expect("fake control is writable")
-                    .insert(
-                        self.socket.clone(),
-                        test_status(&self.session, self.record.clone()),
-                    );
+                    .insert(self.socket.clone(), status);
             }
             let child = std::process::Command::new("/bin/sleep")
                 .arg("30")
@@ -687,6 +694,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: true,
+            host: HostKind::Zellij,
             listener: Mutex::new(None),
             cache_dir: cache.clone(),
             socket: endpoint_in(temp.path()).socket().to_path_buf(),
@@ -736,13 +744,15 @@ mod tests {
             .expect("test endpoint derives")
     }
 
-    /// A registry entry whose socket refuses connections is stale: one
-    /// serialized coldstart replaces it and returns the verified broker.
+    /// A dead Herdr broker registration whose socket refuses connections is
+    /// replaced by one serialized `serve-herdr` coldstart.
     #[tokio::test]
-    async fn refused_registered_socket_is_replaced_by_one_coldstart() {
+    async fn refused_dead_herdr_socket_is_replaced_by_one_coldstart() {
         let temp = owner_temp();
         let config = temp.path().join("config.yml");
-        let endpoint = endpoint_in(temp.path());
+        let discovery = "herdr-dead-stale";
+        let endpoint = RuntimeEndpoint::in_runtime_dir(temp.path(), HostKind::Herdr, discovery)
+            .expect("Herdr endpoint derives");
         endpoint
             .ensure_owner_directory()
             .expect("runtime directory exists");
@@ -762,8 +772,8 @@ mod tests {
         );
 
         let mut stale = BrokerEntry::now(
-            "zellij",
-            "session-test",
+            "herdr",
+            discovery,
             endpoint.socket().to_path_buf(),
             stale_pid,
         );
@@ -780,23 +790,31 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: true,
+            host: HostKind::Herdr,
             listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
-            session: "session-test".to_owned(),
+            session: discovery.to_owned(),
             control: Arc::clone(&control),
             record: test_record("9.9.9"),
         };
-        let reloader = OkReloader;
-        let inputs = zellij_inputs(
-            temp.path(),
-            &config,
+        let inputs = ColdstartInputs {
+            cache_dir: temp.path(),
+            config_file: &config,
+            executable: Path::new("/bin/false"),
             endpoint,
-            &spawner,
-            &control,
-            Some(&reloader),
-            test_record("9.9.9"),
-        );
+            host: ColdstartHost::Herdr {
+                discovery_key: discovery.to_owned(),
+                herdr_binary: PathBuf::from("/bin/false"),
+                herdr_socket: temp.path().join("herdr.sock"),
+            },
+            current_record: test_record("9.9.9"),
+            spawner: &spawner,
+            control: control.as_ref(),
+            reloader: None::<&OkReloader>,
+            readiness_deadline: Duration::from_secs(10),
+            poll_interval: Duration::from_millis(10),
+        };
 
         let ColdstartOutcome::Ready(live) =
             ensure_broker(&inputs).await.expect("stale socket recovers")
@@ -839,6 +857,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: false,
+            host: HostKind::Zellij,
             listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
@@ -895,6 +914,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: false,
+            host: HostKind::Zellij,
             listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
@@ -978,6 +998,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: false,
+            host: HostKind::Herdr,
             listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
@@ -1053,6 +1074,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: false,
+            host: HostKind::Herdr,
             listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
@@ -1132,6 +1154,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: true,
+            host: HostKind::Zellij,
             listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
@@ -1193,6 +1216,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: false,
+            host: HostKind::Zellij,
             listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
@@ -1236,6 +1260,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             auto_register: false,
+            host: HostKind::Zellij,
             listener: Mutex::new(None),
             cache_dir: temp.path().to_path_buf(),
             socket: endpoint.socket().to_path_buf(),
