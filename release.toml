@@ -5,4 +5,5 @@ allow-branch = ["*"]
 consolidate-commits = true
 tag = false
 push = false
+publish = false
 tag-name = "v{{version}}"

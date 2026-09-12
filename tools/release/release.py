@@ -382,10 +382,6 @@ def pre_release(level: str, expected_version: str) -> tuple[str, str, str]:
     return repository, bump_commit, tag
 
 
-def cargo_release_publish() -> None:
-    command(["cargo", "release", "publish", "--workspace", "--execute", "--no-confirm"])
-
-
 def wait_for_release_workflow(repository: str, commit: str) -> str:
     deadline = time.monotonic() + WORKFLOW_DISCOVERY_TIMEOUT_SECONDS
     with CONSOLE.status(
@@ -466,7 +462,6 @@ def release(level: str, *, dry_run: bool) -> None:
         return
 
     repository, bump_commit, tag = pre_release(level, next_version)
-    cargo_release_publish()
     post_release(repository, bump_commit, tag)
 
 
