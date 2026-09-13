@@ -11,23 +11,23 @@ tab:create	`NewTab` accepts `name`, `focus`, and exact `program`/`args`/`cwd`; `
 tab:close	`Action::CloseTab` or `close_focused_tab`; current focused tab only	`tab.close` on the captured origin tab
 tab:rename	Name plus captured origin tab index maps to `RenameTab`; bare rename is rejected because Zellij has no prompt variant	`tab.rename` on the captured origin tab only when `name` is supplied; bare rename is incompatible
 tab:focus	Partial: `GoToTab`, `GoToNextTab`, and `GoToPreviousTab`; only index and next/previous	Pending runtime candidate: resolve the requested target through captured-workspace `tab.list` before host focus; source mapping is not implemented
-tab:move	Direction maps to `MoveTab`; index is rejected because Zellij exposes no index destination primitive	Pending runtime candidate: resolve direction through captured-workspace `tab.list` before `tab.move`; source mapping is not implemented
-tab:swap	Pending runtime composition; no source-proven one-to-one Action or shim operation	Nonnegative index only: list captured workspace, make two direct moves, and verify ordering; partial failure has no replay and a lost move response is OutcomeUnknown
-pane:create	`Action::NewPane` or `new_pane`; placement is host-determined in the focused tab	Incompatible
+tab:move	Direction maps to `MoveTab` (accepts left, right, up, down); index is rejected because Zellij exposes no index destination primitive	`tab.move` accepts a concrete insert index on the captured origin tab; directional moves are rejected
+tab:swap	Rejected: no atomic pinned primitive swaps two tabs	Nonnegative index only: list captured workspace, make two direct moves, and verify ordering; partial failure has no replay and a lost move response is OutcomeUnknown
+pane:create	`Action::NewPane` or `new_pane`; placement is host-determined in the focused tab	Incompatible; Herdr protocol 20 provides no automatic placement primitive
 pane:split	`NewTiledPane` accepts direction and exact `program`/`args`/`cwd`. Focused creation waits for UI dismissal before bridge dispatch; `focus: false` is rejected because Zellij cannot target the immutable origin while the menu is open.	Only explicit `right` or `down` directions are supported. Without `program`, `pane.split` also accepts `focus` and `cwd`. Command splits validate the origin with `session.snapshot`, then use `layout.apply` and `pane.move`. Focused creation waits for the UI pane's retained `pane_closed` event.
 pane:close	`CloseFocusByPaneId` on the captured origin pane	`pane.close` on the captured origin pane
-pane:focus	Direction uses bridge-tracked geometry and index uses bridge manifest order; neither falls back to menu-relative focus	Pending runtime candidate: resolve an index/direction through host pane state before focus; source mapping is not implemented
-pane:move	Direction maps to `MovePaneByPaneId` on the captured origin pane; index is rejected because no primitive exists	Pending runtime candidate: resolve destination through host pane state; source mapping is not implemented
-pane:swap	Pending runtime composition; no source-proven one-to-one pinned operation	`pane.swap(origin_pane_id, direction)` only for left/right/up/down
+pane:focus	Direction uses bridge-tracked geometry and index uses bridge manifest order; neither falls back to menu-relative focus	`pane.focus_direction` on the captured origin pane for cardinal directions (left, right, up, down); indexed focus is rejected
+pane:move	Direction maps to `MovePaneByPaneId` on the captured origin pane; index is rejected because no primitive exists	Incompatible: Herdr `pane.move` requires an explicit destination tab or new-tab container, not a portable index or direction
+pane:swap	Rejected: no pinned primitive swaps two panes	`pane.swap(origin_pane_id, direction)` only for cardinal directions (left, right, up, down); indexed swap is rejected
 pane:resize	`ResizeByPaneId` on the captured origin pane; omitted amount increases, explicit amount is rejected	`pane.resize(origin_pane_id, direction, optional numeric amount)` only for left/right/up/down
 pane:zoom	Bare action maps to `ToggleFocusFullscreenByPaneId`; explicit boolean is rejected	`pane.zoom(origin_pane_id, mode toggle/on/off)`; boolean or omitted input
-pane:fullscreen	Bare action maps to `ToggleFocusFullscreenByPaneId`; explicit boolean is rejected	Incompatible; no protocol-20 method
+pane:fullscreen	Bare action maps to `ToggleFocusNoUiFullscreenByPaneId`; explicit boolean is rejected	Incompatible; no protocol-20 method
 pane:floating	Bare action maps to `TogglePaneEmbedOrFloatingByPaneId`; explicit boolean is rejected	Incompatible; no protocol-20 method
 pane:frame	Rejected: `TogglePaneFrames` is menu-relative, not origin-pane targeted	Incompatible; no protocol-20 method
 session:create	No one-to-one plugin API	Incompatible; only read-only `session.snapshot` exists
-session:attach	No one-to-one plugin API	Incompatible; only read-only `session.snapshot` exists
-session:switch	`switch_session(Some(name))` candidate; changes plugin/client session context	Incompatible; only read-only `session.snapshot` exists
-session:rename	`rename_session(name)` candidate; current session context	Incompatible; only read-only `session.snapshot` exists
-session:detach	`detach()` candidate; client/plugin context dependent	Incompatible; only read-only `session.snapshot` exists
+session:attach	`switch_session(Some(name))` maps through active client session context	Incompatible; only read-only `session.snapshot` exists
+session:switch	`switch_session(Some(name))` changes client session context	Incompatible; only read-only `session.snapshot` exists
+session:rename	`RenameSession` with name for current session context	Incompatible; only read-only `session.snapshot` exists
+session:detach	`Detach` disconnects active client	Incompatible; only read-only `session.snapshot` exists
 session:quit	Rejected: `quit_zellij()` terminates the server, not one portable session	Incompatible; only read-only `session.snapshot` exists
 session:kill	`kill_sessions([captured origin session])`, distinct from server quit	Incompatible; only read-only `session.snapshot` exists

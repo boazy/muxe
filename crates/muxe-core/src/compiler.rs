@@ -1347,24 +1347,14 @@ impl MenuCompiler<'_> {
 }
 fn positional_fields(kind: &ActionKind) -> &'static [&'static str] {
     match kind {
-        ActionKind::Portable(PortableActionKind::MenuOpen) => &["menu"],
-        ActionKind::Portable(
-            PortableActionKind::PaneSplit
-            | PortableActionKind::TabMove
-            | PortableActionKind::PaneMove,
-        ) => &["direction"],
-        ActionKind::Portable(
-            PortableActionKind::TabFocus
-            | PortableActionKind::TabSwap
-            | PortableActionKind::PaneFocus
-            | PortableActionKind::PaneSwap,
-        ) => &["index"],
-        ActionKind::Portable(
-            PortableActionKind::SessionAttach
-            | PortableActionKind::SessionSwitch
-            | PortableActionKind::SessionRename,
-        ) => &["name"],
-        _ => &[],
+        ActionKind::Portable(portable) => match portable.positional_field() {
+            Some("menu") => &["menu"],
+            Some("direction") => &["direction"],
+            Some("index") => &["index"],
+            Some("name") => &["name"],
+            _ => &[],
+        },
+        ActionKind::Native(_) => &[],
     }
 }
 

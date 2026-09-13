@@ -258,6 +258,19 @@ impl PortableActionKind {
         }
     }
 }
+impl PortableActionKind {
+    /// Returns the positional parameter name accepted by this action in compact syntax, if any.
+    #[must_use]
+    pub const fn positional_field(self) -> Option<&'static str> {
+        match self {
+            Self::MenuOpen => Some("menu"),
+            Self::PaneSplit | Self::TabMove | Self::PaneMove => Some("direction"),
+            Self::TabFocus | Self::TabSwap | Self::PaneFocus | Self::PaneSwap => Some("index"),
+            Self::SessionAttach | Self::SessionSwitch | Self::SessionRename => Some("name"),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Direction {

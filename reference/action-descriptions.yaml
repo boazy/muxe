@@ -1,0 +1,299 @@
+actions:
+  menu:open:
+    summary: Opens another menu by ID or renders an inline submenu.
+    parameters:
+      - name: menu
+        type: string (literal only)
+        required: false
+        description: ID of a top-level menu declared in configuration. Context references are not supported. Required unless submenu is used.
+      - name: submenu
+        type: mapping
+        required: false
+        description: Inline submenu definition mapping. Required unless menu is used.
+
+  menu:return:
+    summary: Navigates back to the parent menu in the navigation stack, or closes the menu if at the root.
+
+  menu:quit:
+    summary: Closes the active menu and returns keyboard focus to the captured origin pane.
+
+  menu.page:prev:
+    summary: Navigates to the previous page of items in a paginated menu.
+
+  menu.page:next:
+    summary: Navigates to the next page of items in a paginated menu.
+
+  config:reload:
+    summary: Reloads Muxe configuration from disk and recompiles all menus.
+
+  keyboard:send:
+    summary: Sends simulated key events or text directly to the captured origin pane.
+    parameters:
+      - name: keys
+        type: sequence of keys or context
+        required: false
+        description: List of canonical key strings to send in sequence (for example ["ctrl+c"]). Exactly one of keys or text is required.
+      - name: text
+        type: string or context
+        required: false
+        description: Plain text string to write directly to the pane input stream. Exactly one of keys or text is required.
+
+  command:execute:
+    summary: Spawns an external command as a supervised background process managed by the broker.
+    parameters:
+      - name: program
+        type: string or context
+        required: true
+        description: Executable name or path to run.
+      - name: args
+        type: sequence of strings or context
+        required: false
+        default: "[]"
+        description: Command-line arguments passed to the executable.
+      - name: cwd
+        type: path or context
+        required: false
+        default: origin pane working directory
+        description: Working directory for execution. Literal relative paths join to the origin working directory.
+      - name: env
+        type: mapping of strings or context
+        required: false
+        default: "{}"
+        description: Environment variables set for the child process.
+
+  tab:create:
+    summary: Creates a new tab in the multiplexer.
+    parameters:
+      - name: workspace-id
+        type: string or context
+        required: false
+        default: captured origin workspace
+        description: Destination workspace identifier.
+      - name: name
+        type: string or context
+        required: false
+        default: host default
+        description: Title or label for the new tab.
+      - name: focus
+        type: boolean (literal only)
+        required: false
+        default: "true"
+        description: Whether to focus the new tab upon creation. Context references are rejected in v1.
+      - name: program
+        type: string or context
+        required: false
+        default: host default shell
+        description: Executable to spawn in the initial pane of the new tab.
+      - name: args
+        type: sequence of strings or context
+        required: false
+        default: "[]"
+        description: Arguments for program. Requires program to be set.
+      - name: cwd
+        type: path or context
+        required: false
+        default: captured origin working directory
+        description: Initial working directory for the tab.
+
+  tab:close:
+    summary: Closes the current tab.
+
+  tab:rename:
+    summary: Renames a tab.
+    parameters:
+      - name: name
+        type: string or context
+        required: false
+        description: New display name for the tab. Both Zellij and Herdr require name; bare interactive prompts are not supported by either host.
+
+  tab:focus:
+    summary: Moves tab focus to a specified index or adjacent tab.
+    parameters:
+      - name: index
+        type: non-negative integer or context
+        required: false
+        description: Target tab index. Exactly one of index or direction is required.
+      - name: direction
+        type: direction or context
+        required: false
+        description: Relative tab direction (next or previous). Exactly one of index or direction is required.
+
+  tab:move:
+    summary: Moves the tab to a different position or in a specified direction.
+    parameters:
+      - name: direction
+        type: direction or context
+        required: false
+        description: Relative shift direction. Exactly one of index or direction is required.
+      - name: index
+        type: non-negative integer or context
+        required: false
+        description: Absolute destination index. Exactly one of index or direction is required.
+
+  tab:swap:
+    summary: Swaps the positions of two tabs.
+    parameters:
+      - name: index
+        type: non-negative integer or context
+        required: false
+        description: Target tab index to swap with the origin tab. Exactly one of index or direction is required.
+      - name: direction
+        type: direction or context
+        required: false
+        description: Relative tab direction (next or previous). Exactly one of index or direction is required.
+
+  pane:create:
+    summary: Creates a new pane using host layout rules.
+
+  pane:split:
+    summary: Splits the origin pane in a specified direction.
+    parameters:
+      - name: direction
+        type: direction or context
+        required: false
+        default: host default
+        description: "Split placement direction: left, right, up, or down."
+      - name: focus
+        type: boolean (literal only)
+        required: false
+        default: "true"
+        description: Whether to focus the new pane. Context references are rejected in v1.
+      - name: program
+        type: string or context
+        required: false
+        default: host default shell
+        description: Executable to spawn in the new pane.
+      - name: args
+        type: sequence of strings or context
+        required: false
+        default: "[]"
+        description: Arguments for program. Requires program to be set.
+      - name: cwd
+        type: path or context
+        required: false
+        default: captured origin working directory
+        description: Working directory for the new pane.
+
+  pane:close:
+    summary: Closes the captured origin pane.
+
+  pane:focus:
+    summary: Moves pane focus to an adjacent pane or specified index.
+    parameters:
+      - name: index
+        type: non-negative integer or context
+        required: false
+        description: Target pane manifest index. Exactly one of index or direction is required. Note that index is the positional field in compact syntax; direction requires direction=<dir>.
+      - name: direction
+        type: direction or context
+        required: false
+        description: Direction of neighbor pane (left, right, up, or down). Exactly one of index or direction is required.
+
+  pane:move:
+    summary: Moves the captured origin pane in a specified direction or to a destination index.
+    parameters:
+      - name: direction
+        type: direction or context
+        required: false
+        description: "Direction to move: left, right, up, or down. Positional field in compact syntax. Exactly one of index or direction is required."
+      - name: index
+        type: non-negative integer or context
+        required: false
+        description: Target destination index in the layout. Requires index=<index> in compact syntax. Exactly one of index or direction is required.
+
+  pane:swap:
+    summary: Swaps the captured origin pane with an adjacent pane or specified index.
+    parameters:
+      - name: index
+        type: non-negative integer or context
+        required: false
+        description: Target pane index to swap with. Positional field in compact syntax. Exactly one of index or direction is required.
+      - name: direction
+        type: direction or context
+        required: false
+        description: "Direction of neighbor pane: left, right, up, or down. Requires direction=<dir> in compact syntax. Exactly one of index or direction is required."
+
+  pane:resize:
+    summary: Resizes the captured origin pane in a specified direction.
+    parameters:
+      - name: direction
+        type: direction or context
+        required: true
+        description: "Direction to resize: left, right, up, or down."
+      - name: amount
+        type: scalar or context
+        required: false
+        default: host step
+        description: Resize magnitude. Omit for default single-step increase.
+
+  pane:zoom:
+    summary: Toggles whether the origin pane is zoomed within its layout.
+    parameters:
+      - name: enabled
+        type: boolean (literal only)
+        required: false
+        default: toggle
+        description: Explicit target state. Omit to toggle current state. Context references are rejected in v1.
+
+  pane:fullscreen:
+    summary: Toggles whether the origin pane occupies the full terminal without host chrome.
+    parameters:
+      - name: enabled
+        type: boolean (literal only)
+        required: false
+        default: toggle
+        description: Explicit target state. Omit to toggle current state. Context references are rejected in v1.
+
+  pane:floating:
+    summary: Toggles whether the origin pane floats above the tiled layout.
+    parameters:
+      - name: enabled
+        type: boolean (literal only)
+        required: false
+        default: toggle
+        description: Explicit target state. Omit to toggle current state. Context references are rejected in v1.
+
+  pane:frame:
+    summary: Toggles frame borders around the origin pane.
+    parameters:
+      - name: visible
+        type: boolean (literal only)
+        required: false
+        default: toggle
+        description: Explicit frame visibility. Omit to toggle current state. Context references are rejected in v1.
+
+  session:create:
+    summary: Creates a new multiplexer session.
+
+  session:attach:
+    summary: Attaches a client connection to an existing session.
+    parameters:
+      - name: name
+        type: string or context
+        required: true
+        description: Name of the session to attach.
+
+  session:switch:
+    summary: Switches the current client connection to another session.
+    parameters:
+      - name: name
+        type: string or context
+        required: true
+        description: Target session name.
+
+  session:rename:
+    summary: Renames the active session.
+    parameters:
+      - name: name
+        type: string or context
+        required: true
+        description: New name for the session.
+
+  session:detach:
+    summary: Detaches the active client from the session.
+
+  session:quit:
+    summary: Requests a clean shutdown of the session.
+
+  session:kill:
+    summary: Forcefully terminates the session and its contained processes.
