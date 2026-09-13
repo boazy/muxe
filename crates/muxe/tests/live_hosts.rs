@@ -1307,7 +1307,7 @@ async fn assert_herdr_menu_stays_open(
         .find_map(|line| line.strip_prefix("opened "))
         .ok_or_else(|| io::Error::other(format!("smoke: launcher reported no pane: {stdout}")))?;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    muxe_adapter_herdr::pane_by_id(runtime.client(), runtime.schema(), pane)
+    let menu_pane = muxe_adapter_herdr::pane_by_id(runtime.client(), runtime.schema(), pane)
         .await
         .map_err(|error| {
             let transcript = std::fs::read(&typescript).map_or_else(
@@ -1322,7 +1322,19 @@ async fn assert_herdr_menu_stays_open(
                  --- attached Herdr transcript ---\n{transcript}"
             ))
         })?;
-    eprintln!("[smoke] Herdr menu pane {pane} remained live after launcher exit");
+    let expected_rows = u16::try_from((u32::from(origin.rows) * 3 + 5) / 10)
+        .expect("30% of a u16 row count fits in u16");
+    let actual_rows = menu_pane.rows;
+    if actual_rows.abs_diff(expected_rows) > 1 {
+        return Err(io::Error::other(format!(
+            "smoke: Herdr menu pane {pane} has {actual_rows} rows; expected 30% of the {origin_rows}-row origin (within one cell)",
+            origin_rows = origin.rows,
+        )));
+    }
+    eprintln!(
+        "[smoke] Herdr menu pane {pane} remained live after launcher exit at {actual_rows}/{origin_rows} rows",
+        origin_rows = origin.rows,
+    );
     Ok(())
 }
 

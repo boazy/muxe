@@ -2618,21 +2618,33 @@ fn command_pane_ratio(
     if unsupported.is_some() {
         bail!("the requested split dimension is perpendicular to the Herdr split direction");
     }
-    match requested {
-        None => Ok(0.5),
-        Some(muxe::cli::Dimension::Percent(percent)) if (1..100).contains(&percent) => {
-            Ok(f64::from(percent) / 100.0)
-        }
-        Some(muxe::cli::Dimension::Cells(cells)) if cells > 0 && cells < available => {
-            Ok(f64::from(cells) / f64::from(available))
+    let requested_ratio = match requested {
+        None => return Ok(0.5),
+        Some(muxe::cli::Dimension::Percent(percent)) if (10..=90).contains(&percent) => {
+            f64::from(percent) / 100.0
         }
         Some(muxe::cli::Dimension::Percent(_)) => {
-            bail!("Herdr split percentage must be between 1% and 99%")
+            bail!("Herdr split percentage must be between 10% and 90%")
         }
-        Some(muxe::cli::Dimension::Cells(_)) => bail!(
-            "Herdr split cell dimension must be positive and smaller than the validated destination axis"
-        ),
-    }
+        Some(muxe::cli::Dimension::Cells(cells)) => {
+            if cells == 0 || cells >= available {
+                bail!(
+                    "Herdr split cell dimension must be positive and smaller than the validated destination axis"
+                );
+            }
+            let cells = u32::from(cells);
+            let available = u32::from(available);
+            if cells * 10 < available || cells * 10 > available * 9 {
+                bail!(
+                    "Herdr split cell dimension must reserve between 10% and 90% of the validated destination axis"
+                );
+            }
+            f64::from(cells) / f64::from(available)
+        }
+    };
+    // Herdr records the existing target as the first child and applies `ratio` to it.
+    // The CLI dimension instead names the newly opened second child.
+    Ok(1.0 - requested_ratio)
 }
 
 /// Resolves `muxe pane open --cwd` exactly once at the launcher boundary. The captured live
@@ -3335,6 +3347,62 @@ mod consumer_tests {
         let mut open = pane_open();
         open.placement.height = Some(Dimension::Cells(10));
         assert!(zellij_run_argv("alpha", &open).is_err());
+    }
+
+    #[test]
+    fn herdr_split_ratio_reserves_requested_space_for_moved_pane() {
+        let destination = muxe_adapter_herdr::FocusedPane {
+            workspace: muxe_core::WorkspaceId::new("workspace"),
+            tab: muxe_core::TabId::new("tab"),
+            pane: muxe_core::PaneId::new("pane"),
+            cwd: PathBuf::from("/project"),
+            columns: 80,
+            rows: 50,
+        };
+        let mut open = placement();
+        open.height = Some(Dimension::Percent(30));
+        let ratio = command_pane_ratio(
+            &open,
+            &destination,
+            muxe_adapter_herdr::UiSplitDirection::Down,
+        )
+        .expect("30% height converts");
+        assert!((ratio - 0.7).abs() < f64::EPSILON);
+
+        open.height = None;
+        open.width = Some(Dimension::Cells(20));
+        let ratio = command_pane_ratio(
+            &open,
+            &destination,
+            muxe_adapter_herdr::UiSplitDirection::Right,
+        )
+        .expect("20-cell width converts");
+        assert!((ratio - 0.75).abs() < f64::EPSILON);
+
+        open.width = None;
+        open.height = Some(Dimension::Percent(9));
+        assert!(
+            command_pane_ratio(
+                &open,
+                &destination,
+                muxe_adapter_herdr::UiSplitDirection::Down
+            )
+            .expect_err("Herdr cannot honor a 9% split")
+            .to_string()
+            .contains("between 10% and 90%")
+        );
+
+        open.height = Some(Dimension::Cells(4));
+        assert!(
+            command_pane_ratio(
+                &open,
+                &destination,
+                muxe_adapter_herdr::UiSplitDirection::Down
+            )
+            .expect_err("Herdr cannot honor a 4-cell height in 50 rows")
+            .to_string()
+            .contains("between 10% and 90%")
+        );
     }
 
     #[test]
