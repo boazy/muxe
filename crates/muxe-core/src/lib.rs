@@ -18,10 +18,12 @@ mod session;
 mod theme;
 
 pub use action::{
-    ActionKind, ActionScalar, ActionSpec, CommandAction, ConfigAction, CreateCommand, Direction,
-    IndexOrDirection, KeyboardAction, MenuAction, MenuTarget, NativeActionCandidate, PaneAction,
-    PortableAction, PortableActionDescriptor, PortableActionKind, PortableActionResolutionError,
-    SessionAction, TabAction,
+    ActionCategory, ActionConstraint, ActionKind, ActionParameterName, ActionParameterSchema,
+    ActionParameterType, ActionScalar, ActionSpec, CommandAction, ConfigAction,
+    ConstraintErrorLocation, ConstraintValidationPhase, CreateCommand, Direction, IndexOrDirection,
+    KeyboardAction, MenuAction, MenuTarget, NativeActionCandidate, OmittedParameterBehavior,
+    PaneAction, PortableAction, PortableActionKind, PortableActionResolutionError,
+    PortableActionSchema, SessionAction, TabAction,
 };
 pub use condition::{ConditionEvaluationError, ConditionIr, ConditionProgram, PagesContext};
 pub use config::{

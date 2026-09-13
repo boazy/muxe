@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use strum::{Display, EnumIter, IntoStaticStr};
+
 use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceSpan};
 
 macro_rules! opaque_id {
@@ -37,13 +39,15 @@ opaque_id!(WorktreeId, "Opaque host worktree identity.");
 opaque_id!(AgentId, "Opaque host agent identity.");
 opaque_id!(LinkHandlerId, "Opaque host link-handler identity.");
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
 pub enum OriginHostKind {
     Zellij,
     Herdr,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
 pub enum OriginPaneType {
     Tiled,
     Floating,
@@ -52,7 +56,8 @@ pub enum OriginPaneType {
     Other,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
 pub enum OriginInvocationSource {
     RootBinding,
     CommandLine,

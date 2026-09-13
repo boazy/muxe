@@ -14,6 +14,7 @@ serde.workspace = true
 saphyr.workspace = true
 serde-saphyr.workspace = true
 thiserror.workspace = true
+strum.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]

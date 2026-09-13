@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
 use crate::config::{ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError};
 use crate::context::OriginContext;
@@ -33,233 +34,707 @@ impl ActionKind {
     }
 }
 
-/// The closed v1 portable action registry.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum PortableActionKind {
-    MenuOpen,
-    MenuReturn,
-    MenuQuit,
-    MenuPagePrev,
-    MenuPageNext,
-    ConfigReload,
-    KeyboardSend,
-    CommandExecute,
-    TabCreate,
-    TabClose,
-    TabRename,
-    TabFocus,
-    TabMove,
-    TabSwap,
-    PaneCreate,
-    PaneSplit,
-    PaneClose,
-    PaneFocus,
-    PaneMove,
-    PaneSwap,
-    PaneResize,
-    PaneZoom,
-    PaneFullscreen,
-    PaneFloating,
-    PaneFrame,
-    SessionCreate,
-    SessionAttach,
-    SessionSwitch,
-    SessionRename,
-    SessionDetach,
-    SessionQuit,
-    SessionKill,
+/// Group used to organize portable actions in generated documentation.
+#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ActionCategory {
+    Menu,
+    Configuration,
+    Keyboard,
+    Command,
+    Tab,
+    Pane,
+    Session,
 }
 
-impl PortableActionKind {
-    pub const ALL: &'static [Self] = &[
-        Self::MenuOpen,
-        Self::MenuReturn,
-        Self::MenuQuit,
-        Self::MenuPagePrev,
-        Self::MenuPageNext,
-        Self::ConfigReload,
-        Self::KeyboardSend,
-        Self::CommandExecute,
-        Self::TabCreate,
-        Self::TabClose,
-        Self::TabRename,
-        Self::TabFocus,
-        Self::TabMove,
-        Self::TabSwap,
-        Self::PaneCreate,
-        Self::PaneSplit,
-        Self::PaneClose,
-        Self::PaneFocus,
-        Self::PaneMove,
-        Self::PaneSwap,
-        Self::PaneResize,
-        Self::PaneZoom,
-        Self::PaneFullscreen,
-        Self::PaneFloating,
-        Self::PaneFrame,
-        Self::SessionCreate,
-        Self::SessionAttach,
-        Self::SessionSwitch,
-        Self::SessionRename,
-        Self::SessionDetach,
-        Self::SessionQuit,
-        Self::SessionKill,
-    ];
+/// Closed registry of portable action parameter names.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Display,
+    EnumIter,
+    EnumString,
+    Eq,
+    Hash,
+    IntoStaticStr,
+    Ord,
+    PartialEq,
+    PartialOrd,
+)]
+pub enum ActionParameterName {
+    #[strum(serialize = "menu")]
+    Menu,
+    #[strum(serialize = "submenu")]
+    Submenu,
+    #[strum(serialize = "sequence")]
+    Sequence,
+    #[strum(serialize = "keys")]
+    Keys,
+    #[strum(serialize = "text")]
+    Text,
+    #[strum(serialize = "program")]
+    Program,
+    #[strum(serialize = "args")]
+    Args,
+    #[strum(serialize = "cwd")]
+    Cwd,
+    #[strum(serialize = "env")]
+    Env,
+    #[strum(serialize = "workspace-id")]
+    WorkspaceId,
+    #[strum(serialize = "name")]
+    Name,
+    #[strum(serialize = "focus")]
+    Focus,
+    #[strum(serialize = "index")]
+    Index,
+    #[strum(serialize = "direction")]
+    Direction,
+    #[strum(serialize = "amount")]
+    Amount,
+    #[strum(serialize = "enabled")]
+    Enabled,
+    #[strum(serialize = "visible")]
+    Visible,
+}
 
+impl ActionParameterName {
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::MenuOpen => "menu:open",
-            Self::MenuReturn => "menu:return",
-            Self::MenuQuit => "menu:quit",
-
-            Self::MenuPagePrev => "menu.page:prev",
-            Self::MenuPageNext => "menu.page:next",
-            Self::ConfigReload => "config:reload",
-            Self::KeyboardSend => "keyboard:send",
-            Self::CommandExecute => "command:execute",
-            Self::TabCreate => "tab:create",
-            Self::TabClose => "tab:close",
-            Self::TabRename => "tab:rename",
-            Self::TabFocus => "tab:focus",
-            Self::TabMove => "tab:move",
-            Self::TabSwap => "tab:swap",
-            Self::PaneCreate => "pane:create",
-            Self::PaneSplit => "pane:split",
-            Self::PaneClose => "pane:close",
-            Self::PaneFocus => "pane:focus",
-            Self::PaneMove => "pane:move",
-            Self::PaneSwap => "pane:swap",
-            Self::PaneResize => "pane:resize",
-            Self::PaneZoom => "pane:zoom",
-            Self::PaneFullscreen => "pane:fullscreen",
-            Self::PaneFloating => "pane:floating",
-            Self::PaneFrame => "pane:frame",
-            Self::SessionCreate => "session:create",
-            Self::SessionAttach => "session:attach",
-            Self::SessionSwitch => "session:switch",
-            Self::SessionRename => "session:rename",
-            Self::SessionDetach => "session:detach",
-            Self::SessionQuit => "session:quit",
-            Self::SessionKill => "session:kill",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|kind| kind.as_str() == value)
+    pub fn as_str(self) -> &'static str {
+        self.into()
     }
 }
 
-/// One entry in the closed portable-action registry. `parameter_syntax` is emitted into the
-/// generated reference and intentionally describes the source schema, not host wire payloads.
+/// Value grammar accepted by one portable action parameter.
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+pub enum ActionParameterType {
+    #[strum(serialize = "menu name")]
+    MenuName,
+    #[strum(serialize = "menu mapping")]
+    MenuMapping,
+    #[strum(serialize = "unsupported")]
+    Unsupported,
+    #[strum(serialize = "list of keys or `$origin.` references")]
+    KeySequence,
+    #[strum(serialize = "string or string-valued `$origin.` reference")]
+    StringContextOnly,
+    #[strum(serialize = "string or `$origin.` reference")]
+    TextualContext,
+    #[strum(serialize = "list of strings or `$origin.` references")]
+    TextualContextSequence,
+    #[strum(serialize = "path or `$origin.` reference")]
+    ContextPath,
+    #[strum(serialize = "mapping")]
+    TextualContextMapping,
+    #[strum(serialize = "workspace ID or `$origin.` reference")]
+    ContextWorkspaceId,
+    #[strum(serialize = "boolean")]
+    Boolean,
+    #[strum(serialize = "non-negative integer or `$origin.` reference")]
+    Index,
+    #[strum(serialize = "direction or `$origin.` reference")]
+    Direction,
+    #[strum(serialize = "number or `$origin.` reference")]
+    Scalar,
+}
+
+/// Behavior used when an optional parameter is omitted.
+///
+/// This metadata describes downstream behavior. Parsing preserves the existing `None`, empty
+/// sequence, or empty mapping representation instead of injecting a scalar value.
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+pub enum OmittedParameterBehavior {
+    #[strum(serialize = "empty list")]
+    EmptySequence,
+    #[strum(serialize = "empty mapping")]
+    EmptyMapping,
+    #[strum(serialize = "working directory of the pane where the menu was opened")]
+    OriginPaneCwd,
+    #[strum(serialize = "workspace containing the pane where the menu was opened")]
+    OriginWorkspace,
+    #[strum(serialize = "chosen by Zellij or Herdr")]
+    HostGeneratedName,
+    #[strum(serialize = "host-dependent; see host note")]
+    HostDependent,
+    #[strum(serialize = "default shell")]
+    DefaultShell,
+    #[strum(serialize = "true")]
+    True,
+    #[strum(serialize = "one resize step")]
+    ResizeStep,
+    #[strum(serialize = "toggle the current state")]
+    Toggle,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PortableActionDescriptor {
+pub struct ActionParameterSchema {
+    pub name: ActionParameterName,
+    pub value_type: ActionParameterType,
+    pub required: bool,
+    pub positional: Option<usize>,
+    pub omitted: Option<OmittedParameterBehavior>,
+}
+
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+pub enum ConstraintValidationPhase {
+    BeforeFields,
+    AfterFields,
+}
+
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+pub enum ConstraintErrorLocation {
+    Action,
+    FirstFieldValue,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionConstraint {
+    ExactlyOne {
+        parameters: &'static [ActionParameterName],
+        message: &'static str,
+        validation_phase: ConstraintValidationPhase,
+        error_location: ConstraintErrorLocation,
+    },
+    Requires {
+        parameter: ActionParameterName,
+        required_parameter: ActionParameterName,
+        message: &'static str,
+    },
+    Unsupported {
+        parameter: ActionParameterName,
+        message: &'static str,
+    },
+}
+
+/// Generated syntax and execution metadata for one portable action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableActionSchema {
     pub kind: PortableActionKind,
-    pub parameter_syntax: &'static str,
+    pub category: ActionCategory,
+    pub parameters: &'static [ActionParameterSchema],
+    pub constraints: &'static [ActionConstraint],
     pub default_execution: Option<ExecutionMode>,
     pub capabilities: ExecutionCapabilities,
 }
 
-impl PortableActionKind {
-    #[must_use]
-    pub const fn descriptor(self) -> PortableActionDescriptor {
-        let (parameter_syntax, default_execution, capabilities) = match self {
-            Self::MenuOpen => (
-                "menu=<id> or submenu=<menu>",
-                None,
-                ExecutionCapabilities::SYNCHRONOUS,
-            ),
-            Self::MenuReturn
-            | Self::MenuQuit
-            | Self::MenuPagePrev
-            | Self::MenuPageNext
-            | Self::ConfigReload => ("none", None, ExecutionCapabilities::SYNCHRONOUS),
-            Self::KeyboardSend => (
-                "exactly one of keys=[<canonical-key or $context>, …] or text=<string or $context>",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::CommandExecute => (
-                "program=<string or $context>; args=[<string or $context>, …]?; cwd=<path or $context>?; env={<string>: <string or $context>}?",
-                Some(ExecutionMode::Detach),
-                ExecutionCapabilities {
-                    awaitable: true,
-                    detachable: true,
-                    cancellable: true,
-                },
-            ),
-            Self::TabClose
-            | Self::PaneCreate
-            | Self::PaneClose
-            | Self::SessionCreate
-            | Self::SessionDetach
-            | Self::SessionQuit
-            | Self::SessionKill => (
-                "none",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::TabCreate => (
-                "workspace-id=<string or $context>?; name=<string or $context>?; focus=<boolean>? (default true); program=<string or $context>?; args=[<string or $context>, …]?; cwd=<path or $context>?",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::TabRename => (
-                "name=<string or $context>?",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::TabFocus
-            | Self::TabMove
-            | Self::TabSwap
-            | Self::PaneFocus
-            | Self::PaneMove
-            | Self::PaneSwap => (
-                "exactly one of index=<non-negative integer or $context> or direction=<direction or $context>",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::PaneSplit => (
-                "direction=<direction or $context>?; focus=<boolean>? (default true); program=<string or $context>?; args=[<string or $context>, …]?; cwd=<path or $context>?",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::PaneResize => (
-                "direction=<direction or $context>; amount=<scalar or $context>?",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::PaneZoom | Self::PaneFullscreen | Self::PaneFloating => (
-                "enabled=<boolean>?",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::PaneFrame => (
-                "visible=<boolean>?",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-            Self::SessionAttach | Self::SessionSwitch | Self::SessionRename => (
-                "name=<string or $context>",
-                Some(ExecutionMode::Await),
-                ExecutionCapabilities::ASYNCHRONOUS,
-            ),
-        };
-        PortableActionDescriptor {
-            kind: self,
-            parameter_syntax,
-            default_execution,
-            capabilities,
-        }
-    }
+macro_rules! parameter_required {
+    () => {
+        false
+    };
+    (true) => {
+        true
+    };
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+macro_rules! parameter_position {
+    () => {
+        None
+    };
+    ($position:literal) => {
+        Some($position)
+    };
+}
+
+macro_rules! parameter_omitted {
+    () => {
+        None
+    };
+    ($omitted:ident) => {
+        Some(OmittedParameterBehavior::$omitted)
+    };
+}
+
+macro_rules! define_portable_actions {
+    (
+        $(
+            $variant:ident {
+                name: $name:literal,
+                category: $category:ident,
+                execution: $execution:expr,
+                capabilities: $capabilities:expr,
+                parameters: [
+                    $(
+                        $field:ident as $parameter:ident : $value_type:ident
+                        $([required = $required:tt])?
+                        $([position = $position:literal])?
+                        $([default = $omitted:ident])?;
+                    )*
+                ],
+                constraints: [
+                    $($constraint:expr;)*
+                ],
+            }
+        )*
+    ) => {
+        /// The closed v1 portable action registry.
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            Display,
+            EnumIter,
+            EnumString,
+            Eq,
+            Hash,
+            IntoStaticStr,
+            Ord,
+            PartialEq,
+            PartialOrd,
+        )]
+        #[non_exhaustive]
+        pub enum PortableActionKind {
+            $(
+                #[strum(serialize = $name)]
+                $variant,
+            )*
+        }
+
+        impl PortableActionKind {
+            #[must_use]
+            pub fn parse(value: &str) -> Option<Self> {
+                value.parse().ok()
+            }
+
+            #[must_use]
+            pub fn as_str(self) -> &'static str {
+                self.into()
+            }
+
+            #[must_use]
+            pub const fn schema(self) -> PortableActionSchema {
+                match self {
+                    $(
+                        Self::$variant => PortableActionSchema {
+                            kind: self,
+                            category: ActionCategory::$category,
+                            parameters: &[
+                                $(
+                                    ActionParameterSchema {
+                                        name: ActionParameterName::$parameter,
+                                        value_type: ActionParameterType::$value_type,
+                                        required: parameter_required!($($required)?),
+                                        positional: parameter_position!($($position)?),
+                                        omitted: parameter_omitted!($($omitted)?),
+                                    },
+                                )*
+                            ],
+                            constraints: &[$($constraint,)*],
+                            default_execution: $execution,
+                            capabilities: $capabilities,
+                        },
+                    )*
+                }
+            }
+        }
+    };
+}
+
+macro_rules! portable_action_definitions {
+    ($callback:ident) => {
+        $callback! {
+        MenuOpen {
+            name: "menu:open",
+            category: Menu,
+            execution: None,
+            capabilities: ExecutionCapabilities::SYNCHRONOUS,
+            parameters: [
+                menu as Menu: MenuName [position = 0];
+                submenu as Submenu: MenuMapping;
+            ],
+            constraints: [
+                ActionConstraint::ExactlyOne {
+                    parameters: &[ActionParameterName::Menu, ActionParameterName::Submenu],
+                    validation_phase: ConstraintValidationPhase::BeforeFields,
+                    message: "menu:open requires exactly one of `menu` or `submenu`",
+                    error_location: ConstraintErrorLocation::Action,
+                };
+            ],
+        }
+        MenuReturn {
+            name: "menu:return",
+            category: Menu,
+            execution: None,
+            capabilities: ExecutionCapabilities::SYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        MenuQuit {
+            name: "menu:quit",
+            category: Menu,
+            execution: None,
+            capabilities: ExecutionCapabilities::SYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        MenuPagePrev {
+            name: "menu.page:prev",
+            category: Menu,
+            execution: None,
+            capabilities: ExecutionCapabilities::SYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        MenuPageNext {
+            name: "menu.page:next",
+            category: Menu,
+            execution: None,
+            capabilities: ExecutionCapabilities::SYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        ConfigReload {
+            name: "config:reload",
+            category: Configuration,
+            execution: None,
+            capabilities: ExecutionCapabilities::SYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        KeyboardSend {
+            name: "keyboard:send",
+            category: Keyboard,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                sequence as Sequence: Unsupported;
+                keys as Keys: KeySequence;
+                text as Text: StringContextOnly;
+            ],
+            constraints: [
+                ActionConstraint::Unsupported {
+                    parameter: ActionParameterName::Sequence,
+                    message: "keyboard:send `sequence` is not supported in schema version 1",
+                };
+                ActionConstraint::ExactlyOne {
+                    parameters: &[ActionParameterName::Keys, ActionParameterName::Text],
+                    validation_phase: ConstraintValidationPhase::AfterFields,
+                    message: "keyboard:send requires exactly one of `keys` or `text`",
+                    error_location: ConstraintErrorLocation::Action,
+                };
+            ],
+        }
+        CommandExecute {
+            name: "command:execute",
+            category: Command,
+            execution: Some(ExecutionMode::Detach),
+            capabilities: ExecutionCapabilities {
+                awaitable: true,
+                detachable: true,
+                cancellable: true,
+            },
+            parameters: [
+                program as Program: TextualContext [required = true];
+                args as Args: TextualContextSequence [default = EmptySequence];
+                cwd as Cwd: ContextPath [default = OriginPaneCwd];
+                env as Env: TextualContextMapping [default = EmptyMapping];
+            ],
+            constraints: [],
+        }
+        TabCreate {
+            name: "tab:create",
+            category: Tab,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                workspace_id as WorkspaceId: ContextWorkspaceId [default = OriginWorkspace];
+                name as Name: TextualContext [default = HostGeneratedName];
+                focus as Focus: Boolean [default = True];
+                program as Program: TextualContext [default = DefaultShell];
+                args as Args: TextualContextSequence [default = EmptySequence];
+                cwd as Cwd: ContextPath [default = OriginPaneCwd];
+            ],
+            constraints: [
+                ActionConstraint::Requires {
+                    parameter: ActionParameterName::Args,
+                    required_parameter: ActionParameterName::Program,
+                    message: "tab args requires `program`",
+                };
+            ],
+        }
+        TabClose {
+            name: "tab:close",
+            category: Tab,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        TabRename {
+            name: "tab:rename",
+            category: Tab,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                name as Name: TextualContext;
+            ],
+            constraints: [],
+        }
+        TabFocus {
+            name: "tab:focus",
+            category: Tab,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                index as Index: Index [position = 0];
+                direction as Direction: Direction;
+            ],
+            constraints: [
+                ActionConstraint::ExactlyOne {
+                    parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
+                    validation_phase: ConstraintValidationPhase::AfterFields,
+                    message: "action requires exactly one of `index` or `direction`",
+                    error_location: ConstraintErrorLocation::FirstFieldValue,
+                };
+            ],
+        }
+        TabMove {
+            name: "tab:move",
+            category: Tab,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                direction as Direction: Direction [position = 0];
+                index as Index: Index;
+            ],
+            constraints: [
+                ActionConstraint::ExactlyOne {
+                    parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
+                    validation_phase: ConstraintValidationPhase::AfterFields,
+                    message: "action requires exactly one of `index` or `direction`",
+                    error_location: ConstraintErrorLocation::FirstFieldValue,
+                };
+            ],
+        }
+        TabSwap {
+            name: "tab:swap",
+            category: Tab,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                index as Index: Index [position = 0];
+                direction as Direction: Direction;
+            ],
+            constraints: [
+                ActionConstraint::ExactlyOne {
+                    parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
+                    validation_phase: ConstraintValidationPhase::AfterFields,
+                    message: "action requires exactly one of `index` or `direction`",
+                    error_location: ConstraintErrorLocation::FirstFieldValue,
+                };
+            ],
+        }
+        PaneCreate {
+            name: "pane:create",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        PaneSplit {
+            name: "pane:split",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                direction as Direction: Direction [position = 0] [default = HostDependent];
+                focus as Focus: Boolean [default = True];
+                program as Program: TextualContext [default = DefaultShell];
+                args as Args: TextualContextSequence [default = EmptySequence];
+                cwd as Cwd: ContextPath [default = OriginPaneCwd];
+            ],
+            constraints: [
+                ActionConstraint::Requires {
+                    parameter: ActionParameterName::Args,
+                    required_parameter: ActionParameterName::Program,
+                    message: "pane args requires `program`",
+                };
+            ],
+        }
+        PaneClose {
+            name: "pane:close",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        PaneFocus {
+            name: "pane:focus",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                index as Index: Index [position = 0];
+                direction as Direction: Direction;
+            ],
+            constraints: [
+                ActionConstraint::ExactlyOne {
+                    parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
+                    validation_phase: ConstraintValidationPhase::AfterFields,
+                    message: "action requires exactly one of `index` or `direction`",
+                    error_location: ConstraintErrorLocation::FirstFieldValue,
+                };
+            ],
+        }
+        PaneMove {
+            name: "pane:move",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                direction as Direction: Direction [position = 0];
+                index as Index: Index;
+            ],
+            constraints: [
+                ActionConstraint::ExactlyOne {
+                    parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
+                    validation_phase: ConstraintValidationPhase::AfterFields,
+                    message: "action requires exactly one of `index` or `direction`",
+                    error_location: ConstraintErrorLocation::FirstFieldValue,
+                };
+            ],
+        }
+        PaneSwap {
+            name: "pane:swap",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                index as Index: Index [position = 0];
+                direction as Direction: Direction;
+            ],
+            constraints: [
+                ActionConstraint::ExactlyOne {
+                    parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
+                    validation_phase: ConstraintValidationPhase::AfterFields,
+                    message: "action requires exactly one of `index` or `direction`",
+                    error_location: ConstraintErrorLocation::FirstFieldValue,
+                };
+            ],
+        }
+        PaneResize {
+            name: "pane:resize",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                direction as Direction: Direction [required = true];
+                amount as Amount: Scalar [default = ResizeStep];
+            ],
+            constraints: [],
+        }
+        PaneZoom {
+            name: "pane:zoom",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                enabled as Enabled: Boolean [default = Toggle];
+            ],
+            constraints: [],
+        }
+        PaneFullscreen {
+            name: "pane:fullscreen",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                enabled as Enabled: Boolean [default = Toggle];
+            ],
+            constraints: [],
+        }
+        PaneFloating {
+            name: "pane:floating",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                enabled as Enabled: Boolean [default = Toggle];
+            ],
+            constraints: [],
+        }
+        PaneFrame {
+            name: "pane:frame",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                visible as Visible: Boolean [default = Toggle];
+            ],
+            constraints: [],
+        }
+        SessionCreate {
+            name: "session:create",
+            category: Session,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        SessionAttach {
+            name: "session:attach",
+            category: Session,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                name as Name: TextualContext [required = true] [position = 0];
+            ],
+            constraints: [],
+        }
+        SessionSwitch {
+            name: "session:switch",
+            category: Session,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                name as Name: TextualContext [required = true] [position = 0];
+            ],
+            constraints: [],
+        }
+        SessionRename {
+            name: "session:rename",
+            category: Session,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                name as Name: TextualContext [required = true] [position = 0];
+            ],
+            constraints: [],
+        }
+        SessionDetach {
+            name: "session:detach",
+            category: Session,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        SessionQuit {
+            name: "session:quit",
+            category: Session,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+        SessionKill {
+            name: "session:kill",
+            category: Session,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [],
+            constraints: [],
+        }
+            }
+    };
+}
+
+pub(crate) use portable_action_definitions;
+
+portable_action_definitions!(define_portable_actions);
+
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, Hash, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
 pub enum Direction {
     Left,
     Right,
@@ -791,14 +1266,16 @@ fn ensure_direction(
     scalar: &ActionScalar,
     parameter: &'static str,
 ) -> Result<(), PortableActionResolutionError> {
-    match ensure_string(scalar, parameter)? {
-        "left" | "right" | "up" | "down" | "next" | "previous" => Ok(()),
-        _ => Err(invalid_value(
-            scalar,
-            parameter,
-            "direction must be left, right, up, down, next, or previous",
-        )),
-    }
+    ensure_string(scalar, parameter)?
+        .parse::<Direction>()
+        .map(|_| ())
+        .map_err(|_| {
+            invalid_value(
+                scalar,
+                parameter,
+                "direction must be left, right, up, down, next, or previous",
+            )
+        })
 }
 
 fn ensure_index(
@@ -925,6 +1402,85 @@ impl ActionSpec {
         match self {
             Self::Portable(action) => ActionKind::Portable(action.kind()),
             Self::Native(action) => ActionKind::Native(action.type_name.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use strum::IntoEnumIterator;
+
+    use super::{ActionConstraint, ActionParameterType, PortableActionKind};
+
+    #[test]
+    fn portable_action_schemas_are_complete_and_internally_consistent() {
+        let mut action_names = BTreeSet::new();
+        for action in PortableActionKind::iter() {
+            assert!(action_names.insert(action.as_str()));
+            assert_eq!(action.as_str().parse::<PortableActionKind>(), Ok(action));
+
+            let schema = action.schema();
+            assert_eq!(schema.kind, action);
+            let mut parameter_names = BTreeSet::new();
+            let mut positions = BTreeSet::new();
+            for parameter in schema.parameters {
+                assert!(
+                    parameter_names.insert(parameter.name),
+                    "{action} declares `{}` more than once",
+                    parameter.name
+                );
+                if let Some(position) = parameter.positional {
+                    assert!(
+                        positions.insert(position),
+                        "{action} declares positional index {position} more than once"
+                    );
+                }
+                assert!(
+                    !parameter.required || parameter.omitted.is_none(),
+                    "{action}.{} is required but declares omitted-value behavior",
+                    parameter.name
+                );
+            }
+            assert_eq!(
+                positions.iter().copied().collect::<Vec<_>>(),
+                (0..positions.len()).collect::<Vec<_>>(),
+                "{action} positional indices must be contiguous"
+            );
+
+            for constraint in schema.constraints {
+                match constraint {
+                    ActionConstraint::ExactlyOne { parameters, .. } => {
+                        assert!(parameters.len() >= 2);
+                        for parameter in *parameters {
+                            assert!(
+                                parameter_names.contains(parameter),
+                                "{action} constraint names undeclared parameter `{parameter}`"
+                            );
+                        }
+                    }
+                    ActionConstraint::Requires {
+                        parameter,
+                        required_parameter,
+                        ..
+                    } => {
+                        assert!(parameter_names.contains(parameter));
+                        assert!(parameter_names.contains(required_parameter));
+                    }
+                    ActionConstraint::Unsupported { parameter, .. } => {
+                        assert!(parameter_names.contains(parameter));
+                        assert_eq!(
+                            schema
+                                .parameters
+                                .iter()
+                                .find(|candidate| candidate.name == *parameter)
+                                .map(|candidate| candidate.value_type),
+                            Some(ActionParameterType::Unsupported)
+                        );
+                    }
+                }
+            }
         }
     }
 }

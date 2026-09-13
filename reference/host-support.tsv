@@ -1,33 +1,33 @@
-# action	Zellij mapping and constraints	Herdr mapping and constraints
-menu:open	Muxe menu state; no portable Zellij Action. Separately, `muxe menu/pane open --host zellij` is source-proven to use the origin-client typed bridge for `NewTiledPane` (all four directions) or `NewFloatingPane` overlay with an exact argv/CWD vector and forced menu focus; no transient tab or live-host proof	Broker UI control; no Herdr RPC
-menu:return	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
-menu:quit	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
-menu.page:prev	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
-menu.page:next	Muxe menu state; no Zellij Action or shim equivalent	Broker UI control; no Herdr RPC
-config:reload	Broker configuration control; no Zellij RPC	Broker configuration control; no Herdr RPC
-keyboard:send	Origin-targeted `WriteCharsToPaneId`/`WriteToPaneId`; finite bridge encoding supports text/C0/ESC-meta/VT100/CSI modifiers and rejects super/hyper/keypad/media/F13+ precisely	`pane.send_keys` or `pane.send_text` to the captured origin pane; keys/text must be strings
-command:execute	Broker-owned supervised local process; no Zellij RPC	Broker-owned supervised local process; no Herdr RPC
-tab:create	`NewTab` accepts `name`, `focus`, and exact `program`/`args`/`cwd`; `workspace-id` is rejected because Zellij has no workspaces. Focused creation waits for UI dismissal before bridge dispatch.	Without `program`, `tab.create` accepts `workspace-id`, `name` as `label`, `focus`, and `cwd`. Command tabs use `layout.apply`. Focused creation waits for the UI pane's retained `pane_closed` event.
-tab:close	`Action::CloseTab` or `close_focused_tab`; current focused tab only	`tab.close` on the captured origin tab
-tab:rename	Name plus captured origin tab index maps to `RenameTab`; bare rename is rejected because Zellij has no prompt variant	`tab.rename` on the captured origin tab only when `name` is supplied; bare rename is incompatible
-tab:focus	Partial: `GoToTab`, `GoToNextTab`, and `GoToPreviousTab`; only index and next/previous	Pending runtime candidate: resolve the requested target through captured-workspace `tab.list` before host focus; source mapping is not implemented
-tab:move	Direction maps to `MoveTab`; index is rejected because Zellij exposes no index destination primitive	Pending runtime candidate: resolve direction through captured-workspace `tab.list` before `tab.move`; source mapping is not implemented
-tab:swap	Pending runtime composition; no source-proven one-to-one Action or shim operation	Nonnegative index only: list captured workspace, make two direct moves, and verify ordering; partial failure has no replay and a lost move response is OutcomeUnknown
-pane:create	`Action::NewPane` or `new_pane`; placement is host-determined in the focused tab	Incompatible
-pane:split	`NewTiledPane` accepts direction and exact `program`/`args`/`cwd`. Focused creation waits for UI dismissal before bridge dispatch; `focus: false` is rejected because Zellij cannot target the immutable origin while the menu is open.	Only explicit `right` or `down` directions are supported. Without `program`, `pane.split` also accepts `focus` and `cwd`. Command splits validate the origin with `session.snapshot`, then use `layout.apply` and `pane.move`. Focused creation waits for the UI pane's retained `pane_closed` event.
-pane:close	`CloseFocusByPaneId` on the captured origin pane	`pane.close` on the captured origin pane
-pane:focus	Direction uses bridge-tracked geometry and index uses bridge manifest order; neither falls back to menu-relative focus	Pending runtime candidate: resolve an index/direction through host pane state before focus; source mapping is not implemented
-pane:move	Direction maps to `MovePaneByPaneId` on the captured origin pane; index is rejected because no primitive exists	Pending runtime candidate: resolve destination through host pane state; source mapping is not implemented
-pane:swap	Pending runtime composition; no source-proven one-to-one pinned operation	`pane.swap(origin_pane_id, direction)` only for left/right/up/down
-pane:resize	`ResizeByPaneId` on the captured origin pane; omitted amount increases, explicit amount is rejected	`pane.resize(origin_pane_id, direction, optional numeric amount)` only for left/right/up/down
-pane:zoom	Bare action maps to `ToggleFocusFullscreenByPaneId`; explicit boolean is rejected	`pane.zoom(origin_pane_id, mode toggle/on/off)`; boolean or omitted input
-pane:fullscreen	Bare action maps to `ToggleFocusFullscreenByPaneId`; explicit boolean is rejected	Incompatible; no protocol-20 method
-pane:floating	Bare action maps to `TogglePaneEmbedOrFloatingByPaneId`; explicit boolean is rejected	Incompatible; no protocol-20 method
-pane:frame	Rejected: `TogglePaneFrames` is menu-relative, not origin-pane targeted	Incompatible; no protocol-20 method
-session:create	No one-to-one plugin API	Incompatible; only read-only `session.snapshot` exists
-session:attach	No one-to-one plugin API	Incompatible; only read-only `session.snapshot` exists
-session:switch	`switch_session(Some(name))` candidate; changes plugin/client session context	Incompatible; only read-only `session.snapshot` exists
-session:rename	`rename_session(name)` candidate; current session context	Incompatible; only read-only `session.snapshot` exists
-session:detach	`detach()` candidate; client/plugin context dependent	Incompatible; only read-only `session.snapshot` exists
-session:quit	Rejected: `quit_zellij()` terminates the server, not one portable session	Incompatible; only read-only `session.snapshot` exists
-session:kill	`kill_sessions([captured origin session])`, distinct from server quit	Incompatible; only read-only `session.snapshot` exists
+# action	alert	Zellij note	Herdr note
+menu:open	none	-	-
+menu:return	none	-	-
+menu:quit	none	-	-
+menu.page:prev	none	-	-
+menu.page:next	none	-	-
+config:reload	none	-	-
+keyboard:send	warning	Supports text, control characters, Alt combinations, common navigation keys, and function keys through F12. It does not support Super or Hyper combinations, keypad or media keys, or function keys F13 and above.	-
+command:execute	none	-	-
+tab:create	warning	Does not support `workspace-id`. All other parameters are supported.	-
+tab:close	none	-	-
+tab:rename	warning	Requires `name`; Zellij cannot prompt for a name.	Requires `name`; Herdr cannot prompt for a name.
+tab:focus	warning	Supports `index`, `next`, and `previous`. It does not support `left`, `right`, `up`, or `down`.	Not supported.
+tab:move	warning	Supports `direction` with `left`, `right`, `up`, or `down`. It does not support `index`.	Supports `index`. It does not support `direction`.
+tab:swap	warning	Not supported.	Supports `index`. Herdr performs the swap as two moves. If the second move fails, Herdr does not undo the first move.
+pane:create	warning	Supported. Zellij chooses where to place the pane.	Not supported. Use `pane:split` with `right` or `down`.
+pane:split	warning	`direction` may be omitted; Zellij then chooses placement. All four directions are supported. `focus: false` is not supported. A `cwd` without `program` is not supported.	Requires `direction`, which must be `right` or `down`.
+pane:close	none	-	-
+pane:focus	warning	Supports `index` and all four directions.	Supports all four directions. It does not support `index`.
+pane:move	warning	Supports all four directions. It does not support `index`.	Not supported.
+pane:swap	warning	Not supported.	Supports all four directions. It does not support `index`.
+pane:resize	warning	Supports a direction but not `amount`. Each action changes the pane by one Zellij resize step.	Supports all four directions and an optional numeric `amount`.
+pane:zoom	warning	Can only toggle the current state. Do not set `enabled`.	Can toggle the current state or set `enabled` to `true` or `false`.
+pane:fullscreen	warning	Can only toggle the current state. Do not set `enabled`.	Not supported.
+pane:floating	warning	Can only toggle the current state. Do not set `enabled`.	Not supported.
+pane:frame	warning	Not supported.	Not supported.
+session:create	warning	Not supported.	Not supported.
+session:attach	warning	Supported. Zellij moves this terminal connection to the named session.	Not supported.
+session:switch	warning	Supported.	Not supported.
+session:rename	warning	Supported.	Not supported.
+session:detach	warning	Supported.	Not supported.
+session:quit	warning	Not supported. Zellij can stop the entire server, but it cannot close only the session where you opened the menu through this action.	Not supported.
+session:kill	caution	Terminates the session in which the menu was opened, including the programs running in that session.	Not supported.

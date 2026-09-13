@@ -1,0 +1,157 @@
+actions:
+  menu:open:
+    summary: Opens a named menu or an inline submenu.
+    parameters:
+      menu: Name of a top-level menu in the configuration. `$origin.` references are not supported.
+      submenu: Menu definition written directly inside the action.
+
+  menu:return:
+    summary: Returns to the previous menu. If there is no previous menu, closes the menu.
+
+  menu:quit:
+    summary: Closes the menu and returns keyboard focus to the pane where you opened it.
+
+  menu.page:prev:
+    summary: Shows the previous page of menu items.
+
+  menu.page:next:
+    summary: Shows the next page of menu items.
+
+  config:reload:
+    summary: Reloads the Muxe configuration files.
+
+  keyboard:send:
+    summary: Sends keys or text to the pane where you opened the menu.
+    parameters:
+      keys: Keys to send in order, such as `["ctrl+c", "enter"]`.
+      text: Text to send unchanged.
+
+  command:execute:
+    summary: Starts a command on the local machine.
+    parameters:
+      program: Executable name or path.
+      args: Arguments passed to the program.
+      cwd: Directory in which to start the command. A relative path starts from the working directory of the pane where you opened the menu.
+      env: Environment variables for the command. Each value may be a string or a `$origin.` reference.
+
+  tab:create:
+    summary: Creates a tab.
+    parameters:
+      workspace-id: Workspace in which to create the tab.
+      name: Name shown for the new tab.
+      focus: Set to `false` to leave focus on the tab where you opened the menu. `$origin.` references are not supported.
+      program: Program to start in the first pane.
+      args: Arguments passed to `program`.
+      cwd: Working directory of the first pane.
+
+  tab:close:
+    summary: Closes the tab where you opened the menu.
+
+  tab:rename:
+    summary: Renames the tab where you opened the menu.
+    parameters:
+      name: New tab name.
+
+  tab:focus:
+    summary: Focuses another tab.
+    parameters:
+      index: Index of the tab to focus.
+      direction: Relative tab direction.
+
+  tab:move:
+    summary: Moves the tab where you opened the menu to another position.
+    parameters:
+      direction: Direction in which to move the tab.
+      index: Position to which to move the tab.
+
+  tab:swap:
+    summary: Exchanges the tab where you opened the menu with another tab.
+    parameters:
+      index: Index of the other tab.
+      direction: Direction of the other tab.
+
+  pane:create:
+    summary: Requests a new pane without specifying its position.
+
+  pane:split:
+    summary: Splits the pane where you opened the menu.
+    parameters:
+      direction: Side on which to create the new pane.
+      focus: Set to `false` to leave focus on the existing pane. `$origin.` references are not supported.
+      program: Program to start in the new pane.
+      args: Arguments passed to `program`.
+      cwd: Working directory of the new pane.
+
+  pane:close:
+    summary: Closes the pane where you opened the menu.
+
+  pane:focus:
+    summary: Focuses another pane.
+    parameters:
+      index: Index of the pane to focus.
+      direction: Direction of the pane to focus.
+
+  pane:move:
+    summary: Moves the pane where you opened the menu.
+    parameters:
+      direction: Direction in which to move the pane.
+      index: Position to which to move the pane.
+
+  pane:swap:
+    summary: Exchanges the pane where you opened the menu with another pane.
+    parameters:
+      index: Index of the other pane.
+      direction: Direction of the other pane.
+
+  pane:resize:
+    summary: Changes the size of the pane where you opened the menu.
+    parameters:
+      direction: Edge to move. Use `left`, `right`, `up`, or `down`.
+      amount: Distance by which to move the selected edge.
+
+  pane:zoom:
+    summary: Makes one pane fill the tab's pane area, or restores the tab's layout.
+    parameters:
+      enabled: Set to `true` to zoom or `false` to restore the layout. `$origin.` references are not supported.
+
+  pane:fullscreen:
+    summary: Makes one pane fill the terminal, or restores the Zellij interface.
+    parameters:
+      enabled: Set to `true` to enter fullscreen or `false` to leave it. `$origin.` references are not supported.
+
+  pane:floating:
+    summary: Moves a pane between the tiled layout and the floating layer.
+    parameters:
+      enabled: Set to `true` for a floating pane or `false` for a tiled pane. `$origin.` references are not supported.
+
+  pane:frame:
+    summary: Shows or hides pane borders.
+    parameters:
+      visible: Set to `true` to show borders or `false` to hide them. `$origin.` references are not supported.
+
+  session:create:
+    summary: Requests a new session.
+
+  session:attach:
+    summary: Connects the terminal running Muxe to an existing session.
+    parameters:
+      name: Name of the session.
+
+  session:switch:
+    summary: Moves the terminal running Muxe from its session to another session.
+    parameters:
+      name: Name of the destination session.
+
+  session:rename:
+    summary: Renames the session where you opened the menu.
+    parameters:
+      name: New session name.
+
+  session:detach:
+    summary: Disconnects the terminal running Muxe from the session where you opened the menu.
+
+  session:quit:
+    summary: Requests a clean close of the session where you opened the menu.
+
+  session:kill:
+    summary: Immediately stops the session where you opened the menu and the programs running in it.

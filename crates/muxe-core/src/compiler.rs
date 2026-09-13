@@ -5,9 +5,11 @@ use std::time::Duration;
 use regex::Regex;
 
 use crate::action::{
-    ActionKind, ActionScalar, ActionSpec, CommandAction, ConfigAction, CreateCommand,
-    IndexOrDirection, KeyboardAction, MenuAction, MenuTarget, NativeActionCandidate, PaneAction,
-    PortableAction, PortableActionKind, SessionAction, TabAction,
+    ActionConstraint, ActionKind, ActionParameterName, ActionParameterType, ActionScalar,
+    ActionSpec, CommandAction, ConfigAction, ConstraintErrorLocation, ConstraintValidationPhase,
+    CreateCommand, Direction, IndexOrDirection, KeyboardAction, MenuAction, MenuTarget,
+    NativeActionCandidate, PaneAction, PortableAction, PortableActionKind, PortableActionSchema,
+    SessionAction, TabAction, portable_action_definitions,
 };
 use crate::condition::ConditionProgram;
 use crate::config::{
@@ -1080,31 +1082,23 @@ impl MenuCompiler<'_> {
         fields: &[ConfigField],
         span: SourceSpan,
     ) -> Result<(ActionSpec, ExecutionCapabilities), Vec<ConfigDiagnostic>> {
-        let action = match kind {
-            PortableActionKind::MenuOpen => {
-                let menu = field_named(fields, "menu");
-                let submenu = field_named(fields, "submenu");
-                if menu.is_some() == submenu.is_some() {
-                    return Err(vec![ConfigDiagnostic::error(
-                        DiagnosticCode::InvalidActionArguments,
-                        "menu:open requires exactly one of `menu` or `submenu`",
-                        span,
-                    )]);
-                }
-                ensure_action_fields(fields, &["menu", "submenu"])?;
-                let target = if let Some(menu) = menu {
-                    let target = expect_string(&menu.value, "`menu` must be a menu ID")?.to_owned();
+        let schema = kind.schema();
+        validate_portable_action_fields(schema, fields, &span)?;
+        let parsed = parse_portable_action_fields(schema, fields)?;
+        let action = match parsed {
+            ParsedPortableAction::MenuOpen { menu, submenu } => {
+                let target = if let Some((target, target_span)) = menu {
                     if !self.known_menus.contains(&target) {
                         return Err(vec![ConfigDiagnostic::error(
                             DiagnosticCode::InvalidMenuReference,
                             format!("unknown menu `{target}`"),
-                            menu.value.span.clone(),
+                            target_span,
                         )]);
                     }
                     MenuTarget::Named(target)
                 } else {
-                    let submenu = submenu.expect("checked");
-                    let inline_id = required_field(&submenu.value, "_muxe_inline_id")?;
+                    let submenu = submenu.expect("schema requires menu or submenu");
+                    let inline_id = required_field(&submenu, "_muxe_inline_id")?;
                     let target =
                         expect_string(&inline_id.value, "invalid compiler inline menu ID")?
                             .to_owned();
@@ -1112,260 +1106,258 @@ impl MenuCompiler<'_> {
                 };
                 PortableAction::Menu(MenuAction::Open(target))
             }
-            PortableActionKind::MenuReturn => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Menu(MenuAction::Return)
-            }
-            PortableActionKind::MenuQuit => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Menu(MenuAction::Quit)
-            }
-            PortableActionKind::MenuPagePrev => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Menu(MenuAction::PagePrev)
-            }
-            PortableActionKind::MenuPageNext => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Menu(MenuAction::PageNext)
-            }
-            PortableActionKind::ConfigReload => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Config(ConfigAction::Reload)
-            }
-            PortableActionKind::KeyboardSend => {
-                if field_named(fields, "sequence").is_some() {
-                    return Err(vec![ConfigDiagnostic::error(
-                        DiagnosticCode::UnsupportedFeature,
-                        "keyboard:send `sequence` is not supported in schema version 1",
-                        field_named(fields, "sequence")
-                            .expect("checked")
-                            .value
-                            .span
-                            .clone(),
-                    )]);
-                }
-                ensure_action_fields(fields, &["keys", "text", "sequence"])?;
-                match (field_named(fields, "keys"), field_named(fields, "text")) {
-                    (Some(keys), None) => PortableAction::Keyboard(KeyboardAction::SendKeys(
-                        action_key_sequence(&keys.value)?,
-                    )),
-                    (None, Some(text)) => {
-                        PortableAction::Keyboard(KeyboardAction::SendText(action_string_scalar(
-                            &text.value,
-                            "keyboard text",
-                            ContextAllowance::StringOnly,
-                        )?))
-                    }
-                    _ => {
-                        return Err(vec![ConfigDiagnostic::error(
-                            DiagnosticCode::InvalidActionArguments,
-                            "keyboard:send requires exactly one of `keys` or `text`",
-                            span,
-                        )]);
-                    }
+            ParsedPortableAction::MenuReturn {} => PortableAction::Menu(MenuAction::Return),
+            ParsedPortableAction::MenuQuit {} => PortableAction::Menu(MenuAction::Quit),
+            ParsedPortableAction::MenuPagePrev {} => PortableAction::Menu(MenuAction::PagePrev),
+            ParsedPortableAction::MenuPageNext {} => PortableAction::Menu(MenuAction::PageNext),
+            ParsedPortableAction::ConfigReload {} => PortableAction::Config(ConfigAction::Reload),
+            ParsedPortableAction::KeyboardSend {
+                sequence,
+                keys,
+                text,
+            } => {
+                debug_assert!(sequence.is_none(), "unsupported fields are rejected");
+                if let Some(text) = text {
+                    PortableAction::Keyboard(KeyboardAction::SendText(text))
+                } else {
+                    PortableAction::Keyboard(KeyboardAction::SendKeys(
+                        keys.expect("schema requires keys or text"),
+                    ))
                 }
             }
-            PortableActionKind::CommandExecute => {
-                ensure_action_fields(fields, &["program", "args", "cwd", "env"])?;
-                let program = action_string_scalar(
-                    &required_action_field(fields, "program", &span)?.value,
-                    "command program",
-                    ContextAllowance::Textual,
-                )?;
-                let args = action_string_sequence(
-                    field_named(fields, "args").map(|field| &field.value),
-                    "command args",
-                    ContextAllowance::Textual,
-                )?;
-                let cwd = field_named(fields, "cwd")
-                    .map(|field| {
-                        action_string_scalar(
-                            &field.value,
-                            "command cwd",
-                            ContextAllowance::AbsolutePath,
-                        )
-                    })
-                    .transpose()?;
-                let env = action_string_mapping(
-                    field_named(fields, "env").map(|field| &field.value),
-                    "command env",
-                    ContextAllowance::Textual,
-                )?;
-                PortableAction::Command(CommandAction {
-                    program,
-                    args,
-                    cwd,
-                    env,
-                })
+            ParsedPortableAction::CommandExecute {
+                program,
+                args,
+                cwd,
+                env,
+            } => PortableAction::Command(CommandAction {
+                program,
+                args: args.unwrap_or_default(),
+                cwd,
+                env: env.unwrap_or_default(),
+            }),
+            ParsedPortableAction::TabCreate {
+                workspace_id,
+                name,
+                focus,
+                program,
+                args,
+                cwd,
+            } => PortableAction::Tab(TabAction::Create {
+                workspace_id,
+                name,
+                focus,
+                command: create_command(program, args.unwrap_or_default(), cwd),
+            }),
+            ParsedPortableAction::TabClose {} => PortableAction::Tab(TabAction::Close),
+            ParsedPortableAction::TabRename { name } => {
+                PortableAction::Tab(TabAction::Rename { name })
             }
-            PortableActionKind::TabCreate => {
-                ensure_action_fields(
-                    fields,
-                    &["workspace-id", "name", "focus", "program", "args", "cwd"],
-                )?;
-                let workspace_id = field_named(fields, "workspace-id")
-                    .map(|field| {
-                        action_string_scalar(
-                            &field.value,
-                            "tab workspace-id",
-                            ContextAllowance::WorkspaceId,
-                        )
-                    })
-                    .transpose()?;
-                let name = field_named(fields, "name")
-                    .map(|field| {
-                        action_string_scalar(&field.value, "tab name", ContextAllowance::Textual)
-                    })
-                    .transpose()?;
-                let focus = field_named(fields, "focus")
-                    .map(|field| action_bool_scalar(&field.value, "tab focus"))
-                    .transpose()?;
-                let command = create_command(fields, "tab")?;
-                PortableAction::Tab(TabAction::Create {
-                    workspace_id,
-                    name,
-                    focus,
-                    command,
-                })
+            ParsedPortableAction::TabFocus { index, direction } => {
+                PortableAction::Tab(TabAction::Focus(index_or_direction(index, direction)))
             }
-            PortableActionKind::TabClose => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Tab(TabAction::Close)
+            ParsedPortableAction::TabMove { direction, index } => {
+                PortableAction::Tab(TabAction::Move(index_or_direction(index, direction)))
             }
-            PortableActionKind::TabRename => {
-                ensure_action_fields(fields, &["name"])?;
-                PortableAction::Tab(TabAction::Rename {
-                    name: field_named(fields, "name")
-                        .map(|field| {
-                            action_string_scalar(
-                                &field.value,
-                                "tab name",
-                                ContextAllowance::Textual,
-                            )
-                        })
-                        .transpose()?,
-                })
+            ParsedPortableAction::TabSwap { index, direction } => {
+                PortableAction::Tab(TabAction::Swap(index_or_direction(index, direction)))
             }
-            PortableActionKind::TabFocus => {
-                PortableAction::Tab(TabAction::Focus(index_or_direction(fields, &span)?))
+            ParsedPortableAction::PaneCreate {} => PortableAction::Pane(PaneAction::Create),
+            ParsedPortableAction::PaneSplit {
+                direction,
+                focus,
+                program,
+                args,
+                cwd,
+            } => PortableAction::Pane(PaneAction::Split {
+                direction,
+                focus,
+                command: create_command(program, args.unwrap_or_default(), cwd),
+            }),
+            ParsedPortableAction::PaneClose {} => PortableAction::Pane(PaneAction::Close),
+            ParsedPortableAction::PaneFocus { index, direction } => {
+                PortableAction::Pane(PaneAction::Focus(index_or_direction(index, direction)))
             }
-            PortableActionKind::TabMove => {
-                PortableAction::Tab(TabAction::Move(index_or_direction(fields, &span)?))
+            ParsedPortableAction::PaneMove { direction, index } => {
+                PortableAction::Pane(PaneAction::Move(index_or_direction(index, direction)))
             }
-            PortableActionKind::TabSwap => {
-                PortableAction::Tab(TabAction::Swap(index_or_direction(fields, &span)?))
+            ParsedPortableAction::PaneSwap { index, direction } => {
+                PortableAction::Pane(PaneAction::Swap(index_or_direction(index, direction)))
             }
-            PortableActionKind::PaneCreate => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Pane(PaneAction::Create)
-            }
-            PortableActionKind::PaneSplit => {
-                ensure_action_fields(fields, &["direction", "focus", "program", "args", "cwd"])?;
-                let direction = field_named(fields, "direction")
-                    .map(|field| action_direction_scalar(&field.value, "pane direction"))
-                    .transpose()?;
-                let focus = field_named(fields, "focus")
-                    .map(|field| action_bool_scalar(&field.value, "pane focus"))
-                    .transpose()?;
-                let command = create_command(fields, "pane")?;
-                PortableAction::Pane(PaneAction::Split {
-                    direction,
-                    focus,
-                    command,
-                })
-            }
-            PortableActionKind::PaneClose => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Pane(PaneAction::Close)
-            }
-            PortableActionKind::PaneFocus => {
-                PortableAction::Pane(PaneAction::Focus(index_or_direction(fields, &span)?))
-            }
-            PortableActionKind::PaneMove => {
-                PortableAction::Pane(PaneAction::Move(index_or_direction(fields, &span)?))
-            }
-            PortableActionKind::PaneSwap => {
-                PortableAction::Pane(PaneAction::Swap(index_or_direction(fields, &span)?))
-            }
-            PortableActionKind::PaneResize => {
-                ensure_action_fields(fields, &["direction", "amount"])?;
-                let direction = action_direction_scalar(
-                    &required_action_field(fields, "direction", &span)?.value,
-                    "pane direction",
-                )?;
-                let amount = field_named(fields, "amount")
-                    .map(|field| action_scalar(&field.value, "pane amount"))
-                    .transpose()?;
+            ParsedPortableAction::PaneResize { direction, amount } => {
                 PortableAction::Pane(PaneAction::Resize { direction, amount })
             }
-            PortableActionKind::PaneZoom => PortableAction::Pane(PaneAction::Zoom {
-                enabled: optional_action_bool_field(fields, "enabled")?,
-            }),
-            PortableActionKind::PaneFullscreen => PortableAction::Pane(PaneAction::Fullscreen {
-                enabled: optional_action_bool_field(fields, "enabled")?,
-            }),
-            PortableActionKind::PaneFloating => PortableAction::Pane(PaneAction::Floating {
-                enabled: optional_action_bool_field(fields, "enabled")?,
-            }),
-            PortableActionKind::PaneFrame => {
-                ensure_action_fields(fields, &["visible"])?;
-                PortableAction::Pane(PaneAction::Frame {
-                    visible: field_named(fields, "visible")
-                        .map(|field| action_bool_scalar(&field.value, "pane visible"))
-                        .transpose()?,
-                })
+            ParsedPortableAction::PaneZoom { enabled } => {
+                PortableAction::Pane(PaneAction::Zoom { enabled })
             }
-            PortableActionKind::SessionCreate => {
-                ensure_action_fields(fields, &[])?;
+            ParsedPortableAction::PaneFullscreen { enabled } => {
+                PortableAction::Pane(PaneAction::Fullscreen { enabled })
+            }
+            ParsedPortableAction::PaneFloating { enabled } => {
+                PortableAction::Pane(PaneAction::Floating { enabled })
+            }
+            ParsedPortableAction::PaneFrame { visible } => {
+                PortableAction::Pane(PaneAction::Frame { visible })
+            }
+            ParsedPortableAction::SessionCreate {} => {
                 PortableAction::Session(SessionAction::Create)
             }
-            PortableActionKind::SessionAttach => PortableAction::Session(SessionAction::Attach {
-                name: required_string_action_field(fields, "name", "session name", &span)?,
-            }),
-            PortableActionKind::SessionSwitch => PortableAction::Session(SessionAction::Switch {
-                name: required_string_action_field(fields, "name", "session name", &span)?,
-            }),
-            PortableActionKind::SessionRename => PortableAction::Session(SessionAction::Rename {
-                name: required_string_action_field(fields, "name", "session name", &span)?,
-            }),
-            PortableActionKind::SessionDetach => {
-                ensure_action_fields(fields, &[])?;
+            ParsedPortableAction::SessionAttach { name } => {
+                PortableAction::Session(SessionAction::Attach { name })
+            }
+            ParsedPortableAction::SessionSwitch { name } => {
+                PortableAction::Session(SessionAction::Switch { name })
+            }
+            ParsedPortableAction::SessionRename { name } => {
+                PortableAction::Session(SessionAction::Rename { name })
+            }
+            ParsedPortableAction::SessionDetach {} => {
                 PortableAction::Session(SessionAction::Detach)
             }
-            PortableActionKind::SessionQuit => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Session(SessionAction::Quit)
-            }
-            PortableActionKind::SessionKill => {
-                ensure_action_fields(fields, &[])?;
-                PortableAction::Session(SessionAction::Kill)
-            }
+            ParsedPortableAction::SessionQuit {} => PortableAction::Session(SessionAction::Quit),
+            ParsedPortableAction::SessionKill {} => PortableAction::Session(SessionAction::Kill),
         };
-        let capabilities = kind.descriptor().capabilities;
-        Ok((ActionSpec::Portable(action), capabilities))
+        Ok((ActionSpec::Portable(action), schema.capabilities))
     }
 }
-fn positional_fields(kind: &ActionKind) -> &'static [&'static str] {
-    match kind {
-        ActionKind::Portable(PortableActionKind::MenuOpen) => &["menu"],
-        ActionKind::Portable(
-            PortableActionKind::PaneSplit
-            | PortableActionKind::TabMove
-            | PortableActionKind::PaneMove,
-        ) => &["direction"],
-        ActionKind::Portable(
-            PortableActionKind::TabFocus
-            | PortableActionKind::TabSwap
-            | PortableActionKind::PaneFocus
-            | PortableActionKind::PaneSwap,
-        ) => &["index"],
-        ActionKind::Portable(
-            PortableActionKind::SessionAttach
-            | PortableActionKind::SessionSwitch
-            | PortableActionKind::SessionRename,
-        ) => &["name"],
-        _ => &[],
+fn positional_field(kind: &ActionKind, position: usize) -> Option<&'static str> {
+    let ActionKind::Portable(portable) = kind else {
+        return None;
+    };
+    portable
+        .schema()
+        .parameters
+        .iter()
+        .find(|parameter| parameter.positional == Some(position))
+        .map(|parameter| parameter.name.as_str())
+}
+fn validate_portable_action_fields(
+    schema: PortableActionSchema,
+    fields: &[ConfigField],
+    fallback_span: &SourceSpan,
+) -> Result<(), Vec<ConfigDiagnostic>> {
+    for constraint in schema.constraints {
+        if let ActionConstraint::Unsupported { parameter, message } = constraint
+            && let Some(field) = field_named(fields, parameter.as_str())
+        {
+            return Err(vec![ConfigDiagnostic::error(
+                DiagnosticCode::UnsupportedFeature,
+                *message,
+                field.value.span.clone(),
+            )]);
+        }
     }
+    for constraint in schema.constraints {
+        if let ActionConstraint::ExactlyOne {
+            parameters,
+            message,
+            validation_phase: ConstraintValidationPhase::BeforeFields,
+            error_location,
+        } = constraint
+        {
+            validate_exactly_one(fields, fallback_span, parameters, message, *error_location)?;
+        }
+    }
+
+    let mut errors = fields
+        .iter()
+        .filter(|field| {
+            !schema
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name.as_str() == field.name)
+        })
+        .map(|field| {
+            ConfigDiagnostic::error(
+                DiagnosticCode::InvalidActionArguments,
+                format!("unknown action argument `{}`", field.name),
+                field.name_span.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    errors.extend(
+        schema
+            .parameters
+            .iter()
+            .filter(|parameter| {
+                parameter.required && field_named(fields, parameter.name.as_str()).is_none()
+            })
+            .map(|parameter| {
+                ConfigDiagnostic::error(
+                    DiagnosticCode::MissingField,
+                    format!("action requires `{}`", parameter.name),
+                    fields
+                        .first()
+                        .map_or_else(|| fallback_span.clone(), |field| field.value.span.clone()),
+                )
+            }),
+    );
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    for constraint in schema.constraints {
+        match constraint {
+            ActionConstraint::ExactlyOne {
+                parameters,
+                message,
+                validation_phase: ConstraintValidationPhase::AfterFields,
+                error_location,
+            } => {
+                validate_exactly_one(fields, fallback_span, parameters, message, *error_location)?;
+            }
+            ActionConstraint::ExactlyOne {
+                validation_phase: ConstraintValidationPhase::BeforeFields,
+                ..
+            } => {}
+            ActionConstraint::Requires {
+                parameter,
+                required_parameter,
+                message,
+            } if field_named(fields, parameter.as_str()).is_some()
+                && field_named(fields, required_parameter.as_str()).is_none() =>
+            {
+                let field = field_named(fields, parameter.as_str()).expect("presence checked");
+                return Err(vec![ConfigDiagnostic::error(
+                    DiagnosticCode::InvalidActionArguments,
+                    *message,
+                    field.value.span.clone(),
+                )]);
+            }
+            ActionConstraint::Requires { .. } | ActionConstraint::Unsupported { .. } => {}
+        }
+    }
+    Ok(())
+}
+fn validate_exactly_one(
+    fields: &[ConfigField],
+    fallback_span: &SourceSpan,
+    parameters: &[ActionParameterName],
+    message: &str,
+    error_location: ConstraintErrorLocation,
+) -> Result<(), Vec<ConfigDiagnostic>> {
+    let count = parameters
+        .iter()
+        .filter(|parameter| field_named(fields, parameter.as_str()).is_some())
+        .count();
+    if count == 1 {
+        return Ok(());
+    }
+    let span = match error_location {
+        ConstraintErrorLocation::FirstFieldValue => fields
+            .first()
+            .map_or_else(|| fallback_span.clone(), |field| field.value.span.clone()),
+        ConstraintErrorLocation::Action => fallback_span.clone(),
+    };
+    Err(vec![ConfigDiagnostic::error(
+        DiagnosticCode::InvalidActionArguments,
+        message,
+        span,
+    )])
 }
 
 fn validate_execution(
@@ -1414,6 +1406,321 @@ impl ExecutionPolicyExt for ExecutionPolicy {
     }
 }
 
+enum ParsedActionValue {
+    Scalar(ActionScalar),
+    Sequence(Vec<ActionScalar>),
+    Mapping(BTreeMap<String, ActionScalar>),
+    MenuName { value: String, span: SourceSpan },
+    MenuMapping(ConfigValue),
+}
+
+struct ParsedActionFields(BTreeMap<ActionParameterName, ParsedActionValue>);
+
+impl ParsedActionFields {
+    fn take_scalar(&mut self, name: ActionParameterName) -> Option<ActionScalar> {
+        self.0.remove(&name).map(|value| match value {
+            ParsedActionValue::Scalar(value) => value,
+            _ => unreachable!("schema type for {name} is scalar"),
+        })
+    }
+
+    fn take_sequence(&mut self, name: ActionParameterName) -> Option<Vec<ActionScalar>> {
+        self.0.remove(&name).map(|value| match value {
+            ParsedActionValue::Sequence(value) => value,
+            _ => unreachable!("schema type for {name} is a sequence"),
+        })
+    }
+
+    fn take_mapping(
+        &mut self,
+        name: ActionParameterName,
+    ) -> Option<BTreeMap<String, ActionScalar>> {
+        self.0.remove(&name).map(|value| match value {
+            ParsedActionValue::Mapping(value) => value,
+            _ => unreachable!("schema type for {name} is a mapping"),
+        })
+    }
+
+    fn take_menu_name(&mut self, name: ActionParameterName) -> Option<(String, SourceSpan)> {
+        self.0.remove(&name).map(|value| match value {
+            ParsedActionValue::MenuName { value, span } => (value, span),
+            _ => unreachable!("schema type for {name} is a menu name"),
+        })
+    }
+
+    fn take_menu_mapping(&mut self, name: ActionParameterName) -> Option<ConfigValue> {
+        self.0.remove(&name).map(|value| match value {
+            ParsedActionValue::MenuMapping(value) => value,
+            _ => unreachable!("schema type for {name} is a menu mapping"),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+macro_rules! parsed_value_type {
+    (MenuName) => {
+        (String, SourceSpan)
+    };
+    (MenuMapping) => {
+        ConfigValue
+    };
+    (Unsupported) => {
+        ()
+    };
+    (KeySequence) => {
+        Vec<ActionScalar>
+    };
+    (StringContextOnly) => {
+        ActionScalar
+    };
+    (TextualContext) => {
+        ActionScalar
+    };
+    (TextualContextSequence) => {
+        Vec<ActionScalar>
+    };
+    (ContextPath) => {
+        ActionScalar
+    };
+    (TextualContextMapping) => {
+        BTreeMap<String, ActionScalar>
+    };
+    (ContextWorkspaceId) => {
+        ActionScalar
+    };
+    (Boolean) => {
+        ActionScalar
+    };
+    (Index) => {
+        ActionScalar
+    };
+    (Direction) => {
+        ActionScalar
+    };
+    (Scalar) => {
+        ActionScalar
+    };
+}
+
+macro_rules! take_parsed_value {
+    ($fields:expr, $parameter:ident, MenuName) => {
+        $fields.take_menu_name(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, MenuMapping) => {
+        $fields.take_menu_mapping(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, Unsupported) => {
+        Option::<()>::None
+    };
+    ($fields:expr, $parameter:ident, KeySequence) => {
+        $fields.take_sequence(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, StringContextOnly) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, TextualContext) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, TextualContextSequence) => {
+        $fields.take_sequence(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, ContextPath) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, TextualContextMapping) => {
+        $fields.take_mapping(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, ContextWorkspaceId) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, Boolean) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, Index) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, Direction) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, Scalar) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+}
+
+macro_rules! parsed_parameter_type {
+    ($value_type:ident [true]) => {
+        parsed_value_type!($value_type)
+    };
+    ($value_type:ident) => {
+        Option<parsed_value_type!($value_type)>
+    };
+}
+
+macro_rules! take_parsed_parameter {
+    ($fields:expr, $parameter:ident, $value_type:ident [true]) => {
+        take_parsed_value!($fields, $parameter, $value_type)
+            .unwrap_or_else(|| unreachable!("schema requires {}", ActionParameterName::$parameter))
+    };
+    ($fields:expr, $parameter:ident, $value_type:ident) => {
+        take_parsed_value!($fields, $parameter, $value_type)
+    };
+}
+
+macro_rules! define_parsed_portable_actions {
+    (
+        $(
+            $variant:ident {
+                name: $name:literal,
+                category: $category:ident,
+                execution: $execution:expr,
+                capabilities: $capabilities:expr,
+                parameters: [
+                    $(
+                        $field:ident as $parameter:ident : $value_type:ident
+                        $([required = $required:tt])?
+                        $([position = $position:literal])?
+                        $([default = $omitted:ident])?;
+                    )*
+                ],
+                constraints: [
+                    $($constraint:expr;)*
+                ],
+            }
+        )*
+    ) => {
+        enum ParsedPortableAction {
+            $(
+                $variant {
+                    $(
+                        $field: parsed_parameter_type!($value_type $([$required])?),
+                    )*
+                },
+            )*
+        }
+
+        impl ParsedPortableAction {
+            fn from_fields(kind: PortableActionKind, mut fields: ParsedActionFields) -> Self {
+                let parsed = match kind {
+                    $(
+                        PortableActionKind::$variant => Self::$variant {
+                            $(
+                                $field: take_parsed_parameter!(
+                                    &mut fields,
+                                    $parameter,
+                                    $value_type
+                                    $([$required])?
+                                ),
+                            )*
+                        },
+                    )*
+                };
+                debug_assert!(fields.is_empty(), "all parsed action fields are consumed");
+                parsed
+            }
+        }
+    };
+}
+
+portable_action_definitions!(define_parsed_portable_actions);
+
+fn parse_portable_action_fields(
+    schema: PortableActionSchema,
+    fields: &[ConfigField],
+) -> Result<ParsedPortableAction, Vec<ConfigDiagnostic>> {
+    let mut parsed = BTreeMap::new();
+    for parameter in schema.parameters {
+        let Some(field) = field_named(fields, parameter.name.as_str()) else {
+            continue;
+        };
+        let label = action_parameter_label(schema, parameter.name);
+        let value =
+            match parameter.value_type {
+                ActionParameterType::MenuName => ParsedActionValue::MenuName {
+                    value: expect_string(&field.value, "`menu` must be a menu ID")?.to_owned(),
+                    span: field.value.span.clone(),
+                },
+                ActionParameterType::MenuMapping => {
+                    mapping_fields(&field.value, "`submenu` must be a menu mapping")?;
+                    ParsedActionValue::MenuMapping(field.value.clone())
+                }
+                ActionParameterType::Unsupported => continue,
+                ActionParameterType::KeySequence => {
+                    ParsedActionValue::Sequence(action_key_sequence(&field.value)?)
+                }
+                ActionParameterType::StringContextOnly => ParsedActionValue::Scalar(
+                    action_string_scalar(&field.value, &label, ContextAllowance::StringOnly)?,
+                ),
+                ActionParameterType::TextualContext => ParsedActionValue::Scalar(
+                    action_string_scalar(&field.value, &label, ContextAllowance::Textual)?,
+                ),
+                ActionParameterType::TextualContextSequence => ParsedActionValue::Sequence(
+                    action_string_sequence(Some(&field.value), &label, ContextAllowance::Textual)?,
+                ),
+                ActionParameterType::ContextPath => ParsedActionValue::Scalar(
+                    action_string_scalar(&field.value, &label, ContextAllowance::AbsolutePath)?,
+                ),
+                ActionParameterType::TextualContextMapping => ParsedActionValue::Mapping(
+                    action_string_mapping(Some(&field.value), &label, ContextAllowance::Textual)?,
+                ),
+                ActionParameterType::ContextWorkspaceId => ParsedActionValue::Scalar(
+                    action_string_scalar(&field.value, &label, ContextAllowance::WorkspaceId)?,
+                ),
+                ActionParameterType::Boolean => {
+                    ParsedActionValue::Scalar(action_bool_scalar(&field.value, &label)?)
+                }
+                ActionParameterType::Index => {
+                    ParsedActionValue::Scalar(action_index_scalar(&field.value)?)
+                }
+                ActionParameterType::Direction => {
+                    ParsedActionValue::Scalar(action_direction_scalar(&field.value, &label)?)
+                }
+                ActionParameterType::Scalar => {
+                    ParsedActionValue::Scalar(action_scalar(&field.value, &label)?)
+                }
+            };
+        assert!(
+            parsed.insert(parameter.name, value).is_none(),
+            "schema parameter names are unique"
+        );
+    }
+    Ok(ParsedPortableAction::from_fields(
+        schema.kind,
+        ParsedActionFields(parsed),
+    ))
+}
+
+fn action_parameter_label(schema: PortableActionSchema, parameter: ActionParameterName) -> String {
+    let parameter_type = schema
+        .parameters
+        .iter()
+        .find(|candidate| candidate.name == parameter)
+        .map(|candidate| candidate.value_type)
+        .expect("label requested for declared parameter");
+    match (parameter_type, parameter) {
+        (ActionParameterType::StringContextOnly, _) => return "keyboard text".to_owned(),
+        (_, ActionParameterName::Enabled) => return "enabled".to_owned(),
+        (_, ActionParameterName::Visible) => return "pane visible".to_owned(),
+        (_, ActionParameterName::Index) => return "index".to_owned(),
+        _ => {}
+    }
+    let is_choice = schema.constraints.iter().any(|constraint| {
+        matches!(
+            constraint,
+            ActionConstraint::ExactlyOne { parameters, .. } if parameters.contains(&parameter)
+        )
+    });
+    if is_choice {
+        parameter.to_string()
+    } else {
+        format!(
+            "{} {parameter}",
+            schema.category.to_string().to_ascii_lowercase()
+        )
+    }
+}
 fn validate_key_capabilities(
     required: KeyCapabilities,
     active: KeyCapabilities,
@@ -1469,6 +1776,24 @@ fn action_fields(
             "action must be a compact string or tagged mapping",
             value.span.clone(),
         )]),
+    }
+}
+fn create_command(
+    program: Option<ActionScalar>,
+    args: Vec<ActionScalar>,
+    cwd: Option<ActionScalar>,
+) -> CreateCommand {
+    CreateCommand { program, args, cwd }
+}
+
+fn index_or_direction(
+    index: Option<ActionScalar>,
+    direction: Option<ActionScalar>,
+) -> IndexOrDirection {
+    if let Some(index) = index {
+        IndexOrDirection::Index(index)
+    } else {
+        IndexOrDirection::Direction(direction.expect("schema requires index or direction"))
     }
 }
 
@@ -1532,7 +1857,6 @@ fn compact_action_fields(
             span.clone(),
         )]
     })?;
-    let positional = positional_fields(&kind);
     let mut fields = Vec::new();
     let mut named = false;
     let mut position = 0;
@@ -1559,7 +1883,7 @@ fn compact_action_fields(
                     span,
                 )]);
             }
-            let Some(name) = positional.get(position) else {
+            let Some(name) = positional_field(&kind, position) else {
                 return Err(vec![ConfigDiagnostic::error(
                     DiagnosticCode::InvalidActionArguments,
                     "too many positional action arguments",
@@ -1568,7 +1892,7 @@ fn compact_action_fields(
             };
             position += 1;
             (
-                (*name).to_owned(),
+                name.to_owned(),
                 compact_action_scalar(argument, span.clone())?,
             )
         };
@@ -2153,10 +2477,7 @@ fn action_direction_scalar(
 ) -> Result<ActionScalar, Vec<ConfigDiagnostic>> {
     let scalar = action_string_scalar(value, parameter, ContextAllowance::StringOnly)?;
     if let ConfigValueKind::String(value) = &scalar.value.kind
-        && !matches!(
-            value.as_str(),
-            "left" | "right" | "up" | "down" | "next" | "previous"
-        )
+        && value.parse::<Direction>().is_err()
     {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
@@ -2208,39 +2529,6 @@ fn action_index_scalar(value: &ConfigValue) -> Result<ActionScalar, Vec<ConfigDi
         )]),
     }
 }
-fn index_or_direction(
-    fields: &[ConfigField],
-    fallback_span: &SourceSpan,
-) -> Result<IndexOrDirection, Vec<ConfigDiagnostic>> {
-    ensure_action_fields(fields, &["index", "direction"])?;
-    match (
-        field_named(fields, "index"),
-        field_named(fields, "direction"),
-    ) {
-        (Some(index), None) => Ok(IndexOrDirection::Index(action_index_scalar(&index.value)?)),
-        (None, Some(direction)) => Ok(IndexOrDirection::Direction(action_direction_scalar(
-            &direction.value,
-            "direction",
-        )?)),
-        _ => Err(vec![ConfigDiagnostic::error(
-            DiagnosticCode::InvalidActionArguments,
-            "action requires exactly one of `index` or `direction`",
-            fields
-                .first()
-                .map_or_else(|| fallback_span.clone(), |field| field.value.span.clone()),
-        )]),
-    }
-}
-
-fn optional_action_bool_field(
-    fields: &[ConfigField],
-    name: &str,
-) -> Result<Option<ActionScalar>, Vec<ConfigDiagnostic>> {
-    ensure_action_fields(fields, &[name])?;
-    field_named(fields, name)
-        .map(|field| action_bool_scalar(&field.value, name))
-        .transpose()
-}
 
 fn action_key_sequence(value: &ConfigValue) -> Result<Vec<ActionScalar>, Vec<ConfigDiagnostic>> {
     let ConfigValueKind::Sequence(values) = &value.kind else {
@@ -2268,47 +2556,6 @@ fn action_key_sequence(value: &ConfigValue) -> Result<Vec<ActionScalar>, Vec<Con
             Ok(scalar)
         })
         .collect()
-}
-
-fn create_command(
-    fields: &[ConfigField],
-    action: &str,
-) -> Result<CreateCommand, Vec<ConfigDiagnostic>> {
-    let program = field_named(fields, "program")
-        .map(|field| {
-            action_string_scalar(
-                &field.value,
-                &format!("{action} program"),
-                ContextAllowance::Textual,
-            )
-        })
-        .transpose()?;
-    if field_named(fields, "args").is_some() && program.is_none() {
-        return Err(vec![ConfigDiagnostic::error(
-            DiagnosticCode::InvalidActionArguments,
-            format!("{action} args requires `program`"),
-            field_named(fields, "args")
-                .expect("checked")
-                .value
-                .span
-                .clone(),
-        )]);
-    }
-    let args = action_string_sequence(
-        field_named(fields, "args").map(|field| &field.value),
-        &format!("{action} args"),
-        ContextAllowance::Textual,
-    )?;
-    let cwd = field_named(fields, "cwd")
-        .map(|field| {
-            action_string_scalar(
-                &field.value,
-                &format!("{action} cwd"),
-                ContextAllowance::AbsolutePath,
-            )
-        })
-        .transpose()?;
-    Ok(CreateCommand { program, args, cwd })
 }
 
 fn action_string_sequence(
@@ -2461,36 +2708,6 @@ fn required_field_mut<'a>(
     })
 }
 
-fn required_action_field<'a>(
-    fields: &'a [ConfigField],
-    name: &str,
-    fallback_span: &SourceSpan,
-) -> Result<&'a ConfigField, Vec<ConfigDiagnostic>> {
-    field_named(fields, name).ok_or_else(|| {
-        vec![ConfigDiagnostic::error(
-            DiagnosticCode::MissingField,
-            format!("action requires `{name}`"),
-            fields
-                .first()
-                .map_or_else(|| fallback_span.clone(), |field| field.value.span.clone()),
-        )]
-    })
-}
-
-fn required_string_action_field(
-    fields: &[ConfigField],
-    name: &str,
-    parameter: &str,
-    fallback_span: &SourceSpan,
-) -> Result<ActionScalar, Vec<ConfigDiagnostic>> {
-    ensure_action_fields(fields, &[name])?;
-    action_string_scalar(
-        &required_action_field(fields, name, fallback_span)?.value,
-        parameter,
-        ContextAllowance::Textual,
-    )
-}
-
 fn field_named<'a>(fields: &'a [ConfigField], name: &str) -> Option<&'a ConfigField> {
     fields.iter().find(|field| field.name == name)
 }
@@ -2574,27 +2791,6 @@ fn validate_fields(value: &ConfigValue, allowed: &[&str]) -> Result<(), Vec<Conf
             } else {
                 diagnostic
             });
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-fn ensure_action_fields(
-    fields: &[ConfigField],
-    allowed: &[&str],
-) -> Result<(), Vec<ConfigDiagnostic>> {
-    let mut errors = Vec::new();
-    for field in fields {
-        if !allowed.contains(&field.name.as_str()) {
-            errors.push(ConfigDiagnostic::error(
-                DiagnosticCode::InvalidActionArguments,
-                format!("unknown action argument `{}`", field.name),
-                field.name_span.clone(),
-            ));
         }
     }
     if errors.is_empty() {

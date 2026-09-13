@@ -188,15 +188,9 @@ fn context_value_kind(value: ContextValue) -> ConfigValueKind {
         ContextValue::AbsolutePath(value) => {
             ConfigValueKind::String(value.to_string_lossy().into_owned())
         }
-        ContextValue::HostKind(value) => {
-            ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase())
-        }
-        ContextValue::PaneType(value) => {
-            ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase())
-        }
-        ContextValue::InvocationSource(value) => {
-            ConfigValueKind::String(format!("{value:?}").to_ascii_lowercase())
-        }
+        ContextValue::HostKind(value) => ConfigValueKind::String(value.to_string()),
+        ContextValue::PaneType(value) => ConfigValueKind::String(value.to_string()),
+        ContextValue::InvocationSource(value) => ConfigValueKind::String(value.to_string()),
         ContextValue::ServerId(value) => ConfigValueKind::String(value.to_string()),
         ContextValue::ClientId(value) => ConfigValueKind::String(value.to_string()),
         ContextValue::SessionId(value) => ConfigValueKind::String(value.to_string()),
