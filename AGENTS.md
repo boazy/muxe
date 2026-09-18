@@ -1,6 +1,6 @@
 # Muxe workspace rules
 
-`../muxe-design/DESIGN.md` is authoritative. `../muxe-design/CLI.md` records the public command inventory.
+`../muxe-design` is retired and is not authoritative. `docs/planning/DESIGN.md` and `docs/planning/CLI.md` record only the initial design and are not authoritative. Current non-planning documentation—`README.md`, `REFERENCE.md`, other non-planning docs, and code documentation/comments—takes precedence. If current code conflicts with those sources and the desired behavior cannot be established, stop that specific implementation item and report it as blocked; do not use planning docs to decide it.
 
 - Read `skill://tech-writing-style` on demand for documentation, not code-only
   work.
