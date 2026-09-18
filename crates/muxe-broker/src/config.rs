@@ -109,6 +109,7 @@ pub struct ConfigWatchSpec {
 pub struct ConfigStore {
     inputs: ConfigInputs,
     state: Mutex<ConfigSnapshot>,
+    reload_lock: Mutex<()>,
 }
 
 impl ConfigStore {
@@ -142,6 +143,7 @@ impl ConfigStore {
             state: Mutex::new(ConfigSnapshot {
                 config: Arc::new(config),
             }),
+            reload_lock: Mutex::new(()),
         })
     }
 
@@ -151,6 +153,7 @@ impl ConfigStore {
             state: Mutex::new(ConfigSnapshot {
                 config: Arc::new(config),
             }),
+            reload_lock: Mutex::new(()),
         }
     }
 
@@ -174,6 +177,8 @@ impl ConfigStore {
 
     /// Compiles the next generation completely before replacing the active immutable snapshot.
     /// Existing UI sessions retain their own Arc and therefore cannot observe a partial reload.
+    /// The reload-specific mutex serializes every read, compile, and publish attempt so concurrent
+    /// callers each compile from the generation that is active when their turn begins.
     ///
     /// # Errors
     ///
@@ -183,6 +188,7 @@ impl ConfigStore {
         &self,
         adapter: &dyn HostAdapter,
     ) -> Result<CompiledGeneration, ConfigError> {
+        let _reload_lock = self.reload_lock.lock().await;
         let next = {
             let state = self.state.lock().await;
             CompiledGeneration(
@@ -197,9 +203,6 @@ impl ConfigStore {
         let candidate = compile_inputs(&self.inputs, next, adapter).await?;
 
         let mut state = self.state.lock().await;
-        if state.config.generation >= next {
-            return Ok(state.config.generation);
-        }
         state.config = Arc::new(candidate);
         Ok(next)
     }
@@ -423,12 +426,21 @@ fn key_capabilities(capabilities: &AdapterCapabilities) -> KeyCapabilities {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
+        pin::Pin,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+        task::{Context, Poll, Waker},
         time::Duration,
     };
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        future.poll(&mut context)
+    }
 
     use async_trait::async_trait;
     use muxe_adapter_api::{
@@ -662,6 +674,51 @@ mod tests {
         assert_eq!(
             store.snapshot().await.config.generation,
             CompiledGeneration(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reloads_serialize_reads_and_publish_newest_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yml");
+        fs::write(
+            &path,
+            "version: 1\nmenus:\n  main:\n    bindings:\n      q:\n        label: Older\n        action: menu:quit\n",
+        )
+        .unwrap();
+        let adapter = Arc::new(ReloadAdapter::new());
+        let store = Arc::new(ConfigStore::load(&path, adapter.as_ref()).await.unwrap());
+
+        adapter.pause_capabilities.store(true, Ordering::Release);
+        let first_store = Arc::clone(&store);
+        let first_adapter = Arc::clone(&adapter);
+        let first = tokio::spawn(async move { first_store.reload(first_adapter.as_ref()).await });
+        adapter.capabilities_started.notified().await;
+
+        fs::write(
+            &path,
+            "version: 1\nmenus:\n  main:\n    bindings:\n      q:\n        label: Newer\n        action: menu:quit\n",
+        )
+        .unwrap();
+
+        let mut second = Box::pin(store.reload(adapter.as_ref()));
+        assert!(matches!(poll_once(second.as_mut()), Poll::Pending));
+
+        adapter.capabilities_release.notify_one();
+        assert_eq!(first.await.unwrap().unwrap(), CompiledGeneration(2));
+
+        assert!(matches!(poll_once(second.as_mut()), Poll::Pending));
+        adapter.capabilities_release.notify_one();
+        match poll_once(second.as_mut()) {
+            Poll::Ready(result) => assert_eq!(result.unwrap(), CompiledGeneration(3)),
+            Poll::Pending => panic!("second reload completes after validation release"),
+        }
+
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.config.generation, CompiledGeneration(3));
+        assert_eq!(
+            snapshot.config.menus[0].bindings[0].label.as_deref(),
+            Some("Newer")
         );
     }
 }
