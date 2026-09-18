@@ -312,7 +312,7 @@ mod tests {
 
     use super::*;
     use crate::integration::receipt::{
-        BridgeRecord, Disposition, NodeRecord, RECEIPT_SCHEMA_VERSION, Receipt, store,
+        BridgeRecord, Disposition, NodeRecord, RECEIPT_SCHEMA_VERSION, Receipt, Sha256Digest, store,
     };
     fn secure_test_root(path: &Path) {
         let root = path.parent().expect("test path has TempDir parent");
@@ -576,7 +576,7 @@ mod tests {
             bridge: BridgeRecord {
                 canonical_path: crate::integration::stable_bridge_path(config),
                 installed_version: "test".to_owned(),
-                installed_digest: "a".repeat(64),
+                installed_digest: Sha256Digest::parse("a".repeat(64)).unwrap(),
                 previous_digest: None,
                 bridge_compat: None,
             },
@@ -592,7 +592,7 @@ mod tests {
                 },
                 disposition: Disposition::Created,
                 semantic: "muxe".to_owned(),
-                text_digest: "b".repeat(64),
+                text_digest: Sha256Digest::parse("b".repeat(64)).unwrap(),
                 previous_text: None,
                 previous_semantic: None,
             }],

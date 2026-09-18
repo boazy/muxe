@@ -22,7 +22,7 @@ use std::{
 use kdl::{KdlDocument, KdlNode};
 use thiserror::Error;
 
-use super::receipt::{Disposition, ManagedNode, NodeRecord};
+use super::receipt::{Disposition, ManagedNode, NodeRecord, Sha256Digest};
 use crate::fsutil::{self, FsError};
 
 /// Top-level Zellij node holding the plugin alias.
@@ -126,6 +126,36 @@ fn semantic(node: &KdlNode) -> String {
     let mut normalized = node.clone();
     normalized.autoformat();
     normalized.to_string()
+}
+
+/// Validates and canonicalizes the exact text saved for an updated receipt
+/// record. The saved text must itself be exactly one managed KDL node; no
+/// synthetic parent is used, so sibling or brace-injected nodes cannot hide
+/// outside the validated span.
+pub(crate) fn validate_previous_node(node: ManagedNode, text: &str) -> Result<String, String> {
+    let document =
+        parse_original(Path::new("<receipt>"), text).map_err(|error| error.to_string())?;
+    if document.nodes().len() != 1 {
+        return Err(format!(
+            "{} previous text must contain exactly one top-level node",
+            node.as_str()
+        ));
+    }
+    let managed = &document.nodes()[0];
+    if managed.name().value() != MUXE_NODE {
+        return Err(format!(
+            "{} previous text does not name `{MUXE_NODE}`",
+            node.as_str()
+        ));
+    }
+    let span = managed.span();
+    if span.offset() != 0 || span.offset() + span.len() != text.len() {
+        return Err(format!(
+            "{} previous text contains bytes outside the `{MUXE_NODE}` node",
+            node.as_str()
+        ));
+    }
+    Ok(semantic(managed))
 }
 
 fn parse_original(path: &Path, text: &str) -> Result<KdlDocument, KdlError> {
@@ -954,7 +984,7 @@ impl ConfigApplied {
                 node,
                 disposition,
                 semantic: semantic.clone(),
-                text_digest: crate::fsutil::sha256_hex(text.as_bytes()),
+                text_digest: Sha256Digest::from_bytes(text.as_bytes()),
                 previous_text: previous.as_ref().map(|previous| previous.0.clone()),
                 previous_semantic: previous.as_ref().map(|previous| previous.1.clone()),
             })
@@ -995,7 +1025,7 @@ pub fn plan_records(config_path: &Path, nodes: &[NodePlan]) -> Vec<NodeRecord> {
             node: plan.node,
             disposition: plan.disposition,
             semantic: plan.semantic.clone(),
-            text_digest: plan.text_digest.clone(),
+            text_digest: Sha256Digest::from_bytes(plan.text.as_bytes()),
             previous_text: plan.previous_text.clone(),
             previous_semantic: plan.previous_semantic.clone(),
         })
@@ -1076,7 +1106,7 @@ fn verify_one_record(
     let text = original
         .get(span.offset()..span.offset() + span.len())
         .unwrap_or("");
-    if crate::fsutil::sha256_hex(text.as_bytes()) != record.text_digest {
+    if Sha256Digest::from_bytes(text.as_bytes()) != record.text_digest {
         return Err(format!(
             "`{}` text changed since installation",
             record.node.as_str()

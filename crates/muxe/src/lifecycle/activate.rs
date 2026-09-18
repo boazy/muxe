@@ -817,8 +817,15 @@ where
             ));
         }
         let receipt_digest = Some(receipt.bridge.installed_digest.as_str());
-        integration::bridge::check_previous(&stable, receipt.bridge.previous_digest.as_deref())
-            .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
+        integration::bridge::check_previous(
+            &stable,
+            receipt
+                .bridge
+                .previous_digest
+                .as_ref()
+                .map(integration::receipt::Sha256Digest::as_str),
+        )
+        .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
         let (eligibility, _) = integration::bridge::check_destination(&stable, receipt_digest)
             .map_err(|error| format!("bridge preflight failed: {error}"))?;
         let expected_current = match eligibility {
@@ -833,9 +840,11 @@ where
         }
         preparation.verified_bridge = Some(verification);
         preparation.expected_current = expected_current;
-        preparation
-            .previous_authority
-            .clone_from(&receipt.bridge.previous_digest);
+        preparation.previous_authority = receipt
+            .bridge
+            .previous_digest
+            .as_ref()
+            .map(|digest| digest.as_str().to_owned());
     }
     inputs.preflight.validate_config().await?;
     for unit in units {
@@ -1560,14 +1569,19 @@ fn commit_bridge_receipt(
             ),
         });
     }
-    let target_digest = verification.packaged_digest.as_str();
+    let target_digest = integration::receipt::Sha256Digest::parse(
+        verification.packaged_digest.clone(),
+    )
+    .map_err(|error| ActivateError::UnitFailed {
+        reason: format!("verified bridge digest is invalid: {error}"),
+    })?;
     if let Some(old_digest) = old_bridge_digest.as_deref()
-        && receipt.bridge.installed_digest != old_digest
+        && receipt.bridge.installed_digest.as_str() != old_digest
         && receipt.bridge.installed_digest != target_digest
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "Zellij receipt ownership changed during activation: expected {old_digest} or target {target_digest}, found {}",
+                "Zellij receipt ownership changed during activation: expected {old_digest} or {target_digest}, found {}",
                 receipt.bridge.installed_digest
             ),
         });
@@ -1575,16 +1589,19 @@ fn commit_bridge_receipt(
     let previous_digest = if receipt.bridge.installed_digest == target_digest {
         receipt.bridge.previous_digest.clone()
     } else {
-        old_bridge_digest.or(receipt.bridge.previous_digest.take())
+        old_bridge_digest
+            .map(integration::receipt::Sha256Digest::parse)
+            .transpose()
+            .map_err(|error| ActivateError::UnitFailed {
+                reason: format!("recorded old bridge digest is invalid: {error}"),
+            })?
+            .or(receipt.bridge.previous_digest.take())
     };
     receipt
         .bridge
         .installed_version
         .clone_from(&target.muxe_version);
-    receipt
-        .bridge
-        .installed_digest
-        .clone_from(&verification.packaged_digest);
+    receipt.bridge.installed_digest = target_digest;
     receipt.bridge.previous_digest = previous_digest;
     receipt.bridge.bridge_compat.clone_from(&target.zellij);
     integration::receipt::store(&directory, &receipt)?;
@@ -1984,10 +2001,15 @@ fn restore_recorded_receipt(journal: &ActivationJournal) -> Result<(), String> {
     }
     let target_digest = journal
         .staged_bridge_digest
-        .as_deref()
-        .ok_or_else(|| "committed Zellij journal has no staged bridge digest".to_owned())?;
+        .clone()
+        .ok_or_else(|| "committed Zellij journal has no staged bridge digest".to_owned())
+        .and_then(|digest| {
+            integration::receipt::Sha256Digest::parse(digest).map_err(|error| {
+                format!("committed Zellij journal has invalid bridge digest: {error}")
+            })
+        })?;
     if let Some(old_digest) = journal.old_bridge_digest.as_deref()
-        && receipt.bridge.installed_digest != old_digest
+        && receipt.bridge.installed_digest.as_str() != old_digest
         && receipt.bridge.installed_digest != target_digest
     {
         return Err("integration receipt ownership changed during recovery".to_owned());
@@ -1995,12 +2017,15 @@ fn restore_recorded_receipt(journal: &ActivationJournal) -> Result<(), String> {
     let previous = journal
         .old_bridge_digest
         .clone()
+        .map(integration::receipt::Sha256Digest::parse)
+        .transpose()
+        .map_err(|error| format!("recovery journal has invalid old bridge digest: {error}"))?
         .or(receipt.bridge.previous_digest.take());
     receipt
         .bridge
         .installed_version
         .clone_from(&journal.target_record.muxe_version);
-    target_digest.clone_into(&mut receipt.bridge.installed_digest);
+    receipt.bridge.installed_digest = target_digest;
     receipt.bridge.previous_digest = previous;
     receipt
         .bridge
@@ -2036,12 +2061,21 @@ pub fn restore_recorded_rollback_receipt(journal: &ActivationJournal) -> Result<
     }
     let old = journal
         .old_bridge_digest
-        .as_deref()
-        .ok_or_else(|| "rollback journal has no old bridge digest".to_owned())?;
+        .as_ref()
+        .ok_or_else(|| "rollback journal has no old bridge digest".to_owned())
+        .and_then(|digest| {
+            integration::receipt::Sha256Digest::parse(digest.clone())
+                .map_err(|error| format!("rollback journal has invalid old bridge digest: {error}"))
+        })?;
     let target = journal
         .staged_bridge_digest
         .clone()
-        .ok_or_else(|| "rollback journal has no staged bridge digest".to_owned())?;
+        .ok_or_else(|| "rollback journal has no staged bridge digest".to_owned())
+        .and_then(|digest| {
+            integration::receipt::Sha256Digest::parse(digest).map_err(|error| {
+                format!("rollback journal has invalid staged bridge digest: {error}")
+            })
+        })?;
     if receipt.bridge.installed_digest != target && receipt.bridge.installed_digest != old {
         return Err("integration receipt ownership changed during rollback".to_owned());
     }
@@ -2049,7 +2083,7 @@ pub fn restore_recorded_rollback_receipt(journal: &ActivationJournal) -> Result<
         .bridge
         .installed_version
         .clone_from(&journal.old_record.muxe_version);
-    old.clone_into(&mut receipt.bridge.installed_digest);
+    receipt.bridge.installed_digest = old;
     receipt.bridge.previous_digest = Some(target);
     receipt
         .bridge
@@ -2727,7 +2761,8 @@ mod tests {
                 bridge: integration::receipt::BridgeRecord {
                     canonical_path: stable.to_path_buf(),
                     installed_version: "0.1.0".to_owned(),
-                    installed_digest,
+                    installed_digest: integration::receipt::Sha256Digest::parse(installed_digest)
+                        .expect("test digest is SHA-256"),
                     previous_digest: None,
                     bridge_compat: None,
                 },
@@ -2816,7 +2851,9 @@ mod tests {
             store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
             let directory = integration::integration_dir(&fixture.config);
             let mut receipt = integration::receipt::load(&directory).unwrap().unwrap();
-            receipt.bridge.previous_digest = Some(fsutil::sha256_hex(b"recorded-rollback"));
+            receipt.bridge.previous_digest = Some(integration::receipt::Sha256Digest::from_bytes(
+                b"recorded-rollback",
+            ));
             integration::receipt::store(&directory, &receipt).unwrap();
             let previous = integration::bridge::previous_path(&stable);
             std::fs::write(&previous, foreign_previous).unwrap();
@@ -3012,19 +3049,21 @@ mod tests {
             .unwrap();
         let wrong_path = fixture.config.join("wrong-bridge.wasm");
         let directory = integration::integration_dir(&fixture.config);
-        integration::receipt::store(
-            &directory,
-            &integration::receipt::Receipt {
-                schema_version: integration::receipt::RECEIPT_SCHEMA_VERSION,
-                bridge: integration::receipt::BridgeRecord {
-                    canonical_path: wrong_path,
-                    installed_version: "0.1.0".to_owned(),
-                    installed_digest: fsutil::sha256_hex(&target_bytes),
-                    previous_digest: None,
-                    bridge_compat: None,
+        fsutil::write_atomic(
+            &directory.join(integration::receipt::RECEIPT_FILE_NAME),
+            &serde_json::to_vec(&serde_json::json!({
+                "schema_version": integration::receipt::RECEIPT_SCHEMA_VERSION,
+                "bridge": {
+                    "canonical_path": wrong_path,
+                    "installed_version": "0.1.0",
+                    "installed_digest": integration::receipt::Sha256Digest::from_bytes(&target_bytes),
+                    "previous_digest": null,
+                    "bridge_compat": null,
                 },
-                configs: Vec::new(),
-            },
+                "configs": [],
+            }))
+            .unwrap(),
+            "receipt",
         )
         .unwrap();
         let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
@@ -3039,7 +3078,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(ActivateError::Preflight(message))
-                if message.contains("canonical path")
+                if message.contains("semantically corrupt")
         ));
         assert_eq!(std::fs::read(&stable).unwrap(), target_bytes);
         assert!(fixture.reloader.reloaded.lock().unwrap().is_empty());

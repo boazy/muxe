@@ -3863,8 +3863,14 @@ mod mixed_recovery_production_tests {
                 bridge: muxe::integration::receipt::BridgeRecord {
                     canonical_path: stable.clone(),
                     installed_version: "target".to_owned(),
-                    installed_digest: digest(target_bridge),
-                    previous_digest: Some(digest(old_bridge)),
+                    installed_digest: muxe::integration::receipt::Sha256Digest::parse(digest(
+                        target_bridge,
+                    ))
+                    .expect("target digest is SHA-256"),
+                    previous_digest: Some(
+                        muxe::integration::receipt::Sha256Digest::parse(digest(old_bridge))
+                            .expect("old digest is SHA-256"),
+                    ),
                     bridge_compat: record("target").zellij,
                 },
                 configs: Vec::new(),
@@ -4114,10 +4120,14 @@ mod mixed_recovery_production_tests {
             .expect("restored receipt readable")
             .expect("restored receipt present");
         assert_eq!(receipt.bridge.canonical_path, stable);
-        assert_eq!(receipt.bridge.installed_digest, digest(old_bridge));
+        assert_eq!(receipt.bridge.installed_digest.as_str(), digest(old_bridge));
         assert_eq!(
-            receipt.bridge.previous_digest,
-            Some(digest(target_bridge)),
+            receipt
+                .bridge
+                .previous_digest
+                .as_ref()
+                .map(muxe::integration::receipt::Sha256Digest::as_str),
+            Some(digest(target_bridge).as_str()),
             "receipt retains rotated target authority after rollback"
         );
         let reloads = fs::read_to_string(&reload_log).expect("owned reloader recorded sessions");

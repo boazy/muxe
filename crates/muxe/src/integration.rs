@@ -32,7 +32,7 @@ use crate::{
 
 pub use bridge::{BRIDGE_FILE_NAME, PREVIOUS_SUFFIX};
 pub use kdl::{LOAD_PLUGINS_NODE, MUXE_NODE, PLUGINS_NODE};
-pub use receipt::{Disposition, ManagedNode, NodeRecord, Receipt};
+pub use receipt::{Disposition, ManagedNode, NodeRecord, Receipt, Sha256Digest};
 
 /// Integration directory name under `$CONFIG_DIR/integrations/`.
 pub const ZELLIJ_INTEGRATION_NAME: &str = "zellij";
@@ -255,6 +255,13 @@ pub fn install(inputs: InstallInputs<'_>) -> Result<InstallOutcome, IntegrationE
     let verification = compatibility::verify_packaged_asset(inputs.packaged_wasm)?;
     install_verified(&inputs, verification)
 }
+fn validated_receipt_digest(value: String) -> Result<Sha256Digest, IntegrationError> {
+    Sha256Digest::parse(value).map_err(|error| {
+        IntegrationError::InconsistentJournal(format!(
+            "journal carried an invalid SHA-256 digest: {error}"
+        ))
+    })
+}
 
 fn install_verified(
     inputs: &InstallInputs<'_>,
@@ -300,7 +307,7 @@ fn install_fresh(
         packaged_digest: verification.packaged_digest.clone(),
         prior_digest: receipt
             .as_ref()
-            .map(|receipt| receipt.bridge.installed_digest.clone()),
+            .map(|receipt| receipt.bridge.installed_digest.as_str().to_owned()),
         staged_name: None,
         config_path: None,
         bridge_url: String::new(),
@@ -360,7 +367,8 @@ fn install_fresh(
     inputs.hooks.check(InstallStep::BeforeBridgeSwap)?;
     let authority = receipt
         .as_ref()
-        .and_then(|receipt| receipt.bridge.previous_digest.as_deref());
+        .and_then(|receipt| receipt.bridge.previous_digest.as_ref())
+        .map(Sha256Digest::as_str);
     let (expected_current, previous_digest) = match eligibility {
         bridge::Eligibility::Absent => (None, None),
         bridge::Eligibility::EligibleReplace { current_digest } => {
@@ -391,12 +399,15 @@ fn install_fresh(
         bridge: receipt::BridgeRecord {
             canonical_path: stable,
             installed_version: inputs.version.to_owned(),
-            installed_digest: verification.packaged_digest.clone(),
-            previous_digest: previous_digest.or_else(|| {
-                receipt
-                    .as_ref()
-                    .and_then(|receipt| receipt.bridge.previous_digest.clone())
-            }),
+            installed_digest: Sha256Digest::from_bytes(inputs.packaged_wasm),
+            previous_digest: previous_digest
+                .map(validated_receipt_digest)
+                .transpose()?
+                .or_else(|| {
+                    receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.bridge.previous_digest.clone())
+                }),
             bridge_compat,
         },
         configs: merged,
@@ -881,7 +892,7 @@ fn check_prior_receipt(
     let receipt = receipt::load(directory)?;
     let current = receipt
         .as_ref()
-        .map(|receipt| receipt.bridge.installed_digest.clone());
+        .map(|receipt| receipt.bridge.installed_digest.as_str().to_owned());
     if current != journal.prior_digest {
         return Err(IntegrationError::InconsistentJournal(
             "receipt changed outside the transaction".to_owned(),
@@ -911,7 +922,7 @@ fn verify_pre_swap_bridge_state(
             "unreceipted stable bridge exists while staged bridge is missing".to_owned(),
         )),
         (Some(receipt), Ok(bytes))
-            if fsutil::sha256_hex(&bytes) == receipt.bridge.installed_digest =>
+            if Sha256Digest::from_bytes(&bytes) == receipt.bridge.installed_digest =>
         {
             Ok(())
         }
@@ -1088,10 +1099,14 @@ fn commit_resumed(
                     .and_then(|receipt| receipt.bridge.previous_digest.clone())
             } else {
                 match receipt.as_ref() {
-                    Some(receipt) if receipt.bridge.installed_digest == current_digest => {
-                        let authority = receipt.bridge.previous_digest.as_deref();
+                    Some(receipt) if receipt.bridge.installed_digest.as_str() == current_digest => {
+                        let authority = receipt
+                            .bridge
+                            .previous_digest
+                            .as_ref()
+                            .map(Sha256Digest::as_str);
                         let record = bridge::ensure_backup(stable, authority)?;
-                        Some(record.digest)
+                        Some(validated_receipt_digest(record.digest)?)
                     }
                     _ => {
                         return Err(IntegrationError::InconsistentJournal(
@@ -1118,7 +1133,7 @@ fn commit_resumed(
         // ones; commit re-validates them at the actual mutation.
         let vouched = receipt
             .as_ref()
-            .map(|receipt| receipt.bridge.installed_digest.clone());
+            .map(|receipt| receipt.bridge.installed_digest.as_str().to_owned());
         if expected != vouched && receipt.is_some() {
             return Err(IntegrationError::InconsistentJournal(
                 "stable bridge changed outside the transaction".to_owned(),
@@ -1148,7 +1163,7 @@ fn commit_resumed(
             bridge: receipt::BridgeRecord {
                 canonical_path: stable.to_path_buf(),
                 installed_version: journal.version.clone(),
-                installed_digest: journal.packaged_digest.clone(),
+                installed_digest: validated_receipt_digest(journal.packaged_digest.clone())?,
                 previous_digest: previous_digest.or_else(|| {
                     receipt
                         .as_ref()
@@ -1263,9 +1278,9 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
     }
 
     let previous = bridge::previous_path(&stable);
-    match receipt.bridge.previous_digest.as_deref() {
+    match receipt.bridge.previous_digest.as_ref() {
         Some(expected) => {
-            outcome.previous_removed = bridge::remove_if_matching(&previous, expected)?;
+            outcome.previous_removed = bridge::remove_if_matching(&previous, expected.as_str())?;
         }
         None if previous.exists() => {
             // A rollback copy exists that no receipt vouches for: never delete
@@ -1281,7 +1296,8 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
         }
         None => {}
     }
-    outcome.bridge_removed = bridge::remove_if_matching(&stable, &receipt.bridge.installed_digest)?;
+    outcome.bridge_removed =
+        bridge::remove_if_matching(&stable, receipt.bridge.installed_digest.as_str())?;
     outcome.staging_removed = remove_staging_leftovers(&directory)?;
 
     if outcome.unresolved.is_empty() && !stable.exists() {
@@ -1302,7 +1318,7 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
 /// Refuses uninstallation while an activation journal references the bridge digest.
 fn refuse_when_activation_live(
     cache_dir: &Path,
-    installed_digest: &str,
+    installed_digest: &Sha256Digest,
 ) -> Result<(), IntegrationError> {
     let activation = cache_dir.join("activation");
     let entries = match fs::read_dir(&activation) {
@@ -1327,8 +1343,8 @@ fn refuse_when_activation_live(
         let bytes = fs::read(&path)
             .map_err(|source| fsutil::io_error("reading activation journal", &path, source))?;
         if bytes
-            .windows(installed_digest.len())
-            .any(|window| window == installed_digest.as_bytes())
+            .windows(installed_digest.as_str().len())
+            .any(|window| window == installed_digest.as_str().as_bytes())
         {
             return Err(IntegrationError::ActivationJournalLive { journal: path });
         }
@@ -1549,7 +1565,7 @@ fn plan_uninstall_node(
         .get(span.offset()..span.offset() + span.len())
         .unwrap_or("")
         .to_owned();
-    if fsutil::sha256_hex(current_text.as_bytes()) != record.text_digest {
+    if Sha256Digest::from_bytes(current_text.as_bytes()) != record.text_digest {
         return Err(format!(
             "`{}` changed since installation; left untouched",
             record.node.as_str()
@@ -1968,13 +1984,13 @@ mod tests {
                 bridge: receipt::BridgeRecord {
                     canonical_path: stable_bridge_path(temp.path()),
                     installed_version: "9.9.9".to_owned(),
-                    installed_digest: "f".repeat(64),
+                    installed_digest: Sha256Digest::parse("f".repeat(64)).unwrap(),
                     previous_digest: None,
                     bridge_compat: None,
                 },
                 configs: Vec::new(),
             });
-        receipt.bridge.installed_digest = "e".repeat(64);
+        receipt.bridge.installed_digest = Sha256Digest::parse("e".repeat(64)).unwrap();
         receipt::store(&directory, &receipt).unwrap();
         let error = install(install_inputs(temp.path(), wasm)).unwrap_err();
         assert!(
@@ -2014,6 +2030,125 @@ mod tests {
             matches!(error, IntegrationError::InconsistentJournal(_)),
             "{error}"
         );
+    }
+
+    #[test]
+    fn uninstall_rejects_invalid_receipt_provenance_before_mutation() {
+        for (case, installed_digest, disposition, previous_text, previous_semantic) in [
+            ("empty digest", "", "Created", None, None),
+            ("malformed digest", "not-a-sha256", "Created", None, None),
+            (
+                "created claims prior state",
+                &"a".repeat(64),
+                "Created",
+                Some("old node"),
+                Some("old semantic"),
+            ),
+            (
+                "updated lacks prior state",
+                &"a".repeat(64),
+                "Updated",
+                None,
+                None,
+            ),
+            (
+                "updated has empty prior text",
+                &"a".repeat(64),
+                "Updated",
+                Some(""),
+                Some("muxe location=\"file:/old.wasm\""),
+            ),
+            (
+                "updated prior text names wrong node",
+                &"a".repeat(64),
+                "Updated",
+                Some("other location=\"file:/old.wasm\""),
+                Some("other location=\"file:/old.wasm\""),
+            ),
+            (
+                "updated prior semantic mismatches text",
+                &"a".repeat(64),
+                "Updated",
+                Some("muxe location=\"file:/old.wasm\""),
+                Some("muxe location=\"file:/different.wasm\""),
+            ),
+            (
+                "updated prior text injects sibling node",
+                &"a".repeat(64),
+                "Updated",
+                Some("muxe location=\"file:/old.wasm\"\nother"),
+                Some("muxe location=\"file:/old.wasm\""),
+            ),
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            std::fs::set_permissions(
+                temp.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            let config = temp.path().join("config.kdl");
+            let stable = stable_bridge_path(temp.path());
+            let directory = integration_dir(temp.path());
+            let cache = temp.path().join("cache");
+            let receipt_path = directory.join(receipt::RECEIPT_FILE_NAME);
+            fs::write(&config, "// user configuration\n").unwrap();
+            fsutil::ensure_owner_dir(&directory).unwrap();
+            fs::write(&stable, b"bridge bytes").unwrap();
+            fsutil::ensure_owner_dir(&cache.join("activation")).unwrap();
+            fs::write(cache.join("activation/live.json"), "a".repeat(64)).unwrap();
+            let receipt = serde_json::json!({
+                "schema_version": receipt::RECEIPT_SCHEMA_VERSION,
+                "bridge": {
+                    "canonical_path": stable,
+                    "installed_version": "0.1.0",
+                    "installed_digest": installed_digest,
+                    "previous_digest": null,
+                    "bridge_compat": null,
+                },
+                "configs": [{
+                    "config_path": config,
+                    "node": "plugins_alias",
+                    "disposition": disposition,
+                    "semantic": "muxe",
+                    "text_digest": "b".repeat(64),
+                    "previous_text": previous_text,
+                    "previous_semantic": previous_semantic,
+                }],
+            });
+            fsutil::write_atomic(
+                &receipt_path,
+                &serde_json::to_vec(&receipt).unwrap(),
+                "receipt",
+            )
+            .unwrap();
+
+            let error = uninstall(UninstallInputs {
+                config_dir: temp.path(),
+                cache_dir: &cache,
+                zellij_config: Some(config.clone()),
+                explicit_policy: Some(ConfigurationPolicy::Always),
+                quiet: true,
+                interactive: false,
+                asker: None,
+                logger: None,
+            })
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    IntegrationError::Receipt(receipt::ReceiptError::Invalid { .. })
+                ),
+                "{case}: {error}"
+            );
+            assert_eq!(fs::read(&stable).unwrap(), b"bridge bytes", "{case}");
+            assert_eq!(
+                fs::read_to_string(&config).unwrap(),
+                "// user configuration\n",
+                "{case}"
+            );
+            assert!(receipt_path.exists(), "{case}");
+        }
     }
 
     #[test]
