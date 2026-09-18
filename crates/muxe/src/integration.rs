@@ -527,23 +527,69 @@ fn kdl_abort_snippet(
     }
 }
 
+/// Merges the journaled KDL plans with receipt provenance by the exact
+/// configuration ownership identity and managed node.
+///
+/// A skipped edit has no pending records, so every prior record remains. A
+/// no-op observation only retains ownership when its exact installed semantic
+/// and text digest still match the prior receipt. Replacing an already-owned
+/// node keeps the prior disposition and provenance, so repeated updates still
+/// restore the user's original text on uninstall.
 fn merge_records(
     previous: Option<&Receipt>,
     config_path: &ConfigPath,
     pending: &[NodeRecord],
 ) -> Vec<NodeRecord> {
-    let mut merged: Vec<NodeRecord> = previous
-        .map(|receipt| {
-            receipt
-                .configs
-                .iter()
-                .filter(|record| record.config_path != *config_path)
-                .cloned()
-                .collect()
-        })
+    let mut merged = previous
+        .map(|receipt| receipt.configs.clone())
         .unwrap_or_default();
-    merged.extend(pending.iter().cloned());
+    for pending_record in pending {
+        debug_assert_eq!(&pending_record.config_path, config_path);
+        if let Some(index) = merged.iter().position(|previous_record| {
+            previous_record.config_path == pending_record.config_path
+                && previous_record.node == pending_record.node
+        }) {
+            merged[index] = merge_record(&merged[index], pending_record);
+        } else {
+            merged.push(pending_record.clone());
+        }
+    }
     merged
+}
+
+fn merge_record(previous: &NodeRecord, pending: &NodeRecord) -> NodeRecord {
+    match pending.disposition {
+        Disposition::Observed
+            if previous.disposition != Disposition::Observed
+                && matches_installed_record(previous, pending) =>
+        {
+            previous.clone()
+        }
+        Disposition::Updated
+            if previous.disposition != Disposition::Observed
+                && pending_replaces_installed_record(previous, pending) =>
+        {
+            NodeRecord {
+                disposition: previous.disposition,
+                previous_text: previous.previous_text.clone(),
+                previous_semantic: previous.previous_semantic.clone(),
+                ..pending.clone()
+            }
+        }
+        _ => pending.clone(),
+    }
+}
+
+fn matches_installed_record(previous: &NodeRecord, pending: &NodeRecord) -> bool {
+    previous.semantic == pending.semantic && previous.text_digest == pending.text_digest
+}
+
+fn pending_replaces_installed_record(previous: &NodeRecord, pending: &NodeRecord) -> bool {
+    pending.previous_semantic.as_deref() == Some(&previous.semantic)
+        && pending
+            .previous_text
+            .as_ref()
+            .is_some_and(|text| Sha256Digest::from_bytes(text.as_bytes()) == previous.text_digest)
 }
 
 /// Records an auditable event. Messages carry identifiers, versions, and
@@ -1687,6 +1733,55 @@ mod tests {
         install_verified(&inputs, verification)
     }
 
+    fn uninstall_inputs<'a>(
+        config_dir: &'a Path,
+        cache_dir: &'a Path,
+        zellij_config: PathBuf,
+    ) -> UninstallInputs<'a> {
+        UninstallInputs {
+            config_dir,
+            cache_dir,
+            zellij_config: Some(zellij_config),
+            explicit_policy: Some(ConfigurationPolicy::Always),
+            quiet: true,
+            interactive: false,
+            asker: None,
+            logger: None,
+        }
+    }
+
+    fn assert_managed_node_absent(document: &KdlDocument, node: ManagedNode) {
+        let parent_name = match node {
+            ManagedNode::PluginsAlias => PLUGINS_NODE,
+            ManagedNode::LoadPluginsEntry => LOAD_PLUGINS_NODE,
+        };
+        let parents: Vec<_> = document
+            .nodes()
+            .iter()
+            .filter(|candidate| candidate.name().value() == parent_name)
+            .collect();
+        assert_eq!(parents.len(), 1, "expected one `{parent_name}` block");
+        assert!(
+            !parents[0]
+                .children()
+                .unwrap()
+                .nodes()
+                .iter()
+                .any(|candidate| candidate.name().value() == MUXE_NODE),
+            "owned `{}` node remained",
+            node.as_str()
+        );
+    }
+
+    fn assert_created_nodes_removed_with_user_text(config: &Path) {
+        let text = fs::read_to_string(config).unwrap();
+        assert!(text.contains("    other location=\"file:/other.wasm\"\n"));
+        assert!(text.contains("    other\n"));
+        let document = KdlDocument::parse_v1(&text).unwrap();
+        assert_managed_node_absent(&document, ManagedNode::PluginsAlias);
+        assert_managed_node_absent(&document, ManagedNode::LoadPluginsEntry);
+    }
+
     #[test]
     fn policy_matrix_matches_spec() {
         use ResolvedPolicy::{Always, Ask, Never};
@@ -1773,6 +1868,210 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(receipt.configs.len(), 2);
+    }
+
+    #[test]
+    fn skipped_or_declined_reinstall_preserves_created_records_for_uninstall() {
+        for (case, policy, interactive) in [
+            ("skipped", Some(ConfigurationPolicy::Never), false),
+            ("declined", None, true),
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            std::fs::set_permissions(
+                temp.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            let config = temp.path().join("config.kdl");
+            let original = "plugins {\n    other location=\"file:/other.wasm\"\n}\nload_plugins {\n    other\n}\n";
+            fs::write(&config, original).unwrap();
+            let wasm = b"wasm-v1";
+
+            let mut initial = install_inputs(temp.path(), wasm);
+            initial.explicit_policy = Some(ConfigurationPolicy::Always);
+            initial.zellij_config = Some(config.clone());
+            install(initial).unwrap();
+
+            let declined = |_prompt: &str| false;
+            let mut reinstall = install_inputs(temp.path(), wasm);
+            reinstall.explicit_policy = policy;
+            reinstall.quiet = false;
+            reinstall.interactive = interactive;
+            reinstall.asker = Some(&declined);
+            reinstall.zellij_config = Some(config.clone());
+            let outcome = install(reinstall).unwrap();
+            assert!(
+                !outcome.config_edited,
+                "{case} reinstall edited configuration"
+            );
+
+            let config_path = ConfigPath::from_input(&config).unwrap();
+            let receipt = receipt::load(&integration_dir(temp.path()))
+                .unwrap()
+                .unwrap();
+            assert!(receipt.configs.iter().all(|record| {
+                record.config_path == config_path && record.disposition == Disposition::Created
+            }));
+
+            let cache = temp.path().join("cache");
+            let outcome = uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap();
+            assert_eq!(
+                outcome.removed_nodes,
+                vec![ManagedNode::PluginsAlias, ManagedNode::LoadPluginsEntry],
+                "{case} reinstall lost created ownership"
+            );
+            assert!(outcome.receipt_removed);
+            assert_created_nodes_removed_with_user_text(&config);
+        }
+    }
+
+    #[test]
+    fn no_op_reinstall_retains_created_records_for_uninstall() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = temp.path().join("config.kdl");
+        let original =
+            "plugins {\n    other location=\"file:/other.wasm\"\n}\nload_plugins {\n    other\n}\n";
+        fs::write(&config, original).unwrap();
+        let wasm = b"wasm-v1";
+
+        let mut initial = install_inputs(temp.path(), wasm);
+        initial.explicit_policy = Some(ConfigurationPolicy::Always);
+        initial.zellij_config = Some(config.clone());
+        install(initial).unwrap();
+
+        let mut reinstall = install_inputs(temp.path(), wasm);
+        reinstall.explicit_policy = Some(ConfigurationPolicy::Always);
+        reinstall.zellij_config = Some(config.clone());
+        let outcome = install(reinstall).unwrap();
+        assert!(!outcome.config_edited);
+
+        let config_path = ConfigPath::from_input(&config).unwrap();
+        let receipt = receipt::load(&integration_dir(temp.path()))
+            .unwrap()
+            .unwrap();
+        assert!(receipt.configs.iter().all(|record| {
+            record.config_path == config_path && record.disposition == Disposition::Created
+        }));
+
+        let cache = temp.path().join("cache");
+        let outcome = uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap();
+        assert_eq!(
+            outcome.removed_nodes,
+            vec![ManagedNode::PluginsAlias, ManagedNode::LoadPluginsEntry]
+        );
+        assert!(outcome.receipt_removed);
+        assert_created_nodes_removed_with_user_text(&config);
+    }
+
+    #[test]
+    fn no_op_reinstall_keeps_updated_node_original_restoration_text() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = temp.path().join("config.kdl");
+        let original_alias = "muxe    location=\"file:/original.wasm\"";
+        let original =
+            format!("plugins {{\n    {original_alias}\n}}\nload_plugins {{\n    muxe\n}}\n");
+        fs::write(&config, &original).unwrap();
+        let wasm = b"wasm-v1";
+
+        let mut initial = install_inputs(temp.path(), wasm);
+        initial.explicit_policy = Some(ConfigurationPolicy::Always);
+        initial.zellij_config = Some(config.clone());
+        install(initial).unwrap();
+
+        let mut reinstall = install_inputs(temp.path(), wasm);
+        reinstall.explicit_policy = Some(ConfigurationPolicy::Always);
+        reinstall.zellij_config = Some(config.clone());
+        assert!(!install(reinstall).unwrap().config_edited);
+
+        let config_path = ConfigPath::from_input(&config).unwrap();
+        let receipt = receipt::load(&integration_dir(temp.path()))
+            .unwrap()
+            .unwrap();
+        let alias = receipt
+            .configs
+            .iter()
+            .find(|record| {
+                record.config_path == config_path && record.node == ManagedNode::PluginsAlias
+            })
+            .unwrap_or_else(|| panic!("missing owned alias record: {:?}", receipt.configs));
+        assert_eq!(alias.disposition, Disposition::Updated);
+        assert_eq!(alias.previous_text.as_deref(), Some(original_alias));
+
+        let cache = temp.path().join("cache");
+        let outcome = uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap();
+        assert_eq!(outcome.restored_nodes, vec![ManagedNode::PluginsAlias]);
+        assert!(outcome.receipt_removed);
+        assert_eq!(fs::read(&config).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn user_edited_node_is_observed_without_reclaiming_ownership() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = temp.path().join("config.kdl");
+        fs::write(
+            &config,
+            "plugins {\n    other location=\"file:/other.wasm\"\n}\nload_plugins {\n    other\n}\n",
+        )
+        .unwrap();
+        let wasm = b"wasm-v1";
+
+        let mut initial = install_inputs(temp.path(), wasm);
+        initial.explicit_policy = Some(ConfigurationPolicy::Always);
+        initial.zellij_config = Some(config.clone());
+        install(initial).unwrap();
+        let user_edited =
+            fs::read_to_string(&config)
+                .unwrap()
+                .replacen("muxe location=", "muxe    location=", 1);
+        fs::write(&config, &user_edited).unwrap();
+
+        let mut reinstall = install_inputs(temp.path(), wasm);
+        reinstall.explicit_policy = Some(ConfigurationPolicy::Always);
+        reinstall.zellij_config = Some(config.clone());
+        assert!(!install(reinstall).unwrap().config_edited);
+        let config_path = ConfigPath::from_input(&config).unwrap();
+        let receipt = receipt::load(&integration_dir(temp.path()))
+            .unwrap()
+            .unwrap();
+        let alias = receipt
+            .configs
+            .iter()
+            .find(|record| {
+                record.config_path == config_path && record.node == ManagedNode::PluginsAlias
+            })
+            .unwrap();
+        assert_eq!(alias.disposition, Disposition::Observed);
+
+        let cache = temp.path().join("cache");
+        let outcome = uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap();
+        assert!(!outcome.removed_nodes.contains(&ManagedNode::PluginsAlias));
+        assert!(
+            outcome
+                .removed_nodes
+                .contains(&ManagedNode::LoadPluginsEntry)
+        );
+        assert!(outcome.receipt_removed);
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("    other location=\"file:/other.wasm\"\n"));
+        assert!(text.contains("    other\n"));
+        assert!(text.contains("muxe    location=\""));
+        let document = KdlDocument::parse_v1(&text).unwrap();
+        assert_managed_node_absent(&document, ManagedNode::LoadPluginsEntry);
     }
 
     #[test]

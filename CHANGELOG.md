@@ -3,6 +3,7 @@
 ### 🐛 Bug Fixes
 
 - *(zellij)* Bind uninstall configuration ownership to the recorded path
+- *(zellij)* Preserve receipt-owned configuration provenance across reinstalls
 - *(broker)* Propagate retirement and registry cleanup failures
 - *(herdr)* Close only the leased pending pane and retain uncertain cleanup ownership
 - *(config)* Reject unknown underscore-prefixed fields
