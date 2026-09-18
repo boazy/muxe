@@ -13,8 +13,9 @@
 //! safely re-apply a journaled edit.
 
 use std::{
-    fs, io,
-    os::unix::fs::PermissionsExt,
+    fs::{self, OpenOptions},
+    io::{self, Read},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -42,8 +43,10 @@ pub enum KdlError {
         path: std::path::PathBuf,
         node: &'static str,
     },
+    #[error("refusing non-regular Zellij configuration at {}", path.display())]
+    UnsafePath { path: PathBuf },
     #[error("Zellij configuration at {} changed concurrently; retry", path.display())]
-    ConcurrentChange { path: std::path::PathBuf },
+    ConcurrentChange { path: PathBuf },
     #[error("candidate configuration failed to parse: {detail}")]
     CandidateRejected { detail: String },
 }
@@ -539,66 +542,142 @@ pub fn minimal_document(bridge_url: &str) -> String {
     )
 }
 
-/// A planned configuration change, read without mutating anything.
+/// A configuration file state captured while planning.
 ///
-/// The installer journals the accepted plan (node dispositions, previous
-/// bytes, consent) before committing it, so crash recovery preserves the
-/// original ownership provenance instead of recomputing it from an
-/// already-applied document.
+/// Existing and absent paths remain distinct through commit so a plan for an
+/// absent configuration can use no-replace creation rather than a destructive
+/// replacement.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PlannedFile {
-    /// False when the configuration file does not exist yet.
-    pub existed: bool,
-    /// Exact bytes read; empty when the file did not exist.
-    pub before: Vec<u8>,
-    /// File mode at read time; None when the file did not exist.
-    pub mode: Option<u32>,
-    /// Node plans with Created/Updated/Observed dispositions.
-    pub plan: ConfigPlan,
+pub enum PlannedFile {
+    /// The configuration path was absent during planning.
+    Absent {
+        /// Node plans with Created dispositions.
+        plan: ConfigPlan,
+    },
+    /// The configuration path was a regular file during planning.
+    Existing {
+        /// Exact bytes read through a no-follow descriptor.
+        before: Vec<u8>,
+        /// Identity of the regular file read during planning.
+        identity: FileIdentity,
+        /// Node plans with Created/Updated/Observed dispositions.
+        plan: ConfigPlan,
+    },
+}
+
+impl PlannedFile {
+    /// Returns the configuration plan regardless of the captured path state.
+    #[must_use]
+    pub fn plan(&self) -> &ConfigPlan {
+        match self {
+            Self::Absent { plan } | Self::Existing { plan, .. } => plan,
+        }
+    }
+
+    /// Returns whether the configuration path was absent during planning.
+    #[must_use]
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent { .. })
+    }
+}
+
+/// Identity of a regular configuration file captured by a no-follow read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
 }
 ///
 /// Reads the configuration and plans both managed nodes without mutation.
+///
+/// A symbolic link or another non-regular file is rejected before any bytes
+/// are read. Existing files are read through a no-follow descriptor and
+/// captured with their identity so a later replacement cannot be committed.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration cannot be read or inspected,
 /// is not valid UTF-8, or planning fails on a malformed or ambiguous document.
 pub fn read_and_plan(path: &Path, bridge_url: &str) -> Result<PlannedFile, KdlError> {
-    let before = match fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(PlannedFile::Absent {
+                plan: minimal_plan(path, bridge_url)?,
+            });
+        }
         Err(source) => {
             return Err(KdlError::Fs(fsutil::io_error(
-                "reading Zellij configuration",
+                "checking Zellij configuration",
                 path,
                 source,
             )));
         }
-    };
-    let Some(before) = before else {
-        return Ok(PlannedFile {
-            existed: false,
-            before: Vec::new(),
-            mode: None,
-            plan: minimal_plan(path, bridge_url)?,
-        });
-    };
+    }
+
+    let (before, metadata) = read_regular_file(path)?;
     let original = String::from_utf8(before.clone()).map_err(|_| KdlError::Unparseable {
         path: path.to_path_buf(),
         detail: "configuration is not valid UTF-8".to_owned(),
     })?;
-    let mode = fs::symlink_metadata(path)
-        .map_err(|source| fsutil::io_error("checking Zellij configuration", path, source))?
-        .permissions()
-        .mode()
-        & 0o777;
     let plan = plan(path, &original, bridge_url)?;
-    Ok(PlannedFile {
-        existed: true,
+    Ok(PlannedFile::Existing {
         before,
-        mode: Some(mode),
+        identity: FileIdentity::from_metadata(&metadata),
         plan,
     })
+}
+
+/// Reads a named regular file without following links and verifies its
+/// descriptor still identifies the same directory entry.
+fn read_regular_file(path: &Path) -> Result<(Vec<u8>, fs::Metadata), KdlError> {
+    let named = fs::symlink_metadata(path)
+        .map_err(|source| fsutil::io_error("checking Zellij configuration", path, source))?;
+    if !named.is_file() || named.file_type().is_symlink() {
+        return Err(KdlError::UnsafePath {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .map_err(|source| fsutil::io_error("reading Zellij configuration", path, source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| fsutil::io_error("checking Zellij configuration", path, source))?;
+    if !metadata.is_file() {
+        return Err(KdlError::UnsafePath {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| fsutil::io_error("reading Zellij configuration", path, source))?;
+    let current = fs::symlink_metadata(path)
+        .map_err(|source| fsutil::io_error("checking Zellij configuration", path, source))?;
+    if !current.is_file() || current.file_type().is_symlink() {
+        return Err(KdlError::UnsafePath {
+            path: path.to_path_buf(),
+        });
+    }
+    if FileIdentity::from_metadata(&metadata) != FileIdentity::from_metadata(&current) {
+        return Err(KdlError::ConcurrentChange {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok((bytes, metadata))
 }
 
 /// Plans both managed nodes for a configuration file that does not exist yet.
@@ -660,6 +739,10 @@ fn minimal_plan(_path: &Path, bridge_url: &str) -> Result<ConfigPlan, KdlError> 
 /// change, and atomically writes. The caller must have journaled the accepted
 /// plan before calling this function.
 ///
+/// Absent-path plans publish with an atomic hard-link operation that fails if
+/// any directory entry appeared after planning. Existing regular-file plans
+/// re-read no-follow bytes and identity before the atomic replacement.
+///
 /// # Errors
 ///
 /// Returns `KdlError::Unparseable` for invalid planned bytes,
@@ -671,36 +754,53 @@ pub fn commit_planned(
     bridge_url: &str,
     planned: &PlannedFile,
 ) -> Result<ConfigApplied, KdlError> {
-    if !planned.existed {
-        let candidate = minimal_document(bridge_url);
-        parse_candidate(&candidate)?;
-        write_candidate(path, &candidate, None)?;
-        return Ok(ConfigApplied::CreatedMinimal);
+    match planned {
+        PlannedFile::Absent { .. } => {
+            let candidate = minimal_document(bridge_url);
+            parse_candidate(&candidate)?;
+            write_new_candidate(path, &candidate)?;
+            Ok(ConfigApplied::CreatedMinimal)
+        }
+        PlannedFile::Existing {
+            before,
+            identity,
+            plan,
+        } => {
+            let original =
+                String::from_utf8(before.clone()).map_err(|_| KdlError::Unparseable {
+                    path: path.to_path_buf(),
+                    detail: "configuration is not valid UTF-8".to_owned(),
+                })?;
+            let candidate = apply_edits(&original, &plan.edits);
+            parse_candidate(&candidate)?;
+            let (current, metadata) = match read_regular_file(path) {
+                Ok(current) => current,
+                Err(KdlError::Fs(FsError::Io { source, .. }))
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    return Err(KdlError::ConcurrentChange {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            if current != *before || FileIdentity::from_metadata(&metadata) != *identity {
+                return Err(KdlError::ConcurrentChange {
+                    path: path.to_path_buf(),
+                });
+            }
+            if plan.already_correct {
+                return Ok(ConfigApplied::AlreadyCorrect {
+                    nodes: plan.nodes.clone(),
+                });
+            }
+            let mode = metadata.permissions().mode() & 0o777;
+            write_candidate(path, &candidate, mode)?;
+            Ok(ConfigApplied::Edited {
+                nodes: plan.nodes.clone(),
+            })
+        }
     }
-    if planned.plan.already_correct {
-        return Ok(ConfigApplied::AlreadyCorrect {
-            nodes: planned.plan.nodes.clone(),
-        });
-    }
-    let original =
-        String::from_utf8(planned.before.clone()).map_err(|_| KdlError::Unparseable {
-            path: path.to_path_buf(),
-            detail: "configuration is not valid UTF-8".to_owned(),
-        })?;
-    let candidate = apply_edits(&original, &planned.plan.edits);
-    parse_candidate(&candidate)?;
-    // Concurrent-change check: the file must still hold the planned bytes.
-    let current = fs::read(path)
-        .map_err(|source| fsutil::io_error("re-reading Zellij configuration", path, source))?;
-    if current != planned.before {
-        return Err(KdlError::ConcurrentChange {
-            path: path.to_path_buf(),
-        });
-    }
-    write_candidate(path, &candidate, planned.mode)?;
-    Ok(ConfigApplied::Edited {
-        nodes: planned.plan.nodes.clone(),
-    })
 }
 
 /// Reads, plans, validates, and atomically writes the configuration.
@@ -719,7 +819,7 @@ pub fn apply_config(
     create_if_missing: bool,
 ) -> Result<ConfigApplied, KdlError> {
     let planned = read_and_plan(path, bridge_url)?;
-    if !planned.existed && !create_if_missing {
+    if planned.is_absent() && !create_if_missing {
         return Ok(ConfigApplied::Missing);
     }
     commit_planned(path, bridge_url, &planned)
@@ -732,11 +832,45 @@ fn parse_candidate(candidate: &str) -> Result<(), KdlError> {
     Ok(())
 }
 
-fn write_candidate(
-    path: &Path,
-    candidate: &str,
-    preserve_mode: Option<u32>,
-) -> Result<(), KdlError> {
+fn write_candidate(path: &Path, candidate: &str, preserve_mode: u32) -> Result<(), KdlError> {
+    write_staged(path, candidate, |staging| {
+        fs::rename(staging, path)
+            .map_err(|source| fsutil::io_error("installing Zellij configuration", path, source))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(preserve_mode)).map_err(|source| {
+            fsutil::io_error("restoring Zellij configuration permissions", path, source)
+        })?;
+        Ok(())
+    })
+}
+
+/// Publishes a candidate only if the final path remains absent.
+///
+/// `hard_link` is an atomic no-replace operation: a concurrently created file
+/// or symlink makes it fail with `AlreadyExists`, leaving that entry intact.
+fn write_new_candidate(path: &Path, candidate: &str) -> Result<(), KdlError> {
+    write_staged(path, candidate, |staging| {
+        fs::hard_link(staging, path).map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                KdlError::ConcurrentChange {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                KdlError::Fs(fsutil::io_error(
+                    "creating Zellij configuration without replacement",
+                    path,
+                    source,
+                ))
+            }
+        })
+    })
+}
+
+/// Writes and syncs a staging file beside `path`, then invokes a publication
+/// primitive supplied by the caller. No fallback publication is used.
+fn write_staged<F>(path: &Path, candidate: &str, publish: F) -> Result<(), KdlError>
+where
+    F: FnOnce(&Path) -> Result<(), KdlError>,
+{
     let directory = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(directory) = directory {
         fs::create_dir_all(directory).map_err(|source| {
@@ -749,7 +883,7 @@ fn write_candidate(
         .unwrap_or("config.kdl");
     let directory = directory.unwrap_or_else(|| Path::new("."));
     let (staging, mut file) = fsutil::create_staging_file(directory, name, "kdl")?;
-    let result = (|| {
+    let result: Result<(), KdlError> = (|| {
         use std::io::Write;
         file.write_all(candidate.as_bytes())
             .map_err(|source| fsutil::io_error("writing Zellij configuration", &staging, source))?;
@@ -757,17 +891,12 @@ fn write_candidate(
             fsutil::io_error("synchronizing Zellij configuration", &staging, source)
         })?;
         drop(file);
-        fs::rename(&staging, path)
-            .map_err(|source| fsutil::io_error("installing Zellij configuration", path, source))?;
-        if let Some(mode) = preserve_mode {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
-                fsutil::io_error("restoring Zellij configuration permissions", path, source)
-            })?;
-        }
-        fsutil::sync_external_dir(directory)
+        publish(&staging)?;
+        fsutil::sync_external_dir(directory)?;
+        Ok(())
     })();
     let _ = fs::remove_file(&staging);
-    Ok(result?)
+    result
 }
 
 /// Atomically writes an already-validated candidate, preserving permissions.
@@ -780,12 +909,15 @@ fn write_candidate(
 /// Returns a `KdlError::Fs` error when the existing file cannot be inspected,
 /// read, or atomically replaced.
 pub fn write_raw_config(path: &Path, candidate: &str) -> Result<(), KdlError> {
-    let mode = fs::symlink_metadata(path)
-        .map_err(|source| fsutil::io_error("checking Zellij configuration", path, source))?
-        .permissions()
-        .mode()
-        & 0o777;
-    write_candidate(path, candidate, Some(mode))
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| fsutil::io_error("checking Zellij configuration", path, source))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(KdlError::UnsafePath {
+            path: path.to_path_buf(),
+        });
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    write_candidate(path, candidate, mode)
 }
 
 /// Result of applying the configuration edit.
@@ -967,6 +1099,98 @@ mod tests {
 
     const URL: &str = "file:/cfg/integrations/zellij/muxe-zellij.wasm";
 
+    #[test]
+    fn absent_plan_refuses_concurrent_creation_without_overwriting_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let path = temp.path().join("config.kdl");
+        let planned = read_and_plan(&path, URL).unwrap();
+        fs::write(&path, "// user created this\n").unwrap();
+
+        assert!(matches!(
+            commit_planned(&path, URL, &planned),
+            Err(KdlError::ConcurrentChange { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "// user created this\n");
+    }
+
+    #[test]
+    fn symlinked_configuration_is_refused_without_touching_link_or_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let target = temp.path().join("target.kdl");
+        let path = temp.path().join("config.kdl");
+        let target_bytes = b"// private user configuration\n";
+        fs::write(&target, target_bytes).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            read_and_plan(&path, URL),
+            Err(KdlError::UnsafePath { .. })
+        ));
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), target_bytes);
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn planned_absent_creation_and_existing_update_succeed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+
+        let absent = temp.path().join("absent.kdl");
+        let absent_plan = read_and_plan(&absent, URL).unwrap();
+        assert!(matches!(
+            commit_planned(&absent, URL, &absent_plan),
+            Ok(ConfigApplied::CreatedMinimal)
+        ));
+        assert!(fs::read_to_string(&absent).unwrap().contains(MUXE_NODE));
+
+        let existing = temp.path().join("existing.kdl");
+        fs::write(&existing, "// retain this\n").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o640)).unwrap();
+        let existing_plan = read_and_plan(&existing, URL).unwrap();
+        assert!(matches!(
+            commit_planned(&existing, URL, &existing_plan),
+            Ok(ConfigApplied::Edited { .. })
+        ));
+        assert!(
+            fs::read_to_string(&existing)
+                .unwrap()
+                .starts_with("// retain this\n")
+        );
+        assert_eq!(
+            fs::symlink_metadata(&existing)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
     #[test]
     fn empty_document_appends_both_blocks() {
         let plan = plan(Path::new("config.kdl"), "", URL).unwrap();

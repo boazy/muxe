@@ -331,8 +331,8 @@ fn install_fresh(
     if decision == EditDecision::Apply
         && let Some(planned) = planned
     {
-        journal.pending = kdl::plan_records(&config_path, &planned.plan.nodes);
-        journal.create_config = !planned.existed;
+        journal.pending = kdl::plan_records(&config_path, &planned.plan().nodes);
+        journal.create_config = planned.is_absent();
         journal.apply_config = true;
         write_journal(directory, &journal)?;
         inputs.hooks.check(InstallStep::BeforeKdlApply)?;
@@ -471,6 +471,7 @@ fn plan_config(
         Err(
             error @ (kdl::KdlError::Unparseable { .. }
             | kdl::KdlError::Ambiguous { .. }
+            | kdl::KdlError::UnsafePath { .. }
             | kdl::KdlError::ConcurrentChange { .. }
             | kdl::KdlError::CandidateRejected { .. }),
         ) => Ok((
@@ -496,6 +497,7 @@ fn kdl_abort_snippet(
     match error {
         kdl::KdlError::Unparseable { .. }
         | kdl::KdlError::Ambiguous { .. }
+        | kdl::KdlError::UnsafePath { .. }
         | kdl::KdlError::ConcurrentChange { .. }
         | kdl::KdlError::CandidateRejected { .. } => Ok(format!(
             "Could not edit {error} in {}.\nAdd these nodes manually:\n{}",
@@ -950,6 +952,7 @@ fn reapply_kdl(config_path: &Path, journal: &InstallJournal) -> Result<Vec<NodeR
         Err(
             error @ (kdl::KdlError::Unparseable { .. }
             | kdl::KdlError::Ambiguous { .. }
+            | kdl::KdlError::UnsafePath { .. }
             | kdl::KdlError::ConcurrentChange { .. }
             | kdl::KdlError::CandidateRejected { .. }),
         ) => Err(Reapply::AbortSnippet(format!(
