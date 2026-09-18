@@ -24,3 +24,11 @@
   published, not the local history of our work that contains trials, inline
   fixes (that should be squashed/absorbed) etc.
 
+
+## Isolated workspace lifecycle
+
+- Run at most three concurrent work items in separate JJ workspaces.
+- After verification and review, clean, squash, or reorder agent-owned history as needed. Rebase integrated work onto the latest `main`, then advance the `main` bookmark.
+- Always clean up completed isolated workspaces after integration. When all work is integrated and no unique unmerged or unknown files remain, remove the workspace registration, directory, and build output through the supported JJ/`wt` workflow. Account for ignored and untracked files; never use raw directory deletion.
+- Never delete active or blocked workspaces, or user-owned unmerged work.
+- Monitor free disk space. If it falls below 25 GB, pause builds and clean Rust `target` directories before continuing.
