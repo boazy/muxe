@@ -1088,7 +1088,7 @@ impl BrokerServer {
         let mut socket_device = self.socket_device;
         let mut socket_inode = self.socket_inode;
         let mut config_watch = self.config_watch.take();
-        let health = tokio::spawn(Arc::clone(&broker).monitor(shutdown.clone()));
+        let mut health = Some(tokio::spawn(Arc::clone(&broker).monitor(shutdown.clone())));
         let (commands, mut command_rx) = mpsc::channel(8);
         if let Some(activation) = &activation {
             activation.install_commands(commands).await;
@@ -1130,27 +1130,24 @@ impl BrokerServer {
                             .await;
                         }
                         Some(ServerCommand::Stop { complete }) => {
-                            // Supervisor-only: stop the host adapter, watcher, and health
-                            // monitor before unlinking the listener. Only after all resources
-                            // are retired is the response owner handed an exit ticket.
+                            // Terminal dispatch outcomes remain observable through the health
+                            // monitor until the adapter seals admission, joins every retained
+                            // host task, and closes its completion queue.
                             drop(config_watch.take());
-                            health.abort();
-                            let result = broker
-                                .shutdown_host_adapter()
-                                .await
-                                .map_err(|error| error.to_string())
-                                .and_then(|()| {
+                            let result = match broker.shutdown_host_adapter().await {
+                                Ok(()) => {
+                                    if let Some(health) = health.take() {
+                                        let _ = health.await;
+                                    }
                                     if listener.take().is_some() {
-                                        remove_owned_socket(
-                                            &endpoint,
-                                            socket_device,
-                                            socket_inode,
-                                        )
-                                        .map_err(|error| error.to_string())
+                                        remove_owned_socket(&endpoint, socket_device, socket_inode)
+                                            .map_err(|error| error.to_string())
                                     } else {
                                         Ok(())
                                     }
-                                });
+                                }
+                                Err(error) => Err(error.to_string()),
+                            };
                             match result {
                                 Ok(()) => {
                                     let (ticket, released) = RetirementTicket::pair();
@@ -1188,7 +1185,9 @@ impl BrokerServer {
                 }
             }
         };
-        health.abort();
+        if let Some(health) = health {
+            health.abort();
+        }
         if listener.is_some() {
             let _ = remove_owned_socket(&endpoint, socket_device, socket_inode);
         }
@@ -1846,14 +1845,20 @@ pub enum ServerError {
 #[cfg(test)]
 mod tests {
     use crate::BrokerClient;
-    use std::sync::Arc;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
     use muxe_adapter_api::{
         AdapterCapabilities, AdapterError, AdapterHealthEvent, CaptureLease, CaptureReleaseReason,
-        CaptureRequest, DispatchAccepted, ExecutionCorrelationId, HostAdapter, HostIdentity,
-        KeyboardCapabilities, ModalScopeId, NativeDispatchRequest, OriginCaptureRequest,
-        PendingPaneRegistration, PortableDispatchRequest,
+        CaptureRequest, DispatchAccepted, DispatchCompletion, ExecutionCorrelationId, HostAdapter,
+        HostIdentity, KeyboardCapabilities, ModalScopeId, NativeDispatchRequest,
+        OriginCaptureRequest, PendingPaneRegistration, PortableDispatchRequest,
     };
     use muxe_core::{
         ActionValidation, ActionValidator, CompiledGeneration, ConfigDiagnostic, KeyCapabilities,
@@ -1861,7 +1866,8 @@ mod tests {
     };
     use muxe_protocol::{
         AttachUi, BrokerResponse, ClientRequest, ControlRequest, HostKind, HostPaneId,
-        LiveServerIdentity, PeerRole, Prelude, SchemaFingerprint, ServerId as WireServerId,
+        InvocationDisposition, LiveServerIdentity, PeerRole, Prelude, SchemaFingerprint,
+        ServerId as WireServerId,
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1871,8 +1877,19 @@ mod tests {
 
     use super::*;
 
-    struct SmokeAdapter;
+    struct SmokeAdapter {
+        shutdown: AtomicBool,
+        shutdown_wake: tokio::sync::Notify,
+    }
 
+    impl SmokeAdapter {
+        fn new() -> Self {
+            Self {
+                shutdown: AtomicBool::new(false),
+                shutdown_wake: tokio::sync::Notify::new(),
+            }
+        }
+    }
     impl ActionValidator for SmokeAdapter {
         fn validate_portable(
             &self,
@@ -2021,10 +2038,22 @@ mod tests {
         }
 
         async fn next_health_event(&self) -> Result<AdapterHealthEvent, AdapterError> {
-            std::future::pending().await
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Shutdown,
+                    "smoke fake host is shut down",
+                ));
+            }
+            self.shutdown_wake.notified().await;
+            Err(AdapterError::new(
+                muxe_adapter_api::AdapterErrorKind::Shutdown,
+                "smoke fake host is shut down",
+            ))
         }
 
         async fn shutdown(&self) -> Result<(), AdapterError> {
+            self.shutdown.store(true, Ordering::Relaxed);
+            self.shutdown_wake.notify_waiters();
             Ok(())
         }
     }
@@ -2033,6 +2062,10 @@ mod tests {
         suspend_unsupported: bool,
         resume_fails: bool,
         readiness: std::sync::Mutex<Option<muxe_adapter_api::ActivationReadiness>>,
+        shutdown: AtomicBool,
+        shutdown_wake: tokio::sync::Notify,
+        queued_events: std::sync::Mutex<VecDeque<AdapterHealthEvent>>,
+        observed_events: AtomicUsize,
     }
 
     impl OrderingAdapter {
@@ -2053,8 +2086,18 @@ mod tests {
         fn set_readiness(&self, readiness: Option<muxe_adapter_api::ActivationReadiness>) {
             *self.readiness.lock().expect("readiness script is writable") = readiness;
         }
-    }
 
+        fn queue_event(&self, event: AdapterHealthEvent) {
+            self.queued_events
+                .lock()
+                .expect("health queue is writable")
+                .push_back(event);
+        }
+
+        fn observed_events(&self) -> usize {
+            self.observed_events.load(Ordering::SeqCst)
+        }
+    }
     impl ActionValidator for OrderingAdapter {
         fn validate_portable(
             &self,
@@ -2184,7 +2227,26 @@ mod tests {
         }
 
         async fn next_health_event(&self) -> Result<AdapterHealthEvent, AdapterError> {
-            std::future::pending().await
+            let queued = self
+                .queued_events
+                .lock()
+                .expect("health queue is readable")
+                .pop_front();
+            if let Some(event) = queued {
+                self.observed_events.fetch_add(1, Ordering::SeqCst);
+                return Ok(event);
+            }
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Shutdown,
+                    "ordering fake host is shut down",
+                ));
+            }
+            self.shutdown_wake.notified().await;
+            Err(AdapterError::new(
+                muxe_adapter_api::AdapterErrorKind::Shutdown,
+                "ordering fake host is shut down",
+            ))
         }
 
         async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
@@ -2210,6 +2272,8 @@ mod tests {
         }
 
         async fn shutdown(&self) -> Result<(), AdapterError> {
+            self.shutdown.store(true, Ordering::Relaxed);
+            self.shutdown_wake.notify_waiters();
             Ok(())
         }
 
@@ -2250,6 +2314,10 @@ mod tests {
             suspend_unsupported,
             resume_fails,
             readiness: std::sync::Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+            shutdown_wake: tokio::sync::Notify::new(),
+            queued_events: std::sync::Mutex::new(VecDeque::new()),
+            observed_events: AtomicUsize::new(0),
         });
         let config_source =
             std::fs::read_to_string(&config_path).expect("read owned activation config");
@@ -2313,7 +2381,7 @@ mod tests {
             "version: 1\nmenus:\n  main:\n    bindings:\n      q:\n        label: quit\n        action: menu:quit\n",
         )
         .expect("write owned broker config");
-        let adapter = Arc::new(SmokeAdapter);
+        let adapter = Arc::new(SmokeAdapter::new());
         let config_source =
             std::fs::read_to_string(&config_path).expect("read owned broker config");
         let config = muxe_core::compile_yaml(
@@ -2346,6 +2414,56 @@ mod tests {
             server_task,
         )
     }
+    #[tokio::test]
+    async fn activation_stop_joins_health_monitor_after_empty_or_queued_event() {
+        for queued in [false, true] {
+            let (broker, adapter, _config_dir) = ordering_broker(false, false);
+            let runtime = tempfile::tempdir().expect("owned activation stop endpoint directory");
+            let endpoint =
+                RuntimeEndpoint::in_runtime_dir(runtime.path(), HostKind::Herdr, "owned-fake-host")
+                    .expect("derive activation stop endpoint");
+            if queued {
+                adapter.queue_event(AdapterHealthEvent::DispatchCompleted(
+                    DispatchCompletion::Succeeded {
+                        execution: muxe_core::ExecutionId(999),
+                    },
+                ));
+            }
+            let server = BrokerServer::start_activation(
+                Arc::clone(&broker),
+                endpoint.clone(),
+                ActivationBootstrap::Running {
+                    current: test_record(),
+                },
+                None,
+            )
+            .await
+            .expect("start activation stop server");
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let run_task = tokio::spawn(server.run(shutdown_rx));
+            let mut control = ProductionControl::connect(endpoint.socket())
+                .await
+                .expect("connect activation coordinator");
+            let retired = control
+                .round_trip(ControlOperation::Retire)
+                .await
+                .expect("retire round trip");
+            assert!(
+                matches!(retired, ControlResult::Retired(_)),
+                "retire returns a terminal status"
+            );
+            tokio::time::timeout(Duration::from_secs(2), run_task)
+                .await
+                .expect("activation stop returns")
+                .expect("activation stop task joins")
+                .expect("activation stop succeeds");
+            assert_eq!(
+                adapter.observed_events(),
+                usize::from(queued),
+                "queued terminal event is observed exactly once before stop"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn child_held_lock_binds_and_sibling_acquire_fails_fast() {
@@ -2356,7 +2474,7 @@ mod tests {
             "version: 1\nmenus:\n  main:\n    bindings:\n      q:\n        label: quit\n        action: menu:quit\n",
         )
         .expect("write owned broker config");
-        let adapter = Arc::new(SmokeAdapter);
+        let adapter = Arc::new(SmokeAdapter::new());
         let config_source =
             std::fs::read_to_string(&config_path).expect("read owned broker config");
         let config = muxe_core::compile_yaml(
@@ -3899,12 +4017,11 @@ mod tests {
         std::path::PathBuf,
         tokio::task::JoinHandle<[u8; 7]>,
         std::path::PathBuf,
+        std::path::PathBuf,
     ) {
         let fifo = directory.path().join("started");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
             .expect("owned fifo exists");
-        // RDWR open never blocks; the blocking read runs on a thread pool thread
-        // while the test executor stays free. tokio has no fs feature here.
         let startup = tokio::task::spawn_blocking({
             let fifo = fifo.clone();
             move || {
@@ -3925,71 +4042,22 @@ mod tests {
                 .expect("reader thread joins")
                 .expect("child signals start")
         });
+        let exit_fifo = directory.path().join("exit_trigger");
+        nix::unistd::mkfifo(&exit_fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("exit fifo exists");
         let pidfile = directory.path().join("child.pid");
         let script = directory.path().join("linger.sh");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nprintf started > '{}'\nexec sleep 30\n",
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nprintf started > '{}'\nread line < '{}'\nexit 0\n",
                 pidfile.display(),
-                fifo.display()
+                fifo.display(),
+                exit_fifo.display()
             ),
         )
         .expect("stage lingering child script");
-        (script, startup, pidfile)
-    }
-
-    async fn launch_detached_linger(
-        broker: &Broker,
-        script: &std::path::Path,
-        cwd: &std::path::Path,
-    ) {
-        broker
-            .execute_command(crate::broker::CommandLaunch {
-                session: muxe_protocol::UiSessionId::new("retire-smoke"),
-                wire: muxe_protocol::ExecutionId([11; 16]),
-                core: muxe_core::ExecutionId(11),
-                command: muxe_core::CommandAction {
-                    program: muxe_core::ActionScalar::new(muxe_core::ConfigValue::synthetic(
-                        muxe_core::ConfigValueKind::String("/bin/sh".to_owned()),
-                    )),
-                    args: vec![muxe_core::ActionScalar::new(
-                        muxe_core::ConfigValue::synthetic(muxe_core::ConfigValueKind::String(
-                            script.to_string_lossy().into_owned(),
-                        )),
-                    )],
-                    cwd: None,
-                    env: std::collections::BTreeMap::default(),
-                },
-                origin: OriginContext {
-                    host_kind: OriginHostKind::Herdr,
-                    server_id: ServerId::new("server"),
-                    client_id: None,
-                    session_id: None,
-                    workspace_id: None,
-                    tab_id: None,
-                    tab_index: None,
-                    pane_id: None,
-                    pane_type: None,
-                    pane_cwd: Some(cwd.to_path_buf()),
-                    selection_text: None,
-                    invocation_source: OriginInvocationSource::RootBinding,
-                    worktree_id: None,
-                    worktree_path: None,
-                    agent_id: None,
-                    link_url: None,
-                    link_handler_id: None,
-                },
-                cwd_from_context: false,
-                policy: muxe_core::ExecutionPolicy {
-                    mode: muxe_core::ExecutionMode::Detach,
-                    timeout: None,
-                    on_timeout: muxe_core::TimeoutAction::Detach,
-                    on_menu_control: muxe_core::MenuControlAction::Detach,
-                },
-            })
-            .await
-            .expect("detached child starts");
+        (script, startup, pidfile, exit_fifo)
     }
 
     /// The response/recovery owner must explicitly release the retirement ticket:
@@ -4019,26 +4087,45 @@ mod tests {
     /// readiness, task completion, and liveness probes — no sleep assumptions.
     #[tokio::test]
     async fn retire_supervises_detached_child_until_reaped() {
-        let (broker, _adapter, _directory) = ordering_broker(false, false);
-        // The lingering child's FIFO, script, and pid file live outside the
-        // watched config tree: notify's recursive walk opens every entry with
-        // a blocking open, which hangs on a writer-less FIFO (and refuses
-        // sockets). The watched tree keeps only regular config files, as in
-        // production.
         let staging = tempfile::tempdir().expect("owned child staging directory");
-        let (script, startup, pidfile) = stage_lingering_child(&staging);
-        launch_detached_linger(&broker, &script, staging.path()).await;
-        // Barrier: the child wrote its announcement; it now sleeps.
-        let started = startup.await.expect("child signals start");
-        assert_eq!(&started, b"started");
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("child publishes its pid")
-            .trim()
-            .parse()
-            .expect("pid parses");
-        let child = nix::unistd::Pid::from_raw(pid);
-        // Isolated runtime directory: the watched config tree must not
-        // contain the live endpoint socket (macOS notify refuses).
+        let (script, startup, pidfile, exit_fifo) = stage_lingering_child(&staging);
+
+        let directory = tempfile::tempdir().expect("owned activation runtime directory");
+        let config_path = directory.path().join("config.yml");
+        let yaml = format!(
+            r#"
+version: 1
+menus:
+  main:
+    bindings:
+      l:
+        label: linger
+        action:
+          type: command:execute
+          program: /bin/sh
+          args:
+            - {script:?}
+          cwd: {cwd:?}
+        settings:
+          execution:
+            mode: detach
+"#,
+            script = script.to_string_lossy(),
+            cwd = staging.path().to_string_lossy(),
+        );
+        std::fs::write(&config_path, &yaml).expect("write linger config");
+
+        let adapter = Arc::new(SmokeAdapter::new());
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<owned activation linger>"),
+            yaml,
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("compile linger config");
+        let broker = Broker::from_compiled(adapter, &config_path, config);
+
         let runtime = tempfile::tempdir().expect("owned runtime directory");
         let endpoint =
             RuntimeEndpoint::in_runtime_dir(runtime.path(), HostKind::Herdr, "owned-fake-host")
@@ -4055,6 +4142,74 @@ mod tests {
         .expect("start owned activation server");
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let run_task = tokio::spawn(broker_server.run(shutdown_rx));
+
+        let live_server = broker.live_identity().await.expect("host identity");
+        let client_identity = LiveServerIdentity {
+            host: HostKind::Herdr,
+            discovery_key: "owned-fake-host".to_owned(),
+            server_id: WireServerId::new(live_server.server_id.as_str()),
+        };
+        let mut ui_client = BrokerClient::connect(
+            endpoint.socket(),
+            PeerRole::Ui,
+            "owned-retire-ui",
+            client_identity,
+        )
+        .await
+        .expect("connect UI client");
+        let attached = ui_client
+            .request(ClientRequest::AttachUi(AttachUi {
+                root: muxe_protocol::MenuId::new("main"),
+                pane: HostPaneId::new("owned-ui-pane"),
+                pending_launch: None,
+                origin: None,
+                caller_identity: None,
+                theme: None,
+                color_scheme: None,
+            }))
+            .await
+            .expect("attach UI");
+        let BrokerResponse::UiAttached { session, snapshot } = attached else {
+            panic!("expected UI attached");
+        };
+        let binding = snapshot
+            .menu
+            .menus
+            .iter()
+            .find(|m| m.id == muxe_protocol::MenuId::new("main"))
+            .and_then(|m| m.bindings.first())
+            .expect("linger binding visible");
+        let invoked = ui_client
+            .request(ClientRequest::InvokeBinding(muxe_protocol::InvokeBinding {
+                session: session.clone(),
+                generation: 1,
+                binding: binding.id,
+            }))
+            .await
+            .expect("invoke linger binding");
+        assert!(matches!(
+            invoked,
+            BrokerResponse::InvocationAccepted {
+                disposition: InvocationDisposition::Detached,
+                ..
+            }
+        ));
+
+        // Barrier: the child wrote its announcement; it is now running.
+        let started = startup.await.expect("child signals start");
+        assert_eq!(&started, b"started");
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("child publishes its pid")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        let child = nix::unistd::Pid::from_raw(pid);
+        assert!(
+            nix::sys::signal::kill(child, None).is_ok(),
+            "child alive while running"
+        );
+
+        // Coordinator connects and retires this broker.
         let mut control = ProductionControl::connect(endpoint.socket())
             .await
             .expect("coordinator connects");
@@ -4067,7 +4222,8 @@ mod tests {
             result => panic!("retire must succeed, got {result:?}"),
         };
         assert_eq!(retired.lifecycle, LifecycleState::Retired);
-        // The endpoint is unlinked while the child keeps running.
+
+        // The endpoint is unlinked while the child keeps running under GenericSupervisor.
         tokio::time::timeout(Duration::from_secs(5), async {
             while endpoint.socket().exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4075,18 +4231,46 @@ mod tests {
         })
         .await
         .expect("retire unlinks the endpoint");
+
         assert!(
             !run_task.is_finished(),
             "the service stays supervisor-only while the child runs"
         );
-        nix::sys::signal::kill(child, None).expect("child alive while supervised");
-        nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGTERM)
-            .expect("terminate the lingering child");
-        // The run lifetime ends only now: completion proves the supervisor reaped.
+        assert!(
+            broker.has_supervised_children().await,
+            "GenericSupervisor retains the detached child across activation drain"
+        );
+        assert!(
+            nix::sys::signal::kill(child, None).is_ok(),
+            "child alive while supervised"
+        );
+
+        // Trigger the child's bounded natural exit (no SIGTERM or SIGKILL, no global cleanup).
+        {
+            let mut trigger = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&exit_fifo)
+                .expect("open exit trigger fifo");
+            std::io::Write::write_all(&mut trigger, b"exit\n").expect("write exit trigger");
+        }
+
+        // The run lifetime ends only now: completion proves the supervisor reaped the naturally exited child.
         tokio::time::timeout(Duration::from_secs(10), run_task)
             .await
-            .expect("service terminates after reap")
+            .expect("service terminates after child naturally exits and is reaped")
             .expect("service joins")
             .expect("service has no error");
+
+        // Verify the child process was cleanly reaped (no zombie).
+        assert_eq!(
+            nix::sys::signal::kill(child, None),
+            Err(nix::errno::Errno::ESRCH),
+            "child process is reaped and no longer exists"
+        );
+        assert!(
+            !broker.has_supervised_children().await,
+            "no supervised children remain"
+        );
     }
 }

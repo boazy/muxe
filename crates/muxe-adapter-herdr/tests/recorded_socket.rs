@@ -3,11 +3,11 @@ mod support {
     pub mod recorded_socket;
 }
 
-use std::{fs, os::unix::fs::symlink, time::Duration};
+use std::{fs, os::unix::fs::symlink, sync::Arc, time::Duration};
 
 use muxe_adapter_api::{
-    AdapterErrorKind, AdapterHealthEvent, DispatchCompletion, HostAdapter, HostCallerIdentity,
-    OriginCaptureRequest, OriginHintSource, PendingPaneRegistration,
+    AdapterError, AdapterErrorKind, AdapterHealthEvent, DispatchCompletion, HostAdapter,
+    HostCallerIdentity, OriginCaptureRequest, OriginHintSource, PendingPaneRegistration,
     PostDismissalPortableDispatchRequest, ResolvedPortableAction, UiSessionId, UntrustedOriginHint,
 };
 use muxe_adapter_herdr::{
@@ -662,6 +662,74 @@ async fn defers_focused_tab_creation_until_the_retained_ui_close_event() {
 }
 
 #[tokio::test]
+async fn deferred_preflight_failure_emits_one_retained_terminal() {
+    let snapshot = lifecycle_snapshot();
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned preflight fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures from the owned snapshot");
+    let execution = ExecutionId(74);
+    adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution,
+            action: ResolvedPortableAction {
+                action: PortableAction::Pane(PaneAction::Split {
+                    direction: None,
+                    focus: None,
+                    command: CreateCommand::default(),
+                }),
+            },
+            origin,
+            ui_pane: PaneId::new("pane-2"),
+        })
+        .await
+        .expect("invalid deferred action is admitted while its UI remains live");
+    wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
+
+    fixture
+        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .expect("retained subscription accepts the UI close event");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
+            .await
+            .expect("preflight failure arrives")
+            .expect("adapter reports preflight completion"),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Failed {
+            execution: completed,
+            error,
+        }) if completed == execution
+            && error.kind == AdapterErrorKind::Incompatible
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), adapter.next_health_event())
+            .await
+            .is_err(),
+        "one preflight failure produces exactly one retained terminal"
+    );
+    adapter
+        .shutdown()
+        .await
+        .expect("adapter stops its retained monitor");
+    drop(adapter);
+    drop(fixture);
+}
+#[tokio::test]
 async fn reports_unknown_outcome_when_command_tab_layout_closes_after_flush() {
     let snapshot = lifecycle_snapshot();
     let mut script = ProductionConnectFixture::initial_handshake();
@@ -1252,4 +1320,71 @@ async fn launches_an_exact_command_as_a_labeled_unfocused_tab() {
             .len(),
         1
     );
+}
+
+/// One-consumer invariant: `next_health_event` is called only by the broker
+/// monitor. The dispatch wake must be registered, pinned, and enabled BEFORE
+/// checking for queued terminal outcomes or finalized shutdown status. If
+/// shutdown finalization runs and calls `notify_waiters()` between wake
+/// registration and `select!`, the pre-registered notification is preserved:
+/// queued terminal outcomes drain first, and subsequent calls exit bounded with
+/// `AdapterErrorKind::Shutdown`.
+#[tokio::test]
+async fn shutdown_finalization_between_wake_registration_and_select_drains_terminals_bounded() {
+    let fixture = ProductionConnectFixture::start().expect("owned fake-native fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connect accepts the recorded child and socket handshake");
+    // Consume the initial Healthy event published during connect.
+    let initial = adapter
+        .next_health_event()
+        .await
+        .expect("initial health event");
+    assert!(matches!(initial, AdapterHealthEvent::Healthy { .. }));
+
+    let hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_health_wait_hook(Some(Arc::clone(&hook)));
+
+    let execution = ExecutionId(77);
+    let next_task = tokio::spawn({
+        let adapter = Arc::clone(&adapter);
+        async move { adapter.next_health_event().await }
+    });
+    hook.entered.notified().await;
+
+    adapter.send_dispatch_terminal_for_test(execution, DispatchCompletion::Succeeded { execution });
+    let shutdown_task = tokio::spawn({
+        let adapter = Arc::clone(&adapter);
+        async move { adapter.shutdown().await }
+    });
+    hook.release.notify_one();
+    let event = tokio::time::timeout(Duration::from_secs(2), next_task)
+        .await
+        .expect("next_health_event returns within bounded time")
+        .expect("next_health_event task joins")
+        .expect("next_health_event returns ok event");
+    assert!(matches!(
+        event,
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded { execution: e }) if e == execution
+    ));
+
+    // 2. Shutdown must complete boundedly without deadlocking on retained senders.
+    tokio::time::timeout(Duration::from_secs(2), shutdown_task)
+        .await
+        .expect("shutdown finishes within bounded time")
+        .expect("shutdown task joins")
+        .expect("shutdown succeeds");
+
+    // 3. Once fully drained, `next_health_event` returns Shutdown boundedly.
+    adapter.set_health_wait_hook(None);
+    let terminal = tokio::time::timeout(Duration::from_secs(2), adapter.next_health_event())
+        .await
+        .expect("final next_health_event returns within bounded time");
+    assert!(matches!(
+        terminal,
+        Err(AdapterError {
+            kind: AdapterErrorKind::Shutdown,
+            ..
+        })
+    ));
 }

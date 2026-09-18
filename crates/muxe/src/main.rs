@@ -828,6 +828,77 @@ fn serve_event(logger: &muxe::logging::Logger, host: &str, operation: &str, mess
     }
 }
 
+fn broker_diagnostic_message(outcome: muxe_protocol::ExecutionOutcome) -> &'static str {
+    match outcome {
+        muxe_protocol::ExecutionOutcome::Failed => "detached execution failed",
+        muxe_protocol::ExecutionOutcome::OutcomeUnknown => "detached execution outcome is unknown",
+        muxe_protocol::ExecutionOutcome::Cancelled => "detached execution was cancelled",
+        muxe_protocol::ExecutionOutcome::TimedOut => "detached execution timed out",
+        muxe_protocol::ExecutionOutcome::Succeeded | muxe_protocol::ExecutionOutcome::Detached => {
+            "detached execution completed"
+        }
+    }
+}
+
+struct DiagnosticConsumer {
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DiagnosticConsumer {
+    async fn stop_and_join(self) {
+        let _ = self.stop.send(());
+        let _ = self.task.await;
+    }
+}
+
+fn persist_broker_diagnostic(
+    logger: &muxe::logging::Logger,
+    host: &str,
+    diagnostic: muxe_broker::BrokerDiagnostic,
+) {
+    let event = muxe::logging::LogEvent::new(
+        logger.version().to_owned(),
+        host,
+        "detached-execution",
+        broker_diagnostic_message(diagnostic.outcome),
+    )
+    .map(|event| {
+        event
+            .with_request(format!("{:?}", diagnostic.execution))
+            .with_code(format!("{:?}: {:?}", diagnostic.outcome, diagnostic.code))
+    });
+    if let Ok(event) = event {
+        let _ = logger.append(&event);
+    }
+}
+
+fn retain_broker_diagnostics(
+    logger: Arc<muxe::logging::Logger>,
+    host: &'static str,
+    mut diagnostics: tokio::sync::mpsc::UnboundedReceiver<muxe_broker::BrokerDiagnostic>,
+) -> DiagnosticConsumer {
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                diagnostic = diagnostics.recv() => match diagnostic {
+                    Some(diagnostic) => persist_broker_diagnostic(&logger, host, diagnostic),
+                    None => return,
+                },
+                _ = &mut stopped => {
+                    diagnostics.close();
+                    while let Some(diagnostic) = diagnostics.recv().await {
+                        persist_broker_diagnostic(&logger, host, diagnostic);
+                    }
+                    return;
+                }
+            }
+        }
+    });
+    DiagnosticConsumer { stop, task }
+}
+
 /// Private broker child mode used only by the repository-owned cross-version fixture.
 ///
 /// It accepts concrete paths from the coordinator, never an ambient command hook. A target reads
@@ -838,8 +909,10 @@ fn serve_event(logger: &muxe::logging::Logger, host: &str, operation: &str, mess
     reason = "broker serve transaction: endpoint lock, adapter connect, identity match, journal authorization, registry token, bind, and run form one ordered startup that must stay together to keep the construction/bind gap closed"
 )]
 async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
-    let logger = muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
-        .wrap_err("could not open the broker service audit log")?;
+    let logger = Arc::new(
+        muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
+            .wrap_err("could not open the broker service audit log")?,
+    );
     // Earliest lock ownership, mirroring the Zellij path: the Herdr discovery
     // key is the server socket string, so the normal endpoint derives from
     // argv before any host contact. A live endpoint exits before adapter
@@ -876,6 +949,11 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     let broker = muxe_broker::Broker::load(adapter, &command.config)
         .await
         .wrap_err("could not load the broker configuration")?;
+    let diagnostics = broker
+        .take_diagnostics()
+        .await
+        .expect("new broker owns its diagnostic sink");
+    let diagnostics_task = retain_broker_diagnostics(Arc::clone(&logger), "herdr", diagnostics);
     let live_server = broker
         .live_identity()
         .await
@@ -988,6 +1066,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     };
     let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let result = server.run(shutdown_rx).await;
+    diagnostics_task.stop_and_join().await;
     let _ = registry.unregister(&registration);
     serve_event(&logger, "herdr", "broker-serve", "stopped");
     result.wrap_err("Herdr broker service stopped unexpectedly")
@@ -1001,8 +1080,10 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     reason = "broker serve transaction: endpoint lock, adapter connect, identity match, journal and bridge authorization, registry token, bind, initial round, and run form one ordered startup that must stay together to keep the construction/bind gap closed"
 )]
 async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
-    let logger = muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
-        .wrap_err("could not open the broker service audit log")?;
+    let logger = Arc::new(
+        muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
+            .wrap_err("could not open the broker service audit log")?,
+    );
     // Earliest lock ownership: serialize with concurrent starters before
     // touching the host, so two children never hold overlapping adapters. A
     // live endpoint means another broker won: exit before adapter
@@ -1047,6 +1128,11 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     let broker = muxe_broker::Broker::load(adapter_object, &command.config)
         .await
         .wrap_err("could not load the broker configuration")?;
+    let diagnostics = broker
+        .take_diagnostics()
+        .await
+        .expect("new broker owns its diagnostic sink");
+    let diagnostics_task = retain_broker_diagnostics(Arc::clone(&logger), "zellij", diagnostics);
     let live_server = broker
         .live_identity()
         .await
@@ -1241,10 +1327,12 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
             );
             let _ = shutdown_tx.send(true);
             let _ = server_handle.await;
+            diagnostics_task.stop_and_join().await;
             let _ = registry.unregister(&registration);
             return Err(error).wrap_err("Zellij initial census round never established");
         }
         let joined = server_handle.await;
+        diagnostics_task.stop_and_join().await;
         let _ = registry.unregister(&registration);
         serve_event(&logger, "zellij", "broker-serve", "stopped");
         return joined
@@ -1253,6 +1341,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     }
     let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let result = server.run(shutdown_rx).await;
+    diagnostics_task.stop_and_join().await;
     let _ = registry.unregister(&registration);
     serve_event(&logger, "zellij", "broker-serve", "stopped");
     result.wrap_err("Zellij broker service stopped unexpectedly")
@@ -2880,6 +2969,7 @@ mod tests {
         );
         assert!(resolve_pane_cwd(Path::new("relative"), None).is_err());
     }
+
     /// Consumer boundary: a successful rollback still fails the command, so
     /// CLI callers observe the original activation failure. Pins the exit
     /// decision, never the printed wording.
@@ -3501,18 +3591,26 @@ mod consumer_tests {
 mod mixed_recovery_production_tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{fs, path::Path, sync::Arc, time::Duration};
+    use std::{
+        fs,
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use muxe_adapter_api::{
         AdapterCapabilities, AdapterError, AdapterHealthEvent, CaptureLease, CaptureReleaseReason,
-        CaptureRequest, DispatchAccepted, HostAdapter, HostIdentity, KeyboardCapabilities,
-        ModalScopeId, NativeDispatchRequest, OriginCaptureRequest, PendingPaneLease,
-        PendingPaneRegistration, PortableDispatchRequest,
+        CaptureRequest, DispatchAccepted, ExecutionCorrelationId, HostAdapter, HostIdentity,
+        KeyboardCapabilities, ModalScopeId, NativeDispatchRequest, OriginCaptureRequest,
+        PendingPaneLease, PendingPaneRegistration, PortableDispatchRequest,
     };
     use muxe_core::{
         ActionValidation, ActionValidator, CompiledConfig, CompiledGeneration, ConfigDiagnostic,
-        KeyCapabilities, OriginContext, SourceId,
+        KeyCapabilities, OriginContext, OriginHostKind, OriginInvocationSource, PaneId, SourceId,
     };
     use muxe_protocol::{
         control::{CompatibilityRecord, ZellijCompatibility},
@@ -3532,6 +3630,10 @@ mod mixed_recovery_production_tests {
         discovery_key: String,
         shutdown_gate: Option<Arc<ShutdownGate>>,
         resume_gate: Option<Arc<ShutdownGate>>,
+        diagnostic_mode: bool,
+        diagnostic_emitted: AtomicBool,
+        shutdown: AtomicBool,
+        shutdown_wake: tokio::sync::Notify,
     }
 
     impl ActionValidator for RecoveryAdapter {
@@ -3633,6 +3735,27 @@ mod mixed_recovery_production_tests {
             &self,
             _request: OriginCaptureRequest,
         ) -> Result<OriginContext, AdapterError> {
+            if self.diagnostic_mode {
+                return Ok(OriginContext {
+                    host_kind: OriginHostKind::Zellij,
+                    server_id: muxe_core::ServerId::new("diagnostic-server"),
+                    client_id: None,
+                    session_id: None,
+                    workspace_id: None,
+                    tab_id: None,
+                    tab_index: None,
+                    pane_id: Some(PaneId::new("diagnostic-origin-pane")),
+                    pane_type: None,
+                    pane_cwd: None,
+                    selection_text: None,
+                    invocation_source: OriginInvocationSource::RootBinding,
+                    worktree_id: None,
+                    worktree_path: None,
+                    agent_id: None,
+                    link_url: None,
+                    link_handler_id: None,
+                });
+            }
             Err(AdapterError::new(
                 muxe_adapter_api::AdapterErrorKind::Unsupported,
                 "recovery test does not capture UI origin",
@@ -3641,8 +3764,15 @@ mod mixed_recovery_production_tests {
 
         async fn dispatch_portable(
             &self,
-            _request: PortableDispatchRequest,
+            request: PortableDispatchRequest,
         ) -> Result<DispatchAccepted, AdapterError> {
+            if self.diagnostic_mode {
+                return Ok(DispatchAccepted {
+                    correlation: ExecutionCorrelationId::new("diagnostic-dispatch"),
+                    execution: request.execution,
+                    capabilities: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                });
+            }
             Err(AdapterError::new(
                 muxe_adapter_api::AdapterErrorKind::Unsupported,
                 "recovery test does not dispatch",
@@ -3664,7 +3794,28 @@ mod mixed_recovery_production_tests {
         }
 
         async fn next_health_event(&self) -> Result<AdapterHealthEvent, AdapterError> {
-            std::future::pending().await
+            if self.diagnostic_mode && !self.diagnostic_emitted.swap(true, Ordering::Relaxed) {
+                return Ok(AdapterHealthEvent::DispatchCompleted(
+                    muxe_adapter_api::DispatchCompletion::Failed {
+                        execution: muxe_core::ExecutionId(1),
+                        error: AdapterError::new(
+                            muxe_adapter_api::AdapterErrorKind::DispatchFailed,
+                            "host response carries secret-sentinel",
+                        ),
+                    },
+                ));
+            }
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Shutdown,
+                    "recovery fake host is shut down",
+                ));
+            }
+            self.shutdown_wake.notified().await;
+            Err(AdapterError::new(
+                muxe_adapter_api::AdapterErrorKind::Shutdown,
+                "recovery fake host is shut down",
+            ))
         }
 
         async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
@@ -3684,8 +3835,127 @@ mod mixed_recovery_production_tests {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
+            self.shutdown.store(true, Ordering::Relaxed);
+            self.shutdown_wake.notify_waiters();
             Ok(())
         }
+    }
+    #[tokio::test]
+    async fn detached_broker_failure_after_ui_close_reaches_native_json_log() {
+        let cache = tempfile::tempdir().expect("owned cache directory");
+        let config_path = cache.path().join("config.yml");
+        let adapter = Arc::new(RecoveryAdapter {
+            discovery_key: "diagnostic-host".to_owned(),
+            shutdown_gate: None,
+            resume_gate: None,
+            diagnostic_mode: true,
+            diagnostic_emitted: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            shutdown_wake: tokio::sync::Notify::new(),
+        });
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("diagnostic.yml"),
+            "version: 1\nmenus:\n  main:\n    bindings:\n      f:\n        label: focus\n        action: tab:focus index=1\n        settings:\n          execution:\n            mode: detach\n",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("diagnostic configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("diagnostic binding is visible");
+        let broker = muxe_broker::Broker::from_compiled(adapter, &config_path, config);
+        let diagnostics = broker
+            .take_diagnostics()
+            .await
+            .expect("native composition root owns the broker diagnostic receiver");
+        let logger = Arc::new(
+            muxe::logging::Logger::open(cache.path(), "test").expect("open owner-only logger"),
+        );
+        let consumer = super::retain_broker_diagnostics(Arc::clone(&logger), "zellij", diagnostics);
+        let (events, _events_rx) = tokio::sync::mpsc::channel(1);
+        let muxe_broker::RequestResult::Immediate(muxe_protocol::BrokerResponse::UiAttached {
+            session,
+            ..
+        }) = broker
+            .handle(
+                muxe_protocol::PeerRole::Ui,
+                muxe_protocol::ClientRequest::AttachUi(muxe_protocol::AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: muxe_protocol::HostPaneId::new("muxe-ui"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("fake host attaches UI")
+        else {
+            panic!("expected immediate UI attachment");
+        };
+        let muxe_broker::RequestResult::Immediate(response) = broker
+            .handle(
+                muxe_protocol::PeerRole::Ui,
+                muxe_protocol::ClientRequest::InvokeBinding(muxe_protocol::InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: muxe_protocol::BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("fake host accepts detached dispatch")
+        else {
+            panic!("expected immediate detached acceptance");
+        };
+        assert!(matches!(
+            response,
+            muxe_protocol::BrokerResponse::InvocationAccepted {
+                disposition: muxe_protocol::InvocationDisposition::Detached,
+                ..
+            }
+        ));
+        broker
+            .handle(
+                muxe_protocol::PeerRole::Ui,
+                muxe_protocol::ClientRequest::DetachUi(muxe_protocol::DetachUi { session }),
+                events,
+            )
+            .await
+            .expect("UI closes after accepted dispatch");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let health = tokio::spawn(Arc::clone(&broker).monitor(shutdown_rx));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cache.path().join("logs/muxe.jsonl").exists() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual broker failure reaches the native diagnostic consumer");
+        let _ = shutdown_tx.send(true);
+        health.await.expect("broker health monitor stops");
+        consumer.stop_and_join().await;
+
+        let record = fs::read_to_string(cache.path().join("logs/muxe.jsonl"))
+            .expect("native diagnostic record");
+        assert!(record.contains("detached execution failed"));
+        assert!(record.contains("Failed: ActionBlocked"));
+        assert!(!record.contains("secret-sentinel"));
     }
 
     fn compiled_config() -> CompiledConfig {
@@ -3933,11 +4203,19 @@ mod mixed_recovery_production_tests {
             discovery_key: "old-a".to_owned(),
             shutdown_gate: None,
             resume_gate: Some(Arc::clone(&resume_gate_a)),
+            diagnostic_mode: false,
+            diagnostic_emitted: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            shutdown_wake: tokio::sync::Notify::new(),
         });
         let adapter_b = Arc::new(RecoveryAdapter {
             discovery_key: "old-b".to_owned(),
             shutdown_gate: None,
             resume_gate: Some(Arc::clone(&resume_gate_b)),
+            diagnostic_mode: false,
+            diagnostic_emitted: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            shutdown_wake: tokio::sync::Notify::new(),
         });
         let old_a = muxe_broker::Broker::from_compiled(adapter_a, &config_path, compiled_config());
         let old_b = muxe_broker::Broker::from_compiled(adapter_b, &config_path, compiled_config());
@@ -4036,6 +4314,10 @@ mod mixed_recovery_production_tests {
                 discovery_key: "old-b".to_owned(),
                 shutdown_gate: Some(Arc::clone(&shutdown_gate)),
                 resume_gate: None,
+                diagnostic_mode: false,
+                diagnostic_emitted: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
+                shutdown_wake: tokio::sync::Notify::new(),
             }),
             &config_path,
             compiled_config(),

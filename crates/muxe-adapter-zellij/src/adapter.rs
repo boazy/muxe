@@ -24,16 +24,6 @@
 //! pane is the attaching UI pane. No unique match fails the bootstrap rather
 //! than guessing.
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
-};
-
 use async_trait::async_trait;
 use muxe_adapter_api::{
     ActivationReadiness, AdapterCapabilities, AdapterError, AdapterErrorKind, AdapterHealthEvent,
@@ -59,8 +49,18 @@ use muxe_zellij_protocol::{
     generated::{RawNativeCommand, ValidatedNativeCommand},
     generated_action_fingerprint, pinned_source_revision,
 };
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{Mutex, Notify, mpsc, oneshot},
+    task::JoinHandle,
     time::timeout,
 };
 
@@ -499,6 +499,11 @@ impl LocalTokenSource {
         id
     }
 }
+#[cfg(test)]
+struct WaitHook {
+    entered: Notify,
+    release: Notify,
+}
 
 struct AdapterInner {
     config: ZellijAdapterConfig,
@@ -523,8 +528,15 @@ struct AdapterInner {
     local_tokens: LocalTokenSource,
     events_tx: mpsc::Sender<AdapterHealthEvent>,
     events_rx: Mutex<mpsc::Receiver<AdapterHealthEvent>>,
+    event_loop: StdMutex<Option<JoinHandle<()>>>,
+    quiescing: AtomicBool,
+    #[cfg(test)]
+    health_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    #[cfg(test)]
+    emit_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    quiesce_wake: Notify,
+    health_wake: Notify,
     shutdown: AtomicBool,
-    /// True between `suspend_for_activation` and either resume or shutdown.
     /// While set, host-bound operations fail closed with `Unavailable` and
     /// pipe recovery pauses until resume reinstalls the transport.
     suspended: AtomicBool,
@@ -615,6 +627,14 @@ impl ZellijAdapter {
                 local_tokens: LocalTokenSource::new(),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
+                event_loop: StdMutex::new(None),
+                quiescing: AtomicBool::new(false),
+                #[cfg(test)]
+                health_wait_hook: StdMutex::new(None),
+                #[cfg(test)]
+                emit_wait_hook: StdMutex::new(None),
+                quiesce_wake: Notify::new(),
+                health_wake: Notify::new(),
                 shutdown: AtomicBool::new(false),
                 suspended: AtomicBool::new(false),
                 resume_epoch: AtomicU64::new(0),
@@ -626,9 +646,15 @@ impl ZellijAdapter {
             }),
         };
         let worker = adapter.clone();
-        tokio::spawn(async move {
+        let event_loop = tokio::spawn(async move {
             worker.event_loop().await;
         });
+        adapter
+            .inner
+            .event_loop
+            .lock()
+            .expect("Zellij event-loop slot is not poisoned")
+            .replace(event_loop);
         adapter
     }
 
@@ -830,7 +856,31 @@ impl ZellijAdapter {
             .unwrap_or(u64::MAX)
     }
     async fn emit(&self, event: AdapterHealthEvent) {
-        let _ = self.inner.events_tx.send(event).await;
+        let wake = self.inner.quiesce_wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+        #[cfg(test)]
+        {
+            let hook = self
+                .inner
+                .emit_wait_hook
+                .lock()
+                .expect("Zellij emit hook is not poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+            }
+        }
+        if self.inner.quiescing.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            result = self.inner.events_tx.send(event) => {
+                let _ = result;
+            }
+            () = wake => {}
+        };
     }
 
     fn mint_local_id(&self) -> [u8; 16] {
@@ -857,7 +907,9 @@ impl ZellijAdapter {
         let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
         sweep.tick().await;
         loop {
-            if self.inner.shutdown.load(Ordering::Relaxed) {
+            if self.inner.shutdown.load(Ordering::Relaxed)
+                || self.inner.quiescing.load(Ordering::Acquire)
+            {
                 return;
             }
             tokio::select! {
@@ -866,7 +918,9 @@ impl ZellijAdapter {
                         failures = 0;
                         self.handle_event_line(channel, &line).await;
                     } else {
-                        if self.inner.shutdown.load(Ordering::Relaxed) {
+                        if self.inner.shutdown.load(Ordering::Relaxed)
+                            || self.inner.quiescing.load(Ordering::Acquire)
+                        {
                             return;
                         }
                         failures = failures.saturating_add(1);
@@ -1549,9 +1603,8 @@ impl ZellijAdapter {
                 && let Some(execution) = pending.execution
             {
                 inner.live_executions.lock().await.remove(&execution.0);
-                let _ = inner
-                    .events_tx
-                    .send(AdapterHealthEvent::DispatchCompleted(
+                adapter
+                    .emit(AdapterHealthEvent::DispatchCompleted(
                         DispatchCompletion::OutcomeUnknown {
                             execution,
                             error: AdapterError::new(
@@ -1564,7 +1617,10 @@ impl ZellijAdapter {
             }
             // Never recover the transport while suspended for activation:
             // resume reinstalls both children after revalidation.
-            if inner.shutdown.load(Ordering::Relaxed) || inner.suspended.load(Ordering::SeqCst) {
+            if inner.shutdown.load(Ordering::Relaxed)
+                || inner.quiescing.load(Ordering::Acquire)
+                || inner.suspended.load(Ordering::SeqCst)
+            {
                 return;
             }
             let _ = inner.request.respawn().await;
@@ -1574,6 +1630,7 @@ impl ZellijAdapter {
 
     async fn replace_request_child(&self) -> bool {
         if self.inner.shutdown.load(Ordering::Relaxed)
+            || self.inner.quiescing.load(Ordering::Acquire)
             || self.inner.suspended.load(Ordering::SeqCst)
         {
             return false;
@@ -1585,6 +1642,7 @@ impl ZellijAdapter {
 
     async fn restart_whole_pipe(&self) {
         if self.inner.shutdown.load(Ordering::Relaxed)
+            || self.inner.quiescing.load(Ordering::Acquire)
             || self.inner.suspended.load(Ordering::SeqCst)
         {
             return;
@@ -2663,13 +2721,46 @@ impl HostAdapter for ZellijAdapter {
     }
 
     async fn next_health_event(&self) -> Result<AdapterHealthEvent, AdapterError> {
-        self.inner
-            .events_rx
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| AdapterError::new(AdapterErrorKind::Shutdown, "adapter shut down"))
+        let mut events = self.inner.events_rx.lock().await;
+        loop {
+            // This is the sole health consumer (the broker monitor). Register
+            // the wake before observing the queue or shutdown flag so a
+            // notify_waiters during that observation cannot be lost.
+            let wake = self.inner.health_wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            #[cfg(test)]
+            {
+                let hook = self
+                    .inner
+                    .health_wait_hook
+                    .lock()
+                    .expect("Zellij health hook is not poisoned")
+                    .clone();
+                if let Some(hook) = hook {
+                    hook.entered.notify_one();
+                    hook.release.notified().await;
+                }
+            }
+            if let Ok(event) = events.try_recv() {
+                return Ok(event);
+            }
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Shutdown,
+                    "adapter shut down",
+                ));
+            }
+            tokio::select! {
+                biased;
+                event = events.recv() => {
+                    return event.ok_or_else(|| {
+                        AdapterError::new(AdapterErrorKind::Shutdown, "adapter shut down")
+                    });
+                }
+                () = wake => {}
+            }
+        }
     }
 
     /// Stops the retained pipe transport after broker-owned UI state drains
@@ -2861,17 +2952,25 @@ impl HostAdapter for ZellijAdapter {
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
-        self.inner.shutdown.store(true, Ordering::Relaxed);
-        // Wake every waiter before tearing down the transport: the census
-        // notify releases establish/resume waits into their fail-closed
-        // paths, and dropping the lifecycle waiter senders fails pending
-        // capture/origin receivers promptly through their existing
-        // timeout/else branches instead of stalling to deadline.
+        // Quiesce every producer before publishing the final shutdown wake.
+        self.inner.quiescing.store(true, Ordering::Release);
+        self.inner.quiesce_wake.notify_waiters();
+        self.inner.event.close().await;
+        let event_loop = self
+            .inner
+            .event_loop
+            .lock()
+            .expect("Zellij event-loop slot is not poisoned")
+            .take();
+        if let Some(event_loop) = event_loop {
+            let _ = event_loop.await;
+        }
+        self.inner.shutdown.store(true, Ordering::Release);
+        self.inner.health_wake.notify_waiters();
         self.inner.registry_notify.notify_waiters();
         self.inner.pending_origin.lock().await.clear();
         self.inner.pending_capture.lock().await.clear();
         self.inner.request.close().await;
-        self.inner.event.close().await;
         Ok(())
     }
 }
@@ -4954,5 +5053,167 @@ done
             .expect("finds owned fake");
         assert_eq!(found, exe);
         assert!(super::find_zellij_in_dirs([dir.path().join("missing-dir")].into_iter()).is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_wake_registered_before_shutdown_is_not_lost() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        let hook = Arc::new(WaitHook {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        *adapter
+            .inner
+            .health_wait_hook
+            .lock()
+            .expect("health hook is writable") = Some(Arc::clone(&hook));
+        let next = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.next_health_event().await }
+        });
+        hook.entered.notified().await;
+        let shutdown = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !adapter.inner.quiescing.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown enters producer quiescence");
+        *adapter
+            .inner
+            .health_wait_hook
+            .lock()
+            .expect("health hook is writable") = None;
+        hook.release.notify_one();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), next)
+                .await
+                .expect("health waiter wakes")
+                .expect("health waiter task joins"),
+            Err(AdapterError {
+                kind: AdapterErrorKind::Shutdown,
+                ..
+            })
+        ));
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_one_queued_health_event_before_shutdown() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        adapter
+            .inner
+            .events_tx
+            .send(AdapterHealthEvent::DispatchCompleted(
+                DispatchCompletion::Succeeded {
+                    execution: ExecutionId(91),
+                },
+            ))
+            .await
+            .expect("queue terminal health event");
+        adapter.shutdown().await.expect("adapter shutdown");
+        assert!(matches!(
+            adapter.next_health_event().await,
+            Ok(AdapterHealthEvent::DispatchCompleted(
+                DispatchCompletion::Succeeded {
+                    execution: ExecutionId(91)
+                }
+            ))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event()).await,
+            Ok(Err(AdapterError {
+                kind: AdapterErrorKind::Shutdown,
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_wake_pre_registration_unblocks_full_health_producer() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        for _ in 0..256 {
+            adapter
+                .inner
+                .events_tx
+                .try_send(AdapterHealthEvent::Unhealthy {
+                    modal_scope: None,
+                    error: AdapterError::new(AdapterErrorKind::Unavailable, "fill health queue"),
+                })
+                .expect("fill bounded health queue");
+        }
+        let hook = Arc::new(WaitHook {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        *adapter
+            .inner
+            .emit_wait_hook
+            .lock()
+            .expect("emit hook is writable") = Some(Arc::clone(&hook));
+        let execution = ExecutionId(42);
+        let provenance = RequestProvenance {
+            request_id: RequestId::INITIAL,
+            registration: registration_id(1),
+        };
+        let generation = ChannelGeneration::INITIAL;
+        *adapter.inner.in_flight.lock().await = Some(InFlight {
+            request: provenance,
+            generation,
+            execution: Some(execution),
+        });
+        adapter
+            .inner
+            .live_executions
+            .lock()
+            .await
+            .insert(execution.0, Some(provenance));
+        adapter.watch_release(provenance, generation);
+        tokio::time::advance(RELEASE_TIMEOUT).await;
+        hook.entered.notified().await;
+        let shutdown = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !adapter.inner.quiescing.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown enters producer quiescence");
+        *adapter
+            .inner
+            .emit_wait_hook
+            .lock()
+            .expect("emit hook is writable") = None;
+        hook.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown joins within bounded timeout")
+            .expect("shutdown task joins")
+            .expect("shutdown succeeds with full health queue");
+        assert!(adapter.inner.in_flight.lock().await.is_none());
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&execution.0)
+        );
     }
 }

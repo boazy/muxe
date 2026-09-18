@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -35,7 +35,7 @@ use muxe_protocol::{
 use thiserror::Error;
 use tokio::{
     process::{Child, Command},
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, Notify, mpsc, watch},
 };
 
 use crate::{
@@ -50,10 +50,41 @@ pub struct Broker {
     state: Arc<Mutex<BrokerState>>,
     sessions: Arc<Mutex<HashMap<UiSessionId, SessionRecord>>>,
     generic: Arc<GenericSupervisor>,
+    execution_transitions: Arc<Notify>,
+    diagnostics_tx: mpsc::UnboundedSender<BrokerDiagnostic>,
+    diagnostics_rx: Mutex<Option<mpsc::UnboundedReceiver<BrokerDiagnostic>>>,
     token_source: Mutex<OsTokenSource>,
     next_session: AtomicU64,
     next_execution: AtomicU64,
     next_event: Arc<AtomicU64>,
+    #[cfg(test)]
+    spawn_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct WaitHook {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl WaitHook {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// A payload-safe terminal diagnostic for externally dispatched work that has
+/// outlived the UI session that initiated it. The composition root must use its
+/// typed outcome and code to select broker-authored log text; host error payloads
+/// never cross this boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerDiagnostic {
+    pub execution: ExecutionId,
+    pub outcome: ExecutionOutcome,
+    pub code: DiagnosticCode,
 }
 
 #[derive(Default)]
@@ -61,13 +92,15 @@ struct BrokerState {
     gate: LaunchGate,
     registering: HashSet<PendingLaunchToken>,
     pending_sessions: HashMap<PendingLaunchToken, UiSessionId>,
-    executions: HashMap<UiSessionId, ExecutionRecord>,
-    deferred: HashMap<UiSessionId, DeferredDispatch>,
-    detached_executions: HashMap<CoreExecutionId, ExecutionId>,
+    /// The one authoritative registry for accepted external work. It is keyed by
+    /// the broker's typed execution identity, never by a UI session: a session is
+    /// only an optional notification/capture attachment to work the broker owns.
+    executions: HashMap<CoreExecutionId, ExecutionRecord>,
+    /// An awaited UI can own exactly one pending execution. This is an admission
+    /// index, not the execution registry.
+    awaiting: HashMap<UiSessionId, CoreExecutionId>,
     // Set by `drain_for_activation` before anything is torn down and cleared only when
-    // the broker returns to Running. While set, no new launch or execution is admitted:
-    // admissions check it atomically with insertion, and a dispatch accepted across
-    // the boundary is cancelled immediately instead of leaking unsupervised past handoff.
+    // the broker returns to Running. While set, no new launch or execution is admitted.
     activation_sealed: bool,
 }
 
@@ -95,26 +128,43 @@ enum ExecutionOwner {
     GenericProcess,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutionPhase {
+    /// The broker admitted this typed identity before it can reach an adapter or
+    /// a process spawn. Only a proven pre-dispatch failure may remove it.
+    Reserved,
+    Adapter,
+    Generic,
+    Terminal,
+}
+
 #[derive(Clone)]
 struct ExecutionRecord {
     wire: ExecutionId,
     core: CoreExecutionId,
+    /// The UI that can receive a completion. Detached work deliberately clears
+    /// this without surrendering broker ownership.
+    session: Option<UiSessionId>,
+    awaiting: bool,
     cancellable: bool,
     on_menu_control: muxe_core::MenuControlAction,
+    timeout: Option<Duration>,
+    on_timeout: TimeoutAction,
     owner: ExecutionOwner,
+    phase: ExecutionPhase,
+    /// Focus-sensitive host work remains attached to this exact owner while the
+    /// UI is dismissed; no session-keyed registry owns the payload.
+    deferred: Option<PostDismissalPortableDispatchRequest>,
     pending_control: Option<MenuControl>,
-}
-
-#[derive(Clone)]
-struct DeferredDispatch {
-    wire: ExecutionId,
-    core: CoreExecutionId,
-    request: PostDismissalPortableDispatchRequest,
+    termination_requested: bool,
+    deadline_scheduled: bool,
 }
 
 #[derive(Default)]
 struct GenericSupervisor {
-    processes: Mutex<HashMap<CoreExecutionId, GenericProcess>>,
+    /// Installed synchronously before its reaper task is spawned. This lets a
+    /// concurrent seal signal an owned child without an await-sized gap.
+    processes: StdMutex<HashMap<CoreExecutionId, GenericProcess>>,
 }
 
 struct GenericProcess {
@@ -123,6 +173,118 @@ struct GenericProcess {
 #[derive(Clone, Copy)]
 enum GenericCancellation {
     UserRequested,
+    Timeout,
+}
+
+struct ExecutionDeadline {
+    core: CoreExecutionId,
+    timeout: Duration,
+    on_timeout: TimeoutAction,
+    state: Arc<Mutex<BrokerState>>,
+    sessions: Arc<Mutex<HashMap<UiSessionId, SessionRecord>>>,
+    adapter: Arc<dyn HostAdapter>,
+    generic: Arc<GenericSupervisor>,
+    next_event: Arc<AtomicU64>,
+}
+
+async fn supervise_execution_deadline(deadline: ExecutionDeadline) {
+    tokio::time::sleep(deadline.timeout).await;
+    let timeout = {
+        let mut state = deadline.state.lock().await;
+        let (owner, session, wire, awaiting, outcome) = {
+            let Some(record) = state.executions.get_mut(&deadline.core) else {
+                return;
+            };
+            if matches!(
+                record.phase,
+                ExecutionPhase::Reserved | ExecutionPhase::Terminal
+            ) || record.termination_requested
+            {
+                return;
+            }
+            let session = record.session.take();
+            let awaiting = std::mem::replace(&mut record.awaiting, false);
+            let wire = record.wire;
+            match deadline.on_timeout {
+                TimeoutAction::Detach => {
+                    (None, session, wire, awaiting, ExecutionOutcome::Detached)
+                }
+                TimeoutAction::Cancel => {
+                    record.termination_requested = true;
+                    (
+                        Some(record.owner),
+                        session,
+                        wire,
+                        awaiting,
+                        ExecutionOutcome::TimedOut,
+                    )
+                }
+            }
+        };
+        if awaiting && let Some(session) = &session {
+            state.awaiting.remove(session);
+        }
+        Some((owner, session, wire, outcome))
+    };
+    let Some((owner, session, wire, outcome)) = timeout else {
+        return;
+    };
+    let event_delivery = async {
+        let events = if let Some(session) = &session {
+            // Clone the sender in a short lock scope. Keeping the session map
+            // guard alive across a blocked UI send would stall new admission.
+            deadline
+                .sessions
+                .lock()
+                .await
+                .get(session)
+                .map(|record| record.events.clone())
+        } else {
+            None
+        };
+        if let Some(events) = events {
+            let _ = events
+                .send(WireMessage::Event {
+                    event_id: new_event_id(&deadline.next_event),
+                    event: BrokerEvent::ExecutionCompleted {
+                        session: session.expect("session exists when events sender is present"),
+                        execution: wire,
+                        outcome,
+                        diagnostic: Some(diagnostic(
+                            DiagnosticCode::ActionBlocked,
+                            "execution exceeded its configured timeout",
+                        )),
+                    },
+                })
+                .await;
+        }
+    };
+    // A full UI queue must never delay the owner-side stop. The two futures are
+    // polled together: adapter cancellation can cross its host boundary while
+    // terminal delivery waits for the UI to read.
+    tokio::join!(event_delivery, cancel_deadline_owner(&deadline, owner),);
+}
+
+async fn cancel_deadline_owner(deadline: &ExecutionDeadline, owner: Option<ExecutionOwner>) {
+    if let Some(owner) = owner {
+        match owner {
+            ExecutionOwner::Adapter => {
+                let _ = deadline.adapter.cancel(deadline.core).await;
+            }
+            ExecutionOwner::GenericProcess => {
+                if let Some(cancellation) = deadline
+                    .generic
+                    .processes
+                    .lock()
+                    .expect("generic supervisor registry is not poisoned")
+                    .get(&deadline.core)
+                    .map(|process| process.cancellation.clone())
+                {
+                    let _ = cancellation.send(Some(GenericCancellation::Timeout));
+                }
+            }
+        }
+    }
 }
 
 #[expect(
@@ -167,16 +329,22 @@ impl Broker {
         config_path: impl Into<std::path::PathBuf>,
         config: CompiledConfig,
     ) -> Arc<Self> {
+        let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             adapter,
             config: ConfigStore::from_compiled(config_path, config),
             state: Arc::new(Mutex::new(BrokerState::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             generic: Arc::new(GenericSupervisor::default()),
+            execution_transitions: Arc::new(Notify::new()),
+            diagnostics_tx,
+            diagnostics_rx: Mutex::new(Some(diagnostics_rx)),
             token_source: Mutex::new(OsTokenSource),
             next_session: AtomicU64::new(1),
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            spawn_wait_hook: StdMutex::new(None),
         })
     }
 
@@ -191,17 +359,31 @@ impl Broker {
         config_path: impl Into<std::path::PathBuf>,
     ) -> Result<Arc<Self>, ConfigError> {
         let config = ConfigStore::load(config_path, adapter.as_ref()).await?;
+        let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded_channel();
         Ok(Arc::new(Self {
             adapter,
             config,
             state: Arc::new(Mutex::new(BrokerState::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             generic: Arc::new(GenericSupervisor::default()),
+            execution_transitions: Arc::new(Notify::new()),
+            diagnostics_tx,
+            diagnostics_rx: Mutex::new(Some(diagnostics_rx)),
             token_source: Mutex::new(OsTokenSource),
             next_session: AtomicU64::new(1),
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            spawn_wait_hook: StdMutex::new(None),
         }))
+    }
+
+    /// Transfers the one process-lifetime sink for detached terminal diagnostics.
+    ///
+    /// The composition root owns persistence and logging; the broker retains no
+    /// UI-dependent fallback for detached execution failures.
+    pub async fn take_diagnostics(&self) -> Option<mpsc::UnboundedReceiver<BrokerDiagnostic>> {
+        self.diagnostics_rx.lock().await.take()
     }
 
     pub fn config_path(&self) -> &std::path::Path {
@@ -210,6 +392,13 @@ impl Broker {
 
     pub async fn generation(&self) -> CompiledGeneration {
         self.config.snapshot().await.config.generation
+    }
+    #[cfg(test)]
+    pub(crate) fn set_spawn_wait_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .spawn_wait_hook
+            .lock()
+            .expect("spawn wait hook is not poisoned") = hook;
     }
 
     /// Closes every menu-owned pending pane and releases every UI capture before an activation
@@ -221,49 +410,79 @@ impl Broker {
     /// execution is in flight, or the first cancellation/detach failure (which
     /// reopens admission so the coordinator can retry).
     pub async fn drain_for_activation(&self) -> Result<(), BrokerError> {
-        let executions = {
+        // Register the notification before observing state so a reservation
+        // cannot transition between the observation and the await. The seal is
+        // deliberately retained until every pre-existing dispatch reservation
+        // either becomes a cancellable owner or proves that no dispatch occurred.
+        loop {
+            let notified = self.execution_transitions.notified();
+            tokio::pin!(notified);
+            // `enable` registers before reading the state; a transition that
+            // lands immediately afterwards cannot lose its wake-up.
+            notified.as_mut().enable();
+            let reserved = {
+                let mut state = self.state.lock().await;
+                state.activation_sealed = true;
+                state.executions.values().any(|record| {
+                    record.phase == ExecutionPhase::Reserved && record.deferred.is_none()
+                })
+            };
+            if !reserved {
+                break;
+            }
+            notified.await;
+        }
+        let (adapter_executions, generic_executions, deferred) = {
             let mut state = self.state.lock().await;
-            // Seal first: from this point no new launch or execution is admitted.
-            state.activation_sealed = true;
-            let deferred = state
-                .deferred
-                .iter()
-                .next()
-                .map(|(session, deferred)| (session.as_str().to_owned(), deferred.core.0));
-            if let Some((session, core)) = deferred {
+            let refused = state.executions.values().find_map(|record| {
+                (record.phase == ExecutionPhase::Adapter && !record.cancellable).then(|| {
+                    let owner = record.session.as_ref().map_or_else(
+                        || "detached".to_owned(),
+                        |session| session.as_str().to_owned(),
+                    );
+                    (owner, record.core.0)
+                })
+            });
+            if let Some((owner, core)) = refused {
                 state.activation_sealed = false;
                 return Err(BrokerError::ActivationDrainRefused(format!(
-                    "session {session} has post-dismissal execution {core} pending host acknowledgement",
+                    "{owner} host execution {core} is non-cancellable and still in flight",
                 )));
             }
-            let refused = state
+            let adapter_executions = state
                 .executions
-                .iter()
-                .find(|(_, record)| record.owner == ExecutionOwner::Adapter && !record.cancellable)
-                .map(|(session, record)| (session.as_str().to_owned(), record.core.0));
-            if let Some((session, core)) = refused {
-                // Refuse before mutating: an unresolved non-cancellable host mutation
-                // must never be silently dropped across a handoff.
-                state.activation_sealed = false;
-                return Err(BrokerError::ActivationDrainRefused(format!(
-                    "session {session} has a non-cancellable host execution {core} in flight",
-                )));
-            }
-            std::mem::take(&mut state.executions)
+                .values()
+                .filter(|record| record.phase == ExecutionPhase::Adapter)
+                .map(|record| record.core)
+                .collect::<Vec<_>>();
+            let generic_executions = state
+                .executions
+                .values()
+                .filter(|record| {
+                    (record.phase == ExecutionPhase::Generic
+                        || record.phase == ExecutionPhase::Reserved)
+                        && record.owner == ExecutionOwner::GenericProcess
+                        && record.session.is_some()
+                })
+                .map(|record| record.core)
+                .collect::<Vec<_>>();
+            let deferred = state
+                .executions
+                .values()
+                .filter(|record| record.deferred.is_some())
+                .map(|record| record.core)
+                .collect::<Vec<_>>();
+            (adapter_executions, generic_executions, deferred)
         };
         let drained = async {
-            for (_, record) in executions {
-                match record.owner {
-                    ExecutionOwner::Adapter => {
-                        self.adapter
-                            .cancel(record.core)
-                            .await
-                            .map_err(BrokerError::from)?;
-                    }
-                    ExecutionOwner::GenericProcess => {
-                        let _ = self.cancel_generic(record.core).await;
-                    }
-                }
+            for execution in &adapter_executions {
+                self.request_execution_stop(*execution).await?;
+            }
+            for execution in adapter_executions {
+                self.await_adapter_execution_terminal(execution).await;
+            }
+            for execution in generic_executions {
+                self.request_execution_stop(execution).await?;
             }
             let (pending, pending_sessions) = {
                 let mut state = self.state.lock().await;
@@ -287,12 +506,14 @@ impl Broker {
                 self.detach(&session, CaptureReleaseReason::UiDismissed)
                     .await?;
             }
+            for execution in deferred {
+                self.request_execution_stop(execution).await?;
+                self.await_adapter_execution_terminal(execution).await;
+            }
             Ok(())
         }
         .await;
         if drained.is_err() {
-            // The broker stays Running after a failed drain, so reopen admission;
-            // the coordinator can retry Prepare (drain is idempotent).
             self.state.lock().await.activation_sealed = false;
         }
         drained
@@ -303,7 +524,12 @@ impl Broker {
     /// after every remaining child is reaped.
     #[must_use]
     pub(crate) async fn has_supervised_children(&self) -> bool {
-        !self.generic.processes.lock().await.is_empty()
+        !self
+            .generic
+            .processes
+            .lock()
+            .expect("generic supervisor registry is not poisoned")
+            .is_empty()
     }
 
     /// Reopens launch and execution admission after a failed Prepare or a successful
@@ -314,35 +540,194 @@ impl Broker {
         self.state.lock().await.activation_sealed = false;
     }
 
-    /// Admits an accepted execution unless the activation seal closed first. A dispatch
-    /// accepted across the drain boundary is cancelled immediately and rejected: it
-    /// must never run unsupervised past a handoff.
-    async fn admit_execution(
+    /// Reserves ownership before *any* effectful dispatch or spawn. The awaited
+    /// index is checked and inserted under the same lock as the activation seal.
+    async fn reserve_execution(
         &self,
         session: UiSessionId,
-        record: ExecutionRecord,
+        wire: ExecutionId,
+        core: CoreExecutionId,
+        owner: ExecutionOwner,
+        deferred: Option<PostDismissalPortableDispatchRequest>,
+        policy: &ExecutionPolicy,
     ) -> Result<(), BrokerError> {
-        let sealed = {
+        let mut state = self.state.lock().await;
+        if state.activation_sealed {
+            return Err(BrokerError::ActivationInProgress);
+        }
+        let awaiting = policy.mode == muxe_core::ExecutionMode::Await;
+        if awaiting && state.awaiting.contains_key(&session) {
+            return Err(BrokerError::PendingExecutionInFlight);
+        }
+        state.executions.insert(
+            core,
+            ExecutionRecord {
+                wire,
+                core,
+                session: Some(session.clone()),
+                awaiting,
+                cancellable: owner == ExecutionOwner::GenericProcess,
+                on_menu_control: policy.on_menu_control,
+                timeout: policy.timeout,
+                on_timeout: policy.on_timeout,
+                owner,
+                phase: ExecutionPhase::Reserved,
+                deadline_scheduled: false,
+                deferred,
+                pending_control: None,
+                termination_requested: false,
+            },
+        );
+        if awaiting {
+            state.awaiting.insert(session, core);
+        }
+        Ok(())
+    }
+
+    /// A rejected spawn/dispatch is the only path that proves no external work
+    /// exists, so it alone may return a reservation to admission.
+    async fn release_reservation(&self, core: CoreExecutionId) {
+        let released = {
             let mut state = self.state.lock().await;
-            if state.activation_sealed {
-                Some(record)
+            if !state
+                .executions
+                .get(&core)
+                .is_some_and(|record| record.phase == ExecutionPhase::Reserved)
+            {
+                false
             } else {
-                state.executions.insert(session, record);
-                None
+                let record = state
+                    .executions
+                    .remove(&core)
+                    .expect("reserved execution exists");
+                if record.awaiting
+                    && let Some(session) = record.session
+                {
+                    state.awaiting.remove(&session);
+                }
+                true
             }
         };
-        if let Some(record) = sealed {
-            match record.owner {
-                ExecutionOwner::Adapter => {
-                    let _ = self.adapter.cancel(record.core).await;
+        if released {
+            self.execution_transitions.notify_waiters();
+        }
+    }
+
+    /// Publishes the exact owner after its adapter acceptance or child
+    /// supervision is established. A seal that won after reservation retains the
+    /// owner and requests one shared cancellation transition.
+    async fn activate_execution(
+        &self,
+        core: CoreExecutionId,
+        phase: ExecutionPhase,
+        cancellable: bool,
+    ) -> Result<(), BrokerError> {
+        let (sealed, deadline) = {
+            let mut state = self.state.lock().await;
+            let Some(record) = state.executions.get_mut(&core) else {
+                let sealed = state.activation_sealed;
+                self.execution_transitions.notify_waiters();
+                if sealed {
+                    return Err(BrokerError::ActivationInProgress);
                 }
-                ExecutionOwner::GenericProcess => {
-                    let _ = self.cancel_generic(record.core).await;
-                }
-            }
+                return Ok(());
+            };
+            record.phase = phase;
+            record.cancellable = cancellable;
+            let deadline = (!record.deadline_scheduled)
+                .then(|| record.timeout.map(|timeout| (timeout, record.on_timeout)))
+                .flatten();
+            record.deadline_scheduled |= deadline.is_some();
+            (state.activation_sealed, deadline)
+        };
+        self.execution_transitions.notify_waiters();
+        if let Some((timeout, on_timeout)) = deadline {
+            tokio::spawn(supervise_execution_deadline(ExecutionDeadline {
+                core,
+                timeout,
+                on_timeout,
+                state: Arc::clone(&self.state),
+                sessions: Arc::clone(&self.sessions),
+                adapter: Arc::clone(&self.adapter),
+                generic: Arc::clone(&self.generic),
+                next_event: Arc::clone(&self.next_event),
+            }));
+        }
+        if sealed {
             return Err(BrokerError::ActivationInProgress);
         }
         Ok(())
+    }
+    async fn request_execution_stop(&self, core: CoreExecutionId) -> Result<(), BrokerError> {
+        let record = {
+            let mut state = self.state.lock().await;
+            let Some(record) = state.executions.get_mut(&core) else {
+                return Ok(());
+            };
+            if record.termination_requested {
+                return Ok(());
+            }
+            record.termination_requested = true;
+            record.clone()
+        };
+        let result = if record.phase == ExecutionPhase::Reserved
+            && record.owner == ExecutionOwner::GenericProcess
+        {
+            if self
+                .generic
+                .processes
+                .lock()
+                .expect("generic supervisor registry is not poisoned")
+                .contains_key(&core)
+            {
+                self.cancel_generic(core).await
+            } else {
+                Ok(())
+            }
+        } else {
+            match record.owner {
+                ExecutionOwner::Adapter => {
+                    self.adapter.cancel(core).await.map_err(BrokerError::from)
+                }
+                ExecutionOwner::GenericProcess => self.cancel_generic(core).await,
+            }
+        };
+        if result.is_err() {
+            let mut state = self.state.lock().await;
+            if let Some(record) = state.executions.get_mut(&core)
+                && record.phase != ExecutionPhase::Terminal
+            {
+                record.termination_requested = false;
+            }
+        }
+        result
+    }
+    async fn await_adapter_execution_terminal(&self, core: CoreExecutionId) {
+        loop {
+            let notified = self.execution_transitions.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.state.lock().await.executions.contains_key(&core) {
+                return;
+            }
+            notified.await;
+        }
+    }
+    /// Converts an accepted detached action from a temporary admission hold into
+    /// background-owned work. Its terminal failure is logged, not sent to a UI
+    /// that deliberately chose not to await it.
+    async fn detach_execution_ui(&self, core: CoreExecutionId) {
+        let mut state = self.state.lock().await;
+        let session = {
+            let Some(record) = state.executions.get_mut(&core) else {
+                return;
+            };
+            record.awaiting = false;
+            record.session.take()
+        };
+        if let Some(session) = session {
+            state.awaiting.remove(&session);
+        }
     }
     /// Stops the retained host subscription after UI drain and before the activation
     /// coordinator releases this broker's endpoint. The await proves the old stream
@@ -538,6 +923,9 @@ impl Broker {
                 }
                 event = self.adapter.next_health_event() => match event {
                     Ok(event) => self.handle_health_event(event).await,
+                    Err(error) if error.kind == muxe_adapter_api::AdapterErrorKind::Shutdown => {
+                        return;
+                    }
                     Err(error) => {
                         self.broadcast_health(false, Some(error)).await;
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -610,38 +998,50 @@ impl Broker {
                 )),
             ),
         };
-        let (session, record) = {
+        let record = {
             let mut state = self.state.lock().await;
-            if let Some((session, _)) = state
-                .executions
-                .iter()
-                .find(|(_, record)| record.core == core)
-            {
-                let session = session.clone();
-                let record = state.executions.remove(&session).expect("entry was found");
-                (session, record)
-            } else if let Some(wire) = state.detached_executions.remove(&core) {
-                match outcome {
-                    ExecutionOutcome::Succeeded => {
-                        tracing::debug!(
-                            ?wire,
-                            execution = core.0,
-                            "post-dismissal dispatch completed"
-                        );
-                    }
-                    _ => {
-                        tracing::error!(
-                            ?wire,
-                            execution = core.0,
-                            diagnostic = ?diagnostic,
-                            "post-dismissal dispatch did not complete successfully"
-                        );
-                    }
-                }
+            let Some(record) = state.executions.get_mut(&core) else {
                 return;
-            } else {
+            };
+            if record.owner != ExecutionOwner::Adapter
+                || !matches!(
+                    record.phase,
+                    ExecutionPhase::Reserved | ExecutionPhase::Adapter
+                )
+            {
                 return;
             }
+            record.phase = ExecutionPhase::Terminal;
+            let record = state
+                .executions
+                .remove(&core)
+                .expect("adapter owner exists");
+            if record.awaiting
+                && let Some(session) = &record.session
+            {
+                state.awaiting.remove(session);
+            }
+            record
+        };
+        self.execution_transitions.notify_waiters();
+        if !record.awaiting {
+            if let Some(diagnostic) = diagnostic {
+                let _ = self.diagnostics_tx.send(BrokerDiagnostic {
+                    execution: record.wire,
+                    outcome,
+                    code: diagnostic.code,
+                });
+                tracing::error!(
+                    ?record.wire,
+                    execution = core.0,
+                    diagnostic = ?diagnostic,
+                    "detached adapter execution did not complete successfully"
+                );
+            }
+            return;
+        }
+        let Some(session) = record.session else {
+            return;
         };
         if record.pending_control.is_some() {
             return;
@@ -747,18 +1147,21 @@ impl Broker {
         }
         let failed = {
             let state = self.state.lock().await;
-            scoped
-                .iter()
-                .filter_map(|(session, _)| {
-                    state
-                        .executions
-                        .get(session)
-                        .map(|record| (session.clone(), record.clone()))
+            state
+                .executions
+                .values()
+                .filter(|record| {
+                    record.owner == ExecutionOwner::Adapter
+                        && record.pending_control.is_none()
+                        && record.session.as_ref().is_some_and(|session| {
+                            scoped.iter().any(|(scoped, _)| scoped == session)
+                        })
                 })
+                .cloned()
                 .collect::<Vec<_>>()
         };
-        for (session, record) in &failed {
-            if record.owner == ExecutionOwner::Adapter && record.pending_control.is_none() {
+        for record in &failed {
+            if let Some(session) = &record.session {
                 self.emit_execution_completed(
                     session.clone(),
                     record.wire,
@@ -1386,21 +1789,21 @@ impl Broker {
                         .ui_pane
                         .clone()
                 };
-                let deferred = DeferredDispatch {
-                    wire: execution,
-                    core: core_execution,
-                    request: PostDismissalPortableDispatchRequest {
-                        execution: core_execution,
-                        action,
-                        origin,
-                        ui_pane,
-                    },
+                let deferred = PostDismissalPortableDispatchRequest {
+                    execution: core_execution,
+                    action,
+                    origin,
+                    ui_pane,
                 };
-                let mut state = self.state.lock().await;
-                if state.activation_sealed {
-                    return Err(BrokerError::ActivationInProgress);
-                }
-                state.deferred.insert(request.session.clone(), deferred);
+                self.reserve_execution(
+                    request.session.clone(),
+                    execution,
+                    core_execution,
+                    ExecutionOwner::Adapter,
+                    Some(deferred),
+                    &binding.settings.execution,
+                )
+                .await?;
                 return Ok(RequestResult::Immediate(
                     BrokerResponse::InvocationAccepted {
                         execution,
@@ -1409,7 +1812,6 @@ impl Broker {
                 ));
             }
         }
-        let on_menu_control = binding.settings.execution.on_menu_control;
         let awaitable = binding.settings.execution.mode == muxe_core::ExecutionMode::Await;
         let accepted_capabilities = match binding.action {
             ActionSpec::Portable(muxe_core::PortableAction::Config(ConfigAction::Reload)) => {
@@ -1456,8 +1858,36 @@ impl Broker {
                 std::ops::ControlFlow::Continue(capabilities) => capabilities,
             },
             ActionSpec::Native(candidate) => {
-                self.dispatch_native(core_execution, origin, &candidate)
-                    .await?
+                self.reserve_execution(
+                    request.session.clone(),
+                    execution,
+                    core_execution,
+                    ExecutionOwner::Adapter,
+                    None,
+                    &binding.settings.execution,
+                )
+                .await?;
+                match self
+                    .dispatch_native(core_execution, origin, &candidate)
+                    .await
+                {
+                    Ok(accepted) if accepted.execution == core_execution => {
+                        Some(accepted.capabilities)
+                    }
+                    Ok(accepted) => {
+                        self.activate_execution(
+                            core_execution,
+                            ExecutionPhase::Adapter,
+                            accepted.capabilities.cancellable,
+                        )
+                        .await?;
+                        return Err(BrokerError::MismatchedExecution);
+                    }
+                    Err(error) => {
+                        self.release_reservation(core_execution).await;
+                        return Err(error);
+                    }
+                }
             }
         };
         let disposition = if accepted_capabilities
@@ -1468,21 +1898,14 @@ impl Broker {
         } else {
             InvocationDisposition::Detached
         };
-        if let Some(capabilities) =
-            accepted_capabilities.filter(|_| disposition == InvocationDisposition::Awaited)
-        {
-            // A dispatch accepted across the drain boundary is cancelled at once and
-            // rejected; only a pre-seal acceptance is admitted.
-            self.admit_execution(
-                request.session.clone(),
-                ExecutionRecord {
-                    wire: execution,
-                    core: core_execution,
-                    cancellable: capabilities.cancellable,
-                    on_menu_control,
-                    owner: ExecutionOwner::Adapter,
-                    pending_control: None,
-                },
+        if disposition == InvocationDisposition::Detached {
+            self.detach_execution_ui(core_execution).await;
+        }
+        if let Some(capabilities) = accepted_capabilities {
+            self.activate_execution(
+                core_execution,
+                ExecutionPhase::Adapter,
+                capabilities.cancellable,
             )
             .await?;
         }
@@ -1563,19 +1986,34 @@ impl Broker {
             })?;
         match action.action {
             muxe_core::PortableAction::Command(command) => {
-                self.execute_command(CommandLaunch {
-                    session: session.clone(),
-                    wire: execution,
-                    core: core_execution,
-                    command,
-                    origin,
-                    cwd_from_context: command_cwd_from_context,
-                    policy: policy.clone(),
-                })
+                self.reserve_execution(
+                    session.clone(),
+                    execution,
+                    core_execution,
+                    ExecutionOwner::GenericProcess,
+                    None,
+                    policy,
+                )
                 .await?;
+                if let Err(error) = self
+                    .execute_command(CommandLaunch {
+                        session: session.clone(),
+                        wire: execution,
+                        core: core_execution,
+                        command,
+                        origin,
+                        cwd_from_context: command_cwd_from_context,
+                        policy: policy.clone(),
+                    })
+                    .await
+                {
+                    self.release_reservation(core_execution).await;
+                    return Err(error);
+                }
                 let disposition = if policy.mode == muxe_core::ExecutionMode::Await {
                     InvocationDisposition::Awaited
                 } else {
+                    self.detach_execution_ui(core_execution).await;
                     InvocationDisposition::Detached
                 };
                 Ok(std::ops::ControlFlow::Break(RequestResult::Immediate(
@@ -1586,7 +2024,16 @@ impl Broker {
                 )))
             }
             action => {
-                let accepted = self
+                self.reserve_execution(
+                    session.clone(),
+                    execution,
+                    core_execution,
+                    ExecutionOwner::Adapter,
+                    None,
+                    policy,
+                )
+                .await?;
+                let accepted = match self
                     .adapter
                     .dispatch_portable(PortableDispatchRequest {
                         execution: core_execution,
@@ -1594,8 +2041,20 @@ impl Broker {
                         origin,
                     })
                     .await
-                    .map_err(BrokerError::from)?;
+                {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        self.release_reservation(core_execution).await;
+                        return Err(BrokerError::from(error));
+                    }
+                };
                 if accepted.execution != core_execution {
+                    self.activate_execution(
+                        core_execution,
+                        ExecutionPhase::Adapter,
+                        accepted.capabilities.cancellable,
+                    )
+                    .await?;
                     return Err(BrokerError::MismatchedExecution);
                 }
                 Ok(std::ops::ControlFlow::Continue(Some(accepted.capabilities)))
@@ -1603,44 +2062,33 @@ impl Broker {
         }
     }
 
-    /// Dispatches one native action through the host adapter.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrokerError` for unresolvable origins, adapter rejections, or
-    /// execution mismatches.
     async fn dispatch_native(
         &self,
         core_execution: CoreExecutionId,
         origin: muxe_core::OriginContext,
         candidate: &muxe_core::NativeActionCandidate,
-    ) -> Result<Option<muxe_core::ExecutionCapabilities>, BrokerError> {
+    ) -> Result<muxe_adapter_api::DispatchAccepted, BrokerError> {
         let action = ResolvedNativeAction::from_origin(candidate, &origin)
             .map_err(|_| BrokerError::ContextUnavailable)?;
-        let accepted = self
-            .adapter
+        self.adapter
             .dispatch_native(muxe_adapter_api::NativeDispatchRequest {
                 execution: core_execution,
                 action,
                 origin,
             })
             .await
-            .map_err(BrokerError::from)?;
-        if accepted.execution != core_execution {
-            return Err(BrokerError::MismatchedExecution);
-        }
-        Ok(Some(accepted.capabilities))
+            .map_err(BrokerError::from)
     }
 
     pub(crate) async fn execute_command(&self, launch: CommandLaunch) -> Result<(), BrokerError> {
         let CommandLaunch {
+            wire: _,
             session,
-            wire,
             core,
             command,
             origin,
+            policy: _,
             cwd_from_context,
-            policy,
         } = launch;
         let program = command_string(&command.program, "command program")?;
         if program.is_empty() {
@@ -1663,6 +2111,7 @@ impl Broker {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let (cancellation, cancellation_rx) = watch::channel(None);
         let mut child = child_command.spawn().map_err(|error| {
             BrokerError::GenericProcess(format!("could not spawn {program:?}: {error}"))
         })?;
@@ -1673,49 +2122,77 @@ impl Broker {
                 "spawned command has no valid process-group leader identity".to_owned(),
             ));
         };
-        let (cancellation, cancellation_rx) = watch::channel(None);
+        // This synchronous insertion and the reaper task are established before
+        // any fallible state transition. A seal can therefore only request
+        // cancellation of a child that is already guaranteed to be reaped.
+        let cancellation_for_seal = cancellation.clone();
         self.generic
             .processes
             .lock()
-            .await
+            .expect("generic supervisor registry is not poisoned")
             .insert(core, GenericProcess { cancellation });
-        if policy.mode == muxe_core::ExecutionMode::Await {
-            // A child spawned across the drain boundary is signalled at once for its
-            // supervisor to reap, and the invocation is rejected.
-            self.admit_execution(
-                session.clone(),
-                ExecutionRecord {
-                    wire,
-                    core,
-                    cancellable: true,
-                    on_menu_control: policy.on_menu_control,
-                    owner: ExecutionOwner::GenericProcess,
-                    pending_control: None,
-                },
-            )
-            .await?;
-        }
-        tokio::spawn(supervise_generic_child(GenericChildSpec {
+        let supervisor = tokio::spawn(supervise_generic_child(GenericChildSpec {
             child,
             process_group,
             cancellation: cancellation_rx,
-            timeout: policy.timeout,
-            on_timeout: policy.on_timeout,
-            session,
+            session: session.clone(),
             core,
             state: Arc::clone(&self.state),
             sessions: Arc::clone(&self.sessions),
             generic: Arc::clone(&self.generic),
             next_event: Arc::clone(&self.next_event),
+            diagnostics_tx: self.diagnostics_tx.clone(),
         }));
+        #[cfg(test)]
+        {
+            let hook = self
+                .spawn_wait_hook
+                .lock()
+                .expect("spawn wait hook is not poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+            }
+        }
+        let sealed_before_activation = self
+            .state
+            .lock()
+            .await
+            .executions
+            .get(&core)
+            .is_some_and(|record| record.termination_requested);
+        if sealed_before_activation {
+            let _ = cancellation_for_seal.send(Some(GenericCancellation::UserRequested));
+        }
+        let activation = self
+            .activate_execution(core, ExecutionPhase::Generic, true)
+            .await;
+        if let Err(error) = activation {
+            let _ = cancellation_for_seal.send(Some(GenericCancellation::UserRequested));
+            let _ = supervisor.await;
+            self.generic
+                .processes
+                .lock()
+                .expect("generic supervisor registry is not poisoned")
+                .remove(&core);
+            {
+                let mut state = self.state.lock().await;
+                state.executions.remove(&core);
+                state.awaiting.remove(&session);
+            }
+            self.execution_transitions.notify_waiters();
+            return Err(error);
+        }
         Ok(())
     }
+
     async fn cancel_generic(&self, execution: CoreExecutionId) -> Result<(), BrokerError> {
         let cancellation = self
             .generic
             .processes
             .lock()
-            .await
+            .expect("generic supervisor registry is not poisoned")
             .get(&execution)
             .map(|process| process.cancellation.clone())
             .ok_or(BrokerError::CancelUnsupported)?;
@@ -1732,7 +2209,10 @@ impl Broker {
     async fn control(&self, request: UiMenuControl) -> Result<RequestResult, BrokerError> {
         let pending = {
             let mut state = self.state.lock().await;
-            let Some(record) = state.executions.get_mut(&request.session) else {
+            let Some(core) = state.awaiting.get(&request.session).copied() else {
+                return Ok(RequestResult::Immediate(BrokerResponse::Acknowledged));
+            };
+            let Some(record) = state.executions.get_mut(&core) else {
                 return Ok(RequestResult::Immediate(BrokerResponse::Acknowledged));
             };
             if record.pending_control.is_some() {
@@ -1743,14 +2223,9 @@ impl Broker {
         };
         let accepted = match pending.on_menu_control {
             muxe_core::MenuControlAction::Detach => Ok(()),
-            muxe_core::MenuControlAction::Cancel if pending.cancellable => match pending.owner {
-                ExecutionOwner::Adapter => self
-                    .adapter
-                    .cancel(pending.core)
-                    .await
-                    .map_err(BrokerError::from),
-                ExecutionOwner::GenericProcess => self.cancel_generic(pending.core).await,
-            },
+            muxe_core::MenuControlAction::Cancel if pending.cancellable => {
+                self.request_execution_stop(pending.core).await
+            }
             muxe_core::MenuControlAction::Cancel => Err(BrokerError::CancelUnsupported),
         };
         if let Err(error) = accepted
@@ -1775,49 +2250,57 @@ impl Broker {
         control: MenuControl,
     ) -> bool {
         let mut state = self.state.lock().await;
-        let Some(record) = state.executions.get_mut(session) else {
+        if state.awaiting.get(session) != Some(&core) {
+            return false;
+        }
+        let Some(record) = state.executions.get_mut(&core) else {
             return false;
         };
-        if record.core != core || record.pending_control != Some(control) {
+        if record.pending_control != Some(control) {
             return false;
         }
         record.pending_control = None;
         true
     }
 
-    async fn schedule_post_dismissal(&self, deferred: DeferredDispatch) {
-        {
-            self.state
-                .lock()
-                .await
-                .detached_executions
-                .insert(deferred.core, deferred.wire);
-        }
-        let expected = deferred.core;
+    async fn schedule_post_dismissal(&self, expected: CoreExecutionId) {
+        let request = {
+            let mut state = self.state.lock().await;
+            let Some(record) = state.executions.get_mut(&expected) else {
+                return;
+            };
+            record.deferred.take()
+        };
+        let Some(request) = request else {
+            return;
+        };
         match self
             .adapter
-            .dispatch_portable_after_ui_dismissal(deferred.request)
+            .dispatch_portable_after_ui_dismissal(request)
             .await
         {
-            Ok(accepted) if accepted.execution == expected => {}
             Ok(accepted) => {
-                self.state
-                    .lock()
+                self.detach_execution_ui(expected).await;
+                if let Err(error) = self
+                    .activate_execution(
+                        expected,
+                        ExecutionPhase::Adapter,
+                        accepted.capabilities.cancellable,
+                    )
                     .await
-                    .detached_executions
-                    .remove(&expected);
-                tracing::error!(
-                    expected_execution = expected.0,
-                    received_execution = accepted.execution.0,
-                    "post-dismissal adapter dispatch acknowledged a different execution"
-                );
+                {
+                    tracing::error!(execution = expected.0, %error, "post-dismissal execution was sealed");
+                }
+                if accepted.execution != expected {
+                    tracing::error!(
+                        expected_execution = expected.0,
+                        received_execution = accepted.execution.0,
+                        "post-dismissal adapter dispatch acknowledged a different execution"
+                    );
+                }
             }
             Err(error) => {
-                self.state
-                    .lock()
-                    .await
-                    .detached_executions
-                    .remove(&expected);
+                self.release_reservation(expected).await;
                 tracing::error!(
                     execution = expected.0,
                     %error,
@@ -1833,27 +2316,32 @@ impl Broker {
         reason: CaptureReleaseReason,
     ) -> Result<(), BrokerError> {
         let record = self.sessions.lock().await.remove(session);
-        let (pending, deferred) = {
+        let (cancel, deferred) = {
             let mut state = self.state.lock().await;
             state.gate.detach(session);
-            (
-                state.executions.remove(session),
-                state.deferred.remove(session),
-            )
-        };
-        if let Some(pending) = pending
-            && pending.pending_control.is_none()
-            && pending.on_menu_control == muxe_core::MenuControlAction::Cancel
-            && pending.cancellable
-        {
-            match pending.owner {
-                ExecutionOwner::Adapter => {
-                    let _ = self.adapter.cancel(pending.core).await;
+            state.awaiting.remove(session);
+            let mut cancel = Vec::new();
+            let mut deferred = Vec::new();
+            for execution in state.executions.values_mut() {
+                if execution.session.as_ref() != Some(session) {
+                    continue;
                 }
-                ExecutionOwner::GenericProcess => {
-                    let _ = self.cancel_generic(pending.core).await;
+                execution.awaiting = false;
+                if execution.pending_control.is_none()
+                    && execution.on_menu_control == muxe_core::MenuControlAction::Cancel
+                    && execution.cancellable
+                {
+                    cancel.push(execution.core);
                 }
+                if execution.deferred.is_some() {
+                    deferred.push(execution.core);
+                }
+                execution.session = None;
             }
+            (cancel, deferred)
+        };
+        for execution in cancel {
+            let _ = self.request_execution_stop(execution).await;
         }
         if let Some(record) = record {
             let _ = record.readiness.send(SessionReadiness::Failed(diagnostic(
@@ -1867,8 +2355,8 @@ impl Broker {
                     .map_err(BrokerError::from)?;
             }
         }
-        if let Some(deferred) = deferred {
-            self.schedule_post_dismissal(deferred).await;
+        for execution in deferred {
+            self.schedule_post_dismissal(execution).await;
         }
         Ok(())
     }
@@ -1958,6 +2446,10 @@ enum GenericWait {
 }
 
 /// Owned inputs for one generic command-pane launch.
+#[expect(
+    dead_code,
+    reason = "test-only direct generic-launch fixtures construct the public(crate) input with its full execution contract"
+)]
 pub(crate) struct CommandLaunch {
     pub(crate) session: UiSessionId,
     pub(crate) wire: ExecutionId,
@@ -1973,14 +2465,13 @@ struct GenericChildSpec {
     child: Child,
     process_group: i32,
     cancellation: watch::Receiver<Option<GenericCancellation>>,
-    timeout: Option<Duration>,
-    on_timeout: TimeoutAction,
     session: UiSessionId,
     core: CoreExecutionId,
     state: Arc<Mutex<BrokerState>>,
     sessions: Arc<Mutex<HashMap<UiSessionId, SessionRecord>>>,
     generic: Arc<GenericSupervisor>,
     next_event: Arc<AtomicU64>,
+    diagnostics_tx: mpsc::UnboundedSender<BrokerDiagnostic>,
 }
 
 async fn supervise_generic_child(spec: GenericChildSpec) {
@@ -1988,30 +2479,32 @@ async fn supervise_generic_child(spec: GenericChildSpec) {
         mut child,
         process_group,
         mut cancellation,
-        timeout,
-        on_timeout,
         session,
         core,
         state,
         sessions,
         generic,
         next_event,
+        diagnostics_tx,
     } = spec;
     let handles = SupervisorHandles {
         state,
         sessions,
         generic,
         next_event,
+        diagnostics_tx,
     };
-    let wait = await_child_exit(&mut child, &mut cancellation, timeout).await;
-    match wait {
+    match await_child_exit(&mut child, &mut cancellation, None).await {
         GenericWait::Exited(status) => {
             let (outcome, diagnostic) = generic_exit_outcome(status);
             finish_generic(&session, core, outcome, diagnostic, true, &handles).await;
         }
-        GenericWait::Cancelled(_reason) => {
+        GenericWait::Cancelled(reason) => {
             let completion = terminate_generic_child(&mut child, process_group).await;
             let (outcome, diagnostic) = match completion {
+                Ok(_) if matches!(reason, GenericCancellation::Timeout) => {
+                    (ExecutionOutcome::TimedOut, None)
+                }
                 Ok(_) => (ExecutionOutcome::Cancelled, None),
                 Err(error) => (
                     ExecutionOutcome::Failed,
@@ -2020,33 +2513,7 @@ async fn supervise_generic_child(spec: GenericChildSpec) {
             };
             finish_generic(&session, core, outcome, diagnostic, true, &handles).await;
         }
-        GenericWait::TimedOut if on_timeout == TimeoutAction::Detach => {
-            finish_generic(
-                &session,
-                core,
-                ExecutionOutcome::Detached,
-                Some(diagnostic(
-                    DiagnosticCode::ActionBlocked,
-                    "generic command exceeded its timeout and continues detached",
-                )),
-                false,
-                &handles,
-            )
-            .await;
-            let _ = child.wait().await;
-            handles.generic.processes.lock().await.remove(&core);
-        }
-        GenericWait::TimedOut => {
-            let completion = terminate_generic_child(&mut child, process_group).await;
-            let (outcome, diagnostic) = match completion {
-                Ok(_) => (ExecutionOutcome::TimedOut, None),
-                Err(error) => (
-                    ExecutionOutcome::Failed,
-                    Some(diagnostic(DiagnosticCode::ActionBlocked, &error)),
-                ),
-            };
-            finish_generic(&session, core, outcome, diagnostic, true, &handles).await;
-        }
+        GenericWait::TimedOut => unreachable!("generic timeout is owned by execution deadlines"),
     }
 }
 
@@ -2076,6 +2543,9 @@ async fn await_child_exit(
 async fn await_generic_cancellation(
     cancellation: &mut watch::Receiver<Option<GenericCancellation>>,
 ) -> GenericCancellation {
+    if let Some(reason) = cancellation.borrow().as_ref().copied() {
+        return reason;
+    }
     let _ = cancellation.changed().await;
     cancellation
         .borrow()
@@ -2156,10 +2626,29 @@ struct SupervisorHandles {
     sessions: Arc<Mutex<HashMap<UiSessionId, SessionRecord>>>,
     generic: Arc<GenericSupervisor>,
     next_event: Arc<AtomicU64>,
+    diagnostics_tx: mpsc::UnboundedSender<BrokerDiagnostic>,
+}
+
+struct GenericCompletionGuard {
+    generic: Arc<GenericSupervisor>,
+    core: CoreExecutionId,
+    remove: bool,
+}
+
+impl Drop for GenericCompletionGuard {
+    fn drop(&mut self) {
+        if self.remove {
+            self.generic
+                .processes
+                .lock()
+                .expect("generic supervisor registry is not poisoned")
+                .remove(&self.core);
+        }
+    }
 }
 
 async fn finish_generic(
-    session: &UiSessionId,
+    _session: &UiSessionId,
     core: CoreExecutionId,
     outcome: ExecutionOutcome,
     diagnostic: Option<ProtocolDiagnostic>,
@@ -2171,38 +2660,66 @@ async fn finish_generic(
         sessions,
         generic,
         next_event,
+        diagnostics_tx,
     } = handles;
-    if remove_process {
-        generic.processes.lock().await.remove(&core);
-    }
+    let _process_guard = GenericCompletionGuard {
+        generic: Arc::clone(generic),
+        core,
+        remove: remove_process,
+    };
     let record = {
         let mut state = state.lock().await;
-        match state.executions.get(session) {
-            Some(record)
-                if record.owner == ExecutionOwner::GenericProcess && record.core == core =>
-            {
-                state.executions.remove(session)
-            }
-            _ => None,
+        let Some(record) = state.executions.get_mut(&core) else {
+            return;
+        };
+        if record.owner != ExecutionOwner::GenericProcess {
+            return;
         }
-    };
-    let Some(record) = record else {
-        return;
+        record.phase = ExecutionPhase::Terminal;
+        let record = state
+            .executions
+            .remove(&core)
+            .expect("generic owner exists");
+        if record.awaiting
+            && let Some(session) = &record.session
+        {
+            state.awaiting.remove(session);
+        }
+        record
     };
     if record.pending_control.is_some() {
         return;
     }
+    if !record.awaiting {
+        if let Some(diagnostic) = diagnostic {
+            let _ = diagnostics_tx.send(BrokerDiagnostic {
+                execution: record.wire,
+                outcome,
+                code: diagnostic.code,
+            });
+            tracing::error!(
+                ?record.wire,
+                execution = core.0,
+                diagnostic = ?diagnostic,
+                "detached generic execution did not complete successfully"
+            );
+        }
+        return;
+    }
+    let Some(session) = record.session else {
+        return;
+    };
     let events = sessions
         .lock()
         .await
-        .get(session)
+        .get(&session)
         .map(|record| record.events.clone());
     if let Some(events) = events {
         let _ = events
             .send(WireMessage::Event {
                 event_id: new_event_id(next_event),
                 event: BrokerEvent::ExecutionCompleted {
-                    session: session.clone(),
+                    session,
                     execution: record.wire,
                     outcome,
                     diagnostic,
@@ -2294,6 +2811,13 @@ mod tests {
 
     struct CountingAdapter {
         portable_dispatches: AtomicUsize,
+        cancellable: AtomicBool,
+        cancellations: AtomicUsize,
+        dispatch_entered: Arc<Notify>,
+        dispatch_release: Arc<Notify>,
+        block_dispatch: AtomicBool,
+        mismatch_post_dismissal: AtomicBool,
+        fail_cancellation: AtomicBool,
     }
 
     impl CountingAdapter {
@@ -2318,6 +2842,125 @@ mod tests {
                 link_handler_id: None,
             }
         }
+        fn execution_capabilities(&self) -> muxe_core::ExecutionCapabilities {
+            muxe_core::ExecutionCapabilities {
+                cancellable: self.cancellable.load(Ordering::SeqCst),
+                ..muxe_core::ExecutionCapabilities::ASYNCHRONOUS
+            }
+        }
+    }
+    fn counting_adapter(cancellable: bool) -> Arc<CountingAdapter> {
+        Arc::new(CountingAdapter {
+            portable_dispatches: AtomicUsize::new(0),
+            cancellable: AtomicBool::new(cancellable),
+            cancellations: AtomicUsize::new(0),
+            dispatch_entered: Arc::new(Notify::new()),
+            dispatch_release: Arc::new(Notify::new()),
+            block_dispatch: AtomicBool::new(false),
+            mismatch_post_dismissal: AtomicBool::new(false),
+            fail_cancellation: AtomicBool::new(false),
+        })
+    }
+    async fn dispatch_detached_adapter_execution(
+        cancellable: bool,
+    ) -> (Arc<CountingAdapter>, Arc<Broker>, CoreExecutionId) {
+        let adapter = counting_adapter(cancellable);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<activation drain regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: detach
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("detached adapter configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("test binding is visible");
+        let broker = Broker::from_compiled(
+            adapter.clone(),
+            PathBuf::from("<activation-drain-regression>"),
+            config,
+        );
+        let (events, _events_rx) = mpsc::channel(1);
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("muxe-pane"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("UI attaches")
+        else {
+            panic!("expected immediate UI attachment");
+        };
+        assert!(matches!(
+            broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::InvokeBinding(InvokeBinding {
+                        session: session.clone(),
+                        generation: 1,
+                        binding: BindingId {
+                            generation: binding.generation().0,
+                            ordinal: binding.ordinal(),
+                        },
+                    }),
+                    events.clone(),
+                )
+                .await
+                .expect("fake adapter accepts detached dispatch"),
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                disposition: InvocationDisposition::Detached,
+                ..
+            })
+        ));
+        assert!(matches!(
+            broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::DetachUi(muxe_protocol::DetachUi { session }),
+                    events,
+                )
+                .await
+                .expect("UI detaches"),
+            RequestResult::Immediate(BrokerResponse::Detached)
+        ));
+        let core = CoreExecutionId(1);
+        let state = broker.state.lock().await;
+        let record = state
+            .executions
+            .get(&core)
+            .expect("accepted noncompleting adapter dispatch remains owned");
+        assert!(matches!(record.phase, ExecutionPhase::Adapter));
+        assert!(record.session.is_none());
+        drop(state);
+        assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 1);
+        (adapter, broker, core)
     }
 
     impl ActionValidator for CountingAdapter {
@@ -2327,7 +2970,7 @@ mod tests {
             _action_span: &muxe_core::SourceSpan,
         ) -> Result<ActionValidation, ConfigDiagnostic> {
             Ok(ActionValidation {
-                execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                execution: self.execution_capabilities(),
             })
         }
 
@@ -2337,7 +2980,7 @@ mod tests {
         ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
             Ok(vec![
                 ActionValidation {
-                    execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                    execution: self.execution_capabilities(),
                 };
                 candidates.len()
             ])
@@ -2364,7 +3007,7 @@ mod tests {
                 },
                 supports_capture: false,
                 supports_notifications: false,
-                supports_native_cancellation: false,
+                supports_native_cancellation: self.cancellable.load(Ordering::SeqCst),
             })
         }
 
@@ -2431,10 +3074,14 @@ mod tests {
             request: PortableDispatchRequest,
         ) -> Result<DispatchAccepted, AdapterError> {
             self.portable_dispatches.fetch_add(1, Ordering::SeqCst);
+            if self.block_dispatch.load(Ordering::SeqCst) {
+                self.dispatch_entered.notify_one();
+                self.dispatch_release.notified().await;
+            }
             Ok(DispatchAccepted {
                 correlation: ExecutionCorrelationId::new("unexpected"),
                 execution: request.execution,
-                capabilities: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                capabilities: self.execution_capabilities(),
             })
         }
 
@@ -2443,10 +3090,15 @@ mod tests {
             request: muxe_adapter_api::PostDismissalPortableDispatchRequest,
         ) -> Result<DispatchAccepted, AdapterError> {
             self.portable_dispatches.fetch_add(1, Ordering::SeqCst);
+            let execution = if self.mismatch_post_dismissal.load(Ordering::SeqCst) {
+                CoreExecutionId(request.execution.0 + 1000)
+            } else {
+                request.execution
+            };
             Ok(DispatchAccepted {
                 correlation: ExecutionCorrelationId::new("post-dismissal"),
-                execution: request.execution,
-                capabilities: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                execution,
+                capabilities: self.execution_capabilities(),
             })
         }
 
@@ -2457,12 +3109,26 @@ mod tests {
             Ok(DispatchAccepted {
                 correlation: ExecutionCorrelationId::new("native"),
                 execution: request.execution,
-                capabilities: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                capabilities: self.execution_capabilities(),
             })
         }
 
         async fn cancel(&self, _execution: CoreExecutionId) -> Result<(), AdapterError> {
-            Ok(())
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            if self.fail_cancellation.load(Ordering::SeqCst) {
+                return Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "counting adapter cancellation failed",
+                ));
+            }
+            if self.cancellable.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::CancelUnsupported,
+                    "counting adapter dispatch is not cancellable",
+                ))
+            }
         }
 
         async fn next_health_event(&self) -> Result<AdapterHealthEvent, AdapterError> {
@@ -2658,9 +3324,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_portable_context_does_not_dispatch_to_host() {
-        let adapter = Arc::new(CountingAdapter {
-            portable_dispatches: AtomicUsize::new(0),
-        });
+        let adapter = counting_adapter(false);
         let config = muxe_core::compile_yaml(
             CompiledGeneration(1),
             SourceId::new("<broker regression>"),
@@ -2732,10 +3396,811 @@ menus:
     }
 
     #[tokio::test]
-    async fn focused_creation_arms_only_after_ui_detach() {
-        let adapter = Arc::new(CountingAdapter {
-            portable_dispatches: AtomicUsize::new(0),
+    async fn drain_refuses_detached_non_cancellable_adapter_execution() {
+        let (adapter, broker, core) = dispatch_detached_adapter_execution(false).await;
+
+        assert!(matches!(
+            broker.drain_for_activation().await,
+            Err(BrokerError::ActivationDrainRefused(message))
+                if message.contains("detached host execution 1")
+        ));
+        assert_eq!(
+            adapter.cancellations.load(Ordering::SeqCst),
+            0,
+            "drain must refuse before attempting unsupported cancellation"
+        );
+
+        let state = broker.state.lock().await;
+        assert!(
+            state.executions.contains_key(&core),
+            "refused drain retains the detached host owner"
+        );
+        assert!(
+            !state.activation_sealed,
+            "a refused drain returns the broker to usable admission"
+        );
+    }
+    #[tokio::test]
+    async fn reserved_dispatch_rejects_a_second_valid_invoke_before_acceptance() {
+        let adapter = counting_adapter(false);
+        adapter.block_dispatch.store(true, Ordering::SeqCst);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<atomic execution admission regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: await
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("test configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("test binding is visible");
+        let directory = tempfile::tempdir().expect("test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (session, _events_rx) = attach_ready(&broker, "atomic-admission").await;
+        let make_request = || {
+            ClientRequest::InvokeBinding(InvokeBinding {
+                session: session.clone(),
+                generation: 1,
+                binding: BindingId {
+                    generation: binding.generation().0,
+                    ordinal: binding.ordinal(),
+                },
+            })
+        };
+        let first_request = make_request();
+        let second_request = make_request();
+
+        let entered = adapter.dispatch_entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        let first_broker = Arc::clone(&broker);
+        let first = tokio::spawn(async move {
+            first_broker
+                .handle(PeerRole::Ui, first_request, mpsc::channel(1).0)
+                .await
         });
+        entered.await;
+
+        let second = broker
+            .handle(PeerRole::Ui, second_request, mpsc::channel(1).0)
+            .await;
+        assert!(
+            matches!(second, Err(BrokerError::PendingExecutionInFlight)),
+            "a second awaited invocation cannot cross the reserved owner"
+        );
+        assert_eq!(
+            adapter.portable_dispatches.load(Ordering::SeqCst),
+            1,
+            "the rejected second invocation never reaches the host"
+        );
+
+        adapter.block_dispatch.store(false, Ordering::SeqCst);
+        adapter.dispatch_release.notify_waiters();
+        assert!(matches!(
+            first
+                .await
+                .expect("first invocation task joins")
+                .expect("first invocation succeeds"),
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                disposition: InvocationDisposition::Awaited,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn activation_seal_during_reserved_dispatch_reaps_owner_and_reopens() {
+        let adapter = counting_adapter(true);
+        adapter.block_dispatch.store(true, Ordering::SeqCst);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<reserved activation seal regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: await
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("test configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("test binding is visible");
+        let directory = tempfile::tempdir().expect("test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (session, _events_rx) = attach_ready(&broker, "reserved-seal").await;
+        let request = ClientRequest::InvokeBinding(InvokeBinding {
+            session: session.clone(),
+            generation: 1,
+            binding: BindingId {
+                generation: binding.generation().0,
+                ordinal: binding.ordinal(),
+            },
+        });
+        let invoking = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move {
+                broker
+                    .handle(PeerRole::Ui, request, mpsc::channel(1).0)
+                    .await
+            }
+        });
+        let entered = adapter.dispatch_entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        entered.await;
+
+        let draining = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.drain_for_activation().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if broker.state.lock().await.activation_sealed {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain seals while dispatch remains reserved");
+        adapter.block_dispatch.store(false, Ordering::SeqCst);
+        adapter.dispatch_release.notify_waiters();
+        assert!(matches!(
+            invoking.await.expect("reserved invocation task joins"),
+            Err(BrokerError::ActivationInProgress)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.cancellations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sealed owner is cancelled after acceptance");
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                execution: CoreExecutionId(1),
+            })
+            .await;
+        draining
+            .await
+            .expect("activation drain task joins")
+            .expect("sealed owner reaches a terminal completion");
+        assert!(
+            broker.state.lock().await.activation_sealed,
+            "successful drain remains sealed until the coordinator reopens it"
+        );
+
+        broker.reopen_dispatch().await;
+        let (fresh_session, _events_rx) = attach_ready(&broker, "reserved-seal-fresh").await;
+        let accepted = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: fresh_session,
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                mpsc::channel(1).0,
+            )
+            .await;
+        assert!(matches!(
+            accepted.expect("reopened broker accepts a fresh dispatch"),
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted { .. })
+        ));
+        assert_eq!(
+            adapter.portable_dispatches.load(Ordering::SeqCst),
+            2,
+            "reopened admission reaches the adapter"
+        );
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                execution: CoreExecutionId(2),
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execution_deadlines_detach_or_cancel_once_and_ignore_late_old_completion() {
+        for (on_timeout, expected_outcome, expected_cancellations) in [
+            ("cancel", ExecutionOutcome::TimedOut, 1),
+            ("detach", ExecutionOutcome::Detached, 0),
+        ] {
+            let adapter = counting_adapter(true);
+            let yaml = format!(
+                r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: await
+            timeout: 10ms
+            on-timeout: {on_timeout}
+            on-menu-control: cancel
+"
+            );
+            let config = muxe_core::compile_yaml(
+                CompiledGeneration(1),
+                SourceId::new("<execution deadline regression>"),
+                yaml.as_str(),
+                KeyCapabilities::default(),
+                Some(adapter.as_ref()),
+            )
+            .expect("deadline configuration compiles");
+            let root = muxe_core::MenuId::new("main");
+            let binding = config
+                .attachment_view(&root)
+                .and_then(|view| {
+                    view.menu
+                        .menu(&root)
+                        .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+                })
+                .expect("deadline binding is visible");
+            let directory = tempfile::tempdir().expect("deadline test directory");
+            let broker =
+                Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+            let (session, mut events_rx) = attach_ready(&broker, "deadline").await;
+            let invoke = |session: UiSessionId| {
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session,
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                })
+            };
+            let accepted = broker
+                .handle(PeerRole::Ui, invoke(session.clone()), mpsc::channel(1).0)
+                .await
+                .expect("deadline invocation is accepted");
+            let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                execution: first_execution,
+                disposition: InvocationDisposition::Awaited,
+            }) = accepted
+            else {
+                panic!("deadline invocation remains awaited");
+            };
+
+            tokio::time::advance(Duration::from_millis(10)).await;
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            let Some(WireMessage::Event {
+                event:
+                    BrokerEvent::ExecutionCompleted {
+                        execution, outcome, ..
+                    },
+                ..
+            }) = events_rx.recv().await
+            else {
+                panic!("deadline emits one completion event");
+            };
+            assert_eq!(execution, first_execution);
+            assert_eq!(outcome, expected_outcome);
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                adapter.cancellations.load(Ordering::SeqCst),
+                expected_cancellations,
+                "timeout policy requests exactly its configured host cancellation"
+            );
+
+            let accepted = broker
+                .handle(PeerRole::Ui, invoke(session), mpsc::channel(1).0)
+                .await
+                .expect("the timed-out UI can start a newer execution");
+            let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                execution: second_execution,
+                disposition: InvocationDisposition::Awaited,
+            }) = accepted
+            else {
+                panic!("new execution remains awaited");
+            };
+            assert_ne!(
+                first_execution, second_execution,
+                "late completion identities must not be reused"
+            );
+
+            broker
+                .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                    execution: CoreExecutionId(1),
+                })
+                .await;
+            {
+                let state = broker.state.lock().await;
+                assert!(
+                    state.executions.contains_key(&CoreExecutionId(2)),
+                    "late completion of the timed-out owner leaves the newer owner intact"
+                );
+            }
+            broker
+                .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                    execution: CoreExecutionId(2),
+                })
+                .await;
+            let Some(WireMessage::Event {
+                event:
+                    BrokerEvent::ExecutionCompleted {
+                        execution,
+                        outcome: ExecutionOutcome::Succeeded,
+                        ..
+                    },
+                ..
+            }) = events_rx.recv().await
+            else {
+                panic!("new execution emits its own completion event");
+            };
+            assert_eq!(execution, second_execution);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_ui_event_queue_does_not_delay_timeout_cancellation_or_owner_release() {
+        let adapter = counting_adapter(true);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<full timeout event queue regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: await
+            timeout: 10ms
+            on-timeout: cancel
+            on-menu-control: cancel
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("full-queue timeout configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("full-queue binding is visible");
+        let directory = tempfile::tempdir().expect("full-queue test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (events, mut events_rx) = mpsc::channel(1);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("full-queue"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("full-queue UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("expected full-queue attachment");
+        };
+        events
+            .try_send(WireMessage::Event {
+                event_id: EventId([9; 16]),
+                event: BrokerEvent::AdapterHealthChanged {
+                    healthy: true,
+                    diagnostic: None,
+                },
+            })
+            .expect("test fills the bounded UI event queue");
+        let accepted = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("full-queue invocation is accepted");
+        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+            execution: first_execution,
+            disposition: InvocationDisposition::Awaited,
+        }) = accepted
+        else {
+            panic!("full-queue invocation remains awaited");
+        };
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(10)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            adapter.cancellations.load(Ordering::SeqCst),
+            1,
+            "timeout cancellation crosses the adapter while UI delivery is blocked"
+        );
+        {
+            let state = broker.state.lock().await;
+            let record = state
+                .executions
+                .get(&CoreExecutionId(1))
+                .expect("timed-out owner remains until its late terminal");
+            assert!(matches!(record.owner, ExecutionOwner::Adapter));
+            assert!(record.termination_requested);
+            assert!(!record.awaiting);
+        }
+        let accepted = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("released awaiting slot admits a newer owner");
+        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+            execution: second_execution,
+            ..
+        }) = accepted
+        else {
+            panic!("new owner is accepted while the old terminal delivery waits");
+        };
+        assert_ne!(first_execution, second_execution);
+
+        let late = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move {
+                broker
+                    .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                        execution: CoreExecutionId(1),
+                    })
+                    .await;
+            }
+        });
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        late.await.expect("late completion task joins");
+        assert!(
+            broker
+                .state
+                .lock()
+                .await
+                .executions
+                .contains_key(&CoreExecutionId(2)),
+            "late completion cannot remove the newer owner"
+        );
+        let Some(WireMessage::Event {
+            event: BrokerEvent::AdapterHealthChanged { .. },
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("expected initial health event");
+        };
+        let Some(WireMessage::Event {
+            event:
+                BrokerEvent::ExecutionCompleted {
+                    execution: timed_out_execution,
+                    outcome: ExecutionOutcome::TimedOut,
+                    ..
+                },
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("expected timed-out completion event");
+        };
+        assert_eq!(timed_out_execution, first_execution);
+
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                execution: CoreExecutionId(2),
+            })
+            .await;
+        let Some(WireMessage::Event {
+            event:
+                BrokerEvent::ExecutionCompleted {
+                    execution: succeeded_execution,
+                    outcome: ExecutionOutcome::Succeeded,
+                    ..
+                },
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("expected second execution succeeded completion");
+        };
+        assert_eq!(succeeded_execution, second_execution);
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_detached_cancellable_adapter_completion() {
+        let (adapter, broker, core) = dispatch_detached_adapter_execution(true).await;
+        let draining = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.drain_for_activation().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.cancellations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain requests cancellation from the owned fake adapter");
+        let mut draining = draining;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut draining)
+                .await
+                .is_err(),
+            "drain must wait for the exact detached adapter terminal transition"
+        );
+
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded { execution: core })
+            .await;
+        draining
+            .await
+            .expect("drain task completes")
+            .expect("completion settles the detached adapter owner");
+        assert!(
+            !broker.state.lock().await.executions.contains_key(&core),
+            "terminal completion releases the adapter owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_retries_cancellation_after_adapter_cancel_failure() {
+        let (adapter, broker, core) = dispatch_detached_adapter_execution(true).await;
+        assert_eq!(adapter.cancellations.load(Ordering::SeqCst), 0);
+        adapter.fail_cancellation.store(true, Ordering::SeqCst);
+        let first_drain_result = broker.drain_for_activation().await;
+        assert!(
+            first_drain_result.is_err(),
+            "first drain must fail when adapter cancellation fails"
+        );
+        assert_eq!(
+            adapter.cancellations.load(Ordering::SeqCst),
+            1,
+            "first drain must have attempted cancellation once"
+        );
+        assert!(
+            !broker.state.lock().await.activation_sealed,
+            "failed drain clears the activation seal"
+        );
+
+        broker.reopen_dispatch().await;
+        adapter.fail_cancellation.store(false, Ordering::SeqCst);
+
+        let draining = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.drain_for_activation().await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.cancellations.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second drain retries adapter cancellation");
+
+        let mut draining = draining;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut draining)
+                .await
+                .is_err(),
+            "drain must wait for the exact detached adapter terminal transition"
+        );
+
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded { execution: core })
+            .await;
+        draining.await.expect("second drain task joins").expect(
+            "second drain completes successfully after retried cancellation and completion",
+        );
+
+        assert!(
+            !broker.state.lock().await.executions.contains_key(&core),
+            "terminal completion releases the adapter owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_dismissal_mismatch_does_not_strand_activation_drain() {
+        let adapter = counting_adapter(true);
+        adapter
+            .mismatch_post_dismissal
+            .store(true, Ordering::SeqCst);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<post dismissal mismatch regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      s:
+        label: split pane
+        action: pane:split
+        settings:
+          execution:
+            mode: await
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("config compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("binding is visible");
+        let directory = tempfile::tempdir().expect("test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (session, _events_rx) = attach_ready(&broker, "post-dismissal").await;
+        let accepted = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                mpsc::channel(1).0,
+            )
+            .await
+            .expect("invoke binding accepted");
+        assert!(matches!(
+            accepted,
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                disposition: InvocationDisposition::Dismissed,
+                ..
+            })
+        ));
+
+        // Detach UI triggers schedule_post_dismissal which encounters the execution mismatch.
+        broker
+            .detach(&session, CaptureReleaseReason::UiDismissed)
+            .await
+            .expect("detach UI succeeds");
+
+        // The expected owner was transitioned out of Reserved to Adapter phase despite the mismatch.
+        let core = CoreExecutionId(1);
+        {
+            let state = broker.state.lock().await;
+            let record = state.executions.get(&core).expect("record exists");
+            assert_eq!(record.phase, ExecutionPhase::Adapter);
+        }
+
+        // Activation drain must not hang or be stranded:
+        let draining = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.drain_for_activation().await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.cancellations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain requests cancellation for the transitioned adapter owner");
+
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded { execution: core })
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), draining)
+            .await
+            .expect("drain completes within bound and is not stranded")
+            .expect("drain task joins")
+            .expect("drain succeeds");
+    }
+
+    #[tokio::test]
+    async fn detached_failure_reaches_payload_safe_persistent_diagnostic_sink() {
+        let (_adapter, broker, core) = dispatch_detached_adapter_execution(false).await;
+        let mut diagnostics = broker
+            .take_diagnostics()
+            .await
+            .expect("composition root claims the one diagnostic sink");
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Failed {
+                execution: core,
+                error: AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::DispatchFailed,
+                    "host payload sentinel: secret request body",
+                ),
+            })
+            .await;
+
+        let diagnostic = tokio::time::timeout(Duration::from_secs(1), diagnostics.recv())
+            .await
+            .expect("detached failure is persisted")
+            .expect("diagnostic sender remains live");
+        assert_eq!(diagnostic.execution, Broker::new_execution_id(core.0));
+        assert_eq!(diagnostic.outcome, ExecutionOutcome::Failed);
+        assert_eq!(diagnostic.code, DiagnosticCode::ActionBlocked);
+        assert!(
+            !format!("{diagnostic:?}").contains("secret request body"),
+            "persistent diagnostic records never include host-provided payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn focused_creation_arms_only_after_ui_detach() {
+        let adapter = counting_adapter(false);
         let config = muxe_core::compile_yaml(
             CompiledGeneration(1),
             SourceId::new("<broker creation lifecycle>"),
@@ -2823,10 +4288,109 @@ menus:
     }
 
     #[tokio::test]
-    async fn awaited_config_reload_emits_a_terminal_completion() {
-        let adapter = Arc::new(CountingAdapter {
-            portable_dispatches: AtomicUsize::new(0),
+    async fn deferred_creation_remains_owned_through_activation_drain() {
+        let adapter = counting_adapter(true);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<deferred activation drain regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      t:
+        label: create tab
+        action: tab:create
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("deferred configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("deferred binding is visible");
+        let directory = tempfile::tempdir().expect("deferred test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (session, _events_rx) = attach_ready(&broker, "deferred-drain").await;
+        assert!(matches!(
+            broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::InvokeBinding(InvokeBinding {
+                        session,
+                        generation: 1,
+                        binding: BindingId {
+                            generation: binding.generation().0,
+                            ordinal: binding.ordinal(),
+                        },
+                    }),
+                    mpsc::channel(1).0,
+                )
+                .await
+                .expect("deferred invocation is accepted"),
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                disposition: InvocationDisposition::Dismissed,
+                ..
+            })
+        ));
+        let core = CoreExecutionId(1);
+        {
+            let state = broker.state.lock().await;
+            assert!(
+                state
+                    .executions
+                    .get(&core)
+                    .is_some_and(|record| record.deferred.is_some()),
+                "deferred ownership is registered before UI dismissal can schedule it"
+            );
+        }
+
+        let draining = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.drain_for_activation().await }
         });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.cancellations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("activation drain cancels the deferred adapter owner");
+        let mut draining = draining;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut draining)
+                .await
+                .is_err(),
+            "drain waits for the deferred owner terminal transition"
+        );
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded { execution: core })
+            .await;
+        draining
+            .await
+            .expect("deferred drain task joins")
+            .expect("deferred owner terminal completion finishes drain");
+        let state = broker.state.lock().await;
+        assert!(
+            !state.executions.contains_key(&core),
+            "deferred owner is released exactly at its terminal completion"
+        );
+        assert!(
+            state.activation_sealed,
+            "successful drain seals before handoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn awaited_config_reload_emits_a_terminal_completion() {
+        let adapter = counting_adapter(false);
         let yaml = r"
 version: 1
 menus:
@@ -2922,9 +4486,7 @@ menus:
 
     #[tokio::test]
     async fn host_continuity_loss_keeps_the_pinned_ui_session_attached() {
-        let adapter = Arc::new(CountingAdapter {
-            portable_dispatches: AtomicUsize::new(0),
-        });
+        let adapter = counting_adapter(false);
         let config = muxe_core::compile_yaml(
             CompiledGeneration(1),
             SourceId::new("<continuity regression>"),
@@ -3973,9 +5535,7 @@ menus:
 
     #[tokio::test]
     async fn detached_generic_command_is_reaped_by_its_owned_process_group() {
-        let adapter = Arc::new(CountingAdapter {
-            portable_dispatches: AtomicUsize::new(0),
-        });
+        let adapter = counting_adapter(false);
         let config = muxe_core::compile_yaml(
             CompiledGeneration(1),
             SourceId::new("<generic supervision regression>"),
@@ -4022,7 +5582,13 @@ menus:
             .expect("owned generic child starts");
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if broker.generic.processes.lock().await.is_empty() {
+                if broker
+                    .generic
+                    .processes
+                    .lock()
+                    .expect("generic supervisor registry is not poisoned")
+                    .is_empty()
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4031,6 +5597,190 @@ menus:
         .await
         .expect("generic child is reaped");
     }
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn activation_drain_reaps_owned_generic_process_group() {
+        let directory = tempfile::tempdir().expect("owned generic-process directory");
+        let script = directory.path().join("drain-owned-group.sh");
+        let pidfile = directory.path().join("child.pid");
+        let fifo = directory.path().join("started");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("owned fifo exists");
+        let startup = tokio::task::spawn_blocking({
+            let fifo = fifo.clone();
+            move || {
+                let mut reader = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&fifo)
+                    .map_err(|error| error.to_string())?;
+                let mut started = [0u8; 7];
+                std::io::Read::read_exact(&mut reader, &mut started)
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(started)
+            }
+        });
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nprintf started > '{}'\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+                pidfile.display(),
+                fifo.display()
+            ),
+        )
+        .expect("write owned generic-process script");
+        let adapter = counting_adapter(false);
+        let yaml = format!(
+            r#"
+version: 1
+menus:
+  main:
+    bindings:
+      c:
+        label: cancellable command
+        action:
+          type: command:execute
+          program: /bin/sh
+          args:
+            - {script:?}
+          cwd: {cwd:?}
+        settings:
+          execution:
+            mode: await
+"#,
+            script = script.to_string_lossy(),
+            cwd = directory.path().to_string_lossy(),
+        );
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<generic activation-drain regression>"),
+            yaml.as_str(),
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("generic drain configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("generic binding is visible");
+        let broker = Broker::from_compiled(adapter, directory.path().join("config.yml"), config);
+        let hook = Arc::new(WaitHook::new());
+        broker.set_spawn_wait_hook(Some(Arc::clone(&hook)));
+
+        let (session, _events_rx) = attach_ready(&broker, "generic-drain").await;
+        let invoke_task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            let session = session.clone();
+            let binding_id = BindingId {
+                generation: binding.generation().0,
+                ordinal: binding.ordinal(),
+            };
+            async move {
+                broker
+                    .handle(
+                        PeerRole::Ui,
+                        ClientRequest::InvokeBinding(InvokeBinding {
+                            session,
+                            generation: 1,
+                            binding: binding_id,
+                        }),
+                        mpsc::channel(1).0,
+                    )
+                    .await
+            }
+        });
+
+        // 1. Wait until the generic child is spawned, inserted into GenericSupervisor,
+        // and paused in the hook before activate_execution.
+        hook.entered.notified().await;
+
+        // Startup barrier proves the child process actually started and wrote its PID.
+        let _ = startup
+            .await
+            .expect("startup task joins")
+            .expect("child signals start");
+        let raw_pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("child publishes its pid")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        let child_pid = nix::unistd::Pid::from_raw(raw_pid);
+        assert!(
+            nix::sys::signal::kill(child_pid, None).is_ok(),
+            "child is alive"
+        );
+
+        // 2. Seal activation while paused in this window.
+        let draining = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.drain_for_activation().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !broker.state.lock().await.activation_sealed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain seals activation");
+
+        // 3. Now release the spawn hook while sealed.
+        hook.release.notify_one();
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        draining
+            .await
+            .expect("generic drain task joins")
+            .expect("activation drain reaps the owned process group");
+
+        // 4. Invocation must return ActivationInProgress (NOT Accepted), even though drain cancelled/reaped!
+        let invoke_result = invoke_task.await.expect("invoke task joins");
+        assert!(
+            matches!(invoke_result, Err(BrokerError::ActivationInProgress)),
+            "invocation must fail with ActivationInProgress"
+        );
+
+        // 5. Assert owned PID/group no longer exists using retained child/group fixture.
+        assert_eq!(
+            nix::sys::signal::kill(child_pid, None),
+            Err(nix::errno::Errno::ESRCH),
+            "owned process group must be reaped and no longer exist"
+        );
+        assert!(
+            broker
+                .generic
+                .processes
+                .lock()
+                .expect("generic supervisor registry is not poisoned")
+                .is_empty(),
+            "generic process ownership is cleared only after the reaper completes"
+        );
+        assert!(
+            broker.state.lock().await.executions.is_empty(),
+            "activation drain leaves no generic execution owner behind"
+        );
+        assert!(
+            broker.state.lock().await.awaiting.is_empty(),
+            "activation drain leaves no awaiting entry behind"
+        );
+        broker.reopen_dispatch().await;
+        assert!(
+            !broker.state.lock().await.activation_sealed,
+            "reopening after a completed generic drain restores admission"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn generic_cancellation_escalates_after_its_leader_exits_on_term() {
@@ -4136,6 +5886,8 @@ pub enum BrokerError {
     ActivationDrainRefused(String),
     #[error("a menu control is already pending for this execution")]
     PendingControlInFlight,
+    #[error("the UI already has an awaited execution in flight")]
+    PendingExecutionInFlight,
     #[error("binding belongs to a stale configuration generation")]
     StaleGeneration,
     #[error("binding action is UI-local and must not be dispatched to the broker")]

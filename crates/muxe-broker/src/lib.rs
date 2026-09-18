@@ -14,7 +14,7 @@ pub mod service;
 pub mod spawn;
 mod wire;
 
-pub use broker::{Broker, BrokerError, PendingAttachment, RequestResult};
+pub use broker::{Broker, BrokerDiagnostic, BrokerError, PendingAttachment, RequestResult};
 pub use client::{BrokerClient, ClientError};
 pub use config::{ConfigError, ConfigSnapshot, ConfigStore, load_effective_config};
 pub use gate::{

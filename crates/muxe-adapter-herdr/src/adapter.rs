@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex as StdMutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -55,8 +55,29 @@ pub struct HerdrAdapter {
     // so return proves the subscription task stopped; witnesses can observe the stop
     // by the released adapter references.
     monitor: Mutex<Option<JoinHandle<()>>>,
+    // A host dispatch publishes its owned terminal value here before any bounded
+    // public health-event delivery. One registry lock makes admission and
+    // shutdown mutually exclusive, so every admitted host request remains
+    // retained until either the health consumer or shutdown joins it.
+    dispatch_results_tx: mpsc::UnboundedSender<DispatchTerminal>,
+    dispatch_results_rx: Mutex<mpsc::UnboundedReceiver<DispatchTerminal>>,
+    dispatch_wake: Notify,
+    dispatch_tasks: StdMutex<DispatchTaskRegistry>,
     pending_leases: Mutex<HashMap<PendingPaneLeaseId, PendingPaneLeaseRecord>>,
     post_dismissal: Mutex<HashMap<String, Vec<PostDismissalPortableDispatchRequest>>>,
+    health_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+}
+
+struct DispatchTaskRegistry {
+    closed: bool,
+    finalized: bool,
+    joining: usize,
+    tasks: HashMap<muxe_core::ExecutionId, JoinHandle<()>>,
+}
+
+struct DispatchTerminal {
+    execution: muxe_core::ExecutionId,
+    completion: DispatchCompletion,
 }
 
 /// Transport-free validator for inspecting configuration against the exact
@@ -78,6 +99,21 @@ impl HerdrConfigValidator {
         Ok(Self { schema })
     }
 }
+#[doc(hidden)]
+#[derive(Default)]
+pub struct WaitHook {
+    pub entered: Notify,
+    pub release: Notify,
+}
+
+#[doc(hidden)]
+impl WaitHook {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 struct ContinuityState {
     epoch: u64,
     healthy: bool,
@@ -116,6 +152,7 @@ impl HerdrAdapter {
             .map_err(|error| socket_error(&error))?;
         let identity = runtime.identity().clone();
         let (events_tx, events_rx) = mpsc::channel(64);
+        let (dispatch_results_tx, dispatch_results_rx) = mpsc::unbounded_channel();
         let adapter = Arc::new(Self {
             runtime: RwLock::new(runtime),
             config,
@@ -131,12 +168,22 @@ impl HerdrAdapter {
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             suspend_wake: Notify::new(),
+            health_wait_hook: StdMutex::new(None),
             pending_leases: Mutex::new(HashMap::new()),
             suspended_ack: Notify::new(),
             resume_wake: Notify::new(),
             resume_slot: Mutex::new(None),
-            post_dismissal: Mutex::new(HashMap::new()),
             monitor: Mutex::new(None),
+            dispatch_results_tx,
+            dispatch_results_rx: Mutex::new(dispatch_results_rx),
+            dispatch_wake: Notify::new(),
+            dispatch_tasks: StdMutex::new(DispatchTaskRegistry {
+                closed: false,
+                finalized: false,
+                joining: 0,
+                tasks: HashMap::new(),
+            }),
+            post_dismissal: Mutex::new(HashMap::new()),
         });
         let _ = adapter
             .events_tx
@@ -164,6 +211,78 @@ impl HerdrAdapter {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[doc(hidden)]
+    pub fn set_health_wait_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .health_wait_hook
+            .lock()
+            .expect("Herdr health hook is not poisoned") = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn send_dispatch_terminal_for_test(
+        &self,
+        execution: muxe_core::ExecutionId,
+        completion: DispatchCompletion,
+    ) {
+        let _ = self.dispatch_results_tx.send(DispatchTerminal {
+            execution,
+            completion,
+        });
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
+    fn admit_dispatch_task(
+        &self,
+        execution: muxe_core::ExecutionId,
+        spawn: impl FnOnce() -> JoinHandle<()>,
+    ) -> Result<(), AdapterError> {
+        let mut registry = self
+            .dispatch_tasks
+            .lock()
+            .expect("retained Herdr dispatch registry is not poisoned");
+        if registry.closed {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Herdr adapter is shutting down and cannot admit another dispatch",
+            ));
+        }
+        if registry.tasks.contains_key(&execution) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::DispatchFailed,
+                "Herdr adapter already owns this dispatch execution",
+            ));
+        }
+        // Keep the admission lock through spawn and insertion. Shutdown cannot
+        // observe an unregistered task after its host future is allowed to run.
+        registry.tasks.insert(execution, spawn());
+        Ok(())
+    }
+
+    async fn finish_dispatch_terminal(&self, terminal: DispatchTerminal) -> AdapterHealthEvent {
+        let task = self
+            .dispatch_tasks
+            .lock()
+            .expect("retained Herdr dispatch registry is not poisoned")
+            .tasks
+            .remove(&terminal.execution);
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+        AdapterHealthEvent::DispatchCompleted(terminal.completion)
+    }
+
+    fn dispatches_fully_drained(&self) -> bool {
+        let registry = self
+            .dispatch_tasks
+            .lock()
+            .expect("retained Herdr dispatch registry is not poisoned");
+        registry.closed && registry.finalized && registry.tasks.is_empty() && registry.joining == 0
     }
 
     #[expect(
@@ -302,35 +421,38 @@ impl HerdrAdapter {
             ))
         })?;
         let client = Arc::clone(runtime.client());
-        let sender = self.events_tx.clone();
-        tokio::spawn(async move {
-            let completion = match client.unary(metadata, invocation.params).await {
-                Ok(HerdrResponse::Success(_)) => DispatchCompletion::Succeeded { execution },
-                Ok(HerdrResponse::Error { code, message }) => DispatchCompletion::Failed {
-                    execution,
-                    error: AdapterError::new(
-                        AdapterErrorKind::DispatchFailed,
-                        format!(
-                            "Herdr {} rejected request with {code}: {message}",
-                            metadata.method
+        let results = self.dispatch_results_tx.clone();
+        self.admit_dispatch_task(execution, move || {
+            tokio::spawn(async move {
+                let completion = match client.unary(metadata, invocation.params).await {
+                    Ok(HerdrResponse::Success(_)) => DispatchCompletion::Succeeded { execution },
+                    Ok(HerdrResponse::Error { code, message }) => DispatchCompletion::Failed {
+                        execution,
+                        error: AdapterError::new(
+                            AdapterErrorKind::DispatchFailed,
+                            format!(
+                                "Herdr {} rejected request with {code}: {message}",
+                                metadata.method
+                            ),
                         ),
-                    ),
-                },
-                Err(error) if error.delivery() == DeliveryState::MayHaveReachedHost => {
-                    DispatchCompletion::OutcomeUnknown {
+                    },
+                    Err(error) if error.delivery() == DeliveryState::MayHaveReachedHost => {
+                        DispatchCompletion::OutcomeUnknown {
+                            execution,
+                            error: socket_error(&error),
+                        }
+                    }
+                    Err(error) => DispatchCompletion::Failed {
                         execution,
                         error: socket_error(&error),
-                    }
-                }
-                Err(error) => DispatchCompletion::Failed {
+                    },
+                };
+                let _ = results.send(DispatchTerminal {
                     execution,
-                    error: socket_error(&error),
-                },
-            };
-            let _ = sender
-                .send(AdapterHealthEvent::DispatchCompleted(completion))
-                .await;
-        });
+                    completion,
+                });
+            })
+        })?;
         Ok(DispatchAccepted {
             correlation: ExecutionCorrelationId::new(format!(
                 "herdr-{}",
@@ -377,26 +499,29 @@ impl HerdrAdapter {
         }
         let client = Arc::clone(runtime.client());
         let schema = Arc::clone(runtime.schema());
-        let sender = self.events_tx.clone();
-        tokio::spawn(async move {
-            let completion =
-                match perform_tab_swap(&client, &schema, &workspace, &source_tab, target_index)
-                    .await
-                {
-                    Ok(()) => DispatchCompletion::Succeeded { execution },
-                    Err(TabSwapError::Known(message)) => DispatchCompletion::Failed {
-                        execution,
-                        error: AdapterError::new(AdapterErrorKind::DispatchFailed, message),
-                    },
-                    Err(TabSwapError::Unknown(message)) => DispatchCompletion::OutcomeUnknown {
-                        execution,
-                        error: AdapterError::new(AdapterErrorKind::OutcomeUnknown, message),
-                    },
-                };
-            let _ = sender
-                .send(AdapterHealthEvent::DispatchCompleted(completion))
-                .await;
-        });
+        let results = self.dispatch_results_tx.clone();
+        self.admit_dispatch_task(execution, move || {
+            tokio::spawn(async move {
+                let completion =
+                    match perform_tab_swap(&client, &schema, &workspace, &source_tab, target_index)
+                        .await
+                    {
+                        Ok(()) => DispatchCompletion::Succeeded { execution },
+                        Err(TabSwapError::Known(message)) => DispatchCompletion::Failed {
+                            execution,
+                            error: AdapterError::new(AdapterErrorKind::DispatchFailed, message),
+                        },
+                        Err(TabSwapError::Unknown(message)) => DispatchCompletion::OutcomeUnknown {
+                            execution,
+                            error: AdapterError::new(AdapterErrorKind::OutcomeUnknown, message),
+                        },
+                    };
+                let _ = results.send(DispatchTerminal {
+                    execution,
+                    completion,
+                });
+            })
+        })?;
         Ok(DispatchAccepted {
             correlation: ExecutionCorrelationId::new(format!(
                 "herdr-{}",
@@ -433,46 +558,53 @@ impl HerdrAdapter {
     ) -> Result<DispatchAccepted, AdapterError> {
         self.require_current_origin(&request.origin)?;
         if creation_has_program(&request.action.action) {
-            return Ok(self.dispatch_command_creation(
+            return self.dispatch_command_creation(
                 request.execution,
                 &request.action.action,
                 &request.origin,
-            ));
+            );
         }
         let invocation = portable_invocation(&request.action.action, &request.origin)?;
         self.dispatch(request.execution, invocation)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
     fn dispatch_command_creation(
         &self,
         execution: muxe_core::ExecutionId,
         action: &PortableAction,
         origin: &muxe_core::OriginContext,
-    ) -> DispatchAccepted {
+    ) -> Result<DispatchAccepted, AdapterError> {
         let runtime = self.runtime();
-        let sender = self.events_tx.clone();
+        let results = self.dispatch_results_tx.clone();
         let action = action.clone();
         let origin = origin.clone();
-        tokio::spawn(async move {
-            let completion = match perform_command_creation(
-                runtime.client(),
-                runtime.schema(),
-                &action,
-                &origin,
-            )
-            .await
-            {
-                Ok(()) => DispatchCompletion::Succeeded { execution },
-                Err(error) if error.kind == AdapterErrorKind::OutcomeUnknown => {
-                    DispatchCompletion::OutcomeUnknown { execution, error }
-                }
-                Err(error) => DispatchCompletion::Failed { execution, error },
-            };
-            let _ = sender
-                .send(AdapterHealthEvent::DispatchCompleted(completion))
-                .await;
-        });
-        self.post_dismissal_accepted(execution)
+        self.admit_dispatch_task(execution, move || {
+            tokio::spawn(async move {
+                let completion = match perform_command_creation(
+                    runtime.client(),
+                    runtime.schema(),
+                    &action,
+                    &origin,
+                )
+                .await
+                {
+                    Ok(()) => DispatchCompletion::Succeeded { execution },
+                    Err(error) if error.kind == AdapterErrorKind::OutcomeUnknown => {
+                        DispatchCompletion::OutcomeUnknown { execution, error }
+                    }
+                    Err(error) => DispatchCompletion::Failed { execution, error },
+                };
+                let _ = results.send(DispatchTerminal {
+                    execution,
+                    completion,
+                });
+            })
+        })?;
+        Ok(self.post_dismissal_accepted(execution))
     }
     async fn dispatch_when_ui_is_gone(
         &self,
@@ -531,12 +663,10 @@ impl HerdrAdapter {
         for request in queued {
             let execution = request.execution;
             if let Err(error) = self.start_post_dismissal(&request) {
-                let _ = self
-                    .events_tx
-                    .send(AdapterHealthEvent::DispatchCompleted(
-                        DispatchCompletion::Failed { execution, error },
-                    ))
-                    .await;
+                let _ = self.dispatch_results_tx.send(DispatchTerminal {
+                    execution,
+                    completion: DispatchCompletion::Failed { execution, error },
+                });
             }
         }
     }
@@ -544,15 +674,13 @@ impl HerdrAdapter {
     async fn fail_post_dismissals(&self, message: &str) {
         let queued = std::mem::take(&mut *self.post_dismissal.lock().await);
         for request in queued.into_values().flatten() {
-            let _ = self
-                .events_tx
-                .send(AdapterHealthEvent::DispatchCompleted(
-                    DispatchCompletion::Failed {
-                        execution: request.execution,
-                        error: AdapterError::new(AdapterErrorKind::Unavailable, message),
-                    },
-                ))
-                .await;
+            let _ = self.dispatch_results_tx.send(DispatchTerminal {
+                execution: request.execution,
+                completion: DispatchCompletion::Failed {
+                    execution: request.execution,
+                    error: AdapterError::new(AdapterErrorKind::Unavailable, message),
+                },
+            });
         }
     }
 
@@ -1084,11 +1212,11 @@ impl HostAdapter for HerdrAdapter {
             ));
         }
         if creation_has_program(&request.action.action) {
-            return Ok(self.dispatch_command_creation(
+            return self.dispatch_command_creation(
                 request.execution,
                 &request.action.action,
                 &request.origin,
-            ));
+            );
         }
         let invocation = portable_invocation(&request.action.action, &request.origin)?;
         self.dispatch(request.execution, invocation)
@@ -1136,18 +1264,63 @@ impl HostAdapter for HerdrAdapter {
     }
 
     async fn next_health_event(&self) -> Result<AdapterHealthEvent, AdapterError> {
-        if self.shutdown.load(Ordering::Relaxed) {
-            return Err(AdapterError::new(
-                AdapterErrorKind::Shutdown,
-                "Herdr adapter is shut down",
-            ));
+        loop {
+            // This is the sole health consumer (the broker monitor). Register
+            // the dispatch wake before observing the queue or finalized status
+            // so a notify_waiters during that observation cannot be lost.
+            let wake = self.dispatch_wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            {
+                let hook = self
+                    .health_wait_hook
+                    .lock()
+                    .expect("Herdr health hook is not poisoned")
+                    .clone();
+                if let Some(hook) = hook {
+                    hook.entered.notify_one();
+                    hook.release.notified().await;
+                }
+            }
+            let mut terminals = self.dispatch_results_rx.lock().await;
+            if let Ok(terminal) = terminals.try_recv() {
+                drop(terminals);
+                return Ok(self.finish_dispatch_terminal(terminal).await);
+            }
+            if self.dispatches_fully_drained() {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Shutdown,
+                    "Herdr adapter has drained every admitted dispatch",
+                ));
+            }
+            let mut events = self.events_rx.lock().await;
+            tokio::select! {
+                biased;
+                terminal = terminals.recv() => {
+                    let terminal = terminal.ok_or_else(|| {
+                        AdapterError::new(
+                            AdapterErrorKind::Shutdown,
+                            "Herdr adapter dispatch-result channel closed",
+                        )
+                    })?;
+                    drop(events);
+                    drop(terminals);
+                    return Ok(self.finish_dispatch_terminal(terminal).await);
+                }
+                event = events.recv() => {
+                    return event.ok_or_else(|| {
+                        AdapterError::new(
+                            AdapterErrorKind::Shutdown,
+                            "Herdr adapter event channel closed",
+                        )
+                    });
+                }
+                () = &mut wake => {
+                    drop(events);
+                    drop(terminals);
+                }
+            }
         }
-        self.events_rx.lock().await.recv().await.ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::Shutdown,
-                "Herdr adapter event channel closed",
-            )
-        })
     }
 
     async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
@@ -1250,21 +1423,47 @@ impl HostAdapter for HerdrAdapter {
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
+        let tasks = {
+            let mut registry = self
+                .dispatch_tasks
+                .lock()
+                .expect("retained Herdr dispatch registry is not poisoned");
+            registry.closed = true;
+            registry.joining = registry.joining.saturating_add(registry.tasks.len());
+            std::mem::take(&mut registry.tasks)
+        };
         self.shutdown.store(true, Ordering::Relaxed);
         self.pending_leases.lock().await.clear();
         self.fail_post_dismissals("Herdr adapter shut down before UI dismissal completed")
             .await;
-        // Wake a monitor parked in event reads, reconnect backoff, or the
-        // post-suspend resume wait so shutdown never wedges on a live stream.
+        // Every monitor send is interruptible by the shutdown wake below, so
+        // joining it cannot depend on a consumer freeing bounded health space.
         self.suspend_wake.notify_one();
         self.resume_wake.notify_one();
-        // Await the monitor instead of merely waking it: return proves the retained
-        // subscription socket and its task stopped. The monitor releases its adapter
-        // reference on exit, so witnesses observe the stop through reference release.
         if let Some(monitor) = self.monitor.lock().await.take() {
             let _ = monitor.await;
         }
+        for (_, task) in tasks {
+            let _ = task.await;
+            let mut registry = self
+                .dispatch_tasks
+                .lock()
+                .expect("retained Herdr dispatch registry is not poisoned");
+            registry.joining = registry.joining.saturating_sub(1);
+        }
+        self.dispatch_tasks
+            .lock()
+            .expect("retained Herdr dispatch registry is not poisoned")
+            .finalized = true;
+        self.dispatch_wake.notify_waiters();
         Ok(())
+    }
+}
+
+async fn send_health_or_shutdown(adapter: &Arc<HerdrAdapter>, event: AdapterHealthEvent) -> bool {
+    tokio::select! {
+        sent = adapter.events_tx.send(event) => sent.is_ok(),
+        () = adapter.suspend_wake.notified() => !adapter.shutdown.load(Ordering::Relaxed),
     }
 }
 fn subscription_config() -> SubscriptionConfig {
@@ -1337,16 +1536,20 @@ async fn monitor_subscription(adapter: Arc<HerdrAdapter>, mut subscription: Even
         adapter
             .fail_post_dismissals("Herdr retained event-subscription continuity was lost")
             .await;
-        let _ = adapter
-            .events_tx
-            .send(AdapterHealthEvent::Unhealthy {
+        if !send_health_or_shutdown(
+            &adapter,
+            AdapterHealthEvent::Unhealthy {
                 modal_scope: None,
                 error: AdapterError::new(
                     AdapterErrorKind::Unavailable,
                     "Herdr retained event-subscription continuity was lost",
                 ),
-            })
-            .await;
+            },
+        )
+        .await
+        {
+            return;
+        }
 
         match reconnect_subscription(&adapter, &mut subscription).await {
             ReconnectOutcome::Reconnected | ReconnectOutcome::SuspendRequested => {}
@@ -1434,10 +1637,14 @@ async fn reconnect_subscription(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             continuity.healthy = true;
         }
-        let _ = adapter
-            .events_tx
-            .send(AdapterHealthEvent::Reconnected { previous, current })
-            .await;
+        if !send_health_or_shutdown(
+            adapter,
+            AdapterHealthEvent::Reconnected { previous, current },
+        )
+        .await
+        {
+            return ReconnectOutcome::Stop;
+        }
         *subscription = next_subscription;
         return ReconnectOutcome::Reconnected;
     }
