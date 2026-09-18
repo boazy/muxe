@@ -1,4 +1,8 @@
-use std::{io, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{
+    io,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use muxe_adapter_api::{HostIdentity, HostKind};
 use muxe_adapter_herdr::{EndpointIdentity, HerdrAdapterConfig, generated::BUNDLED_PROTOCOL};
@@ -109,11 +113,19 @@ impl ProductionConnectFixture {
     }
 
     pub fn adapter_config(&self) -> HerdrAdapterConfig {
+        self.adapter_config_at(self.server.socket().to_path_buf())
+    }
+
+    pub fn adapter_config_at(&self, socket_path: PathBuf) -> HerdrAdapterConfig {
         HerdrAdapterConfig {
-            socket_path: self.server.socket().to_path_buf(),
+            socket_path,
             herdr_binary: self.schema_binary.clone(),
             cache_dir: self.cache_dir.clone(),
         }
+    }
+
+    pub fn socket(&self) -> &Path {
+        self.server.socket()
     }
 
     /// Captures the same raw OS host identity that the adapter reports after its production

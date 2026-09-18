@@ -3,12 +3,12 @@ mod support {
     pub mod recorded_socket;
 }
 
-use std::time::Duration;
+use std::{fs, os::unix::fs::symlink, time::Duration};
 
 use muxe_adapter_api::{
-    AdapterHealthEvent, DispatchCompletion, HostAdapter, HostCallerIdentity, OriginCaptureRequest,
-    OriginHintSource, PostDismissalPortableDispatchRequest, ResolvedPortableAction, UiSessionId,
-    UntrustedOriginHint,
+    AdapterErrorKind, AdapterHealthEvent, DispatchCompletion, HostAdapter, HostCallerIdentity,
+    OriginCaptureRequest, OriginHintSource, PendingPaneRegistration,
+    PostDismissalPortableDispatchRequest, ResolvedPortableAction, UiSessionId, UntrustedOriginHint,
 };
 use muxe_adapter_herdr::{
     ApiSchema, CommandPaneLaunch, CommandTabLaunch, FocusedPane, HerdrAdapter, HerdrResponse,
@@ -160,6 +160,403 @@ async fn wait_for_lifecycle_requests(
             .collect::<Vec<_>>();
         panic!("timed out waiting for {stage}; received {methods:?}");
     }
+}
+
+fn pending_pane_registration() -> PendingPaneRegistration {
+    PendingPaneRegistration {
+        ui_session: UiSessionId::new("pending-ui"),
+        pane: PaneId::new("pane-a"),
+        temporary_tab: Some(TabId::new("temporary-tab")),
+    }
+}
+
+fn pending_pane_info() -> serde_json::Value {
+    json!({
+        "type": "pane_info",
+        "pane": {
+            "pane_id": "pane-a",
+            "tab_id": "temporary-tab",
+            "workspace_id": "workspace-1",
+        },
+    })
+}
+
+fn pending_pane_get() -> RecordedExchange {
+    RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Result(pending_pane_info()),
+    }
+}
+
+#[tokio::test]
+async fn pending_cleanup_closes_only_the_registered_pane_in_a_shared_temporary_tab() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(pending_pane_get());
+    script.push(pending_pane_get());
+    script.push(RecordedExchange {
+        method: "pane.close",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Result(json!({ "type": "pane_closed", "pane_id": "pane-a" })),
+    });
+    script.push(RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "pane-b" }),
+        response: RecordedResponse::Result(json!({
+            "type": "pane_info",
+            "pane": {
+                "pane_id": "pane-b",
+                "tab_id": "temporary-tab",
+                "workspace_id": "workspace-1",
+            },
+        })),
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned pending cleanup fixture");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects to the owned fake endpoint");
+    let registration = pending_pane_registration();
+    let lease = adapter
+        .register_pending_pane(registration.clone())
+        .await
+        .expect("the fake host records pane A in the temporary tab also containing pane B");
+
+    adapter
+        .close_pending_pane(registration, lease)
+        .await
+        .expect("cleanup closes the registered pane");
+
+    let response = HerdrSocketClient::new(fixture.adapter_config().socket_path)
+        .unary(
+            method_metadata("pane.get").expect("bundled pane.get metadata"),
+            json!({ "pane_id": "pane-b" }),
+        )
+        .await
+        .expect("the unrelated pane remains queryable after cleanup");
+    assert!(matches!(
+        &response,
+        HerdrResponse::Success(pane)
+            if pane["pane"]["pane_id"] == json!("pane-b")
+                && pane["pane"]["tab_id"] == json!("temporary-tab")
+    ));
+
+    let requests = fixture.requests().await;
+    assert!(
+        requests.iter().all(|request| {
+            request.get("method").and_then(serde_json::Value::as_str) != Some("tab.close")
+        }),
+        "cleanup must not close pane B by closing its shared temporary tab"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.get("method").and_then(serde_json::Value::as_str) == Some("pane.close")
+            })
+            .map(|request| request["params"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!({ "pane_id": "pane-a" })],
+        "cleanup sends one close for its registered pane only"
+    );
+    adapter
+        .shutdown()
+        .await
+        .expect("owned adapter monitor stops");
+}
+
+#[tokio::test]
+async fn pending_cleanup_keeps_the_lease_retryable_when_close_schema_rejects_dispatch() {
+    let mut runtime_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/herdr/herdr-api.schema.json"
+    ))
+    .expect("bundled schema JSON");
+    let close_request = runtime_schema["schemas"]["request"]["oneOf"]
+        .as_array_mut()
+        .expect("bundled schema declares request branches")
+        .iter_mut()
+        .find(|branch| branch.pointer("/properties/method/const") == Some(&json!("pane.close")))
+        .expect("bundled schema declares pane.close");
+    close_request["properties"]["params"] = json!({ "type": "string" });
+
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(pending_pane_get());
+    script.push(pending_pane_get());
+    script.push(pending_pane_get());
+    let fixture = ProductionConnectFixture::start_scripted_with_schema(script, &runtime_schema)
+        .expect("owned pending cleanup fixture");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects to the owned fake endpoint");
+    let registration = pending_pane_registration();
+    let lease = adapter
+        .register_pending_pane(registration.clone())
+        .await
+        .expect("the pending pane registers");
+
+    let first = adapter
+        .close_pending_pane(registration.clone(), lease.clone())
+        .await
+        .expect_err("the incompatible runtime schema prevents pane.close dispatch");
+    let retry = adapter
+        .close_pending_pane(registration, lease)
+        .await
+        .expect_err("a pre-dispatch schema failure keeps the cleanup retryable");
+    assert_eq!(first.kind, AdapterErrorKind::Incompatible);
+    assert_eq!(
+        retry, first,
+        "both attempts report the same pre-dispatch incompatibility, not an unknown outcome"
+    );
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .into_iter()
+            .filter_map(|request| request["method"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>(),
+        vec![
+            "ping",
+            "events.subscribe",
+            "pane.get",
+            "pane.get",
+            "pane.get",
+        ],
+        "schema rejection sends no pane.close bytes"
+    );
+    adapter
+        .shutdown()
+        .await
+        .expect("owned adapter monitor stops");
+}
+
+#[tokio::test]
+async fn pending_cleanup_converges_after_lost_close_response_and_typed_absence() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(pending_pane_get());
+    script.push(pending_pane_get());
+    script.push(RecordedExchange {
+        method: "pane.close",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Close,
+    });
+    script.push(RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Error {
+            code: "pane_not_found".to_owned(),
+            message: "pane-a has already closed".to_owned(),
+        },
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned pending cleanup fixture");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects to the owned fake endpoint");
+    let registration = pending_pane_registration();
+    let lease = adapter
+        .register_pending_pane(registration.clone())
+        .await
+        .expect("the pending pane registers");
+
+    let error = adapter
+        .close_pending_pane(registration.clone(), lease.clone())
+        .await
+        .expect_err("a lost close response has an unknown outcome");
+    assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+    adapter
+        .close_pending_pane(registration.clone(), lease.clone())
+        .await
+        .expect("typed pane absence proves the previous close converged");
+    let error = adapter
+        .close_pending_pane(registration, lease)
+        .await
+        .expect_err("converged cleanup consumes the lease exactly once");
+    assert_eq!(error.kind, AdapterErrorKind::ContextUnavailable);
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .into_iter()
+            .filter_map(|request| request["method"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>(),
+        vec![
+            "ping",
+            "events.subscribe",
+            "pane.get",
+            "pane.get",
+            "pane.close",
+            "pane.get",
+        ],
+        "the recovery observes typed absence and never sends a second close"
+    );
+    adapter
+        .shutdown()
+        .await
+        .expect("owned adapter monitor stops");
+}
+
+#[tokio::test]
+async fn pending_cleanup_keeps_a_reused_pane_id_unknown_after_a_lost_close_response() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(pending_pane_get());
+    script.push(pending_pane_get());
+    script.push(RecordedExchange {
+        method: "pane.close",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Close,
+    });
+    script.push(RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Result(json!({
+            "type": "pane_info",
+            "pane": {
+                "pane_id": "pane-a",
+                "tab_id": "reused-tab",
+                "workspace_id": "workspace-1",
+            },
+        })),
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned pending cleanup fixture");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects to the owned fake endpoint");
+    let registration = pending_pane_registration();
+    let lease = adapter
+        .register_pending_pane(registration.clone())
+        .await
+        .expect("the pending pane registers");
+
+    let error = adapter
+        .close_pending_pane(registration.clone(), lease.clone())
+        .await
+        .expect_err("a lost close response has an unknown outcome");
+    assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+    let error = adapter
+        .close_pending_pane(registration, lease)
+        .await
+        .expect_err("a pane ID observed after the lost response remains unknown");
+    assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .into_iter()
+            .filter_map(|request| request["method"].as_str().map(str::to_owned))
+            .filter(|method| method == "pane.close")
+            .count(),
+        1,
+        "cleanup does not close a pane ID observed after an unknown close outcome"
+    );
+    adapter
+        .shutdown()
+        .await
+        .expect("owned adapter monitor stops");
+}
+
+#[tokio::test]
+async fn pending_cleanup_rejects_a_rebound_endpoint_before_probing_typed_absence() {
+    let mut first_host_script = ProductionConnectFixture::initial_handshake();
+    first_host_script.push(pending_pane_get());
+    let first_host = ProductionConnectFixture::start_scripted(first_host_script)
+        .expect("first owned pending cleanup endpoint starts");
+    let second_host = ProductionConnectFixture::start_scripted(vec![RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Error {
+            code: "pane_not_found".to_owned(),
+            message: "a different host reports no pane-a".to_owned(),
+        },
+    }])
+    .expect("replacement owned pending cleanup endpoint starts");
+    let endpoint_dir = tempfile::tempdir().expect("owned endpoint alias directory");
+    let endpoint = endpoint_dir.path().join("herdr.sock");
+    symlink(first_host.socket(), &endpoint).expect("alias initially selects the first host");
+    let adapter = HerdrAdapter::connect(first_host.adapter_config_at(endpoint.clone()))
+        .await
+        .expect("production adapter connects through the owned endpoint alias");
+    let registration = pending_pane_registration();
+    let lease = adapter
+        .register_pending_pane(registration.clone())
+        .await
+        .expect("the pending pane registers against the first host");
+
+    fs::remove_file(&endpoint).expect("replace the owned endpoint alias");
+    symlink(second_host.socket(), &endpoint).expect("alias now selects the replacement host");
+    let error = adapter
+        .close_pending_pane(registration, lease.clone())
+        .await
+        .expect_err("a replaced endpoint must not report its pane absence as convergence");
+    assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+    adapter
+        .release_pending_pane(lease)
+        .await
+        .expect("the failed not-sent cleanup retains its lease");
+    assert!(
+        second_host.requests().await.is_empty(),
+        "the endpoint check must fail before the replacement host receives pane.get or pane.close"
+    );
+    adapter
+        .shutdown()
+        .await
+        .expect("owned adapter monitor stops");
+}
+
+#[tokio::test]
+async fn pending_cleanup_preserves_its_lease_after_an_unrelated_rpc_failure() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(pending_pane_get());
+    script.push(pending_pane_get());
+    script.push(RecordedExchange {
+        method: "pane.close",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Error {
+            code: "permission_denied".to_owned(),
+            message: "pending cleanup was rejected".to_owned(),
+        },
+    });
+    script.push(pending_pane_get());
+    script.push(RecordedExchange {
+        method: "pane.close",
+        params: json!({ "pane_id": "pane-a" }),
+        response: RecordedResponse::Result(json!({ "type": "pane_closed", "pane_id": "pane-a" })),
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned pending cleanup fixture");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects to the owned fake endpoint");
+    let registration = pending_pane_registration();
+    let lease = adapter
+        .register_pending_pane(registration.clone())
+        .await
+        .expect("the pending pane registers");
+
+    let error = adapter
+        .close_pending_pane(registration.clone(), lease.clone())
+        .await
+        .expect_err("an unrelated host rejection is not idempotent absence");
+    assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
+    adapter
+        .close_pending_pane(registration, lease)
+        .await
+        .expect("the retained lease permits a later confirmed close");
+    adapter
+        .shutdown()
+        .await
+        .expect("owned adapter monitor stops");
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .into_iter()
+            .filter_map(|request| request["method"].as_str().map(str::to_owned))
+            .filter(|method| method == "pane.close")
+            .count(),
+        2,
+        "the explicit rejection preserves the lease for one later close attempt"
+    );
 }
 
 #[tokio::test]

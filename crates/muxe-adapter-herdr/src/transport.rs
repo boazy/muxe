@@ -63,6 +63,8 @@ pub enum SocketError {
         #[source]
         source: io::Error,
     },
+    #[error("Herdr endpoint at {socket} was replaced before the request was sent")]
+    EndpointReplaced { socket: PathBuf },
     #[error("could not read Herdr response")]
     Read {
         delivery: DeliveryState,
@@ -89,7 +91,9 @@ impl SocketError {
             Self::StreamingMethod { .. } | Self::RequestTooLarge | Self::RequestIdExhausted => {
                 DeliveryState::NotSent
             }
-            Self::Connect { .. } | Self::Endpoint { .. } => DeliveryState::NotSent,
+            Self::Connect { .. } | Self::Endpoint { .. } | Self::EndpointReplaced { .. } => {
+                DeliveryState::NotSent
+            }
             Self::Write { delivery, .. }
             | Self::EarlyEof { delivery }
             | Self::ResponseTooLarge { delivery }
@@ -135,6 +139,44 @@ impl HerdrSocketClient {
     ) -> Result<HerdrResponse, SocketError> {
         let (reader, id) = self.send_request(metadata, params).await?;
         Self::finish_unary(reader, &id).await
+    }
+
+    /// Sends one unary request after rejecting a proved replacement of the
+    /// recorded endpoint. An equal endpoint does not prove continuity; the
+    /// retained subscription stream and local epoch remain the authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SocketError::EndpointReplaced`] with [`DeliveryState::NotSent`]
+    /// when the connected endpoint differs from `expected`.
+    pub async fn unary_on_expected_endpoint(
+        &self,
+        metadata: &MethodMetadata,
+        params: Value,
+        expected: &EndpointIdentity,
+    ) -> Result<HerdrResponse, SocketError> {
+        if metadata.transport != MethodTransport::Unary {
+            return Err(SocketError::StreamingMethod {
+                method: metadata.method.to_owned(),
+            });
+        }
+        let id = self.next_id()?;
+        let mut line = encode_request(metadata.method, &id, &params)?;
+        line.push(b'\n');
+        let mut stream = self.connect_stream().await?;
+        let actual = EndpointIdentity::capture(&self.socket, &stream).map_err(|source| {
+            SocketError::Endpoint {
+                socket: self.socket.clone(),
+                source,
+            }
+        })?;
+        if expected.proven_replacement(&actual) {
+            return Err(SocketError::EndpointReplaced {
+                socket: self.socket.clone(),
+            });
+        }
+        write_line(&mut stream, &line).await?;
+        Self::finish_unary(BufReader::new(stream), &id).await
     }
 
     /// Sends one generated unary method, then waits for its single response only until

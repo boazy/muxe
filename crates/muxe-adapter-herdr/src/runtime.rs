@@ -94,12 +94,11 @@ impl HerdrRuntime {
     }
 
     /// The retained OS-visible incarnation of the server this runtime connected to.
-    /// The broker compares fresh probes with [`EndpointIdentity::proven_replacement`]:
-    /// a proved change fails closed host-bound dispatch and never reuses stale
-    /// origins, leases, or pending cleanups against coincident IDs. An unchanged
-    /// record proves nothing on its own (inode numbers may be recycled); the
-    /// continuity authority is the retained subscription stream plus a new local
-    /// epoch after any loss.
+    /// Pending cleanup binds each pane probe and close request to this record and
+    /// rejects a proved replacement before writing bytes. An unchanged record
+    /// proves nothing on its own (inode numbers may be recycled); the continuity
+    /// authority is the retained subscription stream plus a new local epoch after
+    /// any loss.
     #[must_use]
     pub fn endpoint(&self) -> &EndpointIdentity {
         &self.endpoint

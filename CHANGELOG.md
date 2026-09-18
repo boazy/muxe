@@ -4,6 +4,7 @@
 
 - *(zellij)* Bind uninstall configuration ownership to the recorded path
 - *(broker)* Propagate retirement and registry cleanup failures
+- *(herdr)* Close only the leased pending pane and retain uncertain cleanup ownership
 
 ## [0.1.4] - 2026-09-12
 
