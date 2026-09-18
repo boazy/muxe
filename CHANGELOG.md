@@ -3,6 +3,7 @@
 ### 🐛 Bug Fixes
 
 - *(zellij)* Bind uninstall configuration ownership to the recorded path
+- *(broker)* Propagate retirement and registry cleanup failures
 
 ## [0.1.4] - 2026-09-12
 

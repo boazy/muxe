@@ -61,6 +61,19 @@ pub enum ControlError {
     #[error("control operation timed out")]
     Timeout,
 }
+impl ControlError {
+    /// Returns whether connecting failed because the endpoint path is absent.
+    ///
+    /// A refusal, close, or any failure after connecting does not prove that
+    /// the broker is gone: another listener may still own the endpoint.
+    pub(crate) fn is_absent_endpoint(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+}
 
 /// Generates a unique 128-bit request nonce.
 ///
