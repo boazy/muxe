@@ -280,7 +280,9 @@ muxe broker retire --host all
 muxe integration uninstall zellij
 ```
 
-The uninstall command removes nodes created by Muxe, or restores the pre-installation text of nodes Muxe replaced, only when their current text and semantic structure still match the installed state recorded in the receipt. User-modified nodes and root keybindings are never deleted automatically. Bridge files are removed only when their recorded paths and digests match the receipt and no activation journal references them.
+The uninstall command removes nodes created by Muxe, or restores the pre-installation text of nodes Muxe replaced, only when their current text and semantic structure still match the installed state recorded in the receipt. User-modified nodes and root keybindings are never deleted automatically.
+
+Before changing KDL, bridge, or the receipt, uninstall validates every selected KDL plan and the stable bridge and rollback copy against the receipt. It refuses while an interrupted install or the exact bridge-sharing activation unit has a journal, including a corrupt journal. Uninstall retains staging artifacts for the transaction that owns them. Bridge files are removed only when their recorded paths and digests match the receipt.
 
 `--zellij-config` selects receipt ownership only at its recorded absolute path. It cannot transfer authority to another path or symlink alias, and paths containing `..` are refused.
 

@@ -21,12 +21,14 @@ use std::{
 };
 
 use ::kdl::KdlDocument;
+use nix::fcntl::{Flock, FlockArg};
 use thiserror::Error;
 
 use crate::{
     cli::ConfigurationPolicy,
     compatibility,
     fsutil::{self, FsError},
+    lifecycle::journal::{self, JournalError, UnitKind, UnitLock},
     logging::Logger,
     paths::ConfigPath,
 };
@@ -39,17 +41,119 @@ pub use receipt::{Disposition, ManagedNode, NodeRecord, Receipt, Sha256Digest};
 pub const ZELLIJ_INTEGRATION_NAME: &str = "zellij";
 /// Install transaction journal file name.
 pub const INSTALL_JOURNAL_FILE_NAME: &str = ".install-journal.json";
+/// Persistent lock file for the canonical integration directory.
+const INTEGRATION_LOCK_FILE_NAME: &str = ".integration.lock";
 /// Install journal schema version.
 pub const INSTALL_JOURNAL_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
+pub enum IntegrationLockError {
+    #[error(transparent)]
+    Fs(#[from] FsError),
+    #[error(
+        "cannot resolve canonical integration directory {}: {source}",
+        directory.display()
+    )]
+    Canonical {
+        directory: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("cannot acquire integration lock at {}: {source}", path.display())]
+    Acquire {
+        path: PathBuf,
+        #[source]
+        source: nix::errno::Errno,
+    },
+    #[error("integration lock at {} is already held", path.display())]
+    Active { path: PathBuf },
+}
+
+#[derive(Debug)]
+struct IntegrationLock {
+    _file: Flock<fs::File>,
+}
+
+fn integration_lock_path(directory: &Path) -> Result<PathBuf, IntegrationLockError> {
+    fs::canonicalize(directory)
+        .map(|directory| directory.join(INTEGRATION_LOCK_FILE_NAME))
+        .map_err(|source| IntegrationLockError::Canonical {
+            directory: directory.to_path_buf(),
+            source,
+        })
+}
+
+fn open_integration_lock(directory: &Path) -> Result<(PathBuf, fs::File), IntegrationLockError> {
+    fsutil::ensure_owner_dir(directory)?;
+    let path = integration_lock_path(directory)?;
+    let file = fsutil::open_owner_file(&path, false)?;
+    Ok((path, file))
+}
+
+fn lock_integration_file(
+    path: PathBuf,
+    file: fs::File,
+) -> Result<IntegrationLock, IntegrationLockError> {
+    let file = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, source)| {
+        IntegrationLockError::Acquire {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    fsutil::verify_owner_file_descriptor(&path, &file)?;
+    Ok(IntegrationLock { _file: file })
+}
+
+fn acquire_integration_lock(directory: &Path) -> Result<IntegrationLock, IntegrationLockError> {
+    let (path, file) = open_integration_lock(directory)?;
+    lock_integration_file(path, file)
+}
+
+#[cfg(test)]
+enum IntegrationLockAttempt {
+    Acquired(IntegrationLock),
+    Active,
+}
+
+#[cfg(test)]
+fn try_lock_integration_file(
+    path: PathBuf,
+    file: fs::File,
+) -> Result<IntegrationLockAttempt, IntegrationLockError> {
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(file) => {
+            fsutil::verify_owner_file_descriptor(&path, &file)?;
+            Ok(IntegrationLockAttempt::Acquired(IntegrationLock {
+                _file: file,
+            }))
+        }
+        Err((_, source)) if source == nix::errno::Errno::EWOULDBLOCK => {
+            Ok(IntegrationLockAttempt::Active)
+        }
+        Err((_, source)) => Err(IntegrationLockError::Acquire { path, source }),
+    }
+}
+
+#[cfg(test)]
+fn try_acquire_integration_lock(
+    directory: &Path,
+) -> Result<IntegrationLockAttempt, IntegrationLockError> {
+    let (path, file) = open_integration_lock(directory)?;
+    try_lock_integration_file(path, file)
+}
+
+#[derive(Debug, Error)]
 pub enum IntegrationError {
+    #[error(transparent)]
+    IntegrationLock(#[from] IntegrationLockError),
     #[error(transparent)]
     Fs(#[from] FsError),
     #[error(transparent)]
     Receipt(#[from] receipt::ReceiptError),
     #[error(transparent)]
     Bridge(#[from] bridge::BridgeError),
+    #[error(transparent)]
+    Kdl(#[from] kdl::KdlError),
     #[error(transparent)]
     Asset(#[from] compatibility::AssetVerificationError),
     #[error("cannot resolve Zellij configuration: {0}")]
@@ -63,14 +167,39 @@ pub enum IntegrationError {
         "activation journal for this bridge is still live; resolve activation before uninstalling"
     )]
     ActivationJournalLive { journal: PathBuf },
+    #[error(transparent)]
+    ActivationJournal(#[from] JournalError),
+    #[error(
+        "interrupted install journal at {} must be resolved before uninstalling",
+        journal.display()
+    )]
+    InstallJournalLive { journal: PathBuf },
     #[error("fault injected after {step:?} (test hook)")]
     FaultInjected { step: InstallStep },
+    #[cfg(test)]
+    #[error("fault injected after bridge removal (test hook)")]
+    UninstallFaultInjected,
     #[error("interrupted install journal is inconsistent: {0}")]
     InconsistentJournal(String),
     #[error("compatibility record unavailable: {0}")]
     Compat(String),
     #[error("auditable operation cannot proceed without its log record")]
     Audit(#[from] crate::logging::LogError),
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_UNINSTALL_AFTER_BRIDGE_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn set_fail_uninstall_after_bridge_removal(value: bool) {
+    FAIL_UNINSTALL_AFTER_BRIDGE_REMOVAL.with(|failure| failure.set(value));
+}
+
+#[cfg(test)]
+fn fail_uninstall_after_bridge_removal() -> bool {
+    FAIL_UNINSTALL_AFTER_BRIDGE_REMOVAL.with(std::cell::Cell::get)
 }
 
 /// Install transaction boundaries for failure injection.
@@ -85,15 +214,101 @@ pub enum InstallStep {
     BeforeReceiptCommit,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct InstallStepGate {
+    step: InstallStep,
+    reached: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct UninstallGate {
+    directory: PathBuf,
+    reached: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static UNINSTALL_GATE: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<UninstallGate>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_uninstall_gate(gate: Option<std::sync::Arc<UninstallGate>>) {
+    *UNINSTALL_GATE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap() = gate;
+}
+
+#[cfg(test)]
+fn wait_uninstall_gate(directory: &Path) {
+    let gate = UNINSTALL_GATE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(gate) = gate.filter(|gate| gate.directory == directory) {
+        gate.reached.wait();
+        gate.release.wait();
+    }
+}
+
+#[cfg(test)]
+fn assert_integration_lock_active(directory: &Path) {
+    match try_acquire_integration_lock(directory).unwrap() {
+        IntegrationLockAttempt::Active => {}
+        IntegrationLockAttempt::Acquired(lock) => {
+            drop(lock);
+            panic!("integration lock unexpectedly available");
+        }
+    }
+}
+
+#[cfg(test)]
+fn install_gate(
+    step: InstallStep,
+    reached: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
+) -> std::sync::Arc<InstallStepGate> {
+    std::sync::Arc::new(InstallStepGate {
+        step,
+        reached,
+        release,
+    })
+}
+
+#[cfg(test)]
+fn uninstall_gate(
+    directory: PathBuf,
+    reached: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
+) -> std::sync::Arc<UninstallGate> {
+    std::sync::Arc::new(UninstallGate {
+        directory,
+        reached,
+        release,
+    })
+}
+
 /// Test and recovery hooks. Production passes `Hooks::default()`.
 #[derive(Clone, Debug, Default)]
 pub struct Hooks {
     /// When set, the install fails with `FaultInjected` right after the step.
     pub fail_after: Option<InstallStep>,
+    #[cfg(test)]
+    gate: Option<std::sync::Arc<InstallStepGate>>,
 }
 
 impl Hooks {
     fn check(&self, step: InstallStep) -> Result<(), IntegrationError> {
+        #[cfg(test)]
+        if let Some(gate) = self.gate.as_ref().filter(|gate| gate.step == step) {
+            gate.reached.wait();
+            gate.release.wait();
+        }
         if self.fail_after == Some(step) {
             return Err(IntegrationError::FaultInjected { step });
         }
@@ -257,6 +472,8 @@ pub fn zellij_config_path(override_path: Option<&Path>) -> Result<ConfigPath, In
 )]
 pub fn install(inputs: InstallInputs<'_>) -> Result<InstallOutcome, IntegrationError> {
     let verification = compatibility::verify_packaged_asset(inputs.packaged_wasm)?;
+    let directory = integration_dir(inputs.config_dir);
+    let _integration_lock = acquire_integration_lock(&directory)?;
     install_verified(&inputs, verification)
 }
 fn validated_receipt_digest(value: String) -> Result<Sha256Digest, IntegrationError> {
@@ -715,6 +932,7 @@ pub fn resume_install(
     logger: Option<&Logger>,
 ) -> Result<Option<ResumeOutcome>, IntegrationError> {
     let directory = integration_dir(config_dir);
+    let _integration_lock = acquire_integration_lock(&directory)?;
     if !journal_path(&directory).exists() {
         return Ok(None);
     }
@@ -1291,12 +1509,16 @@ fn commit_resumed(
 )]
 pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, IntegrationError> {
     let directory = integration_dir(inputs.config_dir);
+    let _integration_lock = acquire_integration_lock(&directory)?;
     let stable = directory.join(BRIDGE_FILE_NAME);
-    let Some(receipt) = receipt::load(&directory)? else {
+    refuse_interrupted_install(&directory)?;
+    let receipt = receipt::load(&directory)?;
+    let _unit_lock = refuse_when_activation_live(inputs.cache_dir, &stable)?;
+    let Some(receipt) = receipt else {
         return Ok(UninstallOutcome {
             bridge_removed: false,
             previous_removed: false,
-            staging_removed: remove_staging_leftovers(&directory)?,
+            staging_removed: 0,
             restored_nodes: Vec::new(),
             removed_nodes: Vec::new(),
             unresolved: Vec::new(),
@@ -1305,10 +1527,30 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
     };
     let (selected_records, unselected_records) =
         select_uninstall_records(&receipt, inputs.zellij_config.as_deref())?;
-    // Selection establishes receipt authority before any KDL, bridge, or
-    // receipt mutation. In particular, a byte-identical configuration at a
-    // different path cannot acquire ownership from this receipt.
-    refuse_when_activation_live(inputs.cache_dir, &receipt.bridge.installed_digest)?;
+    // The exact bridge-sharing unit stays locked across receipt authority
+    // preflight and mutation. A valid Announced journal has no bridge digest,
+    // so unit identity — never a raw-byte digest search — is the boundary.
+
+    let policy = resolve_policy(inputs.explicit_policy, inputs.quiet, inputs.interactive);
+    let remove_configs = match policy {
+        ResolvedPolicy::Never => false,
+        ResolvedPolicy::Always => true,
+        ResolvedPolicy::Ask => inputs
+            .asker
+            .is_some_and(|ask| ask("Remove or restore Muxe-owned Zellij KDL nodes?")),
+    };
+    let plans = if remove_configs {
+        preflight_uninstall_edits(&selected_records)?
+    } else {
+        Vec::new()
+    };
+    // Nothing destructively changes before every KDL candidate and both bridge
+    // artifacts have receipt authority. Mutation-time operations re-validate
+    // their captured bytes to reject concurrent replacement.
+    preflight_bridge_artifacts(&stable, &receipt.bridge)?;
+
+    #[cfg(test)]
+    wait_uninstall_gate(&directory);
 
     let mut outcome = UninstallOutcome {
         bridge_removed: false,
@@ -1329,18 +1571,13 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
             });
         }
     }
-
-    // KDL nodes first so a later bridge refusal never orphans ownership.
-    let policy = resolve_policy(inputs.explicit_policy, inputs.quiet, inputs.interactive);
-    let remove_configs = match policy {
-        ResolvedPolicy::Never => false,
-        ResolvedPolicy::Always => true,
-        ResolvedPolicy::Ask => inputs
-            .asker
-            .is_some_and(|ask| ask("Remove or restore Muxe-owned Zellij KDL nodes?")),
-    };
     if remove_configs {
-        apply_uninstall_edits(&selected_records, &mut outcome);
+        for plan in plans {
+            let edits = commit_uninstall_plan(plan)?;
+            outcome.removed_nodes.extend(edits.removed);
+            outcome.restored_nodes.extend(edits.restored);
+            outcome.unresolved.extend(edits.unresolved);
+        }
     } else {
         for record in selected_records {
             if record.disposition != Disposition::Observed {
@@ -1354,29 +1591,17 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
     }
 
     let previous = bridge::previous_path(&stable);
-    match receipt.bridge.previous_digest.as_ref() {
-        Some(expected) => {
-            outcome.previous_removed = bridge::remove_if_matching(&previous, expected.as_str())?;
-        }
-        None if previous.exists() => {
-            // A rollback copy exists that no receipt vouches for: never delete
-            // unknown bytes, and keep the receipt until a human resolves it.
-            outcome.unresolved.push(UnresolvedRecord {
-                node: None,
-                config_path: None,
-                reason: format!(
-                    "rollback copy {} has no recorded digest; left in place",
-                    previous.display()
-                ),
-            });
-        }
-        None => {}
+    if let Some(expected) = receipt.bridge.previous_digest.as_ref() {
+        outcome.previous_removed = bridge::remove_if_matching(&previous, expected.as_str())?;
     }
     outcome.bridge_removed =
         bridge::remove_if_matching(&stable, receipt.bridge.installed_digest.as_str())?;
-    outcome.staging_removed = remove_staging_leftovers(&directory)?;
+    #[cfg(test)]
+    if fail_uninstall_after_bridge_removal() {
+        return Err(IntegrationError::UninstallFaultInjected);
+    }
 
-    if outcome.unresolved.is_empty() && !stable.exists() {
+    if outcome.unresolved.is_empty() && bridge_absent(&stable)? {
         receipt::remove(&directory)?;
         outcome.receipt_removed = true;
     }
@@ -1391,73 +1616,85 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
     Ok(outcome)
 }
 
-/// Refuses uninstallation while an activation journal references the bridge digest.
+/// Refuses cleanup while an interrupted install journal remains authoritative.
+///
+/// Uninstall deliberately does not resume it: recovery can legitimately edit
+/// KDL or commit bridge bytes, whereas this operation has not yet resolved
+/// whether it owns any artifact.
+fn refuse_interrupted_install(directory: &Path) -> Result<(), IntegrationError> {
+    let path = journal_path(directory);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Err(IntegrationError::InstallJournalLive { journal: path }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(IntegrationError::Fs(fsutil::io_error(
+            "checking interrupted install journal",
+            &path,
+            source,
+        ))),
+    }
+}
+
+/// Refuses uninstallation while the exact bridge-sharing activation unit is live.
+///
+/// A corrupt journal at that unit path is surfaced through the typed lifecycle
+/// reader and is never mistaken for an absent journal.
 fn refuse_when_activation_live(
     cache_dir: &Path,
-    installed_digest: &Sha256Digest,
-) -> Result<(), IntegrationError> {
-    let activation = cache_dir.join("activation");
-    let entries = match fs::read_dir(&activation) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(IntegrationError::Fs(fsutil::io_error(
-                "scanning activation journals",
-                &activation,
-                source,
-            )));
-        }
+    stable: &Path,
+) -> Result<UnitLock, IntegrationError> {
+    let unit = UnitKind::Zellij {
+        bridge_path_hash: journal::unit_hash(&stable.display().to_string()),
     };
-    for entry in entries {
-        let entry = entry.map_err(|source| {
-            fsutil::io_error("scanning activation journals", &activation, source)
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes = fs::read(&path)
-            .map_err(|source| fsutil::io_error("reading activation journal", &path, source))?;
-        if bytes
-            .windows(installed_digest.as_str().len())
-            .any(|window| window == installed_digest.as_str().as_bytes())
+    let lock = journal::acquire_unit_lock(cache_dir, &unit)?;
+    for (path, entry) in journal::list_journals(cache_dir)? {
+        let journal = entry?;
+        if path.file_name().and_then(|name| name.to_str())
+            != Some(journal.unit.journal_name().as_str())
         {
+            return Err(IntegrationError::ActivationJournal(
+                JournalError::Inconsistent(format!(
+                    "activation journal at {} does not match its typed unit name",
+                    path.display()
+                )),
+            ));
+        }
+        if journal.unit == unit {
             return Err(IntegrationError::ActivationJournalLive { journal: path });
         }
     }
+    Ok(lock)
+}
+
+/// Verifies receipt authority for both bridge artifacts without changing either.
+fn preflight_bridge_artifacts(
+    stable: &Path,
+    bridge_record: &receipt::BridgeRecord,
+) -> Result<(), IntegrationError> {
+    let _ = bridge::check_destination(stable, Some(bridge_record.installed_digest.as_str()))?;
+    bridge::check_previous(
+        stable,
+        bridge_record
+            .previous_digest
+            .as_ref()
+            .map(Sha256Digest::as_str),
+    )?;
     Ok(())
 }
 
-fn remove_staging_leftovers(directory: &Path) -> Result<usize, IntegrationError> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(source) => {
-            return Err(IntegrationError::Fs(fsutil::io_error(
-                "scanning integration directory",
-                directory,
-                source,
-            )));
-        }
-    };
-    let mut removed = 0;
-    for entry in entries {
-        let entry = entry.map_err(|source| {
-            fsutil::io_error("scanning integration directory", directory, source)
-        })?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(".tmp") && name.contains(BRIDGE_FILE_NAME) {
-            fs::remove_file(entry.path()).map_err(|source| {
-                fsutil::io_error("removing staging file", &entry.path(), source)
-            })?;
-            removed += 1;
-        }
+/// Returns whether the stable bridge path is exactly absent.
+///
+/// A dangling symlink is still an artifact. Receipt provenance may be removed
+/// only when no directory entry exists at the stable path.
+fn bridge_absent(stable: &Path) -> Result<bool, IntegrationError> {
+    match fs::symlink_metadata(stable) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(source) => Err(IntegrationError::Fs(fsutil::io_error(
+            "checking stable bridge before receipt removal",
+            stable,
+            source,
+        ))),
     }
-    if removed > 0 {
-        fsutil::sync_dir_of(directory)?;
-    }
-    Ok(removed)
 }
 
 /// Selects receipt records for uninstallation without ever transferring
@@ -1482,8 +1719,10 @@ fn select_uninstall_records<'a>(
     Ok((selected, unselected))
 }
 
-/// Applies owned-node removals and restorations grouped per configuration file.
-fn apply_uninstall_edits(records: &[&NodeRecord], outcome: &mut UninstallOutcome) {
+/// Preflights every selected configuration before any bridge or KDL mutation.
+fn preflight_uninstall_edits(
+    records: &[&NodeRecord],
+) -> Result<Vec<FileUninstallPlan>, IntegrationError> {
     use std::collections::BTreeMap;
     let mut by_file: BTreeMap<ConfigPath, Vec<&NodeRecord>> = BTreeMap::new();
     for record in records {
@@ -1492,24 +1731,10 @@ fn apply_uninstall_edits(records: &[&NodeRecord], outcome: &mut UninstallOutcome
             .or_default()
             .push(*record);
     }
-    for (config_path, records) in by_file {
-        match uninstall_one_file(config_path.as_path(), &records) {
-            Ok(edits) => {
-                outcome.removed_nodes.extend(edits.removed);
-                outcome.restored_nodes.extend(edits.restored);
-                outcome.unresolved.extend(edits.unresolved);
-            }
-            Err(error) => {
-                for record in records {
-                    outcome.unresolved.push(UnresolvedRecord {
-                        node: Some(record.node),
-                        config_path: Some(config_path.to_path_buf()),
-                        reason: error.to_string(),
-                    });
-                }
-            }
-        }
-    }
+    by_file
+        .into_iter()
+        .map(|(config_path, records)| preflight_uninstall_file(config_path.as_path(), &records))
+        .collect()
 }
 
 #[derive(Default)]
@@ -1519,50 +1744,99 @@ struct FileUninstall {
     unresolved: Vec<UnresolvedRecord>,
 }
 
-fn uninstall_one_file(
+struct FileUninstallPlan {
+    config_path: PathBuf,
+    original: Option<kdl::ExistingConfig>,
+    candidate: Option<String>,
+    applied: Vec<(ManagedNode, Disposition)>,
+    result: FileUninstall,
+}
+
+fn unresolved_plan(
     config_path: &Path,
     records: &[&NodeRecord],
-) -> Result<FileUninstall, kdl::KdlError> {
-    let mut result = FileUninstall::default();
-    let bytes = match fs::read(config_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            for record in records {
-                result.unresolved.push(UnresolvedRecord {
+    reason: String,
+) -> FileUninstallPlan {
+    FileUninstallPlan {
+        config_path: config_path.to_path_buf(),
+        original: None,
+        candidate: None,
+        applied: Vec::new(),
+        result: FileUninstall {
+            removed: Vec::new(),
+            restored: Vec::new(),
+            unresolved: records
+                .iter()
+                .filter(|record| record.disposition != Disposition::Observed)
+                .map(|record| UnresolvedRecord {
                     node: Some(record.node),
                     config_path: Some(config_path.to_path_buf()),
-                    reason: "configuration file no longer exists".to_owned(),
-                });
-            }
-            return Ok(result);
+                    reason: reason.clone(),
+                })
+                .collect(),
+        },
+    }
+}
+
+fn preflight_uninstall_file(
+    config_path: &Path,
+    records: &[&NodeRecord],
+) -> Result<FileUninstallPlan, IntegrationError> {
+    match fs::symlink_metadata(config_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(unresolved_plan(
+                config_path,
+                records,
+                "configuration file no longer exists".to_owned(),
+            ));
         }
         Err(source) => {
-            return Err(kdl::KdlError::Fs(fsutil::io_error(
-                "reading Zellij configuration",
+            return Err(IntegrationError::Fs(fsutil::io_error(
+                "checking Zellij configuration",
                 config_path,
                 source,
             )));
         }
+    }
+    let snapshot = kdl::read_existing_config(config_path)?;
+    let bytes = snapshot.bytes().to_vec();
+    let original = match String::from_utf8(bytes.clone()) {
+        Ok(original) => original,
+        Err(_) => {
+            return Ok(unresolved_plan(
+                config_path,
+                records,
+                "configuration is not valid UTF-8".to_owned(),
+            ));
+        }
     };
-    let original = String::from_utf8(bytes.clone()).map_err(|_| kdl::KdlError::Unparseable {
-        path: config_path.to_path_buf(),
-        detail: "configuration is not valid UTF-8".to_owned(),
-    })?;
-    let document =
-        KdlDocument::parse_v1(&original).map_err(|error| kdl::KdlError::Unparseable {
-            path: config_path.to_path_buf(),
-            detail: error.to_string(),
-        })?;
+    let document = match KdlDocument::parse_v1(&original) {
+        Ok(document) => document,
+        Err(error) => return Ok(unresolved_plan(config_path, records, error.to_string())),
+    };
+    let mut result = FileUninstall::default();
     let mut edits = Vec::new();
     for record in records {
         if record.disposition == Disposition::Observed {
             continue;
         }
         match plan_uninstall_node(&document, &original, record) {
-            Ok(Some(edit)) => {
-                edits.push((record.node, record.disposition, edit));
+            Ok(Some(edit)) => edits.push((record.node, record.disposition, edit)),
+            Ok(None) if record.disposition == Disposition::Created => {
+                result.removed.push(record.node);
             }
-            Ok(None) => {}
+            Ok(None) => result.unresolved.push(UnresolvedRecord {
+                node: Some(record.node),
+                config_path: Some(config_path.to_path_buf()),
+                reason: format!(
+                    "`{}` is absent without proven restored provenance; left untouched",
+                    record.node.as_str()
+                ),
+            }),
+            Err(_) if restored_exactly(&document, &original, record) => {
+                result.restored.push(record.node);
+            }
             Err(reason) => result.unresolved.push(UnresolvedRecord {
                 node: Some(record.node),
                 config_path: Some(config_path.to_path_buf()),
@@ -1570,32 +1844,84 @@ fn uninstall_one_file(
             }),
         }
     }
-    if edits.is_empty() {
-        return Ok(result);
-    }
-    let text_edits: Vec<kdl::TextEdit> = edits.iter().map(|(_, _, edit)| edit.clone()).collect();
-    let candidate = kdl::apply_edits(&original, &text_edits);
-    KdlDocument::parse_v1(&candidate).map_err(|error| kdl::KdlError::CandidateRejected {
-        detail: error.to_string(),
-    })?;
-    let current = fs::read(config_path).map_err(|source| {
-        fsutil::io_error("re-reading Zellij configuration", config_path, source)
-    })?;
-    if current != bytes {
-        return Err(kdl::KdlError::ConcurrentChange {
-            path: config_path.to_path_buf(),
-        });
-    }
-    // Commit the already-validated candidate, preserving file permissions.
-    kdl::write_raw_config(config_path, &candidate)?;
-    for (node, disposition, _) in edits {
-        match disposition {
-            Disposition::Created => result.removed.push(node),
-            Disposition::Updated => result.restored.push(node),
-            Disposition::Observed => {}
+    let candidate = if edits.is_empty() {
+        None
+    } else {
+        let text_edits: Vec<kdl::TextEdit> =
+            edits.iter().map(|(_, _, edit)| edit.clone()).collect();
+        let candidate = kdl::apply_edits(&original, &text_edits);
+        KdlDocument::parse_v1(&candidate).map_err(|error| {
+            IntegrationError::Kdl(kdl::KdlError::CandidateRejected {
+                detail: error.to_string(),
+            })
+        })?;
+        Some(candidate)
+    };
+    Ok(FileUninstallPlan {
+        config_path: config_path.to_path_buf(),
+        original: Some(snapshot),
+        candidate,
+        applied: edits
+            .into_iter()
+            .map(|(node, disposition, _)| (node, disposition))
+            .collect(),
+        result,
+    })
+}
+
+fn commit_uninstall_plan(mut plan: FileUninstallPlan) -> Result<FileUninstall, IntegrationError> {
+    if let (Some(snapshot), Some(candidate)) = (&plan.original, &plan.candidate) {
+        kdl::write_existing_config(&plan.config_path, snapshot, candidate)?;
+        for (node, disposition) in plan.applied {
+            match disposition {
+                Disposition::Created => plan.result.removed.push(node),
+                Disposition::Updated => plan.result.restored.push(node),
+                Disposition::Observed => {}
+            }
         }
     }
-    Ok(result)
+    Ok(plan.result)
+}
+
+/// Recognizes an exact restored `Updated` node on retry without rewriting it.
+fn restored_exactly(document: &KdlDocument, original: &str, record: &NodeRecord) -> bool {
+    if record.disposition != Disposition::Updated {
+        return false;
+    }
+    let parent_name = match record.node {
+        ManagedNode::PluginsAlias => PLUGINS_NODE,
+        ManagedNode::LoadPluginsEntry => LOAD_PLUGINS_NODE,
+    };
+    let blocks: Vec<_> = document
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == parent_name)
+        .collect();
+    let Some(block) = (blocks.len() == 1).then(|| blocks[0]) else {
+        return false;
+    };
+    let children: Vec<_> = block
+        .children()
+        .map(|children| {
+            children
+                .nodes()
+                .iter()
+                .filter(|node| node.name().value() == MUXE_NODE)
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(current) = (children.len() == 1).then(|| children[0]) else {
+        return false;
+    };
+    let span = current.span();
+    let Some(text) = original.get(span.offset()..span.offset() + span.len()) else {
+        return false;
+    };
+    let mut semantic = (*current).clone();
+    semantic.autoformat();
+    let semantic = semantic.to_string();
+    record.previous_text.as_deref() == Some(text)
+        && record.previous_semantic.as_deref() == Some(semantic.as_str())
 }
 
 /// Plans the removal or restoration of one owned node.
@@ -1730,6 +2056,8 @@ mod tests {
         let verification = compatibility::NativeAssetVerification {
             packaged_digest: fsutil::sha256_hex(inputs.packaged_wasm),
         };
+        let directory = integration_dir(inputs.config_dir);
+        let _integration_lock = acquire_integration_lock(&directory)?;
         install_verified(&inputs, verification)
     }
 
@@ -1748,6 +2076,46 @@ mod tests {
             asker: None,
             logger: None,
         }
+    }
+
+    fn owner_temp() -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        temp
+    }
+
+    fn lifecycle_record() -> muxe_protocol::control::CompatibilityRecord {
+        muxe_protocol::control::CompatibilityRecord {
+            muxe_version: "0.1.0".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            application_schema_fingerprint: muxe_protocol::SchemaFingerprint([7; 32]),
+            zellij: None,
+            herdr: None,
+        }
+    }
+
+    fn write_announced_journal(cache: &Path, stable: &Path) -> PathBuf {
+        let unit = UnitKind::Zellij {
+            bridge_path_hash: journal::unit_hash(&stable.display().to_string()),
+        };
+        let mut journal = journal::ActivationJournal::new(
+            unit,
+            lifecycle_record(),
+            lifecycle_record(),
+            vec![journal::MemberState {
+                host_identity: "zellij-session".to_owned(),
+                old_socket: PathBuf::from("/tmp/zellij-old.sock"),
+                target_socket: None,
+                handoff_id: None,
+                state: journal::MemberTransition::Prepared,
+            }],
+        );
+        journal.state = journal::JournalState::Announced;
+        journal::write_journal(cache, &journal).unwrap()
     }
 
     fn assert_managed_node_absent(document: &KdlDocument, node: ManagedNode) {
@@ -2976,5 +3344,417 @@ mod tests {
         assert!(!outcome.unresolved.is_empty());
         assert!(!outcome.receipt_removed);
         assert!(outcome.bridge_removed);
+    }
+
+    #[test]
+    fn uninstall_refuses_announced_exact_bridge_unit_before_mutation() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.kdl");
+        let cache = temp.path().join("cache");
+        let mut inputs = install_inputs(temp.path(), b"wasm-v1");
+        inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+        inputs.zellij_config = Some(config.clone());
+        install(inputs).unwrap();
+        let stable = stable_bridge_path(temp.path());
+        let receipt_path = integration_dir(temp.path()).join(receipt::RECEIPT_FILE_NAME);
+        let journal_path = write_announced_journal(&cache, &stable);
+        let config_before = fs::read(&config).unwrap();
+        let stable_before = fs::read(&stable).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+
+        let error = uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::ActivationJournalLive { .. }
+        ));
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+        assert_eq!(fs::read(&stable).unwrap(), stable_before);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+        assert!(journal_path.exists());
+    }
+
+    #[test]
+    fn uninstall_refuses_bridge_committed_install_without_receipt_before_mutation() {
+        let temp = owner_temp();
+        let mut inputs = install_inputs(temp.path(), b"wasm-v1");
+        inputs.hooks.fail_after = Some(InstallStep::BridgeCommitted);
+        assert!(matches!(
+            install(inputs),
+            Err(IntegrationError::FaultInjected {
+                step: InstallStep::BridgeCommitted
+            })
+        ));
+        let directory = integration_dir(temp.path());
+        let stable = stable_bridge_path(temp.path());
+        let journal = journal_path(&directory);
+        let stable_before = fs::read(&stable).unwrap();
+        let journal_before = fs::read(&journal).unwrap();
+
+        let error = uninstall(UninstallInputs {
+            config_dir: temp.path(),
+            cache_dir: &temp.path().join("cache"),
+            zellij_config: None,
+            explicit_policy: Some(ConfigurationPolicy::Always),
+            quiet: true,
+            interactive: false,
+            asker: None,
+            logger: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, IntegrationError::InstallJournalLive { .. }));
+        assert_eq!(fs::read(&stable).unwrap(), stable_before);
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        assert!(receipt::load(&directory).unwrap().is_none());
+    }
+
+    #[test]
+    fn uninstall_refuses_corrupt_activation_journal_before_mutation() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.kdl");
+        let cache = temp.path().join("cache");
+        let mut inputs = install_inputs(temp.path(), b"wasm-v1");
+        inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+        inputs.zellij_config = Some(config.clone());
+        install(inputs).unwrap();
+        let stable = stable_bridge_path(temp.path());
+        let receipt_path = integration_dir(temp.path()).join(receipt::RECEIPT_FILE_NAME);
+        let unit = UnitKind::Zellij {
+            bridge_path_hash: journal::unit_hash(&stable.display().to_string()),
+        };
+        let activation = journal::activation_dir(&cache);
+        fsutil::ensure_owner_dir(&activation).unwrap();
+        let corrupt = activation.join(unit.journal_name());
+        fsutil::write_atomic(&corrupt, b"{not json", "activation").unwrap();
+        let config_before = fs::read(&config).unwrap();
+        let stable_before = fs::read(&stable).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+
+        let error = uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::ActivationJournal(JournalError::Corrupt { .. })
+        ));
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+        assert_eq!(fs::read(&stable).unwrap(), stable_before);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+        assert_eq!(fs::read(&corrupt).unwrap(), b"{not json");
+    }
+
+    #[test]
+    fn mismatched_rollback_copy_refuses_before_kdl_mutation() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.kdl");
+        for wasm in [b"wasm-v1".as_slice(), b"wasm-v2".as_slice()] {
+            let mut inputs = install_inputs(temp.path(), wasm);
+            inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+            inputs.zellij_config = Some(config.clone());
+            install(inputs).unwrap();
+        }
+        let stable = stable_bridge_path(temp.path());
+        let previous = bridge::previous_path(&stable);
+        let receipt_path = integration_dir(temp.path()).join(receipt::RECEIPT_FILE_NAME);
+        fs::write(&previous, b"user backup").unwrap();
+        let config_before = fs::read(&config).unwrap();
+        let stable_before = fs::read(&stable).unwrap();
+        let previous_before = fs::read(&previous).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+
+        let error = uninstall(uninstall_inputs(
+            temp.path(),
+            &temp.path().join("cache"),
+            config.clone(),
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::Bridge(bridge::BridgeError::PreviousProtected { .. })
+        ));
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+        assert_eq!(fs::read(&stable).unwrap(), stable_before);
+        assert_eq!(fs::read(&previous).unwrap(), previous_before);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+    }
+
+    #[test]
+    fn retry_converges_after_bridge_removal_before_receipt_commit() {
+        for (case, reinstall) in [
+            ("stable absent", false),
+            ("stable and previous absent", true),
+        ] {
+            let temp = owner_temp();
+            let config = temp.path().join("config.kdl");
+            let cache = temp.path().join("cache");
+            fs::write(
+                &config,
+                "plugins {\n    other location=\"file:/other.wasm\"\n}\nload_plugins {\n    other\n}\n",
+            )
+            .unwrap();
+            let mut inputs = install_inputs(temp.path(), b"wasm-v1");
+            inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+            inputs.zellij_config = Some(config.clone());
+            install(inputs).unwrap();
+            if reinstall {
+                let mut inputs = install_inputs(temp.path(), b"wasm-v2");
+                inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+                inputs.zellij_config = Some(config.clone());
+                install(inputs).unwrap();
+            }
+            let directory = integration_dir(temp.path());
+            let stable = stable_bridge_path(temp.path());
+            let previous = bridge::previous_path(&stable);
+            assert_eq!(previous.exists(), reinstall, "{case}");
+
+            set_fail_uninstall_after_bridge_removal(true);
+            let error =
+                uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap_err();
+            set_fail_uninstall_after_bridge_removal(false);
+            assert!(matches!(error, IntegrationError::UninstallFaultInjected));
+            assert!(!stable.exists(), "{case}");
+            assert!(!previous.exists(), "{case}");
+            assert_created_nodes_removed_with_user_text(&config);
+            assert!(receipt::load(&directory).unwrap().is_some());
+
+            let outcome = uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap();
+
+            assert!(outcome.receipt_removed, "{case}");
+            assert_created_nodes_removed_with_user_text(&config);
+        }
+    }
+
+    #[test]
+    fn dangling_stable_replacement_keeps_receipt_provenance() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.kdl");
+        let cache = temp.path().join("cache");
+        let mut inputs = install_inputs(temp.path(), b"wasm-v1");
+        inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+        inputs.zellij_config = Some(config.clone());
+        install(inputs).unwrap();
+        let directory = integration_dir(temp.path());
+        let stable = stable_bridge_path(temp.path());
+
+        set_fail_uninstall_after_bridge_removal(true);
+        let error = uninstall(uninstall_inputs(temp.path(), &cache, config.clone())).unwrap_err();
+        set_fail_uninstall_after_bridge_removal(false);
+        assert!(matches!(error, IntegrationError::UninstallFaultInjected));
+        assert!(bridge_absent(&stable).unwrap());
+
+        let replacement = temp.path().join("user-bridge.wasm");
+        std::os::unix::fs::symlink(&replacement, &stable).unwrap();
+        let error = uninstall(uninstall_inputs(temp.path(), &cache, config)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::Bridge(bridge::BridgeError::UnsafeDestination { .. })
+        ));
+        assert!(!bridge_absent(&stable).unwrap());
+        assert!(receipt::load(&directory).unwrap().is_some());
+        assert!(
+            fs::symlink_metadata(&stable)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+    #[test]
+    fn replacing_blocked_integration_lock_fails_closed_without_split_authority() {
+        let temp = owner_temp();
+        let directory = integration_dir(temp.path());
+        let holder = acquire_integration_lock(&directory).unwrap();
+        let path = integration_lock_path(&directory).unwrap();
+        let inode_a = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&path).unwrap());
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let waiter_directory = directory.clone();
+            let waiter = scope.spawn(move || {
+                let (path, file) = open_integration_lock(&waiter_directory).unwrap();
+                opened_tx.send(()).unwrap();
+                let result = lock_integration_file(path, file).map(|_| ());
+                result_tx.send(result).unwrap();
+            });
+            opened_rx.recv().unwrap();
+
+            let replacement = directory.join(".replacement-lock");
+            drop(fsutil::open_owner_file(&replacement, false).unwrap());
+            let inode_b = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&replacement).unwrap());
+            assert_ne!(inode_a, inode_b);
+            fs::rename(&replacement, &path).unwrap();
+            drop(holder);
+
+            let result = result_rx.recv().unwrap();
+            assert!(matches!(
+                result,
+                Err(IntegrationLockError::Fs(FsError::PathChanged { .. }))
+            ));
+            waiter.join().unwrap();
+
+            match try_acquire_integration_lock(&directory).unwrap() {
+                IntegrationLockAttempt::Acquired(lock) => drop(lock),
+                IntegrationLockAttempt::Active => {
+                    panic!("fresh contender unexpectedly saw the replaced inode as active")
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn integration_lock_serializes_install_and_uninstall_authority() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.kdl");
+        fs::write(&config, "// user configuration\n").unwrap();
+        let directory = integration_dir(temp.path());
+        let stable = stable_bridge_path(temp.path());
+        let journal = journal_path(&directory);
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let gate = install_gate(
+            InstallStep::JournalWritten,
+            reached.clone(),
+            release.clone(),
+        );
+        let cache = temp.path().join("cache");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let install_root = temp.path();
+            let install_config = config.clone();
+            let install_gate = gate.clone();
+            let install_thread = scope.spawn(move || {
+                let mut inputs = install_inputs(install_root, b"wasm-v1");
+                inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+                inputs.zellij_config = Some(install_config);
+                inputs.hooks.gate = Some(install_gate);
+                install(inputs)
+            });
+            reached.wait();
+            assert_integration_lock_active(&directory);
+            assert!(journal.exists());
+            assert!(!stable.exists());
+
+            let uninstall_config = config.clone();
+            let uninstall_root = temp.path();
+            let uninstall_cache = cache.clone();
+            let uninstall_thread = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = uninstall(uninstall_inputs(
+                    uninstall_root,
+                    &uninstall_cache,
+                    uninstall_config,
+                ))
+                .map_err(|error| error.to_string());
+                result_tx.send(result).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert!(!stable.exists());
+            assert!(receipt::load(&directory).unwrap().is_none());
+
+            release.wait();
+            let install_result = install_thread.join().unwrap().unwrap();
+            let uninstall_result = result_rx.recv().unwrap().unwrap();
+            uninstall_thread.join().unwrap();
+            assert_eq!(install_result.bridge_digest, fsutil::sha256_hex(b"wasm-v1"));
+            assert!(uninstall_result.bridge_removed);
+            assert!(uninstall_result.receipt_removed);
+        });
+
+        assert!(!stable.exists());
+        assert!(receipt::load(&directory).unwrap().is_none());
+        assert!(integration_lock_path(&directory).unwrap().exists());
+    }
+
+    #[test]
+    fn uninstall_lock_blocks_install_until_fresh_receipt_recheck() {
+        let temp = owner_temp();
+        let config = temp.path().join("config.kdl");
+        fs::write(&config, "// user configuration\n").unwrap();
+        let cache = temp.path().join("cache");
+        let mut initial = install_inputs(temp.path(), b"wasm-v1");
+        initial.explicit_policy = Some(ConfigurationPolicy::Always);
+        initial.zellij_config = Some(config.clone());
+        install(initial).unwrap();
+        let directory = integration_dir(temp.path());
+        let stable = stable_bridge_path(temp.path());
+        let original_receipt = receipt::load(&directory).unwrap().unwrap();
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        set_uninstall_gate(Some(uninstall_gate(
+            directory.clone(),
+            reached.clone(),
+            release.clone(),
+        )));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (install_started_tx, install_started_rx) = std::sync::mpsc::channel();
+        let (install_result_tx, install_result_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let uninstall_config = config.clone();
+            let uninstall_root = temp.path();
+            let uninstall_cache = cache.clone();
+            let uninstall_thread = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                uninstall(uninstall_inputs(
+                    uninstall_root,
+                    &uninstall_cache,
+                    uninstall_config,
+                ))
+            });
+            started_rx.recv().unwrap();
+            reached.wait();
+            assert_integration_lock_active(&directory);
+            assert_eq!(fs::read(&stable).unwrap(), b"wasm-v1");
+            assert_eq!(
+                receipt::load(&directory)
+                    .unwrap()
+                    .unwrap()
+                    .bridge
+                    .installed_digest,
+                original_receipt.bridge.installed_digest
+            );
+
+            let install_config = config.clone();
+            let install_root = temp.path();
+            let install_thread = scope.spawn(move || {
+                let blocked = matches!(
+                    try_acquire_integration_lock(&integration_dir(install_root)).unwrap(),
+                    IntegrationLockAttempt::Active
+                );
+                install_started_tx.send(blocked).unwrap();
+                let mut inputs = install_inputs(install_root, b"wasm-v2");
+                inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+                inputs.zellij_config = Some(install_config);
+                let result = install(inputs).map_err(|error| error.to_string());
+                install_result_tx.send(result).unwrap();
+            });
+            assert!(install_started_rx.recv().unwrap());
+            assert!(matches!(
+                install_result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            release.wait();
+            let uninstall_result = uninstall_thread.join().unwrap().unwrap();
+            let install_result = install_result_rx.recv().unwrap().unwrap();
+            install_thread.join().unwrap();
+            assert!(uninstall_result.receipt_removed);
+            assert_eq!(install_result.bridge_digest, fsutil::sha256_hex(b"wasm-v2"));
+        });
+        set_uninstall_gate(None);
+
+        assert_eq!(fs::read(&stable).unwrap(), b"wasm-v2");
+        let receipt = receipt::load(&directory).unwrap().unwrap();
+        assert_eq!(
+            receipt.bridge.installed_digest,
+            Sha256Digest::from_bytes(b"wasm-v2")
+        );
     }
 }

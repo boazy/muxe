@@ -9,6 +9,7 @@
 - *(config)* Reject unknown underscore-prefixed fields
 - *(config)* Serialize concurrent reloads before publishing newer contents
 - *(cli)* Persist payload-free native command failure events
+- *(zellij)* Preflight uninstall journal and artifact authority before mutation
 
 ## [0.1.4] - 2026-09-12
 

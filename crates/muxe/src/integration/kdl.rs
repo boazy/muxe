@@ -628,6 +628,67 @@ impl FileIdentity {
         }
     }
 }
+
+/// No-follow snapshot of an existing regular configuration file.
+///
+/// The byte and inode identity remain coupled so callers can preflight a
+/// candidate and later commit only to the same file entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExistingConfig {
+    bytes: Vec<u8>,
+    identity: FileIdentity,
+}
+
+impl ExistingConfig {
+    /// Returns the exact bytes captured through the no-follow descriptor.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Reads an existing regular configuration through a no-follow descriptor.
+///
+/// # Errors
+///
+/// Returns [`KdlError`] when the path is absent, unsafe, or cannot be read.
+pub fn read_existing_config(path: &Path) -> Result<ExistingConfig, KdlError> {
+    let (bytes, metadata) = read_regular_file(path)?;
+    Ok(ExistingConfig {
+        bytes,
+        identity: FileIdentity::from_metadata(&metadata),
+    })
+}
+
+/// Revalidates and atomically writes a candidate for a prior no-follow snapshot.
+///
+/// # Errors
+///
+/// Returns [`KdlError::ConcurrentChange`] when either bytes or file identity
+/// changed since `snapshot` was captured.
+pub fn write_existing_config(
+    path: &Path,
+    snapshot: &ExistingConfig,
+    candidate: &str,
+) -> Result<(), KdlError> {
+    let (current, metadata) = match read_regular_file(path) {
+        Ok(current) => current,
+        Err(KdlError::Fs(FsError::Io { source, .. }))
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            return Err(KdlError::ConcurrentChange {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if current != snapshot.bytes || FileIdentity::from_metadata(&metadata) != snapshot.identity {
+        return Err(KdlError::ConcurrentChange {
+            path: path.to_path_buf(),
+        });
+    }
+    write_candidate(path, candidate, metadata.permissions().mode() & 0o777)
+}
 ///
 /// Reads the configuration and plans both managed nodes without mutation.
 ///
