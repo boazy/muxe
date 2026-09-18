@@ -1,3 +1,9 @@
+## Unreleased
+
+### 🐛 Bug Fixes
+
+- *(zellij)* Bind uninstall configuration ownership to the recorded path
+
 ## [0.1.4] - 2026-09-12
 
 ### 🚀 Features

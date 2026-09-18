@@ -14,7 +14,10 @@
 //! home directory), resolution fails instead of falling back to a relative
 //! ambient directory.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Component, Path, PathBuf},
+};
 
 use thiserror::Error;
 
@@ -24,6 +27,14 @@ pub enum PathError {
         "no validated configuration base: set XDG_CONFIG_HOME/XDG_CACHE_HOME to absolute paths or provide a home directory"
     )]
     NoValidatedBase,
+    #[error("could not resolve the current directory while normalizing {path}: {source}")]
+    CurrentDirectory {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Zellij configuration path {path} must not contain `..`")]
+    ParentTraversal { path: PathBuf },
 }
 
 /// Validated absolute application directories.
@@ -66,26 +77,61 @@ pub fn resolve() -> Result<AppPaths, PathError> {
 /// Resolves which Zellij configuration to inspect or edit.
 ///
 /// Uses `--zellij-config` when supplied, otherwise `$ZELLIJ_CONFIG_DIR/config.kdl`,
-/// then the standard Zellij config path under the same XDG base. Fails without
-/// a validated base instead of guessing a relative path.
+/// then the standard Zellij config path under the same XDG base. The result is
+/// absolute with only `.` components removed before it crosses the receipt
+/// boundary. It deliberately preserves every other component and rejects `..`:
+/// collapsing parent traversal would change the target through a symlinked
+/// ancestor. KDL reads and writes reject symlink targets through their
+/// descriptor-safe checks.
 ///
 /// # Errors
 ///
 /// Returns [`PathError::NoValidatedBase`] when no validated base exists and no override is supplied.
 pub fn zellij_config_path(override_path: Option<&Path>) -> Result<PathBuf, PathError> {
-    if let Some(path) = override_path {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(dir) = std::env::var_os("ZELLIJ_CONFIG_DIR")
+    let path = if let Some(path) = override_path {
+        path.to_path_buf()
+    } else if let Some(dir) = std::env::var_os("ZELLIJ_CONFIG_DIR")
         && !dir.is_empty()
     {
-        return Ok(PathBuf::from(dir).join("config.kdl"));
+        PathBuf::from(dir).join("config.kdl")
+    } else {
+        let dirs =
+            platform_dirs::AppDirs::new(Some("zellij"), true).ok_or(PathError::NoValidatedBase)?;
+        // platform-dirs appends the application name; Zellij's own file is
+        // `config.kdl` directly under its configuration directory.
+        dirs.config_dir.join("config.kdl")
+    };
+    normalize_config_path(&path)
+}
+/// Makes a Zellij configuration path absolute and removes only `.` components.
+///
+/// Receipt persistence and uninstall selection both use this one boundary.
+/// Parent traversal is rejected instead of collapsed, so a symlink alias can
+/// never silently become a receipt-owned path.
+pub fn normalize_config_path(path: &Path) -> Result<PathBuf, PathError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| PathError::CurrentDirectory {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(PathError::ParentTraversal { path: absolute });
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
     }
-    let dirs =
-        platform_dirs::AppDirs::new(Some("zellij"), true).ok_or(PathError::NoValidatedBase)?;
-    // platform-dirs appends the application name; Zellij's own file is
-    // `config.kdl` directly under its configuration directory.
-    Ok(dirs.config_dir.join("config.kdl"))
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -99,6 +145,14 @@ mod tests {
     }
 
     #[test]
+    fn normalization_rejects_parent_traversal() {
+        assert!(matches!(
+            normalize_config_path(Path::new("/ancestor-symlink/../config.kdl")),
+            Err(PathError::ParentTraversal { .. })
+        ));
+    }
+
+    #[test]
     fn live_resolution_matches_xdg_contract() {
         // Reads the ambient environment without mutating it: either a resolved
         // XDG-conformant pair or a strict no-base failure.
@@ -109,6 +163,7 @@ mod tests {
                 assert!(paths.config_dir.ends_with("muxe"));
             }
             Err(PathError::NoValidatedBase) => {}
+            Err(error) => panic!("unexpected app path resolution error: {error}"),
         }
     }
 }

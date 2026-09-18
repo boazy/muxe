@@ -282,6 +282,8 @@ muxe integration uninstall zellij
 
 The uninstall command removes nodes created by Muxe, or restores the pre-installation text of nodes Muxe replaced, only when their current text and semantic structure still match the installed state recorded in the receipt. User-modified nodes and root keybindings are never deleted automatically. Bridge files are removed only when their recorded paths and digests match the receipt and no activation journal references them.
 
+`--zellij-config` selects receipt ownership only at its recorded absolute path. It cannot transfer authority to another path or symlink alias, and paths containing `..` are refused.
+
 ## Herdr setup
 
 Muxe installs as a native executable, not as a Herdr manifest plugin. There is no `muxe integration install herdr` command.

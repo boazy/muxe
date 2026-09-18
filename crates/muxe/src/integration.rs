@@ -54,6 +54,11 @@ pub enum IntegrationError {
     #[error("cannot resolve Zellij configuration: {0}")]
     ConfigDiscovery(String),
     #[error(
+        "--zellij-config {} is not a receipt-owned Zellij configuration path; refusing uninstall without mutation",
+        path.display()
+    )]
+    ConfigOverrideUnowned { path: PathBuf },
+    #[error(
         "activation journal for this bridge is still live; resolve activation before uninstalling"
     )]
     ActivationJournalLive { journal: PathBuf },
@@ -223,18 +228,16 @@ pub fn stable_bridge_path(config_dir: &Path) -> PathBuf {
 ///
 /// Delegates to the single native [`crate::paths`] resolver: an explicit
 /// override wins, otherwise `$ZELLIJ_CONFIG_DIR` and the standard Zellij
-/// configuration path apply. Never falls back to a relative directory.
+/// configuration path apply. Its normalized, non-link-resolving result is also
+/// the receipt ownership boundary. Never falls back to a relative directory.
 ///
 /// # Errors
 ///
-/// Returns `IntegrationError::ConfigDiscovery` when neither `XDG_CONFIG_HOME`
-/// nor `HOME` is set and no explicit override was passed.
+/// Returns `IntegrationError::ConfigDiscovery` when no usable Zellij path can
+/// be resolved.
 pub fn zellij_config_path(override_path: Option<&Path>) -> Result<PathBuf, IntegrationError> {
-    crate::paths::zellij_config_path(override_path).map_err(|_| {
-        IntegrationError::ConfigDiscovery(
-            "neither XDG_CONFIG_HOME nor HOME is set; pass --zellij-config explicitly".to_owned(),
-        )
-    })
+    crate::paths::zellij_config_path(override_path)
+        .map_err(|error| IntegrationError::ConfigDiscovery(error.to_string()))
 }
 
 /// Installs the Zellij bridge transactionally.
@@ -1242,6 +1245,11 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
             receipt_removed: false,
         });
     };
+    let (selected_records, unselected_records) =
+        select_uninstall_records(&receipt, inputs.zellij_config.as_deref())?;
+    // Selection establishes receipt authority before any KDL, bridge, or
+    // receipt mutation. In particular, a byte-identical configuration at a
+    // different path cannot acquire ownership from this receipt.
     refuse_when_activation_live(inputs.cache_dir, &receipt.bridge.installed_digest)?;
 
     let mut outcome = UninstallOutcome {
@@ -1253,6 +1261,16 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
         unresolved: Vec::new(),
         receipt_removed: false,
     };
+    for record in unselected_records {
+        if record.disposition != Disposition::Observed {
+            outcome.unresolved.push(UnresolvedRecord {
+                node: Some(record.node),
+                config_path: Some(record.config_path.clone()),
+                reason: "configuration was not selected by --zellij-config; node left in place"
+                    .to_owned(),
+            });
+        }
+    }
 
     // KDL nodes first so a later bridge refusal never orphans ownership.
     let policy = resolve_policy(inputs.explicit_policy, inputs.quiet, inputs.interactive);
@@ -1264,9 +1282,9 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
             .is_some_and(|ask| ask("Remove or restore Muxe-owned Zellij KDL nodes?")),
     };
     if remove_configs {
-        apply_uninstall_edits(&receipt, inputs.zellij_config.as_deref(), &mut outcome);
+        apply_uninstall_edits(&selected_records, &mut outcome);
     } else {
-        for record in &receipt.configs {
+        for record in selected_records {
             if record.disposition != Disposition::Observed {
                 outcome.unresolved.push(UnresolvedRecord {
                     node: Some(record.node),
@@ -1384,23 +1402,40 @@ fn remove_staging_leftovers(directory: &Path) -> Result<usize, IntegrationError>
     Ok(removed)
 }
 
-/// Applies owned-node removals and restorations grouped per configuration file.
-fn apply_uninstall_edits(
-    receipt: &Receipt,
+/// Selects receipt records for uninstallation without ever transferring
+/// ownership between configuration paths.
+fn select_uninstall_records<'a>(
+    receipt: &'a Receipt,
     config_override: Option<&Path>,
-    outcome: &mut UninstallOutcome,
-) {
+) -> Result<(Vec<&'a NodeRecord>, Vec<&'a NodeRecord>), IntegrationError> {
+    let Some(config_override) = config_override else {
+        return Ok((receipt.configs.iter().collect(), Vec::new()));
+    };
+    let selected_path = zellij_config_path(Some(config_override))?;
+    let (selected, unselected): (Vec<_>, Vec<_>) = receipt
+        .configs
+        .iter()
+        .partition(|record| record.config_path == selected_path);
+    if selected.is_empty() {
+        return Err(IntegrationError::ConfigOverrideUnowned {
+            path: selected_path,
+        });
+    }
+    Ok((selected, unselected))
+}
+
+/// Applies owned-node removals and restorations grouped per configuration file.
+fn apply_uninstall_edits(records: &[&NodeRecord], outcome: &mut UninstallOutcome) {
     use std::collections::BTreeMap;
     let mut by_file: BTreeMap<PathBuf, Vec<&NodeRecord>> = BTreeMap::new();
-    for record in &receipt.configs {
+    for record in records {
         by_file
             .entry(record.config_path.clone())
             .or_default()
-            .push(record);
+            .push(*record);
     }
     for (config_path, records) in by_file {
-        let target = config_override.map_or(config_path.clone(), PathBuf::from);
-        match uninstall_one_file(&target, &records) {
+        match uninstall_one_file(&config_path, &records) {
             Ok(edits) => {
                 outcome.removed_nodes.extend(edits.removed);
                 outcome.restored_nodes.extend(edits.restored);
@@ -1410,7 +1445,7 @@ fn apply_uninstall_edits(
                 for record in records {
                     outcome.unresolved.push(UnresolvedRecord {
                         node: Some(record.node),
-                        config_path: Some(target.clone()),
+                        config_path: Some(config_path.clone()),
                         reason: error.to_string(),
                     });
                 }
@@ -2126,6 +2161,7 @@ mod tests {
                 config_dir: temp.path(),
                 cache_dir: &cache,
                 zellij_config: Some(config.clone()),
+
                 explicit_policy: Some(ConfigurationPolicy::Always),
                 quiet: true,
                 interactive: false,
@@ -2149,6 +2185,241 @@ mod tests {
             );
             assert!(receipt_path.exists(), "{case}");
         }
+    }
+
+    #[test]
+    fn uninstall_rejects_legacy_parent_traversal_receipt_before_mutation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = temp.path().join("config.kdl");
+        let stable = stable_bridge_path(temp.path());
+        let directory = integration_dir(temp.path());
+        let receipt_path = directory.join(receipt::RECEIPT_FILE_NAME);
+        fs::write(&config, "// user configuration\n").unwrap();
+        fsutil::ensure_owner_dir(&directory).unwrap();
+        fs::write(&stable, b"bridge bytes").unwrap();
+        let alias = temp.path().join("ancestor-symlink");
+        std::os::unix::fs::symlink(temp.path(), &alias).unwrap();
+        let receipt = serde_json::json!({
+            "schema_version": receipt::RECEIPT_SCHEMA_VERSION,
+            "bridge": {
+                "canonical_path": stable,
+                "installed_version": "0.1.0",
+                "installed_digest": fsutil::sha256_hex(b"bridge bytes"),
+                "previous_digest": null,
+                "bridge_compat": null,
+            },
+            "configs": [{
+                "config_path": alias.join("../config.kdl"),
+                "node": "plugins_alias",
+                "disposition": "Created",
+                "semantic": "muxe",
+                "text_digest": "b".repeat(64),
+                "previous_text": null,
+                "previous_semantic": null,
+            }],
+        });
+        fsutil::write_atomic(
+            &receipt_path,
+            &serde_json::to_vec(&receipt).unwrap(),
+            "receipt",
+        )
+        .unwrap();
+        let config_before = fs::read(&config).unwrap();
+        let bridge_before = fs::read(&stable).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+
+        let error = uninstall(UninstallInputs {
+            config_dir: temp.path(),
+            cache_dir: &temp.path().join("cache"),
+            zellij_config: None,
+            explicit_policy: Some(ConfigurationPolicy::Always),
+            quiet: true,
+            interactive: false,
+            asker: None,
+            logger: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::Receipt(receipt::ReceiptError::Invalid { .. })
+        ));
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+        assert_eq!(fs::read(&stable).unwrap(), bridge_before);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+    }
+    #[test]
+    fn uninstall_override_cannot_transfer_identical_nodes_between_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config_a = temp.path().join("a/config.kdl");
+        let config_b = temp.path().join("b/config.kdl");
+        fs::create_dir_all(config_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(config_b.parent().unwrap()).unwrap();
+        let wasm = b"wasm-v1";
+        let mut inputs = install_inputs(temp.path(), wasm);
+        inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+        inputs.zellij_config = Some(config_a.clone());
+        install(inputs).unwrap();
+        fs::write(&config_b, fs::read(&config_a).unwrap()).unwrap();
+        let stable = stable_bridge_path(temp.path());
+        let receipt_path = integration_dir(temp.path()).join(receipt::RECEIPT_FILE_NAME);
+        let a_before = fs::read(&config_a).unwrap();
+        let b_before = fs::read(&config_b).unwrap();
+        let bridge_before = fs::read(&stable).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+
+        let error = uninstall(UninstallInputs {
+            config_dir: temp.path(),
+            cache_dir: &temp.path().join("cache"),
+            zellij_config: Some(config_b.clone()),
+            explicit_policy: Some(ConfigurationPolicy::Always),
+            quiet: true,
+            interactive: false,
+            asker: None,
+            logger: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::ConfigOverrideUnowned { .. }
+        ));
+        assert_eq!(fs::read(&config_a).unwrap(), a_before);
+        assert_eq!(fs::read(&config_b).unwrap(), b_before);
+        assert_eq!(fs::read(&stable).unwrap(), bridge_before);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+    }
+
+    #[test]
+    fn uninstall_same_receipt_path_removes_owned_nodes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = temp.path().join("config.kdl");
+        fs::write(&config, "// unrelated configuration\n").unwrap();
+        let mut inputs = install_inputs(temp.path(), b"wasm-v1");
+        inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+        inputs.zellij_config = Some(config.clone());
+        install(inputs).unwrap();
+
+        let outcome = uninstall(UninstallInputs {
+            config_dir: temp.path(),
+            cache_dir: &temp.path().join("cache"),
+            zellij_config: Some(config.clone()),
+            explicit_policy: Some(ConfigurationPolicy::Always),
+            quiet: true,
+            interactive: false,
+            asker: None,
+            logger: None,
+        })
+        .unwrap();
+
+        assert!(outcome.bridge_removed);
+        assert_eq!(outcome.removed_nodes.len(), 2);
+        assert!(outcome.receipt_removed);
+        assert!(config.exists());
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.starts_with("// unrelated configuration\n"));
+        assert!(
+            !text.lines().any(|line| line.trim() == "muxe"),
+            "receipt-owned KDL nodes remain:\n{text}"
+        );
+    }
+
+    #[test]
+    fn uninstall_rejects_parent_traversal_without_touching_artifacts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = temp.path().join("owned/config.kdl");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let mut inputs = install_inputs(temp.path(), b"wasm-v1");
+        inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+        inputs.zellij_config = Some(config.clone());
+        install(inputs).unwrap();
+        let alias = temp.path().join("ancestor-symlink");
+        std::os::unix::fs::symlink(config.parent().unwrap(), &alias).unwrap();
+        let stable = stable_bridge_path(temp.path());
+        let receipt_path = integration_dir(temp.path()).join(receipt::RECEIPT_FILE_NAME);
+        let config_before = fs::read(&config).unwrap();
+        let bridge_before = fs::read(&stable).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+
+        let error = uninstall(UninstallInputs {
+            config_dir: temp.path(),
+            cache_dir: &temp.path().join("cache"),
+            zellij_config: Some(alias.join("../config.kdl")),
+            explicit_policy: Some(ConfigurationPolicy::Always),
+            quiet: true,
+            interactive: false,
+            asker: None,
+            logger: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, IntegrationError::ConfigDiscovery(_)));
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+        assert_eq!(fs::read(&stable).unwrap(), bridge_before);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+    }
+
+    #[test]
+    fn uninstall_rejects_symlinked_ancestor_alias_without_touching_artifacts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = temp.path().join("owned/config.kdl");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let mut inputs = install_inputs(temp.path(), b"wasm-v1");
+        inputs.explicit_policy = Some(ConfigurationPolicy::Always);
+        inputs.zellij_config = Some(config.clone());
+        install(inputs).unwrap();
+        let alias = temp.path().join("ancestor-symlink");
+        std::os::unix::fs::symlink(config.parent().unwrap(), &alias).unwrap();
+        let stable = stable_bridge_path(temp.path());
+        let receipt_path = integration_dir(temp.path()).join(receipt::RECEIPT_FILE_NAME);
+        let config_before = fs::read(&config).unwrap();
+        let bridge_before = fs::read(&stable).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+
+        let error = uninstall(UninstallInputs {
+            config_dir: temp.path(),
+            cache_dir: &temp.path().join("cache"),
+            zellij_config: Some(alias.join("config.kdl")),
+            explicit_policy: Some(ConfigurationPolicy::Always),
+            quiet: true,
+            interactive: false,
+            asker: None,
+            logger: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IntegrationError::ConfigOverrideUnowned { .. }
+        ));
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+        assert_eq!(fs::read(&stable).unwrap(), bridge_before);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
     }
 
     #[test]

@@ -207,6 +207,20 @@ impl Receipt {
 
         let mut records = HashSet::new();
         for record in &self.configs {
+            let normalized =
+                crate::paths::normalize_config_path(&record.config_path).map_err(|error| {
+                    format!(
+                        "configuration ownership path {} is unsafe: {error}",
+                        record.config_path.display()
+                    )
+                })?;
+            if normalized != record.config_path {
+                return Err(format!(
+                    "configuration ownership path {} is not the normalized receipt path {}",
+                    record.config_path.display(),
+                    normalized.display()
+                ));
+            }
             if !records.insert((&record.config_path, record.node)) {
                 return Err(format!(
                     "duplicate ownership record for {} in {}",
