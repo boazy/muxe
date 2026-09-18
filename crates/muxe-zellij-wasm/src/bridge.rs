@@ -35,7 +35,7 @@
 //! user-owned newer state: the menu is dismissed and the snapshot is never
 //! restored over it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -182,7 +182,7 @@ pub struct Bridge {
     client_id: Option<String>,
     plugin_id: Option<u32>,
     plugin_client_id: Option<u16>,
-    focused_pane: Option<String>,
+    focused_pane: Option<PaneId>,
     permission_gate: PermissionGate,
     event_cli_id: Option<String>,
     pending_subscribe: bool,
@@ -193,9 +193,10 @@ pub struct Bridge {
     pending: Option<PendingCapture>,
     active: Option<ActiveCapture>,
     restoring_mode: Option<RestoreBarrier>,
-    muxe_panes: BTreeSet<String>,
-    last_non_muxe_pane: Option<String>,
-    origin_pane: Option<String>,
+    pending_ui_pane: Option<PaneId>,
+    capture_panes: BTreeMap<[u8; 16], PaneId>,
+    last_non_muxe_pane: Option<PaneId>,
+    origin_pane: Option<PaneId>,
     inventory: PaneInventory,
     pending_actions: BTreeMap<String, PendingAction>,
     pending_post_dismissals: Vec<PendingPostDismissal>,
@@ -233,7 +234,8 @@ impl Default for Bridge {
             pending: None,
             active: None,
             restoring_mode: None,
-            muxe_panes: BTreeSet::new(),
+            pending_ui_pane: None,
+            capture_panes: BTreeMap::new(),
             last_non_muxe_pane: None,
             origin_pane: None,
             inventory: PaneInventory::new(),
@@ -341,16 +343,16 @@ impl Bridge {
                 if client.is_current_client && client.client_id == anchor_client_id {
                     current_client_present = true;
                     self.client_id = Some(client.client_id.to_string());
-                    let focused = format!("{}", client.pane_id);
+                    let focused = client.pane_id;
                     // Focus history advances only while no menu owns capture and
-                    // only for panes outside the known MUXE set: a focused pane
-                    // during capture, or a known menu pane, is never origin.
+                    // only for panes outside capture-owned UI: a focused pane
+                    // during capture, or a capture-owned menu pane, is never origin.
                     if self.active.is_none()
                         && self.pending.is_none()
-                        && !self.muxe_panes.contains(&focused)
-                        && self.focused_pane.as_deref() != Some(focused.as_str())
+                        && !self.is_focus_excluded(focused)
+                        && self.focused_pane != Some(focused)
                     {
-                        self.last_non_muxe_pane = Some(focused.clone());
+                        self.last_non_muxe_pane = Some(focused);
                     }
                     self.focused_pane = Some(focused);
                     break;
@@ -417,6 +419,7 @@ impl Bridge {
         // Away from Locked with an active capture is user-owned newer state:
         // dismiss without restoring the older snapshot.
         if let Some(active) = self.active.take() {
+            self.release_capture_ui(active.lease);
             self.emit_unsolicited(
                 BridgeEvent::CaptureLost {
                     lease: active.lease,
@@ -447,6 +450,43 @@ impl Bridge {
         }
         self.inventory.set_manifest(panes);
         self.try_post_dismissals(effects);
+    }
+    /// Binds the pending claim pane to a capture lease. The claim and capture
+    /// sessions differ (`claim-*` vs broker `ui-*`), so the join is the pending
+    /// pane itself: it binds only when this bridge still has that pane focused.
+    /// A retry for an already-bound lease stays idempotent; a stale overwrite
+    /// replaces the pending claim before binding.
+    fn bind_capture_ui(&mut self, lease: CaptureLeaseId) {
+        if self.capture_panes.contains_key(&lease.0) {
+            return;
+        }
+        let Some(pane) = self.pending_ui_pane.take() else {
+            return;
+        };
+        // A focus change consumes the stale claim: a later unrelated capture
+        // after focus returns must not resurrect it without a fresh claim.
+        if self.focused_pane != Some(pane) {
+            return;
+        }
+        // A replacement capture supersedes its former lease before the old
+        // EndCapture can release the still-owned pane exclusion.
+        self.capture_panes.retain(|_, excluded| *excluded != pane);
+        self.capture_panes.insert(lease.0, pane);
+    }
+
+    /// Releases one lease's focus exclusion; other leases keep theirs.
+    fn release_capture_ui(&mut self, lease: CaptureLeaseId) {
+        self.capture_panes.remove(&lease.0);
+    }
+
+    /// Panes excluded from eligible focus targets: only panes owned by an
+    /// active capture lease. Without host-proven launch provenance there is no
+    /// permanent Muxe set: attaching never excludes, and dismissal restores
+    /// eligibility for a surviving direct pane.
+    fn is_focus_excluded(&self, pane: PaneId) -> bool {
+        self.capture_panes
+            .values()
+            .any(|excluded| *excluded == pane)
     }
 
     fn on_tab_update(&mut self, tabs: &[TabInfo]) {
@@ -498,6 +538,7 @@ impl Bridge {
             .is_some_and(|pending| lease.is_none_or(|lease| pending.lease == lease));
         if pending_matches {
             let pending = self.pending.take().expect("matching pending capture");
+            self.release_capture_ui(pending.lease);
             if pending.requested
                 && let Some(prior) = pending.prior
             {
@@ -526,9 +567,18 @@ impl Bridge {
             }
             effects.switch_mode(active.prior);
         }
+        self.release_capture_ui(active.lease);
         Some(active)
     }
 
+    /// Clears every capture-lease focus exclusion plus the unconsumed claim.
+    /// Only lease-agnostic resets (replacement channel, unload) call this:
+    /// lease-scoped `EndCapture` keeps newer leases and claims intact through
+    /// `release_capture_ui`.
+    fn clear_capture_ui(&mut self) {
+        self.capture_panes.clear();
+        self.pending_ui_pane = None;
+    }
     fn on_before_close(&mut self, effects: &mut dyn HostEffects) {
         // Unloading with owned Locked capture restores the guarded prior;
         // pending async completions fail instead of dangling. Only unload
@@ -546,6 +596,7 @@ impl Bridge {
             );
         }
         self.pending = None;
+        self.clear_capture_ui();
         self.restoring_mode = None;
         let pending: Vec<PendingAction> = std::mem::take(&mut self.pending_actions)
             .into_values()
@@ -590,6 +641,7 @@ impl Bridge {
         // shared guard, but preserves the restoring barrier until a
         // non-Locked ModeUpdate is observed.
         self.cancel_capture_for_restore(None, effects);
+        self.clear_capture_ui();
         self.pending_actions.clear();
         self.registration = None;
         self.channel_generation = Some(subscription.channel_generation());
@@ -626,7 +678,7 @@ impl Bridge {
             BridgeEvent::Register {
                 registration: ZellijRegistration {
                     client_id,
-                    current_pane: self.focused_pane.clone(),
+                    current_pane: self.focused_pane.map(|pane| pane.to_string()),
                     plugin_id: self.plugin_id,
                     identity: BridgeIdentity {
                         muxe_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -864,7 +916,7 @@ impl Bridge {
                 remaining.push(pending);
                 continue;
             }
-            if self.focused_pane.as_deref() != Some(pending.origin_pane.as_str()) {
+            if PaneId::from_str(&pending.origin_pane).ok() != self.focused_pane {
                 refresh_client_focus = true;
                 remaining.push(pending);
                 continue;
@@ -949,6 +1001,7 @@ impl Bridge {
         _ui_session: UiSessionId,
         effects: &mut dyn HostEffects,
     ) {
+        self.bind_capture_ui(lease);
         if let Some(active) = &self.active
             && active.lease == lease
         {
@@ -1023,6 +1076,7 @@ impl Bridge {
     ) {
         // Guarded cancellation restores only matching pending or active state.
         // A stale lease leaves every newer owner untouched.
+        self.release_capture_ui(lease);
         self.cancel_capture_for_restore(Some(lease), effects);
         self.release(cli_id, request_id, generation, effects);
     }
@@ -1037,10 +1091,21 @@ impl Bridge {
         effects: &mut dyn HostEffects,
     ) {
         // The owning bridge is the one whose focused pane is the attaching UI
-        // pane; every other bridge declines so the adapter moves on. The UI
-        // pane joins the MUXE set so later focus history never mistakes a menu
-        // pane for origin.
-        if self.focused_pane.as_deref() != Some(ui_pane.as_str()) {
+        // pane; every other bridge declines so the adapter moves on. Recording
+        // the session pane alone changes no focus eligibility: exclusion starts
+        // only when BeginCapture binds its lease, so a surviving direct pane
+        // becomes eligible again after dismissal.
+        let Ok(ui_pane_id) = PaneId::from_str(&ui_pane) else {
+            self.release(cli_id, request_id, generation, effects);
+            self.emit_for_request(
+                request_id,
+                generation,
+                BridgeResponse::OriginDeclined { ui_session },
+                effects,
+            );
+            return;
+        };
+        if self.focused_pane != Some(ui_pane_id) {
             self.release(cli_id, request_id, generation, effects);
             self.emit_for_request(
                 request_id,
@@ -1050,15 +1115,13 @@ impl Bridge {
             );
             return;
         }
-        self.muxe_panes.insert(ui_pane.clone());
-        let prior = self.last_non_muxe_pane.clone();
+        self.pending_ui_pane = Some(ui_pane_id);
+        let prior = self.last_non_muxe_pane;
         let cwd = prior
-            .as_deref()
-            .and_then(|pane| PaneId::from_str(pane).ok())
             .and_then(|pane| effects.pane_cwd(pane))
             .map(|path| path.to_string_lossy().into_owned());
-        if let Some(prior) = &prior {
-            self.origin_pane = Some(prior.clone());
+        if let Some(prior) = prior {
+            self.origin_pane = Some(prior);
         }
         self.release(cli_id, request_id, generation, effects);
         self.emit_for_request(
@@ -1069,7 +1132,7 @@ impl Bridge {
                 origin: ZellijOrigin {
                     client_id: self.client_id.clone().unwrap_or_default(),
                     session_name: None,
-                    prior_pane_id: prior,
+                    prior_pane_id: prior.map(|pane| pane.to_string()),
                     ui_pane_id: ui_pane,
                     prior_pane_cwd: cwd,
                 },
@@ -1087,12 +1150,15 @@ impl Bridge {
         index: u32,
         effects: &mut dyn HostEffects,
     ) {
-        let outcome = match self.inventory.pane_at(index) {
+        let outcome = match self
+            .inventory
+            .pane_at(index, |pane| !self.is_focus_excluded(host_pane_id(pane)))
+        {
             Some(pane) => {
                 effects.focus_pane(host_pane_id(pane));
                 CommandOutcome::succeeded()
             }
-            None => CommandOutcome::failed(format!("no pane at manifest index {index}")),
+            None => CommandOutcome::failed(format!("no eligible pane at manifest index {index}")),
         };
         self.release(cli_id, request_id, generation, effects);
         self.emit_for_request(
@@ -1120,10 +1186,12 @@ impl Bridge {
     ) {
         let base = self
             .origin_pane
-            .as_deref()
-            .and_then(|pane| PaneId::from_str(pane).ok())
             .and_then(|pane| to_geometry(pane, &self.inventory));
-        let outcome = match base.and_then(|base| self.inventory.neighbor(base, direction)) {
+        let outcome = match base.and_then(|base| {
+            self.inventory.neighbor(base, direction, |pane| {
+                !self.is_focus_excluded(host_pane_id(pane))
+            })
+        }) {
             Some(neighbor) => {
                 effects.focus_pane(host_pane_id(neighbor));
                 CommandOutcome::succeeded()
@@ -1157,6 +1225,7 @@ impl Bridge {
         // restoring barrier is preserved until a non-Locked ModeUpdate is
         // observed.
         self.cancel_capture_for_restore(None, effects);
+        self.clear_capture_ui();
         let pending: Vec<PendingAction> = std::mem::take(&mut self.pending_actions)
             .into_values()
             .collect();
@@ -1556,7 +1625,7 @@ mod tests {
                 rows: 24,
             }],
         )]));
-        bridge.focused_pane = Some("terminal_7".to_owned());
+        bridge.focused_pane = Some(PaneId::Terminal(7));
         let before = host.events().len();
 
         bridge.defer_post_dismissal_creation(
@@ -2098,12 +2167,25 @@ mod tests {
     #[test]
     fn resubscription_restores_before_replacement_completes() {
         let (mut bridge, mut host) = boot();
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("claim-ui"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_2".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        assert_eq!(bridge.pending_ui_pane, Some(PaneId::Terminal(2)));
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         bridge.pipe(
-            request_msg(BridgeRequest::BeginCapture {
-                lease: lease(51),
-                ui_session: session("ui-1"),
-            }),
+            request_msg_with_id(
+                RequestId::try_from(2).expect("second request"),
+                BridgeRequest::BeginCapture {
+                    lease: lease(51),
+                    ui_session: session("ui-1"),
+                },
+            ),
             &mut host,
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
@@ -2115,7 +2197,8 @@ mod tests {
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal]
         );
-        assert_eq!(bridge.capture_state(), (None, None));
+        assert_eq!(bridge.pending_ui_pane, None);
+        assert!(bridge.capture_panes.is_empty());
         // Re-registration lands before the restore ModeUpdate is observed.
         bridge.update(
             Event::ListClients(clients_current(PaneId::Terminal(2))),
@@ -2380,6 +2463,366 @@ mod tests {
             }
             _ => panic!("expected snapshot, got decline"),
         }
+    }
+    fn pane_info(id: u32, x: usize, y: usize, columns: usize, rows: usize) -> PaneInfo {
+        PaneInfo {
+            id,
+            pane_x: x,
+            pane_y: y,
+            pane_columns: columns,
+            pane_rows: rows,
+            ..Default::default()
+        }
+    }
+
+    fn manifest(tabs: impl IntoIterator<Item = (usize, Vec<PaneInfo>)>) -> PaneManifest {
+        use std::collections::HashMap;
+
+        PaneManifest {
+            panes: HashMap::from_iter(tabs),
+        }
+    }
+
+    #[test]
+    fn direct_ui_pane_is_excluded_only_while_its_capture_owns_it() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::PaneUpdate(manifest([(
+                0,
+                vec![pane_info(2, 0, 0, 10, 10), pane_info(4, 10, 0, 10, 10)],
+            )])),
+            &mut host,
+        );
+        bridge.update(
+            Event::TabUpdate(vec![TabInfo {
+                position: 0,
+                active: true,
+                ..Default::default()
+            }]),
+            &mut host,
+        );
+        // Production claim and capture sessions differ: the origin fan-out
+        // uses a throwaway `claim-*` session while BeginCapture carries the
+        // broker `ui-*` session. The join is the pending pane plus focus.
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("claim-direct"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_2".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        assert_eq!(bridge.pending_ui_pane, Some(PaneId::Terminal(2)));
+
+        let request_2 = RequestId::INITIAL.next().expect("next request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                request_2,
+                BridgeRequest::Dispatch {
+                    execution: exec(30),
+                    request: ZellijDispatchRequest::FocusPaneByIndex { index: 0 },
+                },
+            ),
+            &mut host,
+        );
+        // Attaching alone excludes nothing: the surviving direct pane stays
+        // eligible while focus is unchanged.
+        assert!(bridge.capture_panes.is_empty());
+        assert_eq!(host.focused, vec![PaneId::Terminal(2)]);
+
+        let request_3 = request_2.next().expect("third request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                request_3,
+                BridgeRequest::BeginCapture {
+                    lease: lease(80),
+                    ui_session: session("ui-direct"),
+                },
+            ),
+            &mut host,
+        );
+        let request_4 = request_3.next().expect("fourth request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                request_4,
+                BridgeRequest::Dispatch {
+                    execution: exec(31),
+                    request: ZellijDispatchRequest::FocusPaneByIndex { index: 0 },
+                },
+            ),
+            &mut host,
+        );
+        // Focus never moved, so the pending claim binds to the lease even
+        // though the sessions differ. Eligible index 0 skips terminal_2.
+        assert_eq!(bridge.pending_ui_pane, None);
+        assert!(
+            bridge
+                .capture_panes
+                .values()
+                .any(|pane| *pane == PaneId::Terminal(2))
+        );
+        assert_eq!(host.focused, vec![PaneId::Terminal(2), PaneId::Terminal(4)]);
+
+        let request_5 = request_4.next().expect("fifth request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                request_5,
+                BridgeRequest::EndCapture {
+                    lease: lease(80),
+                    reason: CaptureEndReason::UiDismissed,
+                },
+            ),
+            &mut host,
+        );
+        let request_6 = request_5.next().expect("sixth request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                request_6,
+                BridgeRequest::Dispatch {
+                    execution: exec(32),
+                    request: ZellijDispatchRequest::FocusPaneByIndex { index: 0 },
+                },
+            ),
+            &mut host,
+        );
+        // Dismissal releases the lease, so the surviving direct pane becomes
+        // eligible again: eligible index 0 resolves to terminal_2.
+        assert!(bridge.capture_panes.is_empty());
+        assert_eq!(
+            host.focused,
+            vec![
+                PaneId::Terminal(2),
+                PaneId::Terminal(4),
+                PaneId::Terminal(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_claim_is_consumed_when_focus_moves_before_capture() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::PaneUpdate(manifest([(
+                0,
+                vec![pane_info(2, 0, 0, 10, 10), pane_info(4, 10, 0, 10, 10)],
+            )])),
+            &mut host,
+        );
+        bridge.update(
+            Event::TabUpdate(vec![TabInfo {
+                position: 0,
+                active: true,
+                ..Default::default()
+            }]),
+            &mut host,
+        );
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("claim-stale"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_2".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        // Focus moves before capture, so the first bind consumes the claim
+        // without excluding anything.
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(4))),
+            &mut host,
+        );
+        let request_2 = RequestId::INITIAL.next().expect("next request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                request_2,
+                BridgeRequest::BeginCapture {
+                    lease: lease(82),
+                    ui_session: session("ui-stale"),
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(bridge.pending_ui_pane, None);
+        assert!(bridge.capture_panes.is_empty());
+        // Focus returns, but the stale claim is gone: an unrelated capture
+        // without a fresh RequestOrigin still excludes nothing.
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        bridge.pipe(
+            request_msg_with_id(
+                request_2.next().expect("third request ID"),
+                BridgeRequest::BeginCapture {
+                    lease: lease(83),
+                    ui_session: session("ui-unrelated"),
+                },
+            ),
+            &mut host,
+        );
+        assert!(bridge.capture_panes.is_empty());
+        bridge.pipe(
+            request_msg_with_id(
+                request_2
+                    .next()
+                    .and_then(RequestId::next)
+                    .expect("fourth request ID"),
+                BridgeRequest::Dispatch {
+                    execution: exec(34),
+                    request: ZellijDispatchRequest::FocusPaneByIndex { index: 0 },
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(host.focused, vec![PaneId::Terminal(2)]);
+    }
+
+    #[test]
+    fn failed_attachment_never_excludes_its_pane() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::PaneUpdate(manifest([(
+                0,
+                vec![pane_info(2, 0, 0, 10, 10), pane_info(4, 10, 0, 10, 10)],
+            )])),
+            &mut host,
+        );
+        bridge.update(
+            Event::TabUpdate(vec![TabInfo {
+                position: 0,
+                active: true,
+                ..Default::default()
+            }]),
+            &mut host,
+        );
+        // No RequestOrigin ran for this session, so BeginCapture binds nothing.
+        let request_2 = RequestId::INITIAL.next().expect("next request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                request_2,
+                BridgeRequest::BeginCapture {
+                    lease: lease(81),
+                    ui_session: session("ui-unattached"),
+                },
+            ),
+            &mut host,
+        );
+        bridge.pipe(
+            request_msg_with_id(
+                request_2.next().expect("third request ID"),
+                BridgeRequest::Dispatch {
+                    execution: exec(33),
+                    request: ZellijDispatchRequest::FocusPaneByIndex { index: 0 },
+                },
+            ),
+            &mut host,
+        );
+        assert!(bridge.capture_panes.is_empty());
+        assert_eq!(host.focused, vec![PaneId::Terminal(2)]);
+    }
+
+    #[test]
+    fn focus_targets_only_eligible_panes_in_their_scoped_tabs() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::PaneUpdate(manifest([
+                (
+                    0,
+                    vec![pane_info(2, 0, 0, 10, 10), pane_info(4, 20, 0, 10, 10)],
+                ),
+                (1, vec![pane_info(9, 10, 0, 10, 10)]),
+            ])),
+            &mut host,
+        );
+        bridge.update(
+            Event::TabUpdate(vec![
+                TabInfo {
+                    position: 0,
+                    active: true,
+                    ..Default::default()
+                },
+                TabInfo {
+                    position: 1,
+                    ..Default::default()
+                },
+            ]),
+            &mut host,
+        );
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("claim-menu"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_2".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        let capture_request = RequestId::INITIAL.next().expect("next request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                capture_request,
+                BridgeRequest::BeginCapture {
+                    lease: lease(84),
+                    ui_session: session("ui-menu"),
+                },
+            ),
+            &mut host,
+        );
+        assert!(
+            bridge
+                .capture_panes
+                .values()
+                .any(|pane| *pane == PaneId::Terminal(2))
+        );
+
+        bridge.pipe(
+            request_msg_with_id(
+                capture_request.next().expect("second request ID"),
+                BridgeRequest::Dispatch {
+                    execution: exec(20),
+                    request: ZellijDispatchRequest::FocusPaneNeighbor {
+                        direction: muxe_zellij_protocol::NeighborDirection::Right,
+                    },
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(host.focused, vec![PaneId::Terminal(4)]);
+
+        let second = capture_request.next().expect("second request ID");
+        bridge.pipe(
+            request_msg_with_id(
+                second.next().expect("third request ID"),
+                BridgeRequest::Dispatch {
+                    execution: exec(21),
+                    request: ZellijDispatchRequest::FocusPaneByIndex { index: 1 },
+                },
+            ),
+            &mut host,
+        );
+        // Only terminal_4 is eligible in the active tab, so every out-of-range
+        // eligible index fails without focusing another pane.
+        assert_eq!(host.focused, vec![PaneId::Terminal(4)]);
+
+        bridge.pipe(
+            request_msg_with_id(
+                second
+                    .next()
+                    .and_then(RequestId::next)
+                    .expect("fourth request ID"),
+                BridgeRequest::Dispatch {
+                    execution: exec(22),
+                    request: ZellijDispatchRequest::FocusPaneByIndex { index: 2 },
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(host.focused, vec![PaneId::Terminal(4)]);
     }
 
     #[test]

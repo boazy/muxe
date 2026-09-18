@@ -10,6 +10,7 @@
 - *(config)* Serialize concurrent reloads before publishing newer contents
 - *(cli)* Persist payload-free native command failure events
 - *(zellij)* Preflight uninstall journal and artifact authority before mutation
+- *(zellij)* Filter Muxe-owned panes from eligible focus targets
 
 ## [0.1.4] - 2026-09-12
 

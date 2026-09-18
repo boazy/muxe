@@ -4,11 +4,10 @@
 //! position with full geometry) and `TabUpdate` (positions with an active
 //! flag). Two operations that have no pinned primitive resolve here:
 //!
-//! - Indexed focus selects the active tab's manifest-order pane. Manifest
-//!   order is host-reported order; that semantic is documented on the request.
-//! - Neighbor focus computes the nearest pane from a base pane's tracked
-//!   geometry: strictly separated in the requested direction, ranked by edge
-//!   overlap then center distance.
+//! - Indexed focus selects an eligible manifest-order pane from the active tab.
+//! - Neighbor focus computes the nearest eligible pane from the origin pane's
+//!   tab and tracked geometry: strictly separated in the requested direction,
+//!   ranked by edge overlap then center distance.
 
 use std::collections::BTreeMap;
 
@@ -100,16 +99,38 @@ impl PaneInventory {
     }
 
     /// Panes of the active tab in manifest order, if known.
-    pub fn active_panes(&self) -> Option<&[PaneGeometry]> {
+    fn active_panes(&self) -> Option<&[PaneGeometry]> {
         self.active_tab
             .and_then(|tab| self.panes.get(&tab))
             .map(Vec::as_slice)
     }
 
-    /// Resolves a manifest-order index of the active tab.
-    pub fn pane_at(&self, index: u32) -> Option<PaneGeometry> {
+    /// Panes of the tab containing `origin`, in manifest order.
+    fn origin_tab(&self, origin: PaneGeometry) -> Option<&[PaneGeometry]> {
+        self.panes
+            .values()
+            .find(|panes| panes.contains(&origin))
+            .map(Vec::as_slice)
+    }
+
+    /// Iterates one manifest tab without copying, excluding ineligible panes.
+    fn eligible_panes<'a, F>(
+        panes: &'a [PaneGeometry],
+        is_eligible: F,
+    ) -> impl Iterator<Item = PaneGeometry> + 'a
+    where
+        F: Fn(PaneGeometry) -> bool + 'a,
+    {
+        panes.iter().copied().filter(move |pane| is_eligible(*pane))
+    }
+
+    /// Resolves a manifest-order index among eligible panes of the active tab.
+    pub fn pane_at<F>(&self, index: u32, is_eligible: F) -> Option<PaneGeometry>
+    where
+        F: Fn(PaneGeometry) -> bool,
+    {
         let position: usize = index.try_into().ok()?;
-        self.active_panes()?.get(position).copied()
+        Self::eligible_panes(self.active_panes()?, is_eligible).nth(position)
     }
 
     /// Finds a tracked pane by numeric ID and kind.
@@ -127,18 +148,22 @@ impl PaneInventory {
         self.find(id, is_plugin).is_some()
     }
 
-    /// Computes the nearest neighbor of a base pane in one direction.
+    /// Computes the nearest eligible neighbor of a base pane in one direction.
     ///
     /// Candidates must lie strictly beyond the base edge in that direction;
     /// ranking prefers edge overlap, then center distance. Returns `None` when
-    /// no tracked pane qualifies.
-    pub fn neighbor(
+    /// no tracked eligible pane qualifies.
+    pub fn neighbor<F>(
         &self,
         base: PaneGeometry,
         direction: NeighborDirection,
-    ) -> Option<PaneGeometry> {
+        is_eligible: F,
+    ) -> Option<PaneGeometry>
+    where
+        F: Fn(PaneGeometry) -> bool,
+    {
         let mut best: Option<(usize, usize, PaneGeometry)> = None;
-        for candidate in self.panes.values().flatten() {
+        for candidate in Self::eligible_panes(self.origin_tab(base)?, is_eligible) {
             if candidate.id == base.id && candidate.is_plugin == base.is_plugin {
                 continue;
             }
@@ -152,15 +177,15 @@ impl PaneInventory {
                 continue;
             }
             let overlap = match direction {
-                NeighborDirection::Left | NeighborDirection::Right => base.overlap_y(*candidate),
-                NeighborDirection::Up | NeighborDirection::Down => base.overlap_x(*candidate),
+                NeighborDirection::Left | NeighborDirection::Right => base.overlap_y(candidate),
+                NeighborDirection::Up | NeighborDirection::Down => base.overlap_x(candidate),
             };
-            let distance = base.distance2(*candidate);
+            let distance = base.distance2(candidate);
             let rank = (overlap, usize::MAX - distance);
             if best
                 .is_none_or(|(best_overlap, best_inverse, _)| rank > (best_overlap, best_inverse))
             {
-                best = Some((overlap, usize::MAX - distance, *candidate));
+                best = Some((overlap, usize::MAX - distance, candidate));
             }
         }
         best.map(|(_, _, pane)| pane)
@@ -197,11 +222,11 @@ mod tests {
     }
 
     #[test]
-    fn index_selects_manifest_order() {
+    fn index_selects_eligible_active_tab_order() {
         let inventory = inventory();
-        assert_eq!(inventory.pane_at(0).expect("first").id, 1);
-        assert_eq!(inventory.pane_at(2).expect("third").id, 3);
-        assert!(inventory.pane_at(3).is_none());
+        assert_eq!(inventory.pane_at(0, |_| true).expect("first").id, 1);
+        assert_eq!(inventory.pane_at(2, |_| true).expect("third").id, 3);
+        assert!(inventory.pane_at(3, |_| true).is_none());
     }
 
     #[test]
@@ -210,20 +235,28 @@ mod tests {
         let base = pane(1, 0, 0, 50, 20);
         assert_eq!(
             inventory
-                .neighbor(base, NeighborDirection::Right)
+                .neighbor(base, NeighborDirection::Right, |_| true)
                 .expect("right")
                 .id,
             2
         );
         assert_eq!(
             inventory
-                .neighbor(base, NeighborDirection::Down)
+                .neighbor(base, NeighborDirection::Down, |_| true)
                 .expect("down")
                 .id,
             3
         );
-        assert!(inventory.neighbor(base, NeighborDirection::Left).is_none());
-        assert!(inventory.neighbor(base, NeighborDirection::Up).is_none());
+        assert!(
+            inventory
+                .neighbor(base, NeighborDirection::Left, |_| true)
+                .is_none()
+        );
+        assert!(
+            inventory
+                .neighbor(base, NeighborDirection::Up, |_| true)
+                .is_none()
+        );
     }
 
     #[test]
@@ -245,7 +278,7 @@ mod tests {
         )]));
         assert!(
             with_overlap
-                .neighbor(pane(1, 0, 0, 50, 20), NeighborDirection::Right)
+                .neighbor(pane(1, 0, 0, 50, 20), NeighborDirection::Right, |_| true)
                 .is_none()
         );
     }
