@@ -333,13 +333,10 @@ pub fn candidate_to_raw(
     }
 }
 
-fn bounded(message: String) -> String {
+fn bounded(mut message: String) -> String {
     const LIMIT: usize = 1024;
-    if message.len() > LIMIT {
-        message[..LIMIT].to_owned()
-    } else {
-        message
-    }
+    muxe_protocol::truncate_utf8(&mut message, LIMIT);
+    message
 }
 
 #[cfg(test)]
@@ -393,6 +390,11 @@ mod tests {
         let error = candidate_to_raw("native.herdr.pane:resize", &[], false)
             .expect_err("herdr type is not zellij");
         assert!(matches!(error, ParseError::NotZellij { .. }));
+    }
+
+    #[test]
+    fn bounded_diagnostic_preserves_utf8_boundaries() {
+        assert_eq!(bounded(format!("{}é", "x".repeat(1023))), "x".repeat(1023));
     }
 
     #[test]

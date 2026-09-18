@@ -19,41 +19,43 @@ impl Color {
         let value = value
             .strip_prefix('#')
             .ok_or_else(|| ThemePairError::new("color must begin with `#`"))?;
-        let expand = |character: char| -> Result<u8, ThemePairError> {
-            let digit = character
-                .to_digit(16)
-                .ok_or_else(|| ThemePairError::new("color contains a non-hex digit"))?;
-            u8::try_from(digit)
-                .map_err(|_| ThemePairError::new("color contains a non-hex digit"))
-                .map(|digit| digit * 17)
+        match value.len() {
+            3 | 6 => {}
+            _ => return Err(ThemePairError::new("color must use `#rgb` or `#rrggbb`")),
+        }
+        if !value.is_ascii() {
+            return Err(ThemePairError::new("color contains a non-hex digit"));
+        }
+        if let Some(index) = value.bytes().position(|byte| !byte.is_ascii_hexdigit()) {
+            let message = match value.len() {
+                3 => "color contains a non-hex digit",
+                6 if index < 2 => "invalid red channel",
+                6 if index < 4 => "invalid green channel",
+                6 => "invalid blue channel",
+                _ => unreachable!("validated color length"),
+            };
+            return Err(ThemePairError::new(message));
+        }
+
+        let value = value.as_bytes();
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => unreachable!("validated hexadecimal byte"),
         };
         match value.len() {
-            3 => {
-                let mut chars = value.chars();
-                let red = chars
-                    .next()
-                    .ok_or_else(|| ThemePairError::new("color must use `#rgb` or `#rrggbb`"))?;
-                let green = chars
-                    .next()
-                    .ok_or_else(|| ThemePairError::new("color must use `#rgb` or `#rrggbb`"))?;
-                let blue = chars
-                    .next()
-                    .ok_or_else(|| ThemePairError::new("color must use `#rgb` or `#rrggbb`"))?;
-                Ok(Self::Rgb {
-                    red: expand(red)?,
-                    green: expand(green)?,
-                    blue: expand(blue)?,
-                })
-            }
-            6 => Ok(Self::Rgb {
-                red: u8::from_str_radix(&value[0..2], 16)
-                    .map_err(|_| ThemePairError::new("invalid red channel"))?,
-                green: u8::from_str_radix(&value[2..4], 16)
-                    .map_err(|_| ThemePairError::new("invalid green channel"))?,
-                blue: u8::from_str_radix(&value[4..6], 16)
-                    .map_err(|_| ThemePairError::new("invalid blue channel"))?,
+            3 => Ok(Self::Rgb {
+                red: digit(value[0]) * 17,
+                green: digit(value[1]) * 17,
+                blue: digit(value[2]) * 17,
             }),
-            _ => Err(ThemePairError::new("color must use `#rgb` or `#rrggbb`")),
+            6 => Ok(Self::Rgb {
+                red: digit(value[0]) * 16 + digit(value[1]),
+                green: digit(value[2]) * 16 + digit(value[3]),
+                blue: digit(value[4]) * 16 + digit(value[5]),
+            }),
+            _ => unreachable!("validated color length"),
         }
     }
 }
@@ -419,6 +421,24 @@ mod tests {
                 green: 34,
                 blue: 51
             }
+        );
+    }
+
+    #[test]
+    fn color_parse_rejects_non_ascii_and_non_hex_input() {
+        assert!(Color::parse("#aéaaa").is_err());
+        assert!(Color::parse("#12g").is_err());
+        assert_eq!(
+            Color::parse("#g00000").unwrap_err().to_string(),
+            "invalid red channel"
+        );
+        assert_eq!(
+            Color::parse("#00g000").unwrap_err().to_string(),
+            "invalid green channel"
+        );
+        assert_eq!(
+            Color::parse("#0000g0").unwrap_err().to_string(),
+            "invalid blue channel"
         );
     }
 

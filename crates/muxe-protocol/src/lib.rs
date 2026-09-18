@@ -8,6 +8,7 @@
 pub mod bridge;
 pub mod control;
 pub mod frame;
+pub mod text;
 pub mod wire;
 pub use bridge::{
     BridgeCaptureEndReason, BridgeCaptureLostReason, BridgeEvent, BridgeEventEnvelope,
@@ -24,4 +25,5 @@ pub use frame::{
     ArchivedFrame, ConnectionDecoder, ConnectionPolicy, DecodeError, EncodedFrame, PRELUDE_LEN,
     Prelude, encode_frame,
 };
+pub use text::truncate_utf8;
 pub use wire::*;

@@ -235,9 +235,7 @@ impl CommandOutcome {
     /// Failed host dispatch with a bounded message.
     pub fn failed(detail: impl Into<String>) -> Self {
         let mut text = detail.into();
-        if text.len() > MAX_DETAIL_LEN {
-            text.truncate(MAX_DETAIL_LEN);
-        }
+        muxe_protocol::truncate_utf8(&mut text, MAX_DETAIL_LEN);
         Self {
             status: CommandStatus::Failed,
             detail: text,
@@ -320,9 +318,7 @@ pub enum PipeError {
 
 fn bounded_reason(message: impl Into<String>) -> String {
     let mut text = message.into();
-    if text.len() > MAX_DETAIL_LEN {
-        text.truncate(MAX_DETAIL_LEN);
-    }
+    muxe_protocol::truncate_utf8(&mut text, MAX_DETAIL_LEN);
     text
 }
 
@@ -725,11 +721,32 @@ mod tests {
     }
 
     #[test]
-    fn outcome_detail_is_bounded() {
-        let outcome = CommandOutcome::failed("e".repeat(MAX_DETAIL_LEN + 100));
-        assert_eq!(outcome.detail.len(), MAX_DETAIL_LEN);
+    fn outcome_detail_truncates_multibyte_text_at_the_4096_byte_boundary() {
+        let outcome = CommandOutcome::failed(format!("{}é", "e".repeat(MAX_DETAIL_LEN - 1)));
+        assert_eq!(outcome.detail, "e".repeat(MAX_DETAIL_LEN - 1));
         assert_eq!(outcome.status, CommandStatus::Failed);
         assert_eq!(CommandOutcome::succeeded().status, CommandStatus::Succeeded);
+    }
+
+    #[test]
+    fn unicode_request_decode_error_is_bounded_without_panicking() {
+        let request = PipeRequest {
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            request_id: RequestId::INITIAL,
+            registration: registration(7),
+            channel_generation: ChannelGeneration::INITIAL,
+            target: sample_target(),
+            payload: BridgeRequest::Retire,
+        };
+        let line = serde_json::to_string(&request).expect("request serializes");
+        let malformed = line.replacen("Retire", &"é".repeat(MAX_DETAIL_LEN), 1);
+
+        assert!(malformed.len() < MAX_PIPE_LINE_LEN);
+        let error = decode_request_line(&malformed).expect_err("unknown Unicode variant");
+        let PipeError::InvalidFrame { reason } = error else {
+            panic!("unexpected error type");
+        };
+        assert!(reason.len() <= MAX_DETAIL_LEN);
     }
 
     #[test]

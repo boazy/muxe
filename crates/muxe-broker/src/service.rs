@@ -1716,16 +1716,8 @@ async fn write_message(
 }
 
 fn error_diagnostic(error: &BrokerError) -> muxe_protocol::ProtocolDiagnostic {
-    let message = error.to_string();
-    let message = if message.len() <= muxe_protocol::MAX_DIAGNOSTIC_LEN {
-        message
-    } else {
-        let mut end = muxe_protocol::MAX_DIAGNOSTIC_LEN;
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        message[..end].to_owned()
-    };
+    let mut message = error.to_string();
+    muxe_protocol::truncate_utf8(&mut message, muxe_protocol::MAX_DIAGNOSTIC_LEN);
     muxe_protocol::ProtocolDiagnostic {
         code: match error {
             BrokerError::ActivationInProgress => {

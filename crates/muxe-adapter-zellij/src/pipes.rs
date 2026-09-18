@@ -638,13 +638,10 @@ impl PipeChannel for SubprocessChannel {
     }
 }
 
-fn bounded(reason: String) -> String {
+fn bounded(mut reason: String) -> String {
     const LIMIT: usize = 512;
-    if reason.len() > LIMIT {
-        reason[..LIMIT].to_owned()
-    } else {
-        reason
-    }
+    muxe_protocol::truncate_utf8(&mut reason, LIMIT);
+    reason
 }
 
 /// Deterministic in-memory channels for the adapter-contract suite and unit tests.
@@ -850,6 +847,11 @@ mod tests {
         let (request, event) = channel_names("work");
         assert_eq!(request, "muxe-request-work");
         assert_eq!(event, "muxe-event-work");
+    }
+
+    #[test]
+    fn bounded_transport_diagnostic_preserves_utf8_boundaries() {
+        assert_eq!(bounded(format!("{}é", "x".repeat(511))), "x".repeat(511));
     }
 
     fn write_fake_zellij(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {

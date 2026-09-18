@@ -1944,15 +1944,8 @@ fn adapter_session(session: &UiSessionId) -> muxe_adapter_api::UiSessionId {
 }
 
 fn diagnostic(code: DiagnosticCode, message: &str) -> ProtocolDiagnostic {
-    let message = if message.len() <= muxe_protocol::MAX_DIAGNOSTIC_LEN {
-        message.to_owned()
-    } else {
-        let mut end = muxe_protocol::MAX_DIAGNOSTIC_LEN;
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        message[..end].to_owned()
-    };
+    let mut message = message.to_owned();
+    muxe_protocol::truncate_utf8(&mut message, muxe_protocol::MAX_DIAGNOSTIC_LEN);
     ProtocolDiagnostic { code, message }
 }
 
