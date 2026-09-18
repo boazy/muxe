@@ -236,14 +236,14 @@ fn dangling_bridge_warnings(config_dir: &Path) -> Result<Vec<String>, PurgeError
     };
     let mut warnings = Vec::new();
     for record in receipt.configs {
-        if record.config_path.starts_with(config_dir)
-            || !receipt_listed_node_exists(&record.config_path, record.node)?
+        if record.config_path.is_within(config_dir)
+            || !receipt_listed_node_exists(record.config_path.as_path(), record.node)?
         {
             continue;
         }
         warnings.push(format!(
             "Zellij configuration {} still contains receipt-listed {}; remove that node manually because purge never edits host configuration",
-            record.config_path.display(),
+            record.config_path,
             record.node.as_str(),
         ));
     }
@@ -314,6 +314,7 @@ mod tests {
     use crate::integration::receipt::{
         BridgeRecord, Disposition, NodeRecord, RECEIPT_SCHEMA_VERSION, Receipt, Sha256Digest, store,
     };
+    use crate::paths::ConfigPath;
     fn secure_test_root(path: &Path) {
         let root = path.parent().expect("test path has TempDir parent");
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))
@@ -581,7 +582,7 @@ mod tests {
                 bridge_compat: None,
             },
             configs: vec![NodeRecord {
-                config_path: zellij_config.to_path_buf(),
+                config_path: ConfigPath::from_input(zellij_config).unwrap(),
                 node: if fs::read_to_string(zellij_config)
                     .unwrap()
                     .contains("load_plugins")

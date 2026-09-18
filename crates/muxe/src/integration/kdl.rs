@@ -23,6 +23,8 @@ use kdl::{KdlDocument, KdlNode};
 use thiserror::Error;
 
 use super::receipt::{Disposition, ManagedNode, NodeRecord, Sha256Digest};
+use crate::paths::ConfigPath;
+
 use crate::fsutil::{self, FsError};
 
 /// Top-level Zellij node holding the plugin alias.
@@ -969,10 +971,10 @@ impl ConfigApplied {
     /// what later verification reads back. Dispositions come from the applied
     /// plan (already-correct nodes map to `Observed`, never claimed).
     #[must_use]
-    pub fn node_records(&self, config_path: &Path) -> Vec<NodeRecord> {
-        let snapshots = fs::read_to_string(config_path)
+    pub fn node_records(&self, config_path: &ConfigPath) -> Vec<NodeRecord> {
+        let snapshots = fs::read_to_string(config_path.as_path())
             .ok()
-            .and_then(|text| snapshot_nodes(config_path, &text).ok())
+            .and_then(|text| snapshot_nodes(config_path.as_path(), &text).ok())
             .unwrap_or_default();
         let record = |node: ManagedNode,
                       disposition: Disposition,
@@ -980,7 +982,7 @@ impl ConfigApplied {
          -> Option<NodeRecord> {
             let (text, semantic) = snapshots.get(&node)?;
             Some(NodeRecord {
-                config_path: config_path.to_path_buf(),
+                config_path: config_path.clone(),
                 node,
                 disposition,
                 semantic: semantic.clone(),
@@ -1017,11 +1019,11 @@ impl ConfigApplied {
 /// Already-correct nodes map to `Observed`: the installer never claims a
 /// pre-existing correct node.
 #[must_use]
-pub fn plan_records(config_path: &Path, nodes: &[NodePlan]) -> Vec<NodeRecord> {
+pub fn plan_records(config_path: &ConfigPath, nodes: &[NodePlan]) -> Vec<NodeRecord> {
     nodes
         .iter()
         .map(|plan| NodeRecord {
-            config_path: config_path.to_path_buf(),
+            config_path: config_path.clone(),
             node: plan.node,
             disposition: plan.disposition,
             semantic: plan.semantic.clone(),

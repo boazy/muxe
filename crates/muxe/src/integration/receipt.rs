@@ -17,6 +17,8 @@ use thiserror::Error;
 use super::{BRIDGE_FILE_NAME, kdl};
 use crate::fsutil::{self, FsError};
 
+use crate::paths::ConfigPath;
+
 /// Current receipt schema version.
 pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
 /// Receipt file name inside the integration directory.
@@ -130,7 +132,7 @@ pub struct BridgeRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeRecord {
     /// Which Zellij configuration file holds the node.
-    pub config_path: PathBuf,
+    pub config_path: ConfigPath,
     /// Which managed node this record covers.
     pub node: ManagedNode,
     /// How the installer treated the node.
@@ -207,25 +209,11 @@ impl Receipt {
 
         let mut records = HashSet::new();
         for record in &self.configs {
-            let normalized =
-                crate::paths::normalize_config_path(&record.config_path).map_err(|error| {
-                    format!(
-                        "configuration ownership path {} is unsafe: {error}",
-                        record.config_path.display()
-                    )
-                })?;
-            if normalized != record.config_path {
-                return Err(format!(
-                    "configuration ownership path {} is not the normalized receipt path {}",
-                    record.config_path.display(),
-                    normalized.display()
-                ));
-            }
             if !records.insert((&record.config_path, record.node)) {
                 return Err(format!(
                     "duplicate ownership record for {} in {}",
                     record.node.as_str(),
-                    record.config_path.display()
+                    record.config_path
                 ));
             }
             match (
@@ -296,7 +284,7 @@ struct RawBridgeRecord {
 
 #[derive(Deserialize)]
 struct RawNodeRecord {
-    config_path: PathBuf,
+    config_path: ConfigPath,
     node: ManagedNode,
     disposition: Disposition,
     semantic: String,
@@ -427,7 +415,7 @@ mod tests {
                 bridge_compat: None,
             },
             configs: vec![NodeRecord {
-                config_path: PathBuf::from("/cfg/config.kdl"),
+                config_path: ConfigPath::from_input(Path::new("/cfg/config.kdl")).unwrap(),
                 node: ManagedNode::PluginsAlias,
                 disposition: Disposition::Created,
                 semantic: "muxe".to_owned(),
@@ -463,6 +451,47 @@ mod tests {
         assert_eq!(load(temp.path()).unwrap(), None);
     }
 
+    #[test]
+    fn round_trip_preserves_raw_configuration_spelling() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let dir = temp.path().join("zellij");
+        let mut receipt = sample_receipt(&dir);
+        receipt.configs[0].config_path =
+            ConfigPath::from_input(Path::new("/cfg//config.kdl/")).unwrap();
+
+        store(&dir, &receipt).unwrap();
+        let loaded = load(&dir).unwrap().unwrap();
+
+        let json = fs::read_to_string(dir.join(RECEIPT_FILE_NAME)).unwrap();
+        assert!(json.contains("\"config_path\": \"/cfg//config.kdl/\""));
+        assert_eq!(
+            serde_json::to_string(&loaded.configs[0].config_path).unwrap(),
+            r#""/cfg//config.kdl/""#
+        );
+    }
+
+    #[test]
+    fn duplicate_validation_keeps_distinct_raw_configuration_spellings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let dir = temp.path().join("zellij");
+        let mut receipt = sample_receipt(&dir);
+        let mut distinct = receipt.configs[0].clone();
+        distinct.config_path = ConfigPath::from_input(Path::new("/cfg//config.kdl")).unwrap();
+        receipt.configs.push(distinct);
+
+        store(&dir, &receipt).unwrap();
+        assert_eq!(load(&dir).unwrap().unwrap().configs.len(), 2);
+    }
     #[test]
     fn corrupt_receipt_fails_closed() {
         let temp = tempfile::TempDir::new().unwrap();
