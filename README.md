@@ -324,7 +324,7 @@ If the menu does not open when pressing your hotkey:
 
 - **Check PATH**: Verify that the multiplexer process inherits a `PATH` containing `muxe`. Run `command -v muxe` from a pane inside your multiplexer session.
 - **Test direct execution**: Run `muxe ui menu main` (in Zellij) or `muxe menu open main` (in Herdr) directly from a shell prompt to observe immediate error output.
-- **Inspect logs**: Check persistent logs at `$CACHE_DIR/logs/muxe.jsonl` (default: `~/.cache/muxe/logs/muxe.jsonl`). Herdr notifications are best-effort; the log file is authoritative.
+- **Inspect logs**: Check persistent logs at `$CACHE_DIR/logs/muxe.jsonl` (default: `~/.cache/muxe/logs/muxe.jsonl`). Native command failures add a payload-free event; stderr retains the complete diagnostic. Herdr notifications are best-effort; the log file is authoritative.
 - **Zellij permissions**: In Zellij, confirm that you accepted the host-owned permission prompt displayed when the bridge plugin loaded.
 
 ## Upgrades, activation, and rollback

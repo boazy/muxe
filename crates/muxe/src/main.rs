@@ -33,10 +33,117 @@ use muxe::cli::{
     UiSubcommand,
 };
 
+#[derive(Clone, Copy)]
+enum NativeCommandOperation {
+    Init,
+    ConfigCheck,
+    Compatibility,
+    Purge,
+    MenuOpen,
+    MenuDump,
+    PaneOpen,
+    UiMenu,
+    IntegrationInstall,
+    IntegrationUninstall,
+    Activate,
+    BrokerRetire,
+}
+
+impl NativeCommandOperation {
+    const fn from_command(command: &Command) -> Option<Self> {
+        match command {
+            Command::Init => Some(Self::Init),
+            Command::Config(_) => Some(Self::ConfigCheck),
+            Command::Compatibility(_) => Some(Self::Compatibility),
+            Command::Purge(_) => Some(Self::Purge),
+            Command::Menu(menu) => match menu.command {
+                MenuSubcommand::Open(_) => Some(Self::MenuOpen),
+                MenuSubcommand::Dump(_) => Some(Self::MenuDump),
+            },
+            Command::Pane(_) => Some(Self::PaneOpen),
+            Command::Ui(_) => Some(Self::UiMenu),
+            Command::Integration(integration) => match integration.command {
+                IntegrationSubcommand::Install(_) => Some(Self::IntegrationInstall),
+                IntegrationSubcommand::Uninstall(_) => Some(Self::IntegrationUninstall),
+            },
+            Command::Activate(_) => Some(Self::Activate),
+            Command::Broker(broker) => match broker.command {
+                muxe::cli::BrokerSubcommand::Retire(_) => Some(Self::BrokerRetire),
+                // Broker services already append their own lifecycle records.
+                muxe::cli::BrokerSubcommand::ServeHerdr(_)
+                | muxe::cli::BrokerSubcommand::ServeZellij(_) => None,
+            },
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::ConfigCheck => "config-check",
+            Self::Compatibility => "compatibility",
+            Self::Purge => "purge",
+            Self::MenuOpen => "menu-open",
+            Self::MenuDump => "menu-dump",
+            Self::PaneOpen => "pane-open",
+            Self::UiMenu => "ui-menu",
+            Self::IntegrationInstall => "integration-install",
+            Self::IntegrationUninstall => "integration-uninstall",
+            Self::Activate => "activate",
+            Self::BrokerRetire => "broker-retire",
+        }
+    }
+}
+
+/// Records one payload-safe failure event without replacing the command's
+/// stderr diagnostics. Broker services keep their existing lifecycle records.
+fn record_command_failure(
+    operation: NativeCommandOperation,
+    error: color_eyre::Report,
+) -> Result<()> {
+    let paths = match muxe::paths::resolve() {
+        Ok(paths) => paths,
+        Err(log_error) => {
+            return Err(error.wrap_err(format!(
+                "could not resolve the cache directory to record the native command failure: {log_error}"
+            )));
+        }
+    };
+    let logger = match muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION")) {
+        Ok(logger) => logger,
+        Err(log_error) => {
+            return Err(error.wrap_err(format!(
+                "could not open the native command failure audit log: {log_error}"
+            )));
+        }
+    };
+    let event = muxe::logging::LogEvent::new(
+        env!("CARGO_PKG_VERSION"),
+        "local",
+        operation.as_str(),
+        "native command failed; inspect stderr for diagnostics",
+    )
+    .expect("fixed native command failure event fits the log message bound")
+    .with_code("command-failed");
+    if let Err(log_error) = logger.append(&event) {
+        return Err(error.wrap_err(format!(
+            "could not persist the native command failure audit record: {log_error}"
+        )));
+    }
+    Err(error)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    Box::pin(dispatch(Cli::parse())).await
+    let cli = Cli::parse();
+    let operation = NativeCommandOperation::from_command(&cli.command);
+    match dispatch(cli).await {
+        Ok(()) => Ok(()),
+        Err(error) => match operation {
+            Some(operation) => record_command_failure(operation, error),
+            None => Err(error),
+        },
+    }
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
@@ -1695,7 +1802,7 @@ async fn open_pane(open: &PaneOpen) -> Result<()> {
     let host = match selected_host(open.placement.host) {
         Ok(host) => host,
         Err(error) => {
-            report_launcher_failure(&logger, None, "pane-open", &error.to_string()).await;
+            notify_launcher_failure(None, "pane-open", &error.to_string()).await;
             return Err(error);
         }
     };
@@ -1708,10 +1815,6 @@ async fn open_pane(open: &PaneOpen) -> Result<()> {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "launcher transaction: runtime connect, origin precedence, pane open, and failure reporting form one ordered DES1993 precedence chain; splitting would scatter the saved-over-managed-over-absent ordering"
-)]
 async fn herdr_open_pane(
     logger: &muxe::logging::Logger,
     cache_dir: &Path,
@@ -1728,20 +1831,14 @@ async fn herdr_open_pane(
             let error = color_eyre::eyre::eyre!(
                 "could not establish the exact configured Herdr runtime: {error}"
             );
-            report_launcher_failure(logger, None, "pane-open", &error.to_string()).await;
+            notify_launcher_failure(None, "pane-open", &error.to_string()).await;
             return Err(error);
         }
     };
     let origin = match launcher_origin(&runtime).await {
         Ok(origin) => origin,
         Err(error) => {
-            report_launcher_failure(
-                logger,
-                Some(runtime.client()),
-                "pane-open",
-                &error.to_string(),
-            )
-            .await;
+            notify_launcher_failure(Some(runtime.client()), "pane-open", &error.to_string()).await;
             return Err(error);
         }
     };
@@ -1754,8 +1851,7 @@ async fn herdr_open_pane(
                     let error = color_eyre::eyre::eyre!(
                         "the explicit Herdr parent pane is not a valid live destination: {error}"
                     );
-                    report_launcher_failure(
-                        logger,
+                    notify_launcher_failure(
                         Some(runtime.client()),
                         "pane-open",
                         &error.to_string(),
@@ -1779,13 +1875,7 @@ async fn herdr_open_pane(
         .collect::<Result<Vec<_>>>() {
         Ok(argv) => argv,
         Err(error) => {
-            report_launcher_failure(
-                logger,
-                Some(runtime.client()),
-                "pane-open",
-                &error.to_string(),
-            )
-            .await;
+            notify_launcher_failure(Some(runtime.client()), "pane-open", &error.to_string()).await;
             return Err(error);
         }
     };
@@ -1808,13 +1898,7 @@ async fn herdr_open_pane(
     let launch = match command_pane_launch(open, origin, destination) {
         Ok(launch) => launch,
         Err(error) => {
-            report_launcher_failure(
-                logger,
-                Some(runtime.client()),
-                "pane-open",
-                &error.to_string(),
-            )
-            .await;
+            notify_launcher_failure(Some(runtime.client()), "pane-open", &error.to_string()).await;
             return Err(error);
         }
     };
@@ -1834,13 +1918,7 @@ async fn herdr_open_pane(
         Err(error) => {
             let error =
                 color_eyre::eyre::eyre!("could not open the requested Herdr command pane: {error}");
-            report_launcher_failure(
-                logger,
-                Some(runtime.client()),
-                "pane-open",
-                &error.to_string(),
-            )
-            .await;
+            notify_launcher_failure(Some(runtime.client()), "pane-open", &error.to_string()).await;
             Err(error)
         }
     }
@@ -2002,13 +2080,7 @@ async fn herdr_open_ui_pane(
                     muxe_protocol::AbortUiLaunch { token },
                 ))
                 .await;
-            report_launcher_failure(
-                logger,
-                Some(runtime.client()),
-                "menu-open",
-                &error.to_string(),
-            )
-            .await;
+            notify_launcher_failure(Some(runtime.client()), "menu-open", &error.to_string()).await;
             Err(error)
         }
     }
@@ -2141,14 +2213,6 @@ fn zellij_open_pane(logger: &muxe::logging::Logger, open: &PaneOpen) -> Result<(
                 detail.chars().take(512).collect::<String>()
             )
         };
-        if let Ok(event) = muxe::logging::LogEvent::new(
-            env!("CARGO_PKG_VERSION"),
-            "zellij",
-            "pane-open",
-            error.to_string().chars().take(512).collect::<String>(),
-        ) {
-            let _ = logger.append(&event);
-        }
         return Err(error);
     }
     let pane = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -2309,46 +2373,21 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
     Ok(())
 }
 
-/// Records a launcher failure to the persistent audit log and makes a best-effort
-/// Herdr notification. The log remains authoritative: notification failure never
-/// replaces or hides the original error, which the caller still returns.
-async fn report_launcher_failure(
-    logger: &muxe::logging::Logger,
+/// Makes a best-effort Herdr notification after a launcher failure. Persistent
+/// logging occurs at the CLI composition root, so notification failure never
+/// replaces or hides the original error returned by the caller.
+async fn notify_launcher_failure(
     client: Option<&muxe_adapter_herdr::HerdrSocketClient>,
     operation: &str,
     message: &str,
 ) {
-    let message = bounded_log_message(message);
-    if let Ok(event) = muxe::logging::LogEvent::new(
-        env!("CARGO_PKG_VERSION"),
-        "herdr",
-        operation,
-        message.clone(),
-    ) {
-        let _ = logger.append(&event);
-    }
     if let Some(client) = client {
         best_effort_notify(client, &format!("{operation} failed: {message}")).await;
     }
 }
 
-/// Truncates to the audit bound on a char boundary. Callers pass only semantic
-/// diagnostics here, never resolved argv, environment values, terminal input,
-/// configuration scalars, or native payloads.
-fn bounded_log_message(message: &str) -> String {
-    const MAX: usize = muxe::logging::MAX_MESSAGE_LEN;
-    if message.len() <= MAX {
-        return message.to_owned();
-    }
-    let mut end = MAX;
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    message[..end].to_owned()
-}
-
-/// Best-effort `notification.show` capped at Herdr's 240-character limit. Every
-/// failure is swallowed: the persistent log above is authoritative.
+/// Best-effort `notification.show` capped at Herdr's 240-character limit. The
+/// caller's persistent audit event remains authoritative.
 async fn best_effort_notify(client: &muxe_adapter_herdr::HerdrSocketClient, text: &str) {
     let body: String = text.chars().take(240).collect();
     let Some(metadata) = muxe_adapter_herdr::generated::method_metadata("notification.show") else {
@@ -3168,17 +3207,8 @@ mod launcher_tests {
     }
 
     #[tokio::test]
-    async fn launcher_failure_is_logged_and_notified_before_ui_creation() {
+    async fn launcher_failure_is_notified_before_ui_creation() {
         let directory = tempfile::tempdir().expect("owned launcher failure directory");
-        let cache_dir = directory.path().join("cache");
-        std::fs::create_dir_all(&cache_dir).expect("owned cache directory exists");
-        std::fs::set_permissions(
-            &cache_dir,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .expect("owned cache directory is owner-only");
-        let logger = muxe::logging::Logger::open(&cache_dir, env!("CARGO_PKG_VERSION"))
-            .expect("owned audit log opens");
         // The snapshot knows only paneB; the inherited ACTIVE tuple names paneA.
         let snapshot = serde_json::json!({
             "focused_workspace_id": "w1",
@@ -3212,15 +3242,7 @@ mod launcher_tests {
             .await
             .expect_err("absent ACTIVE pane fails before UI creation");
         assert!(error.to_string().contains("not live"));
-        report_launcher_failure(&logger, Some(&client), "pane-open", &error.to_string()).await;
-        let log = std::fs::read_to_string(cache_dir.join("logs").join("muxe.jsonl"))
-            .expect("audit log written before exit");
-        let record: serde_json::Value = serde_json::from_str(log.trim()).expect("audit log parses");
-        assert_eq!(record["operation"], "pane-open");
-        assert_eq!(record["host"], "herdr");
-        let message = record["message"].as_str().expect("audit message recorded");
-        assert!(message.contains("not live"));
-        assert!(message.len() <= muxe::logging::MAX_MESSAGE_LEN);
+        notify_launcher_failure(Some(&client), "pane-open", &error.to_string()).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if seen.lock().expect("method log is readable").len() >= 2 {
