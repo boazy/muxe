@@ -2779,7 +2779,7 @@ fn validate_fields(value: &ConfigValue, allowed: &[&str]) -> Result<(), Vec<Conf
     let fields = mapping_fields(value, "expected a mapping")?;
     let mut errors = Vec::new();
     for field in fields {
-        if !allowed.contains(&field.name.as_str()) && !field.name.starts_with('_') {
+        if !allowed.contains(&field.name.as_str()) {
             let suggestion = nearest(&field.name, allowed);
             let diagnostic = ConfigDiagnostic::error(
                 DiagnosticCode::UnknownField,

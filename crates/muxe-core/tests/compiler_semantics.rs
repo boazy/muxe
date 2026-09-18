@@ -379,6 +379,38 @@ menus:
 }
 
 #[test]
+fn unknown_underscore_fields_report_source_aware_errors_after_merge() {
+    let host = r#"
+menus:
+  main:
+    settings:
+      _typo: true
+"#;
+    let diagnostics = compile(
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      r: { label: reload, action: config:reload }
+",
+        Some(host),
+        KeyCapabilities::default(),
+    )
+    .expect_err("unknown underscore-prefixed fields must be rejected");
+
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == DiagnosticCode::UnknownField)
+        .expect("unknown underscore-prefixed field diagnostic");
+    let span = &diagnostic.labels[0].span;
+    assert_eq!(span.source.as_str(), "host.yml");
+    let start = host.find("_typo").expect("typo key in host source");
+    assert_eq!(span.start, start);
+    assert_eq!(span.end, start + "_typo".len());
+}
+
+#[test]
 fn compact_actions_preserve_quotes_empty_values_equals_and_yaml_core_scalars() {
     let config = compile(
         r#"
