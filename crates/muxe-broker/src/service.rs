@@ -2027,7 +2027,7 @@ mod tests {
         OriginContext, OriginHostKind, OriginInvocationSource, PaneId, ServerId, SourceId,
     };
     use muxe_protocol::{
-        AttachUi, BrokerResponse, ClientRequest, ControlRequest, HostKind, HostPaneId,
+        AttachUi, BrokerEvent, BrokerResponse, ClientRequest, ControlRequest, HostKind, HostPaneId,
         InvocationDisposition, LiveServerIdentity, PeerRole, Prelude, SchemaFingerprint,
         ServerId as WireServerId,
     };
@@ -4732,6 +4732,18 @@ menus:
             result => panic!("retire must succeed, got {result:?}"),
         };
         assert_eq!(retired.lifecycle, LifecycleState::Retired);
+
+        // The ready UI observes retirement before the connection closes: the drain
+        // emits `BrokerRetiring` to every live session before tearing it down, and
+        // the connection close remains the backstop if the outbox is full.
+        let event = tokio::time::timeout(Duration::from_secs(5), ui_client.next_event())
+            .await
+            .expect("retire emits a UI event within bound")
+            .expect("ready UI receives the retirement event");
+        assert!(
+            matches!(event, BrokerEvent::BrokerRetiring),
+            "the ready UI observes BrokerRetiring before the connection closes"
+        );
 
         // The endpoint is unlinked while the child keeps running under GenericSupervisor.
         tokio::time::timeout(Duration::from_secs(5), async {

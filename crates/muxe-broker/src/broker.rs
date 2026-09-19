@@ -59,8 +59,6 @@ pub struct Broker {
     next_execution: AtomicU64,
     next_event: Arc<AtomicU64>,
     #[cfg(test)]
-    spawn_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
-    #[cfg(test)]
     cleanup_enqueue_hook: StdMutex<Option<Arc<CleanupEnqueueHook>>>,
     #[cfg(test)]
     commit_ui_launch_hook: StdMutex<Option<Arc<WaitHook>>>,
@@ -564,8 +562,6 @@ impl Broker {
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),
             #[cfg(test)]
-            spawn_wait_hook: StdMutex::new(None),
-            #[cfg(test)]
             cleanup_enqueue_hook: StdMutex::new(None),
             #[cfg(test)]
             commit_ui_launch_hook: StdMutex::new(None),
@@ -599,8 +595,6 @@ impl Broker {
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),
             #[cfg(test)]
-            spawn_wait_hook: StdMutex::new(None),
-            #[cfg(test)]
             cleanup_enqueue_hook: StdMutex::new(None),
             #[cfg(test)]
             commit_ui_launch_hook: StdMutex::new(None),
@@ -623,13 +617,6 @@ impl Broker {
         self.config.snapshot().await.config.generation
     }
     #[cfg(test)]
-    pub(crate) fn set_spawn_wait_hook(&self, hook: Option<Arc<WaitHook>>) {
-        *self
-            .spawn_wait_hook
-            .lock()
-            .expect("spawn wait hook is not poisoned") = hook;
-    }
-    #[cfg(test)]
     pub(crate) fn set_cleanup_enqueue_hook(&self, hook: Option<Arc<CleanupEnqueueHook>>) {
         *self
             .cleanup_enqueue_hook
@@ -645,7 +632,9 @@ impl Broker {
     }
 
     /// Closes every menu-owned pending pane and releases every UI capture before an activation
-    /// coordinator drops this broker's listener. Detached generic children remain supervised.
+    /// coordinator drops this broker's listener. Session-owned executions follow the same
+    /// authoritative dismissal transition as quit and disconnect: Detach-policy work keeps its
+    /// supervised child, while Cancel-policy cancellable work is stopped.
     /// Enqueueing is not enough: drain waits, with a bounded deadline, until
     /// the cleanup entries it created are confirmed gone, and returns
     /// `BrokerError::ActivationCleanupUnconfirmed` (reopening admission)
@@ -681,7 +670,7 @@ impl Broker {
             }
             notified.await;
         }
-        let (adapter_executions, generic_executions, deferred) = {
+        let (adapter_executions, deferred) = {
             let mut state = self.state.lock().await;
             let refused = state.executions.values().find_map(|record| {
                 (record.phase == ExecutionPhase::Adapter && !record.cancellable).then(|| {
@@ -704,24 +693,13 @@ impl Broker {
                 .filter(|record| record.phase == ExecutionPhase::Adapter)
                 .map(|record| record.core)
                 .collect::<Vec<_>>();
-            let generic_executions = state
-                .executions
-                .values()
-                .filter(|record| {
-                    (record.phase == ExecutionPhase::Generic
-                        || record.phase == ExecutionPhase::Reserved)
-                        && record.owner == ExecutionOwner::GenericProcess
-                        && record.session.is_some()
-                })
-                .map(|record| record.core)
-                .collect::<Vec<_>>();
             let deferred = state
                 .executions
                 .values()
                 .filter(|record| record.deferred.is_some())
                 .map(|record| record.core)
                 .collect::<Vec<_>>();
-            (adapter_executions, generic_executions, deferred)
+            (adapter_executions, deferred)
         };
         let drained = async {
             for execution in &adapter_executions {
@@ -729,9 +707,6 @@ impl Broker {
             }
             for execution in adapter_executions {
                 self.await_adapter_execution_terminal(execution).await;
-            }
-            for execution in generic_executions {
-                self.request_execution_stop(execution).await?;
             }
             let (pending, pending_sessions) = {
                 let mut state = self.state.lock().await;
@@ -752,6 +727,7 @@ impl Broker {
                 .cloned()
                 .collect::<Vec<_>>();
             for session in sessions {
+                self.emit_broker_retiring(&session).await;
                 self.detach(&session, CaptureReleaseReason::UiDismissed)
                     .await?;
             }
@@ -1497,6 +1473,21 @@ impl Broker {
                     },
                 })
                 .await;
+        }
+    }
+
+    async fn emit_broker_retiring(&self, session: &UiSessionId) {
+        let events = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session).map(|record| record.events.clone())
+        };
+        if let Some(events) = events {
+            // A full UI event queue must never delay retirement teardown; the
+            // connection close remains the backstop, so this notification is best effort.
+            let _ = events.try_send(WireMessage::Event {
+                event_id: self.new_event_id(),
+                event: BrokerEvent::BrokerRetiring,
+            });
         }
     }
 
@@ -2596,18 +2587,6 @@ impl Broker {
             next_event: Arc::clone(&self.next_event),
             diagnostics_tx: self.diagnostics_tx.clone(),
         }));
-        #[cfg(test)]
-        {
-            let hook = self
-                .spawn_wait_hook
-                .lock()
-                .expect("spawn wait hook is not poisoned")
-                .clone();
-            if let Some(hook) = hook {
-                hook.entered.notify_one();
-                hook.release.notified().await;
-            }
-        }
         let sealed_before_activation = self
             .state
             .lock()
@@ -7328,14 +7307,17 @@ menus:
         .expect("generic child is reaped");
     }
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
-    async fn activation_drain_reaps_owned_generic_process_group() {
+    #[tokio::test]
+    async fn activation_drain_detach_policy_keeps_owned_generic_process_group() {
         let directory = tempfile::tempdir().expect("owned generic-process directory");
-        let script = directory.path().join("drain-owned-group.sh");
+        let script = directory.path().join("drain-detach-group.sh");
         let pidfile = directory.path().join("child.pid");
         let fifo = directory.path().join("started");
+        let exit_fifo = directory.path().join("exit_trigger");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
             .expect("owned fifo exists");
+        nix::unistd::mkfifo(&exit_fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("exit fifo exists");
         let startup = tokio::task::spawn_blocking({
             let fifo = fifo.clone();
             move || {
@@ -7353,9 +7335,10 @@ menus:
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nprintf started > '{}'\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nprintf started > '{}'\nread line < '{}'\nexit 0\n",
                 pidfile.display(),
-                fifo.display()
+                fifo.display(),
+                exit_fifo.display()
             ),
         )
         .expect("write owned generic-process script");
@@ -7366,8 +7349,8 @@ version: 1
 menus:
   main:
     bindings:
-      c:
-        label: cancellable command
+      d:
+        label: detach command
         action:
           type: command:execute
           program: /bin/sh
@@ -7377,6 +7360,7 @@ menus:
         settings:
           execution:
             mode: await
+            on-menu-control: detach
 "#,
             script = script.to_string_lossy(),
             cwd = directory.path().to_string_lossy(),
@@ -7399,36 +7383,32 @@ menus:
             })
             .expect("generic binding is visible");
         let broker = Broker::from_compiled(adapter, directory.path().join("config.yml"), config);
-        let hook = Arc::new(WaitHook::new());
-        broker.set_spawn_wait_hook(Some(Arc::clone(&hook)));
-
-        let (session, _events_rx) = attach_ready(&broker, "generic-drain").await;
-        let invoke_task = tokio::spawn({
-            let broker = Arc::clone(&broker);
-            let session = session.clone();
-            let binding_id = BindingId {
-                generation: binding.generation().0,
-                ordinal: binding.ordinal(),
-            };
-            async move {
-                broker
-                    .handle(
-                        PeerRole::Ui,
-                        ClientRequest::InvokeBinding(InvokeBinding {
-                            session,
-                            generation: 1,
-                            binding: binding_id,
-                        }),
-                        mpsc::channel(1).0,
-                    )
-                    .await
-            }
-        });
-
-        // 1. Wait until the generic child is spawned, inserted into GenericSupervisor,
-        // and paused in the hook before activate_execution.
-        hook.entered.notified().await;
-
+        let (session, mut events_rx) = attach_ready(&broker, "generic-drain").await;
+        let response = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                mpsc::channel(1).0,
+            )
+            .await
+            .expect("awaited detach command is accepted");
+        assert!(
+            matches!(
+                response,
+                RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                    disposition: InvocationDisposition::Awaited,
+                    ..
+                })
+            ),
+            "detach-policy invocation stays awaited while the UI is attached"
+        );
         // Startup barrier proves the child process actually started and wrote its PID.
         let _ = startup
             .await
@@ -7444,65 +7424,81 @@ menus:
             nix::sys::signal::kill(child_pid, None).is_ok(),
             "child is alive"
         );
-
-        // 2. Seal activation while paused in this window.
-        let draining = tokio::spawn({
-            let broker = Arc::clone(&broker);
-            async move { broker.drain_for_activation().await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !broker.state.lock().await.activation_sealed {
-                tokio::task::yield_now().await;
+        let core = {
+            let state = broker.state.lock().await;
+            state
+                .awaiting
+                .get(&session)
+                .copied()
+                .expect("awaited generic execution is registered")
+        };
+        // Drain routes session-owned work through the dismissal transition instead
+        // of cancelling it directly.
+        broker
+            .drain_for_activation()
+            .await
+            .expect("activation drain honors the detach dismissal policy");
+        // Drain notifies the UI before teardown, detaches the session, and
+        // retains the Detach-policy child under its existing supervisor.
+        let Some(WireMessage::Event {
+            event: BrokerEvent::BrokerRetiring,
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("drain emits BrokerRetiring to the live UI session before teardown");
+        };
+        assert!(
+            !broker.sessions.lock().await.contains_key(&session),
+            "drain detaches the UI session"
+        );
+        assert!(
+            broker.has_supervised_children().await,
+            "an awaited generic command configured to detach survives the drain supervised"
+        );
+        assert!(
+            nix::sys::signal::kill(child_pid, None).is_ok(),
+            "the detached child is still alive after the drain"
+        );
+        {
+            let state = broker.state.lock().await;
+            let record = state
+                .executions
+                .get(&core)
+                .expect("detached generic owner survives the drain");
+            assert!(
+                record.session.is_none(),
+                "drain clears the session attachment"
+            );
+            assert!(!record.awaiting, "drain clears the awaiting index entry");
+            assert!(
+                !state.awaiting.contains_key(&session),
+                "activation drain leaves no awaiting entry behind"
+            );
+        }
+        // The surviving child still finishes naturally and is reaped.
+        {
+            let mut trigger = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&exit_fifo)
+                .expect("open exit trigger fifo");
+            std::io::Write::write_all(&mut trigger, b"exit\n").expect("write exit trigger");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while broker.has_supervised_children().await {
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .expect("drain seals activation");
-
-        // 3. Now release the spawn hook while sealed.
-        hook.release.notify_one();
-
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(Duration::from_secs(2)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-
-        draining
-            .await
-            .expect("generic drain task joins")
-            .expect("activation drain reaps the owned process group");
-
-        // 4. Invocation must return ActivationInProgress (NOT Accepted), even though drain cancelled/reaped!
-        let invoke_result = invoke_task.await.expect("invoke task joins");
-        assert!(
-            matches!(invoke_result, Err(BrokerError::ActivationInProgress)),
-            "invocation must fail with ActivationInProgress"
-        );
-
-        // 5. Assert owned PID/group no longer exists using retained child/group fixture.
+        .expect("the detached child is reaped after its natural completion");
         assert_eq!(
             nix::sys::signal::kill(child_pid, None),
             Err(nix::errno::Errno::ESRCH),
-            "owned process group must be reaped and no longer exist"
-        );
-        assert!(
-            broker
-                .generic
-                .processes
-                .lock()
-                .expect("generic supervisor registry is not poisoned")
-                .is_empty(),
-            "generic process ownership is cleared only after the reaper completes"
+            "detached child process is reaped and no longer exists"
         );
         assert!(
             broker.state.lock().await.executions.is_empty(),
-            "activation drain leaves no generic execution owner behind"
-        );
-        assert!(
-            broker.state.lock().await.awaiting.is_empty(),
-            "activation drain leaves no awaiting entry behind"
+            "the reaped generic owner is removed from supervision"
         );
         broker.reopen_dispatch().await;
         assert!(
@@ -7512,6 +7508,175 @@ menus:
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn activation_drain_cancel_policy_stops_owned_generic_process_group() {
+        let directory = tempfile::tempdir().expect("owned generic-process directory");
+        let script = directory.path().join("drain-cancel-group.sh");
+        let pidfile = directory.path().join("child.pid");
+        let fifo = directory.path().join("started");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("owned fifo exists");
+        let startup = tokio::task::spawn_blocking({
+            let fifo = fifo.clone();
+            move || {
+                let mut reader = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&fifo)
+                    .map_err(|error| error.to_string())?;
+                let mut started = [0u8; 7];
+                std::io::Read::read_exact(&mut reader, &mut started)
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(started)
+            }
+        });
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nprintf started > '{}'\nwhile :; do sleep 1; done\n",
+                pidfile.display(),
+                fifo.display()
+            ),
+        )
+        .expect("write owned generic-process script");
+        let adapter = counting_adapter(false);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<generic activation-drain cancel regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      c:
+        label: cancel command
+        action: config:reload
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("cancel drain configuration compiles");
+        let broker = Broker::from_compiled(adapter, directory.path().join("config.yml"), config);
+        let (session, mut events_rx) = attach_ready(&broker, "generic-drain-cancel").await;
+        // Cancel-policy work cannot come from `command:execute` YAML: the compiler
+        // rejects `on-menu-control: cancel` for the counting adapter because its
+        // portable validation reports commands as non-cancellable. Build the same
+        // execution record the invoke path would reserve for an awaited,
+        // Cancel-policy cancellable generic child, then supervise a real child for it.
+        let wire = ExecutionId([3; 16]);
+        let core = CoreExecutionId(3);
+        broker
+            .reserve_execution(
+                session.clone(),
+                wire,
+                core,
+                ExecutionOwner::GenericProcess,
+                None,
+                &muxe_core::ExecutionPolicy {
+                    mode: muxe_core::ExecutionMode::Await,
+                    timeout: None,
+                    on_timeout: TimeoutAction::Detach,
+                    on_menu_control: muxe_core::MenuControlAction::Cancel,
+                },
+            )
+            .await
+            .expect("cancel-policy generic execution reserves");
+        let mut origin = CountingAdapter::origin_without_cwd();
+        origin.pane_cwd = Some(directory.path().to_path_buf());
+        let script_arg = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+            script.to_string_lossy().into_owned(),
+        )));
+        broker
+            .execute_command(CommandLaunch {
+                session: session.clone(),
+                wire,
+                core,
+                command: CommandAction {
+                    program: ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+                        "/bin/sh".to_owned(),
+                    ))),
+                    args: vec![script_arg],
+                    cwd: None,
+                    env: std::collections::BTreeMap::default(),
+                },
+                origin,
+                cwd_from_context: false,
+                policy: muxe_core::ExecutionPolicy {
+                    mode: muxe_core::ExecutionMode::Await,
+                    timeout: None,
+                    on_timeout: TimeoutAction::Detach,
+                    on_menu_control: muxe_core::MenuControlAction::Cancel,
+                },
+            })
+            .await
+            .expect("cancel-policy generic child starts");
+        let _ = startup
+            .await
+            .expect("startup task joins")
+            .expect("child signals start");
+        let raw_pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("child publishes its pid")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        let child_pid = nix::unistd::Pid::from_raw(raw_pid);
+        assert!(
+            nix::sys::signal::kill(child_pid, None).is_ok(),
+            "child is alive"
+        );
+        {
+            let state = broker.state.lock().await;
+            assert_eq!(
+                state.awaiting.get(&session),
+                Some(&core),
+                "cancel-policy execution is awaited before the drain"
+            );
+            let record = state
+                .executions
+                .get(&core)
+                .expect("cancel-policy execution is owned");
+            assert_eq!(
+                record.on_menu_control,
+                muxe_core::MenuControlAction::Cancel,
+                "cancel-policy precondition holds before the drain"
+            );
+        }
+        broker
+            .drain_for_activation()
+            .await
+            .expect("activation drain applies the cancel dismissal policy");
+        let Some(WireMessage::Event {
+            event: BrokerEvent::BrokerRetiring,
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("drain emits BrokerRetiring to the live UI session before teardown");
+        };
+        assert!(
+            !broker.sessions.lock().await.contains_key(&session),
+            "drain detaches the UI session"
+        );
+        // The Cancel-policy child is stopped through the dismissal transition and reaped.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while broker.has_supervised_children().await
+                || !broker.state.lock().await.executions.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the cancelled child is reaped after the drain");
+        assert_eq!(
+            nix::sys::signal::kill(child_pid, None),
+            Err(nix::errno::Errno::ESRCH),
+            "cancelled child process is reaped and no longer exists"
+        );
+        broker.reopen_dispatch().await;
+        assert!(
+            !broker.state.lock().await.activation_sealed,
+            "reopening after a completed generic drain restores admission"
+        );
+    }
     #[tokio::test]
     async fn generic_cancellation_escalates_after_its_leader_exits_on_term() {
         let directory = tempfile::tempdir().expect("owned generic-process directory");
