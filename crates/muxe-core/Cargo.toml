@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+muxe-condition = { path = "../muxe-condition" }
 ariadne.workspace = true
 cel.workspace = true
 minijinja.workspace = true

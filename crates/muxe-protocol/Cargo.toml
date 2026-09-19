@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+muxe-condition = { path = "../muxe-condition" }
 rkyv.workspace = true
 serde.workspace = true
 serde_json.workspace = true

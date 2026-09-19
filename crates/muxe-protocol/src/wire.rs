@@ -1,3 +1,4 @@
+use muxe_condition::PagesContext as SharedPagesContext;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use sha2::{Digest, Sha256};
@@ -518,13 +519,39 @@ pub enum ConditionIrWire {
         #[rkyv(omit_bounds)] Box<ConditionIrWire>,
         #[rkyv(omit_bounds)] Box<ConditionIrWire>,
     ),
+    Add(
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+    ),
+    Subtract(
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+    ),
+    Multiply(
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+    ),
+    Divide(
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+    ),
+    Modulo(
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+    ),
+    Negate(#[rkyv(omit_bounds)] Box<ConditionIrWire>),
+    Conditional(
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+        #[rkyv(omit_bounds)] Box<ConditionIrWire>,
+    ),
 }
 
 impl Validate for ConditionIrWire {
     fn validate(&self) -> Result<(), SemanticError> {
         match self {
             Self::Bool(_) | Self::Integer(_) | Self::PagesCount | Self::PagesCurrent => Ok(()),
-            Self::Not(value) => value.validate(),
+            Self::Not(value) | Self::Negate(value) => value.validate(),
             Self::And(left, right)
             | Self::Or(left, right)
             | Self::Equal(left, right)
@@ -532,7 +559,17 @@ impl Validate for ConditionIrWire {
             | Self::Less(left, right)
             | Self::LessEqual(left, right)
             | Self::Greater(left, right)
-            | Self::GreaterEqual(left, right) => {
+            | Self::GreaterEqual(left, right)
+            | Self::Add(left, right)
+            | Self::Subtract(left, right)
+            | Self::Multiply(left, right)
+            | Self::Divide(left, right)
+            | Self::Modulo(left, right) => {
+                left.validate()?;
+                right.validate()
+            }
+            Self::Conditional(condition, left, right) => {
+                condition.validate()?;
                 left.validate()?;
                 right.validate()
             }
@@ -570,51 +607,64 @@ impl Validate for BindingConditionsWire {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
-pub enum ConditionEvaluationErrorWire {
-    #[error("condition expected a boolean value")]
-    ExpectedBoolean,
-    #[error("condition expected an integer value")]
-    ExpectedInteger,
-    #[error("condition result must be boolean")]
-    NonBooleanResult,
-}
+/// Wire-side condition evaluation error. This is the single shared error from `muxe-condition`,
+/// re-exported so the UI contract keeps its existing path.
+pub use muxe_condition::ConditionEvaluationError as ConditionEvaluationErrorWire;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConditionValueWire {
-    Bool(bool),
-    Integer(i64),
-}
-
-impl ConditionValueWire {
-    fn boolean(self) -> Result<bool, ConditionEvaluationErrorWire> {
+/// Shared [`muxe_condition::ConditionNode`] implementation on the archived node itself.
+/// `ArchivedBox<T>: Deref<Target = T>`, so each archived child borrows from the checked archive
+/// for the full archive lifetime: zero-copy access, no cloning, no allocation on the evaluation
+/// path. The archived tree therefore evaluates through the single shared evaluator — no second
+/// short-circuit, comparison, or conversion implementation lives here.
+impl muxe_condition::ConditionNode for ArchivedConditionIrWire {
+    fn view(&self) -> muxe_condition::NodeRef<'_, Self> {
+        use ArchivedConditionIrWire as Ir;
+        use muxe_condition::NodeRef;
         match self {
-            Self::Bool(value) => Ok(value),
-            Self::Integer(_) => Err(ConditionEvaluationErrorWire::ExpectedBoolean),
+            Ir::Bool(value) => NodeRef::Bool(*value),
+            Ir::Integer(value) => NodeRef::Integer(value.to_native()),
+            Ir::PagesCount => NodeRef::PagesCount,
+            Ir::PagesCurrent => NodeRef::PagesCurrent,
+            Ir::Not(value) => NodeRef::Not(value.get()),
+            Ir::And(left, right) => NodeRef::And(left.get(), right.get()),
+            Ir::Or(left, right) => NodeRef::Or(left.get(), right.get()),
+            Ir::Equal(left, right) => NodeRef::Equal(left.get(), right.get()),
+            Ir::NotEqual(left, right) => NodeRef::NotEqual(left.get(), right.get()),
+            Ir::Less(left, right) => NodeRef::Less(left.get(), right.get()),
+            Ir::LessEqual(left, right) => NodeRef::LessEqual(left.get(), right.get()),
+            Ir::Greater(left, right) => NodeRef::Greater(left.get(), right.get()),
+            Ir::GreaterEqual(left, right) => NodeRef::GreaterEqual(left.get(), right.get()),
+            Ir::Add(left, right) => NodeRef::Add(left.get(), right.get()),
+            Ir::Subtract(left, right) => NodeRef::Subtract(left.get(), right.get()),
+            Ir::Multiply(left, right) => NodeRef::Multiply(left.get(), right.get()),
+            Ir::Divide(left, right) => NodeRef::Divide(left.get(), right.get()),
+            Ir::Modulo(left, right) => NodeRef::Modulo(left.get(), right.get()),
+            Ir::Negate(value) => NodeRef::Negate(value.get()),
+            Ir::Conditional(condition, left, right) => {
+                NodeRef::Conditional(condition.get(), left.get(), right.get())
+            }
         }
     }
+}
 
-    fn integer(self) -> Result<i64, ConditionEvaluationErrorWire> {
-        match self {
-            Self::Bool(_) => Err(ConditionEvaluationErrorWire::ExpectedInteger),
-            Self::Integer(value) => Ok(value),
-        }
+fn shared_pages(pages: PagesContextWire) -> SharedPagesContext {
+    SharedPagesContext {
+        count: pages.count,
+        current: pages.current,
     }
 }
 
-/// Evaluates a checked archived condition directly; no CEL parser or deserialized menu graph is
-/// involved when page geometry changes.
+/// Evaluates a checked archived condition through the single shared evaluator; no CEL parser or
+/// deserialized menu graph is involved when page geometry changes.
 /// # Errors
 ///
-/// Returns the evaluation error when the checked condition is not boolean.
+/// Returns the evaluation error when the checked condition is not boolean, divides by zero, or
+/// overflows integer arithmetic.
 pub fn evaluate_archived_condition(
     condition: &ArchivedConditionIrWire,
     pages: PagesContextWire,
 ) -> Result<bool, ConditionEvaluationErrorWire> {
-    match evaluate_archived_condition_value(condition, pages)? {
-        ConditionValueWire::Bool(value) => Ok(value),
-        ConditionValueWire::Integer(_) => Err(ConditionEvaluationErrorWire::NonBooleanResult),
-    }
+    muxe_condition::evaluate(condition, shared_pages(pages))
 }
 
 /// # Errors
@@ -636,69 +686,6 @@ pub fn evaluate_archived_binding_state(
         shown: evaluate(binding.conditions.show.as_ref())?,
         blocked: binding.state.blocked,
     })
-}
-
-fn evaluate_archived_condition_value(
-    condition: &ArchivedConditionIrWire,
-    pages: PagesContextWire,
-) -> Result<ConditionValueWire, ConditionEvaluationErrorWire> {
-    use ArchivedConditionIrWire as Ir;
-    match condition {
-        Ir::Bool(value) => Ok(ConditionValueWire::Bool(*value)),
-        Ir::Integer(value) => Ok(ConditionValueWire::Integer(value.to_native())),
-        Ir::PagesCount => Ok(ConditionValueWire::Integer(
-            i64::try_from(pages.count).unwrap_or(i64::MAX),
-        )),
-        Ir::PagesCurrent => Ok(ConditionValueWire::Integer(
-            i64::try_from(pages.current).unwrap_or(i64::MAX),
-        )),
-        Ir::Not(value) => Ok(ConditionValueWire::Bool(
-            !evaluate_archived_condition_value(value.get(), pages)?.boolean()?,
-        )),
-        Ir::And(left, right) => {
-            let left = evaluate_archived_condition_value(left.get(), pages)?.boolean()?;
-            Ok(ConditionValueWire::Bool(
-                left && evaluate_archived_condition_value(right.get(), pages)?.boolean()?,
-            ))
-        }
-        Ir::Or(left, right) => {
-            let left = evaluate_archived_condition_value(left.get(), pages)?.boolean()?;
-            Ok(ConditionValueWire::Bool(
-                left || evaluate_archived_condition_value(right.get(), pages)?.boolean()?,
-            ))
-        }
-        Ir::Equal(left, right) => Ok(ConditionValueWire::Bool(
-            evaluate_archived_condition_value(left.get(), pages)?
-                == evaluate_archived_condition_value(right.get(), pages)?,
-        )),
-        Ir::NotEqual(left, right) => Ok(ConditionValueWire::Bool(
-            evaluate_archived_condition_value(left.get(), pages)?
-                != evaluate_archived_condition_value(right.get(), pages)?,
-        )),
-        Ir::Less(left, right) => {
-            compare_archived_condition(left.get(), right.get(), pages, |a, b| a < b)
-        }
-        Ir::LessEqual(left, right) => {
-            compare_archived_condition(left.get(), right.get(), pages, |a, b| a <= b)
-        }
-        Ir::Greater(left, right) => {
-            compare_archived_condition(left.get(), right.get(), pages, |a, b| a > b)
-        }
-        Ir::GreaterEqual(left, right) => {
-            compare_archived_condition(left.get(), right.get(), pages, |a, b| a >= b)
-        }
-    }
-}
-
-fn compare_archived_condition(
-    left: &ArchivedConditionIrWire,
-    right: &ArchivedConditionIrWire,
-    pages: PagesContextWire,
-    predicate: impl FnOnce(i64, i64) -> bool,
-) -> Result<ConditionValueWire, ConditionEvaluationErrorWire> {
-    let left = evaluate_archived_condition_value(left, pages)?.integer()?;
-    let right = evaluate_archived_condition_value(right, pages)?.integer()?;
-    Ok(ConditionValueWire::Bool(predicate(left, right)))
 }
 #[derive(
     Archive,
@@ -2723,9 +2710,14 @@ mod tests {
     }
     #[test]
     fn evaluates_checked_archived_conditions_without_a_menu_graph_clone() {
+        // Guards the shared-semantics contract: arithmetic/conditional trees evaluate through the
+        // single shared evaluator on the archived form, without cloning the menu graph.
         let condition = ConditionIrWire::Greater(
-            Box::new(ConditionIrWire::PagesCurrent),
-            Box::new(ConditionIrWire::Integer(1)),
+            Box::new(ConditionIrWire::Add(
+                Box::new(ConditionIrWire::PagesCurrent),
+                Box::new(ConditionIrWire::Integer(1)),
+            )),
+            Box::new(ConditionIrWire::Integer(2)),
         );
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&condition).unwrap();
         let archived =
@@ -2750,5 +2742,251 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    fn archived_result(
+        condition: &ConditionIrWire,
+        pages: PagesContextWire,
+    ) -> Result<bool, ConditionEvaluationErrorWire> {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(condition).unwrap();
+        let archived =
+            rkyv::access::<ArchivedConditionIrWire, rkyv::rancor::Error>(&bytes).unwrap();
+        evaluate_archived_condition(archived, pages)
+    }
+
+    fn pages_wire(count: u64, current: u64) -> PagesContextWire {
+        PagesContextWire { count, current }
+    }
+
+    #[test]
+    fn archived_and_owned_evaluation_agree_for_every_operator() {
+        use muxe_condition::{ConditionIr as Owned, PagesContext};
+        // Each entry: a builder producing the same tree in owned and wire form, plus the page
+        // geometries to compare at. Archive through the real rkyv path; assert equal results.
+        let pages = PagesContext {
+            count: 3,
+            current: 2,
+        };
+        let wire_pages = pages_wire(3, 2);
+        let cases: Vec<(Owned, ConditionIrWire)> = vec![
+            (Owned::Bool(true), ConditionIrWire::Bool(true)),
+            (Owned::Integer(1), ConditionIrWire::Integer(1)),
+            (Owned::PagesCount, ConditionIrWire::PagesCount),
+            (Owned::PagesCurrent, ConditionIrWire::PagesCurrent),
+            (
+                Owned::Not(Box::new(Owned::Bool(false))),
+                ConditionIrWire::Not(Box::new(ConditionIrWire::Bool(false))),
+            ),
+            (
+                Owned::And(Box::new(Owned::Bool(true)), Box::new(Owned::Bool(false))),
+                ConditionIrWire::And(
+                    Box::new(ConditionIrWire::Bool(true)),
+                    Box::new(ConditionIrWire::Bool(false)),
+                ),
+            ),
+            (
+                Owned::Or(Box::new(Owned::Bool(false)), Box::new(Owned::Bool(true))),
+                ConditionIrWire::Or(
+                    Box::new(ConditionIrWire::Bool(false)),
+                    Box::new(ConditionIrWire::Bool(true)),
+                ),
+            ),
+            (
+                Owned::Equal(Box::new(Owned::PagesCount), Box::new(Owned::Integer(3))),
+                ConditionIrWire::Equal(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::Integer(3)),
+                ),
+            ),
+            (
+                Owned::NotEqual(Box::new(Owned::PagesCount), Box::new(Owned::Integer(4))),
+                ConditionIrWire::NotEqual(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::Integer(4)),
+                ),
+            ),
+            (
+                Owned::Less(Box::new(Owned::PagesCurrent), Box::new(Owned::PagesCount)),
+                ConditionIrWire::Less(
+                    Box::new(ConditionIrWire::PagesCurrent),
+                    Box::new(ConditionIrWire::PagesCount),
+                ),
+            ),
+            (
+                Owned::LessEqual(Box::new(Owned::Integer(2)), Box::new(Owned::Integer(2))),
+                ConditionIrWire::LessEqual(
+                    Box::new(ConditionIrWire::Integer(2)),
+                    Box::new(ConditionIrWire::Integer(2)),
+                ),
+            ),
+            (
+                Owned::Greater(Box::new(Owned::PagesCount), Box::new(Owned::Integer(2))),
+                ConditionIrWire::Greater(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::Integer(2)),
+                ),
+            ),
+            (
+                Owned::GreaterEqual(Box::new(Owned::PagesCount), Box::new(Owned::Integer(3))),
+                ConditionIrWire::GreaterEqual(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::Integer(3)),
+                ),
+            ),
+            (
+                Owned::Add(Box::new(Owned::PagesCount), Box::new(Owned::Integer(1))),
+                ConditionIrWire::Add(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::Integer(1)),
+                ),
+            ),
+            (
+                Owned::Subtract(Box::new(Owned::PagesCount), Box::new(Owned::PagesCurrent)),
+                ConditionIrWire::Subtract(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::PagesCurrent),
+                ),
+            ),
+            (
+                Owned::Multiply(Box::new(Owned::PagesCount), Box::new(Owned::Integer(2))),
+                ConditionIrWire::Multiply(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::Integer(2)),
+                ),
+            ),
+            (
+                Owned::Divide(Box::new(Owned::PagesCount), Box::new(Owned::Integer(3))),
+                ConditionIrWire::Divide(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::Integer(3)),
+                ),
+            ),
+            (
+                Owned::Modulo(Box::new(Owned::PagesCount), Box::new(Owned::Integer(2))),
+                ConditionIrWire::Modulo(
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::Integer(2)),
+                ),
+            ),
+            (
+                Owned::Negate(Box::new(Owned::PagesCurrent)),
+                ConditionIrWire::Negate(Box::new(ConditionIrWire::PagesCurrent)),
+            ),
+            (
+                Owned::Conditional(
+                    Box::new(Owned::Bool(true)),
+                    Box::new(Owned::PagesCount),
+                    Box::new(Owned::PagesCurrent),
+                ),
+                ConditionIrWire::Conditional(
+                    Box::new(ConditionIrWire::Bool(true)),
+                    Box::new(ConditionIrWire::PagesCount),
+                    Box::new(ConditionIrWire::PagesCurrent),
+                ),
+            ),
+        ];
+        for (owned, wire) in &cases {
+            assert_eq!(
+                muxe_condition::evaluate(owned, pages).map_err(|error| error as u8),
+                archived_result(wire, wire_pages).map_err(|error| error as u8),
+                "{owned:?}"
+            );
+            assert_eq!(
+                muxe_condition::evaluate_typed(owned, pages).map_err(|error| error as u8),
+                {
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(wire).unwrap();
+                    let archived =
+                        rkyv::access::<ArchivedConditionIrWire, rkyv::rancor::Error>(&bytes)
+                            .unwrap();
+                    muxe_condition::evaluate_typed(archived, pages).map_err(|error| error as u8)
+                },
+                "typed {owned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn archived_short_circuit_and_arithmetic_errors_match_owned() {
+        use muxe_condition::{ConditionEvaluationError, ConditionIr as Owned, PagesContext};
+        let pages = PagesContext {
+            count: 3,
+            current: 2,
+        };
+        let wire_pages = pages_wire(3, 2);
+        let zero = || Owned::Integer(0);
+        let one = || Owned::Integer(1);
+        // `false && <division by zero>` is false; `true || <division by zero>` is true.
+        let and = Owned::And(
+            Box::new(Owned::Bool(false)),
+            Box::new(Owned::Divide(Box::new(one()), Box::new(zero()))),
+        );
+        let wire_and = ConditionIrWire::And(
+            Box::new(ConditionIrWire::Bool(false)),
+            Box::new(ConditionIrWire::Divide(
+                Box::new(ConditionIrWire::Integer(1)),
+                Box::new(ConditionIrWire::Integer(0)),
+            )),
+        );
+        assert_eq!(muxe_condition::evaluate(&and, pages), Ok(false));
+        assert_eq!(archived_result(&wire_and, wire_pages), Ok(false));
+        let or = Owned::Or(
+            Box::new(Owned::Bool(true)),
+            Box::new(Owned::Divide(Box::new(one()), Box::new(zero()))),
+        );
+        let wire_or = ConditionIrWire::Or(
+            Box::new(ConditionIrWire::Bool(true)),
+            Box::new(ConditionIrWire::Divide(
+                Box::new(ConditionIrWire::Integer(1)),
+                Box::new(ConditionIrWire::Integer(0)),
+            )),
+        );
+        assert_eq!(muxe_condition::evaluate(&or, pages), Ok(true));
+        assert_eq!(archived_result(&wire_or, wire_pages), Ok(true));
+        // Division by zero and overflow classify identically on both sides.
+        for (owned, wire, expected) in [
+            (
+                Owned::Divide(Box::new(one()), Box::new(zero())),
+                ConditionIrWire::Divide(
+                    Box::new(ConditionIrWire::Integer(1)),
+                    Box::new(ConditionIrWire::Integer(0)),
+                ),
+                ConditionEvaluationError::DivisionByZero,
+            ),
+            (
+                Owned::Modulo(Box::new(one()), Box::new(zero())),
+                ConditionIrWire::Modulo(
+                    Box::new(ConditionIrWire::Integer(1)),
+                    Box::new(ConditionIrWire::Integer(0)),
+                ),
+                ConditionEvaluationError::DivisionByZero,
+            ),
+            (
+                Owned::Add(Box::new(Owned::Integer(i64::MAX)), Box::new(one())),
+                ConditionIrWire::Add(
+                    Box::new(ConditionIrWire::Integer(i64::MAX)),
+                    Box::new(ConditionIrWire::Integer(1)),
+                ),
+                ConditionEvaluationError::ArithmeticOverflow,
+            ),
+            (
+                Owned::Not(Box::new(one())),
+                ConditionIrWire::Not(Box::new(ConditionIrWire::Integer(1))),
+                ConditionEvaluationError::TypeMismatch,
+            ),
+        ] {
+            assert_eq!(
+                muxe_condition::evaluate_typed(&owned, pages),
+                Err(expected),
+                "{owned:?}"
+            );
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&wire).unwrap();
+            let archived =
+                rkyv::access::<ArchivedConditionIrWire, rkyv::rancor::Error>(&bytes).unwrap();
+            assert_eq!(
+                muxe_condition::evaluate_typed(archived, pages),
+                Err(expected),
+                "{owned:?}"
+            );
+        }
     }
 }

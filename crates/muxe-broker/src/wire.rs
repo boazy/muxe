@@ -154,6 +154,32 @@ fn condition_to_wire(condition: &ConditionIr) -> ConditionIrWire {
             Box::new(condition_to_wire(left)),
             Box::new(condition_to_wire(right)),
         ),
+        ConditionIr::Add(left, right) => ConditionIrWire::Add(
+            Box::new(condition_to_wire(left)),
+            Box::new(condition_to_wire(right)),
+        ),
+        ConditionIr::Subtract(left, right) => ConditionIrWire::Subtract(
+            Box::new(condition_to_wire(left)),
+            Box::new(condition_to_wire(right)),
+        ),
+        ConditionIr::Multiply(left, right) => ConditionIrWire::Multiply(
+            Box::new(condition_to_wire(left)),
+            Box::new(condition_to_wire(right)),
+        ),
+        ConditionIr::Divide(left, right) => ConditionIrWire::Divide(
+            Box::new(condition_to_wire(left)),
+            Box::new(condition_to_wire(right)),
+        ),
+        ConditionIr::Modulo(left, right) => ConditionIrWire::Modulo(
+            Box::new(condition_to_wire(left)),
+            Box::new(condition_to_wire(right)),
+        ),
+        ConditionIr::Negate(value) => ConditionIrWire::Negate(Box::new(condition_to_wire(value))),
+        ConditionIr::Conditional(condition, left, right) => ConditionIrWire::Conditional(
+            Box::new(condition_to_wire(condition)),
+            Box::new(condition_to_wire(left)),
+            Box::new(condition_to_wire(right)),
+        ),
     }
 }
 

@@ -1939,12 +1939,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "muxe-condition"
+version = "0.1.4"
+
+[[package]]
 name = "muxe-core"
 version = "0.1.4"
 dependencies = [
  "ariadne",
  "cel",
  "minijinja",
+ "muxe-condition",
  "proptest",
  "regex",
  "rstest",
@@ -1973,6 +1978,7 @@ dependencies = [
 name = "muxe-protocol"
 version = "0.1.4"
 dependencies = [
+ "muxe-condition",
  "proptest",
  "rkyv",
  "serde",

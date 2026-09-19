@@ -1475,3 +1475,35 @@ menus:
             .is_none()
     );
 }
+
+#[test]
+fn non_boolean_conditions_are_rejected_at_compile_time_without_publication() {
+    for source in ["true && 1", "1", "1 < true", "!1"] {
+        let yaml = format!(
+            "version: 1\nmenus:\n  main:\n    bindings:\n      a:\n        label: gated\n        action: menu:quit\n        conditions:\n          include: '{source}'\n"
+        );
+        let diagnostics = compile(&yaml, None, KeyCapabilities::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidCondition),
+            "{source}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn cel_arithmetic_and_conditional_conditions_compile_for_pager_bindings() {
+    let yaml = "version: 1\nmenus:\n  main:\n    bindings:\n      left:\n        label: prev\n        action: menu.page:prev\n        conditions:\n          include: 'pages.count + 1 > 2'\n";
+    let config = compile(yaml, None, KeyCapabilities::default())
+        .expect("arithmetic conditions should compile");
+    let binding = config
+        .menu(&muxe_core::MenuId::new("main"))
+        .unwrap()
+        .bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "left")
+        .unwrap();
+    assert!(binding.conditions.include.is_some());
+    assert!(binding.conditions.include.as_ref().unwrap().uses_pages());
+}
