@@ -612,14 +612,7 @@ fn portable_action_schema_preserves_failure_diagnostics() {
     }
 }
 
-#[test]
-fn selected_theme_and_color_scheme_are_carried_to_attachment() {
-    let assets = ThemeAssets {
-        themes: std::collections::BTreeMap::from([(
-            "custom".to_owned(),
-            document(
-                "themes/custom.yml",
-                r#"
+const COMPLETE_CUSTOM_THEME_YAML: &str = r#"
 common:
   styles:
     default: { foreground: base.text }
@@ -628,8 +621,18 @@ menu:
     title: { foreground: menu.hotkey, bold: true }
   templates:
     cell: "{{ title }}"
-"#,
-            ),
+    breadcrumbs: "{{ crumbs }}"
+    pagination:
+      full: "{{ pages.current }}/{{ pages.count }}"
+      short: "{{ pages.current }}/{{ pages.count }}"
+    status: "{{ message }}"
+"#;
+
+fn custom_theme_assets(theme_yaml: &str) -> ThemeAssets {
+    ThemeAssets {
+        themes: std::collections::BTreeMap::from([(
+            "custom".to_owned(),
+            document("themes/custom.yml", theme_yaml),
         )]),
         color_schemes: std::collections::BTreeMap::from([(
             "ink".to_owned(),
@@ -646,8 +649,11 @@ colors:
 "##,
             ),
         )]),
-    };
-    let config = Compiler
+    }
+}
+
+fn custom_theme_config(theme_yaml: &str) -> muxe_core::CompiledConfig {
+    Compiler
         .compile(
             CompileInput {
                 generation: CompiledGeneration(10),
@@ -665,11 +671,60 @@ menus:
                 ),
                 host_override: None,
                 key_capabilities: KeyCapabilities::default(),
-                theme_assets: assets,
+                theme_assets: custom_theme_assets(theme_yaml),
             },
             None,
         )
-        .expect("selected source-tracked assets should compile and pair");
+        .expect("selected source-tracked assets should compile and pair")
+}
+
+#[test]
+fn incomplete_theme_is_rejected_before_attachment() {
+    let diagnostics = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(10),
+                base: document(
+                    "config.yml",
+                    r"
+version: 1
+theme: custom
+color-scheme: ink
+menus:
+  main:
+    bindings:
+      r: { label: reload, action: config:reload }
+",
+                ),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: custom_theme_assets(
+                    r#"
+common:
+  styles:
+    default: { foreground: base.text }
+menu:
+  styles:
+    title: { foreground: menu.hotkey, bold: true }
+  templates:
+    cell: "{{ title }}"
+"#,
+                ),
+            },
+            None,
+        )
+        .expect_err("a theme with only `cell` must not compile");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("breadcrumbs")),
+        "missing `breadcrumbs` must be named, got {diagnostics:?}"
+    );
+}
+
+#[test]
+fn selected_theme_and_color_scheme_are_carried_to_attachment() {
+    let config = custom_theme_config(COMPLETE_CUSTOM_THEME_YAML);
     assert_eq!(config.theme_selection.theme, "custom");
     assert_eq!(config.theme_selection.color_scheme, "ink");
     let attachment = config

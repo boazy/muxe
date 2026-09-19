@@ -135,6 +135,20 @@ pub struct Theme {
     pub settings: BTreeMap<String, String>,
 }
 
+/// Required component templates a compiled theme must provide.
+///
+/// This registry is the renderer's completeness contract: every entry must resolve
+/// through `common`/`menu` templates before a theme is publishable, and the UI
+/// renderer constructs from exactly this set. Keep the list here as the single
+/// authority; the renderer consumes it rather than maintaining its own copy.
+pub const REQUIRED_COMPONENT_TEMPLATES: [&str; 5] = [
+    "cell",
+    "breadcrumbs",
+    "pagination.full",
+    "pagination.short",
+    "status",
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledTheme {
     pub theme: Theme,
@@ -159,12 +173,15 @@ impl fmt::Display for ThemePairError {
 impl std::error::Error for ThemePairError {}
 
 impl CompiledTheme {
-    /// Validates a pure theme/scheme pair. It parses templates without filesystem loaders and
-    /// verifies every declared foreground/background path before a UI can select the pair.
+    /// Validates a pure theme/scheme pair. It rejects loader-backed constructs, parses
+    /// templates without filesystem loaders, verifies every declared foreground/background
+    /// path, and proves every [`REQUIRED_COMPONENT_TEMPLATES`] entry resolves before a UI
+    /// can select the pair.
     ///
     /// # Errors
     ///
-    /// Returns [`ThemePairError`] for invalid templates or unresolved style colors.
+    /// Returns [`ThemePairError`] for loader-backed or invalid templates, unresolved style
+    /// colors, unknown literal style references, or a missing required component template.
     pub fn compile(theme: Theme, scheme: ColorScheme) -> Result<Self, ThemePairError> {
         for (section, fallback) in [(&theme.common, None), (&theme.menu, Some(&theme.common))] {
             for style in section.styles.values() {
@@ -180,10 +197,7 @@ impl CompiledTheme {
                 }
             }
             for template in section.templates.values() {
-                if template.contains("{% extends")
-                    || template.contains("{% include")
-                    || template.contains("{% import")
-                {
+                if has_loader_backed_construct(template) {
                     return Err(ThemePairError::new(
                         "theme templates cannot use loader-backed tags",
                     ));
@@ -201,6 +215,15 @@ impl CompiledTheme {
                         "template references unknown literal style `{style_name}`"
                     )));
                 }
+            }
+        }
+        for name in REQUIRED_COMPONENT_TEMPLATES {
+            if !theme.menu.templates.contains_key(name)
+                && !theme.common.templates.contains_key(name)
+            {
+                return Err(ThemePairError::new(format!(
+                    "selected theme has no `{name}` template"
+                )));
             }
         }
         Ok(Self { theme, scheme })
@@ -228,8 +251,133 @@ fn literal_style_tags(template: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Built-in `default` theme. It uses only semantic style paths, so it can pair with a user
-/// scheme or the built-in host-inheriting scheme.
+/// Reports whether a template source uses a loader-backed construct (`extends`,
+/// `include`, `import`, or `from`).
+///
+/// This is the single authority shared by the compiler and the UI renderer. It scans
+/// `{% ... %}` tags with an allocation-light, bounded pass: after the opener it skips
+/// ASCII whitespace plus one optional `-`/`+` whitespace-control marker, then requires
+/// the keyword to end at an identifier boundary so lookalikes such as `included` stay
+/// benign. Comment (`{# ... #}`) and expression (`{{ ... }}`) tags never match. The
+/// keyword set is exactly the minijinja statement set that emits a loader instruction
+/// (`extends` emits `LoadBlocks`; `include`, `import`, and `from ... import ...` emit
+/// `Include`); `block` declares a local block and emits no loader access.
+#[must_use]
+pub fn has_loader_backed_construct(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    // Lexer states: only `{% ... %}` statements can carry loader-backed keywords.
+    // Comment (`{# ... #}`) and expression (`{{ ... }}`) bodies are skipped verbatim so
+    // an `{% include %}` spelling inside them stays benign, matching template semantics.
+    // String literals inside statements are skipped so `{% set x = "{% include" %}` stays
+    // benign; unterminated literals/tags conservatively report no construct.
+    let mut in_comment = false;
+    let mut in_expression = false;
+    while index + 1 < bytes.len() {
+        if in_comment {
+            if bytes[index] == b'#' && bytes[index + 1] == b'}' {
+                in_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_expression {
+            if bytes[index] == b'}' && bytes[index + 1] == b'}' {
+                in_expression = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'{' && bytes[index + 1] == b'#' {
+            in_comment = true;
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'{' && bytes[index + 1] == b'{' {
+            in_expression = true;
+            index += 2;
+            continue;
+        }
+        if bytes[index] != b'{' || bytes[index + 1] != b'%' {
+            index += 1;
+            continue;
+        }
+        if statement_opens_loader_construct(source, index + 2) {
+            return true;
+        }
+        index += 2;
+    }
+    false
+}
+
+fn statement_opens_loader_construct(source: &str, mut cursor: usize) -> bool {
+    let bytes = source.as_bytes();
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor < bytes.len() && (bytes[cursor] == b'-' || bytes[cursor] == b'+') {
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+    }
+    let keyword_length = [
+        ("extends", 7_usize),
+        ("include", 7_usize),
+        ("import", 6_usize),
+        ("from", 4_usize),
+    ]
+    .into_iter()
+    .find(|(word, _)| {
+        source
+            .get(cursor..)
+            .is_some_and(|tail| tail.starts_with(word))
+    })
+    .map(|(_, length)| length);
+    let Some(length) = keyword_length else {
+        return false;
+    };
+    if !source.get(cursor + length..).is_some_and(|tail| {
+        tail.chars()
+            .next()
+            .is_none_or(|character| !(character == '_' || character.is_alphanumeric()))
+    }) {
+        return false;
+    }
+    // The keyword must close in the same statement: scan to the matching `%}` while
+    // skipping quoted string literals, so `{% set x = "%}" %}` cannot hide a keyword and
+    // a keyword inside a string cannot falsely match.
+    let mut position = cursor + length;
+    let mut quote: Option<u8> = None;
+    while position + 1 < bytes.len() {
+        let byte = bytes[position];
+        if let Some(open) = quote {
+            if byte == b'\\' {
+                position += 2;
+                continue;
+            }
+            if byte == open {
+                quote = None;
+            }
+            position += 1;
+            continue;
+        }
+        if byte == b'"' || byte == b'\'' {
+            quote = Some(byte);
+            position += 1;
+            continue;
+        }
+        if byte == b'%' && bytes[position + 1] == b'}' {
+            return true;
+        }
+        position += 1;
+    }
+    false
+}
 #[must_use]
 #[expect(
     clippy::too_many_lines,
@@ -442,6 +590,30 @@ mod tests {
         );
     }
 
+    fn complete_templates(cell_source: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("cell".to_owned(), cell_source.to_owned()),
+            ("breadcrumbs".to_owned(), "{{ crumbs }}".to_owned()),
+            (
+                "pagination.full".to_owned(),
+                "{{ pages.current }}/{{ pages.count }}".to_owned(),
+            ),
+            (
+                "pagination.short".to_owned(),
+                "{{ pages.current }}/{{ pages.count }}".to_owned(),
+            ),
+            ("status".to_owned(), "{{ message }}".to_owned()),
+        ])
+    }
+
+    fn test_scheme() -> ColorScheme {
+        ColorScheme {
+            title: "test".to_owned(),
+            palette: BTreeMap::new(),
+            colors: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn theme_pair_rejects_unknown_literal_style_tags() {
         let error = CompiledTheme::compile(
@@ -449,21 +621,112 @@ mod tests {
                 common: ThemeSection::default(),
                 menu: ThemeSection {
                     styles: BTreeMap::new(),
-                    templates: BTreeMap::from([(
-                        "cell".to_owned(),
-                        "[missing]text[/missing]".to_owned(),
-                    )]),
+                    templates: complete_templates("[missing]text[/missing]"),
                 },
                 settings: BTreeMap::new(),
             },
-            ColorScheme {
-                title: "test".to_owned(),
-                palette: BTreeMap::new(),
-                colors: BTreeMap::new(),
-            },
+            test_scheme(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("unknown literal style"));
+    }
+
+    #[test]
+    fn compile_rejects_each_missing_required_component_template_by_name() {
+        for missing in REQUIRED_COMPONENT_TEMPLATES {
+            let mut templates = complete_templates("{{ title }}");
+            templates.remove(missing);
+            let error = CompiledTheme::compile(
+                Theme {
+                    common: ThemeSection::default(),
+                    menu: ThemeSection {
+                        styles: BTreeMap::new(),
+                        templates,
+                    },
+                    settings: BTreeMap::new(),
+                },
+                test_scheme(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(missing),
+                "missing `{missing}` must be named, got `{error}`"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_accepts_common_section_templates_for_required_names() {
+        let mut menu_templates = complete_templates("{{ title }}");
+        let status = menu_templates.remove("status").expect("status fixture");
+        let error = CompiledTheme::compile(
+            Theme {
+                common: ThemeSection {
+                    styles: BTreeMap::new(),
+                    templates: BTreeMap::from([("status".to_owned(), status)]),
+                },
+                menu: ThemeSection {
+                    styles: BTreeMap::new(),
+                    templates: menu_templates,
+                },
+                settings: BTreeMap::new(),
+            },
+            test_scheme(),
+        );
+        assert!(error.is_ok(), "common fallback must satisfy completeness");
+    }
+
+    #[test]
+    fn compile_rejects_loader_backed_spellings_and_accepts_benign_constructs() {
+        for source in [
+            "{% include x %}",
+            "{%- include x %}",
+            "{% extends x %}",
+            "{%- import x as y %}",
+            "{%+ include x %}",
+            "{%\tinclude x %}",
+            "{% from 'x' import y %}",
+            "{%- from 'x' import y %}",
+            "{%from 'x' import y%}",
+        ] {
+            let error = CompiledTheme::compile(
+                Theme {
+                    common: ThemeSection::default(),
+                    menu: ThemeSection {
+                        styles: BTreeMap::new(),
+                        templates: complete_templates(source),
+                    },
+                    settings: BTreeMap::new(),
+                },
+                test_scheme(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("loader-backed"),
+                "`{source}` must be rejected, got `{error}`"
+            );
+        }
+        for source in [
+            "{# {% include x %} #}",
+            "{{ value }}",
+            "{% if included %}ok{% endif %}",
+            "{% set include_count = 1 %}{{ include_count }}",
+            "{% set x = 1 %}{{ x }}",
+            "{% if x %}ok{% endif %}",
+        ] {
+            CompiledTheme::compile(
+                Theme {
+                    common: ThemeSection::default(),
+                    menu: ThemeSection {
+                        styles: BTreeMap::new(),
+                        templates: complete_templates(source),
+                    },
+                    settings: BTreeMap::new(),
+                },
+                test_scheme(),
+            )
+            .unwrap_or_else(|error| panic!("`{source}` must be benign, got `{error}`"));
+        }
     }
 
     #[test]

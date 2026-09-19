@@ -4,7 +4,9 @@ use std::{
 };
 
 use minijinja::{Environment, Error as MiniError, ErrorKind, UndefinedBehavior, context};
-use muxe_core::{Color, CompiledTheme, Style};
+use muxe_core::{
+    Color, CompiledTheme, REQUIRED_COMPONENT_TEMPLATES, Style, has_loader_backed_construct,
+};
 use muxe_protocol::{ArchivedCompiledThemeWire, ArchivedStyleWire};
 use ratatui::style::{Color as RatatuiColor, Modifier, Style as RatatuiStyle};
 use thiserror::Error;
@@ -84,6 +86,13 @@ pub struct TemplateRenderer {
 impl TemplateRenderer {
     /// Compiles a core theme once for the lifetime of its UI attachment.
     ///
+    /// [`CompiledTheme::compile`] already proves every
+    /// [`REQUIRED_COMPONENT_TEMPLATES`](muxe_core::REQUIRED_COMPONENT_TEMPLATES) entry
+    /// resolves and rejects loader-backed constructs, so the [`TemplateError::MissingTemplate`]
+    /// and [`TemplateError::ForbiddenLoaderBackedConstruct`] arms below are a defensive
+    /// backstop for themes built outside that path (notably [`Self::from_archived`], which
+    /// reads archived wire bytes that were not re-proven at compile time).
+    ///
     /// # Errors
     ///
     /// Returns [`TemplateError::MissingTemplate`] when a required component template is absent,
@@ -95,6 +104,10 @@ impl TemplateRenderer {
 
     /// Compiles the resolved, checked theme embedded in a broker attachment without
     /// deserializing the attachment's menu graph.
+    ///
+    /// This is the one constructor that can still observe a missing or loader-backed
+    /// template first: the archived bytes travel outside [`CompiledTheme::compile`]'s proof,
+    /// so the same two error arms remain the enforcement point here rather than a backstop.
     ///
     /// # Errors
     ///
@@ -119,13 +132,7 @@ impl TemplateRenderer {
         environment.add_filter("ellipsis", ellipsis_filter);
         environment.add_filter("style", style_filter);
 
-        for name in [
-            "cell",
-            "breadcrumbs",
-            "pagination.full",
-            "pagination.short",
-            "status",
-        ] {
+        for name in REQUIRED_COMPONENT_TEMPLATES {
             let source = template_source(name).ok_or(TemplateError::MissingTemplate(name))?;
             if has_loader_backed_construct(source) {
                 return Err(TemplateError::ForbiddenLoaderBackedConstruct(name));
@@ -303,24 +310,6 @@ pub fn escape_markup_text(value: &str) -> Result<String, TemplateError> {
         }
     }
     String::from_utf8(output.bytes).map_err(|error| TemplateError::Render(error.to_string()))
-}
-
-fn has_loader_backed_construct(source: &str) -> bool {
-    source.split("{%").skip(1).any(|tag| {
-        let statement = tag
-            .trim_start()
-            .strip_prefix('-')
-            .unwrap_or(tag.trim_start())
-            .trim_start();
-        ["extends", "include", "import"].into_iter().any(|keyword| {
-            statement.strip_prefix(keyword).is_some_and(|remainder| {
-                remainder
-                    .chars()
-                    .next()
-                    .is_none_or(|character| !(character == '_' || character.is_alphanumeric()))
-            })
-        })
-    })
 }
 
 fn template_source<'a>(theme: &'a CompiledTheme, name: &str) -> Option<&'a str> {
@@ -774,12 +763,47 @@ mod tests {
     }
 
     #[test]
-    fn loader_backed_constructs_cannot_reference_registered_component_templates() {
+    fn renderer_requires_exactly_the_core_template_registry() {
+        let mut missing = BTreeMap::from([
+            ("cell", "{{ title }}"),
+            ("breadcrumbs", "{{ crumbs | join(' › ') }}"),
+            ("pagination.full", "{{ pages.current }}/{{ pages.count }}"),
+            ("pagination.short", "{{ pages.current }}/{{ pages.count }}"),
+            ("status", "registered component"),
+        ]);
+        for name in REQUIRED_COMPONENT_TEMPLATES {
+            let removed = missing.remove(name).expect("registry entry has a fixture");
+            let Err(error) =
+                TemplateRenderer::from_sources(|key| missing.get(key).copied(), BTreeMap::new())
+            else {
+                panic!("renderer must require `{name}`")
+            };
+            assert!(
+                matches!(error, TemplateError::MissingTemplate(got) if got == name),
+                "renderer must name missing `{name}`, got `{error:?}`"
+            );
+            missing.insert(name, removed);
+        }
+        TemplateRenderer::from_sources(|key| missing.get(key).copied(), BTreeMap::new())
+            .expect("the full core registry must construct the renderer");
+    }
+
+    #[test]
+    fn renderer_rejects_the_same_loader_spellings_as_core() {
         for source in [
             "{% extends 'cell' %}",
             "{% include 'status' %}",
             "{% import 'status' as registered %}",
+            "{%- include 'status' %}",
+            "{%- import 'status' as registered %}",
+            "{% from 'status' import registered %}",
+            "{%- from 'status' import registered %}",
+            "{%from 'status' import registered%}",
         ] {
+            assert!(
+                has_loader_backed_construct(source),
+                "core must reject `{source}` exactly as the renderer does"
+            );
             let templates = BTreeMap::from([
                 ("cell", source),
                 ("breadcrumbs", "{{ crumbs | join(' › ') }}"),
@@ -797,6 +821,48 @@ mod tests {
                 error,
                 TemplateError::ForbiddenLoaderBackedConstruct("cell")
             ));
+        }
+    }
+
+    #[test]
+    fn compiled_theme_from_core_registry_always_constructs_the_renderer() {
+        let theme = theme_with_templates("{{ title }}");
+        TemplateRenderer::new(&theme).expect("a compiled theme must be renderable");
+        for missing in REQUIRED_COMPONENT_TEMPLATES {
+            let mut templates = BTreeMap::from([
+                ("cell".to_owned(), "{{ title }}".to_owned()),
+                ("breadcrumbs".to_owned(), "{{ crumbs }}".to_owned()),
+                (
+                    "pagination.full".to_owned(),
+                    "{{ pages.current }}/{{ pages.count }}".to_owned(),
+                ),
+                (
+                    "pagination.short".to_owned(),
+                    "{{ pages.current }}/{{ pages.count }}".to_owned(),
+                ),
+                ("status".to_owned(), "{{ message }}".to_owned()),
+            ]);
+            templates.remove(missing);
+            let error = CompiledTheme::compile(
+                Theme {
+                    common: ThemeSection::default(),
+                    menu: ThemeSection {
+                        styles: BTreeMap::new(),
+                        templates,
+                    },
+                    settings: BTreeMap::new(),
+                },
+                ColorScheme {
+                    title: "test".into(),
+                    palette: BTreeMap::new(),
+                    colors: BTreeMap::new(),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(missing),
+                "removing `{missing}` must fail compilation, got `{error}`"
+            );
         }
     }
 
