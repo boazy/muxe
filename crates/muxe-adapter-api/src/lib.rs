@@ -382,8 +382,9 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
     ) -> Result<(), AdapterError>;
 
     /// Releases adapter provenance after full UI publication without mutating
-    /// host panes or tabs.
-    async fn release_pending_pane(&self, lease: PendingPaneLease) -> Result<(), AdapterError>;
+    /// host panes or tabs. Infallible and idempotent: unknown or stale leases
+    /// are ignored so post-publication release can never fail an attached session.
+    fn release_pending_pane(&self, lease: PendingPaneLease);
     /// stale capture snapshot.
     async fn end_capture(
         &self,

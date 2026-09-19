@@ -3709,9 +3709,7 @@ mod mixed_recovery_production_tests {
             Ok(())
         }
 
-        async fn release_pending_pane(&self, _lease: PendingPaneLease) -> Result<(), AdapterError> {
-            Ok(())
-        }
+        fn release_pending_pane(&self, _lease: PendingPaneLease) {}
 
         async fn end_capture(
             &self,

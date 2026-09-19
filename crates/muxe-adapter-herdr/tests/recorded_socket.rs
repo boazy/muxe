@@ -489,10 +489,8 @@ async fn pending_cleanup_rejects_a_rebound_endpoint_before_probing_typed_absence
         .await
         .expect_err("a replaced endpoint must not report its pane absence as convergence");
     assert_eq!(error.kind, AdapterErrorKind::Unavailable);
-    adapter
-        .release_pending_pane(lease)
-        .await
-        .expect("the failed not-sent cleanup retains its lease");
+    adapter.release_pending_pane(lease.clone());
+    adapter.release_pending_pane(lease);
     assert!(
         second_host.requests().await.is_empty(),
         "the endpoint check must fail before the replacement host receives pane.get or pane.close"

@@ -254,12 +254,7 @@ impl HostAdapter for RecordedContractAdapter {
         Err(Self::unsupported())
     }
 
-    async fn release_pending_pane(
-        &self,
-        _lease: muxe_adapter_api::PendingPaneLease,
-    ) -> Result<(), AdapterError> {
-        Err(Self::unsupported())
-    }
+    fn release_pending_pane(&self, _lease: muxe_adapter_api::PendingPaneLease) {}
 
     async fn capture_origin(
         &self,

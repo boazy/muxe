@@ -35,7 +35,7 @@ use muxe_protocol::{
 use thiserror::Error;
 use tokio::{
     process::{Child, Command},
-    sync::{Mutex, Notify, mpsc, watch},
+    sync::{Mutex, Notify, mpsc, oneshot, watch},
 };
 
 use crate::{
@@ -50,6 +50,7 @@ pub struct Broker {
     state: Arc<Mutex<BrokerState>>,
     sessions: Arc<Mutex<HashMap<UiSessionId, SessionRecord>>>,
     generic: Arc<GenericSupervisor>,
+    cleanup: Arc<CleanupSupervisor>,
     execution_transitions: Arc<Notify>,
     diagnostics_tx: mpsc::UnboundedSender<BrokerDiagnostic>,
     diagnostics_rx: Mutex<Option<mpsc::UnboundedReceiver<BrokerDiagnostic>>>,
@@ -59,6 +60,10 @@ pub struct Broker {
     next_event: Arc<AtomicU64>,
     #[cfg(test)]
     spawn_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    #[cfg(test)]
+    cleanup_enqueue_hook: StdMutex<Option<Arc<CleanupEnqueueHook>>>,
+    #[cfg(test)]
+    commit_ui_launch_hook: StdMutex<Option<Arc<WaitHook>>>,
 }
 
 #[cfg(test)]
@@ -73,6 +78,21 @@ impl WaitHook {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+}
+#[cfg(test)]
+pub(crate) struct CleanupEnqueueHook {
+    entered: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl CleanupEnqueueHook {
+    fn new() -> Self {
+        Self {
+            entered: Notify::new(),
+            release: Notify::new(),
+        }
     }
 }
 
@@ -92,6 +112,17 @@ struct BrokerState {
     gate: LaunchGate,
     registering: HashSet<PendingLaunchToken>,
     pending_sessions: HashMap<PendingLaunchToken, UiSessionId>,
+    /// Committed gated ownership remains retained until the service confirms
+    /// the successful `UiAttached` response publication. This keeps the exact
+    /// registered pane available if disconnect wins after readiness but before
+    /// publication confirmation.
+    gated_sessions: HashMap<PendingLaunchToken, GatedSession>,
+    /// Broker-owned cleanup backlog: every retained `RegisteredPane` or
+    /// acquired `CaptureLease` whose host close/end has not yet succeeded.
+    /// Entries are claimed under the state lock, called outside all locks,
+    /// and removed only on confirmed success, so a cancelled disconnect
+    /// future can never lose retry provenance.
+    cleanup: CleanupRegistry,
     /// The one authoritative registry for accepted external work. It is keyed by
     /// the broker's typed execution identity, never by a UI session: a session is
     /// only an optional notification/capture attachment to work the broker owns.
@@ -103,6 +134,189 @@ struct BrokerState {
     // the broker returns to Running. While set, no new launch or execution is admitted.
     activation_sealed: bool,
 }
+#[derive(Clone)]
+struct GatedSession {
+    session: UiSessionId,
+    registration: Option<RegisteredPane>,
+}
+/// Broker-owned backlog of host cleanups whose adapter call has not yet
+/// succeeded. Entries live in `BrokerState` under the state lock; the retry
+/// path claims due `Ready` entries to `InFlight`, clones the payload, drops
+/// every lock, calls the adapter, then removes on success or records the
+/// failure and backoff. Provenance therefore survives a cancelled caller.
+#[derive(Default)]
+struct CleanupRegistry {
+    pending_panes: HashMap<muxe_adapter_api::PendingPaneLeaseId, PendingPaneCleanup>,
+    captures: HashMap<muxe_adapter_api::CaptureLeaseId, CaptureCleanup>,
+}
+
+/// One retained pending-pane close. `registration` keeps the full typed
+/// provenance (including the lease) until `close_pending_pane` succeeds.
+struct PendingPaneCleanup {
+    session: UiSessionId,
+    registration: RegisteredPane,
+    phase: CleanupPhase,
+    attempt: u32,
+    next_retry: Instant,
+    primary: Option<String>,
+    last_cleanup_error: Option<AdapterError>,
+}
+
+/// One retained capture end. `lease` keeps the acquired lease until
+/// `end_capture` succeeds.
+struct CaptureCleanup {
+    lease: CaptureLease,
+    reason: CaptureReleaseReason,
+    phase: CleanupPhase,
+    attempt: u32,
+    next_retry: Instant,
+    primary: Option<String>,
+    last_cleanup_error: Option<AdapterError>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupPhase {
+    Ready,
+    InFlight,
+}
+/// Cancellation-safe host-cleanup supervisor. Request paths enqueue retained
+/// payloads into `BrokerState::cleanup` and wake an existing task, or spawn one
+/// real task for the typed lease identity. The task owns every adapter await,
+/// so aborting the requesting future cannot strand an `InFlight` entry.
+///
+/// Liveness invariant: an entry present in `BrokerState::cleanup` always has a
+/// live task owning its key. The task's terminal step re-checks for an entry
+/// while holding the broker state lock (`release_slot_unless_requeued`) and
+/// only removes its slot when no entry exists; the enqueue insert holds the
+/// same lock, so exit and re-enqueue are mutually exclusive.
+struct CleanupSupervisor {
+    tasks: StdMutex<HashMap<CleanupTaskKey, CleanupTask>>,
+    /// Serializes the check/spawn/insert sequence. A spawned task waits for its
+    /// handle to be installed under the typed key before it can finish and remove it.
+    launch: StdMutex<()>,
+    next_claim: AtomicU64,
+    wake: Notify,
+}
+
+struct CleanupTask {
+    claim: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum CleanupTaskKey {
+    PendingPane(muxe_adapter_api::PendingPaneLeaseId),
+    Capture(muxe_adapter_api::CaptureLeaseId),
+}
+
+impl Default for CleanupSupervisor {
+    fn default() -> Self {
+        Self {
+            tasks: StdMutex::new(HashMap::new()),
+            launch: StdMutex::new(()),
+            next_claim: AtomicU64::new(1),
+            wake: Notify::new(),
+        }
+    }
+}
+
+impl CleanupSupervisor {
+    fn next_claim(&self) -> u64 {
+        self.next_claim.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn has_live_task(&self, key: &CleanupTaskKey) -> bool {
+        self.tasks
+            .lock()
+            .expect("cleanup tasks are not poisoned")
+            .get(key)
+            .is_some_and(|task| !task.handle.is_finished())
+    }
+
+    fn remove_if_claim(&self, key: &CleanupTaskKey, claim: u64) {
+        let mut tasks = self.tasks.lock().expect("cleanup tasks are not poisoned");
+        if tasks.get(key).is_some_and(|task| task.claim == claim) {
+            tasks.remove(key);
+        }
+    }
+
+    /// Atomically decides the task's terminal step under the broker state
+    /// lock: while holding the state guard, checks whether a cleanup entry
+    /// still exists for `key`. When one exists (a re-enqueue landed before
+    /// this check) the slot is kept and the caller must loop to process it.
+    /// Only when no entry exists is this task's slot removed and the caller
+    /// allowed to exit. The enqueue insert holds the same state lock, so the
+    /// exit check and any re-enqueue insert are mutually exclusive: an entry
+    /// present in `state.cleanup` always has a live task owning its key.
+    /// Takes only the synchronous tasks std mutex inside the guard; no
+    /// `.await` runs while either lock is held.
+    async fn release_slot_unless_requeued(
+        &self,
+        state: &Arc<Mutex<BrokerState>>,
+        key: &CleanupTaskKey,
+        claim: u64,
+    ) -> bool {
+        // Test gate: pauses the task exactly between entry removal and slot
+        // removal, i.e. inside the B2 race window. Every terminal arm routes
+        // through this handshake, so arming it for a key forces the
+        // interleaving deterministically.
+        #[cfg(test)]
+        crate::cleanup_task_hooks::exit_gate(key).await;
+        let guard = state.lock().await;
+        let requeued = match key {
+            CleanupTaskKey::PendingPane(lease) => guard.cleanup.pending_panes.contains_key(lease),
+            CleanupTaskKey::Capture(lease) => guard.cleanup.captures.contains_key(lease),
+        };
+        if requeued {
+            return false;
+        }
+        let mut tasks = self.tasks.lock().expect("cleanup tasks are not poisoned");
+        if tasks.get(key).is_some_and(|task| task.claim == claim) {
+            tasks.remove(key);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn task_count(&self) -> usize {
+        self.tasks
+            .lock()
+            .expect("cleanup tasks are not poisoned")
+            .len()
+    }
+
+    fn notify(&self) {
+        self.wake.notify_waiters();
+    }
+}
+
+/// Deterministic retry delays: 0ms, 25ms, 100ms, 500ms, then 1s capped.
+fn cleanup_retry_delay(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::from_millis(0),
+        1 => Duration::from_millis(25),
+        2 => Duration::from_millis(100),
+        3 => Duration::from_millis(500),
+        _ => Duration::from_secs(1),
+    }
+}
+/// Bounded deadline for `drain_for_activation` to observe confirmation of the
+/// broker-owned host cleanup it initiated. Cleanup retries back off to 1s, so
+/// the deadline spans several attempts without stalling activation forever.
+///
+/// Determinism: the wait uses `tokio::time::Instant` (not `std::time::Instant`)
+/// consistently with `tokio::time::sleep`, so `#[tokio::test(start_paused =
+/// true)]` advances the same clock the deadline reads and the wait completes
+/// without wall-clock sleeps. The `#[cfg(test)]` deadline is shortened so the
+/// failure-path regression completes in milliseconds; wakeups still drive the
+/// fast path and this tick only bounds check staleness.
+#[cfg(not(test))]
+const DRAIN_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const DRAIN_CLEANUP_DEADLINE: Duration = Duration::from_millis(200);
+/// Re-check cadence while waiting for cleanup confirmation: wakeups drive the
+/// fast path, this tick bounds the staleness of the empty check.
+const DRAIN_CLEANUP_POLL: Duration = Duration::from_millis(10);
 
 struct SessionRecord {
     config: Arc<CompiledConfig>,
@@ -297,6 +511,7 @@ pub enum RequestResult {
 }
 
 pub struct PendingAttachment {
+    token: PendingLaunchToken,
     session: UiSessionId,
     receiver: watch::Receiver<SessionReadiness>,
 }
@@ -305,6 +520,10 @@ impl PendingAttachment {
     #[must_use]
     pub fn session(&self) -> &UiSessionId {
         &self.session
+    }
+    #[must_use]
+    pub fn token(&self) -> PendingLaunchToken {
+        self.token
     }
     pub async fn wait(mut self) -> BrokerResponse {
         loop {
@@ -336,6 +555,7 @@ impl Broker {
             state: Arc::new(Mutex::new(BrokerState::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             generic: Arc::new(GenericSupervisor::default()),
+            cleanup: Arc::new(CleanupSupervisor::default()),
             execution_transitions: Arc::new(Notify::new()),
             diagnostics_tx,
             diagnostics_rx: Mutex::new(Some(diagnostics_rx)),
@@ -345,6 +565,10 @@ impl Broker {
             next_event: Arc::new(AtomicU64::new(1)),
             #[cfg(test)]
             spawn_wait_hook: StdMutex::new(None),
+            #[cfg(test)]
+            cleanup_enqueue_hook: StdMutex::new(None),
+            #[cfg(test)]
+            commit_ui_launch_hook: StdMutex::new(None),
         })
     }
 
@@ -367,6 +591,7 @@ impl Broker {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             generic: Arc::new(GenericSupervisor::default()),
             execution_transitions: Arc::new(Notify::new()),
+            cleanup: Arc::new(CleanupSupervisor::default()),
             diagnostics_tx,
             diagnostics_rx: Mutex::new(Some(diagnostics_rx)),
             token_source: Mutex::new(OsTokenSource),
@@ -375,6 +600,10 @@ impl Broker {
             next_event: Arc::new(AtomicU64::new(1)),
             #[cfg(test)]
             spawn_wait_hook: StdMutex::new(None),
+            #[cfg(test)]
+            cleanup_enqueue_hook: StdMutex::new(None),
+            #[cfg(test)]
+            commit_ui_launch_hook: StdMutex::new(None),
         }))
     }
 
@@ -400,15 +629,35 @@ impl Broker {
             .lock()
             .expect("spawn wait hook is not poisoned") = hook;
     }
+    #[cfg(test)]
+    pub(crate) fn set_cleanup_enqueue_hook(&self, hook: Option<Arc<CleanupEnqueueHook>>) {
+        *self
+            .cleanup_enqueue_hook
+            .lock()
+            .expect("cleanup enqueue hook is not poisoned") = hook;
+    }
+    #[cfg(test)]
+    pub(crate) fn set_commit_ui_launch_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .commit_ui_launch_hook
+            .lock()
+            .expect("commit UI launch hook is not poisoned") = hook;
+    }
 
     /// Closes every menu-owned pending pane and releases every UI capture before an activation
     /// coordinator drops this broker's listener. Detached generic children remain supervised.
+    /// Enqueueing is not enough: drain waits, with a bounded deadline, until
+    /// the cleanup entries it created are confirmed gone, and returns
+    /// `BrokerError::ActivationCleanupUnconfirmed` (reopening admission)
+    /// carrying the recorded `last_cleanup_error` when the deadline passes.
     ///
     /// # Errors
     ///
     /// Returns `BrokerError::ActivationDrainRefused` while a non-cancellable host
-    /// execution is in flight, or the first cancellation/detach failure (which
-    /// reopens admission so the coordinator can retry).
+    /// execution is in flight, `BrokerError::ActivationCleanupUnconfirmed` when
+    /// initiated host cleanup is not confirmed before the bounded deadline, or
+    /// the first cancellation/detach failure (each of which reopens admission
+    /// so the coordinator can retry).
     pub async fn drain_for_activation(&self) -> Result<(), BrokerError> {
         // Register the notification before observing state so a reservation
         // cannot transition between the observation and the await. The seal is
@@ -510,6 +759,7 @@ impl Broker {
                 self.request_execution_stop(execution).await?;
                 self.await_adapter_execution_terminal(execution).await;
             }
+            self.await_cleanup_drain().await?;
             Ok(())
         }
         .await;
@@ -517,6 +767,68 @@ impl Broker {
             self.state.lock().await.activation_sealed = false;
         }
         drained
+    }
+
+    /// Bounded wait for broker-owned host cleanup initiated by this drain.
+    /// Polls the cleanup registry for emptiness while listening on the
+    /// supervisor wake notification; no host call runs under the state lock.
+    /// Returns `ActivationCleanupUnconfirmed` with the recorded
+    /// `last_cleanup_error` payloads when `DRAIN_CLEANUP_DEADLINE` passes
+    /// with entries still present.
+    async fn await_cleanup_drain(&self) -> Result<(), BrokerError> {
+        // tokio clock throughout: `start_paused` tests advance the same clock
+        // the deadline reads, so the failure path completes without
+        // wall-clock sleeps (see the `DRAIN_CLEANUP_DEADLINE` comment).
+        let deadline = tokio::time::Instant::now() + DRAIN_CLEANUP_DEADLINE;
+        loop {
+            let pending = {
+                let state = self.state.lock().await;
+                let panes = state.cleanup.pending_panes.len();
+                let captures = state.cleanup.captures.len();
+                if panes == 0 && captures == 0 {
+                    return Ok(());
+                }
+                let mut details = Vec::new();
+                for (lease, entry) in &state.cleanup.pending_panes {
+                    details.push(format!(
+                        "pending pane {} attempt {}: {}",
+                        lease.as_str(),
+                        entry.attempt,
+                        entry
+                            .last_cleanup_error
+                            .as_ref()
+                            .map(|error| error.to_string())
+                            .unwrap_or_else(|| "awaiting first attempt".to_owned())
+                    ));
+                }
+                for (lease, entry) in &state.cleanup.captures {
+                    details.push(format!(
+                        "capture {} attempt {}: {}",
+                        lease.as_str(),
+                        entry.attempt,
+                        entry
+                            .last_cleanup_error
+                            .as_ref()
+                            .map(|error| error.to_string())
+                            .unwrap_or_else(|| "awaiting first attempt".to_owned())
+                    ));
+                }
+                details.sort();
+                details.join("; ")
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BrokerError::ActivationCleanupUnconfirmed(pending));
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let notified = self.cleanup.wake.notified();
+            tokio::pin!(notified);
+            // Re-check on every wake or timeout tick: the notification only
+            // wakes, the state remains authoritative.
+            tokio::select! {
+                () = tokio::time::sleep(remaining.min(DRAIN_CLEANUP_POLL)) => {}
+                () = &mut notified => {}
+            }
+        }
     }
 
     /// Reports whether detached generic children are still under supervision.
@@ -888,6 +1200,103 @@ impl Broker {
                 .await;
         }
     }
+    /// Resolves a gated UI disconnect under one state lock: while the launch
+    /// token is still pending *for this session* the token branch owns
+    /// cleanup; once commit or publication consumed the token, the attached
+    /// session branch owns it. Exactly one branch runs, after unlocking, so a
+    /// commit racing disconnect converges instead of aborting a consumed
+    /// token and leaking the session. A mismatched (token, session) pair
+    /// touches nothing: stale disconnects must never abort or detach
+    /// unrelated ownership.
+    pub async fn disconnect_gated(&self, token: PendingLaunchToken, session: UiSessionId) {
+        enum Cleanup {
+            Pending {
+                session: UiSessionId,
+                registration: Option<RegisteredPane>,
+            },
+            Attached {
+                session: UiSessionId,
+                registration: Option<RegisteredPane>,
+            },
+            Stale,
+        }
+        let cleanup = {
+            let mut state = self.state.lock().await;
+            let pending_matches = state.pending_sessions.get(&token) == Some(&session)
+                && state
+                    .gate
+                    .pending(token)
+                    .is_some_and(|launch| launch.attached_ui.as_ref() == Some(&session));
+            if pending_matches {
+                let registration = state.gate.abort(token).ok().flatten();
+                state.pending_sessions.remove(&token);
+                Cleanup::Pending {
+                    session,
+                    registration,
+                }
+            } else if state
+                .gated_sessions
+                .get(&token)
+                .is_some_and(|owner| owner.session == session)
+            {
+                let registration = state
+                    .gated_sessions
+                    .remove(&token)
+                    .and_then(|owner| owner.registration);
+                Cleanup::Attached {
+                    session,
+                    registration,
+                }
+            } else {
+                Cleanup::Stale
+            }
+        };
+        match cleanup {
+            Cleanup::Pending {
+                session,
+                registration,
+            } => {
+                self.fail_session(&session, CaptureReleaseReason::UiDismissed)
+                    .await;
+                if let Some(registration) = registration {
+                    self.close_registered(&session, registration).await;
+                }
+            }
+            Cleanup::Attached {
+                session,
+                registration,
+            } => {
+                self.disconnect(Some(&session)).await;
+                if let Some(registration) = registration {
+                    self.close_registered(&session, registration).await;
+                }
+            }
+            Cleanup::Stale => {}
+        }
+    }
+    /// Confirms that the service successfully published a gated `UiAttached`
+    /// response. The state claim and synchronous adapter provenance release are
+    /// adjacent, so cancellation cannot strand a claimed lease.
+    pub(crate) async fn confirm_gated_attachment(
+        &self,
+        token: PendingLaunchToken,
+        session: &UiSessionId,
+    ) {
+        let registration = {
+            let mut state = self.state.lock().await;
+            let owner_matches = state
+                .gated_sessions
+                .get(&token)
+                .is_some_and(|owner| owner.session == *session);
+            owner_matches
+                .then(|| state.gated_sessions.remove(&token))
+                .flatten()
+                .and_then(|owner| owner.registration)
+        };
+        if let Some(lease) = registration.and_then(|pane| pane.lease) {
+            self.adapter.release_pending_pane(lease);
+        }
+    }
 
     pub async fn expire_pending(&self) {
         let expired = {
@@ -1194,7 +1603,7 @@ impl Broker {
                 self.fail_session(&session, CaptureReleaseReason::LeaseExpired)
                     .await;
                 if let Some(registration) = registration {
-                    let _ = self.close_registered(&session, registration).await;
+                    self.close_registered(&session, registration).await;
                 }
             }
         }
@@ -1336,8 +1745,17 @@ impl Broker {
                 });
         state.registering.remove(&request.token);
         if !valid {
+            let retained = RegisteredPane {
+                pane: HostPaneId::new(registration.pane.as_str()),
+                temporary_tab: registration
+                    .temporary_tab
+                    .as_ref()
+                    .map(|tab| HostTabId::new(tab.as_str())),
+                lease: Some(lease),
+            };
+            let session = UiSessionId::new(registration.ui_session.as_str());
             drop(state);
-            let _ = self.adapter.close_pending_pane(registration, lease).await;
+            self.close_registered(&session, retained).await;
             return Err(BrokerError::Gate(GateError::UnknownToken));
         }
         state.gate.bind_pending_lease(request.token, lease)?;
@@ -1431,13 +1849,13 @@ impl Broker {
                         None
                     }
                 };
-                if let Some(registration) = registration
-                    && let Err(cleanup_error) = self.close_registered(&session, registration).await
-                {
-                    tracing::error!(
-                        %cleanup_error,
-                        "origin capture failed and registered pane cleanup also failed"
-                    );
+                if let Some(registration) = registration {
+                    self.enqueue_pending_pane_close(
+                        &session,
+                        registration,
+                        Some(error.to_string()),
+                    )
+                    .await;
                 }
                 return Err(BrokerError::from(error));
             }
@@ -1496,6 +1914,13 @@ impl Broker {
                                 registration = latest;
                                 if ready {
                                     state.pending_sessions.remove(&token);
+                                    state.gated_sessions.insert(
+                                        token,
+                                        GatedSession {
+                                            session: session.clone(),
+                                            registration: registration.clone(),
+                                        },
+                                    );
                                 }
                                 (ready, None)
                             }
@@ -1524,19 +1949,21 @@ impl Broker {
         };
         if let Some(error) = finalization_error {
             self.sessions.lock().await.remove(&session);
-            if let Some(registration) = registration
-                && let Err(cleanup_error) = self.close_registered(&session, registration).await
-            {
-                tracing::error!(
-                    %cleanup_error,
-                    "session publication failed and registered pane cleanup also failed"
-                );
+            if let Some(registration) = registration {
+                self.enqueue_pending_pane_close(&session, registration, Some(error.to_string()))
+                    .await;
             }
             return Err(error);
         }
         if !ready {
             return Ok(RequestResult::WaitForAttachment(Box::new(
-                PendingAttachment { session, receiver },
+                PendingAttachment {
+                    token: request
+                        .pending_launch
+                        .expect("gated attachment waiter always has a launch token"),
+                    session,
+                    receiver,
+                },
             )));
         }
         if let Err(error) = self.begin_capture(&session).await {
@@ -1547,14 +1974,6 @@ impl Broker {
                 tracing::error!(
                     %cleanup_error,
                     "capture initialization failed and session detach also failed"
-                );
-            }
-            if let Some(registration) = registration
-                && let Err(cleanup_error) = self.close_registered(&session, registration).await
-            {
-                tracing::error!(
-                    %cleanup_error,
-                    "capture initialization failed and registered pane cleanup also failed"
                 );
             }
             return Err(error);
@@ -1571,23 +1990,9 @@ impl Broker {
                         "attachment response failed and session detach also failed"
                     );
                 }
-                if let Some(registration) = registration
-                    && let Err(cleanup_error) = self.close_registered(&session, registration).await
-                {
-                    tracing::error!(
-                        %cleanup_error,
-                        "attachment response failed and registered pane cleanup also failed"
-                    );
-                }
                 return Err(error);
             }
         };
-        if let Some(lease) = registration.as_ref().and_then(|pane| pane.lease.clone()) {
-            self.adapter
-                .release_pending_pane(lease)
-                .await
-                .map_err(BrokerError::from)?;
-        }
         Ok(RequestResult::Immediate(response))
     }
 
@@ -1615,45 +2020,75 @@ impl Broker {
     }
 
     async fn commit(&self, token: PendingLaunchToken, pane: HostPaneId) -> Result<(), BrokerError> {
-        let (session, registration) = {
+        let session = {
             let mut state = self.state.lock().await;
             let registration = state
                 .gate
                 .pending(token)
                 .and_then(|launch| launch.registered_pane.clone());
             let session = state.gate.commit(token, &pane)?;
-            let session = if let Some(session) = session {
+            if let Some(session) = &session {
                 state.pending_sessions.remove(&token);
-                Some(session)
-            } else {
-                None
-            };
-            (session, registration)
+                state.gated_sessions.insert(
+                    token,
+                    GatedSession {
+                        session: session.clone(),
+                        registration,
+                    },
+                );
+            }
+            session
         };
+        #[cfg(test)]
+        {
+            let hook = self
+                .commit_ui_launch_hook
+                .lock()
+                .expect("commit UI launch hook is not poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+            }
+        }
         let Some(session) = session else {
             return Ok(());
         };
         if let Err(error) = self.begin_capture(&session).await {
-            self.detach(&session, CaptureReleaseReason::UiDismissed)
-                .await?;
-            if let Some(registration) = registration {
-                self.close_registered(&session, registration).await?;
+            let detach_error = self
+                .detach(&session, CaptureReleaseReason::UiDismissed)
+                .await
+                .err();
+            if let Some(cleanup_error) = detach_error {
+                tracing::error!(
+                    %cleanup_error,
+                    "capture initialization failed and session detach also failed"
+                );
             }
             return Err(error);
         }
-        let response = self.attached_response(&session).await?;
-        let sessions = self.sessions.lock().await;
-        if let Some(record) = sessions.get(&session) {
-            let _ = record
-                .readiness
-                .send(SessionReadiness::Ready(Box::new(response)));
-        }
-        drop(sessions);
-        if let Some(lease) = registration.and_then(|pane| pane.lease) {
-            self.adapter
-                .release_pending_pane(lease)
-                .await
-                .map_err(BrokerError::from)?;
+        let response = match self.attached_response(&session).await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Err(cleanup_error) = self
+                    .detach(&session, CaptureReleaseReason::UiDismissed)
+                    .await
+                {
+                    tracing::error!(
+                        %cleanup_error,
+                        "commit response failed and session detach also failed"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(record) = sessions.get(&session) {
+                let _ = record
+                    .readiness
+                    .send(SessionReadiness::Ready(Box::new(response)));
+            }
         }
         Ok(())
     }
@@ -1671,7 +2106,7 @@ impl Broker {
         self.fail_session(&session, CaptureReleaseReason::UiDismissed)
             .await;
         if let Some(registration) = registration {
-            self.close_registered(&session, registration).await?;
+            self.close_registered(&session, registration).await;
         }
         Ok(())
     }
@@ -1701,7 +2136,7 @@ impl Broker {
         self.fail_session(&session, CaptureReleaseReason::UiDismissed)
             .await;
         if let Some(registration) = registration {
-            self.close_registered(&session, registration).await?;
+            self.close_registered(&session, registration).await;
         }
         Ok(())
     }
@@ -1733,11 +2168,29 @@ impl Broker {
             .await
             .map_err(BrokerError::from)?;
         let mut sessions = self.sessions.lock().await;
-        let record = sessions
-            .get_mut(session)
-            .ok_or_else(|| BrokerError::UnknownSession(session.clone()))?;
-        record.capture = Some(capture);
-        Ok(())
+        match sessions.get_mut(session) {
+            Some(record) => {
+                record.capture = Some(capture);
+                Ok(())
+            }
+            // A concurrent detach consumed the session while the host
+            // round-trip was in flight. The freshly acquired lease is still
+            // ours exactly once: enqueue it before reporting the miss so the
+            // supervised cleanup task can retry without the caller retaining
+            // host provenance.
+            None => {
+                drop(sessions);
+                self.enqueue_capture_cleanup(
+                    capture,
+                    CaptureReleaseReason::UiDismissed,
+                    Some(format!(
+                        "UI session {session:?} detached during capture start"
+                    )),
+                )
+                .await;
+                Err(BrokerError::UnknownSession(session.clone()))
+            }
+        }
     }
 
     async fn attached_response(
@@ -2316,10 +2769,37 @@ impl Broker {
         reason: CaptureReleaseReason,
     ) -> Result<(), BrokerError> {
         let record = self.sessions.lock().await.remove(session);
+        // Provenance enqueue is atomic with the ownership unlink: the
+        // capture and gated-registration cleanup entries are inserted under
+        // the same state lock that removes them, so cancellation between the
+        // lock release and the supervised spawns below cannot drop them. Only
+        // the readiness send and the `.await`-holding spawns happen outside.
         let (cancel, deferred) = {
             let mut state = self.state.lock().await;
             state.gate.detach(session);
+            let tokens = state
+                .gated_sessions
+                .iter()
+                .filter(|(_, owner)| owner.session == *session)
+                .map(|(token, _)| *token)
+                .collect::<Vec<_>>();
+            let registrations = tokens
+                .into_iter()
+                .filter_map(|token| state.gated_sessions.remove(&token))
+                .filter_map(|owner| owner.registration)
+                .collect::<Vec<_>>();
             state.awaiting.remove(session);
+            if let Some(capture) = record.as_ref().and_then(|record| record.capture.clone()) {
+                self.insert_capture_cleanup_locked(&mut state, capture, reason, None);
+            }
+            for registration in &registrations {
+                self.insert_pending_pane_cleanup_locked(
+                    &mut state,
+                    session,
+                    registration.clone(),
+                    None,
+                );
+            }
             let mut cancel = Vec::new();
             let mut deferred = Vec::new();
             for execution in state.executions.values_mut() {
@@ -2344,16 +2824,12 @@ impl Broker {
             let _ = self.request_execution_stop(execution).await;
         }
         if let Some(record) = record {
+            // The capture entry was already inserted atomically with the
+            // unlink above; only the readiness failure is sent here.
             let _ = record.readiness.send(SessionReadiness::Failed(diagnostic(
                 DiagnosticCode::LaunchAborted,
                 "UI session detached",
             )));
-            if let Some(capture) = record.capture {
-                self.adapter
-                    .end_capture(capture, reason)
-                    .await
-                    .map_err(BrokerError::from)?;
-            }
         }
         for execution in deferred {
             self.schedule_post_dismissal(execution).await;
@@ -2383,30 +2859,201 @@ impl Broker {
         let Some(registration) = launch.registered_pane.clone() else {
             return Ok(());
         };
-        self.close_registered(session, registration).await
+        self.close_registered(session, registration).await;
+        Ok(())
     }
 
-    async fn close_registered(
+    /// Enqueues a retained pending-pane close and starts or wakes the
+    /// supervised task for its typed lease identity. This method only mutates
+    /// broker state and never awaits the adapter.
+    async fn close_registered(&self, session: &UiSessionId, registration: RegisteredPane) {
+        self.enqueue_pending_pane_close(session, registration, None)
+            .await;
+    }
+
+    /// Inserts a pending-pane cleanup entry under the caller's state lock and
+    /// starts (or wakes) its supervised task. The caller must hold the state
+    /// guard: the insert is atomic with the ownership unlink, so no `.await`
+    /// can interleave and drop provenance. Spawning only takes synchronous
+    /// std mutexes, so it is safe inside the critical section.
+    fn insert_pending_pane_cleanup_locked(
+        &self,
+        state: &mut BrokerState,
+        session: &UiSessionId,
+        registration: RegisteredPane,
+        primary: Option<String>,
+    ) {
+        let primary = primary.map(bounded_cleanup_message);
+        let Some(lease) = registration.lease.clone() else {
+            return;
+        };
+        let key = CleanupTaskKey::PendingPane(lease.id.clone());
+        let entry = state
+            .cleanup
+            .pending_panes
+            .entry(lease.id.clone())
+            .or_insert_with(|| PendingPaneCleanup {
+                session: session.clone(),
+                registration: registration.clone(),
+                phase: CleanupPhase::Ready,
+                attempt: 0,
+                next_retry: Instant::now(),
+                primary: primary.clone(),
+                last_cleanup_error: None,
+            });
+        if entry.primary.is_none() {
+            entry.primary = primary;
+        }
+        let should_start = if entry.phase == CleanupPhase::InFlight {
+            false
+        } else {
+            entry.phase = CleanupPhase::InFlight;
+            entry.next_retry = Instant::now();
+            true
+        };
+        if should_start {
+            self.spawn_pending_pane_cleanup(key);
+        } else {
+            self.cleanup.notify();
+        }
+    }
+
+    /// Inserts a capture cleanup entry under the caller's state lock. Same
+    /// atomicity contract as `insert_pending_pane_cleanup_locked`.
+    fn insert_capture_cleanup_locked(
+        &self,
+        state: &mut BrokerState,
+        lease: CaptureLease,
+        reason: CaptureReleaseReason,
+        primary: Option<String>,
+    ) {
+        let primary = primary.map(bounded_cleanup_message);
+        let key = CleanupTaskKey::Capture(lease.id.clone());
+        let entry = state
+            .cleanup
+            .captures
+            .entry(lease.id.clone())
+            .or_insert_with(|| CaptureCleanup {
+                lease: lease.clone(),
+                reason,
+                phase: CleanupPhase::Ready,
+                attempt: 0,
+                next_retry: Instant::now(),
+                primary: primary.clone(),
+                last_cleanup_error: None,
+            });
+        if entry.primary.is_none() {
+            entry.primary = primary;
+        }
+        let should_start = if entry.phase == CleanupPhase::InFlight {
+            false
+        } else {
+            entry.phase = CleanupPhase::InFlight;
+            entry.next_retry = Instant::now();
+            true
+        };
+        if should_start {
+            self.spawn_capture_cleanup(key);
+        } else {
+            self.cleanup.notify();
+        }
+    }
+
+    async fn enqueue_pending_pane_close(
         &self,
         session: &UiSessionId,
         registration: RegisteredPane,
-    ) -> Result<(), BrokerError> {
-        let Some(lease) = registration.lease.clone() else {
-            return Err(BrokerError::Gate(GateError::PaneMismatch));
+        primary: Option<String>,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            self.insert_pending_pane_cleanup_locked(&mut state, session, registration, primary);
+        }
+        #[cfg(test)]
+        {
+            let hook = self
+                .cleanup_enqueue_hook
+                .lock()
+                .expect("cleanup enqueue hook is not poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+            }
+        }
+    }
+    async fn enqueue_capture_cleanup(
+        &self,
+        lease: CaptureLease,
+        reason: CaptureReleaseReason,
+        primary: Option<String>,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            self.insert_capture_cleanup_locked(&mut state, lease, reason, primary);
+        }
+    }
+
+    fn spawn_pending_pane_cleanup(&self, key: CleanupTaskKey) {
+        let CleanupTaskKey::PendingPane(_) = &key else {
+            unreachable!("pending-pane cleanup spawned with a capture key");
         };
-        self.adapter
-            .close_pending_pane(
-                PendingPaneRegistration {
-                    ui_session: adapter_session(session),
-                    pane: PaneId::new(registration.pane.as_str()),
-                    temporary_tab: registration
-                        .temporary_tab
-                        .map(|tab| muxe_core::TabId::new(tab.as_str())),
-                },
-                lease,
-            )
-            .await
-            .map_err(BrokerError::from)
+        let supervisor = Arc::clone(&self.cleanup);
+        let _launch = supervisor
+            .launch
+            .lock()
+            .expect("cleanup launch lock is not poisoned");
+        if supervisor.has_live_task(&key) {
+            supervisor.notify();
+            return;
+        }
+        let claim = supervisor.next_claim();
+        let adapter = Arc::clone(&self.adapter);
+        let state = Arc::clone(&self.state);
+        let task_supervisor = Arc::clone(&supervisor);
+        let task_key = key.clone();
+        let (start, started) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = started.await;
+            run_pending_pane_cleanup(adapter, state, task_supervisor, task_key, claim).await;
+        });
+        supervisor
+            .tasks
+            .lock()
+            .expect("cleanup tasks are not poisoned")
+            .insert(key, CleanupTask { claim, handle });
+        let _ = start.send(());
+    }
+
+    fn spawn_capture_cleanup(&self, key: CleanupTaskKey) {
+        let CleanupTaskKey::Capture(_) = &key else {
+            unreachable!("capture cleanup spawned with a pending-pane key");
+        };
+        let supervisor = Arc::clone(&self.cleanup);
+        let _launch = supervisor
+            .launch
+            .lock()
+            .expect("cleanup launch lock is not poisoned");
+        if supervisor.has_live_task(&key) {
+            supervisor.notify();
+            return;
+        }
+        let claim = supervisor.next_claim();
+        let adapter = Arc::clone(&self.adapter);
+        let state = Arc::clone(&self.state);
+        let task_supervisor = Arc::clone(&supervisor);
+        let task_key = key.clone();
+        let (start, started) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = started.await;
+            run_capture_cleanup(adapter, state, task_supervisor, task_key, claim).await;
+        });
+        supervisor
+            .tasks
+            .lock()
+            .expect("cleanup tasks are not poisoned")
+            .insert(key, CleanupTask { claim, handle });
+        let _ = start.send(());
     }
 
     fn new_session_id(&self) -> UiSessionId {
@@ -2417,6 +3064,14 @@ impl Broker {
     }
 
     fn new_execution_id(counter: u64) -> ExecutionId {
+        // Reserved-namespace proof: broker ids are a bare u64 counter and
+        // stay below `LOCAL_EXECUTION_CEILING` (`1 << 63`); the Zellij
+        // adapter mints at or above the ceiling and rejects the reserved
+        // range at admission, so the spaces cannot collide.
+        debug_assert!(
+            counter < (1 << 63),
+            "broker execution counter must stay below the adapter-reserved ceiling"
+        );
         let mut bytes = [0; 16];
         bytes[8..].copy_from_slice(&counter.to_be_bytes());
         ExecutionId(bytes)
@@ -2427,8 +3082,302 @@ impl Broker {
     }
 }
 
+async fn run_pending_pane_cleanup(
+    adapter: Arc<dyn HostAdapter>,
+    state: Arc<Mutex<BrokerState>>,
+    supervisor: Arc<CleanupSupervisor>,
+    key: CleanupTaskKey,
+    claim: u64,
+) {
+    let CleanupTaskKey::PendingPane(lease_id) = key.clone() else {
+        unreachable!("pending-pane cleanup task received a capture key");
+    };
+    loop {
+        let payload = {
+            let mut guard = state.lock().await;
+            let Some(entry) = guard.cleanup.pending_panes.get_mut(&lease_id) else {
+                drop(guard);
+                if supervisor
+                    .release_slot_unless_requeued(&state, &key, claim)
+                    .await
+                {
+                    break;
+                }
+                continue;
+            };
+            if entry.phase == CleanupPhase::Ready && entry.next_retry <= Instant::now() {
+                entry.phase = CleanupPhase::InFlight;
+            }
+            (entry.phase == CleanupPhase::InFlight).then(|| {
+                (
+                    entry.session.clone(),
+                    entry.registration.clone(),
+                    entry.primary.clone(),
+                )
+            })
+        };
+        let Some((session, registration, primary)) = payload else {
+            enum WaitOutcome {
+                Gone,
+                Wait(Duration),
+            }
+            let outcome = {
+                let guard = state.lock().await;
+                match guard.cleanup.pending_panes.get(&lease_id) {
+                    None => WaitOutcome::Gone,
+                    Some(entry) => WaitOutcome::Wait(
+                        entry.next_retry.saturating_duration_since(Instant::now()),
+                    ),
+                }
+            };
+            let wait = match outcome {
+                WaitOutcome::Gone => {
+                    if supervisor
+                        .release_slot_unless_requeued(&state, &key, claim)
+                        .await
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                WaitOutcome::Wait(wait) => wait,
+            };
+            let notified = supervisor.wake.notified();
+            tokio::pin!(notified);
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = &mut notified => {}
+            }
+            continue;
+        };
+        let Some(lease) = registration.lease.clone() else {
+            // A lease-less registration carries no host provenance: drop the
+            // entry, then exit only when the terminal check confirms no
+            // re-enqueue replaced it; otherwise loop to process the new entry.
+            {
+                let mut guard = state.lock().await;
+                guard.cleanup.pending_panes.remove(&lease_id);
+            }
+            if supervisor
+                .release_slot_unless_requeued(&state, &key, claim)
+                .await
+            {
+                break;
+            }
+            continue;
+        };
+        let request = PendingPaneRegistration {
+            ui_session: adapter_session(&session),
+            pane: PaneId::new(registration.pane.as_str()),
+            temporary_tab: registration
+                .temporary_tab
+                .as_ref()
+                .map(|tab| TabId::new(tab.as_str())),
+        };
+        match adapter.close_pending_pane(request, lease).await {
+            Ok(()) => {
+                // Success removes the entry; exit only when the terminal
+                // check (under the state lock) confirms nothing was
+                // re-enqueued in the meantime, otherwise loop again.
+                {
+                    let mut guard = state.lock().await;
+                    guard.cleanup.pending_panes.remove(&lease_id);
+                }
+                if supervisor
+                    .release_slot_unless_requeued(&state, &key, claim)
+                    .await
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                let error = bounded_adapter_error(error);
+                enum Outcome {
+                    Missing,
+                    Retry(Duration),
+                }
+                let outcome = {
+                    let mut guard = state.lock().await;
+                    match guard.cleanup.pending_panes.get_mut(&lease_id) {
+                        None => Outcome::Missing,
+                        Some(entry) => {
+                            entry.phase = CleanupPhase::Ready;
+                            entry.attempt = entry.attempt.saturating_add(1);
+                            entry.next_retry = Instant::now() + cleanup_retry_delay(entry.attempt);
+                            entry.last_cleanup_error = Some(error.clone());
+                            tracing::error!(
+                                cleanup = "pending pane",
+                                ?lease_id,
+                                attempt = entry.attempt,
+                                primary = ?primary,
+                                error = %error,
+                                "host cleanup failed; retaining provenance for deterministic retry"
+                            );
+                            Outcome::Retry(cleanup_retry_delay(entry.attempt))
+                        }
+                    }
+                };
+                let delay = match outcome {
+                    Outcome::Missing => {
+                        if supervisor
+                            .release_slot_unless_requeued(&state, &key, claim)
+                            .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Outcome::Retry(delay) => delay,
+                };
+                let notified = supervisor.wake.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = &mut notified => {}
+                }
+            }
+        }
+    }
+    supervisor.remove_if_claim(&key, claim);
+}
+
+async fn run_capture_cleanup(
+    adapter: Arc<dyn HostAdapter>,
+    state: Arc<Mutex<BrokerState>>,
+    supervisor: Arc<CleanupSupervisor>,
+    key: CleanupTaskKey,
+    claim: u64,
+) {
+    let CleanupTaskKey::Capture(lease_id) = key.clone() else {
+        unreachable!("capture cleanup task received a pending-pane key");
+    };
+    loop {
+        let payload = {
+            let mut guard = state.lock().await;
+            let Some(entry) = guard.cleanup.captures.get_mut(&lease_id) else {
+                drop(guard);
+                if supervisor
+                    .release_slot_unless_requeued(&state, &key, claim)
+                    .await
+                {
+                    break;
+                }
+                continue;
+            };
+            if entry.phase == CleanupPhase::Ready && entry.next_retry <= Instant::now() {
+                entry.phase = CleanupPhase::InFlight;
+            }
+            (entry.phase == CleanupPhase::InFlight)
+                .then(|| (entry.lease.clone(), entry.reason, entry.primary.clone()))
+        };
+        let Some((lease, reason, primary)) = payload else {
+            enum WaitOutcome {
+                Gone,
+                Wait(Duration),
+            }
+            let outcome = {
+                let guard = state.lock().await;
+                match guard.cleanup.captures.get(&lease_id) {
+                    None => WaitOutcome::Gone,
+                    Some(entry) => WaitOutcome::Wait(
+                        entry.next_retry.saturating_duration_since(Instant::now()),
+                    ),
+                }
+            };
+            let wait = match outcome {
+                WaitOutcome::Gone => {
+                    if supervisor
+                        .release_slot_unless_requeued(&state, &key, claim)
+                        .await
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                WaitOutcome::Wait(wait) => wait,
+            };
+            let notified = supervisor.wake.notified();
+            tokio::pin!(notified);
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = &mut notified => {}
+            }
+            continue;
+        };
+        match adapter.end_capture(lease, reason).await {
+            Ok(()) => {
+                {
+                    let mut guard = state.lock().await;
+                    guard.cleanup.captures.remove(&lease_id);
+                }
+                if supervisor
+                    .release_slot_unless_requeued(&state, &key, claim)
+                    .await
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                let error = bounded_adapter_error(error);
+                enum Outcome {
+                    Missing,
+                    Retry(Duration),
+                }
+                let outcome = {
+                    let mut guard = state.lock().await;
+                    match guard.cleanup.captures.get_mut(&lease_id) {
+                        None => Outcome::Missing,
+                        Some(entry) => {
+                            entry.phase = CleanupPhase::Ready;
+                            entry.attempt = entry.attempt.saturating_add(1);
+                            entry.next_retry = Instant::now() + cleanup_retry_delay(entry.attempt);
+                            entry.last_cleanup_error = Some(error.clone());
+                            tracing::error!(
+                                cleanup = "capture lease",
+                                ?lease_id,
+                                attempt = entry.attempt,
+                                primary = ?primary,
+                                error = %error,
+                                "host cleanup failed; retaining provenance for deterministic retry"
+                            );
+                            Outcome::Retry(cleanup_retry_delay(entry.attempt))
+                        }
+                    }
+                };
+                let delay = match outcome {
+                    Outcome::Missing => {
+                        if supervisor
+                            .release_slot_unless_requeued(&state, &key, claim)
+                            .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Outcome::Retry(delay) => delay,
+                };
+                let notified = supervisor.wake.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = &mut notified => {}
+                }
+            }
+        }
+    }
+    supervisor.remove_if_claim(&key, claim);
+}
+
 fn adapter_session(session: &UiSessionId) -> muxe_adapter_api::UiSessionId {
     muxe_adapter_api::UiSessionId::new(session.as_str())
+}
+fn bounded_cleanup_message(mut message: String) -> String {
+    muxe_protocol::truncate_utf8(&mut message, muxe_protocol::MAX_DIAGNOSTIC_LEN);
+    message
+}
+fn bounded_adapter_error(mut error: AdapterError) -> AdapterError {
+    muxe_protocol::truncate_utf8(&mut error.message, muxe_protocol::MAX_DIAGNOSTIC_LEN);
+    error
 }
 
 fn diagnostic(code: DiagnosticCode, message: &str) -> ProtocolDiagnostic {
@@ -3055,12 +4004,7 @@ menus:
             Ok(())
         }
 
-        async fn release_pending_pane(
-            &self,
-            _lease: muxe_adapter_api::PendingPaneLease,
-        ) -> Result<(), AdapterError> {
-            Ok(())
-        }
+        fn release_pending_pane(&self, _lease: muxe_adapter_api::PendingPaneLease) {}
 
         async fn capture_origin(
             &self,
@@ -3146,8 +4090,25 @@ menus:
     struct ScopedTestAdapter {
         dispatches: AtomicUsize,
         pending_releases: AtomicUsize,
+        cancellable: AtomicBool,
+        block_cancel: AtomicBool,
+        cancel_entered: Arc<Notify>,
+        cancel_release: Arc<Notify>,
+        capture_entered: Arc<Notify>,
+        capture_release: Arc<Notify>,
+        block_capture: AtomicBool,
         ended_captures: Mutex<Vec<(String, CaptureReleaseReason)>>,
         closed_panes: Mutex<Vec<(String, Option<String>)>>,
+        close_entered: Arc<Notify>,
+        close_release: Arc<Notify>,
+        block_close: AtomicBool,
+        fail_close_once: AtomicBool,
+        fail_close_always: AtomicBool,
+        block_end: AtomicBool,
+        end_entered: Arc<Notify>,
+        end_release: Arc<Notify>,
+        fail_end_once: AtomicBool,
+        fail_end_always: AtomicBool,
         origin_entered: Arc<Notify>,
         origin_release: Arc<Notify>,
         block_origin: AtomicBool,
@@ -3161,7 +4122,10 @@ menus:
             _action_span: &muxe_core::SourceSpan,
         ) -> Result<ActionValidation, ConfigDiagnostic> {
             Ok(ActionValidation {
-                execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                execution: muxe_core::ExecutionCapabilities {
+                    cancellable: self.cancellable.load(Ordering::SeqCst),
+                    ..muxe_core::ExecutionCapabilities::ASYNCHRONOUS
+                },
             })
         }
 
@@ -3169,9 +4133,13 @@ menus:
             &self,
             candidates: &[&muxe_core::NativeActionCandidate],
         ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+            let cancellable = self.cancellable.load(Ordering::SeqCst);
             Ok(vec![
                 ActionValidation {
-                    execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                    execution: muxe_core::ExecutionCapabilities {
+                        cancellable,
+                        ..muxe_core::ExecutionCapabilities::ASYNCHRONOUS
+                    },
                 };
                 candidates.len()
             ])
@@ -3210,18 +4178,33 @@ menus:
             &self,
             request: CaptureRequest,
         ) -> Result<CaptureLease, AdapterError> {
+            if self.block_capture.load(Ordering::SeqCst) {
+                self.capture_entered.notify_one();
+                self.capture_release.notified().await;
+            }
             Ok(CaptureLease {
                 id: CaptureLeaseId::new(request.ui_session.as_str()),
                 ui_session: request.ui_session,
                 modal_scope: request.modal_scope,
             })
         }
-
         async fn end_capture(
             &self,
             lease: CaptureLease,
             reason: CaptureReleaseReason,
         ) -> Result<(), AdapterError> {
+            if self.block_end.load(Ordering::SeqCst) {
+                self.end_entered.notify_one();
+                self.end_release.notified().await;
+            }
+            if self.fail_end_always.load(Ordering::SeqCst)
+                || self.fail_end_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "injected capture cleanup failure",
+                ));
+            }
             self.ended_captures
                 .lock()
                 .await
@@ -3241,12 +4224,23 @@ menus:
                 ui_session: registration.ui_session,
             })
         }
-
         async fn close_pending_pane(
             &self,
             registration: PendingPaneRegistration,
             _lease: muxe_adapter_api::PendingPaneLease,
         ) -> Result<(), AdapterError> {
+            if self.block_close.load(Ordering::SeqCst) {
+                self.close_entered.notify_one();
+                self.close_release.notified().await;
+            }
+            if self.fail_close_always.load(Ordering::SeqCst)
+                || self.fail_close_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "injected pane cleanup failure",
+                ));
+            }
             self.closed_panes.lock().await.push((
                 registration.pane.as_str().to_owned(),
                 registration
@@ -3257,12 +4251,8 @@ menus:
             Ok(())
         }
 
-        async fn release_pending_pane(
-            &self,
-            _lease: muxe_adapter_api::PendingPaneLease,
-        ) -> Result<(), AdapterError> {
+        fn release_pending_pane(&self, _lease: muxe_adapter_api::PendingPaneLease) {
             self.pending_releases.fetch_add(1, Ordering::SeqCst);
-            Ok(())
         }
 
         async fn capture_origin(
@@ -3290,7 +4280,10 @@ menus:
             Ok(DispatchAccepted {
                 correlation: ExecutionCorrelationId::new("unexpected"),
                 execution: request.execution,
-                capabilities: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                capabilities: muxe_core::ExecutionCapabilities {
+                    cancellable: self.cancellable.load(Ordering::SeqCst),
+                    ..muxe_core::ExecutionCapabilities::ASYNCHRONOUS
+                },
             })
         }
 
@@ -3302,11 +4295,18 @@ menus:
             Ok(DispatchAccepted {
                 correlation: ExecutionCorrelationId::new("native"),
                 execution: request.execution,
-                capabilities: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                capabilities: muxe_core::ExecutionCapabilities {
+                    cancellable: self.cancellable.load(Ordering::SeqCst),
+                    ..muxe_core::ExecutionCapabilities::ASYNCHRONOUS
+                },
             })
         }
 
         async fn cancel(&self, _execution: CoreExecutionId) -> Result<(), AdapterError> {
+            if self.block_cancel.load(Ordering::SeqCst) {
+                self.cancel_entered.notify_one();
+                self.cancel_release.notified().await;
+            }
             Ok(())
         }
 
@@ -4624,14 +5624,16 @@ menus:
             )
             .await
             .expect("UI attaches after placement commit");
-        assert!(matches!(
-            attached,
-            RequestResult::Immediate(BrokerResponse::UiAttached { .. })
-        ));
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("expected immediate gated attachment");
+        };
         let state = broker.state.lock().await;
-        assert_eq!(adapter.pending_releases.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.pending_releases.load(Ordering::SeqCst), 0);
         assert!(state.gate.pending(token).is_none());
         assert!(!state.pending_sessions.contains_key(&token));
+        drop(state);
+        broker.confirm_gated_attachment(token, &session).await;
+        assert_eq!(adapter.pending_releases.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4706,13 +5708,18 @@ menus:
             .commit(token, HostPaneId::new("attach-first"))
             .await
             .expect("exact pane commits after attach");
-        assert!(matches!(
-            pending_attachment.wait().await,
-            BrokerResponse::UiAttached { .. }
-        ));
+        let pending_token = pending_attachment.token();
+        let BrokerResponse::UiAttached { session, .. } = pending_attachment.wait().await else {
+            panic!("expected gated attachment readiness");
+        };
         let state = broker.state.lock().await;
         assert!(state.gate.pending(token).is_none());
         assert!(!state.pending_sessions.contains_key(&token));
+        assert_eq!(adapter.pending_releases.load(Ordering::SeqCst), 0);
+        drop(state);
+        broker
+            .confirm_gated_attachment(pending_token, &session)
+            .await;
         assert_eq!(adapter.pending_releases.load(Ordering::SeqCst), 1);
     }
 
@@ -4766,6 +5773,211 @@ menus:
         let state = broker.state.lock().await;
         assert!(state.gate.pending(token).is_none());
         assert!(!state.pending_sessions.contains_key(&token));
+    }
+    #[tokio::test]
+    async fn gated_disconnect_after_commit_detaches_session_instead_of_aborting_token() {
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let token =
+            prepared_registered_launch(&broker, "commit-disconnect", Some("temporary-tab")).await;
+        // Drive the gated attach through the blocked origin barrier so the
+        // test observes the same (pending token, session) association the
+        // connection layer tracks while the launch is unpublished.
+        adapter.block_origin.store(true, Ordering::SeqCst);
+        let attach_broker = Arc::clone(&broker);
+        let attach = tokio::spawn(async move {
+            let (events, _events_rx) = mpsc::channel(1);
+            attach_broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::AttachUi(AttachUi {
+                        root: muxe_protocol::MenuId::new("main"),
+                        pane: HostPaneId::new("commit-disconnect"),
+                        pending_launch: Some(token),
+                        origin: None,
+                        caller_identity: None,
+                        theme: None,
+                        color_scheme: None,
+                    }),
+                    events,
+                )
+                .await
+                .expect("UI attach reaches the origin barrier")
+        });
+        adapter.origin_entered.notified().await;
+        let pending_session = {
+            let state = broker.state.lock().await;
+            state
+                .pending_sessions
+                .get(&token)
+                .cloned()
+                .expect("blocked attach owns a pending session")
+        };
+        // A launcher commit racing the blocked attach consumes the token the
+        // same way a hostile commit/disconnect interleave would; the
+        // disconnect below must then take the attached-session branch, not
+        // abort the already-consumed token.
+        broker
+            .commit(token, HostPaneId::new("commit-disconnect"))
+            .await
+            .expect("placement commit records while origin capture is blocked");
+        adapter.origin_release.notify_one();
+        let attached = attach.await.expect("attach task completes");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("expected immediate attachment after commit");
+        };
+        assert_eq!(session, pending_session);
+        assert_eq!(adapter.pending_releases.load(Ordering::SeqCst), 0);
+        broker
+            .disconnect_gated(token, UiSessionId::new("stale-session"))
+            .await;
+        assert!(
+            broker.sessions.lock().await.contains_key(&session),
+            "mismatched consumed token/session does not detach the live session"
+        );
+        // The exact H06 failure was `abort(consumed token)` here: it errored
+        // on the unknown token and skipped session cleanup. The broker-atomic
+        // classification must detach the published session instead.
+        broker.disconnect_gated(token, session.clone()).await;
+        assert!(
+            broker.sessions.lock().await.get(&session).is_none(),
+            "committed session is detached exactly once"
+        );
+        assert_eq!(
+            adapter.pending_releases.load(Ordering::SeqCst),
+            0,
+            "disconnect claims unconfirmed pane ownership instead of releasing it"
+        );
+        let state = broker.state.lock().await;
+        assert!(state.gate.pending(token).is_none());
+        assert!(
+            state
+                .gate
+                .owner(&muxe_protocol::ModalScopeId::new("commit-disconnect"))
+                .is_none(),
+            "committed scope is released"
+        );
+        drop(state);
+        wait_for_ended_capture(&adapter, session.as_str()).await;
+        let ended = adapter.ended_captures.lock().await;
+        assert_eq!(ended.len(), 1, "exactly one capture ends for the session");
+        assert_eq!(ended[0].0, session.as_str());
+        assert_eq!(ended[0].1, CaptureReleaseReason::UiDismissed);
+    }
+
+    #[tokio::test]
+    async fn pending_disconnect_before_commit_aborts_token_and_closes_pane() {
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let token =
+            prepared_registered_launch(&broker, "pending-disconnect", Some("temporary-tab")).await;
+        adapter.block_origin.store(true, Ordering::SeqCst);
+        let attach_broker = Arc::clone(&broker);
+        let attach = tokio::spawn(async move {
+            let (events, _events_rx) = mpsc::channel(1);
+            attach_broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::AttachUi(AttachUi {
+                        root: muxe_protocol::MenuId::new("main"),
+                        pane: HostPaneId::new("pending-disconnect"),
+                        pending_launch: Some(token),
+                        origin: None,
+                        caller_identity: None,
+                        theme: None,
+                        color_scheme: None,
+                    }),
+                    events,
+                )
+                .await
+        });
+        adapter.origin_entered.notified().await;
+        let pending_session = {
+            broker
+                .state
+                .lock()
+                .await
+                .pending_sessions
+                .get(&token)
+                .cloned()
+                .expect("blocked attach owns a pending session")
+        };
+        // A mismatched pending pair is stale and must not abort the launch.
+        broker
+            .disconnect_gated(token, UiSessionId::new("stale-session"))
+            .await;
+        assert!(broker.state.lock().await.gate.pending(token).is_some());
+        // Disconnect while the token is still pending must take the token
+        // branch: abort the launch and close the registered pane.
+        broker
+            .disconnect_gated(token, pending_session.clone())
+            .await;
+        adapter.origin_release.notify_one();
+        assert!(attach.await.expect("blocked attach completes").is_err());
+        let state = broker.state.lock().await;
+        assert!(state.gate.pending(token).is_none());
+        assert!(!state.pending_sessions.contains_key(&token));
+        drop(state);
+        assert!(broker.sessions.lock().await.is_empty());
+        wait_for_closed_pane(&adapter, "pending-disconnect").await;
+        assert_eq!(
+            *adapter.closed_panes.lock().await,
+            vec![(
+                "pending-disconnect".to_owned(),
+                Some("temporary-tab".to_owned())
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_capture_detach_ends_acquired_lease_exactly_once() {
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let (events, _events_rx) = mpsc::channel(1);
+        // An unscoped attach inserts its session record before capture starts;
+        // a detach racing the blocked begin_capture removes it first, so the
+        // newly acquired lease must be ended exactly once on install miss.
+        adapter.block_capture.store(true, Ordering::SeqCst);
+        let attach_broker = Arc::clone(&broker);
+        let attach = tokio::spawn(async move {
+            attach_broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::AttachUi(AttachUi {
+                        root: muxe_protocol::MenuId::new("main"),
+                        pane: HostPaneId::new("capture-race"),
+                        pending_launch: None,
+                        origin: None,
+                        caller_identity: None,
+                        theme: None,
+                        color_scheme: None,
+                    }),
+                    events,
+                )
+                .await
+        });
+        adapter.capture_entered.notified().await;
+        let racing_session = {
+            broker
+                .sessions
+                .lock()
+                .await
+                .keys()
+                .next()
+                .cloned()
+                .expect("blocked capture owns a session record")
+        };
+        broker
+            .detach(&racing_session, CaptureReleaseReason::UiDismissed)
+            .await
+            .expect("racing detach wins while capture is blocked");
+        adapter.capture_release.notify_one();
+        let result = attach.await.expect("blocked attach completes");
+        assert!(
+            matches!(result, Err(BrokerError::UnknownSession(_))),
+            "install-miss attach reports the detached session"
+        );
+        wait_for_ended_capture(&adapter, racing_session.as_str()).await;
+        let ended = adapter.ended_captures.lock().await;
+        assert_eq!(ended.len(), 1, "the orphaned lease ends exactly once");
+        assert!(broker.sessions.lock().await.is_empty());
     }
     #[tokio::test]
     async fn attach_rechecks_activation_seal_at_final_publication() {
@@ -4886,6 +6098,7 @@ menus:
                 .expect("blocked attach task completes")
                 .is_err()
         );
+        wait_for_closed_pane(&adapter, "abort-blocked").await;
         assert_eq!(
             *adapter.closed_panes.lock().await,
             vec![("abort-blocked".to_owned(), Some("temporary-tab".to_owned()))]
@@ -4945,6 +6158,7 @@ menus:
                 .expect("blocked attach task completes")
                 .is_err()
         );
+        wait_for_closed_pane(&adapter, "expire-blocked").await;
         assert_eq!(
             *adapter.closed_panes.lock().await,
             vec![(
@@ -5003,6 +6217,7 @@ menus:
                 .expect("blocked attach task completes")
                 .is_err()
         );
+        wait_for_closed_pane(&adapter, "replace-blocked").await;
         assert_eq!(
             *adapter.closed_panes.lock().await,
             vec![(
@@ -5040,6 +6255,7 @@ menus:
             )
             .await;
         assert!(result.is_err());
+        wait_for_closed_pane(&adapter, "origin-fails").await;
         assert_eq!(
             *adapter.closed_panes.lock().await,
             vec![("origin-fails".to_owned(), Some("temporary-tab".to_owned()))]
@@ -5094,6 +6310,7 @@ menus:
         assert!(!state.pending_sessions.contains_key(&token));
         drop(state);
         assert!(broker.sessions.lock().await.is_empty());
+        wait_for_closed_pane(&adapter, "abort-real").await;
         assert_eq!(
             *adapter.closed_panes.lock().await,
             vec![("abort-real".to_owned(), Some("temporary-tab".to_owned()))]
@@ -5148,10 +6365,465 @@ menus:
         assert!(!state.pending_sessions.contains_key(&token));
         drop(state);
         assert!(broker.sessions.lock().await.is_empty());
+        wait_for_closed_pane(&adapter, "expire-real").await;
         assert_eq!(
             *adapter.closed_panes.lock().await,
             vec![("expire-real".to_owned(), Some("temporary-tab".to_owned()))]
         );
+    }
+    #[tokio::test]
+    async fn pending_pane_cleanup_retries_after_one_failure() {
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let token = prepared_registered_launch(&broker, "retry-pane", Some("temporary-tab")).await;
+        adapter.fail_close_once.store(true, Ordering::SeqCst);
+        broker
+            .abort(token)
+            .await
+            .expect("abort enqueues pane cleanup without awaiting host I/O");
+        wait_for_closed_pane(&adapter, "retry-pane").await;
+        assert_eq!(
+            *adapter.closed_panes.lock().await,
+            vec![("retry-pane".to_owned(), Some("temporary-tab".to_owned()))]
+        );
+        assert!(
+            broker.state.lock().await.cleanup.pending_panes.is_empty(),
+            "successful retry consumes retained pane provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_cleanup_retries_after_one_failure() {
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let (session, _events) = attach_ready(&broker, "retry-capture").await;
+        adapter.fail_end_once.store(true, Ordering::SeqCst);
+        broker
+            .detach(&session, CaptureReleaseReason::UiDismissed)
+            .await
+            .expect("detach enqueues capture cleanup");
+        wait_for_ended_capture(&adapter, session.as_str()).await;
+        assert_eq!(
+            adapter.ended_captures.lock().await.len(),
+            1,
+            "one retained capture lease is ended after retry"
+        );
+        assert!(broker.state.lock().await.cleanup.captures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requeued_pane_entry_keeps_live_task_through_terminal_window() {
+        // B2 pane variant: parks the task between success entry-removal and
+        // slot removal, re-enqueues the same lease in that window, and proves
+        // the entry keeps a live owning task that completes the cleanup.
+        // Pre-fix (plain `remove_if_claim` exit) this orphans the re-enqueued
+        // entry: no task owns the key, so the close never happens.
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let token =
+            prepared_registered_launch(&broker, "requeue-pane", Some("temporary-tab")).await;
+        broker
+            .abort(token)
+            .await
+            .expect("abort enqueues pane cleanup");
+        let key = {
+            let state = broker.state.lock().await;
+            let lease = state
+                .cleanup
+                .pending_panes
+                .keys()
+                .next()
+                .expect("abort retains a pane entry")
+                .clone();
+            crate::broker::CleanupTaskKey::PendingPane(lease)
+        };
+        // Block the first close so the task cannot finish before the gate
+        // is armed, then wait until it owns the key.
+        adapter.block_close.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !broker.cleanup.has_live_task(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup task owns its key");
+        tokio::time::timeout(Duration::from_secs(1), adapter.close_entered.notified())
+            .await
+            .expect("pane task reaches the blocked adapter close");
+        let (entered, release) = crate::cleanup_task_hooks::arm(&key);
+        // Release the first close: it succeeds, the task removes the entry,
+        // then parks in the exit gate before removing its slot.
+        adapter.block_close.store(false, Ordering::SeqCst);
+        adapter.close_release.notify_one();
+        // Capture the SAME provenance before the terminal pass consumes it:
+        // re-enqueueing this exact (session, registration) reuses the same
+        // lease id, hence the same CleanupTaskKey the parked task owns.
+        let (session, registration) = {
+            let state = broker.state.lock().await;
+            let (session, entry) = state
+                .cleanup
+                .pending_panes
+                .iter()
+                .next()
+                .map(|(_, entry)| (entry.session.clone(), entry.registration.clone()))
+                .expect("abort retains a pane entry");
+            (session, entry)
+        };
+        // Trigger the terminal pass: the task removes the entry and parks in
+        // the exit gate between entry removal and slot removal.
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("task parks in the terminal window");
+        // Re-enqueue the SAME key inside the window: the slot is still live
+        // (handle not finished), so the enqueue wakes instead of spawning.
+        broker
+            .enqueue_pending_pane_close(&session, registration, None)
+            .await;
+        assert!(
+            broker.cleanup.has_live_task(&key),
+            "re-enqueued entry keeps its live owning task"
+        );
+        release.notify_one();
+        // Disarm immediately: the re-processing pass also routes through the
+        // handshake, and must not park a second time.
+        crate::cleanup_task_hooks::clear();
+        wait_for_closed_pane(&adapter, "requeue-pane").await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !broker.state.lock().await.cleanup.pending_panes.is_empty()
+                || broker.cleanup.task_count() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("re-enqueued pane cleanup completes and the slot is released");
+        crate::cleanup_task_hooks::clear();
+    }
+
+    #[tokio::test]
+    async fn requeued_capture_entry_keeps_live_task_through_terminal_window() {
+        // B2 capture variant: same terminal-window interleaving for captures.
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let (session, _events) = attach_ready(&broker, "requeue-capture").await;
+        let lease_id = {
+            broker
+                .detach(&session, CaptureReleaseReason::UiDismissed)
+                .await
+                .expect("detach enqueues capture cleanup");
+            let state = broker.state.lock().await;
+            state
+                .cleanup
+                .captures
+                .keys()
+                .next()
+                .expect("detach retains a capture entry")
+                .clone()
+        };
+        let key = crate::broker::CleanupTaskKey::Capture(lease_id);
+        // Block the first end so the task cannot finish before the gate is
+        // armed, then wait until it owns the key.
+        adapter.block_end.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !broker.cleanup.has_live_task(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capture task owns its key");
+        tokio::time::timeout(Duration::from_secs(1), adapter.end_entered.notified())
+            .await
+            .expect("capture task reaches the blocked adapter end");
+        let (entered, release) = crate::cleanup_task_hooks::arm(&key);
+        // Release the first end: it succeeds, the task removes the entry,
+        // then parks in the exit gate before removing its slot.
+        adapter.block_end.store(false, Ordering::SeqCst);
+        adapter.end_release.notify_one();
+        // Capture the SAME lease before the terminal pass consumes it:
+        // re-enqueueing this exact lease reuses the same CaptureLeaseId,
+        // hence the same CleanupTaskKey the parked task owns.
+        let (lease, reason) = {
+            let state = broker.state.lock().await;
+            state
+                .cleanup
+                .captures
+                .values()
+                .next()
+                .map(|entry| (entry.lease.clone(), entry.reason))
+                .expect("detach retains a capture entry")
+        };
+        // The task removes the entry and parks in the exit gate between
+        // entry removal and slot removal.
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("capture task parks in the terminal window");
+        // Re-enqueue the SAME key inside the window: the slot is still live
+        // (handle not finished), so the enqueue wakes instead of spawning.
+        broker.enqueue_capture_cleanup(lease, reason, None).await;
+        assert!(
+            broker.cleanup.has_live_task(&key),
+            "re-enqueued capture keeps its live owning task"
+        );
+        release.notify_one();
+        crate::cleanup_task_hooks::clear();
+        wait_for_ended_capture(&adapter, session.as_str()).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !broker.state.lock().await.cleanup.captures.is_empty()
+                || broker.cleanup.task_count() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("re-enqueued capture cleanup completes and the slot is released");
+        crate::cleanup_task_hooks::clear();
+    }
+
+    #[tokio::test]
+    async fn drain_fails_closed_when_pane_close_never_confirms() {
+        // B3 pane variant: every close fails, so the registry never drains;
+        // drain must return ActivationCleanupUnconfirmed (carrying the
+        // recorded error) and reopen admission (seal cleared).
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let token = prepared_registered_launch(&broker, "drain-pane", Some("temporary-tab")).await;
+        adapter.fail_close_always.store(true, Ordering::SeqCst);
+        broker
+            .abort(token)
+            .await
+            .expect("abort enqueues pane cleanup");
+        let result = broker.drain_for_activation().await;
+        let detail = match result {
+            Err(BrokerError::ActivationCleanupUnconfirmed(detail)) => detail,
+            other => panic!("drain must not succeed with unconfirmed cleanup: {other:?}"),
+        };
+        assert!(
+            detail.contains("injected pane cleanup failure"),
+            "drain error carries the recorded last_cleanup_error: {detail}"
+        );
+        assert!(
+            !broker.state.lock().await.activation_sealed,
+            "failed drain reopens admission so the coordinator can retry"
+        );
+        // Registry still holds the entry for the retry path.
+        assert_eq!(
+            broker.state.lock().await.cleanup.pending_panes.len(),
+            1,
+            "unconfirmed entry is retained for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_fails_closed_when_capture_end_never_confirms() {
+        // B3 capture variant.
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let (session, _events) = attach_ready(&broker, "drain-capture").await;
+        adapter.fail_end_always.store(true, Ordering::SeqCst);
+        broker
+            .detach(&session, CaptureReleaseReason::UiDismissed)
+            .await
+            .expect("detach enqueues capture cleanup");
+        let result = broker.drain_for_activation().await;
+        let detail = match result {
+            Err(BrokerError::ActivationCleanupUnconfirmed(detail)) => detail,
+            other => panic!("drain must not succeed with unconfirmed capture: {other:?}"),
+        };
+        assert!(
+            detail.contains("injected capture cleanup failure"),
+            "drain error carries the recorded last_cleanup_error: {detail}"
+        );
+        assert!(
+            !broker.state.lock().await.activation_sealed,
+            "failed drain reopens admission so the coordinator can retry"
+        );
+        assert_eq!(
+            broker.state.lock().await.cleanup.captures.len(),
+            1,
+            "unconfirmed capture is retained for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_confirms_cleanup_and_returns_ok_promptly() {
+        // B3 success case: cooperating adapter, drain observes confirmation.
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let token = prepared_registered_launch(&broker, "drain-ok", Some("temporary-tab")).await;
+        broker
+            .abort(token)
+            .await
+            .expect("abort enqueues pane cleanup");
+        tokio::time::timeout(Duration::from_secs(1), broker.drain_for_activation())
+            .await
+            .expect("drain completes promptly with a cooperating adapter")
+            .expect("drain returns Ok once cleanup is confirmed");
+        assert!(
+            broker.state.lock().await.cleanup.pending_panes.is_empty(),
+            "confirmed entries are gone after drain"
+        );
+        wait_for_closed_pane(&adapter, "drain-ok").await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_detach_cannot_drop_cleanup_provenance() {
+        // B4: provenance is inserted atomically with the unlink under the
+        // state lock, so cancelling detach between the unlink and the
+        // `request_execution_stop` await cannot lose it. Pre-fix the capture
+        // and pane enqueues sit after that await, so nothing is inserted at
+        // the barrier and this test fails there.
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        // Gated flow: prepare + register + attach(wait) + commit, so the
+        // session holds both a capture lease and a gated registration.
+        let token =
+            prepared_registered_launch(&broker, "cancel-detach", Some("temporary-tab")).await;
+        let (events, _events_rx) = mpsc::channel(8);
+        let RequestResult::WaitForAttachment(pending) = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("cancel-detach"),
+                    pending_launch: Some(token),
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events,
+            )
+            .await
+            .expect("gated attach waits")
+        else {
+            panic!("expected a gated attachment waiter");
+        };
+        let session = pending.session().clone();
+        broker
+            .commit(token, HostPaneId::new("cancel-detach"))
+            .await
+            .expect("commit publishes gated ownership");
+        // Invoke a cancellable detachable execution on the session so detach
+        // has a `cancel` entry and awaits `request_execution_stop` (which
+        // calls the adapter's blocking `cancel`) after the unlink.
+        let invoked = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: _binding.generation().0,
+                        ordinal: _binding.ordinal(),
+                    },
+                }),
+                mpsc::channel(1).0,
+            )
+            .await
+            .expect("detachable invocation is accepted");
+        assert!(
+            matches!(
+                invoked,
+                RequestResult::Immediate(BrokerResponse::InvocationAccepted { .. })
+            ),
+            "invocation is accepted before the detach race"
+        );
+        // The execution must still own the session with cancel-on-control, or
+        // detach has no `cancel` entry and never awaits `request_execution_stop`.
+        {
+            let state = broker.state.lock().await;
+            let attached = state
+                .executions
+                .values()
+                .filter(|record| {
+                    record.session.as_ref() == Some(&session)
+                        && record.cancellable
+                        && record.on_menu_control == muxe_core::MenuControlAction::Cancel
+                })
+                .count();
+            assert_eq!(
+                attached, 1,
+                "one cancellable cancel-on-control execution owns the session"
+            );
+        }
+        // Block inside `request_execution_stop`: detach has released the
+        // state lock (unlink + atomic inserts done post-fix) but has not yet
+        // reached the provenance enqueues (pre-fix) or the readiness send.
+        // Block the supervised adapter awaits too: otherwise the tasks
+        // spawned by the atomic insert consume the entries before the
+        // post-cancel assert runs.
+        adapter.block_close.store(true, Ordering::SeqCst);
+        adapter.block_end.store(true, Ordering::SeqCst);
+        adapter.block_cancel.store(true, Ordering::SeqCst);
+        let detach_broker = Arc::clone(&broker);
+        let session_clone = session.clone();
+        let detach = tokio::spawn(async move {
+            detach_broker
+                .detach(&session_clone, CaptureReleaseReason::UiDismissed)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), adapter.cancel_entered.notified())
+            .await
+            .expect("detach parks inside request_execution_stop");
+        // Cancel exactly in the window: unlink done, stop-await pending.
+        detach.abort();
+        let _ = detach.await;
+        // Provenance must already exist: atomic with the unlink, not after
+        // the stop await. Pre-fix this assertion fails (zero entries).
+        {
+            let state = broker.state.lock().await;
+            assert_eq!(
+                state.cleanup.pending_panes.len(),
+                1,
+                "cancelled detach keeps the pane entry"
+            );
+            assert_eq!(
+                state.cleanup.captures.len(),
+                1,
+                "cancelled detach keeps the capture entry"
+            );
+        }
+        adapter.block_cancel.store(false, Ordering::SeqCst);
+        adapter.cancel_release.notify_waiters();
+        adapter.block_close.store(false, Ordering::SeqCst);
+        adapter.block_end.store(false, Ordering::SeqCst);
+        adapter.close_release.notify_waiters();
+        adapter.end_release.notify_waiters();
+        wait_for_closed_pane(&adapter, "cancel-detach").await;
+        wait_for_ended_capture(&adapter, session.as_str()).await;
+        crate::cleanup_task_hooks::clear();
+    }
+
+    #[tokio::test]
+    async fn aborted_request_cannot_strand_inflight_pane_cleanup() {
+        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let token =
+            prepared_registered_launch(&broker, "abort-cleanup", Some("temporary-tab")).await;
+        adapter.block_close.store(true, Ordering::SeqCst);
+        let hook = Arc::new(CleanupEnqueueHook::new());
+        broker.set_cleanup_enqueue_hook(Some(Arc::clone(&hook)));
+        let abort_broker = Arc::clone(&broker);
+        let request = tokio::spawn(async move { abort_broker.abort(token).await });
+        hook.entered.notified().await;
+        adapter.close_entered.notified().await;
+        assert!(
+            !request.is_finished(),
+            "originating abort remains pending at the post-enqueue barrier"
+        );
+        request.abort();
+        hook.release.notify_one();
+        adapter.close_release.notify_one();
+        wait_for_closed_pane(&adapter, "abort-cleanup").await;
+        assert!(
+            broker.state.lock().await.cleanup.pending_panes.is_empty(),
+            "supervised cleanup completes after requester abort"
+        );
+        let join_error = request
+            .await
+            .expect_err("aborted origin request must report cancellation");
+        assert!(
+            join_error.is_cancelled(),
+            "origin request future was cancelled rather than completing cleanup inline"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while broker.cleanup.task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed cleanup task is removed from the supervisor registry");
     }
     async fn prepare_pending_scope(
         broker: &Broker,
@@ -5200,9 +6872,26 @@ menus:
     ) {
         let adapter = Arc::new(ScopedTestAdapter {
             dispatches: AtomicUsize::new(0),
+            cancellable: AtomicBool::new(true),
+            block_cancel: AtomicBool::new(false),
+            cancel_entered: Arc::new(Notify::new()),
+            cancel_release: Arc::new(Notify::new()),
+            capture_entered: Arc::new(Notify::new()),
+            capture_release: Arc::new(Notify::new()),
+            block_capture: AtomicBool::new(false),
             pending_releases: AtomicUsize::new(0),
             ended_captures: Mutex::new(Vec::new()),
             closed_panes: Mutex::new(Vec::new()),
+            close_entered: Arc::new(Notify::new()),
+            close_release: Arc::new(Notify::new()),
+            block_close: AtomicBool::new(false),
+            fail_close_once: AtomicBool::new(false),
+            fail_close_always: AtomicBool::new(false),
+            block_end: AtomicBool::new(false),
+            end_entered: Arc::new(Notify::new()),
+            end_release: Arc::new(Notify::new()),
+            fail_end_once: AtomicBool::new(false),
+            fail_end_always: AtomicBool::new(false),
             origin_entered: Arc::new(Notify::new()),
             origin_release: Arc::new(Notify::new()),
             block_origin: AtomicBool::new(false),
@@ -5219,6 +6908,9 @@ menus:
       n:
         label: probe
         action: native.test:probe
+        settings:
+          execution:
+            on-menu-control: cancel
 ",
             KeyCapabilities::default(),
             Some(adapter.as_ref()),
@@ -5237,6 +6929,43 @@ menus:
         let broker =
             Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
         (adapter, broker, binding, directory)
+    }
+    async fn wait_for_closed_pane(adapter: &ScopedTestAdapter, pane: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if adapter
+                    .closed_panes
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(closed, _)| closed == pane)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("supervised pending-pane cleanup completes");
+    }
+
+    async fn wait_for_ended_capture(adapter: &ScopedTestAdapter, session: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if adapter
+                    .ended_captures
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(ended, _)| ended == session)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("supervised capture cleanup completes");
     }
 
     async fn attach_ready(
@@ -5288,6 +7017,7 @@ menus:
             !broker.sessions.lock().await.contains_key(expired),
             "expired client session is detached"
         );
+        wait_for_ended_capture(adapter, expired.as_str()).await;
         let (ended_len, ended_id, ended_reason) = {
             let ended = adapter.ended_captures.lock().await;
             (
@@ -5884,6 +7614,8 @@ pub enum BrokerError {
     CancelUnsupported,
     #[error("activation drain refused with a non-cancellable host execution in flight: {0}")]
     ActivationDrainRefused(String),
+    #[error("activation drain timed out waiting for broker-owned host cleanup: {0}")]
+    ActivationCleanupUnconfirmed(String),
     #[error("a menu control is already pending for this execution")]
     PendingControlInFlight,
     #[error("the UI already has an awaited execution in flight")]

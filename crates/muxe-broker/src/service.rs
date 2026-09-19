@@ -1298,8 +1298,33 @@ struct ConnectionResources {
     handshaken: bool,
     request_ids: HashSet<RequestId>,
     launcher_tokens: HashSet<PendingLaunchToken>,
-    attached_session: Option<UiSessionId>,
-    pending_ui_token: Option<PendingLaunchToken>,
+    /// The one phase of this connection's UI attachment. A single enum owns
+    /// the pending-vs-attached distinction: `Pending` carries both the launch
+    /// token and the pre-published session, `Attached` carries only the live
+    /// session, and the spawned readiness waiter moves `Pending` forward
+    /// before enqueueing its response so disconnect can never observe a stale
+    /// token for a consumed launch.
+    attachment: Arc<std::sync::Mutex<UiAttachment>>,
+    /// The one gated AttachUi readiness waiter. Keeping the real handle lets
+    /// disconnect abort and join it before taking attachment ownership.
+    waiter: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    publication_hook: Option<Arc<crate::broker::WaitHook>>,
+}
+
+/// Phaseful UI attachment ownership for one connection. Exactly one variant
+/// is live at a time; disconnect takes the state to `Closed` atomically.
+#[derive(Clone, Debug)]
+enum UiAttachment {
+    Idle,
+    Pending {
+        token: PendingLaunchToken,
+        session: UiSessionId,
+    },
+    Attached {
+        session: UiSessionId,
+    },
+    Closed,
 }
 
 impl ConnectionResources {
@@ -1309,34 +1334,46 @@ impl ConnectionResources {
             handshaken: false,
             request_ids: HashSet::new(),
             launcher_tokens: HashSet::new(),
-            attached_session: None,
-            pending_ui_token: None,
+            attachment: Arc::new(std::sync::Mutex::new(UiAttachment::Idle)),
+            waiter: None,
+            #[cfg(test)]
+            publication_hook: None,
+        }
+    }
+
+    fn attachment(&self) -> UiAttachment {
+        self.attachment
+            .lock()
+            .expect("connection attachment is not poisoned")
+            .clone()
+    }
+
+    fn attached_session(&self) -> Option<UiSessionId> {
+        match self.attachment() {
+            UiAttachment::Attached { session } => Some(session),
+            UiAttachment::Pending { .. } | UiAttachment::Idle | UiAttachment::Closed => None,
         }
     }
 
     fn validate_request(&self, request: &ClientRequest) -> Result<(), &'static str> {
         match request {
-            ClientRequest::AttachUi(_) if self.role == PeerRole::Ui => self
-                .attached_session
-                .is_none()
-                .then_some(())
-                .ok_or("one UI connection may attach at most one session"),
+            ClientRequest::AttachUi(_) if self.role == PeerRole::Ui => match self.attachment() {
+                UiAttachment::Idle => Ok(()),
+                _ => Err("one UI connection may attach at most one session"),
+            },
             ClientRequest::InvokeBinding(request) if self.role == PeerRole::Ui => self
-                .attached_session
-                .as_ref()
-                .is_some_and(|session| session == &request.session)
+                .attached_session()
+                .is_some_and(|session| session == request.session)
                 .then_some(())
                 .ok_or("UI connection does not own the invoked session"),
             ClientRequest::MenuControl(request) if self.role == PeerRole::Ui => self
-                .attached_session
-                .as_ref()
-                .is_some_and(|session| session == &request.session)
+                .attached_session()
+                .is_some_and(|session| session == request.session)
                 .then_some(())
                 .ok_or("UI connection does not own the controlled session"),
             ClientRequest::DetachUi(request) if self.role == PeerRole::Ui => self
-                .attached_session
-                .as_ref()
-                .is_some_and(|session| session == &request.session)
+                .attached_session()
+                .is_some_and(|session| session == request.session)
                 .then_some(())
                 .ok_or("UI connection does not own the detached session"),
             ClientRequest::RegisterPendingPane(request) if self.role == PeerRole::Launcher => self
@@ -1364,7 +1401,24 @@ impl ConnectionResources {
                 self.launcher_tokens.insert(*token);
             }
             (ClientRequest::AttachUi(_), BrokerResponse::UiAttached { session, .. }) => {
-                self.attached_session = Some(session.clone());
+                *self
+                    .attachment
+                    .lock()
+                    .expect("connection attachment is not poisoned") = UiAttachment::Attached {
+                    session: session.clone(),
+                };
+            }
+            (ClientRequest::DetachUi(request), BrokerResponse::Detached) => {
+                let mut attachment = self
+                    .attachment
+                    .lock()
+                    .expect("connection attachment is not poisoned");
+                if matches!(
+                    &*attachment,
+                    UiAttachment::Attached { session } if session == &request.session
+                ) {
+                    *attachment = UiAttachment::Closed;
+                }
             }
             (ClientRequest::AbortUiLaunch(request), BrokerResponse::Acknowledged) => {
                 self.launcher_tokens.remove(&request.token);
@@ -1377,16 +1431,22 @@ impl ConnectionResources {
         &mut self,
         request: &ClientRequest,
         session: UiSessionId,
-    ) -> Result<(), &'static str> {
+    ) -> Result<Arc<std::sync::Mutex<UiAttachment>>, &'static str> {
         let ClientRequest::AttachUi(request) = request else {
             return Err("only AttachUi may wait for a launch commit");
         };
-        if self.attached_session.is_some() {
+        let token = request
+            .pending_launch
+            .ok_or("only a gated AttachUi may wait for a launch commit")?;
+        let mut attachment = self
+            .attachment
+            .lock()
+            .expect("connection attachment is not poisoned");
+        if !matches!(*attachment, UiAttachment::Idle) {
             return Err("one UI connection may attach at most one session");
         }
-        self.attached_session = Some(session);
-        self.pending_ui_token = request.pending_launch;
-        Ok(())
+        *attachment = UiAttachment::Pending { token, session };
+        Ok(Arc::clone(&self.attachment))
     }
 }
 
@@ -1636,6 +1696,12 @@ async fn serve_request_frame(
     let tracking = request.clone();
     match broker.handle(resources.role, request, outbox.clone()).await {
         Ok(RequestResult::Immediate(response)) => {
+            let gated_confirmation = match (&tracking, &response) {
+                (ClientRequest::AttachUi(request), BrokerResponse::UiAttached { session, .. }) => {
+                    request.pending_launch.map(|token| (token, session.clone()))
+                }
+                _ => None,
+            };
             resources.record_response(&tracking, &response);
             outbox
                 .send(WireMessage::Response {
@@ -1644,21 +1710,97 @@ async fn serve_request_frame(
                 })
                 .await
                 .map_err(|_| ServerError::WriterClosed)?;
+            if let Some((token, session)) = gated_confirmation {
+                broker.confirm_gated_attachment(token, &session).await;
+            }
         }
         Ok(RequestResult::WaitForAttachment(pending)) => {
-            resources
+            let pending_token = pending.token();
+            let attachment = resources
                 .record_pending_attachment(&tracking, pending.session().clone())
                 .map_err(|_| ServerError::UnexpectedMessage)?;
             let outbox = outbox.clone();
-            tokio::spawn(async move {
-                let _ = outbox
+            let broker = Arc::clone(broker);
+            #[cfg(test)]
+            let publication_hook = resources.publication_hook.clone();
+            resources.waiter = Some(tokio::spawn(async move {
+                // Centralize the pending-result transition on the shared
+                // attachment phase: the waiter owns Pending→Attached/Closed,
+                // disconnect owns *→Closed, and both are atomic under the
+                // attachment mutex. A commit that publishes the session before
+                // disconnect runs still converges through `disconnect_gated`,
+                // which classifies pending-vs-attached under the broker lock.
+                let response = (*pending).wait().await;
+                // A gated waiter always answers its connection: success
+                // publishes UiAttached, while any other readiness outcome
+                // (abort, expiry, detach) still delivers its Error frame so
+                // the connection never hangs in `request_frame`. Only the
+                // success path transitions Pending->Attached and confirms
+                // the gated attachment; disconnect wins by taking the phase
+                // first, in which case this waiter owns nothing and sends
+                // nothing.
+                let (published_session, send_response) = {
+                    let mut attachment = attachment
+                        .lock()
+                        .expect("connection attachment is not poisoned");
+                    // Only the waiter that still observes Pending transitions
+                    // the phase. When disconnect already took Closed, this
+                    // waiter owns nothing and must not enqueue a stale
+                    // UiAttached for a session it no longer owns.
+                    if let UiAttachment::Pending { session, .. } = &*attachment {
+                        let session = session.clone();
+                        match &response {
+                            BrokerResponse::UiAttached { .. } => {
+                                *attachment = UiAttachment::Attached {
+                                    session: session.clone(),
+                                };
+                                (Some(session), true)
+                            }
+                            _ => {
+                                *attachment = UiAttachment::Closed;
+                                (None, true)
+                            }
+                        }
+                    } else {
+                        (None, false)
+                    }
+                };
+                if !send_response {
+                    return;
+                }
+                if let Some(session) = published_session {
+                    #[cfg(test)]
+                    if let Some(hook) = publication_hook {
+                        hook.entered.notify_one();
+                        hook.release.notified().await;
+                    }
+                    if outbox
+                        .send(WireMessage::Response {
+                            request_id,
+                            response,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        broker
+                            .confirm_gated_attachment(pending_token, &session)
+                            .await;
+                    }
+                } else if outbox
                     .send(WireMessage::Response {
                         request_id,
-                        response: (*pending).wait().await,
+                        response,
                     })
-                    .await;
-            });
+                    .await
+                    .is_err()
+                {
+                    // The connection is gone; the phase is already Closed and
+                    // the gated token's cleanup already ran when readiness
+                    // failed, so there is nothing left to confirm.
+                }
+            }));
         }
+
         Err(error) => {
             outbox
                 .send(WireMessage::Response {
@@ -1673,10 +1815,30 @@ async fn serve_request_frame(
 }
 
 async fn disconnect_resources(broker: &Arc<Broker>, resources: &mut ConnectionResources) {
-    if let Some(token) = resources.pending_ui_token.take() {
-        let _ = broker.abort(token).await;
-    } else {
-        broker.disconnect(resources.attached_session.as_ref()).await;
+    if let Some(waiter) = resources.waiter.take() {
+        waiter.abort();
+        let _ = waiter.await;
+    }
+    // Take the attachment phase to Closed atomically: the waiter transitions
+    // Pending forward exactly once, disconnect transitions anything to Closed
+    // exactly once, and `disconnect_gated` classifies the taken
+    // (token, session) pair under the broker lock so a commit racing
+    // disconnect converges on exactly one cleanup branch.
+    let attachment = {
+        let mut attachment = resources
+            .attachment
+            .lock()
+            .expect("connection attachment is not poisoned");
+        std::mem::replace(&mut *attachment, UiAttachment::Closed)
+    };
+    match attachment {
+        UiAttachment::Pending { token, session } => {
+            broker.disconnect_gated(token, session).await;
+        }
+        UiAttachment::Attached { session } => {
+            broker.disconnect(Some(&session)).await;
+        }
+        UiAttachment::Idle | UiAttachment::Closed => {}
     }
     for token in resources.launcher_tokens.drain() {
         let _ = broker.abort_on_launcher_disconnect(token).await;
@@ -1844,7 +2006,7 @@ pub enum ServerError {
 }
 #[cfg(test)]
 mod tests {
-    use crate::BrokerClient;
+    use crate::{BrokerClient, broker::WaitHook};
     use std::{
         collections::VecDeque,
         sync::{
@@ -1876,6 +2038,338 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn detached_response_closes_attachment_ownership() {
+        let mut resources = ConnectionResources::new(PeerRole::Ui);
+        let session = muxe_protocol::UiSessionId::new("ui-detached");
+        *resources
+            .attachment
+            .lock()
+            .expect("attachment mutex is not poisoned") = UiAttachment::Attached {
+            session: session.clone(),
+        };
+        let request = ClientRequest::DetachUi(muxe_protocol::DetachUi {
+            session: session.clone(),
+        });
+        resources.record_response(&request, &BrokerResponse::Detached);
+        assert!(matches!(resources.attachment(), UiAttachment::Closed));
+        assert!(
+            resources
+                .validate_request(&ClientRequest::InvokeBinding(
+                    muxe_protocol::InvokeBinding {
+                        session: session.clone(),
+                        generation: 1,
+                        binding: muxe_protocol::BindingId {
+                            generation: 1,
+                            ordinal: 0,
+                        },
+                    }
+                ))
+                .is_err(),
+            "detached UI cannot invoke through the old connection owner"
+        );
+        assert!(
+            resources.validate_request(&request).is_err(),
+            "detached UI cannot detach or be cleaned up a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_pending_waiter_disconnect_race_joins_waiter_and_cleans_once() {
+        let (broker, adapter, _directory) = ordering_broker(false, false);
+        let commit_hook = Arc::new(WaitHook::new());
+        broker.set_commit_ui_launch_hook(Some(Arc::clone(&commit_hook)));
+        let (events, _events_rx) = mpsc::channel(8);
+        let RequestResult::Immediate(BrokerResponse::LaunchPrepared { token, .. }) = broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::PrepareUiLaunch(launch_request()),
+                events.clone(),
+            )
+            .await
+            .expect("prepare launch token")
+        else {
+            panic!("prepare launch returns an immediate token");
+        };
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::RegisterPendingPane(muxe_protocol::RegisterPendingPane {
+                    token,
+                    pane: HostPaneId::new("owned-ui-pane"),
+                    temporary_tab: None,
+                }),
+                events,
+            )
+            .await
+            .expect("register pending pane");
+
+        let mut resources = ConnectionResources::new(PeerRole::Ui);
+        resources.handshaken = true;
+        let (outbox, mut responses) = mpsc::channel(8);
+        serve_request_frame(
+            &broker,
+            None,
+            &outbox,
+            &mut resources,
+            RequestId([1; 16]),
+            ClientRequest::AttachUi(AttachUi {
+                root: muxe_protocol::MenuId::new("main"),
+                pane: HostPaneId::new("owned-ui-pane"),
+                pending_launch: Some(token),
+                origin: None,
+                caller_identity: None,
+                theme: None,
+                color_scheme: None,
+            }),
+        )
+        .await
+        .expect("production AttachUi request enters readiness wait");
+        assert!(
+            resources.waiter.is_some(),
+            "the production request retains its readiness waiter"
+        );
+
+        let commit = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move {
+                broker
+                    .handle(
+                        PeerRole::Launcher,
+                        ClientRequest::CommitUiLaunch(muxe_protocol::CommitUiLaunch {
+                            token,
+                            pane: HostPaneId::new("owned-ui-pane"),
+                        }),
+                        mpsc::channel(1).0,
+                    )
+                    .await
+            }
+        });
+        commit_hook.entered.notified().await;
+        disconnect_resources(&broker, &mut resources).await;
+        commit_hook.release.notify_waiters();
+        let _commit_result = commit.await.expect("commit task joins");
+
+        assert!(
+            resources.waiter.is_none(),
+            "disconnect joins and clears the production readiness waiter"
+        );
+        assert!(
+            matches!(
+                responses.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the losing waiter emits no stale UiAttached response"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.close_calls.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending-pane cleanup reaches the adapter");
+        assert_eq!(
+            adapter.close_calls.load(Ordering::SeqCst),
+            1,
+            "the commit/disconnect race cleans the pane exactly once"
+        );
+    }
+    #[tokio::test]
+    async fn gated_waiter_delivers_abort_error_when_connection_stays_alive() {
+        // B1-a: a gated AttachUi waits for commit; aborting the token with
+        // the connection alive must deliver exactly one Error(LaunchAborted)
+        // response on the outbox (pre-fix the waiter swallowed it and the
+        // connection hung in `request_frame` forever).
+        let (broker, _adapter, _directory) = ordering_broker(false, false);
+        let (events, _events_rx) = mpsc::channel(8);
+        let RequestResult::Immediate(BrokerResponse::LaunchPrepared { token, .. }) = broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::PrepareUiLaunch(launch_request()),
+                events.clone(),
+            )
+            .await
+            .expect("prepare launch token")
+        else {
+            panic!("prepare launch returns an immediate token");
+        };
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::RegisterPendingPane(muxe_protocol::RegisterPendingPane {
+                    token,
+                    pane: HostPaneId::new("owned-ui-pane"),
+                    temporary_tab: None,
+                }),
+                events,
+            )
+            .await
+            .expect("register pending pane");
+
+        let mut resources = ConnectionResources::new(PeerRole::Ui);
+        resources.handshaken = true;
+        let (outbox, mut responses) = mpsc::channel(8);
+        serve_request_frame(
+            &broker,
+            None,
+            &outbox,
+            &mut resources,
+            RequestId([3; 16]),
+            ClientRequest::AttachUi(AttachUi {
+                root: muxe_protocol::MenuId::new("main"),
+                pane: HostPaneId::new("owned-ui-pane"),
+                pending_launch: Some(token),
+                origin: None,
+                caller_identity: None,
+                theme: None,
+                color_scheme: None,
+            }),
+        )
+        .await
+        .expect("gated AttachUi enters readiness wait");
+        assert!(
+            resources.waiter.is_some(),
+            "gated request retains its readiness waiter"
+        );
+        // Abort the pending launch while the connection is alive: readiness
+        // fails, and the waiter must answer with the Error frame.
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::AbortUiLaunch(muxe_protocol::AbortUiLaunch { token }),
+                mpsc::channel(1).0,
+            )
+            .await
+            .expect("abort owns the pending launch");
+        let message = tokio::time::timeout(Duration::from_secs(1), responses.recv())
+            .await
+            .expect("waiter answers instead of hanging")
+            .expect("outbox stays open");
+        let WireMessage::Response {
+            request_id,
+            response,
+        } = message
+        else {
+            panic!("waiter delivers a response frame");
+        };
+        assert_eq!(
+            request_id,
+            RequestId([3; 16]),
+            "the error answers the gated request id"
+        );
+        match response {
+            BrokerResponse::Error(diagnostic) => assert_eq!(
+                diagnostic.code,
+                muxe_protocol::DiagnosticCode::LaunchAborted,
+                "aborted waiter fails with LaunchAborted"
+            ),
+            other => panic!("aborted waiter must deliver Error, got {other:?}"),
+        }
+        assert!(
+            responses.try_recv().is_err(),
+            "the gated request gets exactly one response"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_attachment_publication_disconnect_claims_unconfirmed_pane_once() {
+        let (broker, adapter, _directory) = ordering_broker(false, false);
+        let publication_hook = Arc::new(WaitHook::new());
+        let (events, _events_rx) = mpsc::channel(8);
+        let RequestResult::Immediate(BrokerResponse::LaunchPrepared { token, .. }) = broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::PrepareUiLaunch(launch_request()),
+                events.clone(),
+            )
+            .await
+            .expect("prepare launch token")
+        else {
+            panic!("prepare launch returns an immediate token");
+        };
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::RegisterPendingPane(muxe_protocol::RegisterPendingPane {
+                    token,
+                    pane: HostPaneId::new("owned-ui-pane"),
+                    temporary_tab: None,
+                }),
+                events,
+            )
+            .await
+            .expect("register pending pane");
+
+        let mut resources = ConnectionResources::new(PeerRole::Ui);
+        resources.handshaken = true;
+        resources.publication_hook = Some(Arc::clone(&publication_hook));
+        let (outbox, mut responses) = mpsc::channel(8);
+        serve_request_frame(
+            &broker,
+            None,
+            &outbox,
+            &mut resources,
+            RequestId([2; 16]),
+            ClientRequest::AttachUi(AttachUi {
+                root: muxe_protocol::MenuId::new("main"),
+                pane: HostPaneId::new("owned-ui-pane"),
+                pending_launch: Some(token),
+                origin: None,
+                caller_identity: None,
+                theme: None,
+                color_scheme: None,
+            }),
+        )
+        .await
+        .expect("production AttachUi request enters readiness wait");
+
+        let commit = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move {
+                broker
+                    .handle(
+                        PeerRole::Launcher,
+                        ClientRequest::CommitUiLaunch(muxe_protocol::CommitUiLaunch {
+                            token,
+                            pane: HostPaneId::new("owned-ui-pane"),
+                        }),
+                        mpsc::channel(1).0,
+                    )
+                    .await
+            }
+        });
+        publication_hook.entered.notified().await;
+        assert!(
+            matches!(resources.attachment(), UiAttachment::Attached { .. }),
+            "readiness waiter transitions to Attached before publication confirmation"
+        );
+        disconnect_resources(&broker, &mut resources).await;
+        publication_hook.release.notify_waiters();
+        let _commit_result = commit.await.expect("commit task joins");
+
+        assert!(resources.waiter.is_none());
+        assert!(
+            matches!(
+                responses.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "disconnect wins before publication and emits no stale UiAttached response"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.close_calls.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unconfirmed pending-pane cleanup reaches the adapter");
+        assert_eq!(adapter.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            adapter.release_calls.load(Ordering::SeqCst),
+            0,
+            "disconnect claims unconfirmed provenance instead of releasing it"
+        );
+    }
 
     struct SmokeAdapter {
         shutdown: AtomicBool,
@@ -1978,12 +2472,7 @@ mod tests {
             Ok(())
         }
 
-        async fn release_pending_pane(
-            &self,
-            _lease: muxe_adapter_api::PendingPaneLease,
-        ) -> Result<(), AdapterError> {
-            Ok(())
-        }
+        fn release_pending_pane(&self, _lease: muxe_adapter_api::PendingPaneLease) {}
 
         async fn capture_origin(
             &self,
@@ -2059,6 +2548,9 @@ mod tests {
     }
     struct OrderingAdapter {
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        // Counts real adapter cleanup calls in the production race regression.
+        close_calls: AtomicUsize,
+        release_calls: AtomicUsize,
         suspend_unsupported: bool,
         resume_fails: bool,
         readiness: std::sync::Mutex<Option<muxe_adapter_api::ActivationReadiness>>,
@@ -2183,21 +2675,37 @@ mod tests {
             _registration: PendingPaneRegistration,
             _lease: muxe_adapter_api::PendingPaneLease,
         ) -> Result<(), AdapterError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        async fn release_pending_pane(
-            &self,
-            _lease: muxe_adapter_api::PendingPaneLease,
-        ) -> Result<(), AdapterError> {
-            Ok(())
+        fn release_pending_pane(&self, _lease: muxe_adapter_api::PendingPaneLease) {
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
         }
 
         async fn capture_origin(
             &self,
             _request: OriginCaptureRequest,
         ) -> Result<OriginContext, AdapterError> {
-            unreachable!("ordering adapter never attaches UI")
+            Ok(OriginContext {
+                host_kind: OriginHostKind::Herdr,
+                server_id: ServerId::new("owned-fake-server"),
+                client_id: None,
+                session_id: None,
+                workspace_id: None,
+                tab_id: None,
+                tab_index: None,
+                pane_id: Some(PaneId::new("owned-ui-pane")),
+                pane_type: None,
+                pane_cwd: None,
+                selection_text: None,
+                invocation_source: OriginInvocationSource::RootBinding,
+                worktree_id: None,
+                worktree_path: None,
+                agent_id: None,
+                link_url: None,
+                link_handler_id: None,
+            })
         }
 
         async fn dispatch_portable(
@@ -2311,6 +2819,8 @@ mod tests {
         .expect("write owned activation config");
         let adapter = Arc::new(OrderingAdapter {
             calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            close_calls: AtomicUsize::new(0),
+            release_calls: AtomicUsize::new(0),
             suspend_unsupported,
             resume_fails,
             readiness: std::sync::Mutex::new(None),

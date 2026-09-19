@@ -63,7 +63,7 @@ pub struct HerdrAdapter {
     dispatch_results_rx: Mutex<mpsc::UnboundedReceiver<DispatchTerminal>>,
     dispatch_wake: Notify,
     dispatch_tasks: StdMutex<DispatchTaskRegistry>,
-    pending_leases: Mutex<HashMap<PendingPaneLeaseId, PendingPaneLeaseRecord>>,
+    pending_leases: StdMutex<HashMap<PendingPaneLeaseId, PendingPaneLeaseRecord>>,
     post_dismissal: Mutex<HashMap<String, Vec<PostDismissalPortableDispatchRequest>>>,
     health_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
 }
@@ -169,7 +169,7 @@ impl HerdrAdapter {
             suspended: AtomicBool::new(false),
             suspend_wake: Notify::new(),
             health_wait_hook: StdMutex::new(None),
-            pending_leases: Mutex::new(HashMap::new()),
+            pending_leases: StdMutex::new(HashMap::new()),
             suspended_ack: Notify::new(),
             resume_wake: Notify::new(),
             resume_slot: Mutex::new(None),
@@ -738,7 +738,11 @@ impl HerdrAdapter {
         }
     }
 
-    async fn pending_close_record(
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
+    fn pending_close_record(
         &self,
         registration: &PendingPaneRegistration,
         lease: &PendingPaneLease,
@@ -746,7 +750,7 @@ impl HerdrAdapter {
     ) -> Result<PendingPaneLeaseRecord, AdapterError> {
         self.pending_leases
             .lock()
-            .await
+            .expect("Herdr pending lease registry is not poisoned")
             .get(&lease.id)
             .cloned()
             .filter(|record| {
@@ -759,12 +763,19 @@ impl HerdrAdapter {
             .ok_or_else(pending_cleanup_lease_stale)
     }
 
-    async fn claim_pending_close(
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
+    fn claim_pending_close(
         &self,
         lease: &PendingPaneLeaseId,
         record: &PendingPaneLeaseRecord,
     ) -> Result<(), AdapterError> {
-        let mut leases = self.pending_leases.lock().await;
+        let mut leases = self
+            .pending_leases
+            .lock()
+            .expect("Herdr pending lease registry is not poisoned");
         let Some(current) = leases.get_mut(lease) else {
             return Err(pending_cleanup_lease_stale());
         };
@@ -776,12 +787,11 @@ impl HerdrAdapter {
         }
     }
 
-    async fn reopen_pending_close(
-        &self,
-        lease: &PendingPaneLeaseId,
-        record: &PendingPaneLeaseRecord,
-    ) {
-        let mut leases = self.pending_leases.lock().await;
+    fn reopen_pending_close(&self, lease: &PendingPaneLeaseId, record: &PendingPaneLeaseRecord) {
+        let mut leases = self
+            .pending_leases
+            .lock()
+            .expect("Herdr pending lease registry is not poisoned");
         if let Some(current) = leases.get_mut(lease)
             && current
                 == &(PendingPaneLeaseRecord {
@@ -1061,17 +1071,20 @@ impl HostAdapter for HerdrAdapter {
             "herdr:{epoch}:{}:{}",
             registration.ui_session, registration.pane
         ));
-        self.pending_leases.lock().await.insert(
-            id.clone(),
-            PendingPaneLeaseRecord {
-                host_epoch: epoch,
-                endpoint: self.runtime().endpoint().clone(),
-                ui_session: registration.ui_session.clone(),
-                pane: registration.pane.clone(),
-                temporary_tab: registration.temporary_tab.clone(),
-                close_state: PendingPaneCloseState::Open,
-            },
-        );
+        self.pending_leases
+            .lock()
+            .expect("Herdr pending lease registry is not poisoned")
+            .insert(
+                id.clone(),
+                PendingPaneLeaseRecord {
+                    host_epoch: epoch,
+                    endpoint: self.runtime().endpoint().clone(),
+                    ui_session: registration.ui_session.clone(),
+                    pane: registration.pane.clone(),
+                    temporary_tab: registration.temporary_tab.clone(),
+                    close_state: PendingPaneCloseState::Open,
+                },
+            );
         Ok(PendingPaneLease {
             id,
             ui_session: registration.ui_session,
@@ -1084,9 +1097,7 @@ impl HostAdapter for HerdrAdapter {
         lease: PendingPaneLease,
     ) -> Result<(), AdapterError> {
         let epoch = self.require_continuity()?;
-        let record = self
-            .pending_close_record(&registration, &lease, epoch)
-            .await?;
+        let record = self.pending_close_record(&registration, &lease, epoch)?;
         let pane = match self
             .invoke_unary_response_on_endpoint(
                 "pane.get",
@@ -1097,7 +1108,10 @@ impl HostAdapter for HerdrAdapter {
         {
             HerdrResponse::Success(pane) => pane,
             HerdrResponse::Error { code, .. } if pane_is_proven_absent(&code) => {
-                self.pending_leases.lock().await.remove(&lease.id);
+                self.pending_leases
+                    .lock()
+                    .expect("Herdr pending lease registry is not poisoned")
+                    .remove(&lease.id);
                 return Ok(());
             }
             HerdrResponse::Error { code, message } => {
@@ -1132,48 +1146,44 @@ impl HostAdapter for HerdrAdapter {
             })?;
         let metadata = method_metadata("pane.close")
             .ok_or_else(|| incompatible("bundled Herdr metadata does not declare pane.close"))?;
-        self.claim_pending_close(&lease.id, &record).await?;
+        self.claim_pending_close(&lease.id, &record)?;
         match runtime
             .client()
             .unary_on_expected_endpoint(metadata, close_params, &record.endpoint)
             .await
         {
             Ok(HerdrResponse::Success(_)) => {
-                self.pending_leases.lock().await.remove(&lease.id);
+                self.pending_leases
+                    .lock()
+                    .expect("Herdr pending lease registry is not poisoned")
+                    .remove(&lease.id);
                 Ok(())
             }
             Ok(HerdrResponse::Error { code, .. }) if pane_is_proven_absent(&code) => {
-                self.pending_leases.lock().await.remove(&lease.id);
+                self.pending_leases
+                    .lock()
+                    .expect("Herdr pending lease registry is not poisoned")
+                    .remove(&lease.id);
                 Ok(())
             }
             Ok(HerdrResponse::Error { code, message }) => {
-                self.reopen_pending_close(&lease.id, &record).await;
+                self.reopen_pending_close(&lease.id, &record);
                 Err(host_rejection("pane.close", &code, &message))
             }
             Err(error) => {
                 if error.delivery() == DeliveryState::NotSent {
-                    self.reopen_pending_close(&lease.id, &record).await;
+                    self.reopen_pending_close(&lease.id, &record);
                 }
                 Err(socket_error(&error))
             }
         }
     }
 
-    async fn release_pending_pane(&self, lease: PendingPaneLease) -> Result<(), AdapterError> {
-        let epoch = self.require_continuity()?;
-        if !self
-            .pending_leases
+    fn release_pending_pane(&self, lease: PendingPaneLease) {
+        self.pending_leases
             .lock()
-            .await
-            .get(&lease.id)
-            .is_some_and(|record| {
-                record.host_epoch == epoch && record.ui_session == lease.ui_session
-            })
-        {
-            return Err(pending_cleanup_lease_stale());
-        }
-        self.pending_leases.lock().await.remove(&lease.id);
-        Ok(())
+            .expect("Herdr pending lease registry is not poisoned")
+            .remove(&lease.id);
     }
 
     async fn capture_origin(
@@ -1336,7 +1346,10 @@ impl HostAdapter for HerdrAdapter {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             continuity.healthy = false;
         }
-        self.pending_leases.lock().await.clear();
+        self.pending_leases
+            .lock()
+            .expect("Herdr pending lease registry is not poisoned")
+            .clear();
 
         self.suspend_wake.notify_one();
         // The monitor acks only after dropping the subscription socket, so this
@@ -1433,7 +1446,10 @@ impl HostAdapter for HerdrAdapter {
             std::mem::take(&mut registry.tasks)
         };
         self.shutdown.store(true, Ordering::Relaxed);
-        self.pending_leases.lock().await.clear();
+        self.pending_leases
+            .lock()
+            .expect("Herdr pending lease registry is not poisoned")
+            .clear();
         self.fail_post_dismissals("Herdr adapter shut down before UI dismissal completed")
             .await;
         // Every monitor send is interruptible by the shutdown wake below, so
@@ -1532,7 +1548,11 @@ async fn monitor_subscription(adapter: Arc<HerdrAdapter>, mut subscription: Even
             continuity.epoch = continuity.epoch.saturating_add(1);
             continuity.healthy = false;
         }
-        adapter.pending_leases.lock().await.clear();
+        adapter
+            .pending_leases
+            .lock()
+            .expect("Herdr pending lease registry is not poisoned")
+            .clear();
         adapter
             .fail_post_dismissals("Herdr retained event-subscription continuity was lost")
             .await;

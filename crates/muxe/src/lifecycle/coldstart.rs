@@ -1407,12 +1407,7 @@ mod tests {
         ) -> Result<(), muxe_adapter_api::AdapterError> {
             Ok(())
         }
-        async fn release_pending_pane(
-            &self,
-            _lease: muxe_adapter_api::PendingPaneLease,
-        ) -> Result<(), muxe_adapter_api::AdapterError> {
-            Ok(())
-        }
+        fn release_pending_pane(&self, _lease: muxe_adapter_api::PendingPaneLease) {}
         async fn capture_origin(
             &self,
             _request: muxe_adapter_api::OriginCaptureRequest,

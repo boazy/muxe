@@ -481,6 +481,12 @@ impl AtomicChannelGeneration {
             .map_err(|error| AdapterError::new(AdapterErrorKind::Unavailable, error.to_string()))
     }
 }
+/// Broker executions stay below this ceiling; dispatch admission rejects the
+/// reserved range so adapter-owned local executions cannot collide with them.
+const LOCAL_EXECUTION_CEILING: u64 = 1 << 63;
+/// Bounds one bridge completion report for an adapter-owned pane close.
+const CLOSE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct LocalTokenSource(AtomicU64);
 
 impl LocalTokenSource {
@@ -519,12 +525,14 @@ struct AdapterInner {
     queues: Mutex<BTreeMap<String, VecDeque<QueuedItem>>>,
     in_flight: Mutex<Option<InFlight>>,
     live_executions: Mutex<BTreeMap<u64, Option<RequestProvenance>>>,
+    close_waiters: StdMutex<BTreeMap<u64, oneshot::Sender<DispatchCompletion>>>,
     pending_capture: Mutex<CaptureWaiters>,
     pane_claims: Mutex<BTreeMap<String, String>>,
-    pending_leases: Mutex<BTreeMap<String, (String, RegistrationId)>>,
+    pending_leases: StdMutex<BTreeMap<String, (String, RegistrationId)>>,
     snapshots: Mutex<BTreeMap<String, ZellijOrigin>>,
     generation: AtomicChannelGeneration,
     next_correlation: AtomicU64,
+    next_local_execution: AtomicU64,
     local_tokens: LocalTokenSource,
     events_tx: mpsc::Sender<AdapterHealthEvent>,
     events_rx: Mutex<mpsc::Receiver<AdapterHealthEvent>>,
@@ -617,13 +625,15 @@ impl ZellijAdapter {
                 queues: Mutex::new(BTreeMap::new()),
                 in_flight: Mutex::new(None),
                 live_executions: Mutex::new(BTreeMap::new()),
+                close_waiters: StdMutex::new(BTreeMap::new()),
                 pending_origin: Mutex::new(BTreeMap::new()),
                 snapshots: Mutex::new(BTreeMap::new()),
                 pending_capture: Mutex::new(BTreeMap::new()),
                 pane_claims: Mutex::new(BTreeMap::new()),
-                pending_leases: Mutex::new(BTreeMap::new()),
+                pending_leases: StdMutex::new(BTreeMap::new()),
                 generation: AtomicChannelGeneration::new(),
                 next_correlation: AtomicU64::new(1),
+                next_local_execution: AtomicU64::new(1),
                 local_tokens: LocalTokenSource::new(),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
@@ -856,6 +866,24 @@ impl ZellijAdapter {
             .unwrap_or(u64::MAX)
     }
     async fn emit(&self, event: AdapterHealthEvent) {
+        let event = match event {
+            AdapterHealthEvent::DispatchCompleted(completion)
+                if dispatch_completion_execution(&completion).0 >= LOCAL_EXECUTION_CEILING =>
+            {
+                let execution = dispatch_completion_execution(&completion);
+                let waiter = self
+                    .inner
+                    .close_waiters
+                    .lock()
+                    .expect("Zellij close waiter registry is not poisoned")
+                    .remove(&execution.0);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(completion);
+                }
+                return;
+            }
+            event => event,
+        };
         let wake = self.inner.quiesce_wake.notified();
         tokio::pin!(wake);
         wake.as_mut().enable();
@@ -885,6 +913,21 @@ impl ZellijAdapter {
 
     fn mint_local_id(&self) -> [u8; 16] {
         self.inner.local_tokens.mint()
+    }
+    fn mint_local_execution(&self) -> ExecutionId {
+        // Reserved-namespace proof: adapter ids stay at or above
+        // `LOCAL_EXECUTION_CEILING` (`1 << 63` OR the counter), while broker
+        // ids stay below it (a bare u64 counter), and adapter admission
+        // rejects any broker execution in the reserved range.
+        let counter = self
+            .inner
+            .next_local_execution
+            .fetch_add(1, Ordering::Relaxed);
+        debug_assert!(
+            counter < LOCAL_EXECUTION_CEILING,
+            "local execution counter must stay below the reserved ceiling"
+        );
+        ExecutionId(LOCAL_EXECUTION_CEILING | counter)
     }
 
     fn correlation(&self) -> ExecutionCorrelationId {
@@ -1225,10 +1268,6 @@ impl ZellijAdapter {
         self.emit(AdapterHealthEvent::DispatchCompleted(completion))
             .await;
     }
-    #[expect(
-        clippy::too_many_lines,
-        reason = "registration retirement is one serialized cleanup transaction"
-    )]
     async fn retire_registration_state(
         &self,
         client_id: &str,
@@ -1304,7 +1343,7 @@ impl ZellijAdapter {
         self.inner
             .pending_leases
             .lock()
-            .await
+            .expect("Zellij pending lease registry is not poisoned")
             .retain(|_, (_, owner)| *owner != registration);
         self.inner
             .pane_claims
@@ -2041,6 +2080,11 @@ impl ZellijAdapter {
         client_id: String,
         commands: Vec<RawNativeCommand>,
     ) -> Result<DispatchAccepted, AdapterError> {
+        if execution.0 >= LOCAL_EXECUTION_CEILING {
+            return Err(invalid_request(
+                "Zellij broker execution uses the adapter-reserved execution range",
+            ));
+        }
         // Schema v1 mappings are one host request per execution. In
         // particular, keyboard key bytes are concatenated before this layer.
         let [raw]: [RawNativeCommand; 1] = commands.try_into().map_err(|_| {
@@ -2168,6 +2212,13 @@ fn transport_error(error: &PipeTransportError) -> AdapterError {
 
 fn invalid_request(message: impl Into<String>) -> AdapterError {
     AdapterError::new(AdapterErrorKind::InvalidRequest, message)
+}
+fn dispatch_completion_execution(completion: &DispatchCompletion) -> ExecutionId {
+    match completion {
+        DispatchCompletion::Succeeded { execution }
+        | DispatchCompletion::Failed { execution, .. }
+        | DispatchCompletion::OutcomeUnknown { execution, .. } => *execution,
+    }
 }
 /// Maximum member IDs in one readiness report, mirroring the protocol wire
 /// bound (`MAX_READINESS_CLIENTS`): evidence larger than the wire record
@@ -2441,7 +2492,7 @@ impl HostAdapter for ZellijAdapter {
         self.inner
             .pending_leases
             .lock()
-            .await
+            .expect("Zellij pending lease registry is not poisoned")
             .insert(id.clone(), (client, bridge_registration));
         let _ = pane;
         Ok(PendingPaneLease {
@@ -2450,6 +2501,9 @@ impl HostAdapter for ZellijAdapter {
         })
     }
 
+    /// Dispatches the close action and waits for the bridge's terminal
+    /// completion. `Succeeded` means the bridge dispatched the close action,
+    /// which is the strongest confirmation available from this protocol.
     async fn close_pending_pane(
         &self,
         registration: PendingPaneRegistration,
@@ -2465,7 +2519,7 @@ impl HostAdapter for ZellijAdapter {
             .inner
             .pending_leases
             .lock()
-            .await
+            .expect("Zellij pending lease registry is not poisoned")
             .get(lease.id.as_str())
             .cloned()
             .ok_or_else(|| {
@@ -2482,51 +2536,90 @@ impl HostAdapter for ZellijAdapter {
             ));
         }
         let pane = parse_pane_id(registration.pane.as_str())?;
-        self.enqueue_lifecycle(
-            client.clone(),
-            BridgeRequest::Dispatch {
-                execution: CommonExecutionId(self.mint_local_id()),
+        let execution = self.mint_local_execution();
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .close_waiters
+            .lock()
+            .expect("Zellij close waiter registry is not poisoned")
+            .insert(execution.0, sender);
+        self.enqueue(QueuedItem {
+            execution: Some(execution),
+            client_id: client,
+            payload: Some(BridgeRequest::Dispatch {
+                execution: execution_to_common(execution),
                 request: ZellijDispatchRequest::Command(RawNativeCommand::ClosePaneWithId {
                     pane_id: pane,
                 }),
-            },
-        )
+            }),
+        })
         .await;
-        self.inner
-            .pending_leases
-            .lock()
-            .await
-            .remove(lease.id.as_str());
-        Ok(())
-    }
-
-    async fn release_pending_pane(&self, lease: PendingPaneLease) -> Result<(), AdapterError> {
-        self.require_active()?;
-        let (client, bridge_registration) = self
-            .inner
-            .pending_leases
-            .lock()
-            .await
-            .get(lease.id.as_str())
-            .cloned()
-            .ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    "Zellij pending cleanup lease is stale",
-                )
-            })?;
-        if self.active_registration(&client).await? != bridge_registration {
-            return Err(AdapterError::new(
-                AdapterErrorKind::Unavailable,
-                "Zellij pending cleanup lease registration is stale",
-            ));
+        let completion = tokio::time::timeout(CLOSE_COMPLETION_TIMEOUT, receiver).await;
+        let queued_unsent = {
+            let mut queues = self.inner.queues.lock().await;
+            let mut removed = false;
+            for queue in queues.values_mut() {
+                let before = queue.len();
+                queue.retain(|item| item.execution != Some(execution));
+                removed |= queue.len() != before;
+            }
+            removed
+        };
+        if queued_unsent {
+            self.inner.live_executions.lock().await.remove(&execution.0);
         }
         self.inner
+            .close_waiters
+            .lock()
+            .expect("Zellij close waiter registry is not poisoned")
+            .remove(&execution.0);
+        if queued_unsent {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij pending pane close was never sent",
+            ));
+        }
+        let completion = match completion {
+            Ok(Ok(completion)) => completion,
+            Ok(Err(_)) => {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Zellij pending pane close completion channel closed",
+                ));
+            }
+            Err(_) => {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::OutcomeUnknown,
+                    "timed out waiting for Zellij pending pane close completion",
+                ));
+            }
+        };
+        match completion {
+            DispatchCompletion::Succeeded { .. } => {
+                self.inner
+                    .pending_leases
+                    .lock()
+                    .expect("Zellij pending lease registry is not poisoned")
+                    .remove(lease.id.as_str());
+                Ok(())
+            }
+            DispatchCompletion::Failed { .. } => Err(AdapterError::new(
+                AdapterErrorKind::DispatchFailed,
+                "Zellij bridge reported pending pane close failure",
+            )),
+            DispatchCompletion::OutcomeUnknown { .. } => Err(AdapterError::new(
+                AdapterErrorKind::OutcomeUnknown,
+                "Zellij pending pane close outcome is unknown",
+            )),
+        }
+    }
+
+    fn release_pending_pane(&self, lease: PendingPaneLease) {
+        self.inner
             .pending_leases
             .lock()
-            .await
+            .expect("Zellij pending lease registry is not poisoned")
             .remove(lease.id.as_str());
-        Ok(())
     }
     async fn capture_origin(
         &self,
@@ -2807,9 +2900,47 @@ impl HostAdapter for ZellijAdapter {
         self.inner.captures.lock().await.invalidate_all_clients();
         self.inner.pane_claims.lock().await.clear();
         self.inner.snapshots.lock().await.clear();
-        self.inner.queues.lock().await.clear();
-        self.inner.pending_origin.lock().await.clear();
-        self.inner.pending_capture.lock().await.clear();
+        // Purged dispatch queues can never complete: drop their executions
+        // and fail their close waiters with OutcomeUnknown so nothing waits
+        // for a bridge completion that can no longer arrive. Failing (not
+        // merely dropping) the waiter sender releases the `close_pending_pane`
+        // receiver with the same OutcomeUnknown the retire path reports.
+        let purged: Vec<ExecutionId> = {
+            let mut queues = self.inner.queues.lock().await;
+            let mut purged = Vec::new();
+            for queue in queues.values_mut() {
+                for item in queue.drain(..) {
+                    if let Some(execution) = item.execution {
+                        purged.push(execution);
+                    }
+                }
+            }
+            purged
+        };
+        {
+            let mut live = self.inner.live_executions.lock().await;
+            for execution in &purged {
+                live.remove(&execution.0);
+            }
+        }
+        {
+            let mut waiters = self
+                .inner
+                .close_waiters
+                .lock()
+                .expect("Zellij close waiter registry is not poisoned");
+            for execution in purged {
+                if let Some(waiter) = waiters.remove(&execution.0) {
+                    let _ = waiter.send(DispatchCompletion::OutcomeUnknown {
+                        execution,
+                        error: AdapterError::new(
+                            AdapterErrorKind::OutcomeUnknown,
+                            "Zellij adapter suspended for activation with a queued request",
+                        ),
+                    });
+                }
+            }
+        }
         self.inner.request.park().await;
         self.inner.event.park().await;
         self.emit(AdapterHealthEvent::Unhealthy {
@@ -2988,8 +3119,9 @@ mod tests {
     use crate::pipes::SubprocessChannel;
     use crate::pipes::testing::ScriptedChannel;
     use muxe_zellij_protocol::{
-        BridgeIdentity, CommandOutcome, PipeEvent, PipeEventKind, ZellijRegistration,
-        bridge_build_id, decode_event_subscription, decode_request_line, encode_event_line,
+        BridgeIdentity, CommandOutcome, CommandStatus, PipeEvent, PipeEventKind,
+        ZellijRegistration, bridge_build_id, decode_event_subscription, decode_request_line,
+        encode_event_line,
     };
     fn registration_id(seed: u8) -> RegistrationId {
         RegistrationId::from_random_bytes([seed; 16]).expect("test registration")
@@ -3160,6 +3292,21 @@ mod tests {
             membership,
         )
     }
+    fn test_adapter_with_channels(
+        request: Arc<dyn PipeChannel>,
+        event: Arc<dyn PipeChannel>,
+        membership: Arc<ScriptedMembership>,
+    ) -> ZellijAdapter {
+        ZellijAdapter::new_with_membership(
+            ZellijAdapterConfig {
+                session_name: "session-alpha".to_owned(),
+                zellij_exe: PathBuf::from("/nonexistent/zellij"),
+            },
+            request,
+            event,
+            membership,
+        )
+    }
     /// Writes an owned fake `zellij` executable asserting its argv.
     fn write_fake_exe(body: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::TempDir::with_prefix("muxe-oracle-").expect("unique temp dir");
@@ -3186,6 +3333,276 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+    #[tokio::test]
+    async fn release_pending_pane_is_idempotent_for_stale_or_repeated_leases() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        let lease = PendingPaneLease {
+            id: PendingPaneLeaseId::new("lease-repeat"),
+            ui_session: UiSessionId::new("session-repeat"),
+        };
+        adapter
+            .inner
+            .pending_leases
+            .lock()
+            .expect("Zellij pending lease registry is not poisoned")
+            .insert(
+                lease.id.as_str().to_owned(),
+                ("client-1".to_owned(), registration_id(1)),
+            );
+        adapter.release_pending_pane(lease.clone());
+        adapter.release_pending_pane(lease);
+        assert!(
+            adapter
+                .inner
+                .pending_leases
+                .lock()
+                .expect("Zellij pending lease registry is not poisoned")
+                .is_empty(),
+            "releasing a stale or repeated lease is a no-op"
+        );
+    }
+    #[tokio::test]
+    async fn close_pending_pane_waits_for_bridge_success_before_releasing_lease() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        let (registration, lease) = registered_pending_pane(&adapter, &event).await;
+        let lease_id = lease.id.clone();
+        let close = tokio::spawn({
+            let adapter = adapter.clone();
+            async move {
+                adapter
+                    .close_pending_pane(registration, lease.clone())
+                    .await
+            }
+        });
+        let frame =
+            decode_request_line(&poll_outbound(&request).await).expect("close request frame");
+        let execution = match &frame.payload {
+            BridgeRequest::Dispatch { execution, .. } => {
+                common_to_core(execution).expect("local close execution")
+            }
+            _ => panic!("pending close uses a dispatch request"),
+        };
+        assert!(execution.0 >= LOCAL_EXECUTION_CEILING);
+        push_dispatch_completion(
+            &event,
+            frame.request_id,
+            execution,
+            CommandOutcome::succeeded(),
+        );
+        close
+            .await
+            .expect("close task joins")
+            .expect("bridge dispatch succeeds");
+        assert!(
+            !adapter
+                .inner
+                .pending_leases
+                .lock()
+                .expect("Zellij pending lease registry is not poisoned")
+                .contains_key(lease_id.as_str())
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn close_pending_pane_retains_lease_after_bridge_failure_and_hides_local_event() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        let (registration, lease) = registered_pending_pane(&adapter, &event).await;
+        let lease_id = lease.id.clone();
+        let close = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.close_pending_pane(registration, lease).await }
+        });
+        let frame =
+            decode_request_line(&poll_outbound(&request).await).expect("close request frame");
+        let execution = match &frame.payload {
+            BridgeRequest::Dispatch { execution, .. } => {
+                common_to_core(execution).expect("local close execution")
+            }
+            _ => panic!("pending close uses a dispatch request"),
+        };
+        push_dispatch_completion(
+            &event,
+            frame.request_id,
+            execution,
+            CommandOutcome {
+                status: CommandStatus::Failed,
+                detail: "bridge refused close".to_owned(),
+            },
+        );
+        let error = close
+            .await
+            .expect("close task joins")
+            .expect_err("bridge failure is not close success");
+        assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
+        assert!(
+            adapter
+                .inner
+                .pending_leases
+                .lock()
+                .expect("Zellij pending lease registry is not poisoned")
+                .contains_key(lease_id.as_str())
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "local completion never reaches the broker event stream"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+    #[tokio::test]
+    async fn close_pending_pane_reports_unknown_after_registration_retirement_without_broker_event()
+    {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        let (registration, lease) = registered_pending_pane(&adapter, &event).await;
+        let close = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.close_pending_pane(registration, lease).await }
+        });
+        let frame =
+            decode_request_line(&poll_outbound(&request).await).expect("close request frame");
+        let execution = match &frame.payload {
+            BridgeRequest::Dispatch { execution, .. } => {
+                common_to_core(execution).expect("local close execution")
+            }
+            _ => panic!("pending close uses a dispatch request"),
+        };
+        push_register(&event, "client-1", [8; 16], env!("CARGO_PKG_VERSION"));
+        await_turnover_registration(&adapter).await;
+        let error = close
+            .await
+            .expect("close task joins")
+            .expect_err("retired registration has unknown close outcome");
+        assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+        for _ in 0..3 {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event()).await
+            else {
+                break;
+            };
+            assert!(
+                !matches!(
+                    &event,
+                    AdapterHealthEvent::DispatchCompleted(completion)
+                        if dispatch_completion_execution(completion) == execution
+                ),
+                "local completion never reaches the broker event stream"
+            );
+        }
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn suspend_fails_queued_close_with_unknown_and_drops_live_execution() {
+        // O1: suspending with a queued-but-unsent local close must fail the
+        // close waiter with OutcomeUnknown — not hang to timeout, not
+        // Unavailable — and remove the live_executions entry, so nothing waits
+        // for a bridge completion that can no longer arrive. The seeded queue
+        // entry exercises the `queues`-purge path (not the pre-existing
+        // in-flight arm): pre-O1 the sender is merely dropped and
+        // `close_pending_pane` reports Unavailable. Shutdown does NOT do
+        // this: it only quiesces producers and clears capture queues,
+        // leaving close waiters to their timeout path.
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        // Seed a queued-but-unsent close execution directly: live entry,
+        // queued item, and a waiter sender for the same id.
+        let execution = ExecutionId(LOCAL_EXECUTION_CEILING | 777);
+        adapter
+            .inner
+            .live_executions
+            .lock()
+            .await
+            .insert(execution.0, None);
+        adapter
+            .inner
+            .queues
+            .lock()
+            .await
+            .entry("client-1".to_owned())
+            .or_default()
+            .push_back(QueuedItem {
+                execution: Some(execution),
+                client_id: "client-1".to_owned(),
+                payload: None,
+            });
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        adapter
+            .inner
+            .close_waiters
+            .lock()
+            .expect("close waiter registry is writable")
+            .insert(execution.0, sender);
+        adapter.suspend_for_activation().await.expect("suspend");
+        let completion = tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .expect("purged waiter answers instead of hanging")
+            .expect("waiter sender sends, not drops");
+        match completion {
+            DispatchCompletion::OutcomeUnknown { execution: got, .. } => {
+                assert_eq!(got, execution, "purge fails the exact queued execution");
+            }
+            other => panic!("purged waiter must fail OutcomeUnknown, got {other:?}"),
+        }
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&execution.0),
+            "purged execution is removed from live_executions"
+        );
+        assert!(
+            request.take_outbound().is_empty(),
+            "purged queue never reaches the transport"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn close_pending_pane_retains_lease_after_transport_write_failure() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let failing_request = WriteFailChannel::new(Arc::clone(&request));
+        let adapter = test_adapter_with_channels(
+            failing_request as Arc<dyn PipeChannel>,
+            Arc::clone(&event) as Arc<dyn PipeChannel>,
+            ScriptedMembership::fresh(Vec::new()),
+        );
+        let (registration, lease) = registered_pending_pane(&adapter, &event).await;
+        let lease_id = lease.id.clone();
+        let error = adapter
+            .close_pending_pane(registration, lease)
+            .await
+            .expect_err("transport write failure is not close success");
+        assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+        assert!(
+            adapter
+                .inner
+                .pending_leases
+                .lock()
+                .expect("Zellij pending lease registry is not poisoned")
+                .contains_key(lease_id.as_str())
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "local completion never reaches the broker event stream"
+        );
+        adapter.shutdown().await.expect("shutdown");
     }
     /// Log barrier, not a sleep: returns once the owned fake's invocation
     /// log shows both initial pipe children plus exactly one scoped
@@ -3239,6 +3656,81 @@ mod tests {
         })
         .await
         .expect("registrations land bounded");
+    }
+    async fn registered_pending_pane(
+        adapter: &ZellijAdapter,
+        event: &ScriptedChannel,
+    ) -> (PendingPaneRegistration, PendingPaneLease) {
+        push_register(event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        let registration = PendingPaneRegistration {
+            ui_session: UiSessionId::new("pending-close-session"),
+            pane: PaneId::new("terminal_2"),
+            temporary_tab: None,
+        };
+        let lease = adapter
+            .register_pending_pane(registration.clone())
+            .await
+            .expect("pending pane lease registers");
+        (registration, lease)
+    }
+
+    fn push_dispatch_completion(
+        event: &ScriptedChannel,
+        request_id: RequestId,
+        execution: ExecutionId,
+        outcome: CommandOutcome,
+    ) {
+        event.push_line(
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(request_id),
+                PipeEventKind::Response(BridgeResponse::DispatchCompleted {
+                    execution: execution_to_common(execution),
+                    outcome,
+                }),
+            ))
+            .expect("dispatch completion encodes"),
+        );
+    }
+
+    struct WriteFailChannel {
+        inner: Arc<ScriptedChannel>,
+        fail_writes: std::sync::atomic::AtomicBool,
+    }
+
+    impl WriteFailChannel {
+        fn new(inner: Arc<ScriptedChannel>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                fail_writes: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl PipeChannel for WriteFailChannel {
+        async fn send_line(&self, line: String) -> Result<(), PipeTransportError> {
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(PipeTransportError::Write {
+                    reason: "scripted write failure".to_owned(),
+                })
+            } else {
+                self.inner.send_line(line).await
+            }
+        }
+
+        async fn next_line(&self) -> Result<String, PipeTransportError> {
+            self.inner.next_line().await
+        }
+
+        async fn close(&self) {
+            self.inner.close().await;
+        }
     }
     /// Resume barrier, not a sleep: returns once the event channel installs
     /// an epoch newer than `prev`, proving the attempt respawned the
