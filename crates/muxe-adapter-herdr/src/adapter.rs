@@ -18,8 +18,8 @@ use muxe_adapter_api::{
 };
 use muxe_core::{
     ActionScalar, ActionValidation, ActionValidator, ConfigDiagnostic, ConfigValueKind,
-    DiagnosticCode, ExecutionCapabilities, NativeActionCandidate, PaneAction, PortableAction,
-    TabAction,
+    ContextType, DiagnosticCode, ExecutionCapabilities, NativeActionCandidate, PaneAction,
+    PortableAction, TabAction,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -811,77 +811,30 @@ fn portable_compile_validation(
     if let Some(methods) = command_creation_methods(action) {
         return validate_required_methods(schema, methods);
     }
-    let method = match action {
+    if let Some(description) = portable_request_description(action)? {
+        return validate_portable_request(schema, action, &description);
+    }
+    // Broker-owned forms (menu/config/command), command-bearing creations, and tab:swap
+    // carry no single emitted request: preserve their existing capability contract.
+    match action {
         PortableAction::Menu(_) | PortableAction::Config(_) => {
-            return Ok(ExecutionCapabilities::SYNCHRONOUS);
+            Ok(ExecutionCapabilities::SYNCHRONOUS)
         }
-        // Commands run in the broker, not the host adapter. Their ownership and capability
-        // contract must therefore remain independent of Herdr's RPC inventory.
-        PortableAction::Command(_) => {
-            return Ok(ExecutionCapabilities {
-                awaitable: true,
-                detachable: true,
-                cancellable: true,
-            });
+        PortableAction::Command(_) => Ok(ExecutionCapabilities {
+            awaitable: true,
+            detachable: true,
+            cancellable: true,
+        }),
+        PortableAction::Tab(TabAction::Create { .. })
+        | PortableAction::Pane(PaneAction::Split { .. }) => validate_required_methods(
+            schema,
+            command_creation_methods(action).expect("command-bearing creation lists helper RPCs"),
+        ),
+        PortableAction::Tab(TabAction::Swap(_)) => {
+            validate_required_methods(schema, &["tab.list", "tab.move"])
         }
-        PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(_)) => "pane.send_keys",
-        PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(_)) => "pane.send_text",
-        PortableAction::Tab(TabAction::Create { .. }) => "tab.create",
-        PortableAction::Tab(TabAction::Close) => "tab.close",
-        PortableAction::Tab(TabAction::Rename { name: Some(_) }) => "tab.rename",
-        PortableAction::Tab(TabAction::Rename { name: None }) => {
-            return Err(
-                "Herdr tab.rename requires `label`; the portable bare `tab:rename` has no specified Herdr prompt mapping"
-                    .to_owned(),
-            );
-        }
-        PortableAction::Tab(TabAction::Move(target)) if target_is_index(target) => "tab.move",
-        PortableAction::Tab(TabAction::Swap(target)) if target_is_index(target) => {
-            return validate_required_methods(schema, &["tab.list", "tab.move"]);
-        }
-        PortableAction::Pane(PaneAction::Create) => {
-            return Err(
-                "Herdr has no pane.create method; pane.split requires an explicit right or down direction"
-                    .to_owned(),
-            );
-        }
-        PortableAction::Pane(PaneAction::Split {
-            direction: Some(direction),
-            ..
-        }) if split_direction_is_supported(direction) => "pane.split",
-        PortableAction::Pane(PaneAction::Split {
-            direction: None, ..
-        }) => {
-            return Err("Herdr pane.split requires an explicit right or down direction".to_owned());
-        }
-        PortableAction::Pane(PaneAction::Split { .. }) => {
-            return Err("Herdr pane.split supports only right or down directions".to_owned());
-        }
-        PortableAction::Pane(PaneAction::Close) => "pane.close",
-        PortableAction::Pane(PaneAction::Focus(target))
-            if target_is_cardinal_direction(target) =>
-        {
-            "pane.focus_direction"
-        }
-        PortableAction::Pane(PaneAction::Swap(target))
-            if target_is_cardinal_direction(target) =>
-        {
-            "pane.swap"
-        }
-        PortableAction::Pane(PaneAction::Resize { .. }) => "pane.resize",
-        PortableAction::Pane(PaneAction::Zoom { .. }) => "pane.zoom",
-        PortableAction::Tab(TabAction::Focus(_)) => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that protocol 20 does not expose as a typed action".to_owned()),
-        PortableAction::Tab(TabAction::Move(_)) => return Err("Herdr tab.move supports only a concrete insert index".to_owned()),
-        PortableAction::Tab(TabAction::Swap(_)) => return Err("Herdr tab:swap supports only an index; the schema offers tab.list plus tab.move, not directional tab targeting".to_owned()),
-        PortableAction::Pane(PaneAction::Focus(_)) => return Err("Herdr pane.focus supports only cardinal directions".to_owned()),
-        PortableAction::Pane(PaneAction::Move(_)) => return Err("Herdr pane.move requires an explicit tab/new-tab destination, not a portable index or direction".to_owned()),
-        PortableAction::Pane(PaneAction::Swap(_)) => return Err("Herdr pane.swap supports only cardinal directions".to_owned()),
-        PortableAction::Pane(PaneAction::Fullscreen { .. }) => return Err("Herdr protocol 20 exposes no pane fullscreen method".to_owned()),
-        PortableAction::Pane(PaneAction::Floating { .. }) => return Err("Herdr protocol 20 exposes no pane floating method".to_owned()),
-        PortableAction::Pane(PaneAction::Frame { .. }) => return Err("Herdr protocol 20 exposes no pane frame method".to_owned()),
-        PortableAction::Session(_) => return Err("Herdr protocol 20 exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
-    };
-    validate_required_methods(schema, &[method])
+        _ => unreachable!("portable_request_description covers every remaining portable form"),
+    }
 }
 
 fn command_creation_methods(action: &PortableAction) -> Option<&'static [&'static str]> {
@@ -912,6 +865,446 @@ fn validate_required_methods(
         }
     }
     Ok(ExecutionCapabilities::ASYNCHRONOUS)
+}
+
+/// Validates the described emitted request against the runtime schema: the method must exist
+/// (as before), every emitted field must be declared by the schema, every required property
+/// must be emitted, resolved literals must satisfy the declared type/domain, and unresolved
+/// context values must be acceptable to the declared parameter type/domain. Probes derive
+/// from the schema itself; no dummy concrete values are invented.
+fn validate_portable_request(
+    schema: &ApiSchema,
+    action: &PortableAction,
+    description: &PortableRequestDescription,
+) -> Result<ExecutionCapabilities, String> {
+    let method = description.method;
+    if method_metadata(method).is_none() || schema.method(method).is_none() {
+        return Err(format!(
+            "active Herdr schema does not declare required method {method}"
+        ));
+    }
+    validate_emitted_fields(schema, action, description)?;
+    Ok(ExecutionCapabilities::ASYNCHRONOUS)
+}
+
+/// Checks the emitted field set and each field's value domain against the method's schema.
+fn validate_emitted_fields(
+    schema: &ApiSchema,
+    action: &PortableAction,
+    description: &PortableRequestDescription,
+) -> Result<(), String> {
+    let (params_schema, _) = schema
+        .method_params_schema(description.method)
+        .ok_or_else(|| {
+            format!(
+                "active Herdr schema does not declare required method {}",
+                description.method
+            )
+        })?;
+    let Some(params_object) = params_schema.as_object() else {
+        return Err(format!(
+            "active Herdr schema declares {} with a non-object params schema",
+            description.method
+        ));
+    };
+    let Some(properties) = params_object.get("properties").and_then(Value::as_object) else {
+        // No declared properties (e.g. an empty-params method): the whole probe params must
+        // still validate, so a method narrowed to no properties rejects its emitted fields.
+        let params = build_probe_params(action, description)?;
+        return schema
+            .validate_method(description.method, &params)
+            .map_err(|error| {
+                format!(
+                    "active Herdr schema rejects {}: {error}",
+                    description.method
+                )
+            });
+    };
+    let required: Vec<&str> = match params_object.get("required") {
+        None => Vec::new(),
+        Some(required) => {
+            let Some(required) = required.as_array() else {
+                return Err(format!(
+                    "active Herdr schema declares {} with a malformed required clause",
+                    description.method
+                ));
+            };
+            let mut names = Vec::with_capacity(required.len());
+            for entry in required {
+                let Some(name) = entry.as_str() else {
+                    return Err(format!(
+                        "active Herdr schema declares {} with a malformed required entry",
+                        description.method
+                    ));
+                };
+                names.push(name);
+            }
+            names
+        }
+    };
+    // Every required property must be emitted: a newly required parameter rejects at reload
+    // instead of failing at invocation after the user selected the binding.
+    for name in &required {
+        if !description.fields.iter().any(|field| field.name == *name) {
+            return Err(format!(
+                "active Herdr schema requires parameter {name:?} for {} which the portable action does not emit",
+                description.method
+            ));
+        }
+    }
+    for field in description.fields {
+        let Some(property_schema) = properties.get(field.name) else {
+            return Err(format!(
+                "Herdr {} declares no parameter {:?} emitted by the portable action",
+                description.method, field.name
+            ));
+        };
+        validate_emitted_field(schema, action, description.method, field, property_schema)?;
+    }
+    Ok(())
+}
+
+/// Checks one emitted field's value domain. Config literals face the same scalar conversion
+/// the dispatch builder applies, then the schema's own domain check on the converted probe;
+/// unresolved context markers face the declared-type check against the property's accepted
+/// JSON types; origin strings probe as their typed representative. The verdict always
+/// derives from the schema itself.
+fn validate_emitted_field(
+    schema: &ApiSchema,
+    action: &PortableAction,
+    method: &str,
+    field: &PortableRequestField,
+    property_schema: &Value,
+) -> Result<(), String> {
+    match field.origin {
+        PortableValueOrigin::Origin(context_type) => {
+            let probe = context_probe_value(context_type);
+            probe_value_against_property(schema, method, field.name, &probe, property_schema)
+        }
+        PortableValueOrigin::Literal(kind) | PortableValueOrigin::Default(kind) => {
+            validate_literal_field(schema, action, method, field, property_schema, kind)
+        }
+    }
+}
+
+/// Probes one value against one property schema by validating a single-property object.
+/// Property-level probing keeps the diagnostic on the offending parameter while still
+/// deriving the verdict from the schema itself.
+fn probe_value_against_property(
+    schema: &ApiSchema,
+    method: &str,
+    field_name: &str,
+    probe: &Value,
+    property_schema: &Value,
+) -> Result<(), String> {
+    let instance_path = format!("#/{field_name}");
+    schema
+        .validate_value(property_schema, probe, &instance_path, "#")
+        .map_err(|error| {
+            format!("active Herdr schema rejects the {method} parameter {field_name:?}: {error}")
+        })
+}
+
+/// Validates one config-backed field: converts the configured scalar exactly as the dispatch
+/// builder does, then probes the converted value against the property schema. An unresolved
+/// context marker passes only when its declared type is among the property's accepted JSON
+/// types; absent optionals probe as the builder's default.
+fn validate_literal_field(
+    schema: &ApiSchema,
+    action: &PortableAction,
+    method: &str,
+    field: &PortableRequestField,
+    property_schema: &Value,
+    kind: PortableScalarKind,
+) -> Result<(), String> {
+    if kind == PortableScalarKind::Keys {
+        let probe = converted_keys_probe(action).map_err(|message| {
+            format!(
+                "portable action supplies an invalid value for parameter {:?}: {message}",
+                field.name
+            )
+        })?;
+        return probe_value_against_property(schema, method, field.name, &probe, property_schema);
+    }
+    // The zoom `mode` field converts the `enabled` boolean (`None` emits the `toggle`
+    // default); every other field converts its same-named config scalar.
+    if field.name == "mode" {
+        return validate_zoom_mode_field(schema, action, method, field.name, property_schema);
+    }
+    let scalar = literal_scalar_for(action, field.name);
+    let Some(scalar) = scalar else {
+        // The config leaves this optional absent, so dispatch emits the builder default.
+        let probe = default_probe_value(field, kind);
+        return probe_value_against_property(schema, method, field.name, &probe, property_schema);
+    };
+    if let ConfigValueKind::Context(reference) = &scalar.value.kind {
+        return validate_context_marker(schema, method, field.name, reference, property_schema);
+    }
+    let probe = converted_literal_probe(scalar, field.name, kind)?;
+    probe_value_against_property(schema, method, field.name, &probe, property_schema)
+}
+
+/// Validates the zoom `mode` field, which converts the `enabled` boolean exactly as the
+/// dispatch builder does: absent emits `"toggle"`, `true` emits `"on"`, `false` emits
+/// `"off"`. A context marker cannot convert to a boolean, so it rejects here (dispatch
+/// would also reject it via `scalar_bool`); the converted literal then faces the schema.
+fn validate_zoom_mode_field(
+    schema: &ApiSchema,
+    action: &PortableAction,
+    method: &str,
+    field_name: &str,
+    property_schema: &Value,
+) -> Result<(), String> {
+    let PortableAction::Pane(PaneAction::Zoom { enabled }) = action else {
+        return Err(format!(
+            "portable action supplies an invalid value for parameter {field_name:?}: mode field does not reference a zoom action"
+        ));
+    };
+    let probe = match enabled {
+        None => Value::String("toggle".to_owned()),
+        Some(scalar) => match &scalar.value.kind {
+            ConfigValueKind::Context(_) => {
+                return Err(format!(
+                    "portable action supplies an invalid value for parameter {field_name:?}: enabled must be boolean"
+                ));
+            }
+            _ => scalar_bool_value(scalar)
+                .map(|enabled| Value::String(if enabled { "on" } else { "off" }.to_owned()))
+                .map_err(|message| {
+                    format!("portable action supplies an invalid value for parameter {field_name:?}: {message}")
+                })?,
+        },
+    };
+    probe_value_against_property(schema, method, field_name, &probe, property_schema)
+}
+
+/// Converts a `keys` list: every entry faces the same string conversion the dispatch
+/// builder applies, and context entries probe as their declared type's representative.
+/// A non-string entry (literal or wrongly typed marker) rejects at load time.
+fn converted_keys_probe(action: &PortableAction) -> Result<Value, String> {
+    let PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(keys)) = action else {
+        return Err("keys field does not reference the action key list".to_owned());
+    };
+    keys.iter()
+        .map(|key| match &key.value.kind {
+            ConfigValueKind::Context(reference) => {
+                if reference.expected_type() == ContextType::String {
+                    Ok(Value::String("muxe-context".to_owned()))
+                } else {
+                    Err(format!(
+                        "key context type {:?} does not fit the declared string parameter",
+                        reference.expected_type(),
+                    ))
+                }
+            }
+            _ => scalar_string_value(key).map(Value::String),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+/// Checks an unresolved context marker against the property's accepted JSON types, resolved
+/// through `$ref` and `anyOf`/`oneOf` by the schema itself. The marker's declared type maps
+/// to the JSON types its resolved values inhabit (unsigned integers are JSON integers and
+/// therefore also JSON numbers; every id/path/text type is a JSON string).
+fn validate_context_marker(
+    schema: &ApiSchema,
+    method: &str,
+    field_name: &str,
+    reference: &muxe_core::ContextReference,
+    property_schema: &Value,
+) -> Result<(), String> {
+    let accepted = schema
+        .property_json_types(property_schema)
+        .map_err(|error| {
+            format!(
+                "active Herdr schema is malformed for {method} parameter {field_name:?}: {error}"
+            )
+        })?;
+    let fitting: &[&str] = match reference.expected_type() {
+        ContextType::UnsignedInteger => &["integer", "number"],
+        _ => &["string"],
+    };
+    if fitting.iter().any(|fitting| accepted.contains(*fitting)) {
+        return Ok(());
+    }
+    Err(format!(
+        "active Herdr schema rejects the {method} parameter {field_name:?}: context type {:?} does not fit the declared parameter type",
+        reference.expected_type(),
+    ))
+}
+
+/// Converts one configured literal exactly as the dispatch builder converts it, returning
+/// the JSON probe dispatch will emit for this field.
+fn converted_literal_probe(
+    scalar: &ActionScalar,
+    field_name: &str,
+    kind: PortableScalarKind,
+) -> Result<Value, String> {
+    match kind {
+        PortableScalarKind::String => scalar_string_value(scalar).map(Value::String),
+        PortableScalarKind::Bool => scalar_bool_value(scalar).map(Value::Bool),
+        PortableScalarKind::Index => scalar_index_value(scalar).map(|index| Value::Number(index.into())),
+        PortableScalarKind::Number => scalar_number_value(scalar).and_then(number_to_json),
+        PortableScalarKind::SplitDirection => scalar_split_direction_value(scalar).map(Value::String),
+        PortableScalarKind::PaneDirection => scalar_pane_direction_value(scalar).map(Value::String),
+        PortableScalarKind::Keys => {
+            Err(format!("portable action supplies an invalid value for parameter {field_name:?}: keys convert as a list, not a scalar"))
+        }
+    }
+    .map_err(|message| {
+        format!("portable action supplies an invalid value for parameter {field_name:?}: {message}")
+    })
+}
+
+/// Typed probe for a context-backed value: the canonical inhabitant of the declared
+/// context type. A `String` probe is the only honest universal string; numeric probes use
+/// zero; `PaneId`/`TabId` use representative ids. The schema decides acceptance.
+fn context_probe_value(context_type: ContextType) -> Value {
+    match context_type {
+        ContextType::UnsignedInteger => Value::Number(0.into()),
+        ContextType::PaneId => Value::String("pane".to_owned()),
+        ContextType::TabId => Value::String("tab".to_owned()),
+        ContextType::WorkspaceId => Value::String("workspace".to_owned()),
+        _ => Value::String("muxe-context".to_owned()),
+    }
+}
+
+/// Builds the probe params for the whole-request fallback path: every described field gets
+/// its representative probe value (literals become their converted value; origin fields
+/// become their typed probe).
+fn build_probe_params(
+    action: &PortableAction,
+    description: &PortableRequestDescription,
+) -> Result<Value, String> {
+    let mut params = serde_json::Map::new();
+    for field in description.fields {
+        params.insert(field.name.to_owned(), probe_field_value(action, field)?);
+    }
+    Ok(Value::Object(params))
+}
+
+/// Locates the configured scalar behind one described field, or `None` when the config
+/// leaves the optional absent (dispatch then emits the builder default). Field names are
+/// the description's emitted names (`label` for the config `name`, `mode` for `enabled`,
+/// `insert_index` for the move index).
+fn literal_scalar_for<'a>(
+    action: &'a PortableAction,
+    field_name: &str,
+) -> Option<&'a ActionScalar> {
+    match (action, field_name) {
+        (PortableAction::Tab(TabAction::Create { workspace_id, .. }), "workspace_id") => {
+            workspace_id.as_ref()
+        }
+        (PortableAction::Tab(TabAction::Create { name, .. }), "label") => name.as_ref(),
+        (PortableAction::Tab(TabAction::Create { focus, .. }), "focus") => focus.as_ref(),
+        (PortableAction::Tab(TabAction::Create { command, .. }), "cwd") => command.cwd.as_ref(),
+        (PortableAction::Tab(TabAction::Rename { name }), "label") => name.as_ref(),
+        (
+            PortableAction::Tab(TabAction::Move(muxe_core::IndexOrDirection::Index(index))),
+            "insert_index",
+        ) => Some(index),
+        (PortableAction::Pane(PaneAction::Split { direction, .. }), "direction") => {
+            direction.as_ref()
+        }
+        (PortableAction::Pane(PaneAction::Split { focus, .. }), "focus") => focus.as_ref(),
+        (PortableAction::Pane(PaneAction::Split { command, .. }), "cwd") => command.cwd.as_ref(),
+        (
+            PortableAction::Pane(PaneAction::Focus(muxe_core::IndexOrDirection::Direction(
+                direction,
+            ))),
+            "direction",
+        ) => Some(direction),
+        (
+            PortableAction::Pane(PaneAction::Swap(muxe_core::IndexOrDirection::Direction(
+                direction,
+            ))),
+            "direction",
+        ) => Some(direction),
+        (PortableAction::Pane(PaneAction::Resize { direction, .. }), "direction") => {
+            Some(direction)
+        }
+        (PortableAction::Pane(PaneAction::Resize { amount, .. }), "amount") => amount.as_ref(),
+        (PortableAction::Pane(PaneAction::Zoom { enabled }), "mode") => enabled.as_ref(),
+        (PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(text)), "text") => Some(text),
+        _ => None,
+    }
+}
+
+/// Builder-default probe for an absent optional, derived from the description's `Default`
+/// variant so the probe is exactly what dispatch emits: `focus` (Default Bool) defaults to
+/// `true`, zoom's `mode` (Default String) defaults to `"toggle"`, and every other absent
+/// optional emits `null` (nullable strings/numbers) or `[]` (keys).
+fn default_probe_value(field: &PortableRequestField, kind: PortableScalarKind) -> Value {
+    match field.origin {
+        PortableValueOrigin::Default(PortableScalarKind::Bool) => Value::Bool(true),
+        PortableValueOrigin::Default(PortableScalarKind::String) if field.name == "mode" => {
+            Value::String("toggle".to_owned())
+        }
+        _ => match kind {
+            PortableScalarKind::Bool => Value::Bool(true),
+            PortableScalarKind::String
+            | PortableScalarKind::Index
+            | PortableScalarKind::Number
+            | PortableScalarKind::SplitDirection
+            | PortableScalarKind::PaneDirection => Value::Null,
+            PortableScalarKind::Keys => Value::Array(Vec::new()),
+        },
+    }
+}
+
+/// Representative probe for one described field, used only by the whole-request fallback
+/// path for methods whose params schema declares no `properties`.
+fn probe_field_value(
+    action: &PortableAction,
+    field: &PortableRequestField,
+) -> Result<Value, String> {
+    match field.origin {
+        PortableValueOrigin::Origin(context_type) => Ok(context_probe_value(context_type)),
+        PortableValueOrigin::Literal(kind) | PortableValueOrigin::Default(kind) => {
+            literal_probe_value(action, field.name, kind)
+        }
+    }
+}
+
+/// Probe for one config-backed field on the fallback path: the converted literal, the
+/// context marker's typed probe, or the builder default when absent.
+fn literal_probe_value(
+    action: &PortableAction,
+    field_name: &str,
+    kind: PortableScalarKind,
+) -> Result<Value, String> {
+    if kind == PortableScalarKind::Keys {
+        return converted_keys_probe(action);
+    }
+    let scalar = literal_scalar_for(action, field_name);
+    let Some(scalar) = scalar else {
+        // The fallback path has no described field to derive the default from. Absent
+        // `focus` emits `true` and absent zoom `mode` emits `"toggle"`; every other absent
+        // optional emits `null` (nullable strings/numbers) or `[]` (keys).
+        if field_name == "focus" {
+            return Ok(Value::Bool(true));
+        }
+        if field_name == "mode" {
+            return Ok(Value::String("toggle".to_owned()));
+        }
+        let fallback = PortableRequestField {
+            name: "",
+            origin: PortableValueOrigin::Default(kind),
+        };
+        return Ok(default_probe_value(&fallback, kind));
+    };
+    if let ConfigValueKind::Context(reference) = &scalar.value.kind {
+        return Ok(context_probe_value(reference.expected_type()));
+    }
+    if field_name == "mode" {
+        return scalar_bool_value(scalar)
+            .map(|enabled| Value::String(if enabled { "on" } else { "off" }.to_owned()))
+            .map_err(|message| {
+                format!("portable action supplies an invalid value for parameter {field_name:?}: {message}")
+            });
+    }
+    converted_literal_probe(scalar, field_name, kind)
 }
 
 impl ActionValidator for HerdrConfigValidator {
@@ -1752,10 +2145,6 @@ struct Invocation {
 }
 
 #[expect(
-    clippy::too_many_lines,
-    reason = "closed portable form mapping stays co-located so direction, command, and unsupported-form diagnostics keep one reviewable order"
-)]
-#[expect(
     clippy::result_large_err,
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
@@ -1763,14 +2152,91 @@ fn portable_invocation(
     action: &PortableAction,
     origin: &muxe_core::OriginContext,
 ) -> Result<Invocation, AdapterError> {
+    let description = portable_request_description(action)
+        .map_err(incompatible)?
+        .ok_or_else(|| {
+            // Broker-owned forms (menu/config/command), command-bearing creations, and tab:swap
+            // never reach the single-request builder: dispatch routes them to their own paths.
+            // The description already reported every unsupported form as `Err`, so reaching
+            // here with `None` means dispatch misrouted a multi-request action.
+            incompatible("portable action form is unavailable in Herdr protocol 20")
+        })?;
+    let invocation = build_portable_invocation(&description, action, origin)?;
+    debug_assert_eq!(invocation.method, description.method);
+    debug_assert_eq!(
+        invocation.params.as_object().map(|params| {
+            let mut names: Vec<&str> = params.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            names
+        }),
+        Some({
+            let mut names: Vec<&str> = description.fields.iter().map(|field| field.name).collect();
+            names.sort_unstable();
+            names
+        }),
+        "the dispatch builder must emit exactly the described fields",
+    );
+    Ok(invocation)
+}
+
+/// Builds the dispatch-time invocation from the shared request description plus the
+/// concrete config scalars. The field list (method and parameter names) comes only from
+/// the description; this function only converts each field's runtime value.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
+fn build_portable_invocation(
+    description: &PortableRequestDescription,
+    action: &PortableAction,
+    origin: &muxe_core::OriginContext,
+) -> Result<Invocation, AdapterError> {
+    // The direction diagnostic outranks the command-lifecycle diagnostic: a split without a
+    // direction reports the missing direction even when it also carries a program.
+    if let PortableAction::Pane(PaneAction::Split {
+        direction: None, ..
+    }) = action
+    {
+        return Err(incompatible(
+            "Herdr pane.split requires an explicit right or down direction",
+        ));
+    }
+    if creation_has_program(action) {
+        // Command-bearing creations never reach the single-request builder: dispatch routes
+        // them through the ordered dismiss-and-dispatch lifecycle with its helper RPCs.
+        let message = match action {
+            PortableAction::Tab(TabAction::Create { .. }) => {
+                "Herdr command-bearing tab:create requires the ordered dismiss-and-dispatch lifecycle"
+            }
+            _ => {
+                "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle"
+            }
+        };
+        return Err(incompatible(message));
+    }
+    single_request_invocation(description, action, origin)
+}
+
+/// Builds one single-request invocation from the shared description. Callers guarantee the
+/// action carries no command program and, for splits, a direction; every remaining arm
+/// converts exactly the described fields.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
+fn single_request_invocation(
+    description: &PortableRequestDescription,
+    action: &PortableAction,
+    origin: &muxe_core::OriginContext,
+) -> Result<Invocation, AdapterError> {
     let pane = origin_pane(origin)?;
     match action {
         PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(keys)) => Ok(Invocation {
-            method: "pane.send_keys",
+            method: description.method,
             params: json!({ "pane_id": pane, "keys": keys.iter().map(scalar_string).collect::<Result<Vec<_>, _>>()? }),
         }),
         PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(text)) => Ok(Invocation {
-            method: "pane.send_text",
+            method: description.method,
             params: json!({ "pane_id": pane, "text": scalar_string(text)? }),
         }),
         PortableAction::Tab(TabAction::Create {
@@ -1778,40 +2244,26 @@ fn portable_invocation(
             name,
             focus,
             command,
-        }) => {
-            if command.program.is_some() {
-                return Err(incompatible(
-                    "Herdr command-bearing tab:create requires the ordered dismiss-and-dispatch lifecycle",
-                ));
-            }
-            Ok(Invocation {
-                method: "tab.create",
-                params: json!({
-                    "workspace_id": workspace_id.as_ref().map(scalar_string).transpose()?,
-                    "label": name.as_ref().map(scalar_string).transpose()?,
-                    "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
-                    "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
-                }),
-            })
-        }
+        }) => Ok(Invocation {
+            method: description.method,
+            params: json!({
+                "workspace_id": workspace_id.as_ref().map(scalar_string).transpose()?,
+                "label": name.as_ref().map(scalar_string).transpose()?,
+                "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+            }),
+        }),
         PortableAction::Tab(TabAction::Close) => Ok(Invocation {
-            method: "tab.close",
+            method: description.method,
             params: json!({ "tab_id": origin_tab(origin)? }),
         }),
-        PortableAction::Tab(TabAction::Rename { name }) => {
-            let label = name.as_ref().ok_or_else(|| {
-                incompatible(
-                    "Herdr tab.rename requires `label`; bare portable tab:rename has no host prompt mapping",
-                )
-            })?;
-            Ok(Invocation {
-                method: "tab.rename",
-                params: json!({ "tab_id": origin_tab(origin)?, "label": scalar_string(label)? }),
-            })
-        }
+        PortableAction::Tab(TabAction::Rename { name: Some(label) }) => Ok(Invocation {
+            method: description.method,
+            params: json!({ "tab_id": origin_tab(origin)?, "label": scalar_string(label)? }),
+        }),
         PortableAction::Tab(TabAction::Move(muxe_core::IndexOrDirection::Index(index))) => {
             Ok(Invocation {
-                method: "tab.move",
+                method: description.method,
                 params: json!({ "tab_id": origin_tab(origin)?, "insert_index": scalar_index(index)? }),
             })
         }
@@ -1822,49 +2274,37 @@ fn portable_invocation(
             direction: Some(direction),
             focus,
             command,
-        }) => {
-            if command.program.is_some() {
-                return Err(incompatible(
-                    "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle",
-                ));
-            }
-            Ok(Invocation {
-                method: "pane.split",
-                params: json!({
-                    "target_pane_id": pane,
-                    "direction": scalar_split_direction(direction)?,
-                    "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
-                    "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
-                }),
-            })
-        }
-        PortableAction::Pane(PaneAction::Split {
-            direction: None, ..
-        }) => Err(incompatible(
-            "Herdr pane.split requires an explicit right or down direction",
-        )),
+        }) => Ok(Invocation {
+            method: description.method,
+            params: json!({
+                "target_pane_id": pane,
+                "direction": scalar_split_direction(direction)?,
+                "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+            }),
+        }),
         PortableAction::Pane(PaneAction::Close) => Ok(Invocation {
-            method: "pane.close",
+            method: description.method,
             params: json!({ "pane_id": pane }),
         }),
         PortableAction::Pane(PaneAction::Focus(muxe_core::IndexOrDirection::Direction(
             direction,
         ))) => Ok(Invocation {
-            method: "pane.focus_direction",
+            method: description.method,
             params: json!({ "pane_id": pane, "direction": scalar_pane_direction(direction)? }),
         }),
         PortableAction::Pane(PaneAction::Swap(muxe_core::IndexOrDirection::Direction(
             direction,
         ))) => Ok(Invocation {
-            method: "pane.swap",
+            method: description.method,
             params: json!({ "pane_id": pane, "direction": scalar_pane_direction(direction)? }),
         }),
         PortableAction::Pane(PaneAction::Resize { direction, amount }) => Ok(Invocation {
-            method: "pane.resize",
+            method: description.method,
             params: json!({ "pane_id": pane, "direction": scalar_pane_direction(direction)?, "amount": amount.as_ref().map(scalar_number).transpose()? }),
         }),
         PortableAction::Pane(PaneAction::Zoom { enabled }) => Ok(Invocation {
-            method: "pane.zoom",
+            method: description.method,
             params: json!({ "pane_id": pane, "mode": enabled.as_ref().map(scalar_bool).transpose()?.map_or("toggle", |value| if value { "on" } else { "off" }) }),
         }),
         _ => Err(AdapterError::new(
@@ -1872,6 +2312,200 @@ fn portable_invocation(
             "portable action form is unavailable in Herdr protocol 20",
         )),
     }
+}
+/// One portable action's emitted Herdr request, shared by load-time validation and dispatch.
+///
+/// This is the single source of truth for "which method and which parameter fields this
+/// portable action emits, and where each field's value comes from". Both the load-time
+/// validator and the dispatch-time builder derive from it so the two phases can never
+/// validate different contracts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PortableRequestDescription {
+    method: &'static str,
+    /// Fields the action always emits. Origin-derived values (pane/tab ids) are marked
+    /// `Origin` so load-time checks know they resolve to concrete host strings at dispatch;
+    /// unresolved context references stay marked `Unresolved` with their declared type.
+    fields: &'static [PortableRequestField],
+}
+
+/// One emitted parameter field and the typed origin of its value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PortableRequestField {
+    name: &'static str,
+    origin: PortableValueOrigin,
+}
+
+/// Where one emitted field's value comes from. Concrete scalars resolve at dispatch to the
+/// adapter's checked scalar conversion; `Origin` fields resolve to captured host identity
+/// strings; `Unresolved` fields are context references whose declared type must be accepted
+/// by the schema's parameter type/domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortableValueOrigin {
+    /// A config scalar converted by the named adapter scalar check. A literal faces full
+    /// schema probing; an unresolved context marker faces the declared-type check, since its
+    /// concrete value only exists after broker origin resolution.
+    Literal(PortableScalarKind),
+    /// A captured origin string (pane id, tab id, or workspace id).
+    Origin(ContextType),
+    /// A builder default the dispatch path always supplies (e.g. `focus` defaults to `true`,
+    /// zoom's `toggle` mode). Literals that violate the declared parameter type still reject.
+    Default(PortableScalarKind),
+}
+
+/// The adapter scalar conversion one literal field passes through at dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortableScalarKind {
+    String,
+    Bool,
+    Index,
+    Number,
+    SplitDirection,
+    PaneDirection,
+    Keys,
+}
+/// Derives the single emitted-request description for one portable action, or reports the
+/// same unsupported-form diagnostic the dispatch builder reports. Optional config scalars
+/// that stay absent still emit their builder default, so they appear as `Default` fields;
+/// `None` here means the action has no Herdr mapping at all. Every `PortableAction` variant
+/// is covered below, so the match needs no wildcard arm.
+fn portable_request_description(
+    action: &PortableAction,
+) -> Result<Option<PortableRequestDescription>, String> {
+    use PortableScalarKind as Scalar;
+    use PortableValueOrigin as Origin;
+    let description = match action {
+        PortableAction::Menu(_) | PortableAction::Config(_) | PortableAction::Command(_) => return Ok(None),
+        PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(_)) => PortableRequestDescription {
+            method: "pane.send_keys",
+            fields: &[
+                PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
+                PortableRequestField { name: "keys", origin: Origin::Literal(Scalar::Keys) },
+            ],
+        },
+        PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(_)) => PortableRequestDescription {
+            method: "pane.send_text",
+            fields: &[
+                PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
+                PortableRequestField { name: "text", origin: Origin::Literal(Scalar::String) },
+            ],
+        },
+        PortableAction::Tab(TabAction::Create { command, .. }) => {
+            if command.program.is_some() {
+                return Ok(None);
+            }
+            PortableRequestDescription {
+                method: "tab.create",
+                fields: &[
+                    PortableRequestField { name: "workspace_id", origin: Origin::Literal(Scalar::String) },
+                    PortableRequestField { name: "label", origin: Origin::Literal(Scalar::String) },
+                    PortableRequestField { name: "focus", origin: Origin::Default(Scalar::Bool) },
+                    PortableRequestField { name: "cwd", origin: Origin::Literal(Scalar::String) },
+                ],
+            }
+        }
+        PortableAction::Tab(TabAction::Close) => PortableRequestDescription {
+            method: "tab.close",
+            fields: &[PortableRequestField { name: "tab_id", origin: Origin::Origin(ContextType::TabId) }],
+        },
+        PortableAction::Tab(TabAction::Rename { name: Some(_) }) => PortableRequestDescription {
+            method: "tab.rename",
+            fields: &[
+                PortableRequestField { name: "tab_id", origin: Origin::Origin(ContextType::TabId) },
+                PortableRequestField { name: "label", origin: Origin::Literal(Scalar::String) },
+            ],
+        },
+        PortableAction::Tab(TabAction::Rename { name: None }) => {
+            return Err(
+                "Herdr tab.rename requires `label`; the portable bare `tab:rename` has no specified Herdr prompt mapping"
+                    .to_owned(),
+            );
+        }
+        PortableAction::Tab(TabAction::Move(target)) if target_is_index(target) => PortableRequestDescription {
+            method: "tab.move",
+            fields: &[
+                PortableRequestField { name: "tab_id", origin: Origin::Origin(ContextType::TabId) },
+                PortableRequestField { name: "insert_index", origin: Origin::Literal(Scalar::Index) },
+            ],
+        },
+        PortableAction::Tab(TabAction::Swap(target)) if target_is_index(target) => return Ok(None),
+        PortableAction::Pane(PaneAction::Create) => {
+            return Err(
+                "Herdr has no pane.create method; pane.split requires an explicit right or down direction"
+                    .to_owned(),
+            );
+        }
+        PortableAction::Pane(PaneAction::Split { direction: None, .. }) => {
+            return Err("Herdr pane.split requires an explicit right or down direction".to_owned());
+        }
+        PortableAction::Pane(PaneAction::Split { direction: Some(direction), command, .. })
+            if command.program.is_none() && split_direction_is_supported(direction) =>
+        {
+            PortableRequestDescription {
+                method: "pane.split",
+                fields: &[
+                    PortableRequestField { name: "target_pane_id", origin: Origin::Origin(ContextType::PaneId) },
+                    PortableRequestField { name: "direction", origin: Origin::Literal(Scalar::SplitDirection) },
+                    PortableRequestField { name: "focus", origin: Origin::Default(Scalar::Bool) },
+                    PortableRequestField { name: "cwd", origin: Origin::Literal(Scalar::String) },
+                ],
+            }
+        }
+        PortableAction::Pane(PaneAction::Split { direction: Some(direction), .. })
+            if !split_direction_is_supported(direction) =>
+        {
+            return Err("Herdr pane.split supports only right or down directions".to_owned());
+        }
+        PortableAction::Pane(PaneAction::Split { .. }) => {
+            return Err(
+                "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle"
+                    .to_owned(),
+            );
+        }
+        PortableAction::Pane(PaneAction::Close) => PortableRequestDescription {
+            method: "pane.close",
+            fields: &[PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) }],
+        },
+        PortableAction::Pane(PaneAction::Focus(target)) if target_is_cardinal_direction(target) => PortableRequestDescription {
+            method: "pane.focus_direction",
+            fields: &[
+                PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
+                PortableRequestField { name: "direction", origin: Origin::Literal(Scalar::PaneDirection) },
+            ],
+        },
+        PortableAction::Pane(PaneAction::Swap(target)) if target_is_cardinal_direction(target) => PortableRequestDescription {
+            method: "pane.swap",
+            fields: &[
+                PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
+                PortableRequestField { name: "direction", origin: Origin::Literal(Scalar::PaneDirection) },
+            ],
+        },
+        PortableAction::Pane(PaneAction::Resize { .. }) => PortableRequestDescription {
+            method: "pane.resize",
+            fields: &[
+                PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
+                PortableRequestField { name: "direction", origin: Origin::Literal(Scalar::PaneDirection) },
+                PortableRequestField { name: "amount", origin: Origin::Literal(Scalar::Number) },
+            ],
+        },
+        PortableAction::Pane(PaneAction::Zoom { .. }) => PortableRequestDescription {
+            method: "pane.zoom",
+            fields: &[
+                PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
+                PortableRequestField { name: "mode", origin: Origin::Default(Scalar::String) },
+            ],
+        },
+        PortableAction::Tab(TabAction::Focus(_)) => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that protocol 20 does not expose as a typed action".to_owned()),
+        PortableAction::Tab(TabAction::Move(_)) => return Err("Herdr tab.move supports only a concrete insert index".to_owned()),
+        PortableAction::Tab(TabAction::Swap(_)) => return Err("Herdr tab:swap supports only an index; the schema offers tab.list plus tab.move, not directional tab targeting".to_owned()),
+        PortableAction::Pane(PaneAction::Focus(_)) => return Err("Herdr pane.focus supports only cardinal directions".to_owned()),
+        PortableAction::Pane(PaneAction::Move(_)) => return Err("Herdr pane.move requires an explicit tab/new-tab destination, not a portable index or direction".to_owned()),
+        PortableAction::Pane(PaneAction::Swap(_)) => return Err("Herdr pane.swap supports only cardinal directions".to_owned()),
+        PortableAction::Pane(PaneAction::Fullscreen { .. }) => return Err("Herdr protocol 20 exposes no pane fullscreen method".to_owned()),
+        PortableAction::Pane(PaneAction::Floating { .. }) => return Err("Herdr protocol 20 exposes no pane floating method".to_owned()),
+        PortableAction::Pane(PaneAction::Frame { .. }) => return Err("Herdr protocol 20 exposes no pane frame method".to_owned()),
+        PortableAction::Session(_) => return Err("Herdr protocol 20 exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
+    };
+    Ok(Some(description))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2409,6 +3043,47 @@ fn scalar_split_direction(value: &ActionScalar) -> Result<&str, AdapterError> {
     }
 }
 
+/// Load-time scalar readers mirroring the dispatch-time `scalar_*` conversions without
+/// allocating an `AdapterError`: they return the converted plain value or a diagnostic
+/// fragment the caller attributes to the emitting parameter.
+fn scalar_string_value(value: &ActionScalar) -> Result<String, String> {
+    scalar_string(value)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
+}
+
+fn scalar_bool_value(value: &ActionScalar) -> Result<bool, String> {
+    scalar_bool(value).map_err(|error| error.to_string())
+}
+
+fn scalar_index_value(value: &ActionScalar) -> Result<u64, String> {
+    scalar_index(value).map_err(|error| error.to_string())
+}
+
+fn scalar_number_value(value: &ActionScalar) -> Result<f64, String> {
+    scalar_number(value).map_err(|error| error.to_string())
+}
+
+fn scalar_split_direction_value(value: &ActionScalar) -> Result<String, String> {
+    scalar_split_direction(value)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
+}
+
+fn scalar_pane_direction_value(value: &ActionScalar) -> Result<String, String> {
+    scalar_pane_direction(value)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
+}
+
+/// JSON-number probe for a resize amount. Non-finite floats have no JSON encoding, so
+/// they reject here exactly as `validate_candidate` rejects non-finite native floats.
+fn number_to_json(value: f64) -> Result<Value, String> {
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .ok_or_else(|| "non-finite floating point values are not valid JSON".to_owned())
+}
+
 fn native_candidate_diagnostic(
     candidate: &NativeActionCandidate,
     error: &CandidateValidationError,
@@ -2748,5 +3423,214 @@ mod tests {
 
         assert!(target_is_index(&muxe_core::IndexOrDirection::Index(index)));
         assert!(split_direction_is_supported(&direction));
+    }
+    fn bundled_schema() -> ApiSchema {
+        let raw = serde_json::from_str(include_str!(
+            "../../../fixtures/herdr/herdr-api.schema.json"
+        ))
+        .expect("bundled fixture schema is valid JSON");
+        ApiSchema::parse(raw).expect("bundled schema parses")
+    }
+
+    fn mutated_schema(mutate: impl FnOnce(&mut serde_json::Value)) -> ApiSchema {
+        let mut raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/herdr/herdr-api.schema.json"
+        ))
+        .expect("bundled fixture schema is valid JSON");
+        mutate(&mut raw);
+        ApiSchema::parse(raw).expect("mutated schema parses")
+    }
+
+    #[test]
+    fn added_required_close_parameter_rejects_at_load_time() {
+        // The finding's core case: pane.close is still declared, but the runtime schema
+        // demands a new required field the portable action never emits. Load-time
+        // validation must reject; the binding must never be published.
+        let schema = mutated_schema(|raw| {
+            let defs = raw["schemas"]["request"]["$defs"]
+                .as_object_mut()
+                .expect("bundled schema declares request defs");
+            let target = defs
+                .get_mut("PaneTarget")
+                .expect("bundled schema declares PaneTarget")
+                .as_object_mut()
+                .expect("PaneTarget is an object schema");
+            target
+                .entry("properties")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .expect("properties is an object")
+                .insert("force".to_owned(), serde_json::json!({ "type": "boolean" }));
+            target
+                .entry("required")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .expect("required is an array")
+                .push(serde_json::json!("force"));
+        });
+        let error = portable_compile_validation(&schema, &PortableAction::Pane(PaneAction::Close))
+            .expect_err("a newly required close parameter must reject at load time");
+        assert!(
+            error.contains("force"),
+            "the diagnostic names the missing required parameter: {error}"
+        );
+        assert!(
+            error.contains("pane.close"),
+            "the diagnostic names the affected method: {error}"
+        );
+        // The rejection must surface as a diagnostic attached to the action span, so the
+        // compiler can pin the binding that can never dispatch.
+        let validator = HerdrConfigValidator {
+            schema: std::sync::Arc::new(schema),
+        };
+        let span = SourceSpan::new(SourceId::new("<test>"), 7, 3);
+        let diagnostic = ActionValidator::validate_portable(
+            &validator,
+            &PortableAction::Pane(PaneAction::Close),
+            &span,
+        )
+        .expect_err("the validator reports the unusable binding");
+        assert_eq!(diagnostic.code, DiagnosticCode::InvalidAction);
+        assert!(
+            diagnostic.labels.iter().any(|label| label.span == span),
+            "the diagnostic is attached to the action span"
+        );
+    }
+
+    #[test]
+    fn narrowed_resize_direction_enum_rejects_literal_at_load_time() {
+        // A resize direction the runtime schema's enum dropped must reject at load time,
+        // not at invocation after the user selected the binding.
+        let schema = mutated_schema(|raw| {
+            let pane_direction = raw["schemas"]["request"]["$defs"]["PaneDirection"]
+                .as_object_mut()
+                .expect("bundled schema declares PaneDirection");
+            pane_direction.insert("enum".to_owned(), serde_json::json!(["left", "up"]));
+        });
+        let direction = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+            "right".to_owned(),
+        )));
+        let action = PortableAction::Pane(PaneAction::Resize {
+            direction,
+            amount: None,
+        });
+        let error = portable_compile_validation(&schema, &action)
+            .expect_err("a dropped enum direction must reject at load time");
+        assert!(
+            error.contains("direction"),
+            "the diagnostic names the offending parameter: {error}"
+        );
+    }
+
+    #[test]
+    fn forbidden_emitted_field_rejects_at_load_time() {
+        // An emitted field the schema forbids (closed object without that property) must
+        // reject at load time rather than at dispatch.
+        let mut schema = bundled_schema();
+        let description = portable_request_description(&PortableAction::Pane(PaneAction::Close))
+            .expect("pane:close has a description")
+            .expect("pane:close emits a single request");
+        // Sanity: the unmutated schema accepts the described request.
+        validate_portable_request(
+            &schema,
+            &PortableAction::Pane(PaneAction::Close),
+            &description,
+        )
+        .expect("bundled schema accepts pane:close");
+        // Narrow PaneTarget to declare none of the emitted properties while still
+        // requiring pane_id: the emitted field set is then forbidden.
+        schema = mutated_schema(|raw| {
+            let defs = raw["schemas"]["request"]["$defs"]
+                .as_object_mut()
+                .expect("bundled schema declares request defs");
+            let target = defs
+                .get_mut("PaneTarget")
+                .expect("bundled schema declares PaneTarget")
+                .as_object_mut()
+                .expect("PaneTarget is an object schema");
+            target.insert("properties".to_owned(), serde_json::json!({}));
+        });
+        let error = portable_compile_validation(&schema, &PortableAction::Pane(PaneAction::Close))
+            .expect_err("an undeclared emitted field must reject at load time");
+        assert!(
+            error.contains("pane_id"),
+            "the diagnostic names the forbidden parameter: {error}"
+        );
+    }
+
+    #[test]
+    fn pane_close_dispatch_emits_exact_close_request() {
+        // Guards the restored arm: portable pane:close dispatches exactly
+        // method "pane.close" with params { "pane_id": <origin pane> }.
+        let invocation = portable_invocation(&PortableAction::Pane(PaneAction::Close), &origin())
+            .expect("pane:close dispatches");
+        assert_eq!(invocation.method, "pane.close");
+        assert_eq!(
+            invocation.params,
+            serde_json::json!({ "pane_id": "pane" }),
+            "pane:close emits exactly the origin pane id"
+        );
+    }
+
+    #[test]
+    fn context_domain_mismatch_rejects_at_load_time() {
+        // An unsigned-integer context marker in a string-typed parameter must reject at
+        // load time: `origin.tab.index` can never satisfy `tab.rename`'s `label`.
+        let source = SourceSpan::new(SourceId::new("<test>"), 0, 0);
+        let name = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::Context(
+            ContextReference::parse("origin.tab.index", source)
+                .expect("known unsigned context path"),
+        )));
+        let action = PortableAction::Tab(TabAction::Rename { name: Some(name) });
+        let schema = bundled_schema();
+        let error = portable_compile_validation(&schema, &action)
+            .expect_err("an integer context marker in a string parameter must reject");
+        assert!(
+            error.contains("label"),
+            "the diagnostic names the offending parameter: {error}"
+        );
+        assert!(
+            error.contains("tab.rename"),
+            "the diagnostic names the affected method: {error}"
+        );
+        assert!(
+            error.contains("does not fit"),
+            "the diagnostic names the domain mismatch: {error}"
+        );
+        // The rejection must surface as a diagnostic attached to the action span, so the
+        // compiler can pin the binding that can never dispatch.
+        let validator = HerdrConfigValidator {
+            schema: std::sync::Arc::new(schema),
+        };
+        let span = SourceSpan::new(SourceId::new("<test>"), 7, 3);
+        let diagnostic = ActionValidator::validate_portable(&validator, &action, &span)
+            .expect_err("the validator reports the unusable binding");
+        assert_eq!(diagnostic.code, DiagnosticCode::InvalidAction);
+        assert!(
+            diagnostic.labels.iter().any(|label| label.span == span),
+            "the diagnostic is attached to the action span"
+        );
+    }
+
+    #[test]
+    fn pane_resize_dispatch_emits_exact_resize_request() {
+        // Guards the multi-field arm: portable pane:resize dispatches exactly method
+        // "pane.resize" with params { "pane_id", "direction", "amount" }, so a deleted
+        // or narrowed arm fails loudly instead of dispatching a silent wrong shape.
+        let direction = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+            "right".to_owned(),
+        )));
+        let amount = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::Float(2.0)));
+        let action = PortableAction::Pane(PaneAction::Resize {
+            direction,
+            amount: Some(amount),
+        });
+        let invocation = portable_invocation(&action, &origin()).expect("pane:resize dispatches");
+        assert_eq!(invocation.method, "pane.resize");
+        assert_eq!(
+            invocation.params,
+            serde_json::json!({ "pane_id": "pane", "direction": "right", "amount": 2.0 }),
+            "pane:resize emits exactly the origin pane id with direction and amount"
+        );
     }
 }

@@ -211,6 +211,25 @@ impl ApiSchema {
         self.methods.values().flatten()
     }
 
+    /// Resolves one method's params schema node for load-time probing.
+    ///
+    /// Returns the resolved params schema value and the schema path to report.
+    /// Returns `None` when the method is undeclared or ambiguous, mirroring
+    /// `validate_method`'s method lookup without validating any params.
+    pub(crate) fn method_params_schema(&self, method: &str) -> Option<(&Value, &str)> {
+        let method_schema = self.method(method)?;
+        match &method_schema.params {
+            ParameterSchema::Reference(reference) => self
+                .resolve_reference(reference, "#")
+                .ok()
+                .map(|resolved| (resolved, reference.as_str())),
+            ParameterSchema::Inline {
+                schema,
+                schema_path,
+            } => Some((schema, schema_path.as_str())),
+        }
+    }
+
     /// Validates one method's params against the live request surface.
     ///
     /// # Errors
@@ -241,6 +260,130 @@ impl ApiSchema {
             } => (schema, schema_path.as_str()),
         };
         self.validate(root, params, "#", schema_path, 0)
+    }
+
+    /// Probes one value against one schema node with full `$ref` resolution.
+    ///
+    /// Load-time portable validation derives its per-field verdicts from the schema itself
+    /// through this accessor rather than duplicating schema knowledge in the adapter.
+    pub(crate) fn validate_value(
+        &self,
+        schema_node: &Value,
+        value: &Value,
+        instance_path: &str,
+        schema_path: &str,
+    ) -> Result<(), ValidationError> {
+        self.validate(schema_node, value, instance_path, schema_path, 0)
+    }
+    /// Answers which JSON types one params property can accept, resolving `$ref` nodes and
+    /// unioning `anyOf`/`oneOf` branches. Load-time portable validation checks unresolved
+    /// context values by their declared type through this accessor instead of inventing
+    /// concrete values that could mask a real mismatch.
+    pub(crate) fn property_json_types(
+        &self,
+        property_schema: &Value,
+    ) -> Result<BTreeSet<&'static str>, ValidationError> {
+        let mut types = BTreeSet::new();
+        self.collect_json_types(property_schema, "#", &mut types, 0)?;
+        if types.is_empty() {
+            // An unconstrained node (no `type`, `enum`, `const`, or combinator) accepts anything.
+            types = BTreeSet::from([
+                "null", "boolean", "integer", "number", "string", "array", "object",
+            ]);
+        }
+        Ok(types)
+    }
+
+    fn collect_json_types(
+        &self,
+        node: &Value,
+        schema_path: &str,
+        out: &mut BTreeSet<&'static str>,
+        reference_depth: usize,
+    ) -> Result<(), ValidationError> {
+        if reference_depth > 128 {
+            return Err(error(
+                ValidationCode::Reference,
+                "#",
+                schema_path,
+                "reference depth exceeds 128",
+            ));
+        }
+        if let Some(accepts) = node.as_bool() {
+            if accepts {
+                out.extend([
+                    "null", "boolean", "integer", "number", "string", "array", "object",
+                ]);
+            }
+            return Ok(());
+        }
+        let Some(object) = node.as_object() else {
+            return Ok(());
+        };
+        if let Some(reference) = string_keyword(object, "$ref", schema_path)? {
+            let resolved = self.resolve_reference(reference, schema_path)?;
+            return self.collect_json_types(resolved, reference, out, reference_depth + 1);
+        }
+        match object.get("type") {
+            Some(Value::String(kind)) => {
+                if let Some(canonical) = canonical_json_type(kind) {
+                    out.insert(canonical);
+                }
+            }
+            Some(Value::Array(kinds)) => {
+                for kind in kinds {
+                    if let Some(kind) = kind.as_str()
+                        && let Some(canonical) = canonical_json_type(kind)
+                    {
+                        out.insert(canonical);
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(malformed(
+                    schema_path,
+                    "type must be a string or a string array",
+                ));
+            }
+            None => {}
+        }
+        if let Some(constant) = object.get("const") {
+            out.insert(json_value_type(constant));
+            if constant
+                .as_number()
+                .is_some_and(|number| number.as_i64().is_some() || number.as_u64().is_some())
+            {
+                // An integer-valued const also satisfies a `number` declaration.
+                out.insert("number");
+            }
+        }
+        if let Some(values) = object.get("enum").and_then(Value::as_array) {
+            for value in values {
+                out.insert(json_value_type(value));
+                if value
+                    .as_number()
+                    .is_some_and(|number| number.as_i64().is_some() || number.as_u64().is_some())
+                {
+                    out.insert("number");
+                }
+            }
+        }
+        for keyword in ["anyOf", "oneOf"] {
+            if let Some(alternatives) = object.get(keyword).and_then(Value::as_array) {
+                for (index, alternative) in alternatives.iter().enumerate() {
+                    let alternative_path =
+                        schema_child(&schema_child(schema_path, keyword), &index.to_string());
+                    self.collect_json_types(alternative, &alternative_path, out, reference_depth)?;
+                }
+            }
+        }
+        if object.contains_key("properties") {
+            out.insert("object");
+        }
+        if object.contains_key("items") {
+            out.insert("array");
+        }
+        Ok(())
     }
 
     /// Returns the cache-verified normalized request representation retained at construction.
@@ -928,6 +1071,44 @@ fn value_has_type(value: &Value, kind: &str) -> bool {
             .as_number()
             .is_some_and(|number| number.as_i64().is_some() || number.as_u64().is_some()),
         _ => false,
+    }
+}
+
+/// Canonical closed JSON type name. This crate's schema surface uses `null`, `boolean`,
+/// `object`, `array`, `string`, `number`, and `integer`; anything else is ignored by the
+/// load-time type probe (the dispatch validator still enforces it on concrete values).
+fn canonical_json_type(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "null" => "null",
+        "boolean" => "boolean",
+        "object" => "object",
+        "array" => "array",
+        "string" => "string",
+        "number" => "number",
+        "integer" => "integer",
+        _ => return None,
+    })
+}
+
+/// JSON type of one concrete value for the load-time type probe.
+fn json_value_type(value: &Value) -> &'static str {
+    if value.is_null() {
+        "null"
+    } else if value.is_boolean() {
+        "boolean"
+    } else if value.is_object() {
+        "object"
+    } else if value.is_array() {
+        "array"
+    } else if value.is_string() {
+        "string"
+    } else if value
+        .as_number()
+        .is_some_and(|number| number.as_i64().is_some() || number.as_u64().is_some())
+    {
+        "integer"
+    } else {
+        "number"
     }
 }
 
