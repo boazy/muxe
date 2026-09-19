@@ -101,9 +101,111 @@ pub enum UiError {
     ExecutionSequenceExhausted,
 }
 
+/// Closed status levels for the UI status line, in documented precedence order:
+/// fatal errors outrank pending-action progress, which outranks blocked-binding
+/// diagnostics, which outrank idle notices. There is no `ready` level: successful
+/// completion is an idle notice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusKind {
+    Error,
+    Pending,
+    Blocked,
+    Notice,
+}
+
+impl StatusKind {
+    fn level(self) -> &'static str {
+        match self {
+            StatusKind::Error => "error",
+            StatusKind::Pending => "pending",
+            StatusKind::Blocked => "blocked",
+            StatusKind::Notice => "notice",
+        }
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            StatusKind::Error => 4,
+            StatusKind::Pending => 3,
+            StatusKind::Blocked => 1,
+            StatusKind::Notice => 0,
+        }
+    }
+}
+
 struct StatusMessage {
-    level: String,
+    kind: StatusKind,
     message: String,
+}
+
+/// Visible pending-action text. The exact wording is not a contract; tests observe
+/// visibility and transitions rather than this string.
+const PENDING_MESSAGE: &str = "Action pending";
+
+impl StatusMessage {
+    fn new(kind: StatusKind, message: String) -> Self {
+        Self { kind, message }
+    }
+}
+
+impl UiRuntime {
+    /// Applies the single status priority policy: a new status replaces the
+    /// current one only when its priority is at least as high. Errors therefore
+    /// survive later health notices, and pending progress survives blocked notes.
+    fn set_status(&mut self, kind: StatusKind, message: String) {
+        let replace = self
+            .status
+            .as_ref()
+            .is_none_or(|current| kind.priority() >= current.kind.priority());
+        if replace {
+            self.status = Some(StatusMessage::new(kind, message));
+        }
+    }
+
+    /// Applies healthy-adapter recovery: a recovery notice replaces a stale
+    /// blocked/health notice, but never pending progress or a higher-priority
+    /// error.
+    fn recover_health_status(&mut self, message: String) {
+        let recoverable = self
+            .status
+            .as_ref()
+            .is_none_or(|status| matches!(status.kind, StatusKind::Blocked | StatusKind::Notice));
+        if recoverable {
+            self.status = Some(StatusMessage::new(StatusKind::Notice, message));
+        }
+    }
+
+    /// Clears any status that the documented input/menu transition dismisses.
+    /// Pending progress is owned by the correlated execution transition and is
+    /// never cleared here.
+    fn clear_for_input_or_navigation(&mut self) {
+        let pending = self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.kind == StatusKind::Pending);
+        if !pending {
+            self.status = None;
+        }
+    }
+
+    /// Establishes pending progress for a newly accepted awaited action through
+    /// the centralized priority policy: pending replaces a stale blocked/health
+    /// notice but never a higher-priority error that arrived after input.
+    fn enter_pending_status(&mut self) {
+        self.set_status(StatusKind::Pending, PENDING_MESSAGE.to_owned());
+    }
+
+    /// Clears pending progress only; used when the correlated execution leaves
+    /// the pending state. Never clears a higher-priority error shown above it.
+    fn clear_pending_status(&mut self) {
+        let pending = self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.kind == StatusKind::Pending);
+        if pending {
+            self.status = None;
+        }
+    }
 }
 
 struct BindingAvailabilityOverlay {
@@ -247,10 +349,7 @@ impl UiRuntime {
                     input: MenuSessionInput::Unknown,
                 });
                 if active {
-                    self.status = Some(StatusMessage {
-                        level: "blocked".into(),
-                        message,
-                    });
+                    self.set_status(StatusKind::Blocked, message);
                     return Ok(UiCommand::Redraw);
                 }
                 Ok(self.menu_output(output.as_ref()))
@@ -279,14 +378,14 @@ impl UiRuntime {
                 }
                 let previous = matches!(selection, Selection::PagePrevious);
                 if self.turn_page(previous) {
-                    self.status = None;
+                    self.clear_for_input_or_navigation();
                     Ok(UiCommand::Redraw)
                 } else {
                     Ok(UiCommand::Ignored)
                 }
             }
             Selection::Binding(binding) => {
-                self.status = None;
+                self.clear_for_input_or_navigation();
                 let output = self.menu_session.handle(MenuSessionEvent::Key {
                     at,
                     input: MenuSessionInput::Binding(core_binding_id(binding)),
@@ -388,7 +487,12 @@ impl UiRuntime {
                     at,
                     execution: core,
                 });
-                Ok(self.menu_output(output.as_ref()))
+                let command = self.menu_output(output.as_ref());
+                self.enter_pending_status();
+                if command == UiCommand::Ignored {
+                    return Ok(UiCommand::Redraw);
+                }
+                Ok(command)
             }
             InvocationDisposition::Detached | InvocationDisposition::Dismissed => {
                 let after_action = if disposition == InvocationDisposition::Dismissed {
@@ -437,6 +541,7 @@ impl UiRuntime {
             } if *execution == core
         ) {
             self.pending = None;
+            self.clear_pending_status();
         }
         self.menu_output(output.as_ref())
     }
@@ -507,19 +612,20 @@ impl UiRuntime {
                 healthy,
                 diagnostic,
             } => {
-                self.status = Some(StatusMessage {
-                    level: if *healthy { "ready" } else { "blocked" }.into(),
-                    message: diagnostic.as_ref().map_or_else(
-                        || {
-                            if *healthy {
-                                "Host adapter is available".into()
-                            } else {
-                                "Host adapter is unavailable".into()
-                            }
-                        },
+                if *healthy {
+                    self.recover_health_status(diagnostic.as_ref().map_or_else(
+                        || "Host adapter is available".to_owned(),
                         |diagnostic| diagnostic.message.clone(),
-                    ),
-                });
+                    ));
+                } else {
+                    self.set_status(
+                        StatusKind::Blocked,
+                        diagnostic.as_ref().map_or_else(
+                            || "Host adapter is unavailable".to_owned(),
+                            |diagnostic| diagnostic.message.clone(),
+                        ),
+                    );
+                }
                 Ok(UiCommand::Redraw)
             }
             BrokerEvent::BrokerRetiring | BrokerEvent::Fatal(_) => Ok(UiCommand::Detach),
@@ -556,19 +662,31 @@ impl UiRuntime {
                 ..
             } if *execution == core
         );
+        // A requested menu control wins the race over ordinary completion: the
+        // session intentionally stays pending until PendingControlCompleted, so the
+        // visible pending progress must stay as well.
         if !still_pending {
             self.pending = None;
+            self.clear_pending_status();
         }
         if output.is_some() {
             return self.menu_output(output.as_ref());
         }
         if !still_pending {
-            let (level, fallback) = execution_status(outcome);
-            self.status = Some(StatusMessage {
-                level: level.into(),
-                message: diagnostic
-                    .map_or_else(|| fallback.into(), |diagnostic| diagnostic.message.clone()),
-            });
+            let (kind, fallback) = execution_status(outcome);
+            // Successful completion is an idle notice, not a persistent `ready`
+            // state. The pending-to-idle transition itself still needs a redraw
+            // so the cleared pending text leaves the screen.
+            if kind == StatusKind::Notice && diagnostic.is_none() {
+                return UiCommand::Redraw;
+            }
+            self.set_status(
+                kind,
+                diagnostic.map_or_else(
+                    || fallback.to_owned(),
+                    |diagnostic| diagnostic.message.clone(),
+                ),
+            );
             return UiCommand::Redraw;
         }
         UiCommand::Ignored
@@ -576,10 +694,7 @@ impl UiRuntime {
 
     /// Shows a recoverable broker diagnostic without replacing the pinned attachment.
     pub fn report_broker_error(&mut self, message: String) {
-        self.status = Some(StatusMessage {
-            level: "error".into(),
-            message,
-        });
+        self.set_status(StatusKind::Error, message);
     }
 
     /// Renders the current menu against the exact terminal rectangle before a surface redraw.
@@ -654,7 +769,7 @@ impl UiRuntime {
                     let status = status
                         .map(|status| {
                             self.renderer.render_status(StatusTemplate {
-                                level: &status.level,
+                                level: status.kind.level(),
                                 message: &status.message,
                             })
                         })
@@ -730,7 +845,7 @@ impl UiRuntime {
             Some(MenuSessionOutput::NavigatedTo(_) | MenuSessionOutput::ReturnedTo(_)) => {
                 self.current_page = 0;
                 self.last_page_count = 1;
-                self.status = None;
+                self.clear_for_input_or_navigation();
                 UiCommand::Redraw
             }
             Some(MenuSessionOutput::Dismissed) => UiCommand::Detach,
@@ -747,14 +862,18 @@ impl UiRuntime {
     }
 }
 
-fn execution_status(outcome: ExecutionOutcome) -> (&'static str, &'static str) {
+fn execution_status(outcome: ExecutionOutcome) -> (StatusKind, &'static str) {
     match outcome {
-        ExecutionOutcome::Succeeded => ("ready", "Action completed"),
-        ExecutionOutcome::Failed => ("error", "Action failed"),
-        ExecutionOutcome::Cancelled => ("blocked", "Action cancelled"),
-        ExecutionOutcome::TimedOut => ("error", "Action timed out"),
-        ExecutionOutcome::Detached => ("ready", "Action continues detached"),
-        ExecutionOutcome::OutcomeUnknown => ("error", "Action outcome is unknown"),
+        // Successful completion leaves no persistent status; the correlated
+        // transition above has already cleared pending progress.
+        ExecutionOutcome::Succeeded => (StatusKind::Notice, "Action completed"),
+        ExecutionOutcome::Failed => (StatusKind::Error, "Action failed"),
+        ExecutionOutcome::Cancelled => (StatusKind::Blocked, "Action cancelled"),
+        ExecutionOutcome::TimedOut => (StatusKind::Error, "Action timed out"),
+        // A detached action applies post-action behavior immediately, so there is
+        // no pending progress left to show.
+        ExecutionOutcome::Detached => (StatusKind::Notice, "Action continues detached"),
+        ExecutionOutcome::OutcomeUnknown => (StatusKind::Error, "Action outcome is unknown"),
     }
 }
 
@@ -1556,7 +1675,7 @@ pub(crate) mod tests {
                     at(2),
                 )
                 .expect("awaited action is staged"),
-            UiCommand::Ignored
+            UiCommand::Redraw
         );
         assert_eq!(runtime.inactivity_deadline(), None);
         assert_eq!(
@@ -1627,7 +1746,7 @@ pub(crate) mod tests {
                     at(2),
                 )
                 .expect("awaited action is staged"),
-            UiCommand::Ignored
+            UiCommand::Redraw
         );
         assert_eq!(
             awaited
@@ -1864,6 +1983,421 @@ pub(crate) mod tests {
                     ordinal: 2,
                 },
             }
+        );
+    }
+
+    #[test]
+    fn awaited_acceptance_shows_pending_and_matching_completion_clears_it() {
+        let binding = BindingId {
+            generation: 7,
+            ordinal: 1,
+        };
+        let mut runtime = UiRuntime::attach_at(
+            profiled_attachment(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![binding_with_policy(
+                    1,
+                    "a",
+                    AfterAction::Stay,
+                    ExecutionMode::Await,
+                    None,
+                )],
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+        assert!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("idle renders")
+                .status
+                .is_none()
+        );
+        assert!(matches!(
+            runtime.handle_input_at(&press('a'), at(1)),
+            Ok(UiCommand::Invoke { .. })
+        ));
+        let execution = muxe_protocol::ExecutionId([9; 16]);
+        assert_eq!(
+            runtime
+                .invocation_accepted(binding, execution, InvocationDisposition::Await, at(2),)
+                .expect("awaited acceptance stages pending"),
+            UiCommand::Redraw
+        );
+        assert_eq!(runtime.inactivity_deadline(), None);
+        let pending = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("pending renders");
+        assert!(
+            pending.status.is_some(),
+            "awaited acceptance must show pending status before completion"
+        );
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::ExecutionCompleted {
+                        session: UiSessionId::new("ui"),
+                        execution,
+                        outcome: muxe_protocol::ExecutionOutcome::Succeeded,
+                        diagnostic: None,
+                    },
+                    at(3),
+                )
+                .expect("matching completion applies"),
+            UiCommand::Redraw
+        );
+        assert!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("completion renders")
+                .status
+                .is_none(),
+            "matching completion clears pending deterministically"
+        );
+    }
+
+    fn error_runtime() -> (UiRuntime, BindingId, muxe_protocol::ExecutionId) {
+        let binding = BindingId {
+            generation: 7,
+            ordinal: 1,
+        };
+        let mut runtime = UiRuntime::attach_at(
+            profiled_attachment(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![binding_with_policy(
+                    1,
+                    "a",
+                    AfterAction::Stay,
+                    ExecutionMode::Await,
+                    None,
+                )],
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+        let execution = muxe_protocol::ExecutionId([11; 16]);
+        assert!(matches!(
+            runtime.handle_input_at(&press('a'), at(1)),
+            Ok(UiCommand::Invoke { .. })
+        ));
+        assert_eq!(
+            runtime
+                .invocation_accepted(binding, execution, InvocationDisposition::Await, at(2),)
+                .expect("awaited acceptance stages pending"),
+            UiCommand::Redraw
+        );
+        (runtime, binding, execution)
+    }
+
+    #[test]
+    fn unrelated_completion_keeps_pending_before_the_matching_completion() {
+        let (mut runtime, _, _) = error_runtime();
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::ExecutionCompleted {
+                        session: UiSessionId::new("ui"),
+                        execution: muxe_protocol::ExecutionId([12; 16]),
+                        outcome: muxe_protocol::ExecutionOutcome::Failed,
+                        diagnostic: None,
+                    },
+                    at(3),
+                )
+                .expect("unrelated execution is ignored"),
+            UiCommand::Ignored
+        );
+        assert!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("pending renders")
+                .status
+                .is_some(),
+            "unrelated completion cannot clear pending"
+        );
+    }
+
+    #[test]
+    fn unhealthy_then_healthy_health_events_replace_the_blocked_notice() {
+        // An idle runtime: pending progress would correctly outrank a blocked
+        // diagnostic, so recovery coverage needs no pending execution.
+        let mut runtime = UiRuntime::attach_at(
+            profiled_attachment(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![binding_with_policy(
+                    1,
+                    "a",
+                    AfterAction::Stay,
+                    ExecutionMode::Await,
+                    None,
+                )],
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::AdapterHealthChanged {
+                        healthy: false,
+                        diagnostic: Some(muxe_protocol::ProtocolDiagnostic {
+                            code: muxe_protocol::DiagnosticCode::ActionBlocked,
+                            message: "host went away".into(),
+                        }),
+                    },
+                    at(3),
+                )
+                .expect("unhealthy event applies"),
+            UiCommand::Redraw
+        );
+        let blocked = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("blocked renders")
+            .status
+            .expect("unhealthy adapter is visible");
+        assert_eq!(blocked.plain, "host went away");
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::AdapterHealthChanged {
+                        healthy: true,
+                        diagnostic: Some(muxe_protocol::ProtocolDiagnostic {
+                            code: muxe_protocol::DiagnosticCode::ActionBlocked,
+                            message: "host is back".into(),
+                        }),
+                    },
+                    at(4),
+                )
+                .expect("recovery event applies"),
+            UiCommand::Redraw
+        );
+        let notice = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("recovery renders")
+            .status
+            .expect("recovery replaces the stale blocked notice");
+        assert_eq!(notice.plain, "host is back");
+    }
+
+    #[test]
+    fn error_survives_health_events_until_the_documented_input_transition() {
+        let (mut runtime, _, execution) = error_runtime();
+        runtime.report_broker_error("boom".to_owned());
+        let shown = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("error renders")
+            .status
+            .expect("error is visible");
+        assert!(shown.plain.contains("boom"));
+        for healthy in [true, false] {
+            assert_eq!(
+                runtime
+                    .handle_broker_event(
+                        &BrokerEvent::AdapterHealthChanged {
+                            healthy,
+                            diagnostic: None,
+                        },
+                        at(4),
+                    )
+                    .expect("health event applies"),
+                UiCommand::Redraw
+            );
+            let shown = runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("error still renders")
+                .status
+                .expect("error survives health events");
+            assert!(
+                shown.plain.contains("boom"),
+                "higher-priority errors survive health notices"
+            );
+        }
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::ExecutionCompleted {
+                        session: UiSessionId::new("ui"),
+                        execution,
+                        outcome: muxe_protocol::ExecutionOutcome::Succeeded,
+                        diagnostic: None,
+                    },
+                    at(5),
+                )
+                .expect("matching completion releases the session"),
+            UiCommand::Redraw
+        );
+        let shown = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("error still renders after completion")
+            .status
+            .expect("error outranks the completion notice");
+        assert!(shown.plain.contains("boom"));
+        assert!(matches!(
+            runtime.handle_input_at(&press('a'), at(6)),
+            Ok(UiCommand::Invoke { .. })
+        ));
+        let cleared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("input renders");
+        assert!(
+            cleared.status.is_none(),
+            "the documented input transition clears the error"
+        );
+    }
+
+    #[test]
+    fn matching_completion_waits_for_control_ack_in_the_control_race() {
+        let binding = BindingId {
+            generation: 7,
+            ordinal: 1,
+        };
+        let mut runtime = UiRuntime::attach_at(
+            profiled_attachment_with_timeout(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![
+                    binding_with_policy(1, "a", AfterAction::Stay, ExecutionMode::Await, None),
+                    binding_with_policy(
+                        2,
+                        "r",
+                        AfterAction::Stay,
+                        ExecutionMode::Await,
+                        Some(muxe_protocol::LocalMenuActionWire::Control(
+                            MenuControl::Return,
+                        )),
+                    ),
+                ],
+                Some(10),
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+        let execution = muxe_protocol::ExecutionId([13; 16]);
+        assert!(matches!(
+            runtime.handle_input_at(&press('a'), at(1)),
+            Ok(UiCommand::Invoke { .. })
+        ));
+        assert_eq!(
+            runtime
+                .invocation_accepted(binding, execution, InvocationDisposition::Await, at(2),)
+                .expect("awaited acceptance stages pending"),
+            UiCommand::Redraw
+        );
+        assert_eq!(
+            runtime
+                .handle_input_at(&press('r'), at(3))
+                .expect("pending return is broker-controlled"),
+            UiCommand::MenuControl(MenuControl::Return)
+        );
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::ExecutionCompleted {
+                        session: UiSessionId::new("ui"),
+                        execution,
+                        outcome: muxe_protocol::ExecutionOutcome::Succeeded,
+                        diagnostic: None,
+                    },
+                    at(4),
+                )
+                .expect("racing completion yields to the requested control"),
+            UiCommand::Ignored
+        );
+        assert!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("pending still renders")
+                .status
+                .is_some(),
+            "pending stays visible until the control acknowledgement arrives"
+        );
+        assert_eq!(
+            runtime.pending_control_completed(&execution, MenuControl::Return, at(5)),
+            UiCommand::Detach
+        );
+    }
+
+    #[test]
+    fn pending_acceptance_preserves_an_error_that_arrived_after_input() {
+        let binding = BindingId {
+            generation: 7,
+            ordinal: 1,
+        };
+        let mut runtime = UiRuntime::attach_at(
+            profiled_attachment_with_timeout(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![binding_with_policy(
+                    1,
+                    "a",
+                    AfterAction::Stay,
+                    ExecutionMode::Await,
+                    None,
+                )],
+                Some(10),
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+        // Input dispatches the invocation; a higher-priority broker error lands
+        // before the awaited acceptance arrives.
+        assert!(matches!(
+            runtime.handle_input_at(&press('a'), at(1)),
+            Ok(UiCommand::Invoke { .. })
+        ));
+        runtime.report_broker_error("host went away".to_owned());
+        let execution = muxe_protocol::ExecutionId([17; 16]);
+        assert_eq!(
+            runtime
+                .invocation_accepted(binding, execution, InvocationDisposition::Await, at(2),)
+                .expect("awaited acceptance stages pending"),
+            UiCommand::Redraw
+        );
+        assert_eq!(runtime.inactivity_deadline(), None);
+        let shown = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("error renders over pending ownership")
+            .status
+            .expect("error survives pending acceptance");
+        assert_eq!(shown.plain, "host went away");
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::ExecutionCompleted {
+                        session: UiSessionId::new("ui"),
+                        execution,
+                        outcome: muxe_protocol::ExecutionOutcome::Succeeded,
+                        diagnostic: None,
+                    },
+                    at(3),
+                )
+                .expect("matching completion applies"),
+            UiCommand::Redraw
+        );
+        let shown = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("error still renders after completion")
+            .status
+            .expect("error outranks the completion notice");
+        assert_eq!(shown.plain, "host went away");
+        assert!(matches!(
+            runtime.handle_input_at(&press('a'), at(4)),
+            Ok(UiCommand::Invoke { .. })
+        ));
+        assert!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("input renders")
+                .status
+                .is_none(),
+            "the documented input transition clears the error"
         );
     }
 

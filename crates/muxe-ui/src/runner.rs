@@ -657,7 +657,7 @@ mod tests {
                     WireInvocationDisposition::Awaited,
                 )
                 .expect("accepted invocation stages pending session"),
-            UiCommand::Ignored
+            UiCommand::Redraw
         );
     }
 
