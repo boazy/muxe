@@ -606,7 +606,62 @@ impl HerdrAdapter {
     async fn invoke_unary(&self, method: &str, params: Value) -> Result<Value, AdapterError> {
         match self.invoke_unary_response(method, params).await? {
             HerdrResponse::Success(result) => Ok(result),
-            HerdrResponse::Error { code, message } => Err(host_rejection(method, code, message)),
+            HerdrResponse::Error { code, message } => Err(host_rejection(method, &code, &message)),
+        }
+    }
+
+    async fn pending_close_record(
+        &self,
+        registration: &PendingPaneRegistration,
+        lease: &PendingPaneLease,
+        epoch: u64,
+    ) -> Result<PendingPaneLeaseRecord, AdapterError> {
+        self.pending_leases
+            .lock()
+            .await
+            .get(&lease.id)
+            .cloned()
+            .filter(|record| {
+                lease.ui_session == registration.ui_session
+                    && record.host_epoch == epoch
+                    && record.ui_session == lease.ui_session
+                    && record.pane == registration.pane
+                    && record.temporary_tab == registration.temporary_tab
+            })
+            .ok_or_else(pending_cleanup_lease_stale)
+    }
+
+    async fn claim_pending_close(
+        &self,
+        lease: &PendingPaneLeaseId,
+        record: &PendingPaneLeaseRecord,
+    ) -> Result<(), AdapterError> {
+        let mut leases = self.pending_leases.lock().await;
+        let Some(current) = leases.get_mut(lease) else {
+            return Err(pending_cleanup_lease_stale());
+        };
+        if current == record {
+            current.close_state = PendingPaneCloseState::CloseMayHaveApplied;
+            Ok(())
+        } else {
+            Err(pending_cleanup_outcome_unknown())
+        }
+    }
+
+    async fn reopen_pending_close(
+        &self,
+        lease: &PendingPaneLeaseId,
+        record: &PendingPaneLeaseRecord,
+    ) {
+        let mut leases = self.pending_leases.lock().await;
+        if let Some(current) = leases.get_mut(lease)
+            && current
+                == &(PendingPaneLeaseRecord {
+                    close_state: PendingPaneCloseState::CloseMayHaveApplied,
+                    ..record.clone()
+                })
+        {
+            current.close_state = PendingPaneCloseState::Open;
         }
     }
 }
@@ -902,19 +957,8 @@ impl HostAdapter for HerdrAdapter {
     ) -> Result<(), AdapterError> {
         let epoch = self.require_continuity()?;
         let record = self
-            .pending_leases
-            .lock()
-            .await
-            .get(&lease.id)
-            .cloned()
-            .filter(|record| {
-                lease.ui_session == registration.ui_session
-                    && record.host_epoch == epoch
-                    && record.ui_session == lease.ui_session
-                    && record.pane == registration.pane
-                    && record.temporary_tab == registration.temporary_tab
-            })
-            .ok_or_else(pending_cleanup_lease_stale)?;
+            .pending_close_record(&registration, &lease, epoch)
+            .await?;
         let pane = match self
             .invoke_unary_response_on_endpoint(
                 "pane.get",
@@ -929,7 +973,7 @@ impl HostAdapter for HerdrAdapter {
                 return Ok(());
             }
             HerdrResponse::Error { code, message } => {
-                return Err(host_rejection("pane.get", code, message));
+                return Err(host_rejection("pane.get", &code, &message));
             }
         };
         if record.close_state == PendingPaneCloseState::CloseMayHaveApplied {
@@ -960,21 +1004,7 @@ impl HostAdapter for HerdrAdapter {
             })?;
         let metadata = method_metadata("pane.close")
             .ok_or_else(|| incompatible("bundled Herdr metadata does not declare pane.close"))?;
-        let claimed_close = {
-            let mut leases = self.pending_leases.lock().await;
-            let Some(current) = leases.get_mut(&lease.id) else {
-                return Err(pending_cleanup_lease_stale());
-            };
-            if current != &record {
-                false
-            } else {
-                current.close_state = PendingPaneCloseState::CloseMayHaveApplied;
-                true
-            }
-        };
-        if !claimed_close {
-            return Err(pending_cleanup_outcome_unknown());
-        }
+        self.claim_pending_close(&lease.id, &record).await?;
         match runtime
             .client()
             .unary_on_expected_endpoint(metadata, close_params, &record.endpoint)
@@ -989,27 +1019,12 @@ impl HostAdapter for HerdrAdapter {
                 Ok(())
             }
             Ok(HerdrResponse::Error { code, message }) => {
-                if let Some(current) = self.pending_leases.lock().await.get_mut(&lease.id)
-                    && current
-                        == &(PendingPaneLeaseRecord {
-                            close_state: PendingPaneCloseState::CloseMayHaveApplied,
-                            ..record.clone()
-                        })
-                {
-                    current.close_state = PendingPaneCloseState::Open;
-                }
-                Err(host_rejection("pane.close", code, message))
+                self.reopen_pending_close(&lease.id, &record).await;
+                Err(host_rejection("pane.close", &code, &message))
             }
             Err(error) => {
-                if error.delivery() == DeliveryState::NotSent
-                    && let Some(current) = self.pending_leases.lock().await.get_mut(&lease.id)
-                    && current
-                        == &(PendingPaneLeaseRecord {
-                            close_state: PendingPaneCloseState::CloseMayHaveApplied,
-                            ..record.clone()
-                        })
-                {
-                    current.close_state = PendingPaneCloseState::Open;
+                if error.delivery() == DeliveryState::NotSent {
+                    self.reopen_pending_close(&lease.id, &record).await;
                 }
                 Err(socket_error(&error))
             }
@@ -2205,7 +2220,7 @@ fn socket_error(error: &SocketError) -> AdapterError {
     )
 }
 
-fn host_rejection(method: &str, code: String, message: String) -> AdapterError {
+fn host_rejection(method: &str, code: &str, message: &str) -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::DispatchFailed,
         format!("Herdr {method} rejected request with {code}: {message}"),

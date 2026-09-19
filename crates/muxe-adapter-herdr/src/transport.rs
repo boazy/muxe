@@ -88,12 +88,12 @@ impl SocketError {
     #[must_use]
     pub const fn delivery(&self) -> DeliveryState {
         match self {
-            Self::StreamingMethod { .. } | Self::RequestTooLarge | Self::RequestIdExhausted => {
-                DeliveryState::NotSent
-            }
-            Self::Connect { .. } | Self::Endpoint { .. } | Self::EndpointReplaced { .. } => {
-                DeliveryState::NotSent
-            }
+            Self::StreamingMethod { .. }
+            | Self::RequestTooLarge
+            | Self::RequestIdExhausted
+            | Self::Connect { .. }
+            | Self::Endpoint { .. }
+            | Self::EndpointReplaced { .. } => DeliveryState::NotSent,
             Self::Write { delivery, .. }
             | Self::EarlyEof { delivery }
             | Self::ResponseTooLarge { delivery }

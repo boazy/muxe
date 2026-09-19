@@ -1057,7 +1057,7 @@ impl MenuCompiler<'_> {
                 Ok((ActionSpec::Native(candidate), None))
             }
             ActionKind::Portable(kind) => {
-                let (spec, baseline) = self.parse_portable(kind, &fields, type_span.clone())?;
+                let (spec, baseline) = self.parse_portable(kind, &fields, &type_span)?;
                 let ActionSpec::Portable(action) = &spec else {
                     unreachable!("portable parser returns a portable action");
                 };
@@ -1080,10 +1080,10 @@ impl MenuCompiler<'_> {
         &self,
         kind: PortableActionKind,
         fields: &[ConfigField],
-        span: SourceSpan,
+        span: &SourceSpan,
     ) -> Result<(ActionSpec, ExecutionCapabilities), Vec<ConfigDiagnostic>> {
         let schema = kind.schema();
-        validate_portable_action_fields(schema, fields, &span)?;
+        validate_portable_action_fields(schema, fields, span)?;
         let parsed = parse_portable_action_fields(schema, fields)?;
         let action = match parsed {
             ParsedPortableAction::MenuOpen { menu, submenu } => {
@@ -1310,10 +1310,6 @@ fn validate_portable_action_fields(
             } => {
                 validate_exactly_one(fields, fallback_span, parameters, message, *error_location)?;
             }
-            ActionConstraint::ExactlyOne {
-                validation_phase: ConstraintValidationPhase::BeforeFields,
-                ..
-            } => {}
             ActionConstraint::Requires {
                 parameter,
                 required_parameter,
@@ -1328,7 +1324,12 @@ fn validate_portable_action_fields(
                     field.value.span.clone(),
                 )]);
             }
-            ActionConstraint::Requires { .. } | ActionConstraint::Unsupported { .. } => {}
+            ActionConstraint::ExactlyOne {
+                validation_phase: ConstraintValidationPhase::BeforeFields,
+                ..
+            }
+            | ActionConstraint::Requires { .. }
+            | ActionConstraint::Unsupported { .. } => {}
         }
     }
     Ok(())

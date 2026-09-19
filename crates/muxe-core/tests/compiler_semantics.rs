@@ -380,12 +380,12 @@ menus:
 
 #[test]
 fn unknown_underscore_fields_report_source_aware_errors_after_merge() {
-    let host = r#"
+    let host = r"
 menus:
   main:
     settings:
       _typo: true
-"#;
+";
     let diagnostics = compile(
         r"
 version: 1

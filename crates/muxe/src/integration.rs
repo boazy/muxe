@@ -91,22 +91,22 @@ fn open_integration_lock(directory: &Path) -> Result<(PathBuf, fs::File), Integr
 }
 
 fn lock_integration_file(
-    path: PathBuf,
+    path: &Path,
     file: fs::File,
 ) -> Result<IntegrationLock, IntegrationLockError> {
     let file = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, source)| {
         IntegrationLockError::Acquire {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         }
     })?;
-    fsutil::verify_owner_file_descriptor(&path, &file)?;
+    fsutil::verify_owner_file_descriptor(path, &file)?;
     Ok(IntegrationLock { _file: file })
 }
 
 fn acquire_integration_lock(directory: &Path) -> Result<IntegrationLock, IntegrationLockError> {
     let (path, file) = open_integration_lock(directory)?;
-    lock_integration_file(path, file)
+    lock_integration_file(path.as_path(), file)
 }
 
 #[cfg(test)]
@@ -1752,11 +1752,7 @@ struct FileUninstallPlan {
     result: FileUninstall,
 }
 
-fn unresolved_plan(
-    config_path: &Path,
-    records: &[&NodeRecord],
-    reason: String,
-) -> FileUninstallPlan {
+fn unresolved_plan(config_path: &Path, records: &[&NodeRecord], reason: &str) -> FileUninstallPlan {
     FileUninstallPlan {
         config_path: config_path.to_path_buf(),
         original: None,
@@ -1771,7 +1767,7 @@ fn unresolved_plan(
                 .map(|record| UnresolvedRecord {
                     node: Some(record.node),
                     config_path: Some(config_path.to_path_buf()),
-                    reason: reason.clone(),
+                    reason: reason.to_owned(),
                 })
                 .collect(),
         },
@@ -1788,7 +1784,7 @@ fn preflight_uninstall_file(
             return Ok(unresolved_plan(
                 config_path,
                 records,
-                "configuration file no longer exists".to_owned(),
+                "configuration file no longer exists",
             ));
         }
         Err(source) => {
@@ -1801,19 +1797,16 @@ fn preflight_uninstall_file(
     }
     let snapshot = kdl::read_existing_config(config_path)?;
     let bytes = snapshot.bytes().to_vec();
-    let original = match String::from_utf8(bytes.clone()) {
-        Ok(original) => original,
-        Err(_) => {
-            return Ok(unresolved_plan(
-                config_path,
-                records,
-                "configuration is not valid UTF-8".to_owned(),
-            ));
-        }
+    let Ok(original) = String::from_utf8(bytes) else {
+        return Ok(unresolved_plan(
+            config_path,
+            records,
+            "configuration is not valid UTF-8",
+        ));
     };
     let document = match KdlDocument::parse_v1(&original) {
         Ok(document) => document,
-        Err(error) => return Ok(unresolved_plan(config_path, records, error.to_string())),
+        Err(error) => return Ok(unresolved_plan(config_path, records, &error.to_string())),
     };
     let mut result = FileUninstall::default();
     let mut edits = Vec::new();
@@ -2746,6 +2739,83 @@ mod tests {
         );
     }
 
+    fn assert_invalid_receipt_provenance_case(
+        case: &str,
+        installed_digest: &str,
+        disposition: &str,
+        previous_text: Option<&str>,
+        previous_semantic: Option<&str>,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = temp.path().join("config.kdl");
+        let stable = stable_bridge_path(temp.path());
+        let directory = integration_dir(temp.path());
+        let cache = temp.path().join("cache");
+        let receipt_path = directory.join(receipt::RECEIPT_FILE_NAME);
+        fs::write(&config, "// user configuration\n").unwrap();
+        fsutil::ensure_owner_dir(&directory).unwrap();
+        fs::write(&stable, b"bridge bytes").unwrap();
+        fsutil::ensure_owner_dir(&cache.join("activation")).unwrap();
+        fs::write(cache.join("activation/live.json"), "a".repeat(64)).unwrap();
+        let receipt = serde_json::json!({
+            "schema_version": receipt::RECEIPT_SCHEMA_VERSION,
+            "bridge": {
+                "canonical_path": stable,
+                "installed_version": "0.1.0",
+                "installed_digest": installed_digest,
+                "previous_digest": null,
+                "bridge_compat": null,
+            },
+            "configs": [{
+                "config_path": config,
+                "node": "plugins_alias",
+                "disposition": disposition,
+                "semantic": "muxe",
+                "text_digest": "b".repeat(64),
+                "previous_text": previous_text,
+                "previous_semantic": previous_semantic,
+            }],
+        });
+        fsutil::write_atomic(
+            &receipt_path,
+            &serde_json::to_vec(&receipt).unwrap(),
+            "receipt",
+        )
+        .unwrap();
+
+        let error = uninstall(UninstallInputs {
+            config_dir: temp.path(),
+            cache_dir: &cache,
+            zellij_config: Some(config.clone()),
+            explicit_policy: Some(ConfigurationPolicy::Always),
+            quiet: true,
+            interactive: false,
+            asker: None,
+            logger: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                IntegrationError::Receipt(receipt::ReceiptError::Invalid { .. })
+            ),
+            "{case}: {error}"
+        );
+        assert_eq!(fs::read(&stable).unwrap(), b"bridge bytes", "{case}");
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "// user configuration\n",
+            "{case}"
+        );
+        assert!(receipt_path.exists(), "{case}");
+    }
+
     #[test]
     fn uninstall_rejects_invalid_receipt_provenance_before_mutation() {
         for (case, installed_digest, disposition, previous_text, previous_semantic) in [
@@ -2794,75 +2864,13 @@ mod tests {
                 Some("muxe location=\"file:/old.wasm\""),
             ),
         ] {
-            let temp = tempfile::TempDir::new().unwrap();
-            std::fs::set_permissions(
-                temp.path(),
-                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-            )
-            .unwrap();
-            let config = temp.path().join("config.kdl");
-            let stable = stable_bridge_path(temp.path());
-            let directory = integration_dir(temp.path());
-            let cache = temp.path().join("cache");
-            let receipt_path = directory.join(receipt::RECEIPT_FILE_NAME);
-            fs::write(&config, "// user configuration\n").unwrap();
-            fsutil::ensure_owner_dir(&directory).unwrap();
-            fs::write(&stable, b"bridge bytes").unwrap();
-            fsutil::ensure_owner_dir(&cache.join("activation")).unwrap();
-            fs::write(cache.join("activation/live.json"), "a".repeat(64)).unwrap();
-            let receipt = serde_json::json!({
-                "schema_version": receipt::RECEIPT_SCHEMA_VERSION,
-                "bridge": {
-                    "canonical_path": stable,
-                    "installed_version": "0.1.0",
-                    "installed_digest": installed_digest,
-                    "previous_digest": null,
-                    "bridge_compat": null,
-                },
-                "configs": [{
-                    "config_path": config,
-                    "node": "plugins_alias",
-                    "disposition": disposition,
-                    "semantic": "muxe",
-                    "text_digest": "b".repeat(64),
-                    "previous_text": previous_text,
-                    "previous_semantic": previous_semantic,
-                }],
-            });
-            fsutil::write_atomic(
-                &receipt_path,
-                &serde_json::to_vec(&receipt).unwrap(),
-                "receipt",
-            )
-            .unwrap();
-
-            let error = uninstall(UninstallInputs {
-                config_dir: temp.path(),
-                cache_dir: &cache,
-                zellij_config: Some(config.clone()),
-
-                explicit_policy: Some(ConfigurationPolicy::Always),
-                quiet: true,
-                interactive: false,
-                asker: None,
-                logger: None,
-            })
-            .unwrap_err();
-
-            assert!(
-                matches!(
-                    error,
-                    IntegrationError::Receipt(receipt::ReceiptError::Invalid { .. })
-                ),
-                "{case}: {error}"
+            assert_invalid_receipt_provenance_case(
+                case,
+                installed_digest,
+                disposition,
+                previous_text,
+                previous_semantic,
             );
-            assert_eq!(fs::read(&stable).unwrap(), b"bridge bytes", "{case}");
-            assert_eq!(
-                fs::read_to_string(&config).unwrap(),
-                "// user configuration\n",
-                "{case}"
-            );
-            assert!(receipt_path.exists(), "{case}");
         }
     }
 
@@ -3575,7 +3583,7 @@ mod tests {
             let waiter = scope.spawn(move || {
                 let (path, file) = open_integration_lock(&waiter_directory).unwrap();
                 opened_tx.send(()).unwrap();
-                let result = lock_integration_file(path, file).map(|_| ());
+                let result = lock_integration_file(path.as_path(), file).map(|_| ());
                 result_tx.send(result).unwrap();
             });
             opened_rx.recv().unwrap();

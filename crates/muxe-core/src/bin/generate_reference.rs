@@ -80,10 +80,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     };
-    let catalog_path = arguments
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("reference/action-descriptions.yaml"));
+    let catalog_path = arguments.next().map_or_else(
+        || PathBuf::from("reference/action-descriptions.yaml"),
+        PathBuf::from,
+    );
     if arguments.next().is_some() {
         return Err(
             "usage: generate_reference <output-path> <host-support.tsv> [action-descriptions.yaml]"
