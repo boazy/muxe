@@ -8,6 +8,7 @@ Muxe supports **Zellij** (version 0.46.0) and **Herdr** (version 0.8.2) as both 
 
 - **Host-owned hotkeys**: You configure your root hotkey (such as `Alt m` or `prefix+m`) in your multiplexer's native configuration. Muxe never generates, modifies, or manages your multiplexer's keybindings.
 - **Responsive menu bar**: When triggered, Muxe opens inside a dedicated pane—typically positioned across the bottom of the screen or as a floating overlay.
+- **Colour control**: Muxe honours `NO_COLOR` for colour output through ratatui's crossterm backend. Attributes such as bold are not disabled when `NO_COLOR` is set.
 - **Nested menus**: Pressing a key can execute an action, open an inline submenu, or open another named menu as a submenu.
 - **Built-in navigation**: By default, `Esc` dismisses the active menu stack; `Backspace` returns to the parent menu (or exits if at a root menu); and `Left`/`Right` or `Page Up`/`Page Down` navigate pages in multi-page menus.
 - **Safe key handling**: Any unknown key delivered to Muxe is swallowed: it is not forwarded to the underlying pane, does not alter the menu stack, and resets the inactivity timer. On Zellij, configured Locked-mode host bindings execute before Muxe receives the key and are reserved to the host.
