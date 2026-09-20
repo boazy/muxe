@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     process::Stdio,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -58,6 +58,10 @@ pub struct Broker {
     next_session: AtomicU64,
     next_execution: AtomicU64,
     next_event: Arc<AtomicU64>,
+    /// Self reference for slow-consumer teardown. Delivery sites only hold
+    /// `&self` (or detached supervisor handles), so a full queue upgrades this
+    /// to spawn `detach` on its own task instead of awaiting client I/O.
+    self_weak: Weak<Self>,
     #[cfg(test)]
     cleanup_enqueue_hook: StdMutex<Option<Arc<CleanupEnqueueHook>>>,
     #[cfg(test)]
@@ -397,6 +401,91 @@ struct ExecutionDeadline {
     adapter: Arc<dyn HostAdapter>,
     generic: Arc<GenericSupervisor>,
     next_event: Arc<AtomicU64>,
+    /// Lets terminal delivery spawn slow-consumer teardown without an `Arc`
+    /// at the call site. See `deliver_session_event_to`.
+    broker: Weak<Broker>,
+}
+
+/// Sends one broker event to a session without ever waiting on client I/O.
+///
+/// The per-connection outbox is bounded (see the `mpsc::channel(32)` in
+/// `service.rs`), and its writer task stops consuming while the socket blocks.
+/// Awaiting `send()` here would therefore let one stalled UI park the shared
+/// adapter monitor (or a generic reaper) and wedge completions and health for
+/// every unrelated session. `try_send` keeps delivery non-blocking and
+/// ordered: a healthy session's events still arrive in order and once each,
+/// while a session that is being torn down may have its tail dropped.
+async fn deliver_session_event_to(
+    sessions: &Arc<Mutex<HashMap<UiSessionId, SessionRecord>>>,
+    session: &UiSessionId,
+    event_id: EventId,
+    event: BrokerEvent,
+    kind: &'static str,
+    broker: &Weak<Broker>,
+) {
+    let events = sessions
+        .lock()
+        .await
+        .get(session)
+        .map(|record| record.events.clone());
+    let Some(events) = events else {
+        return;
+    };
+    note_send_outcome(
+        &events.try_send(WireMessage::Event { event_id, event }),
+        broker,
+        session,
+        kind,
+    );
+}
+
+/// Records the outcome of one non-blocking session delivery. `Full` is an
+/// explicit slow-consumer failure, not backpressure: the session is torn down
+/// so its queue, capture, and connection are released instead of wedging
+/// shared state. `Closed` means the connection is already gone, so there is
+/// nothing to do.
+fn note_send_outcome(
+    result: &Result<(), tokio::sync::mpsc::error::TrySendError<WireMessage>>,
+    broker: &Weak<Broker>,
+    session: &UiSessionId,
+    kind: &'static str,
+) {
+    match result {
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            tracing::error!(
+                session = ?session,
+                kind,
+                "slow UI filled its bounded event queue; detaching the session",
+            );
+            spawn_slow_consumer_teardown(broker, session.clone());
+        }
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
+/// Tears a slow consumer down off the delivery path. `detach` awaits adapter
+/// cleanup, so it must never run inline in the shared monitor or a reaper;
+/// teardown runs on its own task instead. Detachment is effectively once per
+/// session: `detach` removes the session record under the sessions lock, so a
+/// racing second teardown finds no record and enqueues no duplicate capture
+/// cleanup (and lease ids are never reused, so a stale teardown cannot catch
+/// a newer session).
+fn spawn_slow_consumer_teardown(broker: &Weak<Broker>, session: UiSessionId) {
+    let Some(broker) = broker.upgrade() else {
+        return;
+    };
+    tokio::spawn(async move {
+        // Candidates for the release reason: `UiDismissed` (the UI is going
+        // away and its capture must be released), `LeaseExpired`,
+        // `AdapterShutdown`, `Replaced`, `UserModeChanged`. Rejected:
+        // `LeaseExpired` (the lease is still valid; the consumer is slow),
+        // `AdapterShutdown`/`Replaced`/`UserModeChanged` (no host transition
+        // happened). `UiDismissed` is the closest existing variant: from the
+        // host's perspective the UI is being disconnected.
+        let _ = broker
+            .detach(&session, CaptureReleaseReason::UiDismissed)
+            .await;
+    });
 }
 
 async fn supervise_execution_deadline(deadline: ExecutionDeadline) {
@@ -442,38 +531,29 @@ async fn supervise_execution_deadline(deadline: ExecutionDeadline) {
         return;
     };
     let event_delivery = async {
-        let events = if let Some(session) = &session {
-            // Clone the sender in a short lock scope. Keeping the session map
-            // guard alive across a blocked UI send would stall new admission.
-            deadline
-                .sessions
-                .lock()
-                .await
-                .get(session)
-                .map(|record| record.events.clone())
-        } else {
-            None
-        };
-        if let Some(events) = events {
-            let _ = events
-                .send(WireMessage::Event {
-                    event_id: new_event_id(&deadline.next_event),
-                    event: BrokerEvent::ExecutionCompleted {
-                        session: session.expect("session exists when events sender is present"),
-                        execution: wire,
-                        outcome,
-                        diagnostic: Some(diagnostic(
-                            DiagnosticCode::ActionBlocked,
-                            "execution exceeded its configured timeout",
-                        )),
-                    },
-                })
-                .await;
+        if let Some(session) = &session {
+            deliver_session_event_to(
+                &deadline.sessions,
+                session,
+                new_event_id(&deadline.next_event),
+                BrokerEvent::ExecutionCompleted {
+                    session: session.clone(),
+                    execution: wire,
+                    outcome,
+                    diagnostic: Some(diagnostic(
+                        DiagnosticCode::ActionBlocked,
+                        "execution exceeded its configured timeout",
+                    )),
+                },
+                "ExecutionCompleted",
+                &deadline.broker,
+            )
+            .await;
         }
     };
-    // A full UI queue must never delay the owner-side stop. The two futures are
-    // polled together: adapter cancellation can cross its host boundary while
-    // terminal delivery waits for the UI to read.
+    // A full UI queue must never delay the owner-side stop. Delivery itself is
+    // non-blocking now; the join keeps the existing shape while adapter
+    // cancellation crosses its host boundary.
     tokio::join!(event_delivery, cancel_deadline_owner(&deadline, owner),);
 }
 
@@ -547,7 +627,7 @@ impl Broker {
         config: CompiledConfig,
     ) -> Arc<Self> {
         let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded_channel();
-        Arc::new(Self {
+        Arc::new_cyclic(|self_weak| Self {
             adapter,
             config: ConfigStore::from_compiled(config_path, config),
             state: Arc::new(Mutex::new(BrokerState::default())),
@@ -561,6 +641,7 @@ impl Broker {
             next_session: AtomicU64::new(1),
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),
+            self_weak: self_weak.clone(),
             #[cfg(test)]
             cleanup_enqueue_hook: StdMutex::new(None),
             #[cfg(test)]
@@ -580,7 +661,7 @@ impl Broker {
     ) -> Result<Arc<Self>, ConfigError> {
         let config = ConfigStore::load(config_path, adapter.as_ref()).await?;
         let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded_channel();
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|self_weak| Self {
             adapter,
             config,
             state: Arc::new(Mutex::new(BrokerState::default())),
@@ -594,6 +675,7 @@ impl Broker {
             next_session: AtomicU64::new(1),
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),
+            self_weak: self_weak.clone(),
             #[cfg(test)]
             cleanup_enqueue_hook: StdMutex::new(None),
             #[cfg(test)]
@@ -939,6 +1021,7 @@ impl Broker {
                 adapter: Arc::clone(&self.adapter),
                 generic: Arc::clone(&self.generic),
                 next_event: Arc::clone(&self.next_event),
+                broker: Weak::clone(&self.self_weak),
             }));
         }
         if sealed {
@@ -1431,23 +1514,20 @@ impl Broker {
         if record.pending_control.is_some() {
             return;
         }
-        let events = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session).map(|record| record.events.clone())
-        };
-        if let Some(events) = events {
-            let _ = events
-                .send(WireMessage::Event {
-                    event_id: self.new_event_id(),
-                    event: BrokerEvent::ExecutionCompleted {
-                        session,
-                        execution: record.wire,
-                        outcome,
-                        diagnostic,
-                    },
-                })
-                .await;
-        }
+        deliver_session_event_to(
+            &self.sessions,
+            &session,
+            self.new_event_id(),
+            BrokerEvent::ExecutionCompleted {
+                session: session.clone(),
+                execution: record.wire,
+                outcome,
+                diagnostic,
+            },
+            "ExecutionCompleted",
+            &self.self_weak,
+        )
+        .await;
     }
 
     async fn emit_execution_completed(
@@ -1457,23 +1537,20 @@ impl Broker {
         outcome: ExecutionOutcome,
         diagnostic: Option<ProtocolDiagnostic>,
     ) {
-        let events = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(&session).map(|record| record.events.clone())
-        };
-        if let Some(events) = events {
-            let _ = events
-                .send(WireMessage::Event {
-                    event_id: self.new_event_id(),
-                    event: BrokerEvent::ExecutionCompleted {
-                        session,
-                        execution,
-                        outcome,
-                        diagnostic,
-                    },
-                })
-                .await;
-        }
+        deliver_session_event_to(
+            &self.sessions,
+            &session,
+            self.new_event_id(),
+            BrokerEvent::ExecutionCompleted {
+                session: session.clone(),
+                execution,
+                outcome,
+                diagnostic,
+            },
+            "ExecutionCompleted",
+            &self.self_weak,
+        )
+        .await;
     }
 
     async fn emit_broker_retiring(&self, session: &UiSessionId) {
@@ -1498,19 +1575,22 @@ impl Broker {
             .sessions
             .lock()
             .await
-            .values()
-            .map(|record| record.events.clone())
+            .iter()
+            .map(|(session, record)| (session.clone(), record.events.clone()))
             .collect::<Vec<_>>();
-        for events in events {
-            let _ = events
-                .send(WireMessage::Event {
+        for (session, events) in &events {
+            note_send_outcome(
+                &events.try_send(WireMessage::Event {
                     event_id: self.new_event_id(),
                     event: BrokerEvent::AdapterHealthChanged {
                         healthy,
                         diagnostic: diagnostic.clone(),
                     },
-                })
-                .await;
+                }),
+                &self.self_weak,
+                session,
+                "AdapterHealthChanged",
+            );
         }
     }
 
@@ -1534,16 +1614,19 @@ impl Broker {
                 .collect::<Vec<_>>()
         };
         let message = error.to_string();
-        for (_, events) in &scoped {
-            let _ = events
-                .send(WireMessage::Event {
+        for (session, events) in &scoped {
+            note_send_outcome(
+                &events.try_send(WireMessage::Event {
                     event_id: self.new_event_id(),
                     event: BrokerEvent::AdapterHealthChanged {
                         healthy: false,
                         diagnostic: Some(diagnostic(DiagnosticCode::HostUnavailable, &message)),
                     },
-                })
-                .await;
+                }),
+                &self.self_weak,
+                session,
+                "AdapterHealthChanged",
+            );
         }
         let failed = {
             let state = self.state.lock().await;
@@ -2586,6 +2669,7 @@ impl Broker {
             generic: Arc::clone(&self.generic),
             next_event: Arc::clone(&self.next_event),
             diagnostics_tx: self.diagnostics_tx.clone(),
+            broker: Weak::clone(&self.self_weak),
         }));
         let sealed_before_activation = self
             .state
@@ -3400,6 +3484,7 @@ struct GenericChildSpec {
     generic: Arc<GenericSupervisor>,
     next_event: Arc<AtomicU64>,
     diagnostics_tx: mpsc::UnboundedSender<BrokerDiagnostic>,
+    broker: Weak<Broker>,
 }
 
 async fn supervise_generic_child(spec: GenericChildSpec) {
@@ -3414,6 +3499,7 @@ async fn supervise_generic_child(spec: GenericChildSpec) {
         generic,
         next_event,
         diagnostics_tx,
+        broker,
     } = spec;
     let handles = SupervisorHandles {
         state,
@@ -3421,6 +3507,7 @@ async fn supervise_generic_child(spec: GenericChildSpec) {
         generic,
         next_event,
         diagnostics_tx,
+        broker,
     };
     match await_child_exit(&mut child, &mut cancellation, None).await {
         GenericWait::Exited(status) => {
@@ -3555,6 +3642,7 @@ struct SupervisorHandles {
     generic: Arc<GenericSupervisor>,
     next_event: Arc<AtomicU64>,
     diagnostics_tx: mpsc::UnboundedSender<BrokerDiagnostic>,
+    broker: Weak<Broker>,
 }
 
 struct GenericCompletionGuard {
@@ -3589,6 +3677,7 @@ async fn finish_generic(
         generic,
         next_event,
         diagnostics_tx,
+        broker,
     } = handles;
     let _process_guard = GenericCompletionGuard {
         generic: Arc::clone(generic),
@@ -3637,24 +3726,20 @@ async fn finish_generic(
     let Some(session) = record.session else {
         return;
     };
-    let events = sessions
-        .lock()
-        .await
-        .get(&session)
-        .map(|record| record.events.clone());
-    if let Some(events) = events {
-        let _ = events
-            .send(WireMessage::Event {
-                event_id: new_event_id(next_event),
-                event: BrokerEvent::ExecutionCompleted {
-                    session,
-                    execution: record.wire,
-                    outcome,
-                    diagnostic,
-                },
-            })
-            .await;
-    }
+    deliver_session_event_to(
+        sessions,
+        &session,
+        new_event_id(next_event),
+        BrokerEvent::ExecutionCompleted {
+            session: session.clone(),
+            execution: record.wire,
+            outcome,
+            diagnostic,
+        },
+        "ExecutionCompleted",
+        broker,
+    )
+    .await;
 }
 
 fn requires_post_dismissal(action: &muxe_core::PortableAction) -> bool {
@@ -3741,6 +3826,7 @@ mod tests {
         portable_dispatches: AtomicUsize,
         cancellable: AtomicBool,
         cancellations: AtomicUsize,
+        ended_captures: AtomicUsize,
         dispatch_entered: Arc<Notify>,
         dispatch_release: Arc<Notify>,
         block_dispatch: AtomicBool,
@@ -3782,6 +3868,7 @@ mod tests {
             portable_dispatches: AtomicUsize::new(0),
             cancellable: AtomicBool::new(cancellable),
             cancellations: AtomicUsize::new(0),
+            ended_captures: AtomicUsize::new(0),
             dispatch_entered: Arc::new(Notify::new()),
             dispatch_release: Arc::new(Notify::new()),
             block_dispatch: AtomicBool::new(false),
@@ -3933,14 +4020,14 @@ menus:
                     kitty_alternate_keys: false,
                     kitty_all_keys_as_escape_codes: false,
                 },
-                supports_capture: false,
+                supports_capture: true,
                 supports_notifications: false,
                 supports_native_cancellation: self.cancellable.load(Ordering::SeqCst),
             })
         }
 
-        async fn modal_scope(&self, _ui_pane: &PaneId) -> Result<ModalScopeId, AdapterError> {
-            Ok(ModalScopeId::new("scope"))
+        async fn modal_scope(&self, ui_pane: &PaneId) -> Result<ModalScopeId, AdapterError> {
+            Ok(ModalScopeId::new(ui_pane.as_str()))
         }
 
         async fn begin_capture(
@@ -3948,7 +4035,7 @@ menus:
             request: CaptureRequest,
         ) -> Result<CaptureLease, AdapterError> {
             Ok(CaptureLease {
-                id: CaptureLeaseId::new("unexpected"),
+                id: CaptureLeaseId::new(request.ui_session.as_str()),
                 ui_session: request.ui_session,
                 modal_scope: request.modal_scope,
             })
@@ -3959,6 +4046,7 @@ menus:
             _lease: CaptureLease,
             _reason: CaptureReleaseReason,
         ) -> Result<(), AdapterError> {
+            self.ended_captures.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -4839,7 +4927,7 @@ menus:
             .await
             .expect("full-queue invocation is accepted");
         let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-            execution: first_execution,
+            execution: _first_execution,
             disposition: InvocationDisposition::Awaited,
         }) = accepted
         else {
@@ -4852,6 +4940,10 @@ menus:
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
+        // The blocked timeout delivery is now non-blocking: the owner-side
+        // stop still crosses the adapter, but the full queue is an explicit
+        // slow-consumer failure, so the session is torn down on its own task
+        // instead of receiving the timed-out completion after the drain.
         assert_eq!(
             adapter.cancellations.load(Ordering::SeqCst),
             1,
@@ -4867,6 +4959,420 @@ menus:
             assert!(record.termination_requested);
             assert!(!record.awaiting);
         }
+        // The pre-filled event is the only item the dead queue ever held; its
+        // drain proves the teardown ran, because a slow-consumer detach leaves
+        // a disconnected queue while the test still holds the only receiver.
+        let Some(WireMessage::Event {
+            event: BrokerEvent::AdapterHealthChanged { .. },
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("expected initial health event");
+        };
+        // Paused clock: poll with yields (no timers) until the spawned
+        // teardown detaches the session.
+        for _ in 0..1000 {
+            if !broker.sessions.lock().await.contains_key(&session) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !broker.sessions.lock().await.contains_key(&session),
+            "slow-consumer teardown detaches the full session"
+        );
+        assert!(
+            broker
+                .state
+                .lock()
+                .await
+                .executions
+                .get(&CoreExecutionId(1))
+                .is_none_or(|record| record.session.is_none()),
+            "torn-down session owns no in-flight execution UI"
+        );
+        // The detached session can no longer admit work: detach is effectively
+        // once per session and the record is gone, so the slot is not reused.
+        let stale = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events.clone(),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(BrokerError::UnknownSession(_))),
+            "detached slow consumer admits no further invocations"
+        );
+        // The teardown ends the session capture exactly once through the
+        // supervised cleanup path.
+        for _ in 0..1000 {
+            if adapter.ended_captures.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            adapter.ended_captures.load(Ordering::SeqCst),
+            1,
+            "slow-consumer teardown ends the session capture exactly once"
+        );
+        // The timed-out session is gone, so the newer owner lives in a second
+        // session: the released owner slot must still admit fresh work.
+        let (second_events, mut second_rx) = mpsc::channel(8);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("full-queue-second"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                second_events.clone(),
+            )
+            .await
+            .expect("second UI attaches after the slow consumer is gone");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            session: second_session,
+            ..
+        }) = attached
+        else {
+            panic!("expected second attachment");
+        };
+        let accepted = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: second_session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                second_events.clone(),
+            )
+            .await
+            .expect("released owner slot admits a newer owner");
+        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+            execution: second_execution,
+            disposition: InvocationDisposition::Awaited,
+        }) = accepted
+        else {
+            panic!("new owner remains awaited");
+        };
+        // A late completion for the torn-down owner cannot remove the newer
+        // owner: the terminal arrived after the old session's removal.
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                execution: CoreExecutionId(1),
+            })
+            .await;
+        assert!(
+            broker
+                .state
+                .lock()
+                .await
+                .executions
+                .contains_key(&CoreExecutionId(2)),
+            "late completion cannot remove the newer owner"
+        );
+        assert!(
+            !broker
+                .state
+                .lock()
+                .await
+                .executions
+                .contains_key(&CoreExecutionId(1)),
+            "late completion of the torn-down owner leaves no execution behind"
+        );
+        // The healthy second session still receives its own terminal through
+        // the same delivery path that dropped the slow consumer.
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                execution: CoreExecutionId(2),
+            })
+            .await;
+        let Some(WireMessage::Event {
+            event:
+                BrokerEvent::ExecutionCompleted {
+                    execution: succeeded_execution,
+                    outcome: ExecutionOutcome::Succeeded,
+                    ..
+                },
+            ..
+        }) = second_rx.recv().await
+        else {
+            panic!("expected second execution succeeded completion");
+        };
+        assert_eq!(succeeded_execution, second_execution);
+        assert!(
+            events_rx.try_recv().is_err(),
+            "slow-consumer teardown delivers no timed-out completion"
+        );
+        assert_eq!(
+            adapter.ended_captures.load(Ordering::SeqCst),
+            1,
+            "no second teardown ends another capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_ui_does_not_block_unrelated_session_completion() {
+        let adapter = counting_adapter(true);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<slow consumer isolation regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: await
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("isolation configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("isolation binding is visible");
+        let directory = tempfile::tempdir().expect("isolation test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let invoke = |session: UiSessionId| {
+            ClientRequest::InvokeBinding(InvokeBinding {
+                session,
+                generation: 1,
+                binding: BindingId {
+                    generation: binding.generation().0,
+                    ordinal: binding.ordinal(),
+                },
+            })
+        };
+        // The slow session's outbox (capacity 1) is filled and never drained.
+        let (slow_events, _slow_rx) = mpsc::channel::<WireMessage>(1);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("slow-ui"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                slow_events.clone(),
+            )
+            .await
+            .expect("slow UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            session: slow_session,
+            ..
+        }) = attached
+        else {
+            panic!("expected slow attachment");
+        };
+        slow_events
+            .try_send(WireMessage::Event {
+                event_id: EventId([7; 16]),
+                event: BrokerEvent::AdapterHealthChanged {
+                    healthy: true,
+                    diagnostic: None,
+                },
+            })
+            .expect("test fills the slow UI queue");
+        // A healthy session shares the same adapter monitor.
+        let (fast_events, mut fast_rx) = mpsc::channel::<WireMessage>(8);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("fast-ui"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                fast_events.clone(),
+            )
+            .await
+            .expect("healthy UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            session: fast_session,
+            ..
+        }) = attached
+        else {
+            panic!("expected healthy attachment");
+        };
+        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+            execution: slow_execution,
+            disposition: InvocationDisposition::Awaited,
+        }) = broker
+            .handle(
+                PeerRole::Ui,
+                invoke(slow_session.clone()),
+                slow_events.clone(),
+            )
+            .await
+            .expect("slow invocation is accepted")
+        else {
+            panic!("slow invocation remains awaited");
+        };
+        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+            execution: fast_execution,
+            disposition: InvocationDisposition::Awaited,
+        }) = broker
+            .handle(
+                PeerRole::Ui,
+                invoke(fast_session.clone()),
+                fast_events.clone(),
+            )
+            .await
+            .expect("healthy invocation is accepted")
+        else {
+            panic!("healthy invocation remains awaited");
+        };
+        assert_ne!(slow_execution, fast_execution);
+        // One unhealthy broadcast must not wedge the healthy session: the slow
+        // queue is torn down while every other session still gets its event.
+        broker.broadcast_health(false, None).await;
+        let Some(WireMessage::Event {
+            event:
+                BrokerEvent::AdapterHealthChanged {
+                    healthy: fast_healthy,
+                    ..
+                },
+            ..
+        }) = fast_rx.recv().await
+        else {
+            panic!("healthy session observes the broadcast");
+        };
+        assert!(
+            !fast_healthy,
+            "healthy session observes the unhealthy broadcast"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !broker.sessions.lock().await.contains_key(&slow_session) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("slow consumer is torn down exactly once");
+        // The other session's execution still completes through the same
+        // monitor that just dropped the slow consumer.
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                execution: CoreExecutionId(2),
+            })
+            .await;
+        let Some(WireMessage::Event {
+            event:
+                BrokerEvent::ExecutionCompleted {
+                    execution: completed,
+                    outcome: ExecutionOutcome::Succeeded,
+                    ..
+                },
+            ..
+        }) = fast_rx.recv().await
+        else {
+            panic!("healthy session receives its completion");
+        };
+        assert_eq!(completed, fast_execution);
+    }
+
+    #[tokio::test]
+    async fn slow_ui_completion_teardown_runs_once_and_delivers_nothing_further() {
+        let adapter = counting_adapter(true);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<slow consumer teardown regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: await
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("teardown configuration compiles");
+        let root = muxe_core::MenuId::new("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("teardown binding is visible");
+        let directory = tempfile::tempdir().expect("teardown test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (events, mut events_rx) = mpsc::channel::<WireMessage>(1);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("slow-teardown"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("slow UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("expected slow attachment");
+        };
+        events
+            .try_send(WireMessage::Event {
+                event_id: EventId([7; 16]),
+                event: BrokerEvent::AdapterHealthChanged {
+                    healthy: true,
+                    diagnostic: None,
+                },
+            })
+            .expect("test fills the slow UI queue");
         let accepted = broker
             .handle(
                 PeerRole::Ui,
@@ -4881,78 +5387,209 @@ menus:
                 events.clone(),
             )
             .await
-            .expect("released awaiting slot admits a newer owner");
+            .expect("slow invocation is accepted");
         let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-            execution: second_execution,
+            disposition: InvocationDisposition::Awaited,
             ..
         }) = accepted
         else {
-            panic!("new owner is accepted while the old terminal delivery waits");
+            panic!("slow invocation remains awaited");
         };
-        assert_ne!(first_execution, second_execution);
-
-        let late = tokio::spawn({
-            let broker = Arc::clone(&broker);
-            async move {
-                broker
-                    .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
-                        execution: CoreExecutionId(1),
-                    })
-                    .await;
-            }
-        });
-        for _ in 0..3 {
-            tokio::task::yield_now().await;
-        }
-        late.await.expect("late completion task joins");
-        assert!(
-            broker
-                .state
-                .lock()
-                .await
-                .executions
-                .contains_key(&CoreExecutionId(2)),
-            "late completion cannot remove the newer owner"
-        );
+        // The full queue is a slow-consumer failure: delivering this terminal
+        // must tear the session down instead of queueing behind the filler.
+        broker
+            .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
+                execution: CoreExecutionId(1),
+            })
+            .await;
+        // The filler is the only event the dead queue ever held; draining it
+        // proves the teardown ran while this test still holds the receiver.
         let Some(WireMessage::Event {
             event: BrokerEvent::AdapterHealthChanged { .. },
             ..
         }) = events_rx.recv().await
         else {
-            panic!("expected initial health event");
+            panic!("expected filler health event");
         };
-        let Some(WireMessage::Event {
-            event:
-                BrokerEvent::ExecutionCompleted {
-                    execution: timed_out_execution,
-                    outcome: ExecutionOutcome::TimedOut,
-                    ..
-                },
-            ..
-        }) = events_rx.recv().await
-        else {
-            panic!("expected timed-out completion event");
-        };
-        assert_eq!(timed_out_execution, first_execution);
-
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !broker.sessions.lock().await.contains_key(&session) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("slow consumer is detached");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if adapter.ended_captures.load(Ordering::SeqCst) == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow-consumer teardown ends the session capture");
+        assert_eq!(
+            adapter.ended_captures.load(Ordering::SeqCst),
+            1,
+            "slow-consumer teardown ends the session capture exactly once"
+        );
+        // No further events are attempted for the torn-down session: a second
+        // terminal for the same execution finds no owner and no UI to notify.
         broker
             .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
-                execution: CoreExecutionId(2),
+                execution: CoreExecutionId(1),
             })
             .await;
-        let Some(WireMessage::Event {
-            event:
-                BrokerEvent::ExecutionCompleted {
-                    execution: succeeded_execution,
-                    outcome: ExecutionOutcome::Succeeded,
-                    ..
-                },
-            ..
-        }) = events_rx.recv().await
-        else {
-            panic!("expected second execution succeeded completion");
+        assert!(
+            !broker.sessions.lock().await.contains_key(&session),
+            "repeat delivery attempts no second teardown"
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "torn-down session receives no completion"
+        );
+        assert_eq!(
+            adapter.ended_captures.load(Ordering::SeqCst),
+            1,
+            "repeat delivery attempts no second capture end"
+        );
+        assert!(
+            !broker
+                .state
+                .lock()
+                .await
+                .executions
+                .contains_key(&CoreExecutionId(1)),
+            "terminal removes the torn-down execution exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_ui_generic_reaper_still_leaves_supervision() {
+        let adapter = counting_adapter(false);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<slow generic reaper regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      x:
+        label: no-op
+        action: config:reload
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("reaper configuration compiles");
+        let directory = tempfile::tempdir().expect("owned command cwd");
+        let broker = Broker::from_compiled(adapter, directory.path().join("config.yml"), config);
+        // Awed execution whose queue (capacity 1) is filled before the child
+        // exits: the reaper's terminal delivery must not block on it.
+        let (events, _events_rx) = mpsc::channel::<WireMessage>(1);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::new("main"),
+                    pane: HostPaneId::new("slow-generic"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("slow UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("expected slow attachment");
         };
-        assert_eq!(succeeded_execution, second_execution);
+        events
+            .try_send(WireMessage::Event {
+                event_id: EventId([7; 16]),
+                event: BrokerEvent::AdapterHealthChanged {
+                    healthy: true,
+                    diagnostic: None,
+                },
+            })
+            .expect("test fills the slow UI queue");
+        let wire = ExecutionId([3; 16]);
+        let core = CoreExecutionId(3);
+        broker
+            .reserve_execution(
+                session.clone(),
+                wire,
+                core,
+                ExecutionOwner::GenericProcess,
+                None,
+                &muxe_core::ExecutionPolicy {
+                    mode: muxe_core::ExecutionMode::Await,
+                    timeout: None,
+                    on_timeout: TimeoutAction::Detach,
+                    on_menu_control: muxe_core::MenuControlAction::Detach,
+                },
+            )
+            .await
+            .expect("slow generic execution reserves");
+        let mut origin = CountingAdapter::origin_without_cwd();
+        origin.pane_cwd = Some(directory.path().to_path_buf());
+        broker
+            .execute_command(CommandLaunch {
+                session: session.clone(),
+                wire,
+                core,
+                command: CommandAction {
+                    program: ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+                        "/usr/bin/true".to_owned(),
+                    ))),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: std::collections::BTreeMap::default(),
+                },
+                origin,
+                cwd_from_context: false,
+                policy: muxe_core::ExecutionPolicy {
+                    mode: muxe_core::ExecutionMode::Await,
+                    timeout: None,
+                    on_timeout: TimeoutAction::Detach,
+                    on_menu_control: muxe_core::MenuControlAction::Detach,
+                },
+            })
+            .await
+            .expect("slow generic child starts");
+        assert!(
+            broker.has_supervised_children().await,
+            "slow generic child is supervised while it runs"
+        );
+        // The reaper must finish even though the UI never reads: the child
+        // leaves supervision (so the activation linger cannot wait on it) and
+        // the wedged session is torn down instead of blocking the reaper.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !broker.has_supervised_children().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("slow-UI reaper leaves supervision");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !broker.sessions.lock().await.contains_key(&session) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("slow consumer is detached by its reaper");
     }
 
     #[tokio::test]
