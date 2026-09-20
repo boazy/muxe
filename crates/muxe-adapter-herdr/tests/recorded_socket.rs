@@ -1079,6 +1079,89 @@ async fn production_native_batch_cache_keeps_mixed_outcomes_in_current_candidate
     drop(fixture);
 }
 #[tokio::test]
+async fn production_structural_batch_reports_every_candidate_like_the_uncached_validator() {
+    let fixture =
+        ProductionConnectFixture::start().expect("owned production structural fixture starts");
+    let mut config = fixture.adapter_config();
+    let cache = tempfile::tempdir().expect("owned structural comparison cache");
+    let schema_binary = config.herdr_binary.clone();
+    config.cache_dir = cache.path().join("cache");
+    let adapter = HerdrAdapter::connect(config)
+        .await
+        .expect("production adapter connect succeeds before structural batch validation");
+    let field = |source: &str, name: &str| muxe_core::ConfigField {
+        name: name.to_owned(),
+        name_span: SourceSpan::new(SourceId::new(source), 0, 1),
+        value: ConfigValue::string("w1:p3"),
+    };
+    let kebab = NativeActionCandidate {
+        type_name: "native.herdr.pane:close".to_owned(),
+        type_span: SourceSpan::new(SourceId::new("warm-kebab"), 10, 20),
+        fields: vec![field("warm-kebab", "pane-id")],
+    };
+    let snake = NativeActionCandidate {
+        type_name: "native.herdr.pane:close".to_owned(),
+        type_span: SourceSpan::new(SourceId::new("mixed-structural"), 10, 20),
+        fields: vec![field("mixed-structural", "pane_id")],
+    };
+    let unknown = NativeActionCandidate {
+        type_name: "native.herdr.not-real:reject".to_owned(),
+        type_span: SourceSpan::new(SourceId::new("mixed-unknown"), 30, 40),
+        fields: Vec::new(),
+    };
+    // Warm the comparison cache with the kebab-spelled batch. The old
+    // wire-normalizing hash erased the kebab/snake distinction, so this key
+    // collides with the snake-spelled batch below; the warm call must report
+    // only the unknown-method diagnostic while storing [ok, rejection].
+    let warm = [&kebab, &unknown];
+    let warm_diagnostics = adapter
+        .validate_native_batch(&warm)
+        .expect_err("the warm kebab batch reports only the unknown method");
+    assert_eq!(
+        warm_diagnostics.len(),
+        1,
+        "the warm batch stores one rejection for the unknown method"
+    );
+    assert_eq!(
+        warm_diagnostics[0].labels[0].span.source.as_str(),
+        "mixed-unknown",
+        "the warm diagnostic pins the unknown candidate"
+    );
+    // Collide with the snake spelling of the same batch. Pre-fix this hits the
+    // warm key and returns only the unknown-method diagnostic; post-fix the
+    // structural pre-check rejects before any lookup and both are reported.
+    let batch = [&snake, &unknown];
+    let cached = adapter
+        .validate_native_batch(&batch)
+        .expect_err("a structurally mixed batch must report every candidate");
+    assert_eq!(
+        cached.len(),
+        2,
+        "the cached adapter path must not drop the semantically invalid candidate"
+    );
+    assert_eq!(
+        cached[0].labels[0].span.source.as_str(),
+        "mixed-structural",
+        "structurally invalid diagnostics stay in input order"
+    );
+    assert_eq!(
+        cached[1].labels[0].span.source.as_str(),
+        "mixed-unknown",
+        "semantically invalid diagnostics stay in input order"
+    );
+    let uncached = muxe_adapter_herdr::HerdrConfigValidator::load(&schema_binary, cache.path())
+        .await
+        .expect("config validator loads the installed schema")
+        .validate_native_batch(&batch)
+        .expect_err("the uncached validator reports the same mixed batch");
+    assert_eq!(
+        cached, uncached,
+        "the structural batch must match the uncached path"
+    );
+    drop(adapter);
+    drop(fixture);
+}
+#[tokio::test]
 async fn reconnects_the_production_adapter_only_after_retained_subscription_loss() {
     let mut script = ProductionConnectFixture::initial_handshake();
     script.extend(ProductionConnectFixture::initial_handshake());

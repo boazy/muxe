@@ -51,15 +51,40 @@ pub fn validate_candidate(
     Ok(metadata)
 }
 
-/// Converts compiler YAML fields to `snake_case` wire JSON params.
+/// Structural compatibility key for one candidate: exact YAML field spellings in
+/// source order, the lossless wire conversion of each value, and the native
+/// discriminator. Two candidates share a semantic cache key only when every
+/// validator-visible distinction is equal here, so a key hit can never authorize
+/// a candidate the uncached path would refuse.
 ///
 /// # Errors
 ///
-/// Returns `ValidationError` when a field name is not `kebab-case`, two fields map to
-/// the same wire name, or a value cannot be represented as JSON.
-pub fn fields_to_json(fields: &[ConfigField]) -> Result<Map<String, Value>, ValidationError> {
-    let mut params = Map::new();
+/// Returns `ValidationError` when a field spelling is not exactly the validator's
+/// kebab-case wire spelling, or when two supplied fields share a wire name.
+pub fn structural_cache_key(candidate: &NativeActionCandidate) -> Result<Value, ValidationError> {
+    Ok(serde_json::json!({
+        "type": candidate.type_name,
+        "fields": checked_wire_fields(&candidate.fields)?
+            .into_iter()
+            .map(|(name, wire, value)| serde_json::json!({
+                "name": name,
+                "wire": wire,
+                "value": value,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// The single structural authority shared by the cache key and the validator:
+/// exact YAML spelling, derived wire name, and lossless JSON value, in source
+/// order. Exact spellings are identity-bearing (a `pane_id` spelling is rejected
+/// even though `pane-id` is accepted); only the `wire` derivation normalizes
+/// kebab-case to `snake_case`, which is the wire encoding the schema validates.
+fn checked_wire_fields(
+    fields: &[ConfigField],
+) -> Result<Vec<(String, String, Value)>, ValidationError> {
     let mut names = BTreeSet::new();
+    let mut checked = Vec::with_capacity(fields.len());
     for field in fields {
         let wire_name = yaml_to_wire_name(&field.name)?;
         if !names.insert(wire_name.clone()) {
@@ -70,9 +95,22 @@ pub fn fields_to_json(fields: &[ConfigField]) -> Result<Map<String, Value>, Vali
                 detail: format!("multiple YAML fields map to Herdr parameter {wire_name:?}"),
             });
         }
-        params.insert(wire_name, value_to_json(&field.value)?);
+        checked.push((field.name.clone(), wire_name, value_to_json(&field.value)?));
     }
-    Ok(params)
+    Ok(checked)
+}
+
+/// Converts compiler YAML fields to `snake_case` wire JSON params.
+///
+/// # Errors
+///
+/// Returns `ValidationError` when a field name is not `kebab-case`, two fields map to
+/// the same wire name, or a value cannot be represented as JSON.
+pub fn fields_to_json(fields: &[ConfigField]) -> Result<Map<String, Value>, ValidationError> {
+    Ok(checked_wire_fields(fields)?
+        .into_iter()
+        .map(|(_, wire, value)| (wire, value))
+        .collect())
 }
 
 fn value_to_json(value: &ConfigValue) -> Result<Value, ValidationError> {

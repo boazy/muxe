@@ -166,8 +166,8 @@ impl HerdrCache {
 }
 
 /// Cache key for one configured native-request set. The normalized request hash
-/// covers methods, supplied wire fields, constraint-relevant literal values,
-/// and typed context references in canonical order.
+/// covers native discriminators, exact supplied YAML spellings in source order,
+/// derived wire names, and lossless literal/context values.
 #[derive(Clone, Debug)]
 pub struct ComparisonKey {
     pub bundled_schema_hash: String,
@@ -224,40 +224,38 @@ impl ComparisonKey {
     }
 }
 
-/// Canonical hash of the effective native-request sequence: method names, wire field names
-/// (kebab-case YAML becomes `snake_case` wire names), literal JSON values, and typed context
-/// references. The compiler supplies deterministic binding order, which is retained because
-/// cached outcomes are positional and must never be applied to a reordered configuration.
-#[must_use]
-pub fn hash_configured_requests(candidates: &[NativeActionCandidate]) -> String {
-    hash_configured_candidate_iter(candidates.iter())
-}
-
-/// Equivalent whole-effective-set hash without cloning borrowed compiler candidates.
-#[must_use]
-pub fn hash_configured_request_refs(candidates: &[&NativeActionCandidate]) -> String {
-    hash_configured_candidate_iter(candidates.iter().copied())
-}
-
-fn hash_configured_candidate_iter<'a>(
-    candidates: impl Iterator<Item = &'a NativeActionCandidate>,
-) -> String {
-    let normalized: Vec<Value> = candidates
+/// Fallible whole-set hash over structurally validated native requests. The
+/// structural representation rejects the same spellings and duplicate fields as
+/// the uncached validator; canonical source values retain distinctions such as
+/// context paths that are not visible in the wire placeholder.
+///
+/// # Errors
+///
+/// Returns [`crate::ValidationError`] when any candidate is structurally invalid.
+pub fn validated_requests_hash(
+    candidates: &[&NativeActionCandidate],
+) -> Result<String, crate::ValidationError> {
+    let validated: Vec<Value> = candidates
+        .iter()
         .map(|candidate| {
-            let mut fields = BTreeMap::new();
-            for field in &candidate.fields {
-                fields.insert(
-                    field.name.replace('-', "_"),
-                    canonical_config_value(&field.value),
-                );
-            }
-            serde_json::json!({
-                "type": candidate.type_name,
-                "fields": fields,
-            })
+            let structural = crate::validation::structural_cache_key(candidate)?;
+            let canonical_fields = candidate
+                .fields
+                .iter()
+                .map(|field| {
+                    serde_json::json!({
+                        "name": field.name,
+                        "value": canonical_config_value(&field.value),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({
+                "structural": structural,
+                "canonical_fields": canonical_fields,
+            }))
         })
-        .collect();
-    sha256_hex(&canonical_bytes(Value::Array(normalized)))
+        .collect::<Result<_, crate::ValidationError>>()?;
+    Ok(sha256_hex(&canonical_bytes(Value::Array(validated))))
 }
 
 fn canonical_config_value(value: &ConfigValue) -> Value {
@@ -286,6 +284,76 @@ fn canonical_config_value(value: &ConfigValue) -> Value {
             }
             Value::Object(object.into_iter().collect())
         }
+    }
+}
+
+/// Canonical hash of the effective native-request sequence. This compatibility
+/// API remains for callers that need a best-effort hash before validation; the
+/// adapter cache uses [`validated_requests_hash`] so invalid candidates never
+/// reach a lookup.
+#[must_use]
+pub fn hash_configured_requests(candidates: &[NativeActionCandidate]) -> String {
+    hash_configured_candidate_iter(candidates.iter())
+}
+
+/// Equivalent whole-effective-set hash without cloning borrowed compiler candidates.
+#[must_use]
+pub fn hash_configured_request_refs(candidates: &[&NativeActionCandidate]) -> String {
+    hash_configured_candidate_iter(candidates.iter().copied())
+}
+
+fn hash_configured_candidate_iter<'a>(
+    candidates: impl Iterator<Item = &'a NativeActionCandidate>,
+) -> String {
+    let normalized: Vec<Value> = candidates
+        .map(|candidate| {
+            crate::validation::structural_cache_key(candidate).unwrap_or_else(|_| {
+                // Unvalidated spellings must still hash without colliding with any
+                // validated key: keep the exact source spelling and losslessly
+                // encode values structurally, never through the wire derivation.
+                serde_json::json!({
+                    "type": candidate.type_name,
+                    "unvalidated_fields": candidate.fields.iter().map(|field| {
+                        serde_json::json!({
+                            "name": field.name,
+                            "value": structural_config_value(&field.value),
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+        })
+        .collect();
+    sha256_hex(&canonical_bytes(Value::Array(normalized)))
+}
+
+/// Lossless structural encoding of a config value for unvalidated candidates.
+fn structural_config_value(value: &ConfigValue) -> Value {
+    match &value.kind {
+        ConfigValueKind::Null => Value::Null,
+        ConfigValueKind::Boolean(value) => Value::Bool(*value),
+        ConfigValueKind::Integer(value) => Value::from(*value),
+        ConfigValueKind::Float(value) => {
+            serde_json::Number::from_f64(*value).map_or(Value::Null, Value::Number)
+        }
+        ConfigValueKind::String(value) => Value::String(value.clone()),
+        ConfigValueKind::Context(reference) => serde_json::json!({
+            "$context": reference.path.as_str(),
+            "type": format!("{:?}", reference.expected_type()),
+        }),
+        ConfigValueKind::Sequence(values) => {
+            Value::Array(values.iter().map(structural_config_value).collect())
+        }
+        ConfigValueKind::Mapping(fields) => Value::Array(
+            fields
+                .iter()
+                .map(|field| {
+                    serde_json::json!({
+                        "name": field.name,
+                        "value": structural_config_value(&field.value),
+                    })
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -446,6 +514,37 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let cache = HerdrCache::new(temp.path());
         (temp, cache)
+    }
+
+    fn candidate(type_name: &str, fields: &[&str]) -> NativeActionCandidate {
+        NativeActionCandidate {
+            type_name: type_name.to_owned(),
+            type_span: muxe_core::SourceSpan::new(muxe_core::SourceId::new("test"), 0, 1),
+            fields: fields
+                .iter()
+                .map(|field| ConfigField {
+                    name: (*field).to_owned(),
+                    name_span: muxe_core::SourceSpan::new(muxe_core::SourceId::new("test"), 0, 1),
+                    value: ConfigValue::string("w1:p3"),
+                })
+                .collect(),
+        }
+    }
+
+    fn comparison_key(configured_requests_hash: String) -> ComparisonKey {
+        ComparisonKey {
+            bundled_schema_hash: "bundled".to_owned(),
+            runtime_schema_hash: "runtime".to_owned(),
+            configured_requests_hash,
+        }
+    }
+
+    fn lookup_after_structural_validation(
+        cache: &HerdrCache,
+        candidate: &NativeActionCandidate,
+    ) -> Result<Option<Vec<bool>>, crate::ValidationError> {
+        let configured_requests_hash = validated_requests_hash(&[candidate])?;
+        Ok(cache.comparison_lookup(&comparison_key(configured_requests_hash)))
     }
 
     #[test]
@@ -655,39 +754,98 @@ mod tests {
     }
 
     #[test]
-    fn configured_request_hash_is_case_stable_and_position_sensitive() {
-        let candidate = |type_name: &str, field: &str| NativeActionCandidate {
-            type_name: type_name.to_owned(),
-            type_span: muxe_core::SourceSpan::new(muxe_core::SourceId::new("test"), 0, 1),
-            fields: vec![ConfigField {
-                name: field.to_owned(),
-                name_span: muxe_core::SourceSpan::new(muxe_core::SourceId::new("test"), 0, 1),
-                value: ConfigValue::string("w1:p3"),
-            }],
-        };
-        let kebab = vec![candidate("native.herdr.pane:resize", "pane-id")];
-        let snake_direct = vec![NativeActionCandidate {
-            type_name: "native.herdr.pane:resize".to_owned(),
-            type_span: muxe_core::SourceSpan::new(muxe_core::SourceId::new("test"), 0, 1),
-            fields: vec![ConfigField {
-                name: "pane_id".to_owned(),
-                name_span: muxe_core::SourceSpan::new(muxe_core::SourceId::new("test"), 0, 1),
-                value: ConfigValue::string("w1:p3"),
-            }],
-        }];
+    fn configured_request_hash_rejects_invalid_spelling_and_preserves_wire_normalization() {
+        let kebab = candidate("native.herdr.pane:resize", &["pane-id"]);
+        let snake = candidate("native.herdr.pane:resize", &["pane_id"]);
+
+        let snake_error = validated_requests_hash(&[&snake])
+            .expect_err("snake_case spelling must fail the structural pre-check");
+        assert_eq!(snake_error.code, crate::ValidationCode::AdditionalProperty);
+
+        let structural = crate::validation::structural_cache_key(&kebab).unwrap();
         assert_eq!(
-            hash_configured_requests(&kebab),
-            hash_configured_requests(&snake_direct)
+            structural["fields"][0]["name"],
+            serde_json::json!("pane-id")
         );
+        assert_eq!(
+            structural["fields"][0]["wire"],
+            serde_json::json!("pane_id")
+        );
+
         let pair = vec![
-            candidate("native.herdr.pane:resize", "pane-id"),
-            candidate("native.herdr.server:reload-config", "pane-id"),
+            candidate("native.herdr.pane:resize", &["pane-id"]),
+            candidate("native.herdr.server:reload-config", &["pane-id"]),
         ];
         let swapped = vec![pair[1].clone(), pair[0].clone()];
+        let pair_refs = pair.iter().collect::<Vec<_>>();
+        let swapped_refs = swapped.iter().collect::<Vec<_>>();
         assert_ne!(
-            hash_configured_requests(&pair),
-            hash_configured_requests(&swapped),
+            validated_requests_hash(&pair_refs).unwrap(),
+            validated_requests_hash(&swapped_refs).unwrap(),
             "whole-set outcomes are positional in compiler binding order"
+        );
+    }
+
+    #[test]
+    fn duplicate_supplied_fields_reject_identically_warm_and_cold() {
+        let valid = candidate("native.herdr.pane:resize", &["pane-id"]);
+        let duplicate = candidate("native.herdr.pane:resize", &["pane-id", "pane-id"]);
+        let (_warm_temp, warm) = cache();
+        let valid_key = comparison_key(validated_requests_hash(&[&valid]).unwrap());
+        warm.comparison_store(&valid_key, &[true]).unwrap();
+
+        let warm_result = lookup_after_structural_validation(&warm, &duplicate);
+        let (_cold_temp, cold) = cache();
+        let cold_result = lookup_after_structural_validation(&cold, &duplicate);
+        assert_eq!(
+            warm_result, cold_result,
+            "duplicate fields must fail before cache state can affect validation"
+        );
+        let error = warm_result.expect_err("duplicate supplied fields must be rejected");
+        assert_eq!(error.code, crate::ValidationCode::AdditionalProperty);
+    }
+
+    #[test]
+    fn comparison_cache_reuses_a_genuinely_identical_valid_candidate() {
+        let first = candidate("native.herdr.pane:resize", &["pane-id"]);
+        let identical = first.clone();
+        let first_hash = validated_requests_hash(&[&first]).unwrap();
+        let identical_hash = validated_requests_hash(&[&identical]).unwrap();
+        assert_eq!(first_hash, identical_hash);
+
+        let (_temp, cache) = cache();
+        let key = comparison_key(first_hash);
+        assert_eq!(cache.comparison_lookup(&key), None);
+        cache.comparison_store(&key, &[false]).unwrap();
+        assert_eq!(
+            lookup_after_structural_validation(&cache, &identical).unwrap(),
+            Some(vec![false]),
+            "an identical valid candidate must reuse the stored outcome"
+        );
+    }
+
+    #[test]
+    fn cached_valid_request_does_not_authorize_invalid_spelling() {
+        let valid = candidate("native.herdr.pane:resize", &["pane-id"]);
+        let snake = candidate("native.herdr.pane:resize", &["pane_id"]);
+        let (_warm_temp, warm) = cache();
+        let valid_key = comparison_key(validated_requests_hash(&[&valid]).unwrap());
+        warm.comparison_store(&valid_key, &[true]).unwrap();
+        assert_eq!(warm.comparison_lookup(&valid_key), Some(vec![true]));
+
+        let cached_result = lookup_after_structural_validation(&warm, &snake);
+        let (_cold_temp, cold) = cache();
+        let uncached_result = lookup_after_structural_validation(&cold, &snake);
+        assert_eq!(
+            cached_result, uncached_result,
+            "cached and uncached invalid candidates must reject identically"
+        );
+        let error = cached_result.expect_err("snake_case spelling must be rejected");
+        assert_eq!(error.code, crate::ValidationCode::AdditionalProperty);
+        assert_eq!(
+            warm.comparison_lookup(&valid_key),
+            Some(vec![true]),
+            "the warm valid result must not be trusted for the invalid candidate"
         );
     }
 }

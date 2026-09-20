@@ -24,7 +24,7 @@ pub use adapter::{HerdrAdapter, HerdrConfigValidator};
 pub use cache::{
     ComparisonKey, HerdrCache,
     canonical_request_bytes_for_test as cache_canonical_request_bytes_for_test,
-    hash_configured_request_refs, hash_configured_requests,
+    hash_configured_request_refs, hash_configured_requests, validated_requests_hash,
 };
 pub use launch::{
     CommandPaneLaunch, CommandPanePlacement, CommandTabLaunch, FocusedPane, PreparedUiPane,

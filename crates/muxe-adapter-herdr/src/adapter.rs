@@ -357,10 +357,34 @@ impl HerdrAdapter {
             return Ok(Vec::new());
         }
         let runtime = self.runtime();
+        let structural = candidates
+            .iter()
+            .copied()
+            .map(crate::validation::structural_cache_key)
+            .collect::<Vec<_>>();
+        if structural.iter().any(Result::is_err) {
+            let mut diagnostics = Vec::new();
+            for (candidate, structural) in candidates.iter().zip(structural) {
+                if let Err(error) = structural {
+                    diagnostics.push(native_diagnostic(candidate, &error.to_string()));
+                    continue;
+                }
+                if let Err(error) = validate_candidate(runtime.schema(), candidate) {
+                    diagnostics.push(native_candidate_diagnostic(candidate, &error));
+                }
+            }
+            return Err(diagnostics);
+        }
+        let configured_requests_hash = match crate::validated_requests_hash(candidates) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return Err(vec![native_diagnostic(candidates[0], &error.to_string())]);
+            }
+        };
         let key = ComparisonKey {
             bundled_schema_hash: BUNDLED_REQUEST_SCHEMA_SHA256.to_owned(),
             runtime_schema_hash: runtime.schema().canonical_request_sha256().to_owned(),
-            configured_requests_hash: crate::hash_configured_request_refs(candidates),
+            configured_requests_hash,
         };
         if let Some(outcomes) = self.cache.comparison_lookup(&key)
             && outcomes.len() == candidates.len()
