@@ -777,9 +777,9 @@ pub enum IndexOrDirection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MenuTarget {
-    Named(String),
-    /// Compiler-generated stable ID for one embedded submenu.
-    Inline(String),
+    Named(crate::menu::MenuName),
+    /// Compiler-generated structural identity for one embedded submenu.
+    Inline(crate::menu::InlineMenuId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -14,19 +14,153 @@ use crate::theme::CompiledTheme;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CompiledGeneration(pub u64);
 
-/// Stable named-menu ID or compiler-generated inline-menu ID.
+/// Validated user-chosen menu name.
+///
+/// The domain is non-empty with no NUL/control characters. Whitespace IS allowed:
+/// quoted whitespace names (e.g. `"my menu"`) are a documented launcher feature.
+/// Construction enforces the domain; there is no unchecked constructor.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct MenuId(Arc<str>);
+pub struct MenuName(Arc<str>);
 
-impl MenuId {
-    #[must_use]
-    pub fn new(value: impl Into<Arc<str>>) -> Self {
-        Self(value.into())
+/// Error for a rejected menu name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidMenuName {
+    /// Machine-readable reason: `empty`, `nul`, or `control`.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for InvalidMenuName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid menu name ({})", self.reason)
+    }
+}
+
+impl std::error::Error for InvalidMenuName {}
+
+impl MenuName {
+    /// Parses a candidate name, enforcing the named-menu domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidMenuName`] for empty names or names containing
+    /// NUL/control characters.
+    pub fn parse(value: impl Into<Arc<str>>) -> Result<Self, InvalidMenuName> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(InvalidMenuName { reason: "empty" });
+        }
+        if value.contains('\0') {
+            return Err(InvalidMenuName { reason: "nul" });
+        }
+        if value.chars().any(char::is_control) {
+            return Err(InvalidMenuName { reason: "control" });
+        }
+        Ok(Self(value))
+    }
+
+    /// Parses a candidate name, mapping the rejection into a config diagnostic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::diagnostic::ConfigDiagnostic`] naming the offending menu.
+    pub fn parse_diagnostic(
+        value: &str,
+        span: crate::diagnostic::SourceSpan,
+    ) -> Result<Self, crate::diagnostic::ConfigDiagnostic> {
+        Self::parse(value).map_err(|error| {
+            crate::diagnostic::ConfigDiagnostic::error(
+                crate::diagnostic::DiagnosticCode::InvalidValue,
+                format!("invalid menu name `{value}` ({})", error.reason),
+                span,
+            )
+        })
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Compiler-generated identity for one embedded submenu.
+///
+/// Structural, never a free-form string: the owning top-level [`MenuName`] plus
+/// a single monotonic ordinal across the compilation unit, assigned in document
+/// order.
+/// It cannot equal a user-chosen name, so a named menu literally called
+/// `main#0` never collides with the inline submenu of `main`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InlineMenuId {
+    owner: MenuName,
+    ordinal: u64,
+}
+
+impl InlineMenuId {
+    #[must_use]
+    pub fn new(owner: MenuName, ordinal: u64) -> Self {
+        Self { owner, ordinal }
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &MenuName {
+        &self.owner
+    }
+
+    #[must_use]
+    pub fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+}
+
+/// Validated menu identity: either a user-chosen name or a compiler-generated
+/// inline identity. The variants are distinct types, so a named menu can never
+/// equal an inline submenu.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MenuId {
+    Named(MenuName),
+    Inline(InlineMenuId),
+}
+
+impl MenuId {
+    #[must_use]
+    pub fn named(name: MenuName) -> Self {
+        Self::Named(name)
+    }
+
+    #[must_use]
+    pub fn inline(id: InlineMenuId) -> Self {
+        Self::Inline(id)
+    }
+
+    /// Returns the name for named identities, or `None` for inline ones.
+    #[must_use]
+    pub fn name(&self) -> Option<&MenuName> {
+        match self {
+            Self::Named(name) => Some(name),
+            Self::Inline(_) => None,
+        }
+    }
+
+    /// Returns the inline identity for inline identities, or `None` for named ones.
+    #[must_use]
+    pub fn inline_id(&self) -> Option<&InlineMenuId> {
+        match self {
+            Self::Named(_) => None,
+            Self::Inline(id) => Some(id),
+        }
+    }
+
+    /// Lossless display form: named identities render bare; inline identities
+    /// render as `owner#ordinal`, which can never be re-parsed as a named
+    /// identity (the wire contract keeps the variant explicit).
+    #[must_use]
+    pub fn display(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Named(name) => std::borrow::Cow::Borrowed(name.as_str()),
+            Self::Inline(id) => {
+                std::borrow::Cow::Owned(format!("{}#{}", id.owner.as_str(), id.ordinal))
+            }
+        }
     }
 }
 
@@ -313,11 +447,12 @@ fn local_menu_action(action: &ActionSpec) -> Option<LocalMenuAction> {
         return None;
     };
     Some(match action {
-        MenuAction::Open(MenuTarget::Named(target) | MenuTarget::Inline(target)) => {
-            LocalMenuAction::Open {
-                target: MenuId::new(target.clone()),
-            }
-        }
+        MenuAction::Open(MenuTarget::Named(target)) => LocalMenuAction::Open {
+            target: MenuId::named(target.clone()),
+        },
+        MenuAction::Open(MenuTarget::Inline(target)) => LocalMenuAction::Open {
+            target: MenuId::inline(target.clone()),
+        },
         MenuAction::Return => LocalMenuAction::Control(MenuControl::Return),
         MenuAction::Quit => LocalMenuAction::Control(MenuControl::Quit),
         MenuAction::PagePrev => LocalMenuAction::PagePrevious,

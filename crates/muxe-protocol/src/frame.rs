@@ -717,7 +717,7 @@ mod tests {
                 request: crate::wire::ClientRequest::PrepareUiLaunch(
                     crate::wire::PrepareUiLaunch {
                         modal_scope: crate::wire::ModalScopeId::new("scope"),
-                        root: crate::wire::MenuId::new("root"),
+                        root: crate::wire::MenuId::named("root"),
                         lease_millis: 1,
                     },
                 ),

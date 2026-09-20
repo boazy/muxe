@@ -183,7 +183,63 @@ macro_rules! string_id {
 
 string_id!(UiSessionId);
 string_id!(ModalScopeId);
-string_id!(MenuId);
+/// Lossless wire menu identity: `Named` carries a validated user-chosen name
+/// (non-empty, no NUL/control; whitespace allowed), `Inline` carries the
+/// structural parent name plus ordinal. The variants are explicit on the wire,
+/// so a named menu literally called `main@0` never equals the inline submenu
+/// of `main`, and neither variant round-trips through a bare string.
+#[derive(
+    Archive,
+    Deserialize,
+    Serialize,
+    SerdeSerialize,
+    SerdeDeserialize,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+)]
+pub enum MenuId {
+    Named(String),
+    Inline { parent: String, ordinal: u64 },
+}
+
+impl MenuId {
+    #[must_use]
+    pub fn named(value: impl Into<String>) -> Self {
+        Self::Named(value.into())
+    }
+
+    #[must_use]
+    pub fn inline(parent: impl Into<String>, ordinal: u64) -> Self {
+        Self::Inline {
+            parent: parent.into(),
+            ordinal,
+        }
+    }
+
+    /// Lossless display form: named identities render bare; inline identities
+    /// render as `parent#ordinal`.
+    #[must_use]
+    pub fn display(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Named(name) => std::borrow::Cow::Borrowed(name),
+            Self::Inline { parent, ordinal } => {
+                std::borrow::Cow::Owned(format!("{parent}#{ordinal}"))
+            }
+        }
+    }
+}
+
+impl Validate for MenuId {
+    fn validate(&self) -> Result<(), SemanticError> {
+        match self {
+            Self::Named(name) => validate_menu_name("MenuId", name),
+            Self::Inline { parent, .. } => validate_menu_name("MenuId.parent", parent),
+        }
+    }
+}
 string_id!(HostPaneId);
 string_id!(HostTabId);
 string_id!(HostClientId);
@@ -1753,6 +1809,40 @@ fn validate_archived_identifier(field: &'static str, value: &str) -> Result<(), 
     Ok(())
 }
 
+/// Archived twin of [`validate_menu_name`]: accepts the named-menu domain core
+/// accepts (whitespace allowed), rejects empty/NUL/control.
+fn validate_archived_menu_name(field: &'static str, value: &str) -> Result<(), SemanticError> {
+    validate_archived_text(field, value, true)
+}
+
+fn validate_archived_menu_id(value: &ArchivedMenuId) -> Result<(), SemanticError> {
+    match value {
+        ArchivedMenuId::Named(name) => validate_archived_menu_name("MenuId", name.as_str()),
+        ArchivedMenuId::Inline { parent, .. } => {
+            validate_archived_menu_name("MenuId.parent", parent.as_str())
+        }
+    }
+}
+
+fn archived_menu_id_eq(left: &ArchivedMenuId, right: &ArchivedMenuId) -> bool {
+    match (left, right) {
+        (ArchivedMenuId::Named(left), ArchivedMenuId::Named(right)) => {
+            left.as_str() == right.as_str()
+        }
+        (
+            ArchivedMenuId::Inline {
+                parent: left_parent,
+                ordinal: left_ordinal,
+            },
+            ArchivedMenuId::Inline {
+                parent: right_parent,
+                ordinal: right_ordinal,
+            },
+        ) => left_parent.as_str() == right_parent.as_str() && left_ordinal == right_ordinal,
+        _ => false,
+    }
+}
+
 fn validate_archived_text(
     field: &'static str,
     value: &str,
@@ -1774,7 +1864,7 @@ fn validate_archived_request(request: &ArchivedClientRequest) -> Result<(), Sema
     match request {
         ArchivedClientRequest::PrepareUiLaunch(value) => {
             validate_archived_identifier("ModalScopeId", value.modal_scope.0.as_str())?;
-            validate_archived_identifier("MenuId", value.root.0.as_str())?;
+            validate_archived_menu_id(&value.root)?;
             (value.lease_millis.to_native() > 0)
                 .then_some(())
                 .ok_or(SemanticError::ZeroLease)
@@ -1788,7 +1878,7 @@ fn validate_archived_request(request: &ArchivedClientRequest) -> Result<(), Sema
             Ok(())
         }
         ArchivedClientRequest::AttachUi(value) => {
-            validate_archived_identifier("MenuId", value.root.0.as_str())?;
+            validate_archived_menu_id(&value.root)?;
             validate_archived_identifier("HostPaneId", value.pane.0.as_str())?;
             if let Some(token) = value.pending_launch.as_ref() {
                 validate_archived_nonce(&token.0, "PendingLaunchToken")?;
@@ -1916,18 +2006,18 @@ fn validate_archived_attachment(value: &ArchivedUiAttachmentWire) -> Result<(), 
 fn validate_archived_menu_view(value: &ArchivedMenuViewWire) -> Result<(), SemanticError> {
     let generation = value.generation.to_native();
     validate_archived_generation(generation)?;
-    validate_archived_identifier("MenuId", value.root.0.as_str())?;
+    validate_archived_menu_id(&value.root)?;
     let mut root_found = false;
     for (index, menu) in value.menus.iter().enumerate() {
         validate_archived_menu(menu)?;
-        if menu.id.0.as_str() == value.root.0.as_str() {
+        if archived_menu_id_eq(&menu.id, &value.root) {
             root_found = true;
         }
         if value
             .menus
             .iter()
             .take(index)
-            .any(|prior| prior.id.0.as_str() == menu.id.0.as_str())
+            .any(|prior| archived_menu_id_eq(&prior.id, &menu.id))
         {
             return Err(SemanticError::DuplicateMenu);
         }
@@ -1940,7 +2030,7 @@ fn validate_archived_menu_view(value: &ArchivedMenuViewWire) -> Result<(), Seman
                 && !value
                     .menus
                     .iter()
-                    .any(|candidate| candidate.id.0.as_str() == target.0.as_str())
+                    .any(|candidate| archived_menu_id_eq(&candidate.id, target))
             {
                 return Err(SemanticError::UnknownMenuTarget);
             }
@@ -1952,7 +2042,7 @@ fn validate_archived_menu_view(value: &ArchivedMenuViewWire) -> Result<(), Seman
 }
 
 fn validate_archived_menu(value: &ArchivedMenuViewMenuWire) -> Result<(), SemanticError> {
-    validate_archived_identifier("MenuId", value.id.0.as_str())?;
+    validate_archived_menu_id(&value.id)?;
     if value.layout.max_item_title_length.to_native() == 0 {
         return Err(SemanticError::ZeroLayoutTitleLength);
     }
@@ -1993,9 +2083,7 @@ fn validate_archived_local_action(
     value: &ArchivedLocalMenuActionWire,
 ) -> Result<(), SemanticError> {
     match value {
-        ArchivedLocalMenuActionWire::Open { target } => {
-            validate_archived_identifier("MenuId", target.0.as_str())
-        }
+        ArchivedLocalMenuActionWire::Open { target } => validate_archived_menu_id(target),
         ArchivedLocalMenuActionWire::Control(_)
         | ArchivedLocalMenuActionWire::PagePrevious
         | ArchivedLocalMenuActionWire::PageNext => Ok(()),
@@ -2202,6 +2290,13 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), SemanticE
     Ok(())
 }
 
+/// Validates a menu NAME: the same domain core accepts (non-empty, no
+/// NUL/control) but whitespace IS allowed, because quoted whitespace names are
+/// a documented launcher feature the old `validate_identifier` wrongly rejected.
+fn validate_menu_name(field: &'static str, value: &str) -> Result<(), SemanticError> {
+    validate_text(field, value)
+}
+
 fn validate_text(field: &'static str, value: &str) -> Result<(), SemanticError> {
     if value.is_empty() {
         return Err(SemanticError::Empty { field });
@@ -2349,9 +2444,9 @@ mod tests {
         UiAttachmentWire {
             menu: MenuViewWire {
                 generation: 1,
-                root: MenuId::new("root"),
+                root: MenuId::named("root"),
                 menus: vec![MenuViewMenuWire {
-                    id: MenuId::new("root"),
+                    id: MenuId::named("root"),
                     title: None,
                     layout: layout(),
                     bindings: Vec::new(),
@@ -2527,7 +2622,7 @@ mod tests {
         let origin = WireMessage::Request {
             request_id: RequestId([2; 16]),
             request: ClientRequest::AttachUi(AttachUi {
-                root: MenuId::new("root"),
+                root: MenuId::named("root"),
                 pane: HostPaneId::new("ui-pane"),
                 pending_launch: Some(PendingLaunchToken([3; 16])),
                 origin: Some(UiOriginBootstrap {
@@ -2551,7 +2646,7 @@ mod tests {
         let caller = WireMessage::Request {
             request_id: RequestId([4; 16]),
             request: ClientRequest::AttachUi(AttachUi {
-                root: MenuId::new("root"),
+                root: MenuId::named("root"),
                 pane: HostPaneId::new("ui-pane"),
                 pending_launch: Some(PendingLaunchToken([5; 16])),
                 origin: Some(UiOriginBootstrap {
@@ -2582,7 +2677,7 @@ mod tests {
         let request = WireMessage::Request {
             request_id: RequestId([8; 16]),
             request: ClientRequest::AttachUi(AttachUi {
-                root: MenuId::new("root"),
+                root: MenuId::named("root"),
                 pane: HostPaneId::new("ui-pane"),
                 pending_launch: Some(PendingLaunchToken([9; 16])),
                 origin: Some(UiOriginBootstrap {
@@ -2617,7 +2712,7 @@ mod tests {
         let request = WireMessage::Request {
             request_id: RequestId([6; 16]),
             request: ClientRequest::AttachUi(AttachUi {
-                root: MenuId::new("root"),
+                root: MenuId::named("root"),
                 pane: HostPaneId::new("ui-pane"),
                 pending_launch: None,
                 origin: None,
@@ -2640,10 +2735,10 @@ mod tests {
         let menus = (0..depth)
             .map(|index| {
                 let action = (index + 1 < depth).then(|| LocalMenuActionWire::Open {
-                    target: MenuId::new(format!("menu-{}", index + 1)),
+                    target: MenuId::named(format!("menu-{}", index + 1)),
                 });
                 MenuViewMenuWire {
-                    id: MenuId::new(format!("menu-{index}")),
+                    id: MenuId::named(format!("menu-{index}")),
                     title: None,
                     layout: layout(),
                     bindings: vec![binding(7, index, action)],
@@ -2652,7 +2747,7 @@ mod tests {
             .collect();
         MenuViewWire {
             generation: 7,
-            root: MenuId::new("menu-0"),
+            root: MenuId::named("menu-0"),
             menus,
         }
         .validate()
@@ -2676,21 +2771,139 @@ mod tests {
 
         let view = MenuViewWire {
             generation: 7,
-            root: MenuId::new("root"),
+            root: MenuId::named("root"),
             menus: vec![MenuViewMenuWire {
-                id: MenuId::new("root"),
+                id: MenuId::named("root"),
                 title: Some("Root".into()),
                 layout: layout(),
                 bindings: vec![binding(
                     7,
                     1,
                     Some(LocalMenuActionWire::Open {
-                        target: MenuId::new("not-present"),
+                        target: MenuId::named("not-present"),
                     }),
                 )],
             }],
         };
         assert_eq!(view.validate(), Err(SemanticError::UnknownMenuTarget));
+    }
+
+    #[test]
+    fn whitespace_menu_name_validates_and_round_trips_losslessly_by_variant() {
+        let named = MenuId::named("my menu");
+        named.validate().expect("whitespace name validates");
+        let inline = MenuId::inline("main", 0);
+        inline.validate().expect("inline identity validates");
+        assert_eq!(inline.display(), "main#0");
+        assert_ne!(named, MenuId::named("main#0"));
+        assert_ne!(inline, MenuId::named("main#0"));
+        let view = MenuViewWire {
+            generation: 7,
+            root: MenuId::named("my menu"),
+            menus: vec![
+                MenuViewMenuWire {
+                    id: MenuId::named("my menu"),
+                    title: None,
+                    layout: layout(),
+                    bindings: vec![binding(
+                        7,
+                        0,
+                        Some(LocalMenuActionWire::Open {
+                            target: MenuId::inline("my menu", 0),
+                        }),
+                    )],
+                },
+                MenuViewMenuWire {
+                    id: MenuId::inline("my menu", 0),
+                    title: None,
+                    layout: layout(),
+                    bindings: Vec::new(),
+                },
+            ],
+        };
+        view.validate()
+            .expect("view with whitespace root validates");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&view).unwrap();
+        let archived = rkyv::access::<ArchivedMenuViewWire, rkyv::rancor::Error>(&bytes).unwrap();
+        let round_tripped: MenuViewWire =
+            rkyv::deserialize::<MenuViewWire, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(round_tripped, view);
+    }
+
+    #[test]
+    fn empty_and_control_menu_names_are_rejected_by_wire_validation() {
+        for name in ["", "bad\u{7}name", "bad\0name"] {
+            assert!(
+                MenuId::named(name).validate().is_err(),
+                "wire rejects {name:?}"
+            );
+        }
+        assert!(MenuId::inline("", 0).validate().is_err());
+        assert!(MenuId::inline("bad\u{7}parent", 0).validate().is_err());
+    }
+
+    #[test]
+    fn named_main_hash_zero_and_inline_submenu_are_distinct_not_duplicates() {
+        let view = MenuViewWire {
+            generation: 7,
+            root: MenuId::named("main"),
+            menus: vec![
+                MenuViewMenuWire {
+                    id: MenuId::named("main"),
+                    title: None,
+                    layout: layout(),
+                    bindings: vec![binding(
+                        7,
+                        0,
+                        Some(LocalMenuActionWire::Open {
+                            target: MenuId::inline("main", 0),
+                        }),
+                    )],
+                },
+                MenuViewMenuWire {
+                    id: MenuId::inline("main", 0),
+                    title: None,
+                    layout: layout(),
+                    bindings: Vec::new(),
+                },
+                MenuViewMenuWire {
+                    id: MenuId::named("main#0"),
+                    title: None,
+                    layout: layout(),
+                    bindings: Vec::new(),
+                },
+            ],
+        };
+        view.validate()
+            .expect("named main#0 coexists with the inline submenu");
+    }
+
+    #[test]
+    fn duplicate_named_identities_are_rejected_with_duplicate_menu() {
+        let menu = || MenuViewMenuWire {
+            id: MenuId::named("main"),
+            title: None,
+            layout: layout(),
+            bindings: Vec::new(),
+        };
+        let view = MenuViewWire {
+            generation: 7,
+            root: MenuId::named("main"),
+            menus: vec![menu(), menu()],
+        };
+        assert_eq!(view.validate(), Err(SemanticError::DuplicateMenu));
+        let inline = || MenuViewMenuWire {
+            id: MenuId::inline("main", 0),
+            title: None,
+            layout: layout(),
+            bindings: Vec::new(),
+        };
+        let inline_view = MenuViewWire {
+            generation: 7,
+            root: MenuId::inline("main", 0),
+            menus: vec![inline(), inline()],
+        };
+        assert_eq!(inline_view.validate(), Err(SemanticError::DuplicateMenu));
     }
 
     #[test]

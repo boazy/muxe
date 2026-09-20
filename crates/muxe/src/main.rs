@@ -251,11 +251,16 @@ async fn dump_menu(command: muxe::cli::MenuDump) -> Result<()> {
     let requested = if command.all {
         None
     } else {
-        Some(muxe_core::MenuId::new(
-            command
-                .menu
-                .expect("clap requires a menu unless --all is present"),
-        ))
+        let name = command
+            .menu
+            .expect("clap requires a menu unless --all is present");
+        let parsed = muxe_core::MenuName::parse(name.as_str()).map_err(|error| {
+            color_eyre::eyre::eyre!(
+                "invalid menu name `{name}` ({}): names must be non-empty with no NUL/control characters",
+                error.reason
+            )
+        })?;
+        Some(muxe_core::MenuId::named(parsed))
     };
     let selection = requested.as_ref().map_or(
         muxe::menu_dump::MenuDumpSelection::All,
@@ -2195,7 +2200,7 @@ async fn prepare_ui_launch(
         .request(muxe_protocol::ClientRequest::PrepareUiLaunch(
             muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new(scope.as_str()),
-                root: muxe_protocol::MenuId::new(root),
+                root: muxe_protocol::MenuId::named(root),
                 lease_millis: LAUNCH_TOKEN_LEASE_MILLIS,
             },
         ))
@@ -2436,7 +2441,7 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
     let frame = client
         .request_frame(muxe_protocol::ClientRequest::AttachUi(
             muxe_protocol::AttachUi {
-                root: muxe_protocol::MenuId::new(&menu.root),
+                root: validated_wire_menu_root(&menu.root)?,
                 pane: muxe_protocol::HostPaneId::new(&pane),
                 pending_launch: None,
                 origin: None,
@@ -2885,6 +2890,15 @@ impl muxe_ui::UiControl for BrokerUiControl {
     }
 }
 
+/// Validates a CLI-supplied root menu name at the construction boundary,
+/// returning a user-facing error for names outside the validated domain.
+fn validated_wire_menu_root(root: &str) -> Result<MenuId> {
+    if root.is_empty() || root.contains('\0') || root.chars().any(char::is_control) {
+        bail!("invalid menu name `{root}`: names must be non-empty with no NUL/control characters");
+    }
+    Ok(MenuId::named(root))
+}
+
 async fn ui_attach_request(
     menu: &UiMenuCommand,
     runtime: &muxe_adapter_herdr::HerdrRuntime,
@@ -2908,7 +2922,7 @@ async fn ui_attach_request(
     let workspace = WorkspaceId::new(caller.workspace.as_str());
     let tab = HostTabId::new(caller.tab.as_str());
     Ok(AttachUi {
-        root: MenuId::new(&menu.root),
+        root: validated_wire_menu_root(&menu.root)?,
         pane: pane.clone(),
         pending_launch: Some(token),
         origin: Some(origin),
@@ -3589,6 +3603,10 @@ mod consumer_tests {
 }
 #[cfg(test)]
 mod mixed_recovery_production_tests {
+    fn named(name: &str) -> muxe_core::MenuId {
+        muxe_core::MenuId::named(muxe_core::MenuName::parse(name).expect("fixture menu name"))
+    }
+
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::{
@@ -3859,7 +3877,7 @@ mod mixed_recovery_production_tests {
             Some(adapter.as_ref()),
         )
         .expect("diagnostic configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -3885,7 +3903,7 @@ mod mixed_recovery_production_tests {
             .handle(
                 muxe_protocol::PeerRole::Ui,
                 muxe_protocol::ClientRequest::AttachUi(muxe_protocol::AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: muxe_protocol::HostPaneId::new("muxe-ui"),
                     pending_launch: None,
                     origin: None,

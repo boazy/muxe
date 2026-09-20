@@ -337,6 +337,11 @@ impl MenuSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::menu::MenuName;
+
+    fn expect_name(value: &str) -> MenuName {
+        MenuName::parse(value).expect("valid test menu name")
+    }
 
     fn at(milliseconds: u64) -> SessionInstant {
         SessionInstant(Duration::from_millis(milliseconds))
@@ -344,7 +349,7 @@ mod tests {
 
     #[test]
     fn unknown_key_resets_inactivity_without_navigation() {
-        let root = MenuId::new("main");
+        let root = MenuId::named(expect_name("main"));
         let mut session = MenuSession::new(root.clone(), Some(Duration::from_secs(10)), at(0));
         assert_eq!(
             session.handle(MenuSessionEvent::Key {
@@ -362,12 +367,12 @@ mod tests {
 
     #[test]
     fn return_uses_actual_caller_stack() {
-        let root = MenuId::new("root");
+        let root = MenuId::named(expect_name("root"));
         let mut session = MenuSession::new(root.clone(), None, at(0));
         assert!(matches!(
             session.handle(MenuSessionEvent::OpenSubmenu {
                 at: at(1),
-                menu: MenuId::new("child")
+                menu: MenuId::named(expect_name("child"))
             }),
             Some(MenuSessionOutput::NavigatedTo(_))
         ));
@@ -382,8 +387,11 @@ mod tests {
 
     #[test]
     fn stale_completion_cannot_finish_later_execution() {
-        let mut session =
-            MenuSession::new(MenuId::new("root"), Some(Duration::from_secs(10)), at(0));
+        let mut session = MenuSession::new(
+            MenuId::named(expect_name("root")),
+            Some(Duration::from_secs(10)),
+            at(0),
+        );
         session.handle(MenuSessionEvent::ActionPending {
             at: at(1),
             execution: ExecutionId(2),
@@ -408,7 +416,7 @@ mod tests {
 
     #[test]
     fn detached_acceptance_applies_post_action_while_active() {
-        let mut session = MenuSession::new(MenuId::new("root"), None, at(0));
+        let mut session = MenuSession::new(MenuId::named(expect_name("root")), None, at(0));
         assert_eq!(
             session.handle(MenuSessionEvent::DetachedAccepted {
                 at: at(1),
@@ -421,8 +429,11 @@ mod tests {
 
     #[test]
     fn pending_control_wins_completion_race_and_resets_paused_timer() {
-        let mut session =
-            MenuSession::new(MenuId::new("root"), Some(Duration::from_secs(10)), at(0));
+        let mut session = MenuSession::new(
+            MenuId::named(expect_name("root")),
+            Some(Duration::from_secs(10)),
+            at(0),
+        );
         session.handle(MenuSessionEvent::ActionPending {
             at: at(1),
             execution: ExecutionId(4),

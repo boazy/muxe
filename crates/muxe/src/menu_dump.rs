@@ -1,12 +1,12 @@
 //! Stable JSON rendering for fully compiled menu configuration.
 
-use std::{borrow::Cow, collections::BTreeSet, time::Duration};
+use std::{borrow::Cow, time::Duration};
 
 use muxe_core::{
     ActionScalar, ActionSpec, AfterAction, BindingConditions, CommandAction, CompiledBinding,
     CompiledConfig, CompiledMenu, ConfigValue, ConfigValueKind, CreateCommand, ExecutionMode,
-    IndexOrDirection, KeyboardAction, MenuAction, MenuControlAction, MenuId, MenuTarget,
-    PaneAction, PortableAction, SessionAction, TabAction, TimeoutAction,
+    IndexOrDirection, InlineMenuId, KeyboardAction, MenuAction, MenuControlAction, MenuId,
+    MenuTarget, PaneAction, PortableAction, SessionAction, TabAction, TimeoutAction,
 };
 use serde::{
     Serialize, Serializer,
@@ -51,15 +51,16 @@ pub fn render(
         MenuDumpSelection::Menu(id) => {
             let menu = config
                 .menu(id)
-                .ok_or_else(|| MenuDumpError::UnknownMenu(id.as_str().to_owned()))?;
+                .ok_or_else(|| MenuDumpError::UnknownMenu(id.display().into_owned()))?;
             menu_node(config, menu)?
         }
         MenuDumpSelection::All => {
-            let inline = inline_menu_ids(config);
-            let mut menus = Vec::with_capacity(config.menus.len().saturating_sub(inline.len()));
+            // Typed rule: top-level keys are named menus only, by variant —
+            // never the `@`/`#` string convention.
+            let mut menus = Vec::with_capacity(config.menus.len());
             for menu in &config.menus {
-                if !inline.contains(menu.id.as_str()) {
-                    menus.push((Cow::Borrowed(menu.id.as_str()), menu_node(config, menu)?));
+                if let Some(name) = menu.id.name() {
+                    menus.push((Cow::Borrowed(name.as_str()), menu_node(config, menu)?));
                 }
             }
             JsonNode::Object(menus)
@@ -68,22 +69,11 @@ pub fn render(
     serde_json::to_string_pretty(&node).map_err(MenuDumpError::from)
 }
 
-fn inline_menu_ids(config: &CompiledConfig) -> BTreeSet<&str> {
+fn find_menu<'a>(config: &'a CompiledConfig, id: &InlineMenuId) -> Option<&'a CompiledMenu> {
     config
         .menus
         .iter()
-        .flat_map(|menu| &menu.bindings)
-        .filter_map(|binding| match &binding.action {
-            ActionSpec::Portable(PortableAction::Menu(MenuAction::Open(MenuTarget::Inline(
-                target,
-            )))) => Some(target.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn find_menu<'a>(config: &'a CompiledConfig, id: &str) -> Option<&'a CompiledMenu> {
-    config.menus.iter().find(|menu| menu.id.as_str() == id)
+        .find(|menu| menu.id.inline_id() == Some(id))
 }
 
 fn menu_node<'a>(
@@ -299,11 +289,14 @@ fn push_menu_action_fields<'a>(
 ) -> Result<(), MenuDumpError> {
     match action {
         MenuAction::Open(MenuTarget::Named(target)) => {
-            fields.push(field("menu", string(target)));
+            fields.push(field("menu", string(target.as_str())));
         }
         MenuAction::Open(MenuTarget::Inline(target)) => {
-            let submenu = find_menu(config, target)
-                .ok_or_else(|| MenuDumpError::MissingInlineMenu(target.clone()))?;
+            let submenu = find_menu(config, target).ok_or_else(|| {
+                MenuDumpError::MissingInlineMenu(
+                    MenuId::inline(target.clone()).display().into_owned(),
+                )
+            })?;
             fields.push(field("submenu", menu_node(config, submenu)?));
         }
         MenuAction::Return | MenuAction::Quit | MenuAction::PagePrev | MenuAction::PageNext => {}
@@ -544,7 +537,13 @@ impl Serialize for JsonNode<'_> {
 
 #[cfg(test)]
 mod tests {
-    use muxe_core::{CompiledGeneration, KeyCapabilities, SourceId, compile_yaml};
+    use muxe_core::{
+        CompiledGeneration, KeyCapabilities, MenuId, MenuName, SourceId, compile_yaml,
+    };
+
+    fn named(name: &str) -> MenuId {
+        MenuId::named(MenuName::parse(name).expect("valid test menu name"))
+    }
     use serde_json::Value;
 
     use super::*;
@@ -610,7 +609,7 @@ inject:
     fn single_dump_nests_fully_compiled_inline_menus() {
         let config = compiled();
         let output =
-            render(&config, MenuDumpSelection::Menu(&MenuId::new("main"))).expect("menu renders");
+            render(&config, MenuDumpSelection::Menu(&named("main"))).expect("menu renders");
         let value: Value = serde_json::from_str(&output).expect("valid JSON");
 
         let inline = &value["bindings"]["x"]["action"]["submenu"];
@@ -643,17 +642,23 @@ inject:
         assert_eq!(menus.len(), 2);
         assert!(menus.contains_key("main"));
         assert!(menus.contains_key("named"));
-        assert!(menus.keys().all(|name| !name.contains('@')));
+        // Typed rule: every top-level key resolves to a named menu in the
+        // compiled graph (inline submenus stay nested, keyed by variant);
+        // delimiter characters are legal in user-chosen names.
+        for name in menus.keys() {
+            let parsed = MenuName::parse(name.as_str()).expect("dump key is a valid name");
+            assert!(
+                config.menu(&MenuId::named(parsed)).is_some(),
+                "dump key `{name}` is a named menu"
+            );
+        }
         assert_eq!(menus["named"]["bindings"]["t"]["action"]["focus"], true);
     }
 
     #[test]
     fn single_dump_rejects_an_unknown_menu() {
-        let error = render(
-            &compiled(),
-            MenuDumpSelection::Menu(&MenuId::new("missing")),
-        )
-        .expect_err("unknown menu must fail");
+        let error = render(&compiled(), MenuDumpSelection::Menu(&named("missing")))
+            .expect_err("unknown menu must fail");
         assert!(matches!(error, MenuDumpError::UnknownMenu(name) if name == "missing"));
     }
 }

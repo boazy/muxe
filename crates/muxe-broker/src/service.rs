@@ -2112,7 +2112,7 @@ mod tests {
             &mut resources,
             RequestId([1; 16]),
             ClientRequest::AttachUi(AttachUi {
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 pane: HostPaneId::new("owned-ui-pane"),
                 pending_launch: Some(token),
                 origin: None,
@@ -2214,7 +2214,7 @@ mod tests {
             &mut resources,
             RequestId([3; 16]),
             ClientRequest::AttachUi(AttachUi {
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 pane: HostPaneId::new("owned-ui-pane"),
                 pending_launch: Some(token),
                 origin: None,
@@ -2309,7 +2309,7 @@ mod tests {
             &mut resources,
             RequestId([2; 16]),
             ClientRequest::AttachUi(AttachUi {
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 pane: HostPaneId::new("owned-ui-pane"),
                 pending_launch: Some(token),
                 origin: None,
@@ -3086,7 +3086,7 @@ mod tests {
         .expect("connect over the owned broker socket");
         let attached = client
             .request(ClientRequest::AttachUi(AttachUi {
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 pane: HostPaneId::new("owned-ui-pane"),
                 pending_launch: None,
                 origin: None,
@@ -3386,7 +3386,7 @@ mod tests {
     fn launch_request() -> muxe_protocol::PrepareUiLaunch {
         muxe_protocol::PrepareUiLaunch {
             modal_scope: muxe_protocol::ModalScopeId::new("owned-fake-scope"),
-            root: muxe_protocol::MenuId::new("main"),
+            root: muxe_protocol::MenuId::named("main"),
             lease_millis: 60_000,
         }
     }
@@ -4666,7 +4666,7 @@ menus:
         .expect("connect UI client");
         let attached = ui_client
             .request(ClientRequest::AttachUi(AttachUi {
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 pane: HostPaneId::new("owned-ui-pane"),
                 pending_launch: None,
                 origin: None,
@@ -4683,7 +4683,7 @@ menus:
             .menu
             .menus
             .iter()
-            .find(|m| m.id == muxe_protocol::MenuId::new("main"))
+            .find(|m| m.id == muxe_protocol::MenuId::named("main"))
             .and_then(|m| m.bindings.first())
             .expect("linger binding visible");
         let invoked = ui_client

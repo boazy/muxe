@@ -1542,7 +1542,7 @@ mod tests {
         .expect("ui handshake reaches the gated target");
         let frame = ui
             .request_frame(ClientRequest::AttachUi(muxe_protocol::AttachUi {
-                root: MenuId::new("main"),
+                root: MenuId::named("main"),
                 pane: muxe_protocol::HostPaneId::new("pane-1"),
                 pending_launch: None,
                 origin: None,
@@ -1585,7 +1585,7 @@ mod tests {
         }
         let frame = ui
             .request_frame(ClientRequest::AttachUi(muxe_protocol::AttachUi {
-                root: MenuId::new("main"),
+                root: MenuId::named("main"),
                 pane: muxe_protocol::HostPaneId::new("pane-1"),
                 pending_launch: None,
                 origin: None,

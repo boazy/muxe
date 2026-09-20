@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use muxe_core::{
     AfterAction as CoreAfterAction, BindingConditions, ConditionIr, KeyboardProfile,
-    LocalMenuAction, MenuControl as CoreMenuControl, MenuView, MenuViewMenu, ThemeSection,
-    UiAttachmentView, ViewBindingSettings,
+    LocalMenuAction, MenuControl as CoreMenuControl, MenuId as CoreMenuId, MenuView, MenuViewMenu,
+    ThemeSection, UiAttachmentView, ViewBindingSettings,
 };
 use muxe_protocol::{
     AfterAction, BindingConditionsWire, BindingId, BindingSettingsWire, BindingStateWire,
@@ -23,17 +23,24 @@ pub fn attachment(view: &UiAttachmentView) -> UiAttachmentWire {
     }
 }
 
+fn core_menu_id(value: &CoreMenuId) -> MenuId {
+    match value {
+        CoreMenuId::Named(name) => MenuId::named(name.as_str()),
+        CoreMenuId::Inline(id) => MenuId::inline(id.owner().as_str(), id.ordinal()),
+    }
+}
+
 fn menu_view(view: &MenuView) -> MenuViewWire {
     MenuViewWire {
         generation: view.generation.0,
-        root: MenuId::new(view.root.as_str()),
+        root: core_menu_id(&view.root),
         menus: view.menus.iter().map(menu).collect(),
     }
 }
 
 fn menu(menu: &MenuViewMenu) -> MenuViewMenuWire {
     MenuViewMenuWire {
-        id: MenuId::new(menu.id.as_str()),
+        id: core_menu_id(&menu.id),
         title: menu.title.clone(),
         layout: LayoutSettingsWire {
             padding: LayoutPaddingWire {
@@ -186,7 +193,7 @@ fn condition_to_wire(condition: &ConditionIr) -> ConditionIrWire {
 fn local_action(action: &LocalMenuAction) -> LocalMenuActionWire {
     match action {
         LocalMenuAction::Open { target } => LocalMenuActionWire::Open {
-            target: MenuId::new(target.as_str()),
+            target: core_menu_id(target),
         },
         LocalMenuAction::Control(CoreMenuControl::Quit) => {
             LocalMenuActionWire::Control(MenuControl::Quit)

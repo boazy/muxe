@@ -50,9 +50,9 @@ pub use key::{
 };
 pub use menu::{
     BindingConditions, BindingId, BindingLocation, BindingSettings, BindingView, CompiledBinding,
-    CompiledGeneration, CompiledMenu, LayoutPadding, LayoutSettings, LocalMenuAction, MenuId,
-    MenuView, MenuViewMenu, UiAttachmentView, ViewBindingSettings, ViewBindingState, binding_index,
-    menu_view,
+    CompiledGeneration, CompiledMenu, InlineMenuId, InvalidMenuName, LayoutPadding, LayoutSettings,
+    LocalMenuAction, MenuId, MenuName, MenuView, MenuViewMenu, UiAttachmentView,
+    ViewBindingSettings, ViewBindingState, binding_index, menu_view,
 };
 pub use session::{
     ExecutionId, MenuSession, MenuSessionEvent, MenuSessionInput, MenuSessionOutput,

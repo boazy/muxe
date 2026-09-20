@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use crate::execution::{
 use crate::key::{CanonicalKey, KeyCapabilities, Vt100BindingKey};
 use crate::menu::{
     BindingConditions, BindingId, BindingSettings, CompiledBinding, CompiledGeneration,
-    CompiledMenu, LayoutSettings, MenuId, binding_index,
+    CompiledMenu, InlineMenuId, LayoutSettings, MenuId, MenuName, binding_index,
 };
 use crate::theme::{
     Color, ColorScheme, CompiledTheme, Style, Theme, ThemeSection, default_color_scheme,
@@ -146,6 +146,9 @@ pub(crate) fn compile_effective(
     let menus_value = required_field(&root, "menus")?;
     let mut raw_menus =
         mapping_fields(&menus_value.value, "`menus` must be an ordered mapping")?.to_vec();
+    for menu in &raw_menus {
+        reject_user_authored_inline_markers(&menu.value)?;
+    }
     if raw_menus.is_empty() {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
@@ -153,28 +156,63 @@ pub(crate) fn compile_effective(
             menus_value.value.span.clone(),
         )]);
     }
+    // Validate every top-level menu NAME before inline collection, so a bad name
+    // fails with a diagnostic naming the offending menu and a duplicate named
+    // identity is rejected at compile time rather than first-wins resolution.
+    let mut named_menus: BTreeMap<MenuName, SourceSpan> = BTreeMap::new();
+    for menu in &raw_menus {
+        let name = MenuName::parse_diagnostic(&menu.name, menu.name_span.clone())
+            .map_err(|diagnostic| vec![diagnostic])?;
+        if let Some(first) = named_menus.get(&name) {
+            return Err(vec![
+                ConfigDiagnostic::error(
+                    DiagnosticCode::DuplicateYamlKey,
+                    format!("duplicate menu `{}`", menu.name),
+                    first.clone(),
+                )
+                .with_label(menu.name_span.clone(), "duplicate menu is here"),
+            ]);
+        }
+        named_menus.insert(name, menu.name_span.clone());
+    }
+    // Collect inline submenus with structural identities (owning top-level name +
+    // a single monotonic ordinal across the compilation unit in document order),
+    // never free-form strings, so a user-chosen name such as `main#0` cannot
+    // collide with a synthesized ID.
+    // The marker encodes `owner#ordinal`; identity is read back from the marker.
     let mut inline_counter = 0_u64;
-    let mut inline_menus = Vec::new();
+    let mut inline_menus: Vec<(InlineMenuId, ConfigField, SourceSpan)> = Vec::new();
     for menu in &mut raw_menus {
+        let owner = named_menus
+            .keys()
+            .find(|name| name.as_str() == menu.name)
+            .cloned()
+            .expect("named menus are validated above");
         collect_inline_menus(
             &mut menu.value,
-            &menu.name,
+            &owner,
             &mut inline_counter,
             &mut inline_menus,
         );
     }
-    raw_menus.extend(inline_menus);
-    let known_menus = raw_menus
-        .iter()
-        .map(|field| field.name.clone())
-        .collect::<BTreeSet<_>>();
-
+    let mut inline_identities: BTreeMap<String, (InlineMenuId, SourceSpan)> = BTreeMap::new();
+    for (id, _, name_span) in &inline_menus {
+        inline_identities.insert(inline_marker(id), (id.clone(), name_span.clone()));
+    }
+    for (_, field, _) in inline_menus {
+        raw_menus.push(field);
+    }
+    let known_menus: BTreeMap<String, MenuName> = named_menus
+        .keys()
+        .map(|name| (name.as_str().to_owned(), name.clone()))
+        .collect();
     let mut compiler = MenuCompiler {
         generation,
         keyboard: &keyboard,
         global_settings,
         global_layout,
         known_menus: &known_menus,
+        inline_identities: &inline_identities,
         action_validator,
         next_binding: 0,
         diagnostics: Vec::new(),
@@ -189,7 +227,7 @@ pub(crate) fn compile_effective(
         return Err(compiler.diagnostics);
     }
     validate_native_actions(&mut menus, action_validator)?;
-    validate_menu_cycles(&menus)?;
+    validate_menu_cycles(&menus, &named_menus, &inline_identities)?;
     let bindings = binding_index(&menus);
     Ok(CompiledConfig {
         generation,
@@ -817,7 +855,8 @@ struct MenuCompiler<'a> {
     keyboard: &'a KeyboardProfile,
     global_settings: EffectiveSettings,
     global_layout: LayoutSettings,
-    known_menus: &'a BTreeSet<String>,
+    known_menus: &'a BTreeMap<String, MenuName>,
+    inline_identities: &'a BTreeMap<String, (InlineMenuId, SourceSpan)>,
     action_validator: Option<&'a dyn ActionValidator>,
     next_binding: u64,
     diagnostics: Vec<ConfigDiagnostic>,
@@ -935,8 +974,30 @@ impl MenuCompiler<'_> {
             }
         }
         let _ = mapping;
+        // Resolve the compiled identity by variant: a marker-carrying field is an
+        // inline submenu (structural parent + ordinal); anything else is a named
+        // menu validated against the named domain.
+        let id = match field
+            .value
+            .field("_muxe_inline_id")
+            .and_then(|marker| marker.value.as_str())
+            .and_then(|marker| self.inline_identities.get(marker))
+        {
+            Some((inline, _)) => MenuId::inline(inline.clone()),
+            None => match MenuName::parse(field.name.as_str()) {
+                Ok(name) => MenuId::named(name),
+                Err(error) => {
+                    self.diagnostics.push(ConfigDiagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        format!("invalid menu name `{}` ({})", field.name, error.reason),
+                        field.name_span.clone(),
+                    ));
+                    return None;
+                }
+            },
+        };
         Some(CompiledMenu {
-            id: MenuId::new(field.name.clone()),
+            id,
             title,
             tags,
             inactivity_timeout: settings.timeout,
@@ -1088,20 +1149,34 @@ impl MenuCompiler<'_> {
         let action = match parsed {
             ParsedPortableAction::MenuOpen { menu, submenu } => {
                 let target = if let Some((target, target_span)) = menu {
-                    if !self.known_menus.contains(&target) {
+                    if !self.known_menus.contains_key(&target) {
                         return Err(vec![ConfigDiagnostic::error(
                             DiagnosticCode::InvalidMenuReference,
                             format!("unknown menu `{target}`"),
                             target_span,
                         )]);
                     }
-                    MenuTarget::Named(target)
+                    let name = MenuName::parse(target.as_str()).map_err(|error| {
+                        vec![ConfigDiagnostic::error(
+                            DiagnosticCode::InvalidValue,
+                            format!("invalid menu name `{target}` ({})", error.reason),
+                            target_span,
+                        )]
+                    })?;
+                    MenuTarget::Named(name)
                 } else {
                     let submenu = submenu.expect("schema requires menu or submenu");
                     let inline_id = required_field(&submenu, "_muxe_inline_id")?;
-                    let target =
-                        expect_string(&inline_id.value, "invalid compiler inline menu ID")?
-                            .to_owned();
+                    let marker =
+                        expect_string(&inline_id.value, "invalid compiler inline menu ID")?;
+                    let (target, _) =
+                        self.inline_identities.get(marker).cloned().ok_or_else(|| {
+                            vec![ConfigDiagnostic::error(
+                                DiagnosticCode::InvalidValue,
+                                "invalid compiler inline menu ID",
+                                inline_id.value.span.clone(),
+                            )]
+                        })?;
                     MenuTarget::Inline(target)
                 };
                 PortableAction::Menu(MenuAction::Open(target))
@@ -2269,11 +2344,56 @@ fn merge_defaults(target: &mut ConfigValue, defaults: &ConfigValue) {
     }
 }
 
+/// Canonical marker encoding for a structural inline identity, shared by the
+/// marker value, the `inline_identities` map key, and the synthesized field
+/// name so the three cannot drift apart.
+fn inline_marker(id: &InlineMenuId) -> String {
+    format!("{}#{}", id.owner().as_str(), id.ordinal())
+}
+
+fn reject_user_authored_inline_markers(value: &ConfigValue) -> Result<(), Vec<ConfigDiagnostic>> {
+    fn visit(value: &ConfigValue, diagnostics: &mut Vec<ConfigDiagnostic>) {
+        match &value.kind {
+            ConfigValueKind::Mapping(fields) => {
+                for field in fields {
+                    if field.name == "_muxe_inline_id" {
+                        diagnostics.push(
+                            ConfigDiagnostic::error(
+                                DiagnosticCode::UnknownField,
+                                "`_muxe_inline_id` is reserved for compiler-generated inline menu identities",
+                                field.name_span.clone(),
+                            )
+                            .with_help(
+                                "this compiler-generated field cannot be authored in configuration",
+                            ),
+                        );
+                    }
+                    visit(&field.value, diagnostics);
+                }
+            }
+            ConfigValueKind::Sequence(values) => {
+                for value in values {
+                    visit(value, diagnostics);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    visit(value, &mut diagnostics);
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(diagnostics)
+    }
+}
+
 fn collect_inline_menus(
     menu: &mut ConfigValue,
-    parent: &str,
+    owner: &MenuName,
     next: &mut u64,
-    output: &mut Vec<ConfigField>,
+    output: &mut Vec<(InlineMenuId, ConfigField, SourceSpan)>,
 ) {
     let mut discovered = Vec::new();
     if let Some(bindings) = menu
@@ -2290,54 +2410,95 @@ fn collect_inline_menus(
             if submenu.value.as_mapping().is_none() {
                 continue;
             }
-            let id = format!("{parent}@{}", *next);
+            let id = InlineMenuId::new(owner.clone(), *next);
             *next += 1;
             let marker = ConfigField {
                 name: "_muxe_inline_id".to_owned(),
                 name_span: submenu.value.span.clone(),
-                value: ConfigValue::string(id.clone()),
+                value: ConfigValue::string(inline_marker(&id)),
             };
             submenu
                 .value
                 .as_mapping_mut()
                 .expect("checked")
                 .push(marker);
+            let name_span = submenu.name_span.clone();
             let mut inline = ConfigField {
-                name: id,
-                name_span: submenu.name_span.clone(),
+                name: inline_marker(&id),
+                name_span: name_span.clone(),
                 value: submenu.value.clone(),
             };
-            collect_inline_menus(&mut inline.value, &inline.name, next, output);
-            discovered.push(inline);
+            // Nested submenus keep the top-level owner: ordinals come from the
+            // same monotonic sequence across the compilation unit, so no nested
+            // ID can collide.
+            collect_inline_menus(&mut inline.value, owner, next, output);
+            discovered.push((id, inline, name_span));
         }
     }
     output.extend(discovered);
 }
 
-fn validate_menu_cycles(menus: &[CompiledMenu]) -> Result<(), Vec<ConfigDiagnostic>> {
-    let graph = menus
-        .iter()
-        .map(|menu| {
-            let edges = menu
-                .bindings
-                .iter()
-                .filter_map(|binding| match &binding.action {
-                    ActionSpec::Portable(PortableAction::Menu(MenuAction::Open(
-                        MenuTarget::Named(target) | MenuTarget::Inline(target),
-                    ))) => Some((target.clone(), binding.action_span.clone())),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            (menu.id.as_str().to_owned(), edges)
-        })
-        .collect::<BTreeMap<_, _>>();
+fn validate_menu_cycles(
+    menus: &[CompiledMenu],
+    named_menus: &BTreeMap<MenuName, SourceSpan>,
+    inline_identities: &BTreeMap<String, (InlineMenuId, SourceSpan)>,
+) -> Result<(), Vec<ConfigDiagnostic>> {
+    // The cycle walk is keyed by the typed identity: duplicate compiled IDs
+    // cannot silently overwrite one another, and a named `main@0` never shares
+    // a key with the inline submenu of `main`. Name spans are threaded from the
+    // config fields so the duplicate diagnostic points at the menu definition.
+    let mut name_spans: BTreeMap<MenuId, SourceSpan> = BTreeMap::new();
+    for menu in menus {
+        name_spans.entry(menu.id.clone()).or_insert_with(|| {
+            menu.bindings
+                .first()
+                .map_or_else(fallback_span, |binding| binding.action_span.clone())
+        });
+    }
+    // Prefer config-field name spans where recoverable: named menus keep the
+    // span recorded at phase 1; inline menus keep the submenu name span.
+    for (name, span) in named_menus {
+        name_spans.insert(MenuId::named(name.clone()), span.clone());
+    }
+    for (id, span) in inline_identities.values() {
+        name_spans.insert(MenuId::inline(id.clone()), span.clone());
+    }
+    let mut graph: BTreeMap<MenuId, Vec<(MenuId, SourceSpan)>> = BTreeMap::new();
+    for menu in menus {
+        if graph.contains_key(&menu.id) {
+            let span = name_spans.get(&menu.id).cloned().unwrap_or_else(|| {
+                menu.bindings
+                    .first()
+                    .map_or_else(fallback_span, |binding| binding.action_span.clone())
+            });
+            return Err(vec![ConfigDiagnostic::error(
+                DiagnosticCode::DuplicateYamlKey,
+                format!("duplicate menu `{}`", menu.id.display()),
+                span,
+            )]);
+        }
+        let edges = menu
+            .bindings
+            .iter()
+            .filter_map(|binding| match &binding.action {
+                ActionSpec::Portable(PortableAction::Menu(MenuAction::Open(
+                    MenuTarget::Named(target),
+                ))) => Some((MenuId::named(target.clone()), binding.action_span.clone())),
+                ActionSpec::Portable(PortableAction::Menu(MenuAction::Open(
+                    MenuTarget::Inline(target),
+                ))) => Some((MenuId::inline(target.clone()), binding.action_span.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        graph.insert(menu.id.clone(), edges);
+    }
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
     for node in graph.keys() {
         if let Some(span) = detect_cycle(node, &graph, &mut visiting, &mut visited) {
             return Err(vec![ConfigDiagnostic::error(
                 DiagnosticCode::MenuCycle,
-                format!("menu reference cycle includes `{node}`"),
+                format!("menu reference cycle includes `{}`", node.display()),
                 span,
             )]);
         }
@@ -2345,16 +2506,20 @@ fn validate_menu_cycles(menus: &[CompiledMenu]) -> Result<(), Vec<ConfigDiagnost
     Ok(())
 }
 
+fn fallback_span() -> SourceSpan {
+    SourceSpan::new(SourceId::new("<muxe built-in>"), 0, 0)
+}
+
 fn detect_cycle(
-    node: &str,
-    graph: &BTreeMap<String, Vec<(String, SourceSpan)>>,
-    visiting: &mut HashSet<String>,
-    visited: &mut HashSet<String>,
+    node: &MenuId,
+    graph: &BTreeMap<MenuId, Vec<(MenuId, SourceSpan)>>,
+    visiting: &mut HashSet<MenuId>,
+    visited: &mut HashSet<MenuId>,
 ) -> Option<SourceSpan> {
     if visited.contains(node) {
         return None;
     }
-    visiting.insert(node.to_owned());
+    visiting.insert(node.clone());
     let cycle = graph.get(node).and_then(|edges| {
         edges.iter().find_map(|(edge, span)| {
             if visiting.contains(edge) {
@@ -2365,7 +2530,7 @@ fn detect_cycle(
         })
     });
     visiting.remove(node);
-    visited.insert(node.to_owned());
+    visited.insert(node.clone());
     cycle
 }
 

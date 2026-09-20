@@ -132,9 +132,9 @@ fn checked_benchmark_frame() -> muxe_protocol::ArchivedFrame {
     let attachment = UiAttachmentWire {
         menu: MenuViewWire {
             generation: 7,
-            root: MenuId::new("root"),
+            root: MenuId::named("root"),
             menus: vec![MenuViewMenuWire {
-                id: MenuId::new("root"),
+                id: MenuId::named("root"),
                 title: Some("Benchmark menu".into()),
                 layout: LayoutSettingsWire {
                     padding: LayoutPaddingWire {

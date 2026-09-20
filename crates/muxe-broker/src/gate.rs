@@ -510,7 +510,7 @@ mod tests {
             .prepare(
                 &mut tokens,
                 ModalScopeId::new(id("scope")),
-                MenuId::new(id("root")),
+                MenuId::named(id("root")),
                 now,
                 std::time::Duration::from_secs(1),
             )
@@ -560,7 +560,7 @@ mod tests {
             .prepare(
                 &mut tokens,
                 ModalScopeId::new(id("scope")),
-                MenuId::new(id("root")),
+                MenuId::named(id("root")),
                 now,
                 std::time::Duration::from_secs(1),
             )
@@ -610,7 +610,7 @@ mod tests {
             .prepare(
                 &mut tokens,
                 ModalScopeId::new(id("scope")),
-                MenuId::new(id("root")),
+                MenuId::named(id("root")),
                 now,
                 std::time::Duration::from_secs(1),
             )
@@ -648,7 +648,7 @@ mod tests {
             .prepare(
                 &mut tokens,
                 ModalScopeId::new(id("one")),
-                MenuId::new(id("root")),
+                MenuId::named(id("root")),
                 now,
                 std::time::Duration::from_millis(1),
             )
@@ -656,7 +656,7 @@ mod tests {
         gate.prepare(
             &mut tokens,
             ModalScopeId::new(id("two")),
-            MenuId::new(id("root")),
+            MenuId::named(id("root")),
             now,
             std::time::Duration::from_secs(1),
         )

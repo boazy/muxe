@@ -320,6 +320,30 @@ const DRAIN_CLEANUP_DEADLINE: Duration = Duration::from_millis(200);
 /// fast path, this tick bounds the staleness of the empty check.
 const DRAIN_CLEANUP_POLL: Duration = Duration::from_millis(10);
 
+fn wire_menu_id_to_core(value: &muxe_protocol::MenuId) -> Option<muxe_core::MenuId> {
+    match value {
+        muxe_protocol::MenuId::Named(name) => muxe_core::MenuName::parse(name.as_str())
+            .ok()
+            .map(muxe_core::MenuId::named),
+        muxe_protocol::MenuId::Inline { parent, ordinal } => {
+            muxe_core::MenuName::parse(parent.as_str())
+                .ok()
+                .map(|owner| {
+                    muxe_core::MenuId::inline(muxe_core::InlineMenuId::new(owner, *ordinal))
+                })
+        }
+    }
+}
+
+fn core_menu_id_to_wire(value: &muxe_core::MenuId) -> muxe_protocol::MenuId {
+    match value {
+        muxe_core::MenuId::Named(name) => muxe_protocol::MenuId::named(name.as_str()),
+        muxe_core::MenuId::Inline(id) => {
+            muxe_protocol::MenuId::inline(id.owner().as_str(), id.ordinal())
+        }
+    }
+}
+
 struct SessionRecord {
     config: Arc<CompiledConfig>,
     root: muxe_core::MenuId,
@@ -1706,10 +1730,8 @@ impl Broker {
         request: muxe_protocol::PrepareUiLaunch,
     ) -> Result<RequestResult, BrokerError> {
         let config = self.config.snapshot().await.config;
-        if config
-            .menu(&muxe_core::MenuId::new(request.root.as_str()))
-            .is_none()
-        {
+        let root = wire_menu_id_to_core(&request.root).filter(|root| config.menu(root).is_some());
+        if root.is_none() {
             return Err(BrokerError::UnknownMenu(request.root));
         }
         let (pending, replaced, replaced_pending, replaced_session) = {
@@ -1851,10 +1873,7 @@ impl Broker {
             .map_err(BrokerError::from)?;
         let wire_scope = ModalScopeId::new(scope.as_str());
         let config = self.config.snapshot().await.config;
-        if config
-            .menu(&muxe_core::MenuId::new(request.root.as_str()))
-            .is_none()
-        {
+        if wire_menu_id_to_core(&request.root).is_none_or(|root| config.menu(&root).is_none()) {
             return Err(BrokerError::UnknownMenu(request.root));
         }
 
@@ -1951,9 +1970,11 @@ impl Broker {
         }
 
         let (readiness, receiver) = watch::channel(SessionReadiness::Pending);
+        let core_root = wire_menu_id_to_core(&request.root)
+            .ok_or_else(|| BrokerError::UnknownMenu(request.root.clone()))?;
         let record = SessionRecord {
             config: Arc::clone(&config),
-            root: muxe_core::MenuId::new(request.root.as_str()),
+            root: core_root,
             scope,
             origin,
             ui_pane: pane,
@@ -2270,9 +2291,10 @@ impl Broker {
         let record = sessions
             .get(session)
             .ok_or_else(|| BrokerError::UnknownSession(session.clone()))?;
-        let view = record.config.attachment_view(&record.root).ok_or_else(|| {
-            BrokerError::UnknownMenu(muxe_protocol::MenuId::new(record.root.as_str()))
-        })?;
+        let view = record
+            .config
+            .attachment_view(&record.root)
+            .ok_or_else(|| BrokerError::UnknownMenu(core_menu_id_to_wire(&record.root)))?;
         Ok(BrokerResponse::UiAttached {
             session: session.clone(),
             snapshot: wire::attachment(&view),
@@ -3815,6 +3837,10 @@ mod tests {
 
     use super::*;
 
+    fn named(name: &str) -> muxe_core::MenuId {
+        muxe_core::MenuId::named(muxe_core::MenuName::parse(name).expect("fixture menu name"))
+    }
+
     struct CountingAdapter {
         portable_dispatches: AtomicUsize,
         cancellable: AtomicBool,
@@ -3892,7 +3918,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("detached adapter configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -3911,7 +3937,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("muxe-pane"),
                     pending_launch: None,
                     origin: None,
@@ -4404,7 +4430,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("test configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -4421,7 +4447,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("muxe-pane"),
                     pending_launch: None,
                     origin: None,
@@ -4503,7 +4529,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("test configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -4590,7 +4616,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("test configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -4729,7 +4755,7 @@ menus:
                 Some(adapter.as_ref()),
             )
             .expect("deadline configuration compiles");
-            let root = muxe_core::MenuId::new("main");
+            let root = named("main");
             let binding = config
                 .attachment_view(&root)
                 .and_then(|view| {
@@ -4863,7 +4889,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("full-queue timeout configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -4880,7 +4906,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("full-queue"),
                     pending_launch: None,
                     origin: None,
@@ -5024,7 +5050,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("full-queue-second"),
                     pending_launch: None,
                     origin: None,
@@ -5143,7 +5169,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("isolation configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -5171,7 +5197,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("slow-ui"),
                     pending_launch: None,
                     origin: None,
@@ -5205,7 +5231,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("fast-ui"),
                     pending_launch: None,
                     origin: None,
@@ -5325,7 +5351,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("teardown configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -5342,7 +5368,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("slow-teardown"),
                     pending_launch: None,
                     origin: None,
@@ -5488,7 +5514,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("slow-generic"),
                     pending_launch: None,
                     origin: None,
@@ -5702,7 +5728,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("config compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -5826,7 +5852,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("creation configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -5843,7 +5869,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("muxe-pane"),
                     pending_launch: None,
                     origin: None,
@@ -5915,7 +5941,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("deferred configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -6023,7 +6049,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("test configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -6038,7 +6064,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("muxe-pane"),
                     pending_launch: None,
                     origin: None,
@@ -6119,7 +6145,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("muxe-pane"),
                     pending_launch: None,
                     origin: None,
@@ -6159,7 +6185,7 @@ menus:
         let pending = broker
             .prepare(muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new(pane),
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 lease_millis: 60_000,
             })
             .await
@@ -6178,19 +6204,62 @@ menus:
         token
     }
 
+    #[test]
+    fn whitespace_compiled_view_passes_wire_validation_and_round_trips() {
+        use muxe_core::{CompiledGeneration, Compiler, SourceId, ThemeAssets};
+        let base = muxe_core::ConfigDocument::parse(
+            SourceId::new("whitespace.yml"),
+            "version: 1\nmenus:\n  \"my menu\":\n    bindings:\n      x:\n        label: tools\n        action:\n          type: menu:open\n          submenu:\n            bindings:\n              q:\n                label: quit\n                action: menu:quit\n",
+        )
+        .expect("whitespace config parses");
+        let config = Compiler
+            .compile(
+                muxe_core::CompileInput {
+                    generation: CompiledGeneration(9),
+                    base,
+                    host_override: None,
+                    key_capabilities: KeyCapabilities::default(),
+                    theme_assets: ThemeAssets::default(),
+                },
+                None,
+            )
+            .expect("quoted whitespace menu name compiles");
+        let root = named("my menu");
+        let view = config.attachment_view(&root).expect("whitespace root view");
+        assert_eq!(view.menu.root, root);
+        // Core -> wire preserves the variant; the owned view validates
+        // (whitespace names are in the wire domain, matching core).
+        let wire_view = wire::attachment(&view);
+        muxe_protocol::Validate::validate(&wire_view)
+            .expect("compiled whitespace view passes wire validation");
+        // Wire -> core round-trips both identities losslessly by variant.
+        let back_root = wire_menu_id_to_core(&wire_view.menu.root).expect("root converts back");
+        assert_eq!(back_root, root);
+        let inline = view
+            .menu
+            .menus
+            .iter()
+            .find_map(|menu| menu.id.inline_id().cloned())
+            .expect("compiled inline submenu");
+        let wire_inline = core_menu_id_to_wire(&muxe_core::MenuId::inline(inline.clone()));
+        let back_inline = wire_menu_id_to_core(&wire_inline).expect("inline converts back");
+        assert_eq!(back_inline, muxe_core::MenuId::inline(inline));
+        assert_ne!(back_inline, named("my menu#0"));
+    }
+
     #[tokio::test]
     async fn prepare_rejects_unknown_menu_before_launching_a_pane() {
         let (_adapter, broker, _binding, _directory) = scoped_two_client_fixture();
         let result = broker
             .prepare(muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new("unknown-root"),
-                root: muxe_protocol::MenuId::new("missing"),
+                root: muxe_protocol::MenuId::named("missing"),
                 lease_millis: 60_000,
             })
             .await;
         assert!(matches!(
             result,
-            Err(BrokerError::UnknownMenu(menu)) if menu.as_str() == "missing"
+            Err(BrokerError::UnknownMenu(menu)) if menu.display() == "missing"
         ));
     }
 
@@ -6221,7 +6290,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("commit-first"),
                     pending_launch: Some(token),
                     origin: None,
@@ -6251,7 +6320,7 @@ menus:
         let pending = broker
             .prepare(muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new("attach-first"),
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 lease_millis: 60_000,
             })
             .await
@@ -6269,7 +6338,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("attach-first"),
                         pending_launch: Some(token),
                         origin: None,
@@ -6344,7 +6413,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("commit-race"),
                         pending_launch: Some(token),
                         origin: None,
@@ -6399,7 +6468,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("commit-disconnect"),
                         pending_launch: Some(token),
                         origin: None,
@@ -6486,7 +6555,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("pending-disconnect"),
                         pending_launch: Some(token),
                         origin: None,
@@ -6550,7 +6619,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("capture-race"),
                         pending_launch: None,
                         origin: None,
@@ -6600,7 +6669,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("seal-race"),
                         pending_launch: Some(token),
                         origin: None,
@@ -6634,7 +6703,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("none-replace"),
                         pending_launch: None,
                         origin: None,
@@ -6650,7 +6719,7 @@ menus:
         let replacement = broker
             .prepare(muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new("none-replace"),
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 lease_millis: 60_000,
             })
             .await
@@ -6683,7 +6752,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("abort-blocked"),
                         pending_launch: Some(token),
                         origin: None,
@@ -6721,7 +6790,7 @@ menus:
         let pending = broker
             .prepare(muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new("expire-blocked"),
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 lease_millis: 1,
             })
             .await
@@ -6745,7 +6814,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("expire-blocked"),
                         pending_launch: Some(token),
                         origin: None,
@@ -6791,7 +6860,7 @@ menus:
                 .handle(
                     PeerRole::Ui,
                     ClientRequest::AttachUi(AttachUi {
-                        root: muxe_protocol::MenuId::new("main"),
+                        root: muxe_protocol::MenuId::named("main"),
                         pane: HostPaneId::new("replace-blocked"),
                         pending_launch: Some(old),
                         origin: None,
@@ -6807,7 +6876,7 @@ menus:
         let replacement = broker
             .prepare(muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new("replace-blocked"),
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 lease_millis: 60_000,
             })
             .await
@@ -6852,7 +6921,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("origin-fails"),
                     pending_launch: Some(token),
                     origin: None,
@@ -6932,7 +7001,7 @@ menus:
         let pending = broker
             .prepare(muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new("expire-real"),
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 lease_millis: 1,
             })
             .await
@@ -7288,7 +7357,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("cancel-detach"),
                     pending_launch: Some(token),
                     origin: None,
@@ -7445,7 +7514,7 @@ menus:
         let pending = broker
             .prepare(muxe_protocol::PrepareUiLaunch {
                 modal_scope: muxe_protocol::ModalScopeId::new("client-c"),
-                root: muxe_protocol::MenuId::new("main"),
+                root: muxe_protocol::MenuId::named("main"),
                 lease_millis: 60_000,
             })
             .await
@@ -7458,7 +7527,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new("client-c"),
                     pending_launch: Some(token),
                     origin: None,
@@ -7529,7 +7598,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("test configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {
@@ -7590,7 +7659,7 @@ menus:
             .handle(
                 PeerRole::Ui,
                 ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     pane: HostPaneId::new(pane),
                     pending_launch: None,
                     origin: None,
@@ -7797,7 +7866,7 @@ menus:
             broker
                 .prepare(muxe_protocol::PrepareUiLaunch {
                     modal_scope: muxe_protocol::ModalScopeId::new("client-a"),
-                    root: muxe_protocol::MenuId::new("main"),
+                    root: muxe_protocol::MenuId::named("main"),
                     lease_millis: 60_000,
                 })
                 .await
@@ -8011,7 +8080,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("generic drain configuration compiles");
-        let root = muxe_core::MenuId::new("main");
+        let root = named("main");
         let binding = config
             .attachment_view(&root)
             .and_then(|view| {

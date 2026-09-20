@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use muxe_core::{
-    AfterAction, CanonicalKey, EventKind, ExecutionId as CoreExecutionId, KeyCapabilities,
-    KeyboardProfile, MenuControl as CoreMenuControl, MenuId as CoreMenuId, MenuSession,
-    MenuSessionEvent, MenuSessionInput, MenuSessionOutput, MenuSessionState, SessionInstant,
+    AfterAction, CanonicalKey, EventKind, ExecutionId as CoreExecutionId, InlineMenuId,
+    KeyCapabilities, KeyboardProfile, MenuControl as CoreMenuControl, MenuId as CoreMenuId,
+    MenuName, MenuSession, MenuSessionEvent, MenuSessionInput, MenuSessionOutput, MenuSessionState,
+    SessionInstant,
 };
 use muxe_protocol::{
-    ArchivedKeyboardProfileWire, ArchivedLocalMenuActionWire, ArchivedMenuControl,
+    ArchivedKeyboardProfileWire, ArchivedLocalMenuActionWire, ArchivedMenuControl, ArchivedMenuId,
     ArchivedMenuViewMenuWire, BindingAvailability, BindingId, BrokerEvent,
     ConditionEvaluationErrorWire, ExecutionId as WireExecutionId, ExecutionOutcome, MenuControl,
     PagesContextWire, ProtocolDiagnostic, evaluate_archived_binding_state,
@@ -99,6 +100,38 @@ pub enum UiError {
     MissingBinding { generation: u64, ordinal: u64 },
     #[error("UI-local execution sequence overflowed")]
     ExecutionSequenceExhausted,
+    #[error("attachment carries a menu identity outside the validated domain")]
+    InvalidMenuIdentity,
+}
+
+/// Converts an archived wire menu identity into its core identity, preserving
+/// the variant. Returns `None` when the name falls outside the validated
+/// domain (empty/NUL/control) — the archived validator rejects those first.
+fn archived_to_core_menu_id(value: &ArchivedMenuId) -> Option<CoreMenuId> {
+    match value {
+        ArchivedMenuId::Named(name) => MenuName::parse(name.as_str()).ok().map(CoreMenuId::named),
+        ArchivedMenuId::Inline { parent, ordinal } => MenuName::parse(parent.as_str())
+            .ok()
+            .map(|owner| CoreMenuId::inline(InlineMenuId::new(owner, ordinal.to_native()))),
+    }
+}
+
+/// Reports whether an archived menu entry addresses the given core identity.
+///
+/// Compares structurally variant-by-variant without re-parsing (reparsing the
+/// `owner#ordinal` display form would yield a `Named` identity for an inline
+/// submenu and silently lose the variant).
+fn archived_targets_core(archived: &ArchivedMenuId, core: &CoreMenuId) -> bool {
+    match (archived, core) {
+        (ArchivedMenuId::Named(name), CoreMenuId::Named(expected)) => {
+            name.as_str() == expected.as_str()
+        }
+        (ArchivedMenuId::Inline { parent, ordinal }, CoreMenuId::Inline(expected)) => {
+            parent.as_str() == expected.owner().as_str()
+                && ordinal.to_native() == expected.ordinal()
+        }
+        _ => false,
+    }
 }
 
 /// Closed status levels for the UI status line, in documented precedence order:
@@ -281,13 +314,14 @@ impl UiRuntime {
         let keyboard_profile = snapshot.with_attachment(keyboard_profile_from_attachment)?;
         let (root, timeout) = snapshot.with_attachment(|attachment| {
             (
-                CoreMenuId::new(attachment.menu.root.0.as_str()),
+                archived_to_core_menu_id(&attachment.menu.root),
                 attachment
                     .inactivity_timeout_millis
                     .as_ref()
                     .map(|timeout| Duration::from_millis(timeout.to_native())),
             )
         })?;
+        let root = root.ok_or(UiError::InvalidMenuIdentity)?;
         snapshot.with_attachment(validate_binding_keys)??;
         Ok(Self {
             snapshot,
@@ -366,10 +400,9 @@ impl UiRuntime {
                 Ok(self.menu_output(output.as_ref()))
             }
             Selection::Open(target) if active => {
-                let output = self.menu_session.handle(MenuSessionEvent::OpenSubmenu {
-                    at,
-                    menu: CoreMenuId::new(target),
-                });
+                let output = self
+                    .menu_session
+                    .handle(MenuSessionEvent::OpenSubmenu { at, menu: target });
                 Ok(self.menu_output(output.as_ref()))
             }
             Selection::Control(control) => {
@@ -427,7 +460,7 @@ impl UiRuntime {
                 .menu
                 .menus
                 .iter()
-                .find(|menu| menu.id.0.as_str() == current_menu.as_str())
+                .find(|menu| archived_targets_core(&menu.id, &current_menu))
                 .ok_or(UiError::MissingRoot)?;
             select_binding(
                 menu,
@@ -768,7 +801,7 @@ impl UiRuntime {
                 .menu
                 .menus
                 .iter()
-                .find(|menu| menu.id.0.as_str() == current_menu.as_str())
+                .find(|menu| archived_targets_core(&menu.id, &current_menu))
                 .ok_or(UiError::MissingRoot)?;
             let padding = SurfacePadding {
                 left: menu.layout.padding.left.to_native(),
@@ -1082,7 +1115,7 @@ fn render_breadcrumbs_or_fallback(
                 .menu
                 .menus
                 .iter()
-                .find(|menu| menu.id.0.as_str() == id.as_str())
+                .find(|menu| archived_targets_core(&menu.id, id))
         })
         .filter_map(|menu| {
             menu.title
@@ -1165,7 +1198,7 @@ fn pager_keys(menu: &ArchivedMenuViewMenuWire, previous: bool) -> Vec<&str> {
 enum Selection {
     Ignored,
     Unavailable(String),
-    Open(String),
+    Open(CoreMenuId),
     Control(MenuControl),
     PagePrevious,
     PageNext,
@@ -1243,9 +1276,9 @@ fn select_binding(
             ));
         }
         return Ok(match binding.local_menu_action.as_ref() {
-            Some(ArchivedLocalMenuActionWire::Open { target }) => {
-                Selection::Open(target.0.as_str().to_owned())
-            }
+            Some(ArchivedLocalMenuActionWire::Open { target }) => Selection::Open(
+                archived_to_core_menu_id(target).ok_or(UiError::InvalidMenuIdentity)?,
+            ),
             Some(ArchivedLocalMenuActionWire::Control(ArchivedMenuControl::Quit)) => {
                 Selection::Control(MenuControl::Quit)
             }
@@ -1412,10 +1445,10 @@ pub(crate) mod tests {
         let attachment = UiAttachmentWire {
             menu: MenuViewWire {
                 generation: 7,
-                root: MenuId::new("root"),
+                root: MenuId::named("root"),
                 menus: vec![
                     MenuViewMenuWire {
-                        id: MenuId::new("root"),
+                        id: MenuId::named("root"),
                         title: Some("Root".into()),
                         layout: layout(),
                         bindings: vec![
@@ -1426,7 +1459,7 @@ pub(crate) mod tests {
                                 "Next",
                                 BindingConditionsWire::default(),
                                 Some(muxe_protocol::LocalMenuActionWire::Open {
-                                    target: MenuId::new("child"),
+                                    target: MenuId::named("child"),
                                 }),
                             ),
                             binding(
@@ -1442,7 +1475,7 @@ pub(crate) mod tests {
                         ],
                     },
                     MenuViewMenuWire {
-                        id: MenuId::new("child"),
+                        id: MenuId::named("child"),
                         title: Some("Child".into()),
                         layout: layout(),
                         bindings: vec![binding(
@@ -1522,9 +1555,9 @@ pub(crate) mod tests {
         archive_attachment(UiAttachmentWire {
             menu: MenuViewWire {
                 generation: 7,
-                root: MenuId::new("root"),
+                root: MenuId::named("root"),
                 menus: vec![MenuViewMenuWire {
-                    id: MenuId::new("root"),
+                    id: MenuId::named("root"),
                     title: Some("Root".into()),
                     layout: layout(),
                     bindings,
@@ -1572,9 +1605,9 @@ pub(crate) mod tests {
         archive_attachment(UiAttachmentWire {
             menu: MenuViewWire {
                 generation: 7,
-                root: MenuId::new("root"),
+                root: MenuId::named("root"),
                 menus: vec![MenuViewMenuWire {
-                    id: MenuId::new("root"),
+                    id: MenuId::named("root"),
                     title: Some("Root".into()),
                     layout: layout(),
                     bindings,
@@ -2623,6 +2656,85 @@ pub(crate) mod tests {
                 .status
                 .is_none(),
             "the documented input transition clears the error"
+        );
+    }
+
+    #[test]
+    fn inline_submenu_navigation_uses_typed_identity_and_returns() {
+        let attachment = UiAttachmentWire {
+            menu: MenuViewWire {
+                generation: 7,
+                root: MenuId::named("root"),
+                menus: vec![
+                    MenuViewMenuWire {
+                        id: MenuId::named("root"),
+                        title: Some("Root".into()),
+                        layout: layout(),
+                        bindings: vec![binding(
+                            1,
+                            "n",
+                            "Next",
+                            BindingConditionsWire::default(),
+                            Some(muxe_protocol::LocalMenuActionWire::Open {
+                                target: MenuId::inline("root", 0),
+                            }),
+                        )],
+                    },
+                    MenuViewMenuWire {
+                        id: MenuId::inline("root", 0),
+                        title: Some("Inline".into()),
+                        layout: layout(),
+                        bindings: vec![binding(
+                            2,
+                            "r",
+                            "Return",
+                            BindingConditionsWire::default(),
+                            Some(muxe_protocol::LocalMenuActionWire::Control(
+                                MenuControl::Return,
+                            )),
+                        )],
+                    },
+                    MenuViewMenuWire {
+                        id: MenuId::named("root#0"),
+                        title: Some("Namesake".into()),
+                        layout: layout(),
+                        bindings: Vec::new(),
+                    },
+                ],
+            },
+            keyboard: KeyboardProfileWire::Kitty(KeyCapabilitiesWire {
+                event_types: true,
+                alternate_keys: true,
+                all_keys_as_escape_codes: false,
+            }),
+            inactivity_timeout_millis: None,
+            theme: default_theme_wire(),
+        };
+        let mut runtime =
+            UiRuntime::attach(archive_attachment(attachment)).expect("archive attaches");
+        assert_eq!(
+            runtime.handle_input(&press('n')).expect("open is local"),
+            UiCommand::Redraw
+        );
+        assert_eq!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("inline renders")
+                .title,
+            "Inline"
+        );
+        assert_eq!(
+            runtime
+                .handle_input(&press('r'))
+                .expect("return is local with a caller"),
+            UiCommand::Redraw
+        );
+        assert_eq!(
+            runtime
+                .prepare(Rect::new(0, 0, 40, 8))
+                .expect("root rerenders")
+                .title,
+            "Root"
         );
     }
 

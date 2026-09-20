@@ -243,8 +243,8 @@ mod tests {
     };
 
     use muxe_core::{
-        ActionSpec, CompiledGeneration, KeyCapabilities, MenuAction, MenuId, PortableAction,
-        SourceId, compile_yaml,
+        ActionSpec, CompiledGeneration, KeyCapabilities, MenuAction, MenuId, MenuName,
+        PortableAction, SourceId, compile_yaml,
     };
     use tempfile::TempDir;
 
@@ -337,7 +337,9 @@ mod tests {
         )
         .expect("starter config compiles with default built-in bindings");
         let main = compiled
-            .menu(&MenuId::new("main"))
+            .menu(&MenuId::named(
+                MenuName::parse("main").expect("starter menu name"),
+            ))
             .expect("starter main menu exists");
 
         assert!(main.bindings.iter().any(|binding| {

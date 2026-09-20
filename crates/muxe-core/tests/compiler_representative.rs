@@ -1,4 +1,8 @@
-use muxe_core::{CompiledGeneration, KeyCapabilities, MenuId, SourceId, compile_yaml};
+use muxe_core::{CompiledGeneration, KeyCapabilities, MenuId, MenuName, SourceId, compile_yaml};
+
+fn id(name: &str) -> MenuId {
+    MenuId::named(MenuName::parse(name).expect("valid test menu name"))
+}
 
 const COMPLETE_BASE: &str = r#"
 version: 1
@@ -115,8 +119,8 @@ fn compiles_the_complete_design_base_example_with_injections_and_inline_menu() {
     .expect("the complete Design base example should compile");
 
     assert_eq!(config.generation, CompiledGeneration(7));
-    assert!(config.menu(&MenuId::new("main")).is_some());
-    assert!(config.menu(&MenuId::new("tabs")).is_some());
+    assert!(config.menu(&id("main")).is_some());
+    assert!(config.menu(&id("tabs")).is_some());
     assert_eq!(
         config.menus.len(),
         3,
@@ -124,7 +128,7 @@ fn compiles_the_complete_design_base_example_with_injections_and_inline_menu() {
     );
     assert!(
         config
-            .menu(&MenuId::new("main"))
+            .menu(&id("main"))
             .expect("main menu")
             .bindings
             .iter()

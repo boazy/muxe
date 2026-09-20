@@ -1,8 +1,12 @@
 use muxe_core::{
     CompileInput, CompiledGeneration, Compiler, ConfigDocument, DiagnosticCode, KeyCapabilities,
-    SourceId, ThemeAssets,
+    MenuName, SourceId, ThemeAssets,
 };
 use std::sync::Mutex;
+
+fn id(name: &str) -> muxe_core::MenuId {
+    muxe_core::MenuId::named(MenuName::parse(name).expect("valid test menu name"))
+}
 
 fn document(name: &str, yaml: &str) -> ConfigDocument {
     ConfigDocument::parse(SourceId::new(name), yaml).unwrap()
@@ -68,8 +72,8 @@ inject:
     )
     .expect("merged configuration should compile");
 
-    assert!(config.menu(&muxe_core::MenuId::new("remove-me")).is_none());
-    let main = config.menu(&muxe_core::MenuId::new("main")).unwrap();
+    assert!(config.menu(&id("remove-me")).is_none());
+    let main = config.menu(&id("main")).unwrap();
     assert!(
         main.bindings
             .iter()
@@ -205,7 +209,7 @@ menus:
     .expect("command action with no mode should compile");
     assert_eq!(
         detached
-            .menu(&muxe_core::MenuId::new("main"))
+            .menu(&id("main"))
             .unwrap()
             .bindings
             .iter()
@@ -235,7 +239,7 @@ menus:
     .expect("an explicit inherited mode should compile");
     assert_eq!(
         inherited
-            .menu(&muxe_core::MenuId::new("main"))
+            .menu(&id("main"))
             .unwrap()
             .bindings
             .iter()
@@ -275,7 +279,7 @@ menus:
     .expect("the Design portable families should compile before host capability checks");
 
     let kinds = config
-        .menu(&muxe_core::MenuId::new("main"))
+        .menu(&id("main"))
         .unwrap()
         .bindings
         .iter()
@@ -411,6 +415,39 @@ menus:
 }
 
 #[test]
+fn user_authored_inline_marker_is_rejected_as_reserved() {
+    let diagnostics = compile(
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      x:
+        label: nested
+        action:
+          type: menu:open
+          submenu:
+            _muxe_inline_id: main#0
+            bindings:
+              q:
+                label: quit
+                action: menu:quit
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect_err("user-authored inline marker must be rejected");
+
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("_muxe_inline_id"))
+        .expect("reserved marker diagnostic");
+    assert_eq!(diagnostic.code, DiagnosticCode::UnknownField);
+    assert!(diagnostic.message.contains("reserved"));
+    assert_eq!(diagnostic.labels[0].span.source.as_str(), "config.yml");
+}
+
+#[test]
 fn compact_actions_preserve_quotes_empty_values_equals_and_yaml_core_scalars() {
     let config = compile(
         r#"
@@ -428,10 +465,7 @@ menus:
         KeyCapabilities::default(),
     )
     .expect("quoted tokens and YAML core scalars should keep their distinct meanings");
-    let bindings = &config
-        .menu(&muxe_core::MenuId::new("main"))
-        .unwrap()
-        .bindings;
+    let bindings = &config.menu(&id("main")).unwrap().bindings;
     let attach = bindings
         .iter()
         .find(|binding| binding.key.canonical_string() == "a")
@@ -785,7 +819,7 @@ fn selected_theme_and_color_scheme_are_carried_to_attachment() {
     assert_eq!(config.theme_selection.theme, "custom");
     assert_eq!(config.theme_selection.color_scheme, "ink");
     let attachment = config
-        .attachment_view(&muxe_core::MenuId::new("main"))
+        .attachment_view(&id("main"))
         .expect("compiled main menu has an attachment");
     assert_eq!(attachment.theme_selection, config.theme_selection);
     assert_eq!(attachment.theme, config.theme);
@@ -1161,7 +1195,7 @@ fn portable_main_action<'a>(
     key: &str,
 ) -> &'a muxe_core::PortableAction {
     let binding = config
-        .menu(&muxe_core::MenuId::new("main"))
+        .menu(&id("main"))
         .and_then(|menu| {
             menu.bindings
                 .iter()
@@ -1541,7 +1575,7 @@ menus:
     )
     .expect("literal relative command cwd is supported");
     let binding = config
-        .menu(&muxe_core::MenuId::new("main"))
+        .menu(&id("main"))
         .unwrap()
         .bindings
         .iter()
@@ -1572,10 +1606,7 @@ menus:
         KeyCapabilities::default(),
     )
     .unwrap();
-    let menu_binding = &config
-        .menu(&muxe_core::MenuId::new("main"))
-        .unwrap()
-        .bindings[0];
+    let menu_binding = &config.menu(&id("main")).unwrap().bindings[0];
     let indexed = config.binding(config.generation, menu_binding.id).unwrap();
     assert!(std::ptr::eq(menu_binding, indexed));
     assert!(
@@ -1610,7 +1641,7 @@ fn cel_arithmetic_and_conditional_conditions_compile_for_pager_bindings() {
     let config = compile(yaml, None, KeyCapabilities::default())
         .expect("arithmetic conditions should compile");
     let binding = config
-        .menu(&muxe_core::MenuId::new("main"))
+        .menu(&id("main"))
         .unwrap()
         .bindings
         .iter()
@@ -1618,4 +1649,194 @@ fn cel_arithmetic_and_conditional_conditions_compile_for_pager_bindings() {
         .unwrap();
     assert!(binding.conditions.include.is_some());
     assert!(binding.conditions.include.as_ref().unwrap().uses_pages());
+}
+
+const MINIMAL_BINDING: &str = "      a:\n        label: alpha\n        action: menu:quit\n";
+
+fn empty_name_document() -> muxe_core::ConfigDocument {
+    use muxe_core::{
+        ConfigDocument, ConfigField, ConfigValue, ConfigValueKind, SourceId, SourceSpan,
+    };
+    let source = SourceId::new("empty.yml");
+    ConfigDocument {
+        source: source.clone(),
+        text: "".into(),
+        root: ConfigValue {
+            span: SourceSpan::new(source.clone(), 0, 0),
+            kind: ConfigValueKind::Mapping(vec![
+                ConfigField {
+                    name: "version".to_owned(),
+                    name_span: SourceSpan::new(source.clone(), 0, 0),
+                    value: ConfigValue {
+                        span: SourceSpan::new(source.clone(), 0, 0),
+                        kind: ConfigValueKind::Integer(1),
+                    },
+                },
+                ConfigField {
+                    name: "menus".to_owned(),
+                    name_span: SourceSpan::new(source.clone(), 0, 0),
+                    value: ConfigValue {
+                        span: SourceSpan::new(source.clone(), 0, 0),
+                        kind: ConfigValueKind::Mapping(vec![ConfigField {
+                            name: String::new(),
+                            name_span: SourceSpan::new(source.clone(), 10, 10),
+                            value: ConfigValue {
+                                span: SourceSpan::new(source, 10, 10),
+                                kind: ConfigValueKind::Mapping(vec![]),
+                            },
+                        }]),
+                    },
+                },
+            ]),
+        },
+    }
+}
+
+#[test]
+fn quoted_whitespace_menu_name_compiles_and_round_trips_through_wire() {
+    let yaml = "version: 1\nmenus:\n  \"my menu\":\n    bindings:\n      a:\n        label: alpha\n        action: menu:quit\n";
+    let config = compile(yaml, None, KeyCapabilities::default()).expect("whitespace name compiles");
+    let root = id("my menu");
+    let view = config.attachment_view(&root).expect("whitespace root view");
+    assert_eq!(view.menu.root, root);
+    // The wire half (validation + lossless variant round-trip of this exact
+    // compiled view) is covered by
+    // `whitespace_compiled_view_passes_wire_validation_and_round_trips` in
+    // `muxe-broker`, which owns the core+protocol dependency edge.
+}
+
+#[test]
+fn empty_and_control_menu_names_are_rejected_at_compile_time_naming_the_menu() {
+    // Control characters survive YAML parsing as string keys, so they reach
+    // the named-menu domain check (empty keys do not parse as strings and are
+    // rejected earlier with "mapping keys must be strings").
+    for name in ["bad\x07name", "bad\u{7f}name"] {
+        let yaml = format!("version: 1\nmenus:\n  \"{name}\":\n    bindings:\n{MINIMAL_BINDING}");
+        let diagnostics = compile(&yaml, None, KeyCapabilities::default()).unwrap_err();
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == muxe_core::DiagnosticCode::InvalidValue
+                    && format!("{diagnostic:?}").contains("(control)")
+            }),
+            "name {name:?}: {diagnostics:?}"
+        );
+    }
+    // The empty name cannot survive YAML key parsing, so hand-build the
+    // document and assert the compiler's own empty-name path fires with a
+    // diagnostic naming it.
+    let diagnostics = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(9),
+                base: empty_name_document(),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: ThemeAssets::default(),
+            },
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, muxe_core::DiagnosticCode::InvalidValue);
+    assert!(
+        format!("{:?}", diagnostics[0]).contains("(empty)"),
+        "empty diagnostic: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn named_main_at_zero_coexists_with_inline_submenu_as_distinct_identities() {
+    let yaml = "version: 1\nmenus:\n  main:\n    bindings:\n      x:\n        label: tools\n        action:\n          type: menu:open\n          submenu:\n            bindings:\n              q:\n                label: quit\n                action: menu:quit\n  \"main@0\":\n    bindings:\n      a:\n        label: alpha\n        action: menu:quit\n";
+    let config = compile(yaml, None, KeyCapabilities::default()).expect("collision-free compile");
+    let inline_targets: Vec<muxe_core::MenuId> = config
+        .menu(&id("main"))
+        .expect("main")
+        .bindings
+        .iter()
+        .filter_map(|binding| match &binding.action {
+            muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Menu(
+                muxe_core::MenuAction::Open(muxe_core::MenuTarget::Inline(target)),
+            )) => Some(muxe_core::MenuId::inline(target.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inline_targets.len(), 1);
+    assert_ne!(inline_targets[0], id("main@0"));
+    assert!(config.menu(&id("main@0")).is_some());
+    let view = config.attachment_view(&id("main")).expect("root view");
+    assert_eq!(view.menu.menus.len(), 3);
+}
+
+#[test]
+fn duplicate_named_menu_is_rejected_with_both_spans_not_first_wins() {
+    use muxe_core::{ConfigField, ConfigValue, ConfigValueKind, SourceId, SourceSpan};
+    let source = SourceId::new("dup.yml");
+    let span = |start: usize, end: usize| SourceSpan::new(source.clone(), start, end);
+    let binding = || ConfigValue {
+        span: span(0, 0),
+        kind: ConfigValueKind::Mapping(vec![ConfigField {
+            name: "a".to_owned(),
+            name_span: span(0, 0),
+            value: ConfigValue {
+                span: span(0, 0),
+                kind: ConfigValueKind::Mapping(vec![]),
+            },
+        }]),
+    };
+    let menu = |at: usize| ConfigField {
+        name: "main".to_owned(),
+        name_span: span(at, at + 4),
+        value: ConfigValue {
+            span: span(at, at + 4),
+            kind: ConfigValueKind::Mapping(vec![ConfigField {
+                name: "bindings".to_owned(),
+                name_span: span(at, at + 4),
+                value: binding(),
+            }]),
+        },
+    };
+    let base = ConfigDocument {
+        source: source.clone(),
+        text: "".into(),
+        root: ConfigValue {
+            span: span(0, 0),
+            kind: ConfigValueKind::Mapping(vec![
+                ConfigField {
+                    name: "version".to_owned(),
+                    name_span: span(0, 0),
+                    value: ConfigValue {
+                        span: span(0, 0),
+                        kind: ConfigValueKind::Integer(1),
+                    },
+                },
+                ConfigField {
+                    name: "menus".to_owned(),
+                    name_span: span(0, 0),
+                    value: ConfigValue {
+                        span: span(0, 0),
+                        kind: ConfigValueKind::Mapping(vec![menu(10), menu(20)]),
+                    },
+                },
+            ]),
+        },
+    };
+    let diagnostics = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(9),
+                base,
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: ThemeAssets::default(),
+            },
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].code,
+        muxe_core::DiagnosticCode::DuplicateYamlKey
+    );
+    let rendered = format!("{:?}", diagnostics[0]);
+    assert!(rendered.contains("main"), "{rendered}");
 }
