@@ -249,6 +249,219 @@ mod tests {
     }
 
     #[test]
+    fn context_backed_session_name_validates() {
+        let validator = ZellijValidator;
+        let reference = muxe_core::ContextReference::parse("origin.selection.text", span())
+            .expect("known text path");
+        let result = validator.validate_native_candidate(&candidate(
+            "native.zellij.command:rename-session",
+            vec![field("name", ConfigValueKind::Context(reference))],
+        ));
+        assert!(
+            result.is_ok(),
+            "text reference supplies required String: {result:?}"
+        );
+    }
+
+    #[test]
+    fn context_backed_tab_index_validates() {
+        let validator = ZellijValidator;
+        let reference = muxe_core::ContextReference::parse("origin.tab.index", span())
+            .expect("known unsigned path");
+        let result = validator.validate_native_candidate(&candidate(
+            "native.zellij.command:close-tab-with-index",
+            vec![field("tab-index", ConfigValueKind::Context(reference))],
+        ));
+        assert!(
+            result.is_ok(),
+            "unsigned reference supplies required usize: {result:?}"
+        );
+    }
+
+    #[test]
+    fn context_backed_go_to_tab_index_validates() {
+        let validator = ZellijValidator;
+        let reference = muxe_core::ContextReference::parse("origin.tab.index", span())
+            .expect("known unsigned path");
+        let result = validator.validate_native_candidate(&candidate(
+            "native.zellij.command:go-to-tab",
+            vec![field("tab-index", ConfigValueKind::Context(reference))],
+        ));
+        assert!(
+            result.is_ok(),
+            "unsigned reference supplies required u32: {result:?}"
+        );
+    }
+
+    #[test]
+    fn context_backed_terminal_path_validates() {
+        let validator = ZellijValidator;
+        let reference =
+            muxe_core::ContextReference::parse("origin.pane.cwd", span()).expect("known path");
+        let result = validator.validate_native_candidate(&candidate(
+            "native.zellij.command:open-terminal",
+            vec![field("path", ConfigValueKind::Context(reference))],
+        ));
+        assert!(
+            result.is_ok(),
+            "path reference supplies required PathBuf: {result:?}"
+        );
+    }
+
+    #[test]
+    fn context_backed_pane_id_validates() {
+        let validator = ZellijValidator;
+        let reference =
+            muxe_core::ContextReference::parse("origin.pane.id", span()).expect("known pane path");
+        let result = validator.validate_native_candidate(&candidate(
+            "native.zellij.command:close-pane-with-id",
+            vec![field("pane-id", ConfigValueKind::Context(reference))],
+        ));
+        assert!(
+            result.is_ok(),
+            "pane reference supplies required PaneId: {result:?}"
+        );
+    }
+
+    #[test]
+    fn context_backed_action_pane_id_validates() {
+        let validator = ZellijValidator;
+        let reference =
+            muxe_core::ContextReference::parse("origin.pane.id", span()).expect("known pane path");
+        let result = validator.validate_native_candidate(&candidate(
+            "native.zellij.action:close-focus-by-pane-id",
+            vec![field("pane-id", ConfigValueKind::Context(reference))],
+        ));
+        assert!(
+            result.is_ok(),
+            "pane reference supplies action PaneId: {result:?}"
+        );
+    }
+
+    #[test]
+    fn context_backed_action_tab_index_validates() {
+        let validator = ZellijValidator;
+        let reference = muxe_core::ContextReference::parse("origin.tab.index", span())
+            .expect("known unsigned path");
+        let result = validator.validate_native_candidate(&candidate(
+            "native.zellij.action:go-to-tab",
+            vec![field("index", ConfigValueKind::Context(reference))],
+        ));
+        assert!(
+            result.is_ok(),
+            "unsigned reference supplies action u32: {result:?}"
+        );
+    }
+
+    #[test]
+    fn context_backed_optional_session_name_validates() {
+        let validator = ZellijValidator;
+        let reference = muxe_core::ContextReference::parse("origin.selection.text", span())
+            .expect("known text path");
+        let result = validator.validate_native_candidate(&candidate(
+            "native.zellij.command:switch-session-with-focus",
+            vec![
+                field("name", ConfigValueKind::Context(reference)),
+                field(
+                    "tab-position",
+                    ConfigValueKind::Context(
+                        muxe_core::ContextReference::parse("origin.tab.index", span())
+                            .expect("known unsigned path"),
+                    ),
+                ),
+            ],
+        ));
+        assert!(
+            result.is_ok(),
+            "optional usize placeholder validates: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pane_reference_into_integer_is_rejected() {
+        let validator = ZellijValidator;
+        let reference =
+            muxe_core::ContextReference::parse("origin.pane.id", span()).expect("known pane path");
+        let error = validator
+            .validate_native_candidate(&candidate(
+                "native.zellij.command:close-tab-with-index",
+                vec![field("tab-index", ConfigValueKind::Context(reference))],
+            ))
+            .expect_err("pane reference cannot supply an integer");
+        assert_eq!(error.code, DiagnosticCode::ContextTypeMismatch);
+        assert!(
+            error.message.contains("origin.pane.id"),
+            "names the reference: {error:?}"
+        );
+        assert!(
+            error.message.contains("tab-index"),
+            "names the parameter: {error:?}"
+        );
+    }
+
+    #[test]
+    fn text_reference_into_integer_is_rejected() {
+        let validator = ZellijValidator;
+        let reference = muxe_core::ContextReference::parse("origin.selection.text", span())
+            .expect("known text path");
+        let error = validator
+            .validate_native_candidate(&candidate(
+                "native.zellij.command:close-tab-with-index",
+                vec![field("tab-index", ConfigValueKind::Context(reference))],
+            ))
+            .expect_err("text reference cannot supply an integer");
+        assert_eq!(error.code, DiagnosticCode::ContextTypeMismatch);
+        assert!(
+            error.message.contains("origin.selection.text"),
+            "names the reference: {error:?}"
+        );
+        assert!(
+            error.message.contains("tab-index"),
+            "names the parameter: {error:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_reference_into_session_name_is_rejected() {
+        let validator = ZellijValidator;
+        let reference = muxe_core::ContextReference::parse("origin.tab.index", span())
+            .expect("known unsigned path");
+        let error = validator
+            .validate_native_candidate(&candidate(
+                "native.zellij.command:rename-session",
+                vec![field("name", ConfigValueKind::Context(reference))],
+            ))
+            .expect_err("numeric reference cannot supply a session name");
+        assert_eq!(error.code, DiagnosticCode::ContextTypeMismatch);
+        assert!(
+            error.message.contains("origin.tab.index"),
+            "names the reference: {error:?}"
+        );
+        assert!(
+            error.message.contains("name"),
+            "names the parameter: {error:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_context_parameter_is_rejected_as_arguments() {
+        let validator = ZellijValidator;
+        let reference = muxe_core::ContextReference::parse("origin.tab.index", span())
+            .expect("known unsigned path");
+        let error = validator
+            .validate_native_candidate(&candidate(
+                "native.zellij.command:close-tab-with-index",
+                vec![field("bogus-param", ConfigValueKind::Context(reference))],
+            ))
+            .expect_err("unknown parameter fails closed");
+        assert_eq!(error.code, DiagnosticCode::InvalidActionArguments);
+        assert!(
+            error.message.contains("bogus-param"),
+            "names the parameter: {error:?}"
+        );
+    }
+
+    #[test]
     fn typed_field_mismatch_is_rejected() {
         let validator = ZellijValidator;
         let error = validator
