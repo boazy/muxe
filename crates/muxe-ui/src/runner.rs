@@ -259,6 +259,41 @@ impl UiSession {
         input.push(bytes, |input| pending_inputs.push_back(input));
     }
 
+    /// Feeds one stdin chunk stamped with its shared arrival timestamp.
+    ///
+    /// The runner passes its own clock reading so the driver can arm the pending Escape deadline
+    /// in that same clock. Test harnesses drive this with a paused clock to pin the boundary.
+    fn push_stdin_at(&mut self, bytes: &[u8], now: Instant) {
+        let (input, pending_inputs) = (&mut self.input, &mut self.pending_inputs);
+        input.push_stdin(bytes, now, |input| pending_inputs.push_back(input));
+    }
+
+    /// Feeds bytes that arrived together with an armed Escape deadline through the production rule.
+    ///
+    /// When the shared arrival timestamp reaches the armed deadline (`now >= deadline`), the
+    /// pending Escape flushes first and the bytes follow as their own keys; otherwise the bytes
+    /// continue the pending sequence. Returns the arbitration decision, or `None` when no Escape
+    /// is pending.
+    fn push_at_escape_deadline(
+        &mut self,
+        bytes: &[u8],
+        now: Instant,
+        deadline: Instant,
+    ) -> Option<crate::terminal::EscapeArrival> {
+        let (input, pending_inputs) = (&mut self.input, &mut self.pending_inputs);
+        input.push_at_escape_deadline(bytes, now, deadline, |input| {
+            pending_inputs.push_back(input);
+        })
+    }
+
+    /// Returns the armed Escape deadline derived from the pending Escape start, if any.
+    #[must_use]
+    fn escape_deadline(&self) -> Option<Instant> {
+        let since = self.input.pending_escape_since()?;
+        let timeout = self.vt100_escape_timeout()?;
+        Some(since + timeout)
+    }
+
     /// Resolves a pending VT100 Escape only at the caller's explicit deadline.
     pub fn flush_vt100_escape(&mut self) {
         let (input, pending_inputs) = (&mut self.input, &mut self.pending_inputs);
@@ -412,6 +447,10 @@ where
         .then_some(Instant::now() + DEFAULT_KITTY_NEGOTIATION_TIMEOUT);
 
     loop {
+        // The stdin arm owns every Escape boundary: a read that lands while a deadline is armed
+        // routes through `push_at_escape_deadline`, so the single `now >= deadline` timestamp
+        // comparison decides instead of the `select!` scheduler. The sleep arm only fires when no
+        // byte arrived first; whichever branch wins, the pending Escape resolves exactly once.
         let now = Instant::now();
         let escape_wait = escape_deadline.map_or(Duration::MAX, |deadline| {
             deadline.saturating_duration_since(now)
@@ -434,12 +473,16 @@ where
                     detach_bounded(control).await?;
                     return Ok(UiExit::InputClosed);
                 }
-                session.push(&bytes[..read]);
+                let arrival = Instant::now();
+                if let Some(deadline) = escape_deadline.take() {
+                    session.push_at_escape_deadline(&bytes[..read], arrival, deadline);
+                    escape_deadline = session.escape_deadline();
+                } else {
+                    session.push_stdin_at(&bytes[..read], arrival);
+                    escape_deadline = session.escape_deadline();
+                }
                 if let Some(exit) = dispatch_queued(session, surface, control).await? {
                     return Ok(exit);
-                }
-                if let Some(timeout) = session.vt100_escape_timeout() {
-                    escape_deadline = Some(Instant::now() + timeout);
                 }
                 if !session.is_negotiating_kitty() {
                     kitty_deadline = None;
@@ -738,5 +781,75 @@ mod tests {
                 },
             })
         );
+    }
+    /// Drives the production stdin/deadline arbitration with a paused clock.
+    ///
+    /// The scenario mirrors `run_loop`: the Escape chunk arms the deadline through `push_stdin_at`,
+    /// the follow-up byte arrives via `push_at_escape_deadline` with the same shared timestamp the
+    /// loop would supply, and the queued inputs drain in order. Identical arrival timestamps must
+    /// produce identical results; the assertions below pin which outcome each timestamp selects.
+    async fn arbitrate_with_paused_clock(
+        escape_at: Duration,
+        byte_at: Duration,
+    ) -> (Option<crate::terminal::EscapeArrival>, Vec<UiCommand>) {
+        let timeout = Duration::from_millis(25);
+        let start = Instant::now();
+        let mut session = pending_control_session();
+        session.push_stdin_at(b"\x1b", start + escape_at);
+        let deadline = session
+            .escape_deadline()
+            .expect("pending Escape arms a deadline");
+        assert_eq!(deadline, start + escape_at + timeout);
+        tokio::time::advance(byte_at.saturating_sub(escape_at)).await;
+        let now = Instant::now();
+        assert_eq!(now, start + byte_at);
+        let decision = session.push_at_escape_deadline(b"b", now, deadline);
+        let mut commands = Vec::new();
+        while let Some(command) = session
+            .next_command()
+            .expect("queued input decodes without broker traffic")
+        {
+            commands.push(command);
+        }
+        (decision, commands)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn escape_deadline_arbitration_is_deterministic_at_the_boundary() {
+        use crate::terminal::EscapeArrival;
+
+        // Well before the deadline the byte continues the sequence: Alt-b matches no binding.
+        let (before_decision, before_commands) =
+            arbitrate_with_paused_clock(Duration::ZERO, Duration::from_millis(10)).await;
+        assert_eq!(before_decision, Some(EscapeArrival::BeforeDeadline));
+        assert_eq!(before_commands, vec![UiCommand::Ignored]);
+
+        // Exactly at the deadline the pending Escape flushes first: standalone Escape is ignored
+        // and the follow-up byte invokes its own binding. The old unbiased select could instead
+        // feed the byte into the pending sequence and emit Alt-b (Ignored above); asserting the
+        // two-command Invoke outcome pins the `now >= deadline` flush-first rule.
+        let (at_decision, at_commands) =
+            arbitrate_with_paused_clock(Duration::ZERO, Duration::from_millis(25)).await;
+        assert_eq!(at_decision, Some(EscapeArrival::AtOrAfterDeadline));
+        assert_eq!(
+            at_commands,
+            vec![
+                UiCommand::Ignored,
+                UiCommand::Invoke {
+                    generation: 7,
+                    binding: BindingId {
+                        generation: 7,
+                        ordinal: 2,
+                    },
+                },
+            ]
+        );
+
+        // Strictly after the deadline resolves identically to the boundary: same decision, same
+        // commands for the same inputs, so identical arrival timestamps never race.
+        let (after_decision, after_commands) =
+            arbitrate_with_paused_clock(Duration::ZERO, Duration::from_millis(40)).await;
+        assert_eq!(after_decision, Some(EscapeArrival::AtOrAfterDeadline));
+        assert_eq!(after_commands, at_commands);
     }
 }

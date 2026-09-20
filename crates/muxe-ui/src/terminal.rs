@@ -12,6 +12,7 @@ use muxe_core::{KeyCapabilities, KeyboardProfile};
 use muxe_terminal_input::{Parser, ProtocolResponse};
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 use thiserror::Error;
+use tokio::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
@@ -22,13 +23,48 @@ use crate::{
 /// Maximum parsed input events held while a Kitty response is pending.
 pub const MAX_PENDING_NEGOTIATION_INPUT: usize = 64;
 
+/// One deterministic arbitration decision for a VT100 Escape deadline.
+///
+/// The driver flushes the pending Escape first and then feeds newly arrived bytes, or feeds the
+/// bytes into the still-pending sequence. The runner computes this from one shared timestamp so
+/// a byte that is readable at the same moment the deadline expires always resolves the same way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EscapeArrival {
+    /// The arrival precedes the deadline, so the byte continues the pending Escape sequence.
+    BeforeDeadline,
+    /// The arrival is at or past the deadline, so the pending Escape flushes first.
+    AtOrAfterDeadline,
+}
+
+/// Arbitrates one Escape-deadline boundary against a single shared arrival timestamp.
+///
+/// Rule: when the arrival timestamp reaches the pending Escape deadline (`now >= deadline`), the
+/// pending Escape flushes first and the newly arrived bytes feed after it as their own keys; when
+/// the arrival precedes the deadline (`now < deadline`), the bytes feed into the still-pending
+/// sequence. An arrival exactly at the deadline counts as expired: the byte raced a deadline that
+/// already elapsed, so it must not join the sequence it lost to. The pending Escape then emits as
+/// a standalone key and the byte follows, which is also what a strictly later arrival produces.
+/// The driver stays clock-free: the caller supplies both `now` and `deadline`.
+#[must_use]
+pub(crate) fn arbitrate_escape_arrival(now: Instant, deadline: Instant) -> EscapeArrival {
+    if now >= deadline {
+        EscapeArrival::AtOrAfterDeadline
+    } else {
+        EscapeArrival::BeforeDeadline
+    }
+}
+
 /// UI-owned parser driving with an explicit effective keyboard profile.
 ///
-/// The driver has no readiness loop or clock. Its caller supplies byte chunks, calls the vt100
-/// Escape deadline boundary, and calls [`Self::finish`] when stdin closes.
+/// The driver has no readiness loop of its own. Its caller supplies byte chunks and the shared
+/// arrival timestamp, calls the vt100 Escape deadline boundary, and calls [`Self::finish`] when
+/// stdin closes. [`Self::push_stdin`] records the pending Escape deadline from the caller-owned
+/// clock; [`Self::push_at_escape_deadline`] arbitrates a both-ready boundary with the single
+/// [`arbitrate_escape_arrival`] comparison instead of a task-scheduling race.
 pub struct InputDriver {
     profile: KeyboardProfile,
     parser: Parser,
+    pending_escape_since: Option<Instant>,
 }
 
 impl InputDriver {
@@ -37,7 +73,27 @@ impl InputDriver {
         Self {
             profile,
             parser: Parser::new(),
+            pending_escape_since: None,
         }
+    }
+
+    /// Returns the arrival timestamp of the currently pending Escape, if any.
+    #[must_use]
+    pub(crate) const fn pending_escape_since(&self) -> Option<Instant> {
+        self.pending_escape_since
+    }
+
+    /// Feeds one stdin chunk stamped with its shared arrival timestamp.
+    ///
+    /// The caller supplies `now` from its own clock (the same clock that owns the Escape
+    /// deadline). When the chunk leaves a bare Escape pending, the driver remembers `now` as
+    /// the sequence start so the runner can derive the deadline; any other outcome clears it.
+    pub(crate) fn push_stdin<F>(&mut self, bytes: &[u8], now: Instant, mut emit: F)
+    where
+        F: FnMut(ConvertedInput),
+    {
+        self.parser.push(bytes, |input| emit(convert_input(input)));
+        self.pending_escape_since = self.parser.has_pending_escape().then_some(now);
     }
 
     #[must_use]
@@ -50,6 +106,50 @@ impl InputDriver {
         F: FnMut(ConvertedInput),
     {
         self.parser.push(bytes, |input| emit(convert_input(input)));
+        if !self.parser.has_pending_escape() {
+            self.pending_escape_since = None;
+        }
+    }
+
+    /// Feeds newly arrived bytes that share their readiness with an armed Escape deadline.
+    ///
+    /// The caller supplies the shared arrival timestamp `now` and the armed `deadline` from its
+    /// own clock. The single [`arbitrate_escape_arrival`] comparison decides: an arrival at or
+    /// past the deadline flushes the pending Escape first and feeds the bytes after it, while an
+    /// earlier arrival feeds the bytes into the still-pending sequence. Returns the decision, or
+    /// `None` when no VT100 Escape is pending and the bytes feed directly.
+    pub(crate) fn push_at_escape_deadline<F>(
+        &mut self,
+        bytes: &[u8],
+        now: Instant,
+        deadline: Instant,
+        mut emit: F,
+    ) -> Option<EscapeArrival>
+    where
+        F: FnMut(ConvertedInput),
+    {
+        if !matches!(self.profile, KeyboardProfile::Vt100 { .. })
+            || !self.parser.has_pending_escape()
+        {
+            self.parser.push(bytes, |input| emit(convert_input(input)));
+            self.pending_escape_since = self.parser.has_pending_escape().then_some(now);
+            return None;
+        }
+        match arbitrate_escape_arrival(now, deadline) {
+            EscapeArrival::BeforeDeadline => {
+                self.parser.push(bytes, |input| emit(convert_input(input)));
+                self.pending_escape_since = self.parser.has_pending_escape().then_some(now);
+                Some(EscapeArrival::BeforeDeadline)
+            }
+            EscapeArrival::AtOrAfterDeadline => {
+                self.pending_escape_since = None;
+                self.parser
+                    .flush_pending_escape(|input| emit(convert_input(input)));
+                self.parser.push(bytes, |input| emit(convert_input(input)));
+                self.pending_escape_since = self.parser.has_pending_escape().then_some(now);
+                Some(EscapeArrival::AtOrAfterDeadline)
+            }
+        }
     }
 
     /// Flushes a pending bare Escape only for the explicit vt100 deadline boundary.
@@ -57,12 +157,16 @@ impl InputDriver {
     where
         F: FnMut(ConvertedInput),
     {
-        match self.profile {
+        let flushed = match self.profile {
             KeyboardProfile::Vt100 { .. } => self
                 .parser
                 .flush_pending_escape(|input| emit(convert_input(input))),
             KeyboardProfile::Kitty(_) => false,
+        };
+        if flushed {
+            self.pending_escape_since = None;
         }
+        flushed
     }
 
     pub fn finish<F>(&mut self, mut emit: F)
@@ -70,6 +174,7 @@ impl InputDriver {
         F: FnMut(ConvertedInput),
     {
         self.parser.finish(|input| emit(convert_input(input)));
+        self.pending_escape_since = None;
     }
 }
 
@@ -408,9 +513,25 @@ mod tests {
         let profile = KeyboardProfile::Vt100 {
             escape_timeout: Duration::from_millis(25),
         };
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(25);
+
+        // Genuinely early byte: strictly before the deadline, so the pending Escape continues.
         let mut before = InputDriver::new(profile.clone());
         let mut before_events = Vec::new();
-        before.push(b"\x1ba", |input| before_events.push(input));
+        before.push_stdin(b"\x1b", start, |input| before_events.push(input));
+        assert!(before_events.is_empty());
+        assert_eq!(
+            before.push_at_escape_deadline(
+                b"a",
+                start + Duration::from_millis(10),
+                deadline,
+                |input| {
+                    before_events.push(input);
+                }
+            ),
+            Some(EscapeArrival::BeforeDeadline)
+        );
         assert!(matches!(
             before_events.as_slice(),
             [ConvertedInput::Key(event)]
@@ -418,23 +539,71 @@ mod tests {
                     && event.event.modifiers.contains(muxe_core::Modifiers::ALT)
         ));
 
-        for _boundary in ["at", "after"] {
-            let mut driver = InputDriver::new(profile.clone());
-            let mut events = Vec::new();
-            driver.push(b"\x1b", |input| events.push(input));
-            assert!(driver.flush_vt100_escape(|input| events.push(input)));
-            driver.push(b"a", |input| events.push(input));
-            assert!(matches!(
-                events.as_slice(),
-                [
-                    ConvertedInput::Key(escape),
-                    ConvertedInput::Key(text),
-                ] if escape.event.primary == Some(KeyIdentity::Named(NamedKey::Escape))
-                    && text.event.primary == Some(KeyIdentity::Text('a'))
-            ));
-        }
-    }
+        // Boundary byte: exactly at the deadline counts as expired, so the production rule flushes
+        // the pending Escape first and the byte follows as its own key. The old unbiased select
+        // could instead feed the byte into the pending sequence and emit Alt-a; asserting the
+        // two-key outcome plus the AtOrAfterDeadline decision pins the deterministic rule.
+        let mut at = InputDriver::new(profile.clone());
+        let mut at_events = Vec::new();
+        at.push_stdin(b"\x1b", start, |input| at_events.push(input));
+        assert!(at_events.is_empty());
+        assert_eq!(
+            at.push_at_escape_deadline(b"a", deadline, deadline, |input| at_events.push(input)),
+            Some(EscapeArrival::AtOrAfterDeadline)
+        );
+        assert!(matches!(
+            at_events.as_slice(),
+            [
+                ConvertedInput::Key(escape),
+                ConvertedInput::Key(text),
+            ] if escape.event.primary == Some(KeyIdentity::Named(NamedKey::Escape))
+                && text.event.primary == Some(KeyIdentity::Text('a'))
+        ));
 
+        // Late byte: strictly after the deadline resolves identically to the boundary case.
+        let mut after = InputDriver::new(profile.clone());
+        let mut after_events = Vec::new();
+        after.push_stdin(b"\x1b", start, |input| after_events.push(input));
+        assert!(after_events.is_empty());
+        assert_eq!(
+            after.push_at_escape_deadline(
+                b"a",
+                deadline + Duration::from_millis(1),
+                deadline,
+                |input| after_events.push(input),
+            ),
+            Some(EscapeArrival::AtOrAfterDeadline)
+        );
+        assert_eq!(after_events, at_events);
+
+        // Re-arm: a both-ready chunk that itself ends in a bare Escape re-arms the deadline from
+        // the shared arrival timestamp, so the stranded Escape still flushes on its own timeout
+        // instead of lingering and swallowing the next byte as Alt.
+        let mut rearmed = InputDriver::new(profile);
+        let mut rearmed_events = Vec::new();
+        rearmed.push_stdin(b"\x1b", start, |input| rearmed_events.push(input));
+        assert_eq!(
+            rearmed.push_at_escape_deadline(b"b\x1b", deadline, deadline, |input| {
+                rearmed_events.push(input);
+            }),
+            Some(EscapeArrival::AtOrAfterDeadline)
+        );
+        assert!(matches!(
+            rearmed_events.as_slice(),
+            [
+                ConvertedInput::Key(escape),
+                ConvertedInput::Key(text),
+            ] if escape.event.primary == Some(KeyIdentity::Named(NamedKey::Escape))
+                && text.event.primary == Some(KeyIdentity::Text('b'))
+        ));
+        let rearmed_deadline = rearmed
+            .pending_escape_since()
+            .expect("trailing Escape re-arms its deadline")
+            + Duration::from_millis(25);
+        assert_eq!(rearmed_deadline, deadline + Duration::from_millis(25));
+        assert!(rearmed.flush_vt100_escape(|input| rearmed_events.push(input)));
+        assert_eq!(rearmed_events.len(), 3);
+    }
     #[test]
     fn kitty_negotiation_requires_exact_flags_and_preserves_interleaved_keys() {
         let capabilities = KeyCapabilities {
