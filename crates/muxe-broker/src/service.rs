@@ -1305,7 +1305,7 @@ struct ConnectionResources {
     /// before enqueueing its response so disconnect can never observe a stale
     /// token for a consumed launch.
     attachment: Arc<std::sync::Mutex<UiAttachment>>,
-    /// The one gated AttachUi readiness waiter. Keeping the real handle lets
+    /// The one gated `AttachUi` readiness waiter. Keeping the real handle lets
     /// disconnect abort and join it before taking attachment ownership.
     waiter: Option<JoinHandle<()>>,
     #[cfg(test)]
@@ -1749,17 +1749,14 @@ async fn serve_request_frame(
                     // UiAttached for a session it no longer owns.
                     if let UiAttachment::Pending { session, .. } = &*attachment {
                         let session = session.clone();
-                        match &response {
-                            BrokerResponse::UiAttached { .. } => {
-                                *attachment = UiAttachment::Attached {
-                                    session: session.clone(),
-                                };
-                                (Some(session), true)
-                            }
-                            _ => {
-                                *attachment = UiAttachment::Closed;
-                                (None, true)
-                            }
+                        if let BrokerResponse::UiAttached { .. } = &response {
+                            *attachment = UiAttachment::Attached {
+                                session: session.clone(),
+                            };
+                            (Some(session), true)
+                        } else {
+                            *attachment = UiAttachment::Closed;
+                            (None, true)
                         }
                     } else {
                         (None, false)
@@ -2058,7 +2055,7 @@ mod tests {
             resources
                 .validate_request(&ClientRequest::InvokeBinding(
                     muxe_protocol::InvokeBinding {
-                        session: session.clone(),
+                        session,
                         generation: 1,
                         binding: muxe_protocol::BindingId {
                             generation: 1,

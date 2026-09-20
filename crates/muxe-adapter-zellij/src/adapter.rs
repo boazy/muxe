@@ -3518,6 +3518,10 @@ mod tests {
         let adapter = test_adapter(&request, &event);
         // Seed a queued-but-unsent close execution directly: live entry,
         // queued item, and a waiter sender for the same id.
+        #[expect(
+            clippy::decimal_bitwise_operands,
+            reason = "the test uses decimal 777 as a recognizable reserved execution sentinel"
+        )]
         let execution = ExecutionId(LOCAL_EXECUTION_CEILING | 777);
         adapter
             .inner

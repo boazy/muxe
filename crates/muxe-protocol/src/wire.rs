@@ -2758,6 +2758,10 @@ mod tests {
         PagesContextWire { count, current }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive owned-versus-archived operator parity matrix stays together for review"
+    )]
     #[test]
     fn archived_and_owned_evaluation_agree_for_every_operator() {
         use muxe_condition::{ConditionIr as Owned, PagesContext};

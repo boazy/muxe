@@ -852,11 +852,10 @@ impl Broker {
                         "pending pane {} attempt {}: {}",
                         lease.as_str(),
                         entry.attempt,
-                        entry
-                            .last_cleanup_error
-                            .as_ref()
-                            .map(|error| error.to_string())
-                            .unwrap_or_else(|| "awaiting first attempt".to_owned())
+                        entry.last_cleanup_error.as_ref().map_or_else(
+                            || "awaiting first attempt".to_owned(),
+                            ToString::to_string
+                        )
                     ));
                 }
                 for (lease, entry) in &state.cleanup.captures {
@@ -864,11 +863,10 @@ impl Broker {
                         "capture {} attempt {}: {}",
                         lease.as_str(),
                         entry.attempt,
-                        entry
-                            .last_cleanup_error
-                            .as_ref()
-                            .map(|error| error.to_string())
-                            .unwrap_or_else(|| "awaiting first attempt".to_owned())
+                        entry.last_cleanup_error.as_ref().map_or_else(
+                            || "awaiting first attempt".to_owned(),
+                            ToString::to_string
+                        )
                     ));
                 }
                 details.sort();
@@ -2242,28 +2240,25 @@ impl Broker {
             .await
             .map_err(BrokerError::from)?;
         let mut sessions = self.sessions.lock().await;
-        match sessions.get_mut(session) {
-            Some(record) => {
-                record.capture = Some(capture);
-                Ok(())
-            }
+        if let Some(record) = sessions.get_mut(session) {
+            record.capture = Some(capture);
+            Ok(())
+        } else {
             // A concurrent detach consumed the session while the host
             // round-trip was in flight. The freshly acquired lease is still
             // ours exactly once: enqueue it before reporting the miss so the
             // supervised cleanup task can retry without the caller retaining
             // host provenance.
-            None => {
-                drop(sessions);
-                self.enqueue_capture_cleanup(
-                    capture,
-                    CaptureReleaseReason::UiDismissed,
-                    Some(format!(
-                        "UI session {session:?} detached during capture start"
-                    )),
-                )
-                .await;
-                Err(BrokerError::UnknownSession(session.clone()))
-            }
+            drop(sessions);
+            self.enqueue_capture_cleanup(
+                capture,
+                CaptureReleaseReason::UiDismissed,
+                Some(format!(
+                    "UI session {session:?} detached during capture start"
+                )),
+            )
+            .await;
+            Err(BrokerError::UnknownSession(session.clone()))
         }
     }
 
@@ -2853,15 +2848,10 @@ impl Broker {
                 .collect::<Vec<_>>();
             state.awaiting.remove(session);
             if let Some(capture) = record.as_ref().and_then(|record| record.capture.clone()) {
-                self.insert_capture_cleanup_locked(&mut state, capture, reason, None);
+                self.insert_capture_cleanup_locked(&mut state, &capture, reason, None);
             }
             for registration in &registrations {
-                self.insert_pending_pane_cleanup_locked(
-                    &mut state,
-                    session,
-                    registration.clone(),
-                    None,
-                );
+                self.insert_pending_pane_cleanup_locked(&mut state, session, registration, None);
             }
             let mut cancel = Vec::new();
             let mut deferred = Vec::new();
@@ -2943,7 +2933,7 @@ impl Broker {
         &self,
         state: &mut BrokerState,
         session: &UiSessionId,
-        registration: RegisteredPane,
+        registration: &RegisteredPane,
         primary: Option<String>,
     ) {
         let primary = primary.map(bounded_cleanup_message);
@@ -2954,7 +2944,7 @@ impl Broker {
         let entry = state
             .cleanup
             .pending_panes
-            .entry(lease.id.clone())
+            .entry(lease.id)
             .or_insert_with(|| PendingPaneCleanup {
                 session: session.clone(),
                 registration: registration.clone(),
@@ -2986,16 +2976,17 @@ impl Broker {
     fn insert_capture_cleanup_locked(
         &self,
         state: &mut BrokerState,
-        lease: CaptureLease,
+        lease: &CaptureLease,
         reason: CaptureReleaseReason,
         primary: Option<String>,
     ) {
         let primary = primary.map(bounded_cleanup_message);
-        let key = CleanupTaskKey::Capture(lease.id.clone());
+        let lease_id = lease.id.clone();
+        let key = CleanupTaskKey::Capture(lease_id.clone());
         let entry = state
             .cleanup
             .captures
-            .entry(lease.id.clone())
+            .entry(lease_id)
             .or_insert_with(|| CaptureCleanup {
                 lease: lease.clone(),
                 reason,
@@ -3030,7 +3021,7 @@ impl Broker {
     ) {
         {
             let mut state = self.state.lock().await;
-            self.insert_pending_pane_cleanup_locked(&mut state, session, registration, primary);
+            self.insert_pending_pane_cleanup_locked(&mut state, session, &registration, primary);
         }
         #[cfg(test)]
         {
@@ -3053,7 +3044,7 @@ impl Broker {
     ) {
         {
             let mut state = self.state.lock().await;
-            self.insert_capture_cleanup_locked(&mut state, lease, reason, primary);
+            self.insert_capture_cleanup_locked(&mut state, &lease, reason, primary);
         }
     }
 
@@ -3145,6 +3136,20 @@ impl Broker {
     }
 }
 
+enum CleanupWaitOutcome {
+    Gone,
+    Wait(Duration),
+}
+
+enum CleanupOutcome {
+    Missing,
+    Retry(Duration),
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "pending-pane cleanup retry state machine keeps ownership and retry ordering auditable"
+)]
 async fn run_pending_pane_cleanup(
     adapter: Arc<dyn HostAdapter>,
     state: Arc<Mutex<BrokerState>>,
@@ -3180,21 +3185,17 @@ async fn run_pending_pane_cleanup(
             })
         };
         let Some((session, registration, primary)) = payload else {
-            enum WaitOutcome {
-                Gone,
-                Wait(Duration),
-            }
             let outcome = {
                 let guard = state.lock().await;
                 match guard.cleanup.pending_panes.get(&lease_id) {
-                    None => WaitOutcome::Gone,
-                    Some(entry) => WaitOutcome::Wait(
+                    None => CleanupWaitOutcome::Gone,
+                    Some(entry) => CleanupWaitOutcome::Wait(
                         entry.next_retry.saturating_duration_since(Instant::now()),
                     ),
                 }
             };
             let wait = match outcome {
-                WaitOutcome::Gone => {
+                CleanupWaitOutcome::Gone => {
                     if supervisor
                         .release_slot_unless_requeued(&state, &key, claim)
                         .await
@@ -3203,7 +3204,7 @@ async fn run_pending_pane_cleanup(
                     }
                     continue;
                 }
-                WaitOutcome::Wait(wait) => wait,
+                CleanupWaitOutcome::Wait(wait) => wait,
             };
             let notified = supervisor.wake.notified();
             tokio::pin!(notified);
@@ -3255,14 +3256,10 @@ async fn run_pending_pane_cleanup(
             }
             Err(error) => {
                 let error = bounded_adapter_error(error);
-                enum Outcome {
-                    Missing,
-                    Retry(Duration),
-                }
                 let outcome = {
                     let mut guard = state.lock().await;
                     match guard.cleanup.pending_panes.get_mut(&lease_id) {
-                        None => Outcome::Missing,
+                        None => CleanupOutcome::Missing,
                         Some(entry) => {
                             entry.phase = CleanupPhase::Ready;
                             entry.attempt = entry.attempt.saturating_add(1);
@@ -3276,12 +3273,12 @@ async fn run_pending_pane_cleanup(
                                 error = %error,
                                 "host cleanup failed; retaining provenance for deterministic retry"
                             );
-                            Outcome::Retry(cleanup_retry_delay(entry.attempt))
+                            CleanupOutcome::Retry(cleanup_retry_delay(entry.attempt))
                         }
                     }
                 };
                 let delay = match outcome {
-                    Outcome::Missing => {
+                    CleanupOutcome::Missing => {
                         if supervisor
                             .release_slot_unless_requeued(&state, &key, claim)
                             .await
@@ -3290,7 +3287,7 @@ async fn run_pending_pane_cleanup(
                         }
                         continue;
                     }
-                    Outcome::Retry(delay) => delay,
+                    CleanupOutcome::Retry(delay) => delay,
                 };
                 let notified = supervisor.wake.notified();
                 tokio::pin!(notified);
@@ -3304,6 +3301,10 @@ async fn run_pending_pane_cleanup(
     supervisor.remove_if_claim(&key, claim);
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "capture cleanup retry state machine keeps ownership and retry ordering auditable"
+)]
 async fn run_capture_cleanup(
     adapter: Arc<dyn HostAdapter>,
     state: Arc<Mutex<BrokerState>>,
@@ -3334,21 +3335,17 @@ async fn run_capture_cleanup(
                 .then(|| (entry.lease.clone(), entry.reason, entry.primary.clone()))
         };
         let Some((lease, reason, primary)) = payload else {
-            enum WaitOutcome {
-                Gone,
-                Wait(Duration),
-            }
             let outcome = {
                 let guard = state.lock().await;
                 match guard.cleanup.captures.get(&lease_id) {
-                    None => WaitOutcome::Gone,
-                    Some(entry) => WaitOutcome::Wait(
+                    None => CleanupWaitOutcome::Gone,
+                    Some(entry) => CleanupWaitOutcome::Wait(
                         entry.next_retry.saturating_duration_since(Instant::now()),
                     ),
                 }
             };
             let wait = match outcome {
-                WaitOutcome::Gone => {
+                CleanupWaitOutcome::Gone => {
                     if supervisor
                         .release_slot_unless_requeued(&state, &key, claim)
                         .await
@@ -3357,7 +3354,7 @@ async fn run_capture_cleanup(
                     }
                     continue;
                 }
-                WaitOutcome::Wait(wait) => wait,
+                CleanupWaitOutcome::Wait(wait) => wait,
             };
             let notified = supervisor.wake.notified();
             tokio::pin!(notified);
@@ -3382,14 +3379,10 @@ async fn run_capture_cleanup(
             }
             Err(error) => {
                 let error = bounded_adapter_error(error);
-                enum Outcome {
-                    Missing,
-                    Retry(Duration),
-                }
                 let outcome = {
                     let mut guard = state.lock().await;
                     match guard.cleanup.captures.get_mut(&lease_id) {
-                        None => Outcome::Missing,
+                        None => CleanupOutcome::Missing,
                         Some(entry) => {
                             entry.phase = CleanupPhase::Ready;
                             entry.attempt = entry.attempt.saturating_add(1);
@@ -3403,12 +3396,12 @@ async fn run_capture_cleanup(
                                 error = %error,
                                 "host cleanup failed; retaining provenance for deterministic retry"
                             );
-                            Outcome::Retry(cleanup_retry_delay(entry.attempt))
+                            CleanupOutcome::Retry(cleanup_retry_delay(entry.attempt))
                         }
                     }
                 };
                 let delay = match outcome {
-                    Outcome::Missing => {
+                    CleanupOutcome::Missing => {
                         if supervisor
                             .release_slot_unless_requeued(&state, &key, claim)
                             .await
@@ -3417,7 +3410,7 @@ async fn run_capture_cleanup(
                         }
                         continue;
                     }
-                    Outcome::Retry(delay) => delay,
+                    CleanupOutcome::Retry(delay) => delay,
                 };
                 let notified = supervisor.wake.notified();
                 tokio::pin!(notified);
@@ -7275,13 +7268,17 @@ menus:
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the cancellation barrier scenario keeps unlink and cleanup ordering together"
+    )]
     async fn cancelled_detach_cannot_drop_cleanup_provenance() {
         // B4: provenance is inserted atomically with the unlink under the
         // state lock, so cancelling detach between the unlink and the
         // `request_execution_stop` await cannot lose it. Pre-fix the capture
         // and pane enqueues sit after that await, so nothing is inserted at
         // the barrier and this test fails there.
-        let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let (adapter, broker, binding, _directory) = scoped_two_client_fixture();
         // Gated flow: prepare + register + attach(wait) + commit, so the
         // session holds both a capture lease and a gated registration.
         let token =
@@ -7321,8 +7318,8 @@ menus:
                     session: session.clone(),
                     generation: 1,
                     binding: BindingId {
-                        generation: _binding.generation().0,
-                        ordinal: _binding.ordinal(),
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
                     },
                 }),
                 mpsc::channel(1).0,
@@ -7945,6 +7942,10 @@ menus:
     }
     #[cfg(unix)]
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the detach-policy process-group lifecycle remains one auditable scenario"
+    )]
     async fn activation_drain_detach_policy_keeps_owned_generic_process_group() {
         let directory = tempfile::tempdir().expect("owned generic-process directory");
         let script = directory.path().join("drain-detach-group.sh");
@@ -8146,6 +8147,10 @@ menus:
 
     #[cfg(unix)]
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the cancel-policy process-group lifecycle remains one auditable scenario"
+    )]
     async fn activation_drain_cancel_policy_stops_owned_generic_process_group() {
         let directory = tempfile::tempdir().expect("owned generic-process directory");
         let script = directory.path().join("drain-cancel-group.sh");
