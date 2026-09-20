@@ -92,6 +92,23 @@ impl CaptureTable {
         self.states.get(client_id).unwrap_or(&CaptureState::Idle)
     }
 
+    /// Owning lease of every currently captured client, for bridge-side
+    /// lease renewal. Pending (`Beginning`) captures are excluded: the
+    /// bridge has no active lease to renew until `CaptureReady` confirms
+    /// it, and the adapter's capture timeout already bounds that wait.
+    pub fn captured_leases(&self) -> Vec<(String, muxe_protocol::CaptureLeaseId)> {
+        self.states
+            .iter()
+            .filter_map(|(client_id, state)| match state {
+                CaptureState::Captured(record) => Some((
+                    client_id.clone(),
+                    muxe_protocol::CaptureLeaseId(record.lease),
+                )),
+                CaptureState::Beginning { .. } | CaptureState::Idle => None,
+            })
+            .collect()
+    }
+
     /// Begins capture for one UI session. Fails while another capture owns or
     /// acquires the client so replacements serialize through release first.
     pub fn begin(
@@ -258,6 +275,23 @@ mod tests {
             table.release("a", [1; 16], true).expect("releases"),
             Some("Normal".to_owned())
         );
+    }
+
+    #[test]
+    fn renewal_covers_only_confirmed_captures() {
+        let mut table = CaptureTable::new();
+        table.begin("a", "ui-1", [1; 16]).expect("begins");
+        // Pending captures have no active bridge lease: no renewal.
+        assert!(table.captured_leases().is_empty());
+        table
+            .confirm("a", [1; 16], "Normal".to_owned())
+            .expect("confirms");
+        let leases = table.captured_leases();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].0, "a");
+        assert_eq!(leases[0].1, muxe_protocol::CaptureLeaseId([1; 16]));
+        table.release("a", [1; 16], true).expect("releases");
+        assert!(table.captured_leases().is_empty());
     }
 
     #[test]

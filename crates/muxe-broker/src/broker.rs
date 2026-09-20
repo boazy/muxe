@@ -1455,7 +1455,8 @@ impl Broker {
                     let reason = match reason {
                         CaptureLossReason::LeaseReplaced => CaptureReleaseReason::Replaced,
                         CaptureLossReason::UserModeChanged => CaptureReleaseReason::UserModeChanged,
-                        CaptureLossReason::AdapterHealth => CaptureReleaseReason::AdapterShutdown,
+                        CaptureLossReason::BrokerLeaseExpired
+                        | CaptureLossReason::AdapterHealth => CaptureReleaseReason::AdapterShutdown,
                     };
                     let _ = self.detach(&session, reason).await;
                 }

@@ -271,6 +271,10 @@ pub enum CaptureLossReason {
     UserModeChanged,
     AdapterHealth,
     LeaseReplaced,
+    /// The bridge-side capture lease expired with no broker renewal: the
+    /// broker stopped its periodic renewal while capture was active, so the
+    /// bridge restored the prior mode itself.
+    BrokerLeaseExpired,
 }
 
 pub enum AdapterHealthEvent {

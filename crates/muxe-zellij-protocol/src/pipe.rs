@@ -381,7 +381,7 @@ impl ValidateBridgeRequest for BridgeRequest {
                 validate_common(lease)?;
                 validate_common(ui_session)
             }
-            Self::EndCapture { lease, .. } => validate_common(lease),
+            Self::EndCapture { lease, .. } | Self::RenewCapture { lease } => validate_common(lease),
             Self::RequestOrigin {
                 ui_session,
                 request,
@@ -675,6 +675,28 @@ mod tests {
             ui_session: muxe_protocol::UiSessionId::new(""),
         };
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn renewal_round_trips_and_validates_lease() {
+        let request = PipeRequest {
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            request_id: RequestId::INITIAL,
+            registration: registration(7),
+            channel_generation: ChannelGeneration::INITIAL,
+            target: sample_target(),
+            payload: BridgeRequest::RenewCapture {
+                lease: muxe_protocol::CaptureLeaseId([5; 16]),
+            },
+        };
+        let line = encode_request_line(&request).expect("encodes");
+        assert_eq!(decode_request_line(&line).expect("decodes"), request);
+        // A zero lease is not a renewal: validation rejects it.
+        let mut bad = request;
+        bad.payload = BridgeRequest::RenewCapture {
+            lease: muxe_protocol::CaptureLeaseId([0; 16]),
+        };
+        assert!(bad.validate().is_err());
     }
 
     #[test]

@@ -34,6 +34,22 @@
 //! the wait. A mode change away from Locked while capture is active is
 //! user-owned newer state: the menu is dismissed and the snapshot is never
 //! restored over it.
+//!
+//! ## Broker-renewed capture lease (H12)
+//!
+//! An active capture owns a broker-renewed lease of [`CAPTURE_LEASE_TICKS`]
+//! timer ticks (3 ticks at `HEARTBEAT_SECS`, i.e. 15 seconds of broker
+//! silence). Renewal is broker-driven, never incidental: the adapter emits a
+//! dedicated `RenewCapture` line on its sweep cadence while a capture is
+//! active, so a healthy-but-idle broker (no dispatch, no cleanup, no origin
+//! work) keeps capture alive past the window and a genuinely silent broker
+//! expires it. A timer tick with no intervening renewal decrements the lease;
+//! reaching zero expires it: the bridge restores the prior mode exactly once
+//! through the same guarded restore as `EndCapture` and reports
+//! `CaptureLost { reason: BrokerLeaseExpired }`, unless the user already left
+//! Locked mode (then the existing user-mode dismissal owns the outcome and
+//! the timer must not restore or report anything further) or the capture
+//! already ended (then expiry is a no-op -- the timer never restores twice).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -61,6 +77,15 @@ const EVENT_PREFIX: &str = "muxe-event-";
 
 /// Heartbeat period in seconds, well under the broker's 15-second lease.
 const HEARTBEAT_SECS: f64 = 5.0;
+
+/// Broker-renewed lease for an active capture, in timer ticks. Renewed to the
+/// full bound only by an explicit `RenewCapture` renewal from the broker (see
+/// the module-level lease contract); incidental request traffic never extends
+/// it, so a quiet-but-live broker still renews on its own sweep cadence while
+/// a dead broker expires. `3` ticks at `HEARTBEAT_SECS` is 15 seconds of
+/// broker silence -- matching the adapter-side heartbeat lease scale the
+/// broker enforces.
+const CAPTURE_LEASE_TICKS: u32 = 3;
 
 /// Narrow host-effects boundary: every nondeterministic host interaction the
 /// bridge needs. Production implements it with plugin shims; tests inject a
@@ -156,6 +181,10 @@ struct PendingCapture {
 struct ActiveCapture {
     lease: CaptureLeaseId,
     prior: InputMode,
+    /// Timer ticks remaining before broker silence expires the capture.
+    /// Set to [`CAPTURE_LEASE_TICKS`] when capture activates and on every
+    /// explicit broker renewal; a timer tick decrements it and zero expires.
+    lease_ticks: u32,
 }
 
 struct RestoreBarrier {
@@ -396,7 +425,11 @@ impl Bridge {
                 // change skips restoration entirely.
                 let prior = pending.prior.unwrap_or(InputMode::Locked);
                 let lease = pending.lease;
-                self.active = Some(ActiveCapture { lease, prior });
+                self.active = Some(ActiveCapture {
+                    lease,
+                    prior,
+                    lease_ticks: CAPTURE_LEASE_TICKS,
+                });
                 self.emit_for_request(
                     pending.request_id,
                     pending.channel_generation,
@@ -539,7 +572,70 @@ impl Bridge {
         // Heartbeats renew the broker-side heartbeat lease; without them an
         // idle healthy bridge would be expired by the registry.
         self.emit_unsolicited(BridgeEvent::Heartbeat, effects);
+        // Broker-silence countdown for an active capture. Renewal arrives
+        // only via explicit `RenewCapture`; incidental traffic never extends
+        // the lease, so a dead broker cannot hold Locked mode forever while
+        // a live one renews on its own sweep cadence. Expiry reuses the
+        // guarded restore so the prior mode is restored at most once and a
+        // capture that already ended (or a user mode change that already
+        // dismissed it) stays untouched.
+        if self.active.is_some() {
+            let expired = match &mut self.active {
+                Some(active) => {
+                    active.lease_ticks = active.lease_ticks.saturating_sub(1);
+                    active.lease_ticks == 0
+                }
+                None => false,
+            };
+            if expired {
+                self.expire_capture_lease(effects);
+            }
+        }
         effects.arm_timer(HEARTBEAT_SECS);
+    }
+
+    /// Expires the active capture lease after broker silence: guarded restore
+    /// plus a typed loss report, exactly once. Idempotent by construction --
+    /// `cancel_capture_for_restore` takes the active capture, so a second
+    /// call (a later tick, a racing `EndCapture`, unload, or channel reset)
+    /// finds no active capture and emits nothing. A user mode change that
+    /// already dismissed the capture likewise leaves nothing to expire.
+    fn expire_capture_lease(&mut self, effects: &mut dyn HostEffects) {
+        let Some(active) = self.active.as_ref().map(|active| active.lease) else {
+            return;
+        };
+        if self
+            .cancel_capture_for_restore(Some(active), effects)
+            .is_some()
+        {
+            self.emit_unsolicited(
+                BridgeEvent::CaptureLost {
+                    lease: active,
+                    reason: CaptureLostReason::BrokerLeaseExpired,
+                },
+                effects,
+            );
+        }
+    }
+
+    /// Renews the active capture lease from explicit broker traffic. Only an
+    /// exact-lease renewal extends the deadline; a renewal for any other
+    /// lease (stale, future, or idle with no active capture) is ignored so a
+    /// displaced broker generation can never keep a newer capture alive.
+    fn renew_capture(
+        &mut self,
+        cli_id: &str,
+        request_id: RequestId,
+        generation: ChannelGeneration,
+        lease: CaptureLeaseId,
+        effects: &mut dyn HostEffects,
+    ) {
+        if let Some(active) = &mut self.active
+            && active.lease == lease
+        {
+            active.lease_ticks = CAPTURE_LEASE_TICKS;
+        }
+        self.release(cli_id, request_id, generation, effects);
     }
 
     /// Cancels matching capture state and compensates every queued Locked
@@ -793,6 +889,9 @@ impl Bridge {
             }
             BridgeRequest::EndCapture { lease, reason } => {
                 self.end_capture(cli_id, request_id, generation, lease, reason, effects);
+            }
+            BridgeRequest::RenewCapture { lease } => {
+                self.renew_capture(cli_id, request_id, generation, lease, effects);
             }
             BridgeRequest::RequestOrigin {
                 ui_session,
@@ -1056,6 +1155,7 @@ impl Bridge {
             self.active = Some(ActiveCapture {
                 lease,
                 prior: InputMode::Locked,
+                lease_ticks: CAPTURE_LEASE_TICKS,
             });
             self.release(cli_id, request_id, generation, effects);
             self.emit_for_request(
@@ -3021,6 +3121,287 @@ mod tests {
         });
         assert!(failed);
         assert_eq!(bridge.capture_state(), (None, None));
+    }
+
+    /// H12: an explicit broker renewal keeps an active capture alive past
+    /// the expiry window. Three timer ticks with no renewal would expire the
+    /// lease; renewing between ticks must hold Locked mode with no restore
+    /// and no loss report.
+    #[test]
+    fn broker_renewal_keeps_capture_alive_past_the_window() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: lease(12),
+                ui_session: session("ui-1"),
+            }),
+            &mut host,
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([12; 16])));
+        host.modes.clear();
+        let outputs_before = host.outputs.len();
+        // Two silent ticks, a renewal, then two more silent ticks: five ticks
+        // total with no expiry, proving renewal (not elapsed time) owns the
+        // deadline. Request IDs must advance: reusing INITIAL trips the
+        // out-of-order observation but still processes; advancing keeps the
+        // script honest.
+        let renew = RequestId::INITIAL.next().expect("second request");
+        let renew_2 = renew.next().expect("third request");
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.pipe(
+            request_msg_with_id(renew, BridgeRequest::RenewCapture { lease: lease(12) }),
+            &mut host,
+        );
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.pipe(
+            request_msg_with_id(renew_2, BridgeRequest::RenewCapture { lease: lease(12) }),
+            &mut host,
+        );
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([12; 16])));
+        assert!(host.modes.is_empty(), "live renewal restores nothing");
+        assert!(
+            host.events()[outputs_before..]
+                .iter()
+                .all(|(_, event)| !matches!(
+                    event,
+                    PipeEventKind::Event(BridgeEvent::CaptureLost { .. })
+                )),
+            "live renewal reports no loss"
+        );
+    }
+
+    /// H12: an idle-but-live broker survives the window on renewal traffic
+    /// alone -- no dispatch, no cleanup, no origin work, only the periodic
+    /// `RenewCapture` line the adapter emits on its sweep cadence.
+    #[test]
+    fn idle_but_live_broker_survives_on_renewal_alone() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: lease(14),
+                ui_session: session("ui-1"),
+            }),
+            &mut host,
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([14; 16])));
+        host.modes.clear();
+        let outputs_before = host.outputs.len();
+        // Six ticks (twice the 3-tick window) with only a renewal between
+        // every pair of ticks: no other broker traffic of any kind.
+        let mut next = RequestId::INITIAL.next().expect("second request");
+        for _ in 0..3 {
+            bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+            bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+            bridge.pipe(
+                request_msg_with_id(next, BridgeRequest::RenewCapture { lease: lease(14) }),
+                &mut host,
+            );
+            next = next.next().expect("request IDs advance");
+        }
+        assert_eq!(bridge.capture_state(), (None, Some([14; 16])));
+        assert!(
+            host.modes.is_empty(),
+            "idle-but-live broker restores nothing"
+        );
+        assert!(
+            host.events()[outputs_before..]
+                .iter()
+                .all(|(_, event)| !matches!(
+                    event,
+                    PipeEventKind::Event(BridgeEvent::CaptureLost { .. })
+                )),
+            "idle-but-live broker reports no loss"
+        );
+    }
+
+    /// H12: stopping renewal past the deadline restores the prior mode
+    /// exactly once and reports the loss; further ticks and a racing
+    /// `EndCapture` never restore twice.
+    #[test]
+    fn stopped_renewal_restores_prior_mode_exactly_once() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: lease(15),
+                ui_session: session("ui-1"),
+            }),
+            &mut host,
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, Some([15; 16])));
+        host.modes.clear();
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert_eq!(bridge.capture_state(), (None, None));
+        assert_eq!(host.modes.as_slice(), [InputMode::Normal]);
+        let losses: Vec<_> = host
+            .events()
+            .into_iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    PipeEventKind::Event(BridgeEvent::CaptureLost {
+                        reason: CaptureLostReason::BrokerLeaseExpired,
+                        ..
+                    })
+                )
+            })
+            .collect();
+        assert_eq!(losses.len(), 1, "expiry reports the loss exactly once");
+        // A further tick is a no-op: nothing left to expire.
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert!(host.modes.len() == 1, "no second restoration");
+        // A racing broker `EndCapture` for the same lease finds no active
+        // capture and restores nothing further.
+        let end_id = RequestId::INITIAL.next().expect("second request");
+        bridge.pipe(
+            request_msg_with_id(
+                end_id,
+                BridgeRequest::EndCapture {
+                    lease: lease(15),
+                    reason: CaptureEndReason::LeaseExpired,
+                },
+            ),
+            &mut host,
+        );
+        assert_eq!(host.modes.as_slice(), [InputMode::Normal]);
+        let losses: Vec<_> = host
+            .events()
+            .into_iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    PipeEventKind::Event(BridgeEvent::CaptureLost {
+                        reason: CaptureLostReason::BrokerLeaseExpired,
+                        ..
+                    })
+                )
+            })
+            .collect();
+        assert_eq!(losses.len(), 1, "racing EndCapture restores nothing twice");
+    }
+
+    /// H12: a user mode change before expiry owns the outcome -- the timer
+    /// must not restore the older snapshot over it and must not report a
+    /// restoration it did not perform.
+    #[test]
+    fn user_mode_change_before_expiry_suppresses_lease_restore() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: lease(16),
+                ui_session: session("ui-1"),
+            }),
+            &mut host,
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        host.modes.clear();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Tab)), &mut host);
+        assert_eq!(bridge.capture_state(), (None, None));
+        assert!(host.modes.is_empty(), "user dismissal restores nothing");
+        // Ticks past the window change nothing: no active capture remains.
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert!(host.modes.is_empty(), "expiry never fights the user");
+        let lease_losses: Vec<_> = host
+            .events()
+            .into_iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    PipeEventKind::Event(BridgeEvent::CaptureLost {
+                        reason: CaptureLostReason::BrokerLeaseExpired,
+                        ..
+                    })
+                )
+            })
+            .collect();
+        assert!(lease_losses.is_empty());
+        let user_losses: Vec<_> = host
+            .events()
+            .into_iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    PipeEventKind::Event(BridgeEvent::CaptureLost {
+                        reason: CaptureLostReason::UserModeChanged,
+                        ..
+                    })
+                )
+            })
+            .collect();
+        assert_eq!(user_losses.len(), 1, "only the user dismissal is reported");
+    }
+
+    /// H12: expiry on an idle bridge (no capture ever began) is a no-op:
+    /// no mode request, no loss report.
+    #[test]
+    fn timer_with_no_capture_is_a_noop() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        host.modes.clear();
+        let outputs_before = host.outputs.len();
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert!(host.modes.is_empty());
+        assert_eq!(
+            host.outputs.len(),
+            outputs_before + 4,
+            "only heartbeats emit"
+        );
+        assert!(
+            host.events()[outputs_before..]
+                .iter()
+                .all(|(_, event)| matches!(event, PipeEventKind::Event(BridgeEvent::Heartbeat)))
+        );
+    }
+
+    /// H12: a renewal for any other lease is ignored -- it never extends the
+    /// active capture and never errors. A stale generation cannot keep a
+    /// newer capture alive.
+    #[test]
+    fn foreign_lease_renewal_is_ignored() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        bridge.pipe(
+            request_msg(BridgeRequest::BeginCapture {
+                lease: lease(17),
+                ui_session: session("ui-1"),
+            }),
+            &mut host,
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        host.modes.clear();
+        let outputs_before = host.outputs.len();
+        let foreign = RequestId::INITIAL.next().expect("second request");
+        bridge.pipe(
+            request_msg_with_id(foreign, BridgeRequest::RenewCapture { lease: lease(99) }),
+            &mut host,
+        );
+        // The foreign renewal still releases the pipe (it was accepted), but
+        // the active lease keeps its original deadline: three silent ticks
+        // expire it.
+        assert_eq!(bridge.capture_state(), (None, Some([17; 16])));
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert_eq!(bridge.capture_state(), (None, None));
+        assert_eq!(host.modes.as_slice(), [InputMode::Normal]);
+        let _ = outputs_before;
     }
 
     #[test]

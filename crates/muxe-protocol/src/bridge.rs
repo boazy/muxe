@@ -219,6 +219,10 @@ pub enum BridgeCaptureLostReason {
     UserModeChanged,
     BridgeUnloading,
     AdapterHealth,
+    /// The bridge-side capture lease expired with no broker renewal: the
+    /// broker stopped its periodic `RenewCapture` traffic while Locked-mode
+    /// capture was active, so the bridge restored the prior mode itself.
+    BrokerLeaseExpired,
 }
 
 /// Host-independent broker-to-bridge lifecycle with typed host extensions.
@@ -242,6 +246,13 @@ pub enum BridgeRequest<D, O, H> {
     },
     Retire,
     Shutdown,
+    /// Broker-driven capture-lease renewal: the adapter emits this on its
+    /// sweep cadence while a capture is active so a healthy-but-idle broker
+    /// keeps the bridge-side lease alive. Carries the lease it renews; a
+    /// renewal for any other lease is ignored, never an error.
+    RenewCapture {
+        lease: CaptureLeaseId,
+    },
     Host(H),
 }
 

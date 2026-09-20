@@ -1093,6 +1093,9 @@ impl ZellijAdapter {
                             muxe_zellij_protocol::CaptureLostReason::UserModeChanged => {
                                 muxe_adapter_api::CaptureLossReason::UserModeChanged
                             }
+                            muxe_zellij_protocol::CaptureLostReason::BrokerLeaseExpired => {
+                                muxe_adapter_api::CaptureLossReason::BrokerLeaseExpired
+                            }
                             muxe_zellij_protocol::CaptureLostReason::BridgeUnloading
                             | muxe_zellij_protocol::CaptureLostReason::AdapterHealth => {
                                 muxe_adapter_api::CaptureLossReason::AdapterHealth
@@ -1872,30 +1875,76 @@ impl ZellijAdapter {
     /// with its modal scope. Skipped while suspended or shut down, where
     /// suspend/shutdown teardown already owns registration state. Driven
     /// by the event-loop timer and re-checked at the availability gates.
+    ///
+    /// Every sweep also renews the bridge-side capture lease of each live
+    /// captured client (see [`Self::renew_active_captures`]): the renewal
+    /// is an explicit periodic `RenewCapture` line per captured client, so
+    /// a healthy-but-idle broker keeps capture alive and only a genuinely
+    /// silent broker lets the bridge expire it.
     async fn sweep_expired_clients(&self) {
         if self.inner.shutdown.load(Ordering::Relaxed)
             || self.inner.suspended.load(Ordering::SeqCst)
         {
             return;
         }
-        let _transition = self.inner.registration_transition.lock().await;
-        let now = self.clock_millis();
-        let expired = self.inner.registry.lock().await.expire_leases(now);
-        for (client, registration) in expired {
-            self.retire_registration_state(
-                &client,
-                registration,
-                "Zellij bridge heartbeat expired before completion",
-            )
-            .await;
-            self.emit(AdapterHealthEvent::Unhealthy {
-                modal_scope: Some(Self::scope_for_client(&client)),
-                error: AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    format!("Zellij client {client} heartbeat lease expired"),
-                ),
-            })
-            .await;
+        // Scope the transition guard to the expiry section: renewal below
+        // enqueues (pump re-acquires the non-reentrant transition lock), so
+        // holding the guard across it would deadlock the event loop on the
+        // first sweep with a captured client. The renewal snapshots the
+        // capture table without holding the guard, so lock order stays
+        // transition-then-captures inside expiry and never inverts.
+        {
+            let _transition = self.inner.registration_transition.lock().await;
+            let now = self.clock_millis();
+            let expired = self.inner.registry.lock().await.expire_leases(now);
+            for (client, registration) in expired {
+                self.retire_registration_state(
+                    &client,
+                    registration,
+                    "Zellij bridge heartbeat expired before completion",
+                )
+                .await;
+                self.emit(AdapterHealthEvent::Unhealthy {
+                    modal_scope: Some(Self::scope_for_client(&client)),
+                    error: AdapterError::new(
+                        AdapterErrorKind::Unavailable,
+                        format!("Zellij client {client} heartbeat lease expired"),
+                    ),
+                })
+                .await;
+            }
+        }
+        self.renew_active_captures().await;
+    }
+
+    /// Renews the bridge-side capture lease of every live captured client.
+    ///
+    /// One explicit `RenewCapture` line per captured client, emitted on the
+    /// sweep cadence (event-loop timer plus availability-gate re-checks, so
+    /// renewal cannot stall while a capture is active). The renewal carries
+    /// the owning lease; the bridge only extends that exact lease, so a
+    /// renewal can never resurrect a displaced or already-ended capture.
+    /// Renewal lines are best-effort liveness, not correctness: if they are
+    /// lost, the bridge expires the lease and restores the prior mode
+    /// itself, and the adapter drops its own record on the next heartbeat
+    /// expiry or broker-driven release.
+    async fn renew_active_captures(&self) {
+        if self.inner.shutdown.load(Ordering::Relaxed)
+            || self.inner.suspended.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let renewals: Vec<(String, CommonCaptureLeaseId)> = self
+            .inner
+            .captures
+            .lock()
+            .await
+            .captured_leases()
+            .into_iter()
+            .collect();
+        for (client_id, lease) in renewals {
+            self.enqueue_lifecycle(client_id, BridgeRequest::RenewCapture { lease })
+                .await;
         }
     }
 
@@ -2156,6 +2205,20 @@ impl ZellijAdapter {
             .await
     }
 
+    /// Release path for a failed capture setup: drops the table record so no
+    /// stale `Beginning` state blocks later attempts, without claiming any
+    /// mode restoration (the bridge owns Locked mode and restores it through
+    /// its own guarded path). Idempotent: releasing an already-released or
+    /// never-held lease is a no-op.
+    async fn release_on_setup_failure(&self, client_id: &str, lease: [u8; 16]) {
+        let _ = self
+            .inner
+            .captures
+            .lock()
+            .await
+            .release(client_id, lease, false);
+    }
+
     async fn enqueue_lifecycle(&self, client_id: String, payload: BridgeRequest) {
         self.enqueue(QueuedItem {
             execution: None,
@@ -2289,6 +2352,10 @@ impl ActionValidator for ZellijAdapter {
 }
 
 #[async_trait]
+#[expect(
+    clippy::too_many_lines,
+    reason = "adapter-contract trait impl: begin_capture's setup/timeout arms plus the capture and origin surface stay co-located for protocol review"
+)]
 impl HostAdapter for ZellijAdapter {
     async fn identity(&self) -> Result<HostIdentity, AdapterError> {
         Ok(self.host_identity())
@@ -2355,60 +2422,72 @@ impl HostAdapter for ZellijAdapter {
             },
         )
         .await;
+        // `CaptureReady` arrived: confirm, but re-check the table first. A
+        // concurrent `CaptureLost` (user mode change, bridge unload, or the
+        // bridge-side lease expiring the capture itself) may have released
+        // the record while the ready line was in flight; confirming then
+        // would resurrect a stale lease. On that race the setup fails and
+        // the release attempt below still runs so a bridge that did enter
+        // Locked mode is told to restore.
         if let Ok(Ok(Ok(prior_mode))) = timeout(CAPTURE_TIMEOUT, receiver).await {
-            self.inner
+            let confirmed = self
+                .inner
                 .captures
                 .lock()
                 .await
                 .confirm(&client_id, lease, prior_mode)
-                .map_err(|error| {
-                    AdapterError::new(AdapterErrorKind::Unavailable, error.to_string())
-                })?;
-            Ok(ApiCaptureLease {
-                id: CaptureLeaseId::new(hex_id(&lease)),
-                ui_session: request.ui_session,
-                modal_scope: request.modal_scope,
-            })
-        } else {
-            let transition = self.inner.registration_transition.lock().await;
-            let sent = self
-                .inner
-                .pending_capture
-                .lock()
-                .await
-                .remove(&lease)
-                .is_some_and(|(_, reply)| reply.request.is_some());
-            if !sent && let Some(queue) = self.inner.queues.lock().await.get_mut(&client_id) {
-                queue.retain(|item| {
-                    !matches!(
-                        item.payload.as_ref(),
-                        Some(BridgeRequest::BeginCapture { lease: pending, .. })
-                            if pending.0 == lease
-                    )
+                .is_ok();
+            if confirmed {
+                return Ok(ApiCaptureLease {
+                    id: CaptureLeaseId::new(hex_id(&lease)),
+                    ui_session: request.ui_session,
+                    modal_scope: request.modal_scope,
                 });
             }
-            let _ = self
-                .inner
-                .captures
-                .lock()
-                .await
-                .release(&client_id, lease, false);
-            drop(transition);
-            if sent {
-                self.enqueue_lifecycle(
-                    client_id,
-                    BridgeRequest::EndCapture {
-                        lease: CommonCaptureLeaseId(lease),
-                        reason: CaptureEndReason::LeaseExpired,
-                    },
-                )
-                .await;
-            }
-            Err(AdapterError::new(
+            self.release_on_setup_failure(&client_id, lease).await;
+            return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "timed out waiting for Zellij Locked-mode capture",
-            ))
+                "Zellij Locked-mode capture was lost before setup completed",
+            ));
         }
+        let transition = self.inner.registration_transition.lock().await;
+        let sent = self
+            .inner
+            .pending_capture
+            .lock()
+            .await
+            .remove(&lease)
+            .is_some_and(|(_, reply)| reply.request.is_some());
+        if !sent && let Some(queue) = self.inner.queues.lock().await.get_mut(&client_id) {
+            queue.retain(|item| {
+                !matches!(
+                    item.payload.as_ref(),
+                    Some(BridgeRequest::BeginCapture { lease: pending, .. })
+                        if pending.0 == lease
+                )
+            });
+        }
+        // Timeout (or dropped waiter): the bridge may still have entered
+        // Locked mode, so attempt the release path rather than relying on
+        // the best-effort `EndCapture` line for correctness. Clearing the
+        // table record first is what unblocks later attempts; the line
+        // itself only asks the bridge to restore.
+        self.release_on_setup_failure(&client_id, lease).await;
+        drop(transition);
+        if sent {
+            self.enqueue_lifecycle(
+                client_id,
+                BridgeRequest::EndCapture {
+                    lease: CommonCaptureLeaseId(lease),
+                    reason: CaptureEndReason::LeaseExpired,
+                },
+            )
+            .await;
+        }
+        Err(AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            "timed out waiting for Zellij Locked-mode capture",
+        ))
     }
 
     async fn end_capture(
@@ -4113,6 +4192,209 @@ mod tests {
         adapter.shutdown().await.expect("shutdown");
     }
 
+    /// H12: setup failure after the bridge may have entered Locked mode
+    /// (the `CaptureReady` waiter resolves only with `Err`, e.g. the waiter
+    /// sender was dropped by a racing `CaptureLost`) attempts the release
+    /// path and leaves the table clean so a subsequent capture succeeds.
+    /// The test drops the waiter sender directly -- the same outcome the
+    /// event loop produces when a `CaptureLost` removes the waiter -- then
+    /// asserts the table is idle and a fresh capture round-trips.
+    #[tokio::test]
+    async fn capture_setup_failure_after_mode_entry_releases_and_unblocks_retry() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        // First attempt: let the BeginCapture line reach the transport, then
+        // release the request pipe so the pump sends it (the event loop only
+        // pumps after `RequestReleased`; without this the line sits queued).
+        let first = tokio::spawn({
+            let adapter = adapter.clone();
+            async move {
+                adapter
+                    .begin_capture(CaptureRequest {
+                        ui_session: UiSessionId::new("session-1"),
+                        modal_scope: ZellijAdapter::scope_for_client("client-1"),
+                    })
+                    .await
+            }
+        });
+        let begin_line = poll_outbound(&request).await;
+        let begin_frame = decode_request_line(&begin_line).expect("begin frame");
+        let BridgeRequest::BeginCapture { lease, .. } = begin_frame.payload else {
+            panic!("first outbound line is BeginCapture");
+        };
+        event.push_line(
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(begin_frame.request_id),
+                PipeEventKind::Response(BridgeResponse::RequestReleased),
+            ))
+            .expect("release encodes"),
+        );
+        // Simulate the racing loss: drop the waiter sender like
+        // `CaptureLost` handling does, so the receiver errors even though
+        // the bridge may have entered Locked mode.
+        adapter.inner.pending_capture.lock().await.remove(&lease.0);
+        let error = first
+            .await
+            .expect("capture task joins")
+            .expect_err("failed setup errors");
+        assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+        // The table is clean: no stale Beginning record blocks a retry.
+        assert!(
+            adapter
+                .inner
+                .captures
+                .lock()
+                .await
+                .state("client-1")
+                .is_idle(),
+            "failed setup leaves no stale capture record"
+        );
+        // A subsequent capture attempt succeeds end to end.
+        let lease = drive_capture_to_ready(&adapter, &request, &event).await;
+        assert_eq!(
+            lease.modal_scope,
+            ZellijAdapter::scope_for_client("client-1")
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    /// Drives one `begin_capture` round-trip against the scripted channels:
+    /// spawns the capture, releases the request pipe, answers `CaptureReady`
+    /// with a `Normal` prior, and returns the resulting lease.
+    async fn drive_capture_to_ready(
+        adapter: &ZellijAdapter,
+        request: &ScriptedChannel,
+        event: &ScriptedChannel,
+    ) -> ApiCaptureLease {
+        let retry = tokio::spawn({
+            let adapter = adapter.clone();
+            async move {
+                adapter
+                    .begin_capture(CaptureRequest {
+                        ui_session: UiSessionId::new("session-1"),
+                        modal_scope: ZellijAdapter::scope_for_client("client-1"),
+                    })
+                    .await
+            }
+        });
+        let retry_line = poll_outbound(request).await;
+        let retry_frame = decode_request_line(&retry_line).expect("retry frame");
+        let BridgeRequest::BeginCapture {
+            lease: retry_lease, ..
+        } = retry_frame.payload
+        else {
+            panic!("retry outbound line is BeginCapture");
+        };
+        event.push_line(
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(retry_frame.request_id),
+                PipeEventKind::Response(BridgeResponse::RequestReleased),
+            ))
+            .expect("release encodes"),
+        );
+        event.push_line(
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(retry_frame.request_id),
+                PipeEventKind::Response(BridgeResponse::CaptureReady {
+                    lease: retry_lease,
+                    state: muxe_zellij_protocol::ZellijCaptureState {
+                        prior_mode: "Normal".to_owned(),
+                    },
+                }),
+            ))
+            .expect("ready encodes"),
+        );
+        retry.await.expect("retry joins").expect("retry succeeds")
+    }
+
+    /// H12: a renewal sweep emits one explicit `RenewCapture` per captured
+    /// client on the sweep cadence, so an idle-but-live broker keeps the
+    /// bridge-side lease alive. Seeded directly (confirmed capture, no
+    /// waiter) so the assertion covers exactly the renewal path.
+    #[tokio::test(start_paused = true)]
+    async fn capture_sweep_renews_live_capture_on_cadence() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        let lease = [9; 16];
+        {
+            let mut captures = adapter.inner.captures.lock().await;
+            captures
+                .begin("client-1", "session-1", lease)
+                .expect("capture begins");
+            captures
+                .confirm("client-1", lease, "Normal".to_owned())
+                .expect("capture confirms");
+        }
+        // One sweep tick renews: a single RenewCapture line for the lease.
+        adapter.sweep_expired_clients().await;
+        let outbound = request.take_outbound();
+        assert_eq!(outbound.len(), 1, "one renewal per captured client");
+        let frame = decode_request_line(&outbound[0]).expect("renewal frame");
+        assert_eq!(frame.target.client_id, "client-1");
+        match frame.payload {
+            BridgeRequest::RenewCapture { lease: renewed } => {
+                assert_eq!(renewed.0, lease);
+            }
+            other => panic!("expected RenewCapture, got {other:?}"),
+        }
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    /// H12: bridge-side lease expiry surfaces as a typed
+    /// `BrokerLeaseExpired` loss (not generic adapter-health), so the broker
+    /// can distinguish a silent broker from other failures.
+    #[tokio::test]
+    async fn capture_lost_lease_expiry_maps_to_typed_reason() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        event.push_line(
+            encode_event_line(&pipe_event(
+                [7; 16],
+                None,
+                PipeEventKind::Event(BridgeEvent::CaptureLost {
+                    lease: CommonCaptureLeaseId([4; 16]),
+                    reason: muxe_zellij_protocol::CaptureLostReason::BrokerLeaseExpired,
+                }),
+            ))
+            .expect("loss encodes"),
+        );
+        assert!(
+            matches!(
+                next_event(&adapter).await,
+                AdapterHealthEvent::CaptureLost {
+                    reason: muxe_adapter_api::CaptureLossReason::BrokerLeaseExpired,
+                    ..
+                }
+            ),
+            "lease expiry maps to the typed loss reason"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
     /// A mismatched `bridge_build_id` registration is contained: the bridge is
     /// recorded but flagged incompatible, so no dispatch line reaches the pipe.
     #[tokio::test]
@@ -4836,6 +5118,12 @@ mod tests {
                 .expect("capture confirms");
         }
         adapter.inner.live_executions.lock().await.insert(77, None);
+        // A real lifecycle payload: the pre-existing `payload: None` seed
+        // could never survive any enqueue-triggered pump (the pump consumes
+        // a payload-less head with an `Unhealthy` report), while production
+        // queues only ever hold encodable payloads. `Retire` models one
+        // queued lifecycle line without touching execution 77, which stays a
+        // purely supervised entry that must never complete as unknown.
         adapter
             .inner
             .queues
@@ -4844,9 +5132,9 @@ mod tests {
             .entry("client-1".to_owned())
             .or_default()
             .push_back(QueuedItem {
-                execution: Some(ExecutionId(77)),
+                execution: None,
                 client_id: "client-1".to_owned(),
-                payload: None,
+                payload: Some(BridgeRequest::Retire),
             });
         let (waiter_tx, mut waiter_rx) = oneshot::channel();
         adapter.inner.pending_capture.lock().await.insert(
@@ -4973,6 +5261,8 @@ mod tests {
         );
         // Session health for exactly the expired client: capture loss with
         // its real session, then the scoped unavailable report.
+        // Session health for exactly the expired client: capture loss with
+        // its real session, then the scoped unavailable report.
         assert!(
             matches!(
                 next_event(&adapter).await,
@@ -4991,6 +5281,17 @@ mod tests {
             ),
             "expiry reports the quiet client unhealthy once"
         );
+        // Pre-expiry pump evidence: the seeded Retire went out on the first
+        // renewal-triggered pump (the renewal itself stays queued behind the
+        // unacked Retire -- the release timer only re-arms the pipe at the
+        // same instant the expiry sweep reaps the client, so the renewal is
+        // never sent). Drained here so later assertions see only post-expiry
+        // behavior.
+        let pre_expiry = request.take_outbound();
+        assert_eq!(pre_expiry.len(), 1, "only the seeded line goes out");
+        let first_out = decode_request_line(&pre_expiry[0]).expect("seeded frame");
+        assert_eq!(first_out.target.client_id, "client-1");
+        assert!(matches!(first_out.payload, BridgeRequest::Retire));
         // The healthy client re-registers and pumps without touching the
         // expired client's paused queue; nothing new reaches the transport
         // and the shared event channel never restarted.
@@ -5000,15 +5301,31 @@ mod tests {
             AdapterHealthEvent::Healthy { .. }
         ));
         adapter.pump_all().await;
+        // Two renewal lines (one per live pre-expiry sweep at the 5s and
+        // 10s ticks) pause instead of purging: without a registration the
+        // pump re-queues instead of sending, and the shared event channel
+        // never restarted. The 15s tick is the one that reaps (paused-clock
+        // overhead makes now-last exceed the 15s lease there), so it renews
+        // nothing after invalidating the capture.
+        let paused: Vec<BridgeRequest> = adapter
+            .inner
+            .queues
+            .lock()
+            .await
+            .get("client-1")
+            .map(|queue| {
+                queue
+                    .iter()
+                    .filter_map(|item| item.payload.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(paused.len(), 2, "renewals pause instead of purging");
         assert!(
-            adapter
-                .inner
-                .queues
-                .lock()
-                .await
-                .get("client-1")
-                .is_some_and(|queue| queue.len() == 1),
-            "expired queue pauses instead of purging"
+            paused
+                .iter()
+                .all(|payload| matches!(payload, BridgeRequest::RenewCapture { .. })),
+            "only renewals remain queued"
         );
         assert!(
             adapter.inner.live_executions.lock().await.contains_key(&77),
