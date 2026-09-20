@@ -1987,6 +1987,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn lock_selectors_route_lock_bearing_parser_events_to_the_lock_binding() {
+        let kitty = KeyboardProfileWire::Kitty(KeyCapabilitiesWire {
+            event_types: true,
+            alternate_keys: true,
+            all_keys_as_escape_codes: false,
+        });
+        let bindings = || {
+            vec![
+                binding(
+                    1,
+                    "caps-lock+left",
+                    "Caps Left",
+                    BindingConditionsWire::default(),
+                    None,
+                ),
+                binding(2, "left", "Left", BindingConditionsWire::default(), None),
+            ]
+        };
+        let mut runtime = UiRuntime::attach(profiled_attachment(kitty.clone(), bindings()))
+            .expect("Kitty attachment attaches");
+        runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("Kitty attachment renders");
+        assert_eq!(
+            runtime
+                .handle_input(&parsed_input(b"\x1b[57350;65u"))
+                .expect("caps-lock event selects the caps-lock binding"),
+            UiCommand::Invoke {
+                generation: 7,
+                binding: BindingId {
+                    generation: 7,
+                    ordinal: 1,
+                },
+            }
+        );
+
+        let mut runtime = UiRuntime::attach(profiled_attachment(kitty, bindings()))
+            .expect("Kitty attachment attaches");
+        runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("Kitty attachment renders");
+        assert_eq!(
+            runtime
+                .handle_input(&parsed_input(b"\x1b[57350;1u"))
+                .expect("lock-free event selects the plain binding"),
+            UiCommand::Invoke {
+                generation: 7,
+                binding: BindingId {
+                    generation: 7,
+                    ordinal: 2,
+                },
+            }
+        );
+    }
+
+    #[test]
     fn awaited_acceptance_shows_pending_and_matching_completion_clears_it() {
         let binding = BindingId {
             generation: 7,

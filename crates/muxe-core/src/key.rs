@@ -45,12 +45,28 @@ impl Modifiers {
     pub const fn has_lock_modifier(self) -> bool {
         self.contains(Self::CAPS_LOCK) || self.contains(Self::NUM_LOCK)
     }
+
+    #[must_use]
+    pub const fn without_locks(self) -> Self {
+        Self(self.0 & !(Self::CAPS_LOCK | Self::NUM_LOCK))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct LockModifiers {
     pub caps_lock: bool,
     pub num_lock: bool,
+}
+
+impl LockModifiers {
+    /// Returns whether this event's lock state satisfies each lock the binding requires.
+    ///
+    /// A binding with no lock selector keeps matching lock-bearing events exactly as
+    /// today: only the lock bits the binding names are required.
+    #[must_use]
+    pub const fn matches_requirements(self, required: Self) -> bool {
+        (!required.caps_lock || self.caps_lock) && (!required.num_lock || self.num_lock)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -671,6 +687,11 @@ impl CanonicalKey {
         capabilities
     }
 
+    /// Matches one event.
+    ///
+    /// Ordinary modifiers must agree exactly. Each configured lock modifier must be
+    /// active in the event's lock state; a binding without lock modifiers ignores
+    /// lock state.
     #[must_use]
     pub fn matches(&self, event: &KeyEvent) -> bool {
         let identity = match self.source {
@@ -678,7 +699,18 @@ impl CanonicalKey {
             KeyIdentitySource::Alternate => event.alternate.as_ref(),
             KeyIdentitySource::BaseLayout => event.base_layout.as_ref(),
         };
-        identity == Some(&self.identity) && event.modifiers == self.modifiers
+        identity == Some(&self.identity)
+            && event.modifiers.without_locks() == self.modifiers.without_locks()
+            && event.locks.matches_requirements(self.lock_requirements())
+    }
+
+    /// Returns the lock state this binding requires, derived from its lock modifiers.
+    #[must_use]
+    pub const fn lock_requirements(&self) -> LockModifiers {
+        LockModifiers {
+            caps_lock: self.modifiers.contains(Modifiers::CAPS_LOCK),
+            num_lock: self.modifiers.contains(Modifiers::NUM_LOCK),
+        }
     }
 
     #[must_use]
@@ -906,6 +938,73 @@ mod tests {
         let required = key.required_capabilities(Some(true));
         assert!(required.event_types);
         assert!(!required.all_keys_as_escape_codes);
+    }
+
+    #[test]
+    fn configured_lock_modifiers_match_event_lock_state() {
+        let left = || KeyEvent {
+            primary: Some(KeyIdentity::Named(NamedKey::Left)),
+            alternate: None,
+            base_layout: None,
+            modifiers: Modifiers::empty(),
+            kind: EventKind::Press,
+            locks: LockModifiers::default(),
+            keypad: false,
+        };
+        let caps = KeyEvent {
+            locks: LockModifiers {
+                caps_lock: true,
+                num_lock: false,
+            },
+            ..left()
+        };
+        let num = KeyEvent {
+            locks: LockModifiers {
+                caps_lock: false,
+                num_lock: true,
+            },
+            ..left()
+        };
+        let caps_binding = CanonicalKey::parse("caps-lock+left").unwrap();
+        let num_binding = CanonicalKey::parse("num-lock+left").unwrap();
+        let plain = CanonicalKey::parse("left").unwrap();
+
+        assert!(caps_binding.matches(&caps));
+        assert!(!caps_binding.matches(&left()));
+        assert!(!caps_binding.matches(&num));
+        assert!(num_binding.matches(&num));
+        assert!(!num_binding.matches(&left()));
+        assert!(!num_binding.matches(&caps));
+        assert!(plain.matches(&caps));
+        assert!(plain.matches(&num));
+        assert!(plain.matches(&left()));
+    }
+
+    #[test]
+    fn lock_and_ordinary_modifiers_combine_without_cross_matching() {
+        let event = KeyEvent {
+            primary: Some(KeyIdentity::Named(NamedKey::Left)),
+            alternate: None,
+            base_layout: None,
+            modifiers: Modifiers::empty(),
+            kind: EventKind::Press,
+            locks: LockModifiers {
+                caps_lock: true,
+                num_lock: false,
+            },
+            keypad: false,
+        };
+        assert!(
+            CanonicalKey::parse("caps-lock+left")
+                .unwrap()
+                .matches(&event)
+        );
+        assert!(
+            !CanonicalKey::parse("shift+caps-lock+left")
+                .unwrap()
+                .matches(&event)
+        );
+        assert!(!CanonicalKey::parse("shift+left").unwrap().matches(&event));
     }
 
     #[test]

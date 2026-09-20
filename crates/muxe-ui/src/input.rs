@@ -294,4 +294,77 @@ mod tests {
             assert!(converted.event.locks.num_lock);
         }
     }
+
+    fn parsed_key_event(bytes: &[u8]) -> ConvertedKeyEvent {
+        let mut parser = Parser::new();
+        let mut parsed = None;
+        parser.push(bytes, |event| {
+            assert!(
+                parsed.replace(event).is_none(),
+                "one sequence emits one event"
+            );
+        });
+        parser.finish(|event| {
+            assert!(
+                parsed.replace(event).is_none(),
+                "one sequence emits one event"
+            );
+        });
+        let ConvertedInput::Key(converted) = convert_input(parsed.expect("sequence emits")) else {
+            panic!("CSI-u key sequence must convert to a key event");
+        };
+        converted
+    }
+
+    #[test]
+    fn lock_bearing_csi_u_events_match_their_configured_lock_bindings() {
+        use muxe_core::{CanonicalKey, KeyboardProfile};
+
+        let profile = KeyboardProfile::Kitty(muxe_core::KeyCapabilities::default());
+        for (bytes, lock_binding, other_lock_binding) in [
+            (
+                b"\x1b[57350;65u".as_slice(),
+                "caps-lock+left",
+                "num-lock+left",
+            ),
+            (
+                b"\x1b[57350;129u".as_slice(),
+                "num-lock+left",
+                "caps-lock+left",
+            ),
+        ] {
+            let converted = parsed_key_event(bytes);
+            assert_eq!(
+                converted.event.primary,
+                Some(KeyIdentity::Named(NamedKey::Left))
+            );
+            let configured = CanonicalKey::parse(lock_binding).unwrap();
+            let other = CanonicalKey::parse(other_lock_binding).unwrap();
+            let plain = CanonicalKey::parse("left").unwrap();
+            assert!(configured.matches(&converted.event));
+            assert!(profile.matches_binding(&configured, &converted.event));
+            assert!(!other.matches(&converted.event));
+            assert!(!profile.matches_binding(&other, &converted.event));
+            assert!(plain.matches(&converted.event));
+            assert!(profile.matches_binding(&plain, &converted.event));
+        }
+    }
+
+    #[test]
+    fn lock_selectors_reject_lock_free_csi_u_events() {
+        use muxe_core::{CanonicalKey, KeyboardProfile};
+
+        let profile = KeyboardProfile::Kitty(muxe_core::KeyCapabilities::default());
+        let converted = parsed_key_event(b"\x1b[57350;1u");
+        assert!(!converted.event.locks.caps_lock);
+        assert!(!converted.event.locks.num_lock);
+        for binding in ["caps-lock+left", "num-lock+left"] {
+            let configured = CanonicalKey::parse(binding).unwrap();
+            assert!(!configured.matches(&converted.event));
+            assert!(!profile.matches_binding(&configured, &converted.event));
+        }
+        let plain = CanonicalKey::parse("left").unwrap();
+        assert!(plain.matches(&converted.event));
+        assert!(profile.matches_binding(&plain, &converted.event));
+    }
 }
