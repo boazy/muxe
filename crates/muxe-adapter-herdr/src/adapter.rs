@@ -1229,10 +1229,20 @@ fn literal_scalar_for<'a>(
         (PortableAction::Tab(TabAction::Create { workspace_id, .. }), "workspace_id") => {
             workspace_id.as_ref()
         }
-        (PortableAction::Tab(TabAction::Create { name, .. }), "label") => name.as_ref(),
-        (PortableAction::Tab(TabAction::Create { focus, .. }), "focus") => focus.as_ref(),
-        (PortableAction::Tab(TabAction::Create { command, .. }), "cwd") => command.cwd.as_ref(),
-        (PortableAction::Tab(TabAction::Rename { name }), "label") => name.as_ref(),
+        (
+            PortableAction::Tab(TabAction::Create { name, .. } | TabAction::Rename { name }),
+            "label",
+        ) => name.as_ref(),
+        (
+            PortableAction::Tab(TabAction::Create { focus, .. })
+            | PortableAction::Pane(PaneAction::Split { focus, .. }),
+            "focus",
+        ) => focus.as_ref(),
+        (
+            PortableAction::Tab(TabAction::Create { command, .. })
+            | PortableAction::Pane(PaneAction::Split { command, .. }),
+            "cwd",
+        ) => command.cwd.as_ref(),
         (
             PortableAction::Tab(TabAction::Move(muxe_core::IndexOrDirection::Index(index))),
             "insert_index",
@@ -1240,18 +1250,11 @@ fn literal_scalar_for<'a>(
         (PortableAction::Pane(PaneAction::Split { direction, .. }), "direction") => {
             direction.as_ref()
         }
-        (PortableAction::Pane(PaneAction::Split { focus, .. }), "focus") => focus.as_ref(),
-        (PortableAction::Pane(PaneAction::Split { command, .. }), "cwd") => command.cwd.as_ref(),
         (
-            PortableAction::Pane(PaneAction::Focus(muxe_core::IndexOrDirection::Direction(
-                direction,
-            ))),
-            "direction",
-        ) => Some(direction),
-        (
-            PortableAction::Pane(PaneAction::Swap(muxe_core::IndexOrDirection::Direction(
-                direction,
-            ))),
+            PortableAction::Pane(
+                PaneAction::Focus(muxe_core::IndexOrDirection::Direction(direction))
+                | PaneAction::Swap(muxe_core::IndexOrDirection::Direction(direction)),
+            ),
             "direction",
         ) => Some(direction),
         (PortableAction::Pane(PaneAction::Resize { direction, .. }), "direction") => {
@@ -2358,15 +2361,10 @@ fn single_request_invocation(
             method: description.method,
             params: json!({ "pane_id": pane }),
         }),
-        PortableAction::Pane(PaneAction::Focus(muxe_core::IndexOrDirection::Direction(
-            direction,
-        ))) => Ok(Invocation {
-            method: description.method,
-            params: json!({ "pane_id": pane, "direction": scalar_pane_direction(direction)? }),
-        }),
-        PortableAction::Pane(PaneAction::Swap(muxe_core::IndexOrDirection::Direction(
-            direction,
-        ))) => Ok(Invocation {
+        PortableAction::Pane(
+            PaneAction::Focus(muxe_core::IndexOrDirection::Direction(direction))
+            | PaneAction::Swap(muxe_core::IndexOrDirection::Direction(direction)),
+        ) => Ok(Invocation {
             method: description.method,
             params: json!({ "pane_id": pane, "direction": scalar_pane_direction(direction)? }),
         }),
@@ -2439,6 +2437,10 @@ enum PortableScalarKind {
 /// that stay absent still emit their builder default, so they appear as `Default` fields;
 /// `None` here means the action has no Herdr mapping at all. Every `PortableAction` variant
 /// is covered below, so the match needs no wildcard arm.
+#[expect(
+    clippy::too_many_lines,
+    reason = "The explicit action-to-request table is the validation and dispatch contract."
+)]
 fn portable_request_description(
     action: &PortableAction,
 ) -> Result<Option<PortableRequestDescription>, String> {
