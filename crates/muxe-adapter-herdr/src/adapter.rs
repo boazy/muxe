@@ -285,6 +285,33 @@ impl HerdrAdapter {
         registry.closed && registry.finalized && registry.tasks.is_empty() && registry.joining == 0
     }
 
+    /// One explicit adapter lifecycle gate for every host-bound operation,
+    /// mirroring Zellij's `require_active` shape: a shut-down adapter fails
+    /// closed with `Shutdown` first, a suspended adapter is `Unavailable`
+    /// while its retained stream is released, and only then does the retained
+    /// continuity epoch authorize the call. `identity` stays on continuity
+    /// alone (it returns the retained identity, never a new host request) so
+    /// its error behavior is unchanged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
+    fn require_lifecycle(&self) -> Result<u64, AdapterError> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Herdr adapter is shut down; host-bound operations are closed",
+            ));
+        }
+        if self.suspended.load(Ordering::SeqCst) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Herdr adapter is suspended for activation; host-bound operations are blocked until resume or commit",
+            ));
+        }
+        self.require_continuity()
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
@@ -312,7 +339,7 @@ impl HerdrAdapter {
         &self,
         origin: &muxe_core::OriginContext,
     ) -> Result<u64, AdapterError> {
-        let epoch = self.require_continuity()?;
+        let epoch = self.require_lifecycle()?;
         if !origin_is_current(origin, &self.identity(), epoch) {
             return Err(AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
@@ -404,6 +431,10 @@ impl HerdrAdapter {
         execution: muxe_core::ExecutionId,
         invocation: Invocation,
     ) -> Result<DispatchAccepted, AdapterError> {
+        // The closed registry already rejects admission after shutdown, but
+        // the lifecycle gate owns the ordering (shutdown → suspended →
+        // continuity) and covers the window before shutdown closes it.
+        self.require_lifecycle()?;
         let runtime = self.runtime();
         runtime
             .schema()
@@ -473,6 +504,7 @@ impl HerdrAdapter {
         origin: &muxe_core::OriginContext,
         target_index: u64,
     ) -> Result<DispatchAccepted, AdapterError> {
+        self.require_lifecycle()?;
         let runtime = self.runtime();
         let source_tab = origin_tab(origin)?.to_owned();
         let workspace = origin
@@ -578,6 +610,7 @@ impl HerdrAdapter {
         action: &PortableAction,
         origin: &muxe_core::OriginContext,
     ) -> Result<DispatchAccepted, AdapterError> {
+        self.require_lifecycle()?;
         let runtime = self.runtime();
         let results = self.dispatch_results_tx.clone();
         let action = action.clone();
@@ -689,7 +722,7 @@ impl HerdrAdapter {
         method: &str,
         params: Value,
     ) -> Result<HerdrResponse, AdapterError> {
-        self.require_continuity()?;
+        self.require_lifecycle()?;
         let runtime = self.runtime();
         runtime
             .schema()
@@ -713,7 +746,7 @@ impl HerdrAdapter {
         params: Value,
         endpoint: &EndpointIdentity,
     ) -> Result<HerdrResponse, AdapterError> {
-        self.require_continuity()?;
+        self.require_lifecycle()?;
         let runtime = self.runtime();
         runtime
             .schema()
@@ -1435,7 +1468,7 @@ impl HostAdapter for HerdrAdapter {
         &self,
         registration: PendingPaneRegistration,
     ) -> Result<PendingPaneLease, AdapterError> {
-        let epoch = self.require_continuity()?;
+        let epoch = self.require_lifecycle()?;
         let pane = self
             .invoke_unary("pane.get", json!({ "pane_id": registration.pane.as_str() }))
             .await?;
@@ -1489,7 +1522,7 @@ impl HostAdapter for HerdrAdapter {
         registration: PendingPaneRegistration,
         lease: PendingPaneLease,
     ) -> Result<(), AdapterError> {
-        let epoch = self.require_continuity()?;
+        let epoch = self.require_lifecycle()?;
         let record = self.pending_close_record(&registration, &lease, epoch)?;
         let pane = match self
             .invoke_unary_response_on_endpoint(
@@ -1526,9 +1559,13 @@ impl HostAdapter for HerdrAdapter {
                 "pending Herdr pane identity changed",
             ));
         }
-        if self.require_continuity()? != record.host_epoch {
+        if self.require_lifecycle()? != record.host_epoch {
             return Err(pending_cleanup_lease_stale());
         }
+        // Re-check immediately before the state-changing send: a shutdown
+        // that raced the pane.get probe must not let a cloned lease's
+        // endpoint request reach the host after shutdown returned.
+        self.require_lifecycle()?;
         let runtime = self.runtime();
         let close_params = json!({ "pane_id": record.pane.as_str() });
         runtime
@@ -1583,7 +1620,7 @@ impl HostAdapter for HerdrAdapter {
         &self,
         request: OriginCaptureRequest,
     ) -> Result<muxe_core::OriginContext, AdapterError> {
-        let epoch = self.require_continuity()?;
+        let epoch = self.require_lifecycle()?;
         let runtime = self.runtime();
         let origin = crate::origin::capture_origin(
             runtime.client(),
@@ -1763,6 +1800,12 @@ impl HostAdapter for HerdrAdapter {
     }
 
     async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Herdr adapter is shut down; refusing to install a resumed subscription",
+            ));
+        }
         if !self.suspended.load(Ordering::SeqCst) {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
@@ -1805,7 +1848,15 @@ impl HostAdapter for HerdrAdapter {
         }
         {
             // A fresh local epoch: raw endpoint equality is diagnostic only and
-            // never continuity proof, so stale origins stay rejected.
+            // never continuity proof, so stale origins stay rejected. A shutdown
+            // that raced the resume must win: re-check before installing a new
+            // epoch so no fresh subscription revives a shut-down adapter.
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Shutdown,
+                    "Herdr adapter shut down during activation resume; refusing to install a resumed subscription",
+                ));
+            }
             let mut continuity = self
                 .continuity
                 .write()
@@ -1839,6 +1890,17 @@ impl HostAdapter for HerdrAdapter {
             std::mem::take(&mut registry.tasks)
         };
         self.shutdown.store(true, Ordering::Relaxed);
+        // Invalidate continuity before stopping the stream: no later path may
+        // see a healthy epoch, and a racing resume/reconnect cannot install a
+        // fresh subscription after this point. The parked monitor also drops
+        // its resume slot below so a handed-over subscription cannot revive it.
+        {
+            let mut continuity = self
+                .continuity
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            continuity.healthy = false;
+        }
         self.pending_leases
             .lock()
             .expect("Herdr pending lease registry is not poisoned")
@@ -1847,6 +1909,9 @@ impl HostAdapter for HerdrAdapter {
             .await;
         // Every monitor send is interruptible by the shutdown wake below, so
         // joining it cannot depend on a consumer freeing bounded health space.
+        // Clearing the resume slot first means a suspend-parked monitor can
+        // only observe shutdown, never a stale handed-over subscription.
+        *self.resume_slot.lock().await = None;
         self.suspend_wake.notify_one();
         self.resume_wake.notify_one();
         if let Some(monitor) = self.monitor.lock().await.take() {
@@ -2044,6 +2109,12 @@ async fn reconnect_subscription(
             *identity = current.clone();
         }
         {
+            // A shutdown that raced the reconnect must win: re-check before
+            // marking continuity healthy so no fresh subscription revives a
+            // shut-down adapter.
+            if adapter.shutdown.load(Ordering::Relaxed) {
+                return ReconnectOutcome::Stop;
+            }
             let mut continuity = adapter
                 .continuity
                 .write()

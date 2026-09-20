@@ -1386,3 +1386,182 @@ async fn shutdown_finalization_between_wake_registration_and_select_drains_termi
         })
     ));
 }
+
+/// M31: after `shutdown`, every host-bound operation fails closed and the
+/// recorded server receives no new request bytes. The fixture counts requests
+/// before/after; the only forced disconnect is the retained-stream drop at
+/// shutdown, never a new JSON-RPC request.
+#[tokio::test]
+async fn shutdown_leaves_no_host_bound_operation_reaching_the_recorded_server() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(ProductionConnectFixture::snapshot_exchange(
+        &lifecycle_snapshot(),
+    ));
+    // One pane.get proves register reaches the host before shutdown; no
+    // further host request may follow shutdown.
+    script.push(pending_pane_get());
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned shutdown fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures before shutdown");
+    let lease = adapter
+        .register_pending_pane(pending_pane_registration())
+        .await
+        .expect("register reaches the host before shutdown");
+    // Handshake plus capture plus register: ping + subscribe + snapshot +
+    // pane.get. The scripted script must cover exactly those exchanges.
+    fixture.wait_for_requests(4).await;
+    let before = fixture.requests().await.len();
+    assert_eq!(before, 4, "handshake plus capture plus register only");
+
+    adapter.shutdown().await.expect("shutdown succeeds");
+    let after_shutdown = fixture.requests().await.len();
+    assert_eq!(
+        after_shutdown, before,
+        "shutdown itself sends no JSON-RPC request"
+    );
+
+    let modal = adapter.modal_scope(&PaneId::new("pane-1")).await;
+    assert!(
+        matches!(
+            &modal,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+                || error.kind == AdapterErrorKind::Unavailable
+        ),
+        "modal_scope fails closed after shutdown, got {modal:?}"
+    );
+    let capture = adapter.capture_origin(lifecycle_capture_request()).await;
+    assert!(
+        matches!(
+            &capture,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+                || error.kind == AdapterErrorKind::Unavailable
+        ),
+        "capture_origin fails closed after shutdown, got {capture:?}"
+    );
+    let register = adapter
+        .register_pending_pane(pending_pane_registration())
+        .await;
+    assert!(
+        matches!(
+            &register,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+                || error.kind == AdapterErrorKind::Unavailable
+        ),
+        "register_pending_pane fails closed after shutdown, got {register:?}"
+    );
+    let close = adapter
+        .close_pending_pane(pending_pane_registration(), lease)
+        .await;
+    assert!(
+        matches!(
+            &close,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+                || error.kind == AdapterErrorKind::Unavailable
+        ),
+        "close_pending_pane fails closed after shutdown, got {close:?}"
+    );
+    let post_dismissal = adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution: ExecutionId(7_310_001),
+            action: ResolvedPortableAction {
+                action: PortableAction::Tab(TabAction::Create {
+                    workspace_id: Some(lifecycle_scalar("workspace-1")),
+                    name: Some(lifecycle_scalar("logs")),
+                    focus: None,
+                    command: CreateCommand::default(),
+                }),
+            },
+            origin,
+            ui_pane: PaneId::new("pane-2"),
+        })
+        .await;
+    assert!(
+        matches!(
+            &post_dismissal,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+                || error.kind == AdapterErrorKind::Unavailable
+        ),
+        "post-dismissal dispatch fails closed after shutdown, got {post_dismissal:?}"
+    );
+    // `identity` stays gated by continuity (not ungated): with continuity
+    // invalidated it must fail closed rather than return the retained value.
+    let identity = adapter.identity().await;
+    assert!(
+        matches!(
+            &identity,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+                || error.kind == AdapterErrorKind::Unavailable
+        ),
+        "identity fails closed after shutdown, got {identity:?}"
+    );
+    // `capabilities` is local-only: it may succeed, but must send no bytes.
+    let _ = adapter.capabilities().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fixture.requests().await.len(),
+        before,
+        "no host-bound operation after shutdown reached the recorded server"
+    );
+    drop(adapter);
+    drop(fixture);
+}
+
+/// M31: a shutdown raced against a suspended adapter cannot be undone by a
+/// later resume: the resume fails closed and installs no subscription, so no
+/// subscribe/ping bytes reach the fixture beyond the initial handshake.
+#[tokio::test]
+async fn shutdown_while_suspended_cannot_be_revived_by_resume() {
+    let fixture =
+        ProductionConnectFixture::start_scripted(ProductionConnectFixture::initial_handshake())
+            .expect("owned suspend-shutdown fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects before suspend");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(10), adapter.suspend_for_activation())
+        .await
+        .expect("suspend completes")
+        .expect("suspend stops the retained subscription");
+    fixture.wait_for_requests(2).await;
+    let before = fixture.requests().await.len();
+
+    adapter
+        .shutdown()
+        .await
+        .expect("shutdown succeeds while suspended");
+    let resume = adapter.resume_after_activation_abort().await;
+    assert!(
+        matches!(
+            &resume,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+        ),
+        "resume after shutdown fails closed with Shutdown, got {resume:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fixture.requests().await.len(),
+        before,
+        "no resume subscribe/ping reached the recorded server after shutdown"
+    );
+    drop(adapter);
+    drop(fixture);
+}
