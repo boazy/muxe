@@ -18,9 +18,13 @@ mod transport;
 mod validation;
 #[doc(hidden)]
 pub use adapter::WaitHook;
+#[doc(hidden)]
+pub use adapter::production_required_methods;
 pub use adapter::{HerdrAdapter, HerdrConfigValidator};
 pub use cache::{
-    ComparisonKey, HerdrCache, hash_configured_request_refs, hash_configured_requests,
+    ComparisonKey, HerdrCache,
+    canonical_request_bytes_for_test as cache_canonical_request_bytes_for_test,
+    hash_configured_request_refs, hash_configured_requests,
 };
 pub use launch::{
     CommandPaneLaunch, CommandPanePlacement, CommandTabLaunch, FocusedPane, PreparedUiPane,
@@ -31,6 +35,7 @@ pub use launch::{
 pub use runtime::{HerdrAdapterConfig, HerdrRuntime, probe_endpoint_identity, probe_live_identity};
 pub use schema::{
     ApiSchema, MethodSchema, VALIDATOR_FORMAT_VERSION, ValidationCode, ValidationError,
+    canonical_request_bytes_for_test as schema_canonical_request_bytes_for_test,
 };
 pub use subscription::{EventSubscription, SubscriptionConfig, SubscriptionEvent};
 pub use transport::{
@@ -61,8 +66,10 @@ pub(crate) fn pane_info(
 /// - `session.snapshot`: origin capture and launcher pane resolution;
 /// - `pane.get`: capture and pending-pane validation;
 /// - `pane.send_keys`, `pane.send_text`, `tab.create`, `tab.close`, `tab.rename`,
-///   `tab.move`, `pane.split`, `pane.close`, `pane.focus_direction`, `pane.swap`,
-///   `pane.resize`, `pane.zoom`: portable dispatch invocations;
+///   `tab.move`, `tab.list`, `pane.split`, `pane.close`, `pane.focus_direction`,
+///   `pane.swap`, `pane.resize`, `pane.zoom`: portable dispatch invocations
+///   (`tab.list` serves the `tab:swap` list-to-ID bridge via `perform_tab_swap`
+///   and its `dispatch_tab_swap` preflight);
 /// - `layout.apply`, `pane.move`: UI trampoline create and move phases;
 /// - `tab.close`: transient-tab failure cleanup;
 /// - `notification.show`: capability-gated launcher failure reporting.
@@ -87,6 +94,7 @@ pub const VERIFIED_HERDR_METHODS: &[&str] = &[
     "session.snapshot",
     "tab.close",
     "tab.create",
+    "tab.list",
     "tab.move",
     "tab.rename",
 ];
@@ -123,6 +131,111 @@ mod tests {
                 "verified set must keep the trampoline-critical {required}"
             );
         }
+    }
+
+    #[test]
+    fn verified_methods_cover_every_production_required_method() {
+        use muxe_core::{ActionScalar, ConfigValue, ConfigValueKind, IndexOrDirection};
+        let scalar = |value: &str| ActionScalar::new(ConfigValue::string(value.to_owned()));
+        let index =
+            |value: i64| ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::Integer(value)));
+        let command = |program: Option<ActionScalar>| muxe_core::CreateCommand {
+            program,
+            args: Vec::new(),
+            cwd: None,
+        };
+        let actions = [
+            muxe_core::PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(vec![scalar(
+                "ctrl-a",
+            )])),
+            muxe_core::PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(scalar("hi"))),
+            muxe_core::PortableAction::Tab(muxe_core::TabAction::Create {
+                workspace_id: None,
+                name: None,
+                focus: None,
+                command: command(None),
+            }),
+            muxe_core::PortableAction::Tab(muxe_core::TabAction::Create {
+                workspace_id: None,
+                name: None,
+                focus: None,
+                command: command(Some(scalar("tool"))),
+            }),
+            muxe_core::PortableAction::Tab(muxe_core::TabAction::Close),
+            muxe_core::PortableAction::Tab(muxe_core::TabAction::Rename {
+                name: Some(scalar("name")),
+            }),
+            muxe_core::PortableAction::Tab(muxe_core::TabAction::Move(IndexOrDirection::Index(
+                index(0),
+            ))),
+            muxe_core::PortableAction::Tab(muxe_core::TabAction::Swap(IndexOrDirection::Index(
+                index(1),
+            ))),
+            muxe_core::PortableAction::Pane(muxe_core::PaneAction::Split {
+                direction: Some(scalar("right")),
+                focus: None,
+                command: command(None),
+            }),
+            muxe_core::PortableAction::Pane(muxe_core::PaneAction::Split {
+                direction: Some(scalar("right")),
+                focus: None,
+                command: command(Some(scalar("tool"))),
+            }),
+            muxe_core::PortableAction::Pane(muxe_core::PaneAction::Close),
+            muxe_core::PortableAction::Pane(muxe_core::PaneAction::Focus(
+                IndexOrDirection::Direction(scalar("left")),
+            )),
+            muxe_core::PortableAction::Pane(muxe_core::PaneAction::Swap(
+                IndexOrDirection::Direction(scalar("left")),
+            )),
+            muxe_core::PortableAction::Pane(muxe_core::PaneAction::Resize {
+                direction: scalar("left"),
+                amount: None,
+            }),
+            muxe_core::PortableAction::Pane(muxe_core::PaneAction::Zoom { enabled: None }),
+        ];
+        for action in &actions {
+            for method in production_required_methods(action) {
+                assert!(
+                    generated::method_metadata(&method).is_some(),
+                    "production method {method} must exist in the bundled schema metadata"
+                );
+                assert!(
+                    VERIFIED_HERDR_METHODS.contains(&method.as_ref()),
+                    "verified set omits production-required method {method}"
+                );
+            }
+        }
+        assert!(
+            VERIFIED_HERDR_METHODS.contains(&"tab.list"),
+            "the tab:swap list-to-ID bridge requires tab.list in the verified set"
+        );
+    }
+
+    #[test]
+    fn independent_canonicalisers_agree_with_pin_and_generated_digest() {
+        use sha2::{Digest, Sha256};
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/herdr/herdr-api.schema.json"
+        ))
+        .expect("bundled fixture schema is valid JSON");
+        let schema_bytes = schema_canonical_request_bytes_for_test(&raw);
+        let cache_bytes = cache_canonical_request_bytes_for_test(&raw);
+        assert_eq!(
+            schema_bytes, cache_bytes,
+            "schema validator and adapter cache must hash identical canonical bytes"
+        );
+        let digest = format!("{:x}", Sha256::digest(&schema_bytes));
+        assert_eq!(
+            digest,
+            generated::BUNDLED_REQUEST_SCHEMA_SHA256,
+            "canonical digest must match the generated constant"
+        );
+        let pin = include_str!("../../../pins/herdr.toml");
+        assert!(
+            pin.contains(&format!("canonical_schema_sha256 = \"{digest}\"")),
+            "pin canonical_schema_sha256 must match the computed canonical digest"
+        );
     }
 
     #[test]

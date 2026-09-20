@@ -6,7 +6,7 @@ use std::{
     fmt::Write as _,
     fs,
     io::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
 };
 
@@ -20,7 +20,15 @@ use crate::classification::Transport;
 
 const DEFAULT_INPUT: &str = "fixtures/herdr/herdr-api.schema.json";
 const DEFAULT_OUTPUT: &str = "crates/muxe-adapter-herdr/src/generated.rs";
+const DEFAULT_PIN: &str = "pins/herdr.toml";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HerdrPin {
+    protocol: u64,
+    schema_version: u64,
+    schema_sha256: String,
+    canonical_schema_sha256: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Method {
     name: String,
@@ -34,6 +42,7 @@ struct Method {
 struct Arguments {
     input: PathBuf,
     output: PathBuf,
+    pin: PathBuf,
     check: bool,
 }
 
@@ -46,7 +55,6 @@ fn main() -> ExitCode {
         }
     }
 }
-
 fn run() -> Result<()> {
     let arguments = parse_arguments(env::args().skip(1))?;
     let source = fs::read_to_string(&arguments.input)
@@ -54,6 +62,12 @@ fn run() -> Result<()> {
     let schema: Value = serde_json::from_str(&source)
         .wrap_err_with(|| format!("could not parse {}", arguments.input.display()))?;
     let raw_provenance_sha256 = sha256_hex(source.as_bytes());
+    let request = schema
+        .pointer("/schemas/request")
+        .cloned()
+        .ok_or_else(|| eyre::eyre!("schema has no schemas.request"))?;
+    let pin = parse_pin(&arguments.pin)?;
+    validate_pin(&pin, &schema, &raw_provenance_sha256, &request)?;
     let output = generate(&schema, &raw_provenance_sha256)?;
 
     if arguments.check {
@@ -81,6 +95,7 @@ fn run() -> Result<()> {
 fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Arguments> {
     let mut input = PathBuf::from(DEFAULT_INPUT);
     let mut output = PathBuf::from(DEFAULT_OUTPUT);
+    let mut pin = PathBuf::from(DEFAULT_PIN);
     let mut check = false;
     let mut arguments = arguments.into_iter();
 
@@ -88,9 +103,12 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
         match argument.as_str() {
             "--input" => input = PathBuf::from(next_value(&mut arguments, "--input")?),
             "--output" => output = PathBuf::from(next_value(&mut arguments, "--output")?),
+            "--pin" => pin = PathBuf::from(next_value(&mut arguments, "--pin")?),
             "--check" => check = true,
             "--help" | "-h" => {
-                println!("Usage: muxe-herdr-gen [--input PATH] [--output PATH] [--check]");
+                println!(
+                    "Usage: muxe-herdr-gen [--input PATH] [--output PATH] [--pin PATH] [--check]"
+                );
                 std::process::exit(0);
             }
             _ => bail!("unknown argument {argument:?}"),
@@ -100,8 +118,95 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
     Ok(Arguments {
         input,
         output,
+        pin,
         check,
     })
+}
+
+fn parse_pin(path: &Path) -> Result<HerdrPin> {
+    let source =
+        fs::read_to_string(path).wrap_err_with(|| format!("could not read {}", path.display()))?;
+    let protocol = pin_integer(&source, path, "protocol")?;
+    let schema_version = pin_integer(&source, path, "schema_version")?;
+    let schema_sha256 = pin_scalar(&source, path, "schema_sha256")?;
+    let canonical_schema_sha256 = pin_scalar(&source, path, "canonical_schema_sha256")?;
+    for digest in [&schema_sha256, &canonical_schema_sha256] {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!(
+                "{} has a malformed SHA-256 digest {digest:?}",
+                path.display()
+            );
+        }
+    }
+    Ok(HerdrPin {
+        protocol,
+        schema_version,
+        schema_sha256,
+        canonical_schema_sha256,
+    })
+}
+
+fn pin_integer(source: &str, path: &Path, key: &str) -> Result<u64> {
+    let prefix = format!("{key} = ");
+    let line = source
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| eyre::eyre!("{} has no {key:?}", path.display()))?;
+    line[prefix.len()..]
+        .trim()
+        .parse::<u64>()
+        .wrap_err_with(|| format!("{} has a non-integer {key:?}", path.display()))
+}
+
+fn pin_scalar(source: &str, path: &Path, key: &str) -> Result<String> {
+    let prefix = format!("{key} = ");
+    let line = source
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| eyre::eyre!("{} has no {key:?}", path.display()))?;
+    let value = line[prefix.len()..].trim();
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .map(str::to_owned)
+        .ok_or_else(|| eyre::eyre!("{} {key:?} must be a quoted string", path.display()))
+}
+
+fn validate_pin(pin: &HerdrPin, schema: &Value, raw_sha256: &str, request: &Value) -> Result<()> {
+    let protocol = schema
+        .get("protocol")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| eyre::eyre!("top-level protocol must be an unsigned integer"))?;
+    let schema_version = schema
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| eyre::eyre!("top-level schema_version must be an unsigned integer"))?;
+    if protocol != pin.protocol {
+        bail!(
+            "fixture protocol {protocol} differs from pin protocol {}",
+            pin.protocol
+        );
+    }
+    if schema_version != pin.schema_version {
+        bail!(
+            "fixture schema_version {schema_version} differs from pin schema_version {}",
+            pin.schema_version
+        );
+    }
+    if raw_sha256 != pin.schema_sha256 {
+        bail!(
+            "fixture raw digest {raw_sha256} differs from pin schema_sha256 {}",
+            pin.schema_sha256
+        );
+    }
+    let canonical = sha256_hex(&canonical_json(request)?);
+    if canonical != pin.canonical_schema_sha256 {
+        bail!(
+            "fixture canonical request digest {canonical} differs from pin canonical_schema_sha256 {}",
+            pin.canonical_schema_sha256
+        );
+    }
+    Ok(())
 }
 
 fn next_value(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<String> {
@@ -442,6 +547,44 @@ mod tests {
         }];
         let error = validate_reversible_unique(&methods).unwrap_err();
         assert!(error.to_string().contains("reversibly decode"));
+    }
+
+    #[test]
+    fn pin_validation_rejects_protocol_drift() {
+        let pin = HerdrPin {
+            protocol: 21,
+            schema_version: 1,
+            schema_sha256: "0".repeat(64),
+            canonical_schema_sha256: "0".repeat(64),
+        };
+        let schema = serde_json::json!({"protocol": 20, "schema_version": 1});
+        let error = validate_pin(&pin, &schema, &"0".repeat(64), &serde_json::json!({}))
+            .expect_err("protocol drift must fail");
+        assert!(error.to_string().contains("protocol"));
+    }
+    #[test]
+    fn pin_validation_rejects_digest_drift() {
+        let pin = HerdrPin {
+            protocol: 20,
+            schema_version: 1,
+            schema_sha256: "0".repeat(64),
+            canonical_schema_sha256: "0".repeat(64),
+        };
+        let schema = serde_json::json!({"protocol": 20, "schema_version": 1});
+        let error = validate_pin(&pin, &schema, &"1".repeat(64), &serde_json::json!({}))
+            .expect_err("raw digest drift must fail");
+        assert!(error.to_string().contains("raw digest"));
+        let error = validate_pin(
+            &HerdrPin {
+                schema_sha256: "1".repeat(64),
+                ..pin
+            },
+            &schema,
+            &"1".repeat(64),
+            &serde_json::json!({"oneOf": []}),
+        )
+        .expect_err("canonical digest drift must fail");
+        assert!(error.to_string().contains("canonical request digest"));
     }
 
     #[test]

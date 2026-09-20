@@ -296,6 +296,15 @@ fn canonical_request_schema(raw_document: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Canonical bytes of one checked-in fixture's `/schemas/request` subtree,
+/// computed with the cache's own key-sorting policy. The agreement test uses
+/// this to prove the adapter cache and the schema validator hash the same bytes.
+#[doc(hidden)]
+#[must_use]
+pub fn canonical_request_bytes_for_test(raw_document: &Value) -> Vec<u8> {
+    canonical_bytes(canonical_request_schema(raw_document))
+}
+
 /// Recursively sorts object keys so hashes are independent of JSON key order.
 fn canonicalize(value: Value) -> Value {
     match value {

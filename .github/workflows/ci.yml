@@ -129,9 +129,10 @@ jobs:
               --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
-      - name: pinned Herdr host (0.8.2, digest-verified)
-        # Official v0.8.2 release assets exist; each carries a published
-        # SHA-256 digest (release id 373248423) verified here before use.
+      - name: pinned Herdr host (digest-verified)
+        # Official release assets exist; repository, version, and per-platform
+        # asset digests all come from pins/herdr.toml (release id 373248423);
+        # nothing here repeats them.
         run: |
           set -euo pipefail
           file_digest() {
@@ -139,22 +140,30 @@ jobs:
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
             else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
           }
+          hrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/herdr.toml)"
+          hver="$(sed -n 's/^host_version = "\(.*\)"$/\1/p' pins/herdr.toml)"
+          test -n "$hrepo"
+          test -n "$hver"
           case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64) hasset="herdr-linux-x86_64"; hdigest="976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4" ;;
-            Linux-aarch64) hasset="herdr-linux-aarch64"; hdigest="f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d" ;;
-            Darwin-arm64) hasset="herdr-macos-aarch64"; hdigest="a5d4f4d504d8b309c91f811050559300faba31258425f53c50852fc96f6ae574" ;;
+            Linux-x86_64) hkey="linux_x86_64" ;;
+            Linux-aarch64) hkey="linux_aarch64" ;;
+            Darwin-arm64) hkey="macos_aarch64" ;;
             *) echo "no pinned Herdr asset for $(uname -s)-$(uname -m)"; exit 1 ;;
           esac
+          hasset="$(sed -n "s/^release_${hkey}_asset = \"\(.*\)\"$/\1/p" pins/herdr.toml)"
+          hdigest="$(sed -n "s/^release_${hkey}_sha256 = \"\(.*\)\"$/\1/p" pins/herdr.toml)"
+          test -n "$hasset"
+          test "${#hdigest}" -eq 64
           hdir="$RUNNER_TEMP/herdr-host"
           mkdir -p "$hdir"
-          curl -fSL "https://github.com/herdrdev/herdr/releases/download/v0.8.2/$hasset" -o "$hdir/herdr"
+          curl -fSL "$hrepo/releases/download/v$hver/$hasset" -o "$hdir/herdr"
           test "$(file_digest "$hdir/herdr")" = "$hdigest" || {
             echo "Herdr release asset digest mismatch for $hasset"
             exit 1
           }
           chmod 755 "$hdir/herdr"
           echo "$hdir" >> "$GITHUB_PATH"
-          "$hdir/herdr" --version | grep -F "0.8.2"
+          "$hdir/herdr" --version | grep -F "$hver"
       - name: wasm bridge producer (this checkout)
         # Same producer task as the release flow; the digest below comes
         # from these exact bytes, never from a sidecar or hardcoded hash.
@@ -342,7 +351,9 @@ jobs:
               --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
-      - name: pinned Herdr host (0.8.2, digest-verified)
+      - name: pinned Herdr host (digest-verified)
+        # Linux x86_64 asset for the smoke row; repository, version, asset,
+        # and digest all come from pins/herdr.toml, mirroring the Zellij step.
         run: |
           set -euo pipefail
           file_digest() {
@@ -350,18 +361,24 @@ jobs:
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
             else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
           }
-          hasset="herdr-linux-x86_64"
-          hdigest="976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4"
+          hrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/herdr.toml)"
+          hver="$(sed -n 's/^host_version = "\(.*\)"$/\1/p' pins/herdr.toml)"
+          hasset="$(sed -n 's/^release_linux_x86_64_asset = "\(.*\)"$/\1/p' pins/herdr.toml)"
+          hdigest="$(sed -n 's/^release_linux_x86_64_sha256 = "\(.*\)"$/\1/p' pins/herdr.toml)"
+          test -n "$hrepo"
+          test -n "$hver"
+          test -n "$hasset"
+          test "${#hdigest}" -eq 64
           hdir="$RUNNER_TEMP/herdr-host"
           mkdir -p "$hdir"
-          curl -fSL "https://github.com/herdrdev/herdr/releases/download/v0.8.2/$hasset" -o "$hdir/herdr"
+          curl -fSL "$hrepo/releases/download/v$hver/$hasset" -o "$hdir/herdr"
           test "$(file_digest "$hdir/herdr")" = "$hdigest" || {
             echo "Herdr release asset digest mismatch for $hasset"
             exit 1
           }
           chmod 755 "$hdir/herdr"
           echo "$hdir" >> "$GITHUB_PATH"
-          "$hdir/herdr" --version | grep -F "0.8.2"
+          "$hdir/herdr" --version | grep -F "$hver"
       - name: host capability probe (real version asserts)
         # Both pinned hosts must answer their version commands or this gate
         # fails explicitly. A missing capability is a failing gate, never a

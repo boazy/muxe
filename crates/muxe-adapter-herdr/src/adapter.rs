@@ -886,6 +886,29 @@ fn command_creation_methods(action: &PortableAction) -> Option<&'static [&'stati
     }
 }
 
+/// Every JSON-RPC method a portable production path can require for one action:
+/// the command-creation helper RPCs, the single emitted-request method, and the
+/// composite-action methods (today `tab:swap` needs its `tab.list` + `tab.move`
+/// bridge, which the emitted-request table cannot express alone). Broker-owned
+/// forms (menu/config/command) require no host method. The verified-methods test
+/// derives coverage from this, so a new production method fails the test instead
+/// of silently under-declaring the exercised surface.
+#[doc(hidden)]
+#[must_use]
+pub fn production_required_methods(action: &PortableAction) -> Vec<&'static str> {
+    if let Some(methods) = command_creation_methods(action) {
+        return methods.to_vec();
+    }
+    match portable_request_description(action) {
+        Ok(Some(description)) => vec![description.method],
+        Ok(None) => match action {
+            PortableAction::Tab(TabAction::Swap(_)) => vec!["tab.list", "tab.move"],
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
 fn validate_required_methods(
     schema: &ApiSchema,
     methods: &[&str],

@@ -1249,6 +1249,19 @@ fn canonical_json(value: &Value) -> Vec<u8> {
     serde_json::to_vec(&value).expect("serde_json values are serializable")
 }
 
+/// Canonical bytes of one checked-in fixture's `/schemas/request` subtree,
+/// computed with the schema validator's own key-sorting policy. The agreement
+/// test uses this to prove every independent policy hashes the same bytes.
+#[doc(hidden)]
+#[must_use]
+pub fn canonical_request_bytes_for_test(raw_document: &Value) -> Vec<u8> {
+    let request = raw_document
+        .pointer("/schemas/request")
+        .cloned()
+        .unwrap_or(Value::Null);
+    canonical_json(&request)
+}
+
 fn sort_json(value: &mut Value) {
     match value {
         Value::Object(object) => {

@@ -480,6 +480,11 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
+        # Per-platform asset/digest selector; each digest must equal the
+        # matching release_*_sha256 entry in pins/herdr.toml (the step asserts
+        # this). GitHub matrix syntax cannot read the pin file at
+        # matrix-expansion time, so the literal rows stay with this comment
+        # rather than a fragile generated matrix.
         include:
           - asset: linux-x64
             os: ubuntu-24.04
@@ -535,7 +540,10 @@ jobs:
               --locked --root "$zdir" zellij
           "$zdir/bin/zellij" --version | grep -F "$zver"
           echo "ZELLIJ_BINARY=$zdir/bin/zellij" >> "$GITHUB_ENV"
-      - name: pinned Herdr host (0.8.2, digest-verified)
+      - name: pinned Herdr host (digest-verified)
+        # Matrix asset/digest rows below stay the release-platform selector; the
+        # repository, version, and download URL come from pins/herdr.toml, and
+        # the per-row digests must match the pin's release_*_sha256 entries.
         run: |
           set -euo pipefail
           file_digest() {
@@ -545,11 +553,26 @@ jobs:
           }
           hasset="${{ matrix.herdr_asset }}"
           hdigest="${{ matrix.herdr_digest }}"
+          hrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/herdr.toml)"
+          hver="$(sed -n 's/^host_version = "\(.*\)"$/\1/p' pins/herdr.toml)"
           test -n "$hasset"
           test "${#hdigest}" -eq 64
+          test -n "$hrepo"
+          test -n "$hver"
+          case "$hasset" in
+            herdr-linux-x86_64) hkey="linux_x86_64" ;;
+            herdr-linux-aarch64) hkey="linux_aarch64" ;;
+            herdr-macos-aarch64) hkey="macos_aarch64" ;;
+            *) echo "no pinned Herdr digest key for $hasset"; exit 1 ;;
+          esac
+          pin_digest="$(sed -n "s/^release_${hkey}_sha256 = \"\(.*\)\"$/\1/p" pins/herdr.toml)"
+          test "$hdigest" = "$pin_digest" || {
+            echo "matrix herdr_digest for $hasset drifts from pins/herdr.toml"
+            exit 1
+          }
           hdir="$RUNNER_TEMP/herdr-host"
           mkdir -p "$hdir"
-          curl -fSL "https://github.com/herdrdev/herdr/releases/download/v0.8.2/$hasset" -o "$hdir/herdr"
+          curl -fSL "$hrepo/releases/download/v$hver/$hasset" -o "$hdir/herdr"
           test "$(file_digest "$hdir/herdr")" = "$hdigest" || {
             echo "Herdr release asset digest mismatch for $hasset"
             exit 1
@@ -562,7 +585,7 @@ jobs:
               exit 1
             }
           fi
-          "$hdir/herdr" --version | grep -F "0.8.2"
+          "$hdir/herdr" --version | grep -F "$hver"
           echo "HERDR_BINARY=$hdir/herdr" >> "$GITHUB_ENV"
       - name: package host tools
         run: |
