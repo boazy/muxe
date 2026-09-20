@@ -425,6 +425,12 @@ fn find_zellij_in_dirs(directories: impl Iterator<Item = PathBuf>) -> Option<Pat
 /// send time.
 struct QueuedItem {
     execution: Option<ExecutionId>,
+    /// Synthetic slot this item settles in its execution record. A fresh
+    /// `INITIAL`-then-`next()` sequence per execution, reserved at acceptance
+    /// and renamed to the minted transport request ID at send, so every
+    /// queued request owns a distinct terminal slot even before the
+    /// transport mints its live provenance.
+    request_slot: Option<RequestId>,
     client_id: String,
     /// Taken for encoding; restored on retry so no clone is needed.
     payload: Option<BridgeRequest>,
@@ -443,10 +449,98 @@ struct RequestProvenance {
     registration: RegistrationId,
 }
 
+/// One accepted execution and the host requests that settle it.
+///
+/// Acceptance/completion contract: `dispatch_*` returns [`DispatchAccepted`]
+/// once every host request in the batch is queued; the single terminal
+/// [`DispatchCompletion`] is published only after **every** request in
+/// `requests` has reached a terminal state (bridge completion, write
+/// failure, retirement, purge, release timeout, pipe restart, or
+/// suspend/shutdown). A one-request batch therefore behaves exactly like the
+/// schema-v1 single-command path: its lone completion is the terminal.
+/// `dispatch_to_client` rejects an empty batch with `InvalidRequest`, so an
+/// awaited caller can never accept an execution that completes nothing.
+///
+/// Aggregate precedence (worst case wins, deterministic):
+/// `OutcomeUnknown` > `Failed` > `Succeeded`. Any unknown poisons the
+/// aggregate even when a failure is already recorded; a failure beats
+/// success; the terminal carries the worst error with the execution.
+/// Exactly one terminal is published per execution.
+struct ExecutionRecord {
+    execution: ExecutionId,
+    /// Outstanding host requests that must still settle before the terminal
+    /// publishes. `None` until the request reaches the transport and mints
+    /// provenance. Settled slots are REMOVED (not marked), so termination
+    /// compares `settled` against the immutable `total` below, never against
+    /// this map's shrinking length.
+    requests: BTreeMap<RequestId, Option<RequestProvenance>>,
+    /// Batch size captured at construction; the terminal publishes when
+    /// `settled == total`.
+    total: u64,
+    /// Worst aggregate outcome so far; `None` while every settled request
+    /// succeeded (or nothing settled yet).
+    worst: Option<(OutcomeRank, AdapterError)>,
+    settled: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutcomeRank {
+    Failed,
+    Unknown,
+}
+
+impl ExecutionRecord {
+    fn new(execution: ExecutionId, request_ids: Vec<RequestId>) -> Self {
+        Self {
+            execution,
+            total: request_ids.len() as u64,
+            requests: request_ids.into_iter().map(|id| (id, None)).collect(),
+            worst: None,
+            settled: 0,
+        }
+    }
+
+    fn note_success(&mut self) -> bool {
+        self.settled += 1;
+        self.settled == self.total
+    }
+
+    fn note_failure(&mut self, rank: OutcomeRank, error: AdapterError) -> bool {
+        let worse = match &self.worst {
+            None => true,
+            Some((OutcomeRank::Failed, _)) => rank == OutcomeRank::Unknown,
+            Some((OutcomeRank::Unknown, _)) => false,
+        };
+        if worse {
+            self.worst = Some((rank, error));
+        }
+        self.settled += 1;
+        self.settled == self.total
+    }
+
+    fn terminal(&self) -> DispatchCompletion {
+        match &self.worst {
+            None => DispatchCompletion::Succeeded {
+                execution: self.execution,
+            },
+            Some((OutcomeRank::Failed, error)) => DispatchCompletion::Failed {
+                execution: self.execution,
+                error: error.clone(),
+            },
+            Some((OutcomeRank::Unknown, error)) => DispatchCompletion::OutcomeUnknown {
+                execution: self.execution,
+                error: error.clone(),
+            },
+        }
+    }
+}
+
 struct InFlight {
     request: RequestProvenance,
     generation: ChannelGeneration,
     execution: Option<ExecutionId>,
+    request_slot: Option<RequestId>,
+    settled: bool,
 }
 
 struct AtomicChannelGeneration(AtomicU64);
@@ -524,7 +618,7 @@ struct AdapterInner {
     captures: Mutex<CaptureTable>,
     queues: Mutex<BTreeMap<String, VecDeque<QueuedItem>>>,
     in_flight: Mutex<Option<InFlight>>,
-    live_executions: Mutex<BTreeMap<u64, Option<RequestProvenance>>>,
+    live_executions: Mutex<BTreeMap<u64, ExecutionRecord>>,
     close_waiters: StdMutex<BTreeMap<u64, oneshot::Sender<DispatchCompletion>>>,
     pending_capture: Mutex<CaptureWaiters>,
     pane_claims: Mutex<BTreeMap<String, String>>,
@@ -605,6 +699,11 @@ impl ZellijAdapter {
     /// oracle. The contract suite injects scripted channels with recorded
     /// lines and a scripted oracle; production callers use
     /// [`ZellijAdapter::connect`], which installs the live CLI oracle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the event-loop mutex is poisoned while storing the spawned
+    /// event-loop task.
     pub fn new_with_membership(
         config: ZellijAdapterConfig,
         request: Arc<dyn PipeChannel>,
@@ -1229,7 +1328,16 @@ impl ZellijAdapter {
             // Late acknowledgement from a restarted channel: ignore.
             return;
         }
-        *self.inner.in_flight.lock().await = None;
+        let mut in_flight = self.inner.in_flight.lock().await;
+        if let Some(pending) = in_flight.as_mut()
+            && pending.request.request_id == request_id
+            && pending.generation == channel_generation
+            && pending.request.registration == registration
+        {
+            pending.settled = true;
+        }
+        *in_flight = None;
+        drop(in_flight);
         self.pump_all().await;
     }
 
@@ -1244,32 +1352,145 @@ impl ZellijAdapter {
             // Completion for an encoding no broker execution can own.
             return;
         };
-        let expected = self
-            .inner
-            .live_executions
-            .lock()
-            .await
-            .get(&execution.0)
-            .copied()
-            .flatten();
-        if !expected.is_some_and(|provenance| {
-            provenance.request_id == request_id && provenance.registration == registration
-        }) {
-            // Completion for an unsent, forgotten, or displaced request.
-            return;
-        }
-        self.inner.live_executions.lock().await.remove(&execution.0);
-        let completion = match outcome.status {
-            muxe_zellij_protocol::CommandStatus::Succeeded => {
-                DispatchCompletion::Succeeded { execution }
+        let terminal = {
+            let mut live = self.inner.live_executions.lock().await;
+            let Some(record) = live.get_mut(&execution.0) else {
+                // Completion for an unsent, forgotten, or displaced execution.
+                return;
+            };
+            let provenance = match record.requests.get(&request_id) {
+                Some(Some(provenance)) => *provenance,
+                // Completion for a request outside this execution's set,
+                // an unsent (still queued) request, or a duplicate of an
+                // already-settled request (its key is gone): no-op.
+                Some(None) | None => return,
+            };
+            if provenance.registration != registration {
+                // Completion from a displaced registration.
+                return;
             }
-            muxe_zellij_protocol::CommandStatus::Failed => DispatchCompletion::Failed {
-                execution,
-                error: AdapterError::new(AdapterErrorKind::DispatchFailed, outcome.detail),
-            },
+            record.requests.remove(&request_id);
+            let done = match outcome.status {
+                muxe_zellij_protocol::CommandStatus::Succeeded => record.note_success(),
+                muxe_zellij_protocol::CommandStatus::Failed => record.note_failure(
+                    OutcomeRank::Failed,
+                    AdapterError::new(AdapterErrorKind::DispatchFailed, outcome.detail),
+                ),
+            };
+            if !done {
+                return;
+            }
+            let terminal = record.terminal();
+            live.remove(&execution.0);
+            terminal
         };
-        self.emit(AdapterHealthEvent::DispatchCompleted(completion))
+        self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
             .await;
+    }
+
+    /// Settles one outstanding request slot, folding `outcome` into its
+    /// execution aggregate. When the slot is the last unsettled request the
+    /// record's single terminal is removed and returned; otherwise `None`
+    /// (still outstanding siblings). Unknown slots (never sent, already
+    /// settled, or already removed) return `None` and change nothing, so
+    /// every interruption path resolves each request exactly once.
+    fn settle_slot(
+        live: &mut BTreeMap<u64, ExecutionRecord>,
+        execution: ExecutionId,
+        slot: RequestId,
+        outcome: Option<(OutcomeRank, AdapterError)>,
+    ) -> Option<DispatchCompletion> {
+        let record = live.get_mut(&execution.0)?;
+        // The slot must still be outstanding (never-sent `None` and
+        // sent `Some` both count). Settled slots were removed, so a second
+        // settle of the same slot finds no key and changes nothing: each
+        // request resolves exactly once.
+        record.requests.remove(&slot)?;
+        let done = match outcome {
+            None => record.note_success(),
+            Some((rank, error)) => record.note_failure(rank, error),
+        };
+        if !done {
+            return None;
+        }
+        let terminal = record.terminal();
+        live.remove(&execution.0);
+        Some(terminal)
+    }
+
+    /// Settles one outstanding request of `execution` regardless of slot,
+    /// for queued items whose slot never reached the record. Prefers the
+    /// acceptance slot, then any outstanding slot; returns the terminal when
+    /// the execution reaches all-terminal.
+    fn settle_any_slot(
+        live: &mut BTreeMap<u64, ExecutionRecord>,
+        execution: ExecutionId,
+        outcome: Option<(OutcomeRank, AdapterError)>,
+    ) -> Option<DispatchCompletion> {
+        let record = live.get_mut(&execution.0)?;
+        let slot = record.requests.keys().copied().next()?;
+        Self::settle_slot(live, execution, slot, outcome)
+    }
+
+    /// Settles every outstanding request matching `predicate` as `OutcomeUnknown`
+    /// with `reason`, publishing the aggregate terminal for each execution that
+    /// reaches all-terminal and removing it. Returns the terminal completions
+    /// so callers that must route them elsewhere (the local close-waiter
+    /// table) can do so; broker-owned executions are emitted inline.
+    async fn settle_matching_unknown(
+        &self,
+        predicate: impl Fn(RequestProvenance) -> bool,
+        reason: &str,
+    ) -> Vec<DispatchCompletion> {
+        let terminals: Vec<DispatchCompletion> = {
+            let mut live = self.inner.live_executions.lock().await;
+            let mut terminals = Vec::new();
+            let mut remove = Vec::new();
+            for record in live.values_mut() {
+                // Only sent slots carry provenance to match; never-sent
+                // (`None`) slots belong to the queue drain, which settles by
+                // slot key instead.
+                let matched: Vec<RequestId> = record
+                    .requests
+                    .iter()
+                    .filter_map(|(slot, provenance)| {
+                        provenance
+                            .filter(|provenance| predicate(*provenance))
+                            .map(|_| *slot)
+                    })
+                    .collect();
+                let unknown = matched.len() as u64;
+                for slot in matched {
+                    record.requests.remove(&slot);
+                }
+                let mut done = false;
+                for _ in 0..unknown {
+                    done = record.note_failure(
+                        OutcomeRank::Unknown,
+                        AdapterError::new(AdapterErrorKind::OutcomeUnknown, reason),
+                    );
+                }
+                if unknown > 0 && done {
+                    terminals.push(record.terminal());
+                    remove.push(record.execution.0);
+                }
+            }
+            for execution in &remove {
+                live.remove(execution);
+            }
+            terminals
+        };
+        let mut locals = Vec::new();
+        for terminal in terminals {
+            let execution = dispatch_completion_execution(&terminal);
+            if execution.0 >= LOCAL_EXECUTION_CEILING {
+                locals.push(terminal);
+            } else {
+                self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                    .await;
+            }
+        }
+        locals
     }
     async fn retire_registration_state(
         &self,
@@ -1287,29 +1508,12 @@ impl ZellijAdapter {
             }
         }
 
-        let executions = {
-            let mut live = self.inner.live_executions.lock().await;
-            let executions: Vec<u64> = live
-                .iter()
-                .filter_map(|(execution, request)| {
-                    request
-                        .is_some_and(|request| request.registration == registration)
-                        .then_some(*execution)
-                })
-                .collect();
-            for execution in &executions {
-                live.remove(execution);
-            }
-            executions
-        };
-        for execution in executions {
-            self.emit(AdapterHealthEvent::DispatchCompleted(
-                DispatchCompletion::OutcomeUnknown {
-                    execution: ExecutionId(execution),
-                    error: AdapterError::new(AdapterErrorKind::OutcomeUnknown, reason),
-                },
-            ))
-            .await;
+        for terminal in self
+            .settle_matching_unknown(|provenance| provenance.registration == registration, reason)
+            .await
+        {
+            self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                .await;
         }
 
         self.inner.pending_origin.lock().await.retain(|_, reply| {
@@ -1394,13 +1598,6 @@ impl ZellijAdapter {
     }
 
     async fn enqueue(&self, item: QueuedItem) {
-        if let Some(execution) = item.execution {
-            self.inner
-                .live_executions
-                .lock()
-                .await
-                .insert(execution.0, None);
-        }
         self.inner
             .queues
             .lock()
@@ -1455,7 +1652,7 @@ impl ZellijAdapter {
         // One request-child respawn retry inline. Lifecycle payloads retry
         // only when their semantics are idempotent; dispatch never replays.
         for _ in 0..2 {
-            let item = {
+            let mut item = {
                 let mut queues = self.inner.queues.lock().await;
                 match queues.get_mut(client_id).and_then(VecDeque::pop_front) {
                     Some(item) => item,
@@ -1477,6 +1674,13 @@ impl ZellijAdapter {
                 request_id,
                 registration,
             };
+            // Stamp the live slot if the item still holds its acceptance
+            // slot: requeue retries keep the minted slot (re-minting would
+            // orphan the record key), while a foreign item (tests) with no
+            // slot borrows the minted id.
+            if item.execution.is_some() && item.request_slot.is_none() {
+                item.request_slot = Some(request_id);
+            }
             match self.send_item(client_id, provenance, item).await {
                 SendItemResult::Accepted => return SendItemResult::Accepted,
                 SendItemResult::RestartWhole => return SendItemResult::RestartWhole,
@@ -1508,6 +1712,27 @@ impl ZellijAdapter {
                 ),
             })
             .await;
+            if let (Some(execution), Some(slot)) = (item.execution, item.request_slot) {
+                let terminal = {
+                    let mut live_executions = self.inner.live_executions.lock().await;
+                    Self::settle_slot(
+                        &mut live_executions,
+                        execution,
+                        slot,
+                        Some((
+                            OutcomeRank::Unknown,
+                            AdapterError::new(
+                                AdapterErrorKind::OutcomeUnknown,
+                                "queued Zellij request lost its payload before send",
+                            ),
+                        )),
+                    )
+                };
+                if let Some(terminal) = terminal {
+                    self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                        .await;
+                }
+            }
             return SendItemResult::Continue;
         };
         let replay_safe = !matches!(&payload, BridgeRequest::Dispatch { .. });
@@ -1544,8 +1769,31 @@ impl ZellijAdapter {
                     error: AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string()),
                 })
                 .await;
-                if let Some(execution) = item.execution {
-                    self.inner.live_executions.lock().await.remove(&execution.0);
+                if let (Some(execution), Some(slot)) = (item.execution, item.request_slot) {
+                    // Encoding failed before the transport minted provenance:
+                    // the never-sent slot resolves unknown against the
+                    // acceptance key. A last-slot failure publishes the
+                    // aggregate terminal once; siblings still queue behind
+                    // their own slots.
+                    let terminal = {
+                        let mut live_executions = self.inner.live_executions.lock().await;
+                        Self::settle_slot(
+                            &mut live_executions,
+                            execution,
+                            slot,
+                            Some((
+                                OutcomeRank::Unknown,
+                                AdapterError::new(
+                                    AdapterErrorKind::OutcomeUnknown,
+                                    "Zellij request encoding failed before send",
+                                ),
+                            )),
+                        )
+                    };
+                    if let Some(terminal) = terminal {
+                        self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                            .await;
+                    }
                 }
                 return SendItemResult::Continue;
             }
@@ -1553,16 +1801,30 @@ impl ZellijAdapter {
         let PipeRequest { payload, .. } = frame;
         item.payload = Some(payload);
         if let Some(execution) = item.execution {
-            self.inner
-                .live_executions
-                .lock()
-                .await
-                .insert(execution.0, Some(request));
+            let mut live_executions = self.inner.live_executions.lock().await;
+            if let Some(record) = live_executions.get_mut(&execution.0) {
+                // Rename the acceptance slot to the minted request id on
+                // first send; retries keep the minted key.
+                if let Some(slot) = item.request_slot
+                    && slot != request.request_id
+                    && record.requests.remove(&slot).is_some()
+                {
+                    record.requests.insert(request.request_id, Some(request));
+                    item.request_slot = Some(request.request_id);
+                } else if let Some(slot) = item.request_slot {
+                    record.requests.insert(slot, Some(request));
+                } else {
+                    record.requests.insert(request.request_id, Some(request));
+                    item.request_slot = Some(request.request_id);
+                }
+            }
         }
         *self.inner.in_flight.lock().await = Some(InFlight {
             request,
             generation,
             execution: item.execution,
+            request_slot: item.request_slot,
+            settled: false,
         });
         if let Err(error) = self.inner.request.send_line(line).await {
             let matches = self
@@ -1582,14 +1844,20 @@ impl ZellijAdapter {
             // replayed. Lifecycle payloads retry only when their payload kind
             // is explicitly classified as idempotent.
             if let Some(execution) = item.execution {
-                self.inner.live_executions.lock().await.remove(&execution.0);
-                self.emit(AdapterHealthEvent::DispatchCompleted(
-                    DispatchCompletion::OutcomeUnknown {
+                let slot = item.request_slot.unwrap_or(request.request_id);
+                let terminal = {
+                    let mut live_executions = self.inner.live_executions.lock().await;
+                    Self::settle_slot(
+                        &mut live_executions,
                         execution,
-                        error: transport_error(&error),
-                    },
-                ))
-                .await;
+                        slot,
+                        Some((OutcomeRank::Unknown, transport_error(&error))),
+                    )
+                };
+                if let Some(terminal) = terminal {
+                    self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                        .await;
+                }
             } else if !replay_safe {
                 self.emit(AdapterHealthEvent::Unhealthy {
                     modal_scope: Some(Self::scope_for_client(client_id)),
@@ -1643,19 +1911,29 @@ impl ZellijAdapter {
             let pending = inner.in_flight.lock().await.take();
             if let Some(pending) = pending
                 && let Some(execution) = pending.execution
+                && !pending.settled
             {
-                inner.live_executions.lock().await.remove(&execution.0);
-                adapter
-                    .emit(AdapterHealthEvent::DispatchCompleted(
-                        DispatchCompletion::OutcomeUnknown {
-                            execution,
-                            error: AdapterError::new(
+                let slot = pending.request_slot.unwrap_or(pending.request.request_id);
+                let terminal = {
+                    let mut live = inner.live_executions.lock().await;
+                    ZellijAdapter::settle_slot(
+                        &mut live,
+                        execution,
+                        slot,
+                        Some((
+                            OutcomeRank::Unknown,
+                            AdapterError::new(
                                 AdapterErrorKind::OutcomeUnknown,
                                 "Zellij bridge did not release the request pipe in time",
                             ),
-                        },
-                    ))
-                    .await;
+                        )),
+                    )
+                };
+                if let Some(terminal) = terminal {
+                    adapter
+                        .emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                        .await;
+                }
             }
             // Never recover the transport while suspended for activation:
             // resume reinstalls both children after revalidation.
@@ -1704,18 +1982,28 @@ impl ZellijAdapter {
         // The in-flight request may have reached the host: outcome unknown, never replayed.
         if let Some(pending) = self.inner.in_flight.lock().await.take()
             && let Some(execution) = pending.execution
+            && !pending.settled
         {
-            self.inner.live_executions.lock().await.remove(&execution.0);
-            self.emit(AdapterHealthEvent::DispatchCompleted(
-                DispatchCompletion::OutcomeUnknown {
+            let slot = pending.request_slot.unwrap_or(pending.request.request_id);
+            let terminal = {
+                let mut live = self.inner.live_executions.lock().await;
+                Self::settle_slot(
+                    &mut live,
                     execution,
-                    error: AdapterError::new(
-                        AdapterErrorKind::OutcomeUnknown,
-                        "event pipe failed while a request was in flight",
-                    ),
-                },
-            ))
-            .await;
+                    slot,
+                    Some((
+                        OutcomeRank::Unknown,
+                        AdapterError::new(
+                            AdapterErrorKind::OutcomeUnknown,
+                            "event pipe failed while a request was in flight",
+                        ),
+                    )),
+                )
+            };
+            if let Some(terminal) = terminal {
+                self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                    .await;
+            }
         }
         self.invalidate_all_registrations("Zellij event pipe failed before completion")
             .await;
@@ -2134,29 +2422,62 @@ impl ZellijAdapter {
                 "Zellij broker execution uses the adapter-reserved execution range",
             ));
         }
-        // Schema v1 mappings are one host request per execution. In
-        // particular, keyboard key bytes are concatenated before this layer.
-        let [raw]: [RawNativeCommand; 1] = commands.try_into().map_err(|_| {
-            AdapterError::new(
-                AdapterErrorKind::InvalidRequest,
-                "Zellij execution must resolve to exactly one host command",
-            )
-        })?;
-        // Gate acceptance on a live compatible registration. The queue mints
-        // its request ID only after re-resolving that registration at send time.
+        // Batch contract: an empty batch is a typed invalid request (never
+        // an acceptance with no completion), and a batch of N >= 1 queues one
+        // host request per command under this execution. Schema-v1 mappings
+        // still produce the single-request case: keyboard key bytes are
+        // concatenated before this layer, so `SendKeys` arrives as one
+        // command and behaves exactly as before.
+        if commands.is_empty() {
+            return Err(invalid_request(
+                "Zellij execution must resolve to at least one host command",
+            ));
+        }
+        // Gate acceptance on a live compatible registration. Each request
+        // mints its own ID only after re-resolving that registration at send
+        // time; the slots below are a fresh `INITIAL`-then-`next()` sequence
+        // per execution (not the registry counter) so the record owns the
+        // full request set before the first send, and the transport renames
+        // each slot to its minted ID.
         self.active_registration(&client_id).await?;
-        ValidatedNativeCommand::try_from(raw.clone()).map_err(|error| {
-            AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
-        })?;
-        self.enqueue(QueuedItem {
-            execution: Some(execution),
-            client_id,
-            payload: Some(BridgeRequest::Dispatch {
-                execution: execution_to_common(execution),
-                request: ZellijDispatchRequest::Command(raw),
-            }),
-        })
-        .await;
+        let mut raws = Vec::with_capacity(commands.len());
+        for raw in commands {
+            ValidatedNativeCommand::try_from(raw.clone()).map_err(|error| {
+                AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
+            })?;
+            raws.push(raw);
+        }
+        let mut slot = RequestId::INITIAL;
+        let mut slots = Vec::with_capacity(raws.len());
+        for _ in &raws {
+            slots.push(slot);
+            slot = slot
+                .next()
+                .map_err(|_| invalid_request("Zellij execution exceeds its request ID space"))?;
+        }
+        self.inner
+            .live_executions
+            .lock()
+            .await
+            .insert(execution.0, ExecutionRecord::new(execution, slots.clone()));
+        for (raw, slot) in raws.into_iter().zip(slots) {
+            self.inner
+                .queues
+                .lock()
+                .await
+                .entry(client_id.clone())
+                .or_default()
+                .push_back(QueuedItem {
+                    execution: Some(execution),
+                    request_slot: Some(slot),
+                    client_id: client_id.clone(),
+                    payload: Some(BridgeRequest::Dispatch {
+                        execution: execution_to_common(execution),
+                        request: ZellijDispatchRequest::Command(raw),
+                    }),
+                });
+        }
+        self.pump_all().await;
         Ok(DispatchAccepted {
             correlation: self.correlation(),
             execution,
@@ -2222,6 +2543,7 @@ impl ZellijAdapter {
     async fn enqueue_lifecycle(&self, client_id: String, payload: BridgeRequest) {
         self.enqueue(QueuedItem {
             execution: None,
+            request_slot: None,
             client_id,
             payload: Some(payload),
         })
@@ -2348,6 +2670,106 @@ impl ActionValidator for ZellijAdapter {
         candidates: &[&NativeActionCandidate],
     ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
         self.inner.validator.validate_native_batch(candidates)
+    }
+}
+
+impl ZellijAdapter {
+    /// Drains every queued item, settling its execution slot unknown and
+    /// routing local close terminals through the close-waiter table.
+    /// Suspend calls this BEFORE registration retirement so each queued slot
+    /// settles exactly once here; the retire pass then only sees sent slots.
+    /// Shutdown reuses the same drain for the same reason: queued slots must
+    /// settle before the transport parks.
+    async fn drain_queued_for_suspend(&self) {
+        enum PurgeRoute {
+            Waiter(oneshot::Sender<DispatchCompletion>, DispatchCompletion),
+            Broker(DispatchCompletion),
+        }
+        // Purged queued requests settle their execution slots as unknown;
+        // executions that reach all-terminal publish their aggregate once.
+        // Local close executions route through the close-waiter table (the
+        // `close_pending_pane` receiver) instead of the broker event stream.
+        // A queued item whose slot never reached its record (seeded or raced
+        // fixtures) still settles: the first unknown marks the record's only
+        // slot so the waiter can never hang.
+        let purged: Vec<(ExecutionId, Option<RequestId>)> = {
+            let mut queues = self.inner.queues.lock().await;
+            let mut purged = Vec::new();
+            for queue in queues.values_mut() {
+                for item in queue.drain(..) {
+                    if let Some(execution) = item.execution {
+                        purged.push((execution, item.request_slot));
+                    }
+                }
+            }
+            purged
+        };
+        {
+            let mut live = self.inner.live_executions.lock().await;
+            let mut terminals = Vec::new();
+            for (execution, slot) in &purged {
+                let error = || {
+                    (
+                        OutcomeRank::Unknown,
+                        AdapterError::new(
+                            AdapterErrorKind::OutcomeUnknown,
+                            "Zellij adapter suspended for activation with a queued request",
+                        ),
+                    )
+                };
+                let terminal = match slot {
+                    Some(slot) => Self::settle_slot(&mut live, *execution, *slot, Some(error())),
+                    None => Self::settle_any_slot(&mut live, *execution, Some(error())),
+                };
+                if let Some(terminal) = terminal {
+                    terminals.push(terminal);
+                }
+            }
+            let routed: Vec<PurgeRoute> = {
+                let mut waiters = self
+                    .inner
+                    .close_waiters
+                    .lock()
+                    .expect("Zellij close waiter registry is not poisoned");
+                let mut routed = Vec::new();
+                for terminal in terminals {
+                    let execution = dispatch_completion_execution(&terminal);
+                    if let Some(waiter) = waiters.remove(&execution.0) {
+                        routed.push(PurgeRoute::Waiter(waiter, terminal));
+                    } else {
+                        routed.push(PurgeRoute::Broker(terminal));
+                    }
+                }
+                routed
+            };
+            for route in routed {
+                match route {
+                    PurgeRoute::Waiter(waiter, terminal) => {
+                        let _ = waiter.send(terminal);
+                    }
+                    PurgeRoute::Broker(terminal) => {
+                        self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Suspend tail: park the transport and report `Unhealthy`. Separated so
+    /// the queue drain above can own queued slots before retirement runs.
+    async fn park_suspended_transport(&self) -> Result<(), AdapterError> {
+        self.inner.request.park().await;
+        self.inner.event.park().await;
+        self.emit(AdapterHealthEvent::Unhealthy {
+            modal_scope: None,
+            error: AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij pipe transport suspended for activation",
+            ),
+        })
+        .await;
+        Ok(())
     }
 }
 
@@ -2622,8 +3044,13 @@ impl HostAdapter for ZellijAdapter {
             .lock()
             .expect("Zellij close waiter registry is not poisoned")
             .insert(execution.0, sender);
+        self.inner.live_executions.lock().await.insert(
+            execution.0,
+            ExecutionRecord::new(execution, vec![RequestId::INITIAL]),
+        );
         self.enqueue(QueuedItem {
             execution: Some(execution),
+            request_slot: Some(RequestId::INITIAL),
             client_id: client,
             payload: Some(BridgeRequest::Dispatch {
                 execution: execution_to_common(execution),
@@ -2780,6 +3207,10 @@ impl HostAdapter for ZellijAdapter {
                         )
                     })?;
                 self.active_registration(&client_id).await?;
+                self.inner.live_executions.lock().await.insert(
+                    request.execution.0,
+                    ExecutionRecord::new(request.execution, vec![RequestId::INITIAL]),
+                );
                 let payload = match focus {
                     crate::FocusRequest::ByIndex { index } => BridgeRequest::Dispatch {
                         execution: execution_to_common(request.execution),
@@ -2794,6 +3225,7 @@ impl HostAdapter for ZellijAdapter {
                 };
                 self.enqueue(QueuedItem {
                     execution: Some(request.execution),
+                    request_slot: Some(RequestId::INITIAL),
                     client_id,
                     payload: Some(payload),
                 })
@@ -2851,8 +3283,13 @@ impl HostAdapter for ZellijAdapter {
                 )
             })?;
         self.active_registration(&client_id).await?;
+        self.inner.live_executions.lock().await.insert(
+            request.execution.0,
+            ExecutionRecord::new(request.execution, vec![RequestId::INITIAL]),
+        );
         self.enqueue(QueuedItem {
             execution: Some(request.execution),
+            request_slot: Some(RequestId::INITIAL),
             client_id,
             payload: Some(BridgeRequest::Dispatch {
                 execution: execution_to_common(request.execution),
@@ -2953,18 +3390,28 @@ impl HostAdapter for ZellijAdapter {
         // receivers immediately instead of hanging to timeout.
         if let Some(pending) = self.inner.in_flight.lock().await.take()
             && let Some(execution) = pending.execution
+            && !pending.settled
         {
-            self.inner.live_executions.lock().await.remove(&execution.0);
-            self.emit(AdapterHealthEvent::DispatchCompleted(
-                DispatchCompletion::OutcomeUnknown {
+            let slot = pending.request_slot.unwrap_or(pending.request.request_id);
+            let terminal = {
+                let mut live = self.inner.live_executions.lock().await;
+                Self::settle_slot(
+                    &mut live,
                     execution,
-                    error: AdapterError::new(
-                        AdapterErrorKind::OutcomeUnknown,
-                        "Zellij adapter suspended for activation with a request in flight",
-                    ),
-                },
-            ))
-            .await;
+                    slot,
+                    Some((
+                        OutcomeRank::Unknown,
+                        AdapterError::new(
+                            AdapterErrorKind::OutcomeUnknown,
+                            "Zellij adapter suspended for activation with a request in flight",
+                        ),
+                    )),
+                )
+            };
+            if let Some(terminal) = terminal {
+                self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                    .await;
+            }
         }
         // Fail closed while the old pipes drain: stale registrations,
         // captures, claims, snapshots, queues, stamps, and waiters must never
@@ -2972,6 +3419,13 @@ impl HostAdapter for ZellijAdapter {
         // receivers immediately instead of hanging to timeout. Membership for
         // resume comes from a fresh authoritative query per attempt, never
         // from this pre-suspend registry, so nothing is snapshotted here.
+        // Queued items drain BEFORE registration retirement: the purge owns
+        // each queued slot's unknown, so the retire pass below only settles
+        // sent (provenance-bearing) slots and can never double-settle. The
+        // retirement here settles by registration rather than by slot, but a
+        // slot the purge already settled is `None` and `settle_slot` skips
+        // it, so each request still resolves exactly once.
+        self.drain_queued_for_suspend().await;
         self.invalidate_all_registrations("Zellij adapter suspended before completion")
             .await;
         self.inner.register_epoch.lock().await.clear();
@@ -2979,58 +3433,7 @@ impl HostAdapter for ZellijAdapter {
         self.inner.captures.lock().await.invalidate_all_clients();
         self.inner.pane_claims.lock().await.clear();
         self.inner.snapshots.lock().await.clear();
-        // Purged dispatch queues can never complete: drop their executions
-        // and fail their close waiters with OutcomeUnknown so nothing waits
-        // for a bridge completion that can no longer arrive. Failing (not
-        // merely dropping) the waiter sender releases the `close_pending_pane`
-        // receiver with the same OutcomeUnknown the retire path reports.
-        let purged: Vec<ExecutionId> = {
-            let mut queues = self.inner.queues.lock().await;
-            let mut purged = Vec::new();
-            for queue in queues.values_mut() {
-                for item in queue.drain(..) {
-                    if let Some(execution) = item.execution {
-                        purged.push(execution);
-                    }
-                }
-            }
-            purged
-        };
-        {
-            let mut live = self.inner.live_executions.lock().await;
-            for execution in &purged {
-                live.remove(&execution.0);
-            }
-        }
-        {
-            let mut waiters = self
-                .inner
-                .close_waiters
-                .lock()
-                .expect("Zellij close waiter registry is not poisoned");
-            for execution in purged {
-                if let Some(waiter) = waiters.remove(&execution.0) {
-                    let _ = waiter.send(DispatchCompletion::OutcomeUnknown {
-                        execution,
-                        error: AdapterError::new(
-                            AdapterErrorKind::OutcomeUnknown,
-                            "Zellij adapter suspended for activation with a queued request",
-                        ),
-                    });
-                }
-            }
-        }
-        self.inner.request.park().await;
-        self.inner.event.park().await;
-        self.emit(AdapterHealthEvent::Unhealthy {
-            modal_scope: None,
-            error: AdapterError::new(
-                AdapterErrorKind::Unavailable,
-                "Zellij pipe transport suspended for activation",
-            ),
-        })
-        .await;
-        Ok(())
+        return self.park_suspended_transport().await;
     }
 
     /// Re-establishes the retained pipe transport after an activation abort,
@@ -3162,6 +3565,46 @@ impl HostAdapter for ZellijAdapter {
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
+        // Settle outstanding executions first, before quiescing: `emit`
+        // drops broker events once quiescing is set, so terminals must be
+        // published while producers still run. Mirrors the suspend path:
+        // the in-flight slot settles by key, the queue drain owns queued
+        // slots (routing local close terminals to their waiters), and the
+        // catch-all settles every remaining sent slot; each request resolves
+        // exactly once and no execution is left non-terminal.
+        if let Some(pending) = self.inner.in_flight.lock().await.take()
+            && let Some(execution) = pending.execution
+            && !pending.settled
+        {
+            let slot = pending.request_slot.unwrap_or(pending.request.request_id);
+            let terminal = {
+                let mut live = self.inner.live_executions.lock().await;
+                Self::settle_slot(
+                    &mut live,
+                    execution,
+                    slot,
+                    Some((
+                        OutcomeRank::Unknown,
+                        AdapterError::new(
+                            AdapterErrorKind::OutcomeUnknown,
+                            "Zellij adapter shut down before completion",
+                        ),
+                    )),
+                )
+            };
+            if let Some(terminal) = terminal {
+                self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                    .await;
+            }
+        }
+        self.drain_queued_for_suspend().await;
+        for terminal in self
+            .settle_matching_unknown(|_| true, "Zellij adapter shut down before completion")
+            .await
+        {
+            self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
+                .await;
+        }
         // Quiesce every producer before publishing the final shutdown wake.
         self.inner.quiescing.store(true, Ordering::Release);
         self.inner.quiesce_wake.notify_waiters();
@@ -3602,12 +4045,10 @@ mod tests {
             reason = "the test uses decimal 777 as a recognizable reserved execution sentinel"
         )]
         let execution = ExecutionId(LOCAL_EXECUTION_CEILING | 777);
-        adapter
-            .inner
-            .live_executions
-            .lock()
-            .await
-            .insert(execution.0, None);
+        adapter.inner.live_executions.lock().await.insert(
+            execution.0,
+            ExecutionRecord::new(execution, vec![RequestId::INITIAL]),
+        );
         adapter
             .inner
             .queues
@@ -3617,6 +4058,7 @@ mod tests {
             .or_default()
             .push_back(QueuedItem {
                 execution: Some(execution),
+                request_slot: Some(RequestId::INITIAL),
                 client_id: "client-1".to_owned(),
                 payload: None,
             });
@@ -3779,6 +4221,20 @@ mod tests {
             ))
             .expect("dispatch completion encodes"),
         );
+    }
+    fn push_request_released(event: &ScriptedChannel, request_id: RequestId) {
+        event.push_line(
+            encode_event_line(&pipe_event(
+                [7; 16],
+                Some(request_id),
+                PipeEventKind::Response(BridgeResponse::RequestReleased),
+            ))
+            .expect("request release encodes"),
+        );
+    }
+
+    fn two_request_batch() -> Vec<RawNativeCommand> {
+        vec![RawNativeCommand::CloseFocus, RawNativeCommand::CloseSelf]
     }
 
     struct WriteFailChannel {
@@ -4111,6 +4567,466 @@ mod tests {
             AdapterHealthEvent::CaptureReady { .. } => panic!("capture ready"),
             AdapterHealthEvent::CaptureLost { .. } => panic!("capture lost"),
         }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "single-request execution publishes exactly one terminal"
+        );
+        assert!(
+            !adapter.inner.live_executions.lock().await.contains_key(&7),
+            "single-request execution is removed after its terminal"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn multi_request_batch_publishes_one_aggregate_failure_after_all_requests() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+
+        let execution = ExecutionId(101);
+        adapter
+            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch())
+            .await
+            .expect("two-request batch is accepted");
+        let first = decode_request_line(&poll_outbound(&request).await).expect("first request");
+        push_request_released(&event, first.request_id);
+        let second = decode_request_line(&poll_outbound(&request).await).expect("second request");
+
+        push_dispatch_completion(
+            &event,
+            first.request_id,
+            execution,
+            CommandOutcome::succeeded(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "the first success does not complete the aggregate"
+        );
+
+        push_request_released(&event, second.request_id);
+        push_dispatch_completion(
+            &event,
+            second.request_id,
+            execution,
+            CommandOutcome {
+                status: CommandStatus::Failed,
+                detail: "second request failed".to_owned(),
+            },
+        );
+        match next_event(&adapter).await {
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Failed {
+                execution: got,
+                error,
+            }) => {
+                assert_eq!(got, execution);
+                assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
+                assert_eq!(error.message, "second request failed");
+            }
+            other => {
+                let _ = other;
+                panic!("expected one aggregate failure")
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "aggregate after-action notification is emitted exactly once"
+        );
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&execution.0),
+            "aggregate record is removed after the final request"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_with_write_failure_publishes_one_unknown_terminal() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let failing_request = WriteFailChannel::new(Arc::clone(&request));
+        let adapter = test_adapter_with_channels(
+            failing_request as Arc<dyn PipeChannel>,
+            Arc::clone(&event) as Arc<dyn PipeChannel>,
+            ScriptedMembership::fresh(Vec::new()),
+        );
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+
+        let execution = ExecutionId(202);
+        adapter
+            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch())
+            .await
+            .expect("mixed batch remains accepted before transport outcome");
+        match next_event(&adapter).await {
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+                execution: got,
+                error,
+            }) => {
+                assert_eq!(got, execution);
+                assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+            }
+            _ => panic!("expected one unknown terminal"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "write-failure batch publishes no duplicate terminal"
+        );
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&execution.0),
+            "write-failure batch leaves no live execution"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn registration_retirement_resolves_batch_once() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+
+        let execution = ExecutionId(303);
+        adapter
+            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch())
+            .await
+            .expect("two-request batch is accepted");
+        let _first = decode_request_line(&poll_outbound(&request).await).expect("first request");
+
+        push_register(&event, "client-1", [8; 16], env!("CARGO_PKG_VERSION"));
+        await_turnover_registration(&adapter).await;
+        let second = decode_request_line(&poll_outbound(&request).await).expect("second request");
+        assert_eq!(second.registration, registration_id(8));
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+
+        push_register(&event, "client-1", [9; 16], env!("CARGO_PKG_VERSION"));
+        await_turnover_registration(&adapter).await;
+        match next_event(&adapter).await {
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+                execution: got,
+                error,
+            }) => {
+                assert_eq!(got, execution);
+                assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+            }
+            _ => panic!("expected one retirement terminal"),
+        }
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "registration retirement emits no duplicate terminal"
+        );
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&execution.0),
+            "retired batch leaves no live execution"
+        );
+        assert!(
+            adapter
+                .inner
+                .queues
+                .lock()
+                .await
+                .values()
+                .all(VecDeque::is_empty),
+            "retired batch leaves no queued request"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn suspend_queue_purge_resolves_batch_once() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+
+        let execution = ExecutionId(404);
+        adapter
+            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch())
+            .await
+            .expect("two-request batch is accepted");
+        let _first = decode_request_line(&poll_outbound(&request).await).expect("first request");
+
+        adapter
+            .suspend_for_activation()
+            .await
+            .expect("suspend purges the batch");
+        match next_event(&adapter).await {
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+                execution: got,
+                error,
+            }) => {
+                assert_eq!(got, execution);
+                assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+            }
+            _ => panic!("expected one purge terminal"),
+        }
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Unhealthy { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "queue purge emits no duplicate terminal"
+        );
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&execution.0),
+            "purged batch leaves no live execution"
+        );
+        assert!(
+            adapter
+                .inner
+                .queues
+                .lock()
+                .await
+                .values()
+                .all(VecDeque::is_empty),
+            "purged batch leaves no queued request"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    /// Success plus an outcome-unknown interruption aggregates unknown:
+    /// worst case wins (`OutcomeUnknown` > `Failed` > `Succeeded`), and the
+    /// terminal carries the interruption error, not the success. Fails
+    /// pre-change at the old completion path, which published the first
+    /// success as the terminal and orphaned the sibling.
+    #[tokio::test]
+    async fn batch_success_plus_unknown_publishes_one_unknown_terminal() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+
+        let execution = ExecutionId(303);
+        adapter
+            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch())
+            .await
+            .expect("two-request batch is accepted");
+        let first = decode_request_line(&poll_outbound(&request).await).expect("first request");
+        push_request_released(&event, first.request_id);
+        let second = decode_request_line(&poll_outbound(&request).await).expect("second request");
+
+        push_dispatch_completion(
+            &event,
+            first.request_id,
+            execution,
+            CommandOutcome::succeeded(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "the first success does not complete the aggregate"
+        );
+
+        // The second request's bridge dies mid-flight: retirement settles it
+        // unknown, and the aggregate must publish exactly one unknown
+        // terminal carrying the retirement error.
+        push_register(&event, "client-1", [8; 16], env!("CARGO_PKG_VERSION"));
+        await_turnover_registration(&adapter).await;
+        match next_event(&adapter).await {
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+                execution: got,
+                error,
+            }) => {
+                assert_eq!(got, execution);
+                assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+            }
+            _ => panic!("expected one unknown aggregate terminal"),
+        }
+        // The turnover registration itself reports `Healthy` on arrival; the
+        // retirement terminal above was already consumed, so drain exactly
+        // one `Healthy` and then require silence: no duplicate terminal.
+        // (`push_request_released` is intentionally NOT called for
+        // `second.request_id`: its slot settled unknown at retirement.)
+        let _ = second;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "success+unknown batch publishes no duplicate terminal"
+        );
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&execution.0),
+            "aggregate record is removed after success+unknown"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    /// A duplicate bridge completion for an already-settled request is a
+    /// no-op: it must not double-count, publish early, or orphan the real
+    /// sibling. The terminal publishes exactly once, on the genuine second
+    /// completion, and the record empties.
+    #[tokio::test]
+    async fn duplicate_completion_for_one_request_does_not_publish_early() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &["client-1"]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+
+        let execution = ExecutionId(404);
+        adapter
+            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch())
+            .await
+            .expect("two-request batch is accepted");
+        let first = decode_request_line(&poll_outbound(&request).await).expect("first request");
+        push_request_released(&event, first.request_id);
+        let second = decode_request_line(&poll_outbound(&request).await).expect("second request");
+        push_request_released(&event, second.request_id);
+
+        push_dispatch_completion(
+            &event,
+            first.request_id,
+            execution,
+            CommandOutcome::succeeded(),
+        );
+        // Duplicate of the FIRST request's completion: must be ignored, not
+        // counted as the second request's terminal.
+        push_dispatch_completion(
+            &event,
+            first.request_id,
+            execution,
+            CommandOutcome::succeeded(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "duplicate completion publishes no terminal"
+        );
+
+        push_dispatch_completion(
+            &event,
+            second.request_id,
+            execution,
+            CommandOutcome::succeeded(),
+        );
+        match next_event(&adapter).await {
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
+                execution: got,
+            }) => {
+                assert_eq!(got, execution);
+            }
+            _ => panic!("expected one success terminal on the genuine second completion"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                .await
+                .is_err(),
+            "duplicate-tolerant batch publishes exactly one terminal"
+        );
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&execution.0),
+            "record empties after genuine completion"
+        );
+        adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn empty_batch_is_rejected_as_invalid_request() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+
+        // The ExecutionRecord acceptance/completion contract documents this
+        // deliberate bounded behavior: an empty batch is rejected rather than
+        // accepted with no request capable of producing a terminal result.
+        let error = adapter
+            .dispatch_to_client(ExecutionId(505), "client-1".to_owned(), Vec::new())
+            .await
+            .expect_err("empty batch is invalid");
+        assert_eq!(error.kind, AdapterErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Zellij execution must resolve to at least one host command"
+        );
+        assert!(
+            adapter.inner.live_executions.lock().await.is_empty(),
+            "rejected empty batch does not create an execution"
+        );
+        adapter.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -5117,7 +6033,10 @@ mod tests {
                 .confirm("client-1", lease, "normal".to_owned())
                 .expect("capture confirms");
         }
-        adapter.inner.live_executions.lock().await.insert(77, None);
+        adapter.inner.live_executions.lock().await.insert(
+            77,
+            ExecutionRecord::new(ExecutionId(77), vec![RequestId::INITIAL]),
+        );
         // A real lifecycle payload: the pre-existing `payload: None` seed
         // could never survive any enqueue-triggered pump (the pump consumes
         // a payload-less head with an `Unhealthy` report), while production
@@ -5133,6 +6052,7 @@ mod tests {
             .or_default()
             .push_back(QueuedItem {
                 execution: None,
+                request_slot: None,
                 client_id: "client-1".to_owned(),
                 payload: Some(BridgeRequest::Retire),
             });
@@ -6017,13 +6937,19 @@ done
             request: provenance,
             generation,
             execution: Some(execution),
+            request_slot: Some(RequestId::INITIAL),
+            settled: false,
         });
-        adapter
-            .inner
-            .live_executions
-            .lock()
-            .await
-            .insert(execution.0, Some(provenance));
+        adapter.inner.live_executions.lock().await.insert(
+            execution.0,
+            ExecutionRecord {
+                execution,
+                total: 1,
+                requests: BTreeMap::from([(RequestId::INITIAL, Some(provenance))]),
+                worst: None,
+                settled: 0,
+            },
+        );
         adapter.watch_release(provenance, generation);
         tokio::time::advance(RELEASE_TIMEOUT).await;
         hook.entered.notified().await;
