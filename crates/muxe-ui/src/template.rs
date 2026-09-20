@@ -14,7 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::layout::{ellipsize, sanitize_single_line};
 
-const MAX_COMPONENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_COMPONENT_BYTES: usize = 64 * 1024;
 
 /// Plain values available to the menu cell template.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +62,43 @@ pub struct RenderedSpan {
 pub struct RenderedText {
     pub plain: String,
     pub spans: Vec<RenderedSpan>,
+}
+impl RenderedText {
+    /// Builds a sanitized, unstyled single-span fallback without evaluating any
+    /// template. The text is cut to one line and truncated to the component byte
+    /// limit, so the fallback itself can never exceed the output bound.
+    #[must_use]
+    pub(crate) fn plain_fallback(text: &str) -> Self {
+        let mut plain = sanitize_single_line(text);
+        if plain.len() > MAX_COMPONENT_BYTES {
+            let mut end = MAX_COMPONENT_BYTES;
+            while !plain.is_char_boundary(end) {
+                end -= 1;
+            }
+            plain.truncate(end);
+        }
+        let spans = if plain.is_empty() {
+            Vec::new()
+        } else {
+            vec![RenderedSpan {
+                text: plain.clone(),
+                style: RatatuiStyle::default(),
+            }]
+        };
+        Self { plain, spans }
+    }
+
+    /// Builds the degraded cell fallback from the already-known plain model
+    /// values: the sanitized key and title-limited label joined as unstyled text,
+    /// with a `!` marker when the binding is blocked. No template is evaluated,
+    /// so a broken cell template cannot fail this path.
+    #[must_use]
+    pub(crate) fn fallback_cell(cell: CellTemplate<'_>) -> Self {
+        let key = sanitize_single_line(cell.key);
+        let title = ellipsize(cell.title, cell.max_title_width);
+        let marker = if cell.blocked { "! " } else { "" };
+        Self::plain_fallback(&format!("{marker}{key} → {title}"))
+    }
 }
 
 /// A template compilation or render failure.

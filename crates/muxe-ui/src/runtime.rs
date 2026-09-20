@@ -147,8 +147,19 @@ impl StatusMessage {
         Self { kind, message }
     }
 }
-
 impl UiRuntime {
+    /// The single degraded-component status shared by every render path below.
+    /// It routes through the centralized priority policy, so one menu keeps
+    /// one status: repeated degraded components refresh the same error and
+    /// never open a second status channel. Error outranks pending progress,
+    /// matching the documented precedence order.
+    fn flag_degraded_component(&mut self, component: &'static str, error: &TemplateError) {
+        self.set_status(
+            StatusKind::Error,
+            format!("Menu template `{component}` failed; showing plain text: {error}"),
+        );
+    }
+
     /// Applies the single status priority policy: a new status replaces the
     /// current one only when its priority is at least as high. Errors therefore
     /// survive later health notices, and pending progress survives blocked notes.
@@ -699,10 +710,19 @@ impl UiRuntime {
 
     /// Renders the current menu against the exact terminal rectangle before a surface redraw.
     ///
+    /// A component whose template is load-valid but fails evaluation (undefined
+    /// variable, failing filter, excessive output) degrades to a sanitized,
+    /// unstyled fallback built from the already-known plain model values. The
+    /// first degraded component sets the centralized error status and the rest
+    /// of the menu keeps rendering; preparation never aborts the run loop for
+    /// an evaluation failure.
+    ///
     /// # Errors
     ///
-    /// Returns [`UiError`] when the current menu is missing, a template fails to render, or the
-    /// page conditions never stabilize on a page count.
+    /// Returns [`UiError`] when the current menu is missing or the page
+    /// conditions never stabilize on a page count. Low-level renderer errors
+    /// stay fallible at the renderer boundary; this method applies the
+    /// per-component degrade policy to evaluation failures instead.
     pub fn prepare(&mut self, area: Rect) -> Result<PreparedMenu, UiError> {
         if self
             .last_area
@@ -712,12 +732,38 @@ impl UiRuntime {
             self.current_page = 0;
             self.last_page_count = 1;
         }
+        // First pass: lay out against the pre-existing status so a healthy
+        // menu renders byte-identical to before. When that pass newly degrades
+        // a component, the centralized error status was absent at layout time,
+        // so a second pass re-lays out with the row reserved; degradation is
+        // monotonic, so one re-run converges instead of oscillating. Compare
+        // against the pre-existing status rather than the rendered line: the
+        // first pass always paints the error it detects.
+        let status_visible = self.status.is_some();
+        let (mut prepared, page, degraded) = self.prepare_with_status_row(area, false)?;
+        if !degraded.is_empty() && !status_visible {
+            (prepared, _, _) = self.prepare_with_status_row(area, true)?;
+        }
+        self.current_page = page;
+        self.last_page_count = prepared.plan.page_count.max(1);
+        Ok(prepared)
+    }
+
+    /// Renders one frame with explicit control over the reserved status row.
+    /// Degraded components set the centralized error status through
+    /// [`Self::flag_degraded_component`] and the status line is rendered in
+    /// the same call, so the frame that detects a failure also paints it.
+    fn prepare_with_status_row(
+        &mut self,
+        area: Rect,
+        status_reserved: bool,
+    ) -> Result<(PreparedMenu, usize, Vec<DegradedComponent>), UiError> {
         let current_menu = self.current_menu_id()?;
         let stack = self.menu_session.stack();
         let current_page = self.current_page;
         let last_page_count = self.last_page_count;
-        let status = self.status.as_ref();
-        let (prepared, page) = self.snapshot.with_attachment(|attachment| {
+        let reserve_status = status_reserved || self.status.is_some();
+        let (prepared, page, degraded) = self.snapshot.with_attachment(|attachment| {
             let menu = attachment
                 .menu
                 .menus
@@ -730,7 +776,7 @@ impl UiRuntime {
                 top: menu.layout.padding.top.to_native(),
                 bottom: menu.layout.padding.bottom.to_native(),
             };
-            let grid = grid_rect(area, padding, status.is_some());
+            let grid = grid_rect(area, padding, reserve_status);
             let max_title_width = menu.layout.max_item_title_length.to_native() as usize;
             let mut count = last_page_count.max(1);
             let mut page = current_page.min(count.saturating_sub(1));
@@ -741,7 +787,7 @@ impl UiRuntime {
                     current: page.saturating_add(1) as u64,
                     count: count as u64,
                 };
-                let cells = render_visible_cells(
+                let (cells, degraded_cells) = render_visible_cells(
                     &self.renderer,
                     menu,
                     pages,
@@ -763,17 +809,18 @@ impl UiRuntime {
                 let next_count = plan.page_count.max(1);
                 let next_page = page.min(next_count.saturating_sub(1));
                 if next_count == count && next_page == page {
-                    let breadcrumbs = render_breadcrumbs(&self.renderer, attachment, stack)?;
-                    let pager_text =
-                        render_pager(&self.renderer, menu, &plan, page, grid.width as usize)?;
-                    let status = status
-                        .map(|status| {
-                            self.renderer.render_status(StatusTemplate {
-                                level: status.kind.level(),
-                                message: &status.message,
-                            })
-                        })
-                        .transpose()?;
+                    let (breadcrumbs, degraded_crumbs) =
+                        render_breadcrumbs_or_fallback(&self.renderer, attachment, stack);
+                    let (pager_text, degraded_pager) = render_pager_or_fallback(
+                        &self.renderer,
+                        menu,
+                        &plan,
+                        page,
+                        grid.width as usize,
+                    );
+                    let mut degraded: Vec<DegradedComponent> = degraded_cells;
+                    degraded.extend(degraded_crumbs);
+                    degraded.extend(degraded_pager);
                     return Ok((
                         PreparedMenu {
                             title: menu
@@ -787,9 +834,10 @@ impl UiRuntime {
                             cells,
                             page,
                             pager: pager_text,
-                            status,
+                            status: None,
                         },
                         page,
+                        degraded,
                     ));
                 }
                 count = next_count;
@@ -797,9 +845,33 @@ impl UiRuntime {
             }
             Err(UiError::UnstablePageConditions)
         })??;
-        self.current_page = page;
-        self.last_page_count = prepared.plan.page_count.max(1);
-        Ok(prepared)
+        let mut prepared = prepared;
+        for (component, error) in &degraded {
+            self.flag_degraded_component(component, error);
+        }
+        prepared.status = self.render_current_status();
+        Ok((prepared, page, degraded))
+    }
+
+    /// Renders the current centralized status through the status template in
+    /// the same `prepare` that set it, so the detecting frame paints its own
+    /// error line. A failing status template degrades to the plain message
+    /// text rather than aborting the otherwise fully rendered menu.
+    fn render_current_status(&mut self) -> Option<RenderedText> {
+        let (level, message) = self
+            .status
+            .as_ref()
+            .map(|status| (status.kind.level(), status.message.clone()))?;
+        match self.renderer.render_status(StatusTemplate {
+            level,
+            message: &message,
+        }) {
+            Ok(rendered) => Some(rendered),
+            Err(error) => {
+                self.flag_degraded_component("status", &error);
+                Some(RenderedText::plain_fallback(&message))
+            }
+        }
     }
 
     fn current_menu_id(&self) -> Result<CoreMenuId, UiError> {
@@ -936,15 +1008,23 @@ fn grid_rect(area: Rect, padding: SurfacePadding, has_status: bool) -> GridRect 
             .saturating_sub(u16::from(has_status)),
     }
 }
+/// One load-valid component that failed evaluation, named for the centralized
+/// error status with the renderer error that the caller reports.
+type DegradedComponent = (&'static str, TemplateError);
 
+/// Renders every visible cell, degrading a failing cell to its plain model
+/// values instead of aborting the menu. Each degraded cell is returned as a
+/// [`DegradedComponent`] so the caller can report it through the centralized
+/// error status without a second status channel.
 fn render_visible_cells(
     renderer: &TemplateRenderer,
     menu: &ArchivedMenuViewMenuWire,
     pages: PagesContextWire,
     max_title_width: usize,
     availability: &[BindingAvailabilityOverlay],
-) -> Result<Vec<RenderedText>, UiError> {
+) -> Result<(Vec<RenderedText>, Vec<DegradedComponent>), UiError> {
     let mut cells = Vec::new();
+    let mut degraded = Vec::new();
     for binding in menu.bindings.iter() {
         let state = evaluate_archived_binding_state(binding, pages)?;
         if !state.included || !state.shown || binding.hidden {
@@ -960,28 +1040,41 @@ fn render_visible_cells(
             .map_or(state.blocked, |current| {
                 current.availability == BindingAvailability::Blocked
             });
-        cells.push(
-            renderer.render_cell(CellTemplate {
-                key: binding.key.as_str(),
-                title: binding
-                    .label
-                    .as_ref()
-                    .map(rkyv::string::ArchivedString::as_str)
-                    .unwrap_or_default(),
-                disabled: !state.enabled || blocked,
-                blocked,
-                max_title_width,
-            })?,
-        );
+        let cell = CellTemplate {
+            key: binding.key.as_str(),
+            title: binding
+                .label
+                .as_ref()
+                .map(rkyv::string::ArchivedString::as_str)
+                .unwrap_or_default(),
+            disabled: !state.enabled || blocked,
+            blocked,
+            max_title_width,
+        };
+        match renderer.render_cell(cell) {
+            Ok(rendered) => cells.push(rendered),
+            // Evaluation failed on a load-valid template (undefined variable,
+            // failing filter, oversized output): fall back to the already-known
+            // plain model values, unstyled and without template evaluation, and
+            // keep the rest of the menu usable.
+            Err(error) => {
+                degraded.push(("cell", error));
+                cells.push(RenderedText::fallback_cell(cell));
+            }
+        }
     }
-    Ok(cells)
+    Ok((cells, degraded))
 }
 
-fn render_breadcrumbs(
+/// Renders breadcrumbs, degrading to the plain crumb titles when the
+/// load-valid template fails evaluation. The fallback joins the already-known
+/// menu titles without template evaluation, and the failure is reported
+/// through the centralized error status by the caller.
+fn render_breadcrumbs_or_fallback(
     renderer: &TemplateRenderer,
     attachment: &muxe_protocol::ArchivedUiAttachmentWire,
     stack: &[CoreMenuId],
-) -> Result<RenderedText, UiError> {
+) -> (RenderedText, Option<DegradedComponent>) {
     let crumbs = stack
         .iter()
         .filter_map(|id| {
@@ -997,20 +1090,27 @@ fn render_breadcrumbs(
                 .map(rkyv::string::ArchivedString::as_str)
         })
         .collect::<Vec<_>>();
-    renderer
-        .render_breadcrumbs(BreadcrumbTemplate { crumbs: &crumbs })
-        .map_err(UiError::from)
+    match renderer.render_breadcrumbs(BreadcrumbTemplate { crumbs: &crumbs }) {
+        Ok(rendered) => (rendered, None),
+        Err(error) => {
+            let fallback = RenderedText::plain_fallback(&crumbs.join(" › "));
+            (fallback, Some(("breadcrumbs", error)))
+        }
+    }
 }
-
-fn render_pager(
+/// Renders the pager, degrading to plain `current/count` text when the
+/// load-valid template fails evaluation. The fallback uses the already-known
+/// page numbers without template evaluation, and the failure is reported
+/// through the centralized error status by the caller.
+fn render_pager_or_fallback(
     renderer: &TemplateRenderer,
     menu: &ArchivedMenuViewMenuWire,
     plan: &GridPlan,
     page: usize,
     available_width: usize,
-) -> Result<Option<RenderedText>, UiError> {
+) -> (Option<RenderedText>, Option<DegradedComponent>) {
     if !plan.has_pager {
-        return Ok(None);
+        return (None, None);
     }
     let prev_keys = pager_keys(menu, true);
     let next_keys = pager_keys(menu, false);
@@ -1022,11 +1122,31 @@ fn render_pager(
         prev_keys: &prev_keys,
         next_keys: &next_keys,
     };
-    let full = renderer.render_pagination_full(pagination)?;
+    let full = match renderer.render_pagination_full(pagination) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return (
+                Some(RenderedText::plain_fallback(&format!(
+                    "{} / {}",
+                    pagination.current, pagination.count
+                ))),
+                Some(("pagination.full", error)),
+            );
+        }
+    };
     if UnicodeWidthStr::width(full.plain.as_str()) <= available_width {
-        Ok(Some(full))
+        (Some(full), None)
     } else {
-        Ok(Some(renderer.render_pagination_short(pagination)?))
+        match renderer.render_pagination_short(pagination) {
+            Ok(rendered) => (Some(rendered), None),
+            Err(error) => (
+                Some(RenderedText::plain_fallback(&format!(
+                    "{} / {}",
+                    pagination.current, pagination.count
+                ))),
+                Some(("pagination.short", error)),
+            ),
+        }
     }
 }
 
@@ -1393,6 +1513,55 @@ pub(crate) mod tests {
         bindings: Vec<muxe_protocol::BindingViewWire>,
     ) -> muxe_protocol::ArchivedFrame {
         profiled_attachment_with_timeout(keyboard, bindings, None)
+    }
+
+    fn profiled_attachment_with_theme(
+        bindings: Vec<muxe_protocol::BindingViewWire>,
+        theme: CompiledThemeWire,
+    ) -> muxe_protocol::ArchivedFrame {
+        archive_attachment(UiAttachmentWire {
+            menu: MenuViewWire {
+                generation: 7,
+                root: MenuId::new("root"),
+                menus: vec![MenuViewMenuWire {
+                    id: MenuId::new("root"),
+                    title: Some("Root".into()),
+                    layout: layout(),
+                    bindings,
+                }],
+            },
+            keyboard: KeyboardProfileWire::Kitty(KeyCapabilitiesWire {
+                event_types: true,
+                alternate_keys: true,
+                all_keys_as_escape_codes: false,
+            }),
+            inactivity_timeout_millis: None,
+            theme,
+        })
+    }
+
+    /// Returns the default wire theme with the `cell` template replaced by a
+    /// load-valid source. Callers pass syntactically valid templates that fail
+    /// only at evaluation (undefined variables, failing filters); malformed
+    /// sources stay rejected at attach time, matching production.
+    fn theme_with_template(name: &str, source: &str) -> CompiledThemeWire {
+        let mut theme = default_theme_wire();
+        let entry = theme
+            .menu
+            .templates
+            .iter_mut()
+            .find(|template| template.name == name)
+            .expect("default theme carries the replaced template");
+        entry.value = source.to_owned();
+        theme
+    }
+
+    /// Returns the default wire theme with the `cell` template replaced by a
+    /// load-valid source. Callers pass syntactically valid templates that fail
+    /// only at evaluation (undefined variables, failing filters); malformed
+    /// sources stay rejected at attach time, matching production.
+    fn theme_with_cell(cell: &str) -> CompiledThemeWire {
+        theme_with_template("cell", cell)
     }
 
     pub(crate) fn profiled_attachment_with_timeout(
@@ -2510,6 +2679,277 @@ pub(crate) mod tests {
                 .expect("root rerenders")
                 .title,
             "Root"
+        );
+    }
+    #[test]
+    fn undefined_cell_variable_degrades_to_plain_values_with_an_error_status() {
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![
+                binding(1, "a", "Open", BindingConditionsWire::default(), None),
+                binding(2, "b", "Build", BindingConditionsWire::default(), None),
+            ],
+            // Syntactically valid, so attach succeeds; strict undefined
+            // behavior fails every cell only at evaluation time.
+            theme_with_cell("{{ missing }}"),
+        ))
+        .expect("load-valid theme attaches");
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("evaluation failure degrades instead of aborting");
+        assert_eq!(prepared.cells.len(), 2, "both cells stay visible");
+        assert_eq!(
+            prepared.cells[0].plain, "a → Open",
+            "the failing cell falls back to its plain key and label"
+        );
+        assert_eq!(
+            prepared.cells[1].plain, "b → Build",
+            "the sibling cell degrades to its own plain values, not a copy"
+        );
+        assert!(
+            prepared.cells[0]
+                .spans
+                .iter()
+                .all(|span| span.style == Default::default()),
+            "the fallback carries no template styling"
+        );
+        let status = prepared.status.expect("degradation sets the error status");
+        assert!(
+            status.plain.contains("cell") && status.plain.contains("plain text"),
+            "one menu-wide error names the failing component, got `{}`",
+            status.plain
+        );
+        // The degraded cells stay selectable: the menu is still usable.
+        assert_eq!(
+            runtime
+                .handle_input(&press('b'))
+                .expect("sibling binding matches"),
+            UiCommand::Invoke {
+                generation: 7,
+                binding: BindingId {
+                    generation: 7,
+                    ordinal: 2,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_cell_degrades_within_the_output_bound() {
+        // Load-valid syntax whose evaluation expands past the 64 KiB
+        // renderer bound: the loop emits 70 000 bytes, so every cell fails
+        // with `OutputTooLarge` at evaluation time, not at load.
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![
+                binding(1, "a", "Open", BindingConditionsWire::default(), None),
+                binding(2, "b", "Build", BindingConditionsWire::default(), None),
+            ],
+            theme_with_cell("{% for i in range(70000) %}x{% endfor %}{{ title }}"),
+        ))
+        .expect("oversized template attaches");
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("oversized output degrades instead of aborting");
+        assert_eq!(prepared.cells.len(), 2, "both cells stay visible");
+        assert_eq!(
+            prepared.cells[0].plain, "a → Open",
+            "the oversized cell falls back to its plain key and label"
+        );
+        assert_eq!(
+            prepared.cells[1].plain, "b → Build",
+            "the sibling degrades to its own plain values, not a copy"
+        );
+        assert!(
+            prepared
+                .cells
+                .iter()
+                .all(|cell| cell.plain.len() <= 64 * 1024),
+            "every degraded fallback respects the output bound"
+        );
+        assert!(
+            prepared.status.is_some(),
+            "oversized output is observable through the error status"
+        );
+        // The degraded menu stays usable.
+        assert_eq!(
+            runtime
+                .handle_input(&press('a'))
+                .expect("binding still matches"),
+            UiCommand::Invoke {
+                generation: 7,
+                binding: BindingId {
+                    generation: 7,
+                    ordinal: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn failing_filter_degrades_like_an_undefined_variable() {
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![
+                binding(1, "a", "Open", BindingConditionsWire::default(), None),
+                binding(2, "b", "Build", BindingConditionsWire::default(), None),
+            ],
+            // Valid syntax: the filter exists, but an empty pad string fails
+            // at evaluation time.
+            theme_with_cell("{{ title | rpad(24, '') }}"),
+        ))
+        .expect("load-valid theme attaches");
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("failing filter degrades instead of aborting");
+        assert_eq!(prepared.cells.len(), 2);
+        assert_eq!(prepared.cells[0].plain, "a → Open");
+        assert_eq!(prepared.cells[1].plain, "b → Build");
+        assert!(
+            prepared.status.is_some(),
+            "a failing filter is observable through the error status"
+        );
+    }
+
+    #[test]
+    fn load_valid_malformed_cell_template_still_degrades() {
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![
+                binding(1, "a", "Open", BindingConditionsWire::default(), None),
+                binding(2, "b", "Build", BindingConditionsWire::default(), None),
+            ],
+            // Parses cleanly at load, then divides by zero at evaluation.
+            theme_with_cell("{{ 1 // 0 }} {{ title }}"),
+        ))
+        .expect("load-valid theme attaches");
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("evaluation failure degrades instead of aborting");
+        assert_eq!(prepared.cells.len(), 2);
+        assert_eq!(prepared.cells[0].plain, "a → Open");
+        assert_eq!(prepared.cells[1].plain, "b → Build");
+        assert!(
+            prepared.status.is_some(),
+            "a load-valid but failing template sets the error status"
+        );
+    }
+
+    #[test]
+    fn healthy_menu_renders_without_an_error_status() {
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![
+                binding(1, "a", "Open", BindingConditionsWire::default(), None),
+                binding(2, "b", "Build", BindingConditionsWire::default(), None),
+            ],
+            theme_with_cell("{{ key }} {{ title }}"),
+        ))
+        .expect("healthy theme attaches");
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("healthy menu renders");
+        assert_eq!(prepared.cells.len(), 2);
+        assert_eq!(prepared.cells[0].plain, "a Open");
+        assert_eq!(prepared.cells[1].plain, "b Build");
+        assert!(
+            prepared.status.is_none(),
+            "a healthy menu sets no error status"
+        );
+    }
+
+    #[test]
+    fn degraded_menu_converges_when_reprepared_with_its_error_status() {
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![
+                binding(1, "a", "Open", BindingConditionsWire::default(), None),
+                binding(2, "b", "Build", BindingConditionsWire::default(), None),
+            ],
+            theme_with_cell("{{ missing }}"),
+        ))
+        .expect("load-valid theme attaches");
+        let first = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("first degrade succeeds");
+        assert!(first.status.is_some());
+        let second = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("re-prepare with the error status succeeds");
+        assert_eq!(second.cells.len(), 2);
+        assert_eq!(second.cells[0].plain, "a → Open");
+        assert_eq!(second.cells[1].plain, "b → Build");
+        let status = second.status.expect("error status survives re-prepare");
+        assert!(
+            status.plain.contains("cell"),
+            "the converged frame keeps the single component error, got `{}`",
+            status.plain
+        );
+    }
+    #[test]
+    fn broken_breadcrumbs_degrade_to_plain_titles_with_an_error_status() {
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![
+                binding(1, "a", "Open", BindingConditionsWire::default(), None),
+                binding(2, "b", "Build", BindingConditionsWire::default(), None),
+            ],
+            // Syntactically valid, so attach succeeds; strict undefined
+            // behavior fails the component only at evaluation time.
+            theme_with_template("breadcrumbs", "{{ missing }}"),
+        ))
+        .expect("load-valid theme attaches");
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("broken breadcrumbs degrade instead of aborting");
+        assert_eq!(prepared.cells.len(), 2, "cells still render");
+        assert!(
+            prepared.cells[0].plain.contains("Open"),
+            "healthy cells keep their template rendering"
+        );
+        assert_eq!(
+            prepared.breadcrumbs.plain, "Root",
+            "breadcrumbs fall back to the plain menu title"
+        );
+        assert!(
+            prepared
+                .breadcrumbs
+                .spans
+                .iter()
+                .all(|span| span.style == Default::default()),
+            "the breadcrumbs fallback carries no template styling"
+        );
+        let status = prepared.status.expect("degradation sets the error status");
+        assert!(
+            status.plain.contains("breadcrumbs"),
+            "one menu-wide error names the failing component, got `{}`",
+            status.plain
+        );
+    }
+
+    #[test]
+    fn broken_status_template_degrades_to_the_plain_message() {
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![binding(
+                1,
+                "a",
+                "Open",
+                BindingConditionsWire::default(),
+                None,
+            )],
+            theme_with_template("status", "{{ missing }}"),
+        ))
+        .expect("load-valid theme attaches");
+        runtime.report_broker_error("boom".to_owned());
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("broken status degrades instead of aborting");
+        assert_eq!(prepared.cells.len(), 1, "cells still render");
+        let status = prepared.status.expect("status line still paints");
+        assert!(
+            status.plain.contains("boom"),
+            "the status fallback shows the plain message, got `{}`",
+            status.plain
+        );
+        assert!(
+            status
+                .spans
+                .iter()
+                .all(|span| span.style == Default::default()),
+            "the status fallback carries no template styling"
         );
     }
 }
