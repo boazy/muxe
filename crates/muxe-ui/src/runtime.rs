@@ -1052,7 +1052,7 @@ fn render_visible_cells(
             max_title_width,
         };
         match renderer.render_cell(cell) {
-            Ok(rendered) => cells.push(rendered),
+            Ok(cell_output) => cells.push(cell_output),
             // Evaluation failed on a load-valid template (undefined variable,
             // failing filter, oversized output): fall back to the already-known
             // plain model values, unstyled and without template evaluation, and
@@ -1091,7 +1091,7 @@ fn render_breadcrumbs_or_fallback(
         })
         .collect::<Vec<_>>();
     match renderer.render_breadcrumbs(BreadcrumbTemplate { crumbs: &crumbs }) {
-        Ok(rendered) => (rendered, None),
+        Ok(breadcrumb_output) => (breadcrumb_output, None),
         Err(error) => {
             let fallback = RenderedText::plain_fallback(&crumbs.join(" › "));
             (fallback, Some(("breadcrumbs", error)))
@@ -1123,7 +1123,7 @@ fn render_pager_or_fallback(
         next_keys: &next_keys,
     };
     let full = match renderer.render_pagination_full(pagination) {
-        Ok(rendered) => rendered,
+        Ok(full_output) => full_output,
         Err(error) => {
             return (
                 Some(RenderedText::plain_fallback(&format!(
@@ -1138,7 +1138,7 @@ fn render_pager_or_fallback(
         (Some(full), None)
     } else {
         match renderer.render_pagination_short(pagination) {
-            Ok(rendered) => (Some(rendered), None),
+            Ok(short_output) => (Some(short_output), None),
             Err(error) => (
                 Some(RenderedText::plain_fallback(&format!(
                     "{} / {}",
@@ -2709,7 +2709,7 @@ pub(crate) mod tests {
             prepared.cells[0]
                 .spans
                 .iter()
-                .all(|span| span.style == Default::default()),
+                .all(|span| span.style == ratatui::style::Style::default()),
             "the fallback carries no template styling"
         );
         let status = prepared.status.expect("degradation sets the error status");
@@ -2909,7 +2909,7 @@ pub(crate) mod tests {
                 .breadcrumbs
                 .spans
                 .iter()
-                .all(|span| span.style == Default::default()),
+                .all(|span| span.style == ratatui::style::Style::default()),
             "the breadcrumbs fallback carries no template styling"
         );
         let status = prepared.status.expect("degradation sets the error status");
@@ -2948,7 +2948,7 @@ pub(crate) mod tests {
             status
                 .spans
                 .iter()
-                .all(|span| span.style == Default::default()),
+                .all(|span| span.style == ratatui::style::Style::default()),
             "the status fallback carries no template styling"
         );
     }
