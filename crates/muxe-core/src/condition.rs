@@ -29,18 +29,6 @@ impl ConditionProgram {
     /// Returns a diagnostic when CEL parsing fails, when the AST uses a construct the IR cannot
     /// represent, or when the lowered expression does not type-check to Boolean.
     pub fn compile(source: &str, span: SourceSpan) -> Result<Self, ConfigDiagnostic> {
-        // The CEL AST normalizes `0x10` to `Int(16)`, losing the spelling, so a source
-        // pre-scan rejects hexadecimal integer literals with the actionable diagnostic.
-        if let Some(literal) = find_hex_literal(source) {
-            return Err(ConfigDiagnostic::error(
-                DiagnosticCode::InvalidCondition,
-                unsupported(
-                    "hexadecimal integer literal",
-                    "conditions support only decimal integers; rewrite the literal in decimal",
-                ) + &format!(" near `{literal}`"),
-                span,
-            ));
-        }
         let program = Program::compile(source).map_err(|error| {
             ConfigDiagnostic::error(
                 DiagnosticCode::InvalidCondition,
@@ -332,51 +320,6 @@ fn unsupported(construct: &str, help: &str) -> String {
     format!("unsupported construct in condition: {construct} ({help})")
 }
 
-/// Scans the raw source for a hexadecimal integer literal outside string literals. The CEL AST
-/// normalizes `0x10` to `Int(16)`, so the spelling is unrecoverable after parsing; this pre-scan
-/// keeps the rejection actionable. Returns the offending literal text.
-fn find_hex_literal(source: &str) -> Option<String> {
-    let bytes = source.as_bytes();
-    let mut index = 0;
-    let mut quote: Option<u8> = None;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if let Some(open) = quote {
-            if byte == b'\\' {
-                index += 2;
-                continue;
-            }
-            if byte == open {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if byte == b'\'' || byte == b'"' {
-            quote = Some(byte);
-            index += 1;
-            continue;
-        }
-        let is_hex_prefix = byte == b'0'
-            && index + 1 < bytes.len()
-            && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X');
-        let preceded_by_word =
-            index > 0 && (bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
-        if is_hex_prefix && !preceded_by_word {
-            let mut end = index + 2;
-            while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
-                end += 1;
-            }
-            if end > index + 2 {
-                return Some(source[index..end].to_owned());
-            }
-            return Some(source[index..index + 2].to_owned());
-        }
-        index += 1;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +419,59 @@ mod tests {
     }
 
     #[test]
+    fn accepts_cel_hexadecimal_integers_through_ast() {
+        assert_eq!(
+            evaluate_source(
+                "0x10 > 15",
+                PagesContext {
+                    count: 0,
+                    current: 0
+                }
+            ),
+            Ok(true)
+        );
+        // The pinned CEL parser accepts lowercase `0x` integer literals but not an uppercase
+        // `0X` prefix; this is its own syntax diagnostic, not a hand-rolled hex rejection.
+        let uppercase_error = ConditionProgram::compile("0XFF == 255", span())
+            .expect_err("uppercase hexadecimal is outside the pinned CEL grammar");
+        assert_eq!(uppercase_error.code, DiagnosticCode::InvalidCondition);
+        assert!(
+            uppercase_error
+                .message
+                .starts_with("ERROR: <input>:1:2: Syntax error: mismatched input 'XFF' expecting"),
+            "{uppercase_error:?}"
+        );
+        assert!(
+            !uppercase_error
+                .message
+                .contains("hexadecimal integer literal"),
+            "{uppercase_error:?}"
+        );
+
+        // CEL keeps strings as strings, so the shared lowerer rejects this rather than treating
+        // the `0x` text as an integer literal.
+        let string_error = ConditionProgram::compile("\"0x10\" == \"0x10\"", span())
+            .expect_err("string comparisons are outside the condition IR");
+        assert!(
+            string_error.message.contains("string literal"),
+            "{string_error:?}"
+        );
+
+        // CEL discards the line comment before producing the AST, so the condition evaluates as
+        // the comparison preceding the comment.
+        assert_eq!(
+            evaluate_source(
+                "16 > 15 // 0xFF\n",
+                PagesContext {
+                    count: 0,
+                    current: 0
+                }
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_cel_constructs_with_actionable_diagnostics() {
         for (source, fragment) in [
             ("\"a\" == \"b\"", "string"),
@@ -490,8 +486,6 @@ mod tests {
             ("b\"a\" == b\"b\"", "bytes"),
             ("has(pages.count)", "has"),
             ("[1].exists(x, x > 0)", "comprehension"),
-            ("0x10 > 15", "hexadecimal"),
-            ("0XFF == 255", "hexadecimal"),
         ] {
             let error = ConditionProgram::compile(source, span()).expect_err("must not compile");
             assert_eq!(error.code, DiagnosticCode::InvalidCondition, "{source}");
