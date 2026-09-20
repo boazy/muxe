@@ -897,16 +897,23 @@ fn kitty_event_details(
     if parameters.len < 2 {
         return Ok((Modifiers::NONE, LockState::NONE, EventKind::Press));
     }
-    let modifiers = parameters.values[1];
-    if modifiers.len == 0 || modifiers.len > 2 {
+    kitty_modifier_and_kind(parameters.values[1])
+}
+
+/// Decodes the `modifier[:event-type]` component shared by the CSI-u, direct-letter,
+/// tilde, and shift-tab functional-key forms.
+fn kitty_modifier_and_kind(
+    parameter: CsiParameter,
+) -> Result<(Modifiers, LockState, EventKind), MalformedReason> {
+    if parameter.len == 0 || parameter.len > 2 {
         return Err(MalformedReason::InvalidSyntax);
     }
-    let modifier_value = modifiers.values[0].unwrap_or(1);
-    if modifiers.len == 2 && modifiers.values[0].is_none() {
+    let modifier_value = parameter.values[0].unwrap_or(1);
+    if parameter.len == 2 && parameter.values[0].is_none() {
         return Err(MalformedReason::InvalidSyntax);
     }
     let (modifier_set, locks) = kitty_modifiers(modifier_value)?;
-    let kind = match modifiers.values[1] {
+    let kind = match parameter.values[1] {
         None | Some(1) => EventKind::Press,
         Some(2) => EventKind::Repeat,
         Some(3) => EventKind::Release,
@@ -943,21 +950,21 @@ fn decode_tilde(parameters: &CsiParameters, final_byte: u8, bytes: usize) -> Inp
     let Some((primary, keypad)) = tilde_identity(number) else {
         return unknown_csi(final_byte, bytes);
     };
-    let modifier_value = match parameters.len {
-        1 => 1,
-        2 if parameters.values[1].len == 1 => parameters.values[1].first().unwrap_or(1),
+    let (modifiers, locks, kind) = match parameters.len {
+        1 => (Modifiers::NONE, LockState::NONE, EventKind::Press),
+        2 => match kitty_modifier_and_kind(parameters.values[1]) {
+            Ok(details) => details,
+            Err(MalformedReason::InvalidSyntax) => return unknown_csi(final_byte, bytes),
+            Err(reason) => return malformed(SequenceClass::Csi, reason, saturating_u8(bytes)),
+        },
         _ => return unknown_csi(final_byte, bytes),
-    };
-    let (modifiers, locks) = match kitty_modifiers(modifier_value) {
-        Ok(result) => result,
-        Err(reason) => return malformed(SequenceClass::Csi, reason, saturating_u8(bytes)),
     };
     InputEvent::Key(RawKeyEvent {
         primary,
         shifted: None,
         base: None,
         modifiers,
-        kind: EventKind::Press,
+        kind,
         locks,
         keypad,
     })
@@ -983,23 +990,24 @@ fn decode_direct_event(
     final_byte: u8,
     bytes: usize,
 ) -> InputEvent {
-    let modifier_value = match parameters.len {
-        0 => 1,
-        1 if parameters.values[0].len == 1 && parameters.values[0].first() == Some(1) => 1,
-        2 if parameters.values[0].len == 1
-            && parameters.values[0].first().is_some()
-            && parameters.values[1].len == 1 =>
-        {
-            parameters.values[1].first().unwrap_or(1)
+    let no_modifiers = (Modifiers::NONE, LockState::NONE, EventKind::Press);
+    let (modifiers, locks, kind) = match parameters.len {
+        0 => no_modifiers,
+        1 if parameters.values[0].len == 1 && parameters.values[0].first() == Some(1) => {
+            no_modifiers
+        }
+        2 if parameters.values[0].len == 1 && parameters.values[0].first().is_some() => {
+            match kitty_modifier_and_kind(parameters.values[1]) {
+                Ok(details) => details,
+                Err(MalformedReason::InvalidSyntax) => return unknown_csi(final_byte, bytes),
+                Err(reason) => return malformed(SequenceClass::Csi, reason, saturating_u8(bytes)),
+            }
         }
         _ => return unknown_csi(final_byte, bytes),
     };
-    let (modifiers, locks) = match kitty_modifiers(modifier_value) {
-        Ok(result) => result,
-        Err(reason) => return malformed(SequenceClass::Csi, reason, saturating_u8(bytes)),
-    };
     event.modifiers = modifiers;
     event.locks = locks;
+    event.kind = kind;
     InputEvent::Key(event)
 }
 
@@ -1008,17 +1016,20 @@ fn decode_shift_tab(parameters: &CsiParameters, final_byte: u8, bytes: usize) ->
     event.modifiers = Modifiers::SHIFT;
     match parameters.len {
         0 => InputEvent::Key(event),
-        2 if parameters.values[0].first() == Some(1) && parameters.values[1].len == 1 => {
-            let (modifiers, locks) =
-                match kitty_modifiers(parameters.values[1].first().unwrap_or(1)) {
-                    Ok(result) => result,
-                    Err(reason) => {
-                        return malformed(SequenceClass::Csi, reason, saturating_u8(bytes));
-                    }
-                };
-            event.modifiers = modifiers;
-            event.locks = locks;
-            InputEvent::Key(event)
+        // `CSI 1;modifier[:event-type]Z` reuses the shared decoder; a bare
+        // `CSI 1;modifierZ` keeps the legacy behavior of replacing the implied Shift
+        // with the reported modifiers.
+        2 if parameters.values[0].first() == Some(1) => {
+            match kitty_modifier_and_kind(parameters.values[1]) {
+                Ok((modifiers, locks, kind)) => {
+                    event.modifiers = modifiers;
+                    event.locks = locks;
+                    event.kind = kind;
+                    InputEvent::Key(event)
+                }
+                Err(MalformedReason::InvalidSyntax) => unknown_csi(final_byte, bytes),
+                Err(reason) => malformed(SequenceClass::Csi, reason, saturating_u8(bytes)),
+            }
         }
         _ => unknown_csi(final_byte, bytes),
     }
@@ -1566,6 +1577,140 @@ mod tests {
             let fragmented = parse_chunks(&[&stream[..split], &stream[split..]], true);
             assert_eq!(fragmented, whole, "split at byte {split}");
         }
+    }
+
+    fn assert_direct_event(stream: &[u8], expected: RawKeyEvent) {
+        let events = parse_chunks(&[stream], true);
+        assert_eq!(events, vec![InputEvent::Key(expected)], "{stream:?}");
+        let whole = parse_chunks(&[stream], true);
+        for split in 0..=stream.len() {
+            let fragmented = parse_chunks(&[&stream[..split], &stream[split..]], true);
+            assert_eq!(fragmented, whole, "split at byte {split} of {stream:?}");
+        }
+    }
+
+    #[test]
+    fn direct_letter_functional_keys_decode_press_repeat_and_release() {
+        for (stream, kind) in [
+            (b"\x1b[1;1A".as_slice(), EventKind::Press),
+            (b"\x1b[1;1:2A".as_slice(), EventKind::Repeat),
+            (b"\x1b[1;1:3A".as_slice(), EventKind::Release),
+        ] {
+            assert_direct_event(
+                stream,
+                RawKeyEvent {
+                    primary: KeyIdentity::Functional(FunctionalKey::Up),
+                    shifted: None,
+                    base: None,
+                    modifiers: Modifiers::NONE,
+                    kind,
+                    locks: LockState::NONE,
+                    keypad: None,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn tilde_functional_keys_decode_press_repeat_and_release() {
+        for (stream, kind) in [
+            (b"\x1b[5;1~".as_slice(), EventKind::Press),
+            (b"\x1b[5;1:2~".as_slice(), EventKind::Repeat),
+            (b"\x1b[5;1:3~".as_slice(), EventKind::Release),
+        ] {
+            assert_direct_event(
+                stream,
+                RawKeyEvent {
+                    primary: KeyIdentity::Functional(FunctionalKey::PageUp),
+                    shifted: None,
+                    base: None,
+                    modifiers: Modifiers::NONE,
+                    kind,
+                    locks: LockState::NONE,
+                    keypad: None,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn direct_and_tilde_events_preserve_modifiers_and_locks_with_event_kind() {
+        let events = parse_chunks(&[b"\x1b[1;198:2A"], true);
+        assert_eq!(
+            events,
+            vec![InputEvent::Key(RawKeyEvent {
+                primary: KeyIdentity::Functional(FunctionalKey::Up),
+                shifted: None,
+                base: None,
+                modifiers: Modifiers::SHIFT | Modifiers::CONTROL,
+                kind: EventKind::Repeat,
+                locks: LockState {
+                    caps_lock: true,
+                    num_lock: true,
+                },
+                keypad: None,
+            })]
+        );
+        let events = parse_chunks(&[b"\x1b[5;198:3~"], true);
+        assert_eq!(
+            events,
+            vec![InputEvent::Key(RawKeyEvent {
+                primary: KeyIdentity::Functional(FunctionalKey::PageUp),
+                shifted: None,
+                base: None,
+                modifiers: Modifiers::SHIFT | Modifiers::CONTROL,
+                kind: EventKind::Release,
+                locks: LockState {
+                    caps_lock: true,
+                    num_lock: true,
+                },
+                keypad: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn invalid_event_kinds_are_malformed_not_unknown() {
+        for stream in [
+            b"\x1b[1;1:4A".as_slice(),
+            b"\x1b[5;1:4~".as_slice(),
+            b"\x1b[97;1:4u".as_slice(),
+        ] {
+            let events = parse_chunks(&[stream], true);
+            assert_eq!(
+                events,
+                vec![malformed(
+                    SequenceClass::Csi,
+                    MalformedReason::InvalidEventKind,
+                    u8::try_from(stream.len() - 3).expect("fixture length fits")
+                )],
+                "{stream:?}"
+            );
+        }
+        // `CSI 1;1:2Z` reuses the shared shift-tab reading: shift-tab with an explicit
+        // repeat event kind, consistent with the direct, tilde, and CSI-u forms.
+        let events = parse_chunks(&[b"\x1b[1;1:2Z"], true);
+        assert_eq!(
+            events,
+            vec![InputEvent::Key(RawKeyEvent {
+                primary: KeyIdentity::Functional(FunctionalKey::Tab),
+                shifted: None,
+                base: None,
+                modifiers: Modifiers::NONE,
+                kind: EventKind::Repeat,
+                locks: LockState::NONE,
+                keypad: None,
+            })]
+        );
+        let events = parse_chunks(&[b"\x1b[1;1:4Z"], true);
+        assert_eq!(
+            events,
+            vec![malformed(
+                SequenceClass::Csi,
+                MalformedReason::InvalidEventKind,
+                5
+            )]
+        );
     }
 
     #[test]
