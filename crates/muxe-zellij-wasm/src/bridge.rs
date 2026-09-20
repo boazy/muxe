@@ -52,7 +52,7 @@
 //! already ended (then expiry is a no-op -- the timer never restores twice).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use muxe_protocol::{CaptureLeaseId, ExecutionId, UiSessionId};
@@ -205,6 +205,96 @@ enum PermissionGate {
     Denied,
 }
 
+/// Identity of the pane the Muxe UI was launched from, with the
+/// classification that admits it. All three slots live here so one owner —
+/// [`Bridge::on_list_clients`] for focus observations plus [`Bridge::request_origin`]
+/// for the UI-pane proof — updates them together and they can never diverge.
+///
+/// H10: focus tracking must not adopt a newly focused pane as the prior pane
+/// before the host has classified it. A first `ListClients` for a new pane
+/// proves focus, not kind: the menu pane arrives exactly this way (origin
+/// pane -> newly launched menu pane), and adopting it immediately snapshots
+/// the menu as its own origin.
+///
+/// Rule: a newly focused pane parks as the unconfirmed `candidate` and the
+/// previously confirmed pane stays `confirmed` until host evidence sorts the
+/// candidate — a census-row `running_command` structurally matching the Muxe
+/// UI argv (see [`is_muxe_running_command`]) drops it as proven Muxe UI, and
+/// anything else about a transition the bridge can already account for (a
+/// later census re-observing the candidate while focus rests on it, or the
+/// candidate arriving as `RequestOrigin`'s non-UI prior) confirms it. Only
+/// confirmation moves the candidate into `confirmed`; a proven-Muxe
+/// candidate is dropped so the previous confirmed pane survives.
+/// `RequestOrigin` independently refuses to report a prior pane that equals
+/// the requesting UI pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClassifiedOrigin {
+    /// Last confirmed non-Muxe pane: the snapshot prior.
+    confirmed: Option<PaneId>,
+    /// Newly focused pane awaiting classification. Set on every genuine
+    /// focus transition; cleared only by confirmation or proven-Muxe drop.
+    candidate: Option<PaneId>,
+    /// Last confirmed non-Muxe pane: the directional-focus base.
+    /// Updated whenever classification confirms a pane, so the focus base is
+    /// available at the same observation point as the prior.
+    focus_base: Option<PaneId>,
+}
+
+impl ClassifiedOrigin {
+    /// Record a focus observation for the bridge's own client row.
+    /// `proven_muxe_ui` is the census-row `running_command` exclusion (see
+    /// [`is_muxe_running_command`]): a matching entrant is dropped as proven
+    /// Muxe UI and never parks, so the previous confirmed pane survives. Any
+    /// other entrant parks as the candidate; the confirmed pane is retained
+    /// untouched until the candidate is confirmed by the next focus transition.
+    /// A first observation with nothing confirmed and no candidate adopts the
+    /// focused pane directly as the confirmed prior: there is no leaving pane
+    /// to classify, and the menu case always has a confirmed pane (boot
+    /// focused the origin pane first).
+    fn observe(&mut self, focused: PaneId, proven_muxe_ui: bool) {
+        if proven_muxe_ui {
+            if self.candidate == Some(focused) {
+                self.candidate = None;
+            }
+            if self.confirmed == Some(focused) {
+                self.confirmed = None;
+                if self.focus_base == Some(focused) {
+                    self.focus_base = None;
+                }
+            }
+            return;
+        }
+        if self.confirmed.is_none() && self.candidate.is_none() {
+            self.confirmed = Some(focused);
+            self.focus_base = Some(focused);
+            return;
+        }
+        self.candidate = Some(focused);
+    }
+
+    /// Confirm the candidate once host evidence proves it is not Muxe UI.
+    /// Confirming a pane that is not the candidate is a no-op. A proven-Muxe
+    /// pane never reaches this path: it is dropped in [`ClassifiedOrigin::observe`]
+    /// or cleared by [`ClassifiedOrigin::drop_ui`] below.
+    fn confirm(&mut self, pane: PaneId) {
+        if self.candidate != Some(pane) {
+            return;
+        }
+        self.candidate = None;
+        self.confirmed = Some(pane);
+        self.focus_base = Some(pane);
+    }
+
+    /// Drop the requesting UI pane's proof of Muxe UI: clear it from the
+    /// candidate slot so it can never be confirmed later, while the
+    /// previously confirmed pane survives untouched.
+    fn drop_ui(&mut self, pane: PaneId) {
+        if self.candidate == Some(pane) {
+            self.candidate = None;
+        }
+    }
+}
+
 /// Bridge state for one Zellij client. Identity fields stay empty until
 /// verified host data arrives; no registration emits before that.
 pub struct Bridge {
@@ -225,8 +315,7 @@ pub struct Bridge {
     restoring_mode: Option<RestoreBarrier>,
     pending_ui_pane: Option<PaneId>,
     capture_panes: BTreeMap<[u8; 16], PaneId>,
-    last_non_muxe_pane: Option<PaneId>,
-    origin_pane: Option<PaneId>,
+    origin: ClassifiedOrigin,
     inventory: PaneInventory,
     pending_actions: BTreeMap<String, PendingAction>,
     pending_post_dismissals: Vec<PendingPostDismissal>,
@@ -267,8 +356,7 @@ impl Default for Bridge {
             restoring_mode: None,
             pending_ui_pane: None,
             capture_panes: BTreeMap::new(),
-            last_non_muxe_pane: None,
-            origin_pane: None,
+            origin: ClassifiedOrigin::default(),
             inventory: PaneInventory::new(),
             pending_actions: BTreeMap::new(),
             pending_post_dismissals: Vec::new(),
@@ -377,15 +465,32 @@ impl Bridge {
                     current_client_present = true;
                     self.client_id = Some(client.client_id.to_string());
                     let focused = client.pane_id;
-                    // Focus history advances only while no menu owns capture and
-                    // only for panes outside capture-owned UI: a focused pane
-                    // during capture, or a capture-owned menu pane, is never origin.
+                    // Focus history advances only while no menu owns capture.
+                    // `ListClients` proves focus, not kind: the census row's
+                    // own `running_command` structurally proves a Muxe UI
+                    // pane (see `is_muxe_running_command`), which is dropped
+                    // as proven UI; any other entrant parks as the
+                    // unconfirmed candidate while the previously confirmed
+                    // pane stays the prior. Adopting the entrant on focus
+                    // alone would snapshot the newly launched menu as its own
+                    // prior (H10). Empty/`"N/A"`/unparsable commands stay
+                    // unclassified — never a positive proof of either kind.
                     if self.active.is_none()
                         && self.pending.is_none()
-                        && !self.is_focus_excluded(focused)
                         && self.focused_pane != Some(focused)
                     {
-                        self.last_non_muxe_pane = Some(focused);
+                        // Departure confirms the pane being left: it held
+                        // focus through a full census without proving to be
+                        // Muxe UI, so it is the pre-transition origin. This
+                        // cannot confirm a menu pane: a proven-Muxe entrant
+                        // never parks as a candidate (dropped in `observe`),
+                        // and the requesting UI pane is dropped by `drop_ui`
+                        // at `RequestOrigin`, so `confirm` no-ops on it.
+                        if let Some(leaving) = self.focused_pane {
+                            self.origin.confirm(leaving);
+                        }
+                        let proven_muxe_ui = is_muxe_running_command(&client.running_command);
+                        self.origin.observe(focused, proven_muxe_ui);
                     }
                     self.focused_pane = Some(focused);
                     break;
@@ -516,14 +621,16 @@ impl Bridge {
         self.capture_panes.remove(&lease.0);
     }
 
-    /// Panes excluded from eligible focus targets: only panes owned by an
-    /// active capture lease. Without host-proven launch provenance there is no
-    /// permanent Muxe set: attaching never excludes, and dismissal restores
-    /// eligibility for a surviving direct pane.
+    /// Panes excluded from eligible focus targets: lease-owned Muxe panes,
+    /// plus the classified origin base while any lease owns the UI capture.
+    /// The latter preserves the old `last_non_muxe_pane` exclusion when the
+    /// UI pane is absent from the current manifest, while dismissal restores
+    /// the classified origin's eligibility.
     fn is_focus_excluded(&self, pane: PaneId) -> bool {
         self.capture_panes
             .values()
             .any(|excluded| *excluded == pane)
+            || (!self.capture_panes.is_empty() && self.origin.focus_base == Some(pane))
     }
 
     /// Tracks the current session name plus the active tab position and
@@ -1236,12 +1343,18 @@ impl Bridge {
             return;
         }
         self.pending_ui_pane = Some(ui_pane_id);
-        let prior = self.last_non_muxe_pane;
-        let cwd = prior
-            .and_then(|pane| effects.pane_cwd(pane))
-            .map(|path| path.to_string_lossy().into_owned());
-        if let Some(prior) = prior {
-            self.origin_pane = Some(prior);
+        // The requesting UI pane is proven Muxe UI by the request itself:
+        // drop it from the candidate slot so it can never be confirmed
+        // later. The previously confirmed pane therefore survives an
+        // unclassified menu transition (H10).
+        self.origin.drop_ui(ui_pane_id);
+        // RequestOrigin never reports the requesting UI pane as its own
+        // prior: absence fails closed downstream instead of targeting the
+        // menu itself. The focus base was populated when the confirmed pane
+        // was classified, not deferred until this snapshot.
+        let mut prior = self.origin.confirmed;
+        if prior == Some(ui_pane_id) {
+            prior = None;
         }
         let (active_tab, active_tab_id) = self.inventory.active_tab_with_id();
         let active_tab_index = active_tab.and_then(|position| u64::try_from(position).ok());
@@ -1251,6 +1364,9 @@ impl Bridge {
         // `Some(false)`, a plugin prior is `Some(true)`, and only a genuinely
         // absent prior stays `None`.
         let prior_is_plugin = prior.map(|pane| matches!(pane, PaneId::Plugin(_)));
+        let cwd = prior
+            .and_then(|pane| effects.pane_cwd(pane))
+            .map(|path| path.to_string_lossy().into_owned());
         self.release(cli_id, request_id, generation, effects);
         self.emit_for_request(
             request_id,
@@ -1316,7 +1432,8 @@ impl Bridge {
         effects: &mut dyn HostEffects,
     ) {
         let base = self
-            .origin_pane
+            .origin
+            .focus_base
             .and_then(|pane| to_geometry(pane, &self.inventory));
         let outcome = match base.and_then(|base| {
             self.inventory.neighbor(base, direction, |pane| {
@@ -1447,6 +1564,29 @@ impl Bridge {
             effects.pipe_output(event_cli_id, &line);
         }
     }
+}
+
+/// Reports whether a `ListClients` census row's `running_command` proves the
+/// focused pane is the Muxe UI. Structural match mirroring the adapter's
+/// `is_ui_argv` (`crates/muxe-adapter-zellij/src/launch.rs`): the first
+/// whitespace-separated token's file name is `muxe`, followed by `ui` and
+/// `menu`. The host renders a `Run::Command` pane as `"{command} {args…}"`
+/// and anything else (`Run::Cwd`, no command) as `"N/A"`, so empty, `"N/A"`,
+/// or unparsable text stays unclassified — never a positive proof of
+/// either kind. Used only as a proven-Muxe *exclusion* (a matching pane is
+/// never adopted or promoted); correctness for the bootstrap transition
+/// comes from deferred adoption, not from this string.
+fn is_muxe_running_command(running_command: &str) -> bool {
+    let mut tokens = running_command.split_whitespace();
+    let (Some(program), Some(first), Some(second)) = (tokens.next(), tokens.next(), tokens.next())
+    else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "muxe")
+        && first == "ui"
+        && second == "menu"
 }
 
 /// Host pane ID for tracked geometry.
@@ -1628,10 +1768,21 @@ mod tests {
     }
 
     fn clients_for(client_id: u16, pane: PaneId) -> Vec<ClientInfo> {
+        clients_for_command(client_id, pane, "")
+    }
+
+    /// Census row carrying the focused pane's own command string. The pinned
+    /// host fills `running_command` per focused pane (`"{command} {args…}"`
+    /// for a `Run::Command` pane, `"N/A"` otherwise), so a row showing the
+    /// menu pane taking focus can already say `muxe ui menu …`. The bridge
+    /// matches that signal structurally (see [`is_muxe_running_command`]):
+    /// empty/`"N/A"`/unparsable stays unclassified and is never adopted on
+    /// its own.
+    fn clients_for_command(client_id: u16, pane: PaneId, running_command: &str) -> Vec<ClientInfo> {
         vec![ClientInfo {
             client_id,
             pane_id: pane,
-            running_command: String::new(),
+            running_command: running_command.to_owned(),
             is_current_client: true,
         }]
     }
@@ -2562,10 +2713,12 @@ mod tests {
     #[test]
     fn origin_snapshots_prior_pane_not_the_menu() {
         let (mut bridge, mut host) = boot();
-        // Menu pane takes focus while no capture is active... it must NOT
-        // become origin: the claim below still snapshots terminal_2.
+        // Real bootstrap transition: boot focused terminal_2, then the newly
+        // launched menu pane (terminal_5, unclassified command) takes focus.
+        // Departure confirms terminal_2, the entrant parks as the candidate,
+        // and the claim below still snapshots terminal_2 — never the menu.
         bridge.update(
-            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            Event::ListClients(clients_for_command(5, PaneId::Terminal(5), "")),
             &mut host,
         );
         // Production event order: tab inventory and session identity arrive
@@ -2615,7 +2768,7 @@ mod tests {
                     BridgeRequest::RequestOrigin {
                         ui_session: session("ui-9"),
                         request: ZellijOriginRequest {
-                            ui_pane: "terminal_2".to_owned(),
+                            ui_pane: "terminal_5".to_owned(),
                         },
                     },
                 )),
@@ -2628,6 +2781,8 @@ mod tests {
         match event {
             PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
                 assert_eq!(origin.prior_pane_id.as_deref(), Some("terminal_2"));
+                assert_eq!(origin.prior_pane_cwd.as_deref(), Some("/work"));
+                assert_ne!(origin.prior_pane_id.as_deref(), Some("terminal_5"));
                 // The snapshot carries the bridge-tracked session and tab.
                 assert_eq!(origin.session_name.as_deref(), Some("session-alpha"));
                 assert_eq!(origin.active_tab_index, Some(4));
@@ -2644,16 +2799,25 @@ mod tests {
     fn origin_prior_kind_derives_from_typed_pane_id() {
         // A plugin prior the inventory never observed still reports its kind:
         // derivation reads the typed PaneId, never the manifest geometry.
+        // Re-derived for H10: boot focuses terminal_2, then a plugin pane
+        // takes focus and rest confirms it; the claim below snapshots the
+        // plugin pane as a real transition target, never a pane that equals
+        // its own UI pane.
         let (mut bridge, mut host) = boot();
         bridge.update(
             Event::ListClients(clients_current(PaneId::Plugin(9))),
             &mut host,
         );
+        // The UI pane itself takes focus carrying the structural Muxe argv:
+        // proven UI, so it parks nothing and leaves plugin_9 confirmed.
         bridge.update(
-            Event::ListClients(clients_current(PaneId::Plugin(9))),
+            Event::ListClients(clients_for_command(
+                5,
+                PaneId::Terminal(4),
+                "muxe ui menu main",
+            )),
             &mut host,
         );
-        host.cwd.insert("plugin_9".to_owned(), "/work".to_owned());
         bridge.pipe(
             PipeMessage {
                 source: PipeSource::Cli(REQUEST_CLI.to_owned()),
@@ -2663,7 +2827,7 @@ mod tests {
                     BridgeRequest::RequestOrigin {
                         ui_session: session("ui-9"),
                         request: ZellijOriginRequest {
-                            ui_pane: "plugin_9".to_owned(),
+                            ui_pane: "terminal_4".to_owned(),
                         },
                     },
                 )),
@@ -2676,6 +2840,7 @@ mod tests {
         match event {
             PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
                 assert_eq!(origin.prior_pane_id.as_deref(), Some("plugin_9"));
+                assert_eq!(origin.prior_pane_cwd, None);
                 assert_eq!(origin.prior_pane_is_plugin, Some(true));
             }
             _ => panic!("expected snapshot, got decline"),
@@ -2687,9 +2852,12 @@ mod tests {
         // Fresh boot with no TabUpdate/SessionUpdate observed: the bridge
         // emits None rather than inventing tab/session values, and the adapter
         // turns those gaps into `context_unavailable` instead of guessing.
+        // Re-derived for H10: boot focuses terminal_2, then the menu pane
+        // (terminal_5, unclassified) takes focus; departure confirms
+        // terminal_2 and the claim for terminal_5 snapshots it.
         let (mut bridge, mut host) = boot();
         bridge.update(
-            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            Event::ListClients(clients_for_command(5, PaneId::Terminal(5), "")),
             &mut host,
         );
         host.cwd.insert("terminal_2".to_owned(), "/work".to_owned());
@@ -2702,7 +2870,7 @@ mod tests {
                     BridgeRequest::RequestOrigin {
                         ui_session: session("ui-9"),
                         request: ZellijOriginRequest {
-                            ui_pane: "terminal_2".to_owned(),
+                            ui_pane: "terminal_5".to_owned(),
                         },
                     },
                 )),
@@ -2723,6 +2891,152 @@ mod tests {
             _ => panic!("expected snapshot, got decline"),
         }
     }
+
+    /// H10 exact sequence: `ListClients(origin)`, `ListClients(new UI)`,
+    /// `RequestOrigin(new UI)` — the snapshot must carry the ORIGINAL pane,
+    /// not the UI pane. The UI pane carries the structural Muxe argv, so it
+    /// is proven UI; the confirmed origin pane survives.
+    #[test]
+    fn origin_after_menu_launch_reports_the_pre_menu_pane() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::ListClients(clients_for_command(
+                5,
+                PaneId::Terminal(6),
+                "muxe ui menu main",
+            )),
+            &mut host,
+        );
+        host.cwd.insert("terminal_2".to_owned(), "/work".to_owned());
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("ui-proven"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_6".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        let (_, event) = host.last_event();
+        match event {
+            PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
+                assert_eq!(origin.prior_pane_id.as_deref(), Some("terminal_2"));
+                assert_eq!(origin.prior_pane_cwd.as_deref(), Some("/work"));
+                assert_ne!(origin.prior_pane_id.as_deref(), Some("terminal_6"));
+                assert_eq!(origin.ui_pane_id, "terminal_6");
+            }
+            _ => panic!("expected snapshot, got decline"),
+        }
+    }
+
+    /// H10 without any classification signal for the new pane (empty command):
+    /// the retained prior still wins and the origin never equals the UI pane.
+    #[test]
+    fn origin_never_reports_an_unclassified_pane_as_prior() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::ListClients(clients_for_command(5, PaneId::Terminal(7), "")),
+            &mut host,
+        );
+        host.cwd.insert("terminal_2".to_owned(), "/work".to_owned());
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("ui-unknown"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_7".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        let (_, event) = host.last_event();
+        match event {
+            PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
+                assert_eq!(origin.prior_pane_id.as_deref(), Some("terminal_2"));
+                assert_ne!(
+                    origin.prior_pane_id.as_deref(),
+                    Some(origin.ui_pane_id.as_str())
+                );
+            }
+            _ => panic!("expected snapshot, got decline"),
+        }
+    }
+
+    /// H10 genuine transition: focus moves to a normal pane and rests there
+    /// across censuses, confirming it; the next snapshot adopts it.
+    #[test]
+    fn origin_adopts_a_genuine_non_muxe_focus_transition() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::ListClients(clients_for_command(5, PaneId::Terminal(8), "")),
+            &mut host,
+        );
+        // Focus rests on terminal_8: the repeated census confirms the
+        // candidate.
+        bridge.update(
+            Event::ListClients(clients_for_command(5, PaneId::Terminal(8), "")),
+            &mut host,
+        );
+        // The menu then takes focus; departure confirms terminal_8.
+        bridge.update(
+            Event::ListClients(clients_for_command(
+                5,
+                PaneId::Terminal(9),
+                "muxe ui menu main",
+            )),
+            &mut host,
+        );
+        host.cwd.insert("terminal_8".to_owned(), "/work".to_owned());
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("ui-adopt"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_9".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        let (_, event) = host.last_event();
+        match event {
+            PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
+                assert_eq!(origin.prior_pane_id.as_deref(), Some("terminal_8"));
+                assert_eq!(origin.prior_pane_cwd.as_deref(), Some("/work"));
+            }
+            _ => panic!("expected snapshot, got decline"),
+        }
+    }
+
+    /// H10 negative case: no transition at all — the adopted pane IS the
+    /// requesting UI pane — so the guard drops it and the field is absent.
+    /// Absence fails closed downstream: pane-scoped dispatch maps it to
+    /// `context_unavailable` (`PortableError::Incompatible`), never to the
+    /// menu itself.
+    #[test]
+    fn origin_drops_a_candidate_that_equals_the_ui_pane() {
+        let (mut bridge, mut host) = boot();
+        // Boot focused terminal_2 and confirmed nothing else: terminal_2 is
+        // both the adopted prior and the requesting UI pane.
+        host.cwd.insert("terminal_2".to_owned(), "/work".to_owned());
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("ui-same"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_2".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        let (_, event) = host.last_event();
+        match event {
+            PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
+                assert_eq!(origin.prior_pane_id, None);
+                assert_eq!(origin.prior_pane_cwd, None);
+                assert_eq!(origin.prior_pane_is_plugin, None);
+                assert_eq!(origin.ui_pane_id, "terminal_2");
+            }
+            _ => panic!("expected snapshot, got decline"),
+        }
+    }
+
     fn pane_info(id: u32, x: usize, y: usize, columns: usize, rows: usize) -> PaneInfo {
         PaneInfo {
             id,
@@ -3008,15 +3322,20 @@ mod tests {
             ]),
             &mut host,
         );
+        // Re-derived for H10: boot focused terminal_2, so claiming
+        // terminal_2 as its own UI pane would report an absent prior.
+        // Instead the menu takes focus as a new pane (terminal_5,
+        // unclassified) and the claim targets it: departure confirms
+        // terminal_2 and the snapshot carries it as the focus base.
         bridge.update(
-            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            Event::ListClients(clients_for_command(5, PaneId::Terminal(5), "")),
             &mut host,
         );
         bridge.pipe(
             request_msg(BridgeRequest::RequestOrigin {
                 ui_session: session("claim-menu"),
                 request: ZellijOriginRequest {
-                    ui_pane: "terminal_2".to_owned(),
+                    ui_pane: "terminal_5".to_owned(),
                 },
             }),
             &mut host,
@@ -3036,7 +3355,7 @@ mod tests {
             bridge
                 .capture_panes
                 .values()
-                .any(|pane| *pane == PaneId::Terminal(2))
+                .any(|pane| *pane == PaneId::Terminal(5))
         );
 
         bridge.pipe(

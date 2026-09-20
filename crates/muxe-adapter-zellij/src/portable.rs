@@ -1371,6 +1371,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_origin_pane_fails_closed_with_context_unavailable() {
+        // This is the adapter boundary shape emitted by the bridge when the
+        // requesting UI pane is also the only adopted pane: prior_pane_id
+        // (and therefore the resolved origin pane) is absent.
+        let mut origin = test_origin();
+        origin.pane_id = None;
+
+        let error = map_portable(&PortableAction::Pane(PaneAction::Close), &origin)
+            .expect_err("missing origin pane must not target the UI pane");
+
+        assert_eq!(
+            error,
+            PortableError::Incompatible {
+                action: "pane:close",
+                reason: "origin carries no pane; the target is context_unavailable",
+            }
+        );
+    }
+
+    #[test]
     fn keyboard_targets_the_origin_pane() {
         let action = single_host(&PortableAction::Keyboard(KeyboardAction::SendText(text(
             "hi",
