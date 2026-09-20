@@ -180,6 +180,7 @@ enum PermissionGate {
 /// verified host data arrives; no registration emits before that.
 pub struct Bridge {
     client_id: Option<String>,
+    session_name: Option<String>,
     plugin_id: Option<u32>,
     plugin_client_id: Option<u16>,
     focused_pane: Option<PaneId>,
@@ -221,6 +222,7 @@ impl Default for Bridge {
     fn default() -> Self {
         Self {
             client_id: None,
+            session_name: None,
             plugin_id: None,
             plugin_client_id: None,
             focused_pane: None,
@@ -258,6 +260,7 @@ impl Bridge {
             EventType::ModeUpdate,
             EventType::PaneUpdate,
             EventType::TabUpdate,
+            EventType::SessionUpdate,
             EventType::ActionComplete,
             EventType::Timer,
         ]);
@@ -275,6 +278,7 @@ impl Bridge {
             Event::ModeUpdate(mode) => self.on_mode_update(&mode, effects),
             Event::PaneUpdate(manifest) => self.on_pane_update(&manifest, effects),
             Event::TabUpdate(tabs) => self.on_tab_update(&tabs),
+            Event::SessionUpdate(sessions, _) => self.on_session_update(&sessions),
             Event::ActionComplete(_, _, context) => self.on_action_complete(&context, effects),
             Event::Timer(_) => self.on_timer(effects),
             Event::PermissionRequestResult(status) => match status {
@@ -489,9 +493,25 @@ impl Bridge {
             .any(|excluded| *excluded == pane)
     }
 
+    /// Tracks the current session name plus the active tab position and
+    /// stable host tab ID. The current session is the one flagged
+    /// `is_current_session`; an update with no flagged session retains the
+    /// previous name rather than clearing it. Retention is safe because the
+    /// adapter cross-checks the snapshot name against its configured live
+    /// session at the capture boundary (`build_origin_context` fails on a
+    /// mismatch): a stale retained name can only fail closed, never
+    /// cross-wire dispatch into another session.
+    fn on_session_update(&mut self, sessions: &[SessionInfo]) {
+        let current = sessions.iter().find(|session| session.is_current_session);
+        if let Some(session) = current {
+            self.session_name = Some(session.name.clone());
+        }
+    }
+
     fn on_tab_update(&mut self, tabs: &[TabInfo]) {
-        let active = tabs.iter().find(|tab| tab.active).map(|tab| tab.position);
-        self.inventory.set_active_tab(active);
+        let active = tabs.iter().find(|tab| tab.active);
+        self.inventory
+            .set_active_tab_with_id(active.map(|tab| tab.position), active.map(|tab| tab.tab_id));
     }
 
     fn on_action_complete(
@@ -1123,6 +1143,14 @@ impl Bridge {
         if let Some(prior) = prior {
             self.origin_pane = Some(prior);
         }
+        let (active_tab, active_tab_id) = self.inventory.active_tab_with_id();
+        let active_tab_index = active_tab.and_then(|position| u64::try_from(position).ok());
+        let snapshot_active_tab_id = active_tab_id.and_then(|tab_id| u64::try_from(tab_id).ok());
+        // The prior is already a typed host pane ID, so its kind is known
+        // without consulting the manifest inventory: a terminal prior is
+        // `Some(false)`, a plugin prior is `Some(true)`, and only a genuinely
+        // absent prior stays `None`.
+        let prior_is_plugin = prior.map(|pane| matches!(pane, PaneId::Plugin(_)));
         self.release(cli_id, request_id, generation, effects);
         self.emit_for_request(
             request_id,
@@ -1131,10 +1159,13 @@ impl Bridge {
                 ui_session,
                 origin: ZellijOrigin {
                     client_id: self.client_id.clone().unwrap_or_default(),
-                    session_name: None,
+                    session_name: self.session_name.clone(),
+                    active_tab_index,
+                    active_tab_id: snapshot_active_tab_id,
                     prior_pane_id: prior.map(|pane| pane.to_string()),
                     ui_pane_id: ui_pane,
                     prior_pane_cwd: cwd,
+                    prior_pane_is_plugin: prior_is_plugin,
                 },
             },
             effects,
@@ -2437,6 +2468,43 @@ mod tests {
             Event::ListClients(clients_current(PaneId::Terminal(2))),
             &mut host,
         );
+        // Production event order: tab inventory and session identity arrive
+        // over the subscribed host events before the origin request.
+        bridge.update(
+            Event::TabUpdate(vec![
+                TabInfo {
+                    position: 3,
+                    active: false,
+                    tab_id: 10,
+                    ..Default::default()
+                },
+                TabInfo {
+                    position: 4,
+                    active: true,
+                    tab_id: 11,
+                    ..Default::default()
+                },
+            ]),
+            &mut host,
+        );
+        bridge.update(
+            Event::SessionUpdate(
+                vec![
+                    SessionInfo {
+                        name: "other".to_owned(),
+                        is_current_session: false,
+                        ..Default::default()
+                    },
+                    SessionInfo {
+                        name: "session-alpha".to_owned(),
+                        is_current_session: true,
+                        ..Default::default()
+                    },
+                ],
+                Vec::new(),
+            ),
+            &mut host,
+        );
         host.cwd.insert("terminal_2".to_owned(), "/work".to_owned());
         bridge.pipe(
             PipeMessage {
@@ -2460,6 +2528,97 @@ mod tests {
         match event {
             PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
                 assert_eq!(origin.prior_pane_id.as_deref(), Some("terminal_2"));
+                // The snapshot carries the bridge-tracked session and tab.
+                assert_eq!(origin.session_name.as_deref(), Some("session-alpha"));
+                assert_eq!(origin.active_tab_index, Some(4));
+                assert_eq!(origin.active_tab_id, Some(11));
+                // No PaneUpdate ever observed terminal_2: the kind still
+                // derives directly from the typed prior pane ID.
+                assert_eq!(origin.prior_pane_is_plugin, Some(false));
+            }
+            _ => panic!("expected snapshot, got decline"),
+        }
+    }
+
+    #[test]
+    fn origin_prior_kind_derives_from_typed_pane_id() {
+        // A plugin prior the inventory never observed still reports its kind:
+        // derivation reads the typed PaneId, never the manifest geometry.
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Plugin(9))),
+            &mut host,
+        );
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Plugin(9))),
+            &mut host,
+        );
+        host.cwd.insert("plugin_9".to_owned(), "/work".to_owned());
+        bridge.pipe(
+            PipeMessage {
+                source: PipeSource::Cli(REQUEST_CLI.to_owned()),
+                name: REQUEST_NAME.to_owned(),
+                payload: Some(request_line(
+                    registration(7),
+                    BridgeRequest::RequestOrigin {
+                        ui_session: session("ui-9"),
+                        request: ZellijOriginRequest {
+                            ui_pane: "plugin_9".to_owned(),
+                        },
+                    },
+                )),
+                args: BTreeMap::new(),
+                is_private: false,
+            },
+            &mut host,
+        );
+        let (_, event) = host.last_event();
+        match event {
+            PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
+                assert_eq!(origin.prior_pane_id.as_deref(), Some("plugin_9"));
+                assert_eq!(origin.prior_pane_is_plugin, Some(true));
+            }
+            _ => panic!("expected snapshot, got decline"),
+        }
+    }
+
+    #[test]
+    fn origin_without_tracked_tab_or_session_leaves_typed_gaps() {
+        // Fresh boot with no TabUpdate/SessionUpdate observed: the bridge
+        // emits None rather than inventing tab/session values, and the adapter
+        // turns those gaps into `context_unavailable` instead of guessing.
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        host.cwd.insert("terminal_2".to_owned(), "/work".to_owned());
+        bridge.pipe(
+            PipeMessage {
+                source: PipeSource::Cli(REQUEST_CLI.to_owned()),
+                name: REQUEST_NAME.to_owned(),
+                payload: Some(request_line(
+                    registration(7),
+                    BridgeRequest::RequestOrigin {
+                        ui_session: session("ui-9"),
+                        request: ZellijOriginRequest {
+                            ui_pane: "terminal_2".to_owned(),
+                        },
+                    },
+                )),
+                args: BTreeMap::new(),
+                is_private: false,
+            },
+            &mut host,
+        );
+        let (_, event) = host.last_event();
+        match event {
+            PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) => {
+                assert_eq!(origin.prior_pane_id.as_deref(), Some("terminal_2"));
+                assert_eq!(origin.session_name, None);
+                assert_eq!(origin.active_tab_index, None);
+                assert_eq!(origin.active_tab_id, None);
+                assert_eq!(origin.prior_pane_is_plugin, Some(false));
             }
             _ => panic!("expected snapshot, got decline"),
         }

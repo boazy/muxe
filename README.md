@@ -376,6 +376,8 @@ This command renders the embedded compatibility record; it does not probe runnin
 
 The JSON report forms the release compatibility contract. It records the pinned host version and source revision, generated action and protocol fingerprints, the bridge build ID, and the packaged-WASM SHA-256.
 
+Origins now carry session and active-tab metadata: an upgraded native binary rejects a previously installed bridge fail-closed at the registration handshake, so refresh installed bridges with `muxe activate` after upgrading.
+
 ## Uninstallation and purge
 
 Standard uninstallation removes the tool and bridge while preserving your configuration files, custom themes, caches, and logs.

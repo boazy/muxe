@@ -1230,26 +1230,74 @@ mod tests {
         ))
     }
 
+    /// Production-shaped captured origin: session, tab id, and tab index all
+    /// arrive in the bridge frame (`ZellijOrigin.session_name`,
+    /// `active_tab_id`, `active_tab_index`) — never hand-filled after capture.
+    /// Values mirror `origin::snapshot_builds_immutable_origin`.
+    fn production_captured_origin() -> OriginContext {
+        crate::origin::build_origin_context(
+            &muxe_zellij_protocol::ZellijOrigin {
+                client_id: "client-1".to_owned(),
+                session_name: Some("session-alpha".to_owned()),
+                active_tab_index: Some(3),
+                active_tab_id: Some(11),
+                prior_pane_id: Some("terminal_4".to_owned()),
+                ui_pane_id: "plugin-9".to_owned(),
+                prior_pane_cwd: None,
+                prior_pane_is_plugin: Some(false),
+            },
+            "session-alpha",
+            "plugin-9",
+            None,
+            None,
+            None,
+        )
+        .expect("production-shaped snapshot builds")
+    }
+
     fn test_origin() -> OriginContext {
-        OriginContext {
-            host_kind: muxe_core::OriginHostKind::Zellij,
-            server_id: muxe_core::ServerId::new("session-alpha"),
-            client_id: Some(muxe_core::ClientId::new("client-1")),
-            session_id: Some(muxe_core::SessionId::new("session-alpha")),
-            workspace_id: None,
-            tab_id: Some(muxe_core::TabId::new("tab-0")),
-            tab_index: Some(3),
-            pane_id: Some(muxe_core::PaneId::new("terminal_4")),
-            pane_type: None,
-            pane_cwd: None,
-            selection_text: None,
-            invocation_source: muxe_core::OriginInvocationSource::RootBinding,
-            worktree_id: None,
-            worktree_path: None,
-            agent_id: None,
-            link_url: None,
-            link_handler_id: None,
-        }
+        production_captured_origin()
+    }
+
+    #[test]
+    fn production_captured_origin_resolves_tab_and_session_operations() {
+        let origin = production_captured_origin();
+        assert_eq!(
+            origin.session_id.as_ref().map(muxe_core::SessionId::as_str),
+            Some("session-alpha")
+        );
+        assert_eq!(origin.tab_index, Some(3));
+        assert_eq!(
+            origin.tab_id.as_ref().map(muxe_core::TabId::as_str),
+            Some("11")
+        );
+        // Named tab rename resolves its index from the captured origin.
+        let PortableMapping::HostAction { commands } = map_portable(
+            &PortableAction::Tab(TabAction::Rename {
+                name: Some(text("logs")),
+            }),
+            &origin,
+        )
+        .expect("captured origin resolves rename") else {
+            panic!("expected host action");
+        };
+        assert!(matches!(
+            &commands[..],
+            [RawNativeCommand::RunAction { action, .. }]
+                if matches!(action, raw::Action::RenameTab { tab_index: 3, .. })
+        ));
+        // Session kill resolves its target from the captured origin.
+        let PortableMapping::HostAction { commands } =
+            map_portable(&PortableAction::Session(SessionAction::Kill), &origin)
+                .expect("captured origin resolves kill")
+        else {
+            panic!("expected host action");
+        };
+        assert!(matches!(
+            &commands[..],
+            [RawNativeCommand::KillSessions { session_names }]
+                if session_names == &vec!["session-alpha".to_owned()]
+        ));
     }
 
     fn map(action: &PortableAction) -> Result<PortableMapping, PortableError> {
@@ -1488,13 +1536,33 @@ mod tests {
             validated::Action::RenameTab { tab_index: 3, .. }
         ));
 
-        let mut origin = test_origin();
-        origin.tab_index = None;
+        // Negative path derives from the production shape with no TabUpdate
+        // observed: the bridge frame carries active_tab_index None, so capture
+        // leaves tab_index None without any post-capture mutation.
+        let untabbed = crate::origin::build_origin_context(
+            &muxe_zellij_protocol::ZellijOrigin {
+                client_id: "client-1".to_owned(),
+                session_name: Some("session-alpha".to_owned()),
+                active_tab_index: None,
+                active_tab_id: None,
+                prior_pane_id: Some("terminal_4".to_owned()),
+                ui_pane_id: "plugin-9".to_owned(),
+                prior_pane_cwd: None,
+                prior_pane_is_plugin: Some(false),
+            },
+            "session-alpha",
+            "plugin-9",
+            None,
+            None,
+            None,
+        )
+        .expect("untabbed snapshot builds");
+        assert_eq!(untabbed.tab_index, None);
         let error = map_portable(
             &PortableAction::Tab(TabAction::Rename {
                 name: Some(text("logs")),
             }),
-            &origin,
+            &untabbed,
         )
         .expect_err("missing origin index fails");
         assert!(matches!(

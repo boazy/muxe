@@ -247,20 +247,28 @@ impl CommandOutcome {
 ///
 /// The bridge continuously tracks the last focused non-Muxe pane for its client;
 /// when the Muxe UI attaches through its own pane ID, the bridge snapshots that
-/// prior pane. Fields the host does not expose stay `None`; the adapter turns a
-/// missing required value into `context_unavailable` instead of guessing.
+/// prior pane plus the active tab the bridge already observes. Fields the host
+/// does not expose stay `None`; the adapter turns a missing required value
+/// into `context_unavailable` instead of guessing. Zellij has no workspace
+/// concept, so this frame never carries one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZellijOrigin {
     /// Zellij client ID that owns this snapshot.
     pub client_id: String,
     /// Live session name, when the bridge could read it.
     pub session_name: Option<String>,
+    /// Active tab position (0-indexed) at snapshot time, when tracked.
+    pub active_tab_index: Option<u64>,
+    /// Stable host identifier of the active tab, when tracked.
+    pub active_tab_id: Option<u64>,
     /// Last focused non-Muxe pane before the Muxe UI pane took focus.
     pub prior_pane_id: Option<String>,
     /// The Muxe UI's own pane ID, echoed for cleanup correlation.
     pub ui_pane_id: String,
     /// Working directory of the prior pane, when exposed.
     pub prior_pane_cwd: Option<String>,
+    /// Whether the prior pane is a plugin pane, when the bridge tracked it.
+    pub prior_pane_is_plugin: Option<bool>,
 }
 
 /// Handshake material the WASM bridge embeds and reports at registration.
@@ -754,9 +762,12 @@ mod tests {
         let origin = ZellijOrigin {
             client_id: "c".to_owned(),
             session_name: None,
+            active_tab_index: None,
+            active_tab_id: None,
             prior_pane_id: None,
             ui_pane_id: "pane-1".to_owned(),
             prior_pane_cwd: Some("relative/path".to_owned()),
+            prior_pane_is_plugin: None,
         };
         assert!(origin.validate().is_err());
     }

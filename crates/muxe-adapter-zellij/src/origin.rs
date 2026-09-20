@@ -56,6 +56,14 @@ pub fn build_origin_context(
     tab_id: Option<&str>,
     tab_index: Option<u64>,
 ) -> Result<OriginContext, OriginError> {
+    // The bridge frame is the sole source of tab/session metadata: the
+    // snapshot's typed active-tab and session fields flow straight into the
+    // immutable origin, with explicit caller overrides winning only when the
+    // caller proves a value. There is no post-capture field injection path.
+    let tab_index = tab_index.or(snapshot.active_tab_index);
+    let tab_id = tab_id
+        .map(str::to_owned)
+        .or_else(|| snapshot.active_tab_id.map(|id| id.to_string()));
     if snapshot.ui_pane_id != ui_pane {
         return Err(OriginError::InvalidId {
             field: "ui-pane",
@@ -103,7 +111,13 @@ pub fn build_origin_context(
         tab_id: tab_id.map(TabId::new),
         tab_index,
         pane_id: prior,
-        pane_type: None,
+        pane_type: snapshot.prior_pane_is_plugin.map(|is_plugin| {
+            if is_plugin {
+                muxe_core::OriginPaneType::Plugin
+            } else {
+                muxe_core::OriginPaneType::Terminal
+            }
+        }),
         pane_cwd: prior_cwd,
         selection_text: None,
         invocation_source: OriginInvocationSource::RootBinding,
@@ -127,27 +141,27 @@ mod tests {
     use super::*;
     use muxe_zellij_protocol::ZellijOrigin;
 
+    /// Production-shaped snapshot: every tab/session field comes from the
+    /// bridge frame itself, never hand-filled after capture.
     fn snapshot() -> ZellijOrigin {
         ZellijOrigin {
             client_id: "client-1".to_owned(),
             session_name: Some("alpha".to_owned()),
+            active_tab_index: Some(3),
+            active_tab_id: Some(11),
             prior_pane_id: Some("terminal-2".to_owned()),
             ui_pane_id: "plugin-9".to_owned(),
             prior_pane_cwd: Some("/home/user/work".to_owned()),
+            prior_pane_is_plugin: Some(false),
         }
     }
 
     #[test]
     fn snapshot_builds_immutable_origin() {
-        let origin = build_origin_context(
-            &snapshot(),
-            "alpha",
-            "plugin-9",
-            None,
-            Some("tab-0"),
-            Some(0),
-        )
-        .expect("valid snapshot builds");
+        // Production-shaped capture: no caller-supplied tab/session values.
+        // Every asserted identity comes from the bridge frame itself.
+        let origin = build_origin_context(&snapshot(), "alpha", "plugin-9", None, None, None)
+            .expect("valid snapshot builds");
         assert_eq!(origin.host_kind, OriginHostKind::Zellij);
         assert_eq!(origin.server_id.as_str(), "alpha");
         // The action origin is the bridge PRIOR pane, never the Muxe UI pane:
@@ -157,8 +171,35 @@ mod tests {
             Some("terminal-2")
         );
         assert_eq!(origin.pane_cwd, Some(PathBuf::from("/home/user/work")));
-        assert_eq!(origin.tab_index, Some(0));
+        assert_eq!(
+            origin.session_id.as_ref().map(muxe_core::SessionId::as_str),
+            Some("alpha")
+        );
+        assert_eq!(
+            origin.tab_id.as_ref().map(muxe_core::TabId::as_str),
+            Some("11")
+        );
+        assert_eq!(origin.tab_index, Some(3));
+        assert_eq!(origin.pane_type, Some(muxe_core::OriginPaneType::Terminal));
         assert_eq!(prior_pane_id(&snapshot()), Some("terminal-2"));
+    }
+
+    #[test]
+    fn caller_tab_override_wins_over_snapshot() {
+        let origin = build_origin_context(
+            &snapshot(),
+            "alpha",
+            "plugin-9",
+            None,
+            Some("tab-9"),
+            Some(9),
+        )
+        .expect("caller override builds");
+        assert_eq!(
+            origin.tab_id.as_ref().map(muxe_core::TabId::as_str),
+            Some("tab-9")
+        );
+        assert_eq!(origin.tab_index, Some(9));
     }
 
     #[test]
@@ -189,10 +230,16 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.prior_pane_cwd = None;
         snapshot.session_name = None;
+        snapshot.active_tab_index = None;
+        snapshot.active_tab_id = None;
+        snapshot.prior_pane_is_plugin = None;
         let origin =
             build_origin_context(&snapshot, "alpha", "plugin-9", None, None, None).expect("builds");
         assert_eq!(origin.pane_cwd, None);
         assert_eq!(origin.session_id, None);
+        assert_eq!(origin.tab_index, None);
+        assert_eq!(origin.tab_id, None);
+        assert_eq!(origin.pane_type, None);
         assert_eq!(
             origin.pane_id.as_ref().map(muxe_core::PaneId::as_str),
             Some("terminal-2")

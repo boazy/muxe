@@ -74,6 +74,7 @@ impl PaneGeometry {
 pub struct PaneInventory {
     panes: BTreeMap<usize, Vec<PaneGeometry>>,
     active_tab: Option<usize>,
+    active_tab_id: Option<usize>,
 }
 
 impl PaneInventory {
@@ -87,9 +88,16 @@ impl PaneInventory {
         self.panes = panes;
     }
 
-    /// Records the active tab position from a `TabUpdate` event.
-    pub fn set_active_tab(&mut self, position: Option<usize>) {
+    /// Records the active tab position with its stable host tab ID.
+    pub fn set_active_tab_with_id(&mut self, position: Option<usize>, tab_id: Option<usize>) {
         self.active_tab = position;
+        self.active_tab_id = tab_id;
+    }
+
+    /// Active tab position with its stable host tab ID, when tracked.
+    #[must_use]
+    pub fn active_tab_with_id(&self) -> (Option<usize>, Option<usize>) {
+        (self.active_tab, self.active_tab_id)
     }
 
     /// Whether at least one authoritative `PaneUpdate` manifest has been observed.
@@ -217,7 +225,7 @@ mod tests {
                 pane(3, 0, 20, 100, 10),
             ],
         )]));
-        inventory.set_active_tab(Some(0));
+        inventory.set_active_tab_with_id(Some(0), None);
         inventory
     }
 

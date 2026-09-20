@@ -5377,13 +5377,18 @@ done
         }
     }
 
+    /// Production-shaped snapshot: session, active tab, and prior-pane kind
+    /// all come from the bridge frame, mirroring `request_origin` output.
     fn origin_snapshot(ui_pane: &str, prior: Option<&str>) -> muxe_zellij_protocol::ZellijOrigin {
         muxe_zellij_protocol::ZellijOrigin {
             client_id: "client-1".to_owned(),
             session_name: Some("session-alpha".to_owned()),
+            active_tab_index: Some(3),
+            active_tab_id: Some(11),
             prior_pane_id: prior.map(str::to_owned),
             ui_pane_id: ui_pane.to_owned(),
             prior_pane_cwd: Some("/work".to_owned()),
+            prior_pane_is_plugin: Some(false),
         }
     }
 
@@ -5407,6 +5412,18 @@ done
             Some("terminal_2")
         );
         assert_eq!(origin.pane_cwd, Some(std::path::PathBuf::from("/work")));
+        // Production-shaped capture: session, tab, and pane kind all arrive
+        // in the bridge frame with no caller-supplied values.
+        assert_eq!(
+            origin.session_id.as_ref().map(muxe_core::SessionId::as_str),
+            Some("session-alpha")
+        );
+        assert_eq!(origin.tab_index, Some(3));
+        assert_eq!(
+            origin.tab_id.as_ref().map(muxe_core::TabId::as_str),
+            Some("11")
+        );
+        assert_eq!(origin.pane_type, Some(muxe_core::OriginPaneType::Terminal));
         adapter.shutdown().await.expect("shutdown");
     }
 
@@ -5485,9 +5502,12 @@ done
                     origin: muxe_zellij_protocol::ZellijOrigin {
                         client_id: "client-1".to_owned(),
                         session_name: Some("session-alpha".to_owned()),
+                        active_tab_index: Some(3),
+                        active_tab_id: Some(11),
                         prior_pane_id: Some("terminal_2".to_owned()),
                         ui_pane_id: "plugin-9".to_owned(),
                         prior_pane_cwd: Some("/work".to_owned()),
+                        prior_pane_is_plugin: Some(false),
                     },
                 }),
             )
@@ -5512,6 +5532,16 @@ done
             Some("terminal_2")
         );
         assert_eq!(origin.pane_cwd, Some(std::path::PathBuf::from("/work")));
+        // The captured origin carries the bridge-reported session and tab.
+        assert_eq!(
+            origin.session_id.as_ref().map(muxe_core::SessionId::as_str),
+            Some("session-alpha")
+        );
+        assert_eq!(origin.tab_index, Some(3));
+        assert_eq!(
+            origin.tab_id.as_ref().map(muxe_core::TabId::as_str),
+            Some("11")
+        );
 
         // Consumer proof: closing the origin pane closes the PRIOR pane, not
         // the Muxe UI that now holds focus.
