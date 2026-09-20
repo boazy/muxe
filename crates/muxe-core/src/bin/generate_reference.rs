@@ -269,6 +269,13 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
     )
     .unwrap();
 
+    writeln!(output, "### Lock modifier matching\n").unwrap();
+    writeln!(
+        output,
+        "Ordinary modifiers must match exactly. Each lock modifier in a binding is a requirement on the lock state the terminal reports: `caps-lock+left` matches only while Caps Lock is active. A binding with no lock modifier matches regardless of lock state, so `left` still matches when Caps Lock or Num Lock is active. Extra locks in the event do not disqualify a binding, while an extra ordinary modifier does. Lock modifiers on printable characters require all-keys-as-escape-codes mode.\n"
+    )
+    .unwrap();
+
     writeln!(output, "### Keys that share a VT100 code\n").unwrap();
     writeln!(
         output,

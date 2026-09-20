@@ -1580,9 +1580,12 @@ mod tests {
     }
 
     fn assert_direct_event(stream: &[u8], expected: RawKeyEvent) {
-        let events = parse_chunks(&[stream], true);
-        assert_eq!(events, vec![InputEvent::Key(expected)], "{stream:?}");
+        assert_fragmented_round_trip(stream, &[InputEvent::Key(expected)]);
+    }
+
+    fn assert_fragmented_round_trip(stream: &[u8], expected: &[InputEvent]) {
         let whole = parse_chunks(&[stream], true);
+        assert_eq!(whole, expected, "{stream:?}");
         for split in 0..=stream.len() {
             let fragmented = parse_chunks(&[&stream[..split], &stream[split..]], true);
             assert_eq!(fragmented, whole, "split at byte {split} of {stream:?}");
@@ -1635,10 +1638,9 @@ mod tests {
 
     #[test]
     fn direct_and_tilde_events_preserve_modifiers_and_locks_with_event_kind() {
-        let events = parse_chunks(&[b"\x1b[1;198:2A"], true);
-        assert_eq!(
-            events,
-            vec![InputEvent::Key(RawKeyEvent {
+        assert_direct_event(
+            b"\x1b[1;198:2A",
+            RawKeyEvent {
                 primary: KeyIdentity::Functional(FunctionalKey::Up),
                 shifted: None,
                 base: None,
@@ -1649,12 +1651,11 @@ mod tests {
                     num_lock: true,
                 },
                 keypad: None,
-            })]
+            },
         );
-        let events = parse_chunks(&[b"\x1b[5;198:3~"], true);
-        assert_eq!(
-            events,
-            vec![InputEvent::Key(RawKeyEvent {
+        assert_direct_event(
+            b"\x1b[5;198:3~",
+            RawKeyEvent {
                 primary: KeyIdentity::Functional(FunctionalKey::PageUp),
                 shifted: None,
                 base: None,
@@ -1665,7 +1666,7 @@ mod tests {
                     num_lock: true,
                 },
                 keypad: None,
-            })]
+            },
         );
     }
 
@@ -1676,23 +1677,20 @@ mod tests {
             b"\x1b[5;1:4~".as_slice(),
             b"\x1b[97;1:4u".as_slice(),
         ] {
-            let events = parse_chunks(&[stream], true);
-            assert_eq!(
-                events,
-                vec![malformed(
+            assert_fragmented_round_trip(
+                stream,
+                &[malformed(
                     SequenceClass::Csi,
                     MalformedReason::InvalidEventKind,
-                    u8::try_from(stream.len() - 3).expect("fixture length fits")
+                    u8::try_from(stream.len() - 3).expect("fixture length fits"),
                 )],
-                "{stream:?}"
             );
         }
         // `CSI 1;1:2Z` reuses the shared shift-tab reading: shift-tab with an explicit
         // repeat event kind, consistent with the direct, tilde, and CSI-u forms.
-        let events = parse_chunks(&[b"\x1b[1;1:2Z"], true);
-        assert_eq!(
-            events,
-            vec![InputEvent::Key(RawKeyEvent {
+        assert_direct_event(
+            b"\x1b[1;1:2Z",
+            RawKeyEvent {
                 primary: KeyIdentity::Functional(FunctionalKey::Tab),
                 shifted: None,
                 base: None,
@@ -1700,16 +1698,15 @@ mod tests {
                 kind: EventKind::Repeat,
                 locks: LockState::NONE,
                 keypad: None,
-            })]
+            },
         );
-        let events = parse_chunks(&[b"\x1b[1;1:4Z"], true);
-        assert_eq!(
-            events,
-            vec![malformed(
+        assert_fragmented_round_trip(
+            b"\x1b[1;1:4Z",
+            &[malformed(
                 SequenceClass::Csi,
                 MalformedReason::InvalidEventKind,
-                5
-            )]
+                5,
+            )],
         );
     }
 

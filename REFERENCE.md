@@ -591,6 +591,10 @@ Write modifiers in this order: `ctrl`, `alt`, `shift`, `super`, `hyper`, `meta`,
 
 For a printable character, write the character itself. Use `unicode+<hex-scalar>` for other Unicode characters. Examples: `ctrl+c`, `alternate:alt+unicode+e9`, and `ctrl+f12`.
 
+### Lock modifier matching
+
+Ordinary modifiers must match exactly. Each lock modifier in a binding is a requirement on the lock state the terminal reports: `caps-lock+left` matches only while Caps Lock is active. A binding with no lock modifier matches regardless of lock state, so `left` still matches when Caps Lock or Num Lock is active. Extra locks in the event do not disqualify a binding, while an extra ordinary modifier does. Lock modifiers on printable characters require all-keys-as-escape-codes mode.
+
 ### Keys that share a VT100 code
 
 Older VT100-style terminal input cannot distinguish these pairs:
