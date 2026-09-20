@@ -254,11 +254,15 @@ fn literal_style_tags(template: &str) -> impl Iterator<Item = &str> {
 /// Reports whether a template source uses a loader-backed construct (`extends`,
 /// `include`, `import`, or `from`).
 ///
-/// This is the single authority shared by the compiler and the UI renderer. It scans
-/// `{% ... %}` tags with an allocation-light, bounded pass: after the opener it skips
-/// ASCII whitespace plus one optional `-`/`+` whitespace-control marker, then requires
-/// the keyword to end at an identifier boundary so lookalikes such as `included` stay
-/// benign. Comment (`{# ... #}`) and expression (`{{ ... }}`) tags never match. The
+/// This is the single authority shared by the compiler and the UI renderer. It makes one
+/// forward pass over the source: comment (`{# ... #}`) and expression (`{{ ... }}`)
+/// bodies are skipped verbatim, and each `{% ... %}` statement is classified exactly
+/// once — after the opener it skips ASCII whitespace plus one optional `-`/`+`
+/// whitespace-control marker, requires the keyword to end at an identifier boundary so
+/// lookalikes such as `included` stay benign, then scans once to the closing `%}`
+/// (skipping quoted string literals) and resumes after it. A tag without a closer ends
+/// the scan with no match. Each byte is therefore visited a constant number of times, so
+/// adversarial inputs such as kilobytes of unterminated `{%` openers stay linear. The
 /// keyword set is exactly the minijinja statement set that emits a loader instruction
 /// (`extends` emits `LoadBlocks`; `include`, `import`, and `from ... import ...` emit
 /// `Include`); `block` declares a local block and emits no loader access.
@@ -266,55 +270,59 @@ fn literal_style_tags(template: &str) -> impl Iterator<Item = &str> {
 pub fn has_loader_backed_construct(source: &str) -> bool {
     let bytes = source.as_bytes();
     let mut index = 0;
-    // Lexer states: only `{% ... %}` statements can carry loader-backed keywords.
-    // Comment (`{# ... #}`) and expression (`{{ ... }}`) bodies are skipped verbatim so
-    // an `{% include %}` spelling inside them stays benign, matching template semantics.
-    // String literals inside statements are skipped so `{% set x = "{% include" %}` stays
-    // benign; unterminated literals/tags conservatively report no construct.
-    let mut in_comment = false;
-    let mut in_expression = false;
     while index + 1 < bytes.len() {
-        if in_comment {
-            if bytes[index] == b'#' && bytes[index + 1] == b'}' {
-                in_comment = false;
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if in_expression {
-            if bytes[index] == b'}' && bytes[index + 1] == b'}' {
-                in_expression = false;
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if bytes[index] == b'{' && bytes[index + 1] == b'#' {
-            in_comment = true;
-            index += 2;
-            continue;
-        }
-        if bytes[index] == b'{' && bytes[index + 1] == b'{' {
-            in_expression = true;
-            index += 2;
-            continue;
-        }
-        if bytes[index] != b'{' || bytes[index + 1] != b'%' {
+        if bytes[index] != b'{' {
             index += 1;
             continue;
         }
-        if statement_opens_loader_construct(source, index + 2) {
-            return true;
+        match bytes[index + 1] {
+            b'#' => {
+                let Some(after) = skip_verbatim_tag(bytes, index + 2, b'#', b'}') else {
+                    return false;
+                };
+                index = after;
+            }
+            b'{' => {
+                let Some(after) = skip_verbatim_tag(bytes, index + 2, b'}', b'}') else {
+                    return false;
+                };
+                index = after;
+            }
+            b'%' => {
+                let Some((is_loader, after)) = scan_statement(source, index + 2) else {
+                    return false;
+                };
+                if is_loader {
+                    return true;
+                }
+                index = after;
+            }
+            _ => index += 1,
         }
-        index += 2;
     }
     false
 }
 
-fn statement_opens_loader_construct(source: &str, mut cursor: usize) -> bool {
+/// Skips a comment or expression body to its two-byte closer, returning the byte offset
+/// just past it, or `None` when the tag never closes (nothing after it can terminate
+/// either, so the caller stops the whole scan).
+fn skip_verbatim_tag(bytes: &[u8], mut position: usize, first: u8, second: u8) -> Option<usize> {
+    while position + 1 < bytes.len() {
+        if bytes[position] == first && bytes[position + 1] == second {
+            return Some(position + 2);
+        }
+        position += 1;
+    }
+    None
+}
+
+/// Classifies the `{% ... %}` statement opened at `cursor` (the offset just past `{%`),
+/// returning whether it opens a loader-backed construct plus the offset just past its
+/// closing `%}`. Returns `None` when the statement never closes. The closer scan skips
+/// quoted string literals so `{% set x = "%}" %}` still ends at the true closer; a
+/// keyword inside a string literal is therefore never misread as the statement head,
+/// and an opener inside a string is skipped along with its statement.
+fn scan_statement(source: &str, mut cursor: usize) -> Option<(bool, usize)> {
     let bytes = source.as_bytes();
     while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
         cursor += 1;
@@ -325,7 +333,7 @@ fn statement_opens_loader_construct(source: &str, mut cursor: usize) -> bool {
             cursor += 1;
         }
     }
-    let keyword_length = [
+    let length = [
         ("extends", 7_usize),
         ("include", 7_usize),
         ("import", 6_usize),
@@ -338,20 +346,14 @@ fn statement_opens_loader_construct(source: &str, mut cursor: usize) -> bool {
             .is_some_and(|tail| tail.starts_with(word))
     })
     .map(|(_, length)| length);
-    let Some(length) = keyword_length else {
-        return false;
-    };
-    if !source.get(cursor + length..).is_some_and(|tail| {
-        tail.chars()
-            .next()
-            .is_none_or(|character| !(character == '_' || character.is_alphanumeric()))
-    }) {
-        return false;
-    }
-    // The keyword must close in the same statement: scan to the matching `%}` while
-    // skipping quoted string literals, so `{% set x = "%}" %}` cannot hide a keyword and
-    // a keyword inside a string cannot falsely match.
-    let mut position = cursor + length;
+    let is_loader = length.is_some_and(|length| {
+        source.get(cursor + length..).is_some_and(|tail| {
+            tail.chars()
+                .next()
+                .is_none_or(|character| !(character == '_' || character.is_alphanumeric()))
+        })
+    });
+    let mut position = cursor + length.unwrap_or(0);
     let mut quote: Option<u8> = None;
     while position + 1 < bytes.len() {
         let byte = bytes[position];
@@ -372,11 +374,11 @@ fn statement_opens_loader_construct(source: &str, mut cursor: usize) -> bool {
             continue;
         }
         if byte == b'%' && bytes[position + 1] == b'}' {
-            return true;
+            return Some((is_loader, position + 2));
         }
         position += 1;
     }
-    false
+    None
 }
 #[must_use]
 #[expect(
@@ -727,6 +729,54 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("`{source}` must be benign, got `{error}`"));
         }
+    }
+    #[test]
+    fn loader_scan_stays_linear_on_adversarial_openers() {
+        use std::time::{Duration, Instant};
+        // 64 KiB of unterminated `{%` openers: no keyword head, so the scan advances
+        // past each opener once and reports no construct well inside this bound.
+        let openers = "{%".repeat(32 * 1024);
+        let started = Instant::now();
+        assert!(
+            !has_loader_backed_construct(&openers),
+            "an unterminated statement cannot be a loader construct"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "64 KiB of openers must scan in linear time"
+        );
+        // The true quadratic shape of the old per-opener re-scan: every opener carries a
+        // keyword head but no closer, so the old code re-scanned to EOF once per opener
+        // (~14 s in debug at 256 KiB). The single forward pass stops at the first
+        // unterminated statement and finishes far inside this bound with no match.
+        let keywords = "{% include ".repeat(32 * 1024);
+        let started = Instant::now();
+        assert!(
+            !has_loader_backed_construct(&keywords),
+            "an unterminated loader statement cannot match"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "256 KiB of unclosed keyword openers must scan in linear time"
+        );
+        // Same bare-openers input with exactly one late closer: the benign statement is
+        // classified once and the scan completes just as quickly.
+        let late_close = format!("{openers} if x %}}");
+        let started = Instant::now();
+        assert!(
+            !has_loader_backed_construct(&late_close),
+            "a late-closed benign statement must stay benign"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a late closer must not trigger a quadratic re-scan"
+        );
+        // And a late loader keyword is still caught through the same single pass.
+        let late_loader = ["{%", &(" ".repeat(64 * 1024 - 16) + "include x"), "%}"].concat();
+        assert!(
+            has_loader_backed_construct(&late_loader),
+            "a late loader keyword must still be detected"
+        );
     }
 
     #[test]

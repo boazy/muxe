@@ -723,6 +723,63 @@ menu:
 }
 
 #[test]
+fn whitespace_controlled_loader_tags_are_rejected_at_compile() {
+    for (name, cell) in [
+        ("dash include", "{%- include 'status' %}"),
+        ("plus include", "{%+ include 'status' %}"),
+        ("dash import", "{%- import 'status' as registered %}"),
+        ("dash from-import", "{%- from 'status' import registered %}"),
+    ] {
+        let theme_yaml = format!(
+            r#"
+common:
+  styles:
+    default: {{ foreground: base.text }}
+menu:
+  styles:
+    title: {{ foreground: menu.hotkey, bold: true }}
+  templates:
+    cell: "{cell}"
+    breadcrumbs: "{{{{ crumbs }}}}"
+    pagination:
+      full: "{{{{ pages.current }}}}{{{{ pages.count }}}}"
+      short: "{{{{ pages.current }}}}{{{{ pages.count }}}}"
+    status: "ok"
+"#,
+        );
+        let diagnostics = Compiler
+            .compile(
+                CompileInput {
+                    generation: CompiledGeneration(10),
+                    base: document(
+                        "config.yml",
+                        r"
+version: 1
+theme: custom
+color-scheme: ink
+menus:
+  main:
+    bindings:
+      r: { label: reload, action: config:reload }
+",
+                    ),
+                    host_override: None,
+                    key_capabilities: KeyCapabilities::default(),
+                    theme_assets: custom_theme_assets(&theme_yaml),
+                },
+                None,
+            )
+            .expect_err("a loader-backed cell must not compile");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("loader-backed")),
+            "{name} must be rejected as loader-backed, got {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn selected_theme_and_color_scheme_are_carried_to_attachment() {
     let config = custom_theme_config(COMPLETE_CUSTOM_THEME_YAML);
     assert_eq!(config.theme_selection.theme, "custom");
