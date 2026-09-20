@@ -621,15 +621,104 @@ fn truncate_to_width(value: &str, width: usize) -> String {
     output
 }
 
-fn repeat_to_width(pad: &str, width: usize) -> Result<String, MiniError> {
+/// Measures display width for the padding fill path.
+///
+/// Every `UnicodeWidthStr::width` call in the fill path goes through this
+/// helper so the linearity guard cannot be bypassed by re-measuring the
+/// growing buffer with a raw call: test builds count invocations and assert
+/// a constant bound independent of the output size. Production builds pay
+/// nothing for it.
+fn pad_str_width(value: &str) -> usize {
+    #[cfg(test)]
+    PAD_WIDTH_PROBES.with(|probes| probes.set(probes.get() + 1));
+    UnicodeWidthStr::width(value)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAD_WIDTH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_pad_width_probes() {
+    PAD_WIDTH_PROBES.with(|probes| probes.set(0));
+}
+
+#[cfg(test)]
+fn pad_width_probes() -> usize {
+    PAD_WIDTH_PROBES.with(std::cell::Cell::get)
+}
+
+/// Reports whether repeating `pad` grows display width additively.
+///
+/// `UnicodeWidthStr::width` is context-sensitive, so a fill's measured width
+/// need not equal the sum of its copies' widths: a ZWJ-terminated scalar
+/// measures 2 for any repeat count, and VS16 + heart measures 1, 3, 5 for
+/// one, two, three copies. A single scalar cannot join across copies, so its
+/// width is additive and the sized path is safe without measuring. A
+/// multi-scalar fill takes the sized path only when
+/// `width(pad.repeat(2)) == 2 * pad_width` and
+/// `width(pad.repeat(3)) == 3 * pad_width`; the two-copy probe alone is not
+/// enough (1, 3, 5 passes it at n = 2 but fails at n = 3). Every probe read
+/// goes through the counting helper; the counter itself is `#[cfg(test)]`-only
+/// so production pays only the width computations (at most three reads).
+fn fill_is_additive(pad: &str, pad_width: usize) -> bool {
+    if pad.chars().count() == 1 {
+        return true;
+    }
+    let double = pad.repeat(2);
+    if pad_str_width(double.as_str()) != 2 * pad_width {
+        return false;
+    }
+    let triple = pad.repeat(3);
+    pad_str_width(triple.as_str()) == 3 * pad_width
+}
+
+/// The pre-change greedy loop, verbatim: append one copy, re-measure the
+/// accumulated fill, enforce the byte limit on the accumulated untruncated
+/// size after each append, stop as soon as the measured width reaches the
+/// target, then `truncate_to_width`.
+///
+/// The non-additive fallback below calls this so exotic fills return
+/// byte-identical results and errors (same bytes, same
+/// `"padding output exceeds the component limit"` message, same
+/// boundaries). Its cost is bounded by `MAX_COMPONENT_BYTES` pad bytes
+/// rather than linear in produced output: each append re-measures the
+/// accumulated fill. Making it linear would change observable results for
+/// context-sensitive fills (the sized fill overshoots where the old loop
+/// stopped early, or undershoots where boundary joins add width), so the
+/// fallback keeps the loop deliberately. This residual is a known,
+/// deliberate limitation, accepted to preserve exact equivalence.
+fn greedy_repeat_to_width(pad: &str, width: usize) -> Result<String, MiniError> {
     let mut output = String::new();
-    while UnicodeWidthStr::width(output.as_str()) < width {
+    while pad_str_width(output.as_str()) < width {
         output.push_str(pad);
         if output.len() > MAX_COMPONENT_BYTES {
             return Err(filter_error("padding output exceeds the component limit"));
         }
     }
     Ok(truncate_to_width(&output, width))
+}
+
+fn repeat_to_width(pad: &str, width: usize) -> Result<String, MiniError> {
+    let pad_width = pad_str_width(pad);
+    if pad_width == 0 {
+        return Err(filter_error("padding string has zero display width"));
+    }
+    if !fill_is_additive(pad, pad_width) {
+        return greedy_repeat_to_width(pad, width);
+    }
+    // Size the fill up front: the smallest copy count whose summed per-copy
+    // widths reach (or pass) `width`. A width-2 fill at an odd target still
+    // overshoots and `truncate_to_width` still trims the overhang, preserving
+    // the old undershoot. `str::repeat` builds the fill in one shot, and the
+    // byte check stays over the pre-truncation size, as the old loop did.
+    let copies = width.div_ceil(pad_width);
+    if copies.saturating_mul(pad.len()) > MAX_COMPONENT_BYTES {
+        return Err(filter_error("padding output exceeds the component limit"));
+    }
+    let fill = pad.repeat(copies);
+    Ok(truncate_to_width(&fill, width))
 }
 
 fn filter_error(message: &'static str) -> MiniError {
@@ -881,5 +970,374 @@ mod tests {
             })
             .expect_err("oversized component must fail");
         assert!(matches!(error, TemplateError::OutputTooLarge));
+    }
+
+    fn pad_error_message(error: &MiniError) -> &str {
+        error
+            .detail()
+            .expect("padding errors carry a detail message")
+    }
+
+    #[test]
+    fn padding_fills_to_exact_width_with_single_width_fill() {
+        let padded = rpad_filter("ab", 5, Some(" ".into())).expect("padding fits");
+        assert_eq!(padded, "ab   ");
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 5);
+        let padded = lpad_filter("ab", 5, Some("-".into())).expect("padding fits");
+        assert_eq!(padded, "---ab");
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 5);
+    }
+
+    #[test]
+    fn padding_with_wide_fill_keeps_the_old_undershoot() {
+        // The greedy loop overshot an odd target, then `truncate_to_width`
+        // dropped the overhanging wide char instead of exceeding the width.
+        let padded = rpad_filter("", 3, Some("日".into())).expect("padding fits");
+        assert_eq!(padded, "日");
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 2);
+        let padded = rpad_filter("", 4, Some("日".into())).expect("padding fits");
+        assert_eq!(padded, "日日");
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 4);
+    }
+
+    #[test]
+    fn padding_handles_empty_at_width_and_over_width_values() {
+        let padded = rpad_filter("", 3, Some(" ".into())).expect("padding fits");
+        assert_eq!(padded, "   ");
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 3);
+        let padded = rpad_filter("abc", 3, Some(" ".into())).expect("padding fits");
+        assert_eq!(padded, "abc");
+        let padded = rpad_filter("abcdef", 3, Some(" ".into())).expect("padding fits");
+        assert_eq!(padded, "abc");
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 3);
+    }
+
+    #[test]
+    fn padding_rejects_a_zero_width_fill_before_any_fill_work() {
+        for pad in ["", "\u{0301}"] {
+            let error = rpad_filter("ab", 5, Some(pad.into())).expect_err("no fill width");
+            assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+            assert_eq!(
+                pad_error_message(&error),
+                "padding string has zero display width"
+            );
+            let error = repeat_to_width(pad, 5).expect_err("no fill width");
+            assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+            assert_eq!(
+                pad_error_message(&error),
+                "padding string has zero display width"
+            );
+        }
+    }
+
+    #[test]
+    fn padding_keeps_an_additive_multi_character_fill_on_the_sized_path() {
+        // "ab" is additive (2, 4, 6 for one, two, three copies), so the
+        // probe passes and the sized path must return the loop outcome at
+        // several widths across the range, including the odd-target
+        // overshoot-then-truncate and the limit-adjacent edges.
+        assert!(fill_is_additive("ab", UnicodeWidthStr::width("ab")));
+        for (target, expected) in [
+            (2, "ab".to_string()),
+            (3, "aba".to_string()),
+            (5, "ababa".to_string()),
+            (6, "ababab".to_string()),
+            (1024, "ab".repeat(512)),
+            (8192, "ab".repeat(4096)),
+            (MAX_COMPONENT_BYTES - 1, "ab".repeat(32_767) + "a"),
+            (MAX_COMPONENT_BYTES, "ab".repeat(32_768)),
+        ] {
+            let padded = repeat_to_width("ab", target)
+                .expect("pre-change loop succeeded within the byte limit");
+            assert_eq!(
+                padded, expected,
+                "pre-change loop built `{expected}` for an additive fill at width {target}"
+            );
+            assert_eq!(
+                UnicodeWidthStr::width(padded.as_str()),
+                target.min(expected.len())
+            );
+            reset_pad_width_probes();
+            let padded =
+                repeat_to_width("ab", target).expect("additive fill stays on the sized path");
+            assert_eq!(
+                padded, expected,
+                "sized path must match the pre-change loop at width {target}"
+            );
+            assert_eq!(
+                pad_width_probes(),
+                3,
+                "an additive multi-character fill costs exactly 3 width reads \
+                 (pad + 2-copy probe + 3-copy probe) at width {target}"
+            );
+            let padded = rpad_filter("", target, Some("ab".into()))
+                .expect("pre-change filter succeeded within the byte limit");
+            assert_eq!(
+                padded, expected,
+                "pre-change filter built `{expected}` for an additive fill at width {target}"
+            );
+        }
+        let error = repeat_to_width("ab", MAX_COMPONENT_BYTES + 1)
+            .expect_err("pre-change loop failed past the byte limit");
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+    }
+
+    #[test]
+    fn padding_matches_the_old_loop_for_a_never_growing_fill() {
+        // "👩‍" is U+1F469 U+200D: width 2 alone and width 2 for any repeat,
+        // so the pre-change loop never reached its target and failed on
+        // bytes at every target below.
+        let pad = "👩‍";
+        assert_eq!(UnicodeWidthStr::width(pad), 2);
+        assert_eq!(
+            UnicodeWidthStr::width(pad.repeat(2).as_str()),
+            2,
+            "the fill is not additive, which is what makes this case special"
+        );
+        assert!(!fill_is_additive(pad, 2));
+        for target in [3, 4, 15_000, 21_843, 21_844] {
+            let error = repeat_to_width(pad, target)
+                .expect_err("pre-change loop failed on bytes for a never-growing fill");
+            assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+            assert_eq!(
+                pad_error_message(&error),
+                "padding output exceeds the component limit",
+                "pre-change loop failed on bytes at target {target}"
+            );
+            let error = rpad_filter("", target, Some(pad.into()))
+                .expect_err("pre-change filter failed on bytes for a never-growing fill");
+            assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+            assert_eq!(
+                pad_error_message(&error),
+                "padding output exceeds the component limit",
+                "pre-change filter failed on bytes at target {target}"
+            );
+        }
+        let error = lpad_filter("", 4, Some(pad.into()))
+            .expect_err("pre-change left filter failed on bytes for a never-growing fill");
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+    }
+
+    #[test]
+    fn padding_matches_the_old_loop_for_a_super_additive_fill() {
+        // "\u{FE0F}❤" is VS16 + heart: width 1 alone but 3 for two copies and
+        // 5 for three, so the sized path would overshoot where the pre-change
+        // loop stopped early. The probe must fail and the fallback must rerun
+        // the loop byte-for-byte, succeeding at 15000 and 21843 (10922
+        // copies, 65,532 bytes) and failing only at 21844.
+        let pad = "\u{FE0F}❤";
+        assert_eq!(UnicodeWidthStr::width(pad), 1);
+        assert_eq!(UnicodeWidthStr::width(pad.repeat(2).as_str()), 3);
+        assert_eq!(UnicodeWidthStr::width(pad.repeat(3).as_str()), 5);
+        assert!(!fill_is_additive(pad, 1));
+        for (target, copies, bytes, width) in [
+            (3, 2, 12, 3),
+            (4, 3, 18, 5),
+            (15_000, 7501, 45_006, 15_001),
+            (21_843, 10_922, 65_532, 21_843),
+        ] {
+            let expected = pad.repeat(copies);
+            assert_eq!(expected.len(), bytes);
+            let padded = repeat_to_width(pad, target).expect(
+                "pre-change loop stopped early at the first measured width reaching the target",
+            );
+            assert_eq!(
+                padded, expected,
+                "pre-change loop built {copies} copies ({bytes} bytes) at target {target}"
+            );
+            assert_eq!(UnicodeWidthStr::width(padded.as_str()), width);
+            let padded = rpad_filter("", target, Some(pad.into()))
+                .expect("pre-change filter agreed with the loop");
+            assert_eq!(
+                padded, expected,
+                "pre-change filter built {copies} copies ({bytes} bytes) at target {target}"
+            );
+        }
+        let error = repeat_to_width(pad, 21_844)
+            .expect_err("pre-change loop failed on bytes past 10922 copies");
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit",
+            "pre-change loop failed on bytes at target 21844"
+        );
+        let error = rpad_filter("", 21_844, Some(pad.into()))
+            .expect_err("pre-change filter failed on bytes at target 21844");
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+    }
+
+    #[test]
+    fn padding_keeps_single_character_fills_on_the_sized_path() {
+        // A single scalar's width is additive across copies, so both fills
+        // below skip the two-copy/three-copy probe and cost exactly one
+        // measurement at any size, preserving the width-2 truncation
+        // undershoot (target 3 keeps one wide char at width 2).
+        assert!(fill_is_additive(" ", 1));
+        assert!(fill_is_additive("日", 2));
+        for target in [
+            1,
+            2,
+            3,
+            4,
+            1023,
+            1024,
+            MAX_COMPONENT_BYTES - 1,
+            MAX_COMPONENT_BYTES,
+        ] {
+            let padded =
+                repeat_to_width(" ", target).expect("pre-change loop succeeded for spaces");
+            assert_eq!(padded.len(), target);
+            reset_pad_width_probes();
+            let padded = repeat_to_width(" ", target).expect("space stays sized");
+            assert_eq!(
+                padded,
+                " ".repeat(target),
+                "pre-change loop built {target} spaces"
+            );
+            assert_eq!(
+                pad_width_probes(),
+                1,
+                "a single-character fill costs exactly 1 width read at width {target}"
+            );
+        }
+        let padded = repeat_to_width("日", 3).expect("pre-change loop overshot, then truncated");
+        assert_eq!(padded, "日");
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 2);
+        let padded = repeat_to_width("日", 4).expect("pre-change loop fit evenly");
+        assert_eq!(padded, "日日");
+        // The byte check stays over the pre-truncation fill: 32,768 copies of
+        // the 3-byte `日` are 98,304 bytes, so the widest fill that fits is
+        // 21,845 copies (65,535 bytes) at width 43,690; the pre-change loop
+        // agreed, failing only on bytes past that.
+        let padded = repeat_to_width("日", 43_690)
+            .expect("pre-change loop succeeded just under the byte limit");
+        assert_eq!(padded, "日".repeat(21_845));
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 43_690);
+        let error = repeat_to_width("日", MAX_COMPONENT_BYTES + 1)
+            .expect_err("pre-change loop failed on bytes past the limit");
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+    }
+
+    #[test]
+    fn padding_fails_fast_for_a_never_growing_fill() {
+        // A longer non-additive pad ("👩‍".repeat(100), still width 2 for any
+        // repeat) hits the byte limit in ~90 appends with the same error as
+        // the pre-change loop, keeping this boundedness test fast.
+        let pad = "👩‍".repeat(100);
+        assert_eq!(UnicodeWidthStr::width(pad.as_str()), 2);
+        assert_eq!(UnicodeWidthStr::width(pad.repeat(2).as_str()), 2);
+        assert!(!fill_is_additive(&pad, 2));
+        let error = repeat_to_width(&pad, 5)
+            .expect_err("pre-change loop failed on bytes for a never-growing fill");
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+        let error = rpad_filter("", 5, Some(pad.clone()))
+            .expect_err("pre-change filter failed on bytes for a never-growing fill");
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+        reset_pad_width_probes();
+        let error = repeat_to_width(&pad, 5).expect_err("fallback still fails on bytes");
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+        assert!(
+            pad_width_probes() < 200,
+            "the non-additive fallback must stay bounded by the byte limit, \
+             not grow with the target"
+        );
+    }
+
+    #[test]
+    fn padding_keeps_the_width_and_byte_limits() {
+        let first = rpad_filter("ab", MAX_COMPONENT_BYTES + 1, Some(" ".into()))
+            .expect_err("width limit must hold");
+        assert_eq!(first.kind(), ErrorKind::InvalidOperation);
+        assert_eq!(
+            pad_error_message(&first),
+            "padding width exceeds the component limit"
+        );
+        let ok = rpad_filter("ab", 8, Some(" ".into())).expect("limit edge fits");
+        assert_eq!(ok, "ab      ");
+        // `é` is one column but two bytes, so the byte limit binds first.
+        let ok =
+            rpad_filter(&"é".repeat(32_768), 32_768, Some(" ".into())).expect("byte edge fits");
+        assert_eq!(ok.len(), MAX_COMPONENT_BYTES);
+        let error = rpad_filter(&"é".repeat(32_768), 32_769, Some(" ".into()))
+            .expect_err("bytes past the limit must fail");
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+        let ok = repeat_to_width(" ", MAX_COMPONENT_BYTES).expect("fill edge fits");
+        assert_eq!(ok.len(), MAX_COMPONENT_BYTES);
+        let error = repeat_to_width(" ", MAX_COMPONENT_BYTES + 1)
+            .expect_err("fill past the limit must fail");
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+        // The byte check stays over the pre-truncation fill: 21,846 copies of
+        // the 3-byte `日` are 65,538 bytes, so this fails even though the
+        // truncated result would fit in 65,535 bytes.
+        let error = rpad_filter("", 43_691, Some("日".into()))
+            .expect_err("untruncated wide fill must fail");
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+        assert_eq!(
+            pad_error_message(&error),
+            "padding output exceeds the component limit"
+        );
+    }
+
+    #[test]
+    fn padding_scales_linearly_without_remeasuring_the_fill() {
+        // The old loop re-measured the whole growing fill on every append,
+        // so probes grew with the target (~65k probes for a 64 KiB fill).
+        // A single-character fill measures the pad once and never probes,
+        // so it costs exactly 1 measurement at every size: any per-append
+        // re-measurement on the fast path would break this constant. Every
+        // width read in the fill path goes through `pad_str_width`, so a
+        // quadratic re-measurement cannot bypass this counter.
+        for target in [1024, 8192, MAX_COMPONENT_BYTES] {
+            reset_pad_width_probes();
+            let padded = repeat_to_width(" ", target).expect("valid padding fits");
+            assert_eq!(padded.len(), target);
+            assert_eq!(UnicodeWidthStr::width(padded.as_str()), target);
+            assert_eq!(
+                pad_width_probes(),
+                1,
+                "a {target}-column fill must cost 1 width read, not one per append"
+            );
+        }
+        // An additive multi-character fill adds the two probe reads.
+        for target in [1024, 8192, MAX_COMPONENT_BYTES] {
+            reset_pad_width_probes();
+            let padded = repeat_to_width("ab", target).expect("valid padding fits");
+            assert_eq!(UnicodeWidthStr::width(padded.as_str()), target);
+            assert_eq!(
+                pad_width_probes(),
+                3,
+                "a {target}-column additive fill must cost 3 width reads, not one per append"
+            );
+        }
     }
 }
