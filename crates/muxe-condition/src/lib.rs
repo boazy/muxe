@@ -343,9 +343,11 @@ fn compare<N: ConditionNode + ?Sized>(
 ///
 /// # Errors
 ///
-/// Returns [`ConditionEvaluationError::NonBooleanResult`] when the tree evaluates to an integer,
-/// [`ConditionEvaluationError::TypeMismatch`] when a mistyped subtree reaches an operator, and the
-/// arithmetic errors for division by zero or `i64` overflow.
+/// Returns [`ConditionEvaluationError::TypeMismatch`] when a mistyped subtree reaches an
+/// operator, [`ConditionEvaluationError::NonBooleanResult`] when the root evaluates to an
+/// integer, [`ConditionEvaluationError::DivisionByZero`] for integer division or remainder by
+/// zero, and [`ConditionEvaluationError::ArithmeticOverflow`] for signed integer overflow or
+/// narrowing a `pages.*` (`u64`) value to `i64`.
 pub fn evaluate<N: ConditionNode + ?Sized>(
     node: &N,
     pages: PagesContext,
@@ -358,6 +360,15 @@ pub fn evaluate<N: ConditionNode + ?Sized>(
 
 /// Evaluates one borrowed condition subtree to its typed value. Exposed for parity checks that
 /// compare owned and archived evaluation below the top-level Boolean gate.
+///
+/// # Errors
+///
+/// Returns [`ConditionEvaluationError::TypeMismatch`] when a mistyped subtree reaches an
+/// operator, [`ConditionEvaluationError::DivisionByZero`] for integer division or remainder by
+/// zero, and [`ConditionEvaluationError::ArithmeticOverflow`] for signed integer overflow or
+/// narrowing a `pages.*` (`u64`) value to `i64`. It never returns
+/// [`ConditionEvaluationError::NonBooleanResult`], which is emitted only by [`evaluate`] when its
+/// root value is an integer.
 pub fn evaluate_typed<N: ConditionNode + ?Sized>(
     node: &N,
     pages: PagesContext,
@@ -375,6 +386,11 @@ pub enum ConditionType {
 /// Type-checks one borrowed condition tree. Returns the type of the root; every operator enforces
 /// its operand types, so `true && 1`, `1 < true`, `!pages.count`, arithmetic on Booleans, and a
 /// top-level integer all fail here, before publication, instead of during evaluation.
+///
+/// # Errors
+///
+/// Returns [`TypeError`] when an operator receives an operand of the wrong type, comparison
+/// operands have different types, or the two branches of `?:` have different types.
 pub fn type_check<N: ConditionNode + ?Sized>(node: &N) -> Result<ConditionType, TypeError> {
     match node.view() {
         NodeRef::Bool(_) => Ok(ConditionType::Boolean),
