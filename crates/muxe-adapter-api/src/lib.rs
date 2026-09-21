@@ -290,6 +290,12 @@ pub enum AdapterHealthEvent {
         previous: HostIdentity,
         current: HostIdentity,
     },
+    /// Terminal host loss: the adapter exhausted its bounded grace and will not recover;
+    /// the broker must retire it.
+    HostLost {
+        identity: HostIdentity,
+        error: AdapterError,
+    },
     CaptureReady {
         lease: CaptureLease,
     },

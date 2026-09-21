@@ -1213,6 +1213,68 @@ async fn reconnects_the_production_adapter_only_after_retained_subscription_loss
     drop(fixture);
 }
 
+#[tokio::test]
+async fn production_reconnect_emits_one_terminal_host_loss_after_bounded_grace() {
+    let fixture =
+        ProductionConnectFixture::start_scripted(ProductionConnectFixture::initial_handshake())
+            .expect("owned fake-native terminal-loss fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial production adapter connection succeeds");
+    assert!(matches!(
+        HostAdapter::next_health_event(adapter.as_ref())
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    tokio::time::pause();
+
+    fixture.lose_retained_subscriptions();
+    assert!(matches!(
+        HostAdapter::next_health_event(adapter.as_ref())
+            .await
+            .expect("subscription loss is reported"),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+
+    let waiting = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { HostAdapter::next_health_event(adapter.as_ref()).await })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(11)).await;
+    let terminal = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("bounded host-loss reconnect emits a terminal event")
+        .expect("terminal health task joins")
+        .expect("terminal health event is delivered");
+    assert!(matches!(terminal, AdapterHealthEvent::HostLost { .. }));
+
+    let attempts_at_terminal = fixture.requests().await.len();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        fixture.requests().await.len(),
+        attempts_at_terminal,
+        "the monitor must stop reconnecting after HostLost"
+    );
+
+    let duplicate = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { HostAdapter::next_health_event(adapter.as_ref()).await })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), duplicate)
+            .await
+            .is_err(),
+        "host loss must be emitted exactly once"
+    );
+    drop(adapter);
+    drop(fixture);
+}
+
 fn command_launch_exchanges() -> Vec<RecordedExchange> {
     vec![
         RecordedExchange {

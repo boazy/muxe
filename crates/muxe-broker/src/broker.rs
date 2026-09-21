@@ -3,7 +3,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -58,6 +58,12 @@ pub struct Broker {
     next_session: AtomicU64,
     next_execution: AtomicU64,
     next_event: Arc<AtomicU64>,
+    /// Terminal host-loss signal owned by the broker: the health monitor sets
+    /// it on `AdapterHealthEvent::HostLost` and returns immediately so the
+    /// Stop join can never block on health delivery. The service run loop owns
+    /// the listener/config-watch/endpoint unlink and polls this flag.
+    host_loss_retirement: Arc<Notify>,
+    host_loss_armed: AtomicBool,
     /// Self reference for slow-consumer teardown. Delivery sites only hold
     /// `&self` (or detached supervisor handles), so a full queue upgrades this
     /// to spawn `detach` on its own task instead of awaiting client I/O.
@@ -665,6 +671,8 @@ impl Broker {
             next_session: AtomicU64::new(1),
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),
+            host_loss_retirement: Arc::new(Notify::new()),
+            host_loss_armed: AtomicBool::new(false),
             self_weak: self_weak.clone(),
             #[cfg(test)]
             cleanup_enqueue_hook: StdMutex::new(None),
@@ -699,6 +707,8 @@ impl Broker {
             next_session: AtomicU64::new(1),
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),
+            host_loss_retirement: Arc::new(Notify::new()),
+            host_loss_armed: AtomicBool::new(false),
             self_weak: self_weak.clone(),
             #[cfg(test)]
             cleanup_enqueue_hook: StdMutex::new(None),
@@ -1412,7 +1422,11 @@ impl Broker {
                     }
                 }
                 event = self.adapter.next_health_event() => match event {
-                    Ok(event) => self.handle_health_event(event).await,
+                    Ok(event) => {
+                        if self.handle_health_event(event).await {
+                            return;
+                        }
+                    }
                     Err(error) if error.kind == muxe_adapter_api::AdapterErrorKind::Shutdown => {
                         return;
                     }
@@ -1425,21 +1439,31 @@ impl Broker {
         }
     }
 
-    async fn handle_health_event(&self, event: AdapterHealthEvent) {
+    /// Returns true when the monitor must exit: the terminal host-loss
+    /// outcome was recorded and the service run loop now owns retirement.
+    /// The monitor signals and returns immediately; it never blocks on the
+    /// Stop join, and later duplicates are dropped idempotently.
+    pub(crate) async fn handle_health_event(&self, event: AdapterHealthEvent) -> bool {
         match event {
             AdapterHealthEvent::Healthy { .. }
             | AdapterHealthEvent::CaptureReady { .. }
             | AdapterHealthEvent::Reconnected { .. } => {
                 self.broadcast_health(true, None).await;
+                false
             }
             AdapterHealthEvent::Unhealthy { modal_scope, error } => match modal_scope {
                 None => {
                     self.broadcast_health(false, Some(error)).await;
+                    false
                 }
                 Some(scope) => {
                     self.scope_unhealthy(scope, error).await;
+                    false
                 }
             },
+            AdapterHealthEvent::HostLost { error, .. } => {
+                return self.retire_on_host_loss(error).await;
+            }
             AdapterHealthEvent::CaptureLost { lease, reason } => {
                 let session = {
                     let sessions = self.sessions.lock().await;
@@ -1460,11 +1484,75 @@ impl Broker {
                     };
                     let _ = self.detach(&session, reason).await;
                 }
+                false
             }
             AdapterHealthEvent::DispatchCompleted(completion) => {
                 self.dispatch_completed(completion).await;
+                false
             }
         }
+    }
+
+    /// Terminal host-loss signal: fail first, then signal, then return.
+    /// The monitor must never block on the Stop join, so this performs no
+    /// drain here: it fails every Adapter-owned execution with the terminal
+    /// outcome (Herdr's cancel is always `CancelUnsupported` and
+    /// `ASYNCHRONOUS` is `cancellable: false`, so a later drain would refuse
+    /// a live non-cancellable host owner; failing first empties the owner set
+    /// so the run-loop drain can proceed), arms the broker-owned retirement
+    /// flag, wakes the run loop, and returns immediately. The service run
+    /// loop owns the drain (`BrokerRetiring` emits + detaches, cleanup error
+    /// warned and ignored against a dead host) followed by the exact Stop
+    /// teardown. Exactly-once via `host_loss_armed`: later duplicates only
+    /// re-broadcast unhealthiness. Returns true so the monitor exits and never
+    /// blocks the Stop join.
+    async fn retire_on_host_loss(&self, error: AdapterError) -> bool {
+        self.broadcast_health(false, Some(error.clone())).await;
+        if self.host_loss_armed.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+        self.fail_host_executions(&error).await;
+        self.host_loss_retirement.notify_waiters();
+        true
+    }
+
+    /// Fails every Adapter-owned execution with the terminal host-loss outcome
+    /// before any drain. Collects the Adapter-owned cores, then reuses the
+    /// shared terminal delivery below with a `HostUnavailable` diagnostic
+    /// carrying the terminal message; generic (detached) supervision is
+    /// untouched, and unrelated state is unchanged.
+    async fn fail_host_executions(&self, error: &AdapterError) {
+        let cores = {
+            self.state
+                .lock()
+                .await
+                .executions
+                .values()
+                .filter(|record| record.owner == ExecutionOwner::Adapter)
+                .map(|record| record.core)
+                .collect::<Vec<_>>()
+        };
+        let message = error.to_string();
+        for core in cores {
+            self.complete_adapter_execution(
+                core,
+                ExecutionOutcome::Failed,
+                Some(diagnostic(DiagnosticCode::HostUnavailable, &message)),
+            )
+            .await;
+        }
+    }
+
+    /// Minimal monitor-to-server signal for terminal host loss. The broker owns
+    /// the flag; the service run loop owns the listener/config-watch/unlink.
+    pub(crate) fn host_loss_notified(&self) -> bool {
+        self.host_loss_armed.load(Ordering::SeqCst)
+    }
+
+    /// Wakes when terminal host loss is recorded. The run loop selects on this
+    /// alongside shutdown/commands so plain (non-activation) servers retire too.
+    pub(crate) async fn host_loss_retired(&self) {
+        self.host_loss_retirement.notified().await;
     }
 
     async fn dispatch_completed(&self, completion: DispatchCompletion) {
@@ -1489,6 +1577,20 @@ impl Broker {
                 )),
             ),
         };
+        self.complete_adapter_execution(core, outcome, diagnostic)
+            .await;
+    }
+
+    /// Shared Adapter-owned terminal delivery: map removal, awaiting-index
+    /// cleanup, transition wake, then detached-diagnostic logging or awaiting
+    /// `ExecutionCompleted` delivery. Both adapter completions and terminal
+    /// host loss funnel here so the teardown cannot drift.
+    async fn complete_adapter_execution(
+        &self,
+        core: CoreExecutionId,
+        outcome: ExecutionOutcome,
+        diagnostic: Option<ProtocolDiagnostic>,
+    ) {
         let record = {
             let mut state = self.state.lock().await;
             let Some(record) = state.executions.get_mut(&core) else {
@@ -4480,6 +4582,218 @@ menus:
 
         assert!(matches!(result, Err(BrokerError::ContextUnavailable)));
         assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn host_loss_fails_adapter_execution_and_signals_retirement_once() {
+        // H08 finding check (broker layer): a terminal HostLost fails every
+        // Adapter-owned execution with HostUnavailable and fires the
+        // retirement signal exactly once. The monitor performs no drain: the
+        // service run loop owns the drain + Stop teardown after the signal,
+        // so admission stays unsealed and the session stays attached here.
+        let (adapter, broker, _core) = dispatch_detached_adapter_execution(false).await;
+        let (session, events_rx) = attach_ready(&broker, "host-loss-ui").await;
+        // Awaited adapter execution on the attached session: invoke the same
+        // detach-mode binding requires await mode; reuse the native probe path
+        // through scoped fixture instead. Here assert at least the detached
+        // host owner fails + signal fires once.
+        broker
+            .handle_health_event(AdapterHealthEvent::HostLost {
+                identity: HostIdentity {
+                    kind: muxe_adapter_api::HostKind::Herdr,
+                    discovery_key: "test".to_owned(),
+                    live_server_id: "server".to_owned(),
+                },
+                error: AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "Herdr host did not recover within the bounded reconnect grace",
+                ),
+            })
+            .await;
+        assert!(
+            broker.state.lock().await.executions.is_empty(),
+            "terminal host loss removes every Adapter-owned execution owner"
+        );
+        assert!(
+            broker.host_loss_notified(),
+            "terminal host loss arms the broker-owned retirement signal"
+        );
+        assert!(
+            !broker.state.lock().await.activation_sealed,
+            "the monitor never drains: the run loop owns the drain after the signal"
+        );
+        // Exactly-once: a duplicate HostLost re-broadcasts but performs no
+        // second teardown.
+        broker
+            .handle_health_event(AdapterHealthEvent::HostLost {
+                identity: HostIdentity {
+                    kind: muxe_adapter_api::HostKind::Herdr,
+                    discovery_key: "test".to_owned(),
+                    live_server_id: "server".to_owned(),
+                },
+                error: AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "duplicate host loss",
+                ),
+            })
+            .await;
+        assert!(
+            broker.state.lock().await.executions.is_empty(),
+            "duplicate host loss performs no second teardown"
+        );
+        assert_eq!(
+            adapter.cancellations.load(Ordering::SeqCst),
+            0,
+            "fail-first ordering never attempts unsupported Herdr cancellation"
+        );
+        assert!(
+            broker.sessions.lock().await.contains_key(&session),
+            "the monitor never detaches: the run-loop drain owns session teardown"
+        );
+        drop(events_rx);
+    }
+
+    #[tokio::test]
+    async fn host_loss_delivers_failed_completion_to_awaiting_session() {
+        // Awaiting adapter execution observes Failed/HostUnavailable terminal
+        // delivery; unrelated generic supervision is untouched.
+        let adapter = counting_adapter(false);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<host loss awaiting regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: await
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("await adapter configuration compiles");
+        let root = named("main");
+        let binding = config
+            .attachment_view(&root)
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("test binding is visible");
+        let directory = tempfile::tempdir().expect("owned host-loss directory");
+        let broker = Broker::from_compiled(adapter, directory.path().join("config.yml"), config);
+        let (session, mut events_rx) = attach_ready(&broker, "host-loss-await").await;
+        let (events, _) = mpsc::channel(1);
+        let accepted = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events,
+            )
+            .await
+            .expect("await adapter dispatch is accepted");
+        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+            execution: wire,
+            disposition: InvocationDisposition::Awaited,
+        }) = accepted
+        else {
+            panic!("expected an awaited acceptance");
+        };
+        broker
+            .handle_health_event(AdapterHealthEvent::HostLost {
+                identity: HostIdentity {
+                    kind: muxe_adapter_api::HostKind::Herdr,
+                    discovery_key: "test".to_owned(),
+                    live_server_id: "server".to_owned(),
+                },
+                error: AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "Herdr host did not recover within the bounded reconnect grace",
+                ),
+            })
+            .await;
+        // Terminal delivery: the awaiting session observes Failed with the
+        // HostUnavailable diagnostic. The unhealthy broadcast precedes it;
+        // skip health events. No BrokerRetiring here: the run loop owns the
+        // drain that emits it.
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = events_rx.recv().await.expect("event channel stays open");
+                let WireMessage::Event { event, .. } = message else {
+                    continue;
+                };
+                if matches!(
+                    event,
+                    BrokerEvent::AdapterHealthChanged { .. } | BrokerEvent::BrokerRetiring
+                ) {
+                    continue;
+                }
+                break event;
+            }
+        })
+        .await
+        .expect("terminal host-loss event arrives bounded");
+        let BrokerEvent::ExecutionCompleted {
+            execution,
+            outcome,
+            diagnostic,
+            ..
+        } = event
+        else {
+            panic!("expected a terminal completion, got {event:?}");
+        };
+        assert_eq!(execution, wire);
+        assert_eq!(outcome, ExecutionOutcome::Failed);
+        assert_eq!(
+            diagnostic.map(|diagnostic| diagnostic.code),
+            Some(DiagnosticCode::HostUnavailable)
+        );
+        assert!(
+            broker.state.lock().await.executions.is_empty(),
+            "awaiting host owner is removed after terminal delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_unhealthy_does_not_retire_or_fail_executions() {
+        // Transient blip: Unhealthy still retries/recovers — no retirement
+        // signal, no execution teardown, no admission seal.
+        let (_adapter, broker, _core) = dispatch_detached_adapter_execution(false).await;
+        broker
+            .handle_health_event(AdapterHealthEvent::Unhealthy {
+                modal_scope: None,
+                error: AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "transient subscription flap",
+                ),
+            })
+            .await;
+        assert!(
+            !broker.host_loss_notified(),
+            "a transient blip must not arm host-loss retirement"
+        );
+        assert!(
+            !broker.state.lock().await.activation_sealed,
+            "a transient blip must not seal admission"
+        );
+        assert_eq!(
+            broker.state.lock().await.executions.len(),
+            1,
+            "a transient blip retains the host execution owner"
+        );
     }
 
     #[tokio::test]

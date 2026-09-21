@@ -4564,6 +4564,7 @@ mod tests {
             AdapterHealthEvent::Healthy { .. } => panic!("second healthy"),
             AdapterHealthEvent::Unhealthy { error, .. } => panic!("unhealthy: {error}"),
             AdapterHealthEvent::Reconnected { .. } => panic!("reconnected"),
+            AdapterHealthEvent::HostLost { error, .. } => panic!("host lost: {error}"),
             AdapterHealthEvent::CaptureReady { .. } => panic!("capture ready"),
             AdapterHealthEvent::CaptureLost { .. } => panic!("capture lost"),
         }

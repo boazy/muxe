@@ -1102,7 +1102,58 @@ impl BrokerServer {
                         break Ok(());
                     }
                 }
-                _ = expiry.tick() => broker.expire_pending().await,
+                _ = expiry.tick() => {
+                    broker.expire_pending().await;
+                    // Poll the broker-owned flag here too: `notify_waiters`
+                    // stores no permit, so a notification that fired before
+                    // this select was entered would otherwise be missed.
+                    if !supervisor_only && broker.host_loss_notified() {
+                        if let Err(error) = retire_for_host_loss(
+                            &broker,
+                            &endpoint,
+                            &mut listener,
+                            socket_device,
+                            socket_inode,
+                            &mut config_watch,
+                            &mut health,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, "host-loss retirement teardown failed");
+                        }
+                        supervisor_only = true;
+                        break Ok(());
+                    }
+                }
+                () = broker.host_loss_retired() => {
+                    // Re-check after wake: the notification carries no permit,
+                    // so only the broker-owned flag authorizes retirement.
+                    if supervisor_only || !broker.host_loss_notified() {
+                        continue;
+                    }
+                    // Terminal host loss: the monitor failed every Adapter-owned
+                    // execution and signalled; the helper below drains UI state
+                    // (drain's BrokerRetiring emits + detaches), shuts the host
+                    // adapter down, joins the monitor, and unlinks the owned
+                    // endpoint — then the loop lingers supervisor-only for
+                    // detached generic children. The loop owns
+                    // listener/config-watch; the broker only signals.
+                    if let Err(error) = retire_for_host_loss(
+                        &broker,
+                        &endpoint,
+                        &mut listener,
+                        socket_device,
+                        socket_inode,
+                        &mut config_watch,
+                        &mut health,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "host-loss retirement teardown failed");
+                    }
+                    supervisor_only = true;
+                    break Ok(());
+                }
                 command = command_rx.recv(), if activation.is_some() => {
                     match command {
                         Some(ServerCommand::Drain { complete }) => {
@@ -1133,22 +1184,29 @@ impl BrokerServer {
                             // Terminal dispatch outcomes remain observable through the health
                             // monitor until the adapter seals admission, joins every retained
                             // host task, and closes its completion queue.
+                            // Coordinator Stop owns its UI drain through the Retire
+                            // branch (`ActivationController::handle`); the shared
+                            // helper below must not drain again here.
                             drop(config_watch.take());
-                            let result = match broker.shutdown_host_adapter().await {
+                            let outcome = match broker.shutdown_host_adapter().await {
                                 Ok(()) => {
-                                    if let Some(health) = health.take() {
-                                        let _ = health.await;
+                                    if let Some(monitor) = health.take() {
+                                        let _ = monitor.await;
                                     }
                                     if listener.take().is_some() {
-                                        remove_owned_socket(&endpoint, socket_device, socket_inode)
-                                            .map_err(|error| error.to_string())
+                                        remove_owned_socket(
+                                            &endpoint,
+                                            socket_device,
+                                            socket_inode,
+                                        )
+                                        .map_err(|error| error.to_string())
                                     } else {
                                         Ok(())
                                     }
                                 }
                                 Err(error) => Err(error.to_string()),
                             };
-                            match result {
+                            match outcome {
                                 Ok(()) => {
                                     let (ticket, released) = RetirementTicket::pair();
                                     if complete.send(Ok(ticket)).is_ok() {
@@ -1195,6 +1253,50 @@ impl BrokerServer {
             await_supervised_drain(&broker, &mut shutdown).await;
         }
         result
+    }
+}
+
+/// Terminal host-loss teardown (not the coordinator Stop path, which owns
+/// its UI drain through the Retire branch): drains broker-owned UI state
+/// (`BrokerRetiring` emits + detaches; a dead host cannot confirm
+/// pending-pane/capture closes, so the cleanup error is warned and ignored),
+/// then drops the config watch (probes stop: reloads revalidate against the
+/// adapter), shuts the host adapter down, joins the health monitor, and
+/// unlinks the owned endpoint. The caller then lingers supervisor-only until
+/// detached generic children are reaped.
+/// Listener/config-watch ownership stays with the run loop; the broker only
+/// signals via its host-loss flag. The monitor already failed every
+/// Adapter-owned execution before signalling, so the drain finds an empty
+/// host-owner set and cannot refuse on non-cancellable Herdr work.
+async fn retire_for_host_loss(
+    broker: &Arc<Broker>,
+    endpoint: &RuntimeEndpoint,
+    listener: &mut Option<UnixListener>,
+    socket_device: u64,
+    socket_inode: u64,
+    config_watch: &mut Option<ConfigWatch>,
+    health: &mut Option<JoinHandle<()>>,
+) -> Result<(), String> {
+    if let Err(error) = broker.drain_for_activation().await {
+        tracing::warn!(
+            %error,
+            "host-loss drain could not confirm host cleanup; retiring anyway"
+        );
+    }
+    drop(config_watch.take());
+    match broker.shutdown_host_adapter().await {
+        Ok(()) => {
+            if let Some(monitor) = health.take() {
+                let _ = monitor.await;
+            }
+            if listener.take().is_some() {
+                remove_owned_socket(endpoint, socket_device, socket_inode)
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -4758,6 +4860,218 @@ menus:
         assert!(
             broker.has_supervised_children().await,
             "GenericSupervisor retains the detached child across activation drain"
+        );
+        assert!(
+            nix::sys::signal::kill(child, None).is_ok(),
+            "child alive while supervised"
+        );
+
+        // Trigger the child's bounded natural exit (no SIGTERM or SIGKILL, no global cleanup).
+        {
+            let mut trigger = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&exit_fifo)
+                .expect("open exit trigger fifo");
+            std::io::Write::write_all(&mut trigger, b"exit\n").expect("write exit trigger");
+        }
+
+        // The run lifetime ends only now: completion proves the supervisor reaped the naturally exited child.
+        tokio::time::timeout(Duration::from_secs(10), run_task)
+            .await
+            .expect("service terminates after child naturally exits and is reaped")
+            .expect("service joins")
+            .expect("service has no error");
+
+        // Verify the child process was cleanly reaped (no zombie).
+        assert_eq!(
+            nix::sys::signal::kill(child, None),
+            Err(nix::errno::Errno::ESRCH),
+            "child process is reaped and no longer exists"
+        );
+        assert!(
+            !broker.has_supervised_children().await,
+            "no supervised children remain"
+        );
+    }
+
+    /// H08 acceptance (service layer, owned fixtures only): a queued terminal
+    /// HostLost drives the exact Stop teardown — config watch dropped (probes
+    /// stop), owned endpoint unlinked, awaiting host execution failed with
+    /// HostUnavailable — while the detached generic child stays supervised.
+    /// Cloned from `retire_supervises_detached_child_until_reaped`; the only
+    /// difference is the retirement trigger (health signal, not Retire RPC).
+    #[tokio::test]
+    async fn host_loss_retires_owned_endpoint_and_keeps_generic_supervision() {
+        let staging = tempfile::tempdir().expect("owned child staging directory");
+        let (script, startup, pidfile, exit_fifo) = stage_lingering_child(&staging);
+
+        let directory = tempfile::tempdir().expect("owned activation runtime directory");
+        let config_path = directory.path().join("config.yml");
+        let yaml = format!(
+            r#"
+version: 1
+menus:
+  main:
+    bindings:
+      l:
+        label: linger
+        action:
+          type: command:execute
+          program: /bin/sh
+          args:
+            - {script:?}
+          cwd: {cwd:?}
+        settings:
+          execution:
+            mode: detach
+"#,
+            script = script.to_string_lossy(),
+            cwd = staging.path().to_string_lossy(),
+        );
+        std::fs::write(&config_path, &yaml).expect("write linger config");
+
+        let adapter = Arc::new(SmokeAdapter::new());
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<owned activation linger>"),
+            yaml,
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("compile linger config");
+        let broker = Broker::from_compiled(adapter, &config_path, config);
+
+        let runtime = tempfile::tempdir().expect("owned runtime directory");
+        let endpoint =
+            RuntimeEndpoint::in_runtime_dir(runtime.path(), HostKind::Herdr, "owned-fake-host")
+                .expect("derive owned endpoint");
+        let broker_server = BrokerServer::start_activation(
+            Arc::clone(&broker),
+            endpoint.clone(),
+            ActivationBootstrap::Running {
+                current: test_record(),
+            },
+            None,
+        )
+        .await
+        .expect("start owned activation server");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let run_task = tokio::spawn(broker_server.run(shutdown_rx));
+
+        let live_server = broker.live_identity().await.expect("host identity");
+        let client_identity = LiveServerIdentity {
+            host: HostKind::Herdr,
+            discovery_key: "owned-fake-host".to_owned(),
+            server_id: WireServerId::new(live_server.server_id.as_str()),
+        };
+        let mut ui_client = BrokerClient::connect(
+            endpoint.socket(),
+            PeerRole::Ui,
+            "owned-retire-ui",
+            client_identity,
+        )
+        .await
+        .expect("connect UI client");
+        let attached = ui_client
+            .request(ClientRequest::AttachUi(AttachUi {
+                root: muxe_protocol::MenuId::named("main"),
+                pane: HostPaneId::new("owned-ui-pane"),
+                pending_launch: None,
+                origin: None,
+                caller_identity: None,
+                theme: None,
+                color_scheme: None,
+            }))
+            .await
+            .expect("attach UI");
+        let BrokerResponse::UiAttached { session, snapshot } = attached else {
+            panic!("expected UI attached");
+        };
+        let binding = snapshot
+            .menu
+            .menus
+            .iter()
+            .find(|m| m.id == muxe_protocol::MenuId::named("main"))
+            .and_then(|m| m.bindings.first())
+            .expect("linger binding visible");
+        let invoked = ui_client
+            .request(ClientRequest::InvokeBinding(muxe_protocol::InvokeBinding {
+                session: session.clone(),
+                generation: 1,
+                binding: binding.id,
+            }))
+            .await
+            .expect("invoke linger binding");
+        assert!(matches!(
+            invoked,
+            BrokerResponse::InvocationAccepted {
+                disposition: InvocationDisposition::Detached,
+                ..
+            }
+        ));
+
+        // Barrier: the child wrote its announcement; it is now running.
+        let started = startup.await.expect("child signals start");
+        assert_eq!(&started, b"started");
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("child publishes its pid")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        let child = nix::unistd::Pid::from_raw(pid);
+        assert!(
+            nix::sys::signal::kill(child, None).is_ok(),
+            "child alive while running"
+        );
+
+        // Terminal host loss — no coordinator, no Retire RPC: the monitor
+        // signal alone must retire this broker.
+        broker
+            .handle_health_event(AdapterHealthEvent::HostLost {
+                identity: HostIdentity {
+                    kind: muxe_adapter_api::HostKind::Herdr,
+                    discovery_key: "owned-fake-host".to_owned(),
+                    live_server_id: "owned-fake-server".to_owned(),
+                },
+                error: AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Herdr host did not recover within the bounded reconnect grace",
+                ),
+            })
+            .await;
+
+        // The ready UI observes retirement before the connection closes. The
+        // terminal path broadcasts AdapterHealthChanged(false) before the
+        // drain emits BrokerRetiring, so skip health events until retiring.
+        let _event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ui_client.next_event().await {
+                    Ok(BrokerEvent::BrokerRetiring) => break,
+                    Ok(_) => continue,
+                    Err(error) => panic!("ready UI receives the retirement event: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("host loss emits a UI event within bound");
+
+        // The endpoint is unlinked while the child keeps running under GenericSupervisor.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while endpoint.socket().exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("host loss unlinks the endpoint");
+
+        assert!(
+            !run_task.is_finished(),
+            "the service stays supervisor-only while the child runs"
+        );
+        assert!(
+            broker.has_supervised_children().await,
+            "GenericSupervisor retains the detached child across host-loss retirement"
         );
         assert!(
             nix::sys::signal::kill(child, None).is_ok(),

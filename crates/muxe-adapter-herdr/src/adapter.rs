@@ -35,6 +35,9 @@ use crate::{
 
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_RETRY: Duration = Duration::from_secs(1);
+/// Ten seconds covers a normal Herdr restart while ensuring a permanently lost host
+/// reaches the broker's terminal lifecycle path instead of retrying forever.
+const HOST_LOSS_GRACE: Duration = Duration::from_secs(10);
 
 pub struct HerdrAdapter {
     runtime: RwLock<Arc<HerdrRuntime>>,
@@ -2082,6 +2085,16 @@ async fn monitor_subscription(adapter: Arc<HerdrAdapter>, mut subscription: Even
         match reconnect_subscription(&adapter, &mut subscription).await {
             ReconnectOutcome::Reconnected | ReconnectOutcome::SuspendRequested => {}
             ReconnectOutcome::Stop => return,
+            ReconnectOutcome::HostLost(error) => {
+                let _ = adapter
+                    .events_tx
+                    .send(AdapterHealthEvent::HostLost {
+                        identity: adapter.identity(),
+                        error,
+                    })
+                    .await;
+                return;
+            }
         }
     }
 }
@@ -2094,12 +2107,17 @@ enum ReconnectOutcome {
     Stop,
     /// Suspend was requested; the caller drops the old stream, acks, and parks.
     SuspendRequested,
+    /// The host did not recover within the bounded grace.
+    HostLost(AdapterError),
 }
 
 async fn reconnect_subscription(
     adapter: &Arc<HerdrAdapter>,
     subscription: &mut EventSubscription,
 ) -> ReconnectOutcome {
+    let deadline = tokio::time::Instant::now() + HOST_LOSS_GRACE;
+    let mut last_error = None;
+
     loop {
         if adapter.shutdown.load(Ordering::Relaxed) {
             return ReconnectOutcome::Stop;
@@ -2107,38 +2125,43 @@ async fn reconnect_subscription(
         if adapter.suspended.load(Ordering::SeqCst) {
             return ReconnectOutcome::SuspendRequested;
         }
-        let refreshed = tokio::select! {
-            refreshed = HerdrRuntime::connect(adapter.config.clone()) => Some(refreshed),
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt = tokio::select! {
+            attempt = tokio::time::timeout(remaining, reconnect_attempt(adapter)) => Some(attempt),
             () = adapter.suspend_wake.notified() => None,
         };
         // A suspend wake re-checks the flag at the loop head so the old stream
-        // is dropped and acked promptly. Dropping the connect future kills only
+        // is dropped and acked promptly. Dropping the attempt future kills only
         // the owned schema child via `kill_on_drop`; no global cleanup runs.
-        let Some(refreshed) = refreshed else {
+        let Some(attempt) = attempt else {
             continue;
         };
-        let Ok(refreshed) = refreshed else {
-            if !interruptible_sleep(adapter).await {
+        let Ok(attempt) = attempt else {
+            last_error = Some(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Herdr reconnect attempt exceeded the host-loss grace",
+            ));
+            break;
+        };
+        let Ok((refreshed, next_subscription)) = attempt else {
+            last_error = attempt.err();
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                break;
+            }
+            if !interruptible_sleep(adapter, RECONNECT_RETRY.min(remaining)).await {
                 return ReconnectOutcome::Stop;
             }
             continue;
         };
         let refreshed = Arc::new(refreshed);
-        let reconnected = tokio::select! {
-            reconnected = EventSubscription::connect(refreshed.client(), subscription_config()) => {
-                Some(reconnected)
-            }
-            () = adapter.suspend_wake.notified() => None,
-        };
-        let Some(reconnected) = reconnected else {
-            continue;
-        };
-        let Ok((next_subscription, _)) = reconnected else {
-            if !interruptible_sleep(adapter).await {
-                return ReconnectOutcome::Stop;
-            }
-            continue;
-        };
         // Endpoint metadata is diagnostic observation only. A new subscription plus this
         // monotonically increasing local epoch is the sole authority after continuity loss:
         // no equal device/inode/peer/version observation can revive stale origins.
@@ -2182,13 +2205,31 @@ async fn reconnect_subscription(
         *subscription = next_subscription;
         return ReconnectOutcome::Reconnected;
     }
+
+    ReconnectOutcome::HostLost(last_error.unwrap_or_else(|| {
+        AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            "Herdr host did not recover within the bounded reconnect grace",
+        )
+    }))
+}
+
+async fn reconnect_attempt(
+    adapter: &Arc<HerdrAdapter>,
+) -> Result<(HerdrRuntime, EventSubscription), AdapterError> {
+    let refreshed = HerdrRuntime::connect(adapter.config.clone()).await?;
+    let (next_subscription, _) =
+        EventSubscription::connect(refreshed.client(), subscription_config())
+            .await
+            .map_err(|error| socket_error(&error))?;
+    Ok((refreshed, next_subscription))
 }
 
 /// Sleeps between reconnect attempts. Returns false only for terminal shutdown;
 /// a suspend wake returns true so the caller re-checks the suspend flag promptly.
-async fn interruptible_sleep(adapter: &Arc<HerdrAdapter>) -> bool {
+async fn interruptible_sleep(adapter: &Arc<HerdrAdapter>, delay: Duration) -> bool {
     tokio::select! {
-        () = tokio::time::sleep(RECONNECT_RETRY) => true,
+        () = tokio::time::sleep(delay) => true,
         () = adapter.suspend_wake.notified() => !adapter.shutdown.load(Ordering::Relaxed),
     }
 }
