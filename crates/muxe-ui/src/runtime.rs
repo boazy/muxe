@@ -12,7 +12,7 @@ use muxe_protocol::{
     ConditionEvaluationErrorWire, ExecutionId as WireExecutionId, ExecutionOutcome, MenuControl,
     PagesContextWire, ProtocolDiagnostic, evaluate_archived_binding_state,
 };
-use ratatui::layout::Rect;
+use ratatui::{layout::Rect, style::Style as RatatuiStyle};
 use thiserror::Error;
 use unicode_width::UnicodeWidthStr;
 
@@ -51,6 +51,7 @@ pub enum InvocationDisposition {
 /// A fully rendered page derived from one checked archived attachment.
 pub struct PreparedMenu {
     pub title: String,
+    pub title_style: RatatuiStyle,
     pub breadcrumbs: RenderedText,
     pub padding: SurfacePadding,
     pub plan: GridPlan,
@@ -66,6 +67,7 @@ impl PreparedMenu {
     pub fn surface_frame(&self) -> SurfaceFrame<'_> {
         SurfaceFrame {
             title: &self.title,
+            title_style: self.title_style,
             breadcrumb: &self.breadcrumbs,
             padding: self.padding,
             plan: &self.plan,
@@ -880,6 +882,7 @@ impl UiRuntime {
                     return Ok((
                         PreparedMenu {
                             title,
+                            title_style: self.renderer.title_style(),
                             breadcrumbs,
                             padding,
                             plan,
@@ -2927,7 +2930,6 @@ pub(crate) mod tests {
             "Root"
         );
     }
-
     #[test]
     fn prepared_breadcrumb_preserves_current_menu_under_tight_width() {
         let mut runtime = UiRuntime::attach(archived_attachment()).expect("archive attaches");
@@ -2951,6 +2953,23 @@ pub(crate) mod tests {
             !prepared.breadcrumbs.plain.contains("Root"),
             "leading crumbs must be removed when the budget is tight: {:?}",
             prepared.breadcrumbs.plain
+        );
+    }
+
+    #[test]
+    fn resolved_title_style_reaches_surface_frame() {
+        let mut runtime = UiRuntime::attach(archived_attachment()).expect("archive attaches");
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("root renders");
+        let frame = prepared.surface_frame();
+        assert_eq!(frame.title, "Root");
+        assert!(
+            frame
+                .title_style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "configured menu title style must reach the surface frame"
         );
     }
     #[test]

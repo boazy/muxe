@@ -158,6 +158,12 @@ impl TemplateRenderer {
         )
     }
 
+    /// Returns the resolved `title` style, falling back to ratatui's default style when absent.
+    #[must_use]
+    pub(crate) fn title_style(&self) -> RatatuiStyle {
+        self.styles.get("title").copied().unwrap_or_default()
+    }
+
     fn from_sources<'a>(
         template_source: impl Fn(&str) -> Option<&'a str>,
         styles: BTreeMap<String, RatatuiStyle>,

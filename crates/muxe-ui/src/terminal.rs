@@ -310,6 +310,7 @@ pub struct SurfacePadding {
 #[derive(Clone, Copy)]
 pub struct SurfaceFrame<'a> {
     pub title: &'a str,
+    pub title_style: ratatui::style::Style,
     pub breadcrumb: &'a RenderedText,
     pub padding: SurfacePadding,
     pub plan: &'a GridPlan,
@@ -619,12 +620,12 @@ impl<W: Write> TerminalSurface<W> {
 
 /// Renders the title row, breadcrumb spans, and [`MenuGrid`] body into the current frame.
 ///
-/// The runtime owns the title-derived breadcrumb budget and passes a suffix-fitted
-/// [`RenderedText`]; this surface only renders the supplied spans and leaves their styles intact.
-/// The title keeps its historical default styling (`SurfaceFrame.title` is plain text; a
-/// configured title style is a separate finding), while the breadcrumb already carries span
-/// styles through `write_rendered`, and the grid cells carry theirs through [`MenuGrid`].
-/// Geometry matches the previous hand-written path so callers and layout keep the same areas.
+/// The title uses its resolved `SurfaceFrame.title_style`, while the breadcrumb separator remains
+/// plain and breadcrumb spans carry their own styles through `write_rendered`; grid cells carry
+/// theirs through [`MenuGrid`]. The runtime owns the title-derived breadcrumb budget and passes a
+/// suffix-fitted [`RenderedText`]; this surface only renders the supplied spans and leaves their
+/// styles intact. Geometry matches the previous hand-written path so callers and layout keep the
+/// same areas.
 fn render_surface(frame_context: &mut ratatui::Frame<'_>, frame: SurfaceFrame<'_>, area: Rect) {
     let buffer = frame_context.buffer_mut();
     buffer.set_stringn(
@@ -632,7 +633,7 @@ fn render_surface(frame_context: &mut ratatui::Frame<'_>, frame: SurfaceFrame<'_
         area.y,
         frame.title,
         area.width as usize,
-        ratatui::style::Style::default(),
+        frame.title_style,
     );
     let title_width =
         u16::try_from(UnicodeWidthStr::width(frame.title).min(usize::from(area.width)))
@@ -893,6 +894,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "Child",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1065,7 +1067,10 @@ mod tests {
         );
         let unstyled = styled_cell("cd", RatatuiStyle::default());
         let frame = SurfaceFrame {
-            title: "",
+            title: "T",
+            title_style: RatatuiStyle::default()
+                .fg(RatatuiColor::Green)
+                .add_modifier(Modifier::BOLD),
             breadcrumb: &breadcrumb,
             padding: SurfacePadding::default(),
             plan: &plan,
@@ -1083,6 +1088,10 @@ mod tests {
             .writer_mut()
             .clone();
         let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text[..text.find('T').expect("styled title emitted")].contains("\x1b[38;5;2"),
+            "title style must precede its bytes"
+        );
         assert!(text.contains("\x1b[1m"), "bold SGR missing in {text:?}");
         assert!(
             text.contains("\x1b[38;5;1"),
@@ -1141,6 +1150,7 @@ mod tests {
         let wide = styled_cell("あa", ratatui::style::Style::default());
         let frame = SurfaceFrame {
             title: "",
+            title_style: ratatui::style::Style::default(),
             breadcrumb: &breadcrumb,
             padding: SurfacePadding::default(),
             plan: &plan,
@@ -1203,6 +1213,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1246,6 +1257,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &narrow_plan,
@@ -1313,6 +1325,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1336,6 +1349,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1410,6 +1424,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1434,6 +1449,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1482,6 +1498,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1501,6 +1518,7 @@ mod tests {
         let error = surface.render(
             SurfaceFrame {
                 title: "",
+                title_style: ratatui::style::Style::default(),
                 breadcrumb: &breadcrumb,
                 padding: SurfacePadding::default(),
                 plan: &grown_plan,
@@ -1549,6 +1567,7 @@ mod tests {
         let error = surface.render(
             SurfaceFrame {
                 title: "",
+                title_style: ratatui::style::Style::default(),
                 breadcrumb: &breadcrumb,
                 padding: SurfacePadding::default(),
                 plan: &plan,
@@ -1612,6 +1631,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1636,6 +1656,7 @@ mod tests {
             .render(
                 SurfaceFrame {
                     title: "",
+                    title_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
