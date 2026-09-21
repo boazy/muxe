@@ -619,6 +619,8 @@ impl<W: Write> TerminalSurface<W> {
 
 /// Renders the title row, breadcrumb spans, and [`MenuGrid`] body into the current frame.
 ///
+/// The runtime owns the title-derived breadcrumb budget and passes a suffix-fitted
+/// [`RenderedText`]; this surface only renders the supplied spans and leaves their styles intact.
 /// The title keeps its historical default styling (`SurfaceFrame.title` is plain text; a
 /// configured title style is a separate finding), while the breadcrumb already carries span
 /// styles through `write_rendered`, and the grid cells carry theirs through [`MenuGrid`].
@@ -693,10 +695,10 @@ mod tests {
         time::Duration,
     };
 
-    use muxe_core::{KeyIdentity, NamedKey};
-    use muxe_terminal_input::ProtocolResponse;
+    use muxe_core::{KeyIdentity, NamedKey, compiled_default_theme};
 
     use super::*;
+    use crate::TemplateRenderer;
 
     static BYTE_CAPTURE: Mutex<()> = Mutex::new(());
 
@@ -869,6 +871,55 @@ mod tests {
             plain: String::new(),
             spans: Vec::new(),
         }
+    }
+
+    #[test]
+    fn narrow_surface_keeps_the_current_breadcrumb_tail() {
+        let _byte_capture = BYTE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let theme = compiled_default_theme();
+        let renderer = TemplateRenderer::new(&theme).expect("default theme compiles");
+        let crumbs = ["Root", "Section", "Child"];
+        let breadcrumb = crate::runtime::render_breadcrumbs_to_width(&renderer, &crumbs, 10)
+            .expect("breadcrumb suffix renders");
+        assert_eq!(breadcrumb.plain, "… › Child");
+
+        let area = Rect::new(0, 0, 17, 2);
+        let plan = single_cell_plan(area.width);
+        let output = Vec::new();
+        let mut surface = TerminalSurface::for_test(output, area).expect("test surface");
+        surface
+            .render(
+                SurfaceFrame {
+                    title: "Child",
+                    breadcrumb: &breadcrumb,
+                    padding: SurfacePadding::default(),
+                    plan: &plan,
+                    cells: &[],
+                    page: 0,
+                    pager: None,
+                    status: None,
+                },
+                area,
+            )
+            .expect("narrow render succeeds");
+        let bytes = surface
+            .terminal
+            .as_mut()
+            .expect("terminal stored")
+            .backend_mut()
+            .writer_mut()
+            .clone();
+        let visible = strip_escapes(&bytes);
+        assert!(
+            visible.contains("…›Child"),
+            "surface must show the prepared breadcrumb suffix: {visible:?}"
+        );
+        assert!(
+            !visible.contains("Root"),
+            "leading crumbs must not reappear in a narrow surface: {visible:?}"
+        );
     }
 
     #[derive(Debug)]

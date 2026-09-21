@@ -63,6 +63,8 @@ pub(crate) fn write_rendered(
     width: u16,
     rendered: &RenderedText,
 ) {
+    // Runtime owns component width and breadcrumb suffix selection; this writer only paints the
+    // spans it receives left-to-right and must not reorder them to recover clipped tails.
     let right = x.saturating_add(width);
     for span in &rendered.spans {
         if x >= right {

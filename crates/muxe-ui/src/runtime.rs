@@ -819,6 +819,15 @@ impl UiRuntime {
                 top: menu.layout.padding.top.to_native(),
                 bottom: menu.layout.padding.bottom.to_native(),
             };
+            let title = menu
+                .title
+                .as_ref()
+                .map(|title| sanitize_single_line(title.as_str()))
+                .unwrap_or_default();
+            // Width ownership stays here: reserve the title and delimiter, then trim leading
+            // crumbs before SurfaceFrame reaches the terminal. Terminal/widget only render the
+            // spans they receive, so right-edge clipping cannot discard the current-menu tail.
+            let breadcrumb_width = available_breadcrumb_width(area.width, &title);
             let grid = grid_rect(area, padding, reserve_status);
             let max_title_width = menu.layout.max_item_title_length.to_native() as usize;
             let mut count = last_page_count.max(1);
@@ -852,8 +861,12 @@ impl UiRuntime {
                 let next_count = plan.page_count.max(1);
                 let next_page = page.min(next_count.saturating_sub(1));
                 if next_count == count && next_page == page {
-                    let (breadcrumbs, degraded_crumbs) =
-                        render_breadcrumbs_or_fallback(&self.renderer, attachment, stack);
+                    let (breadcrumbs, degraded_crumbs) = render_breadcrumbs_or_fallback(
+                        &self.renderer,
+                        attachment,
+                        stack,
+                        breadcrumb_width,
+                    );
                     let (pager_text, degraded_pager) = render_pager_or_fallback(
                         &self.renderer,
                         menu,
@@ -866,11 +879,7 @@ impl UiRuntime {
                     degraded.extend(degraded_pager);
                     return Ok((
                         PreparedMenu {
-                            title: menu
-                                .title
-                                .as_ref()
-                                .map(|title| sanitize_single_line(title.as_str()))
-                                .unwrap_or_default(),
+                            title,
                             breadcrumbs,
                             padding,
                             plan,
@@ -1110,13 +1119,13 @@ fn render_visible_cells(
 }
 
 /// Renders breadcrumbs, degrading to the plain crumb titles when the
-/// load-valid template fails evaluation. The fallback joins the already-known
-/// menu titles without template evaluation, and the failure is reported
-/// through the centralized error status by the caller.
+/// load-valid template fails evaluation. The runtime owns the available width:
+/// it re-renders a suffix with an ellipsis before handing spans to the terminal.
 fn render_breadcrumbs_or_fallback(
     renderer: &TemplateRenderer,
     attachment: &muxe_protocol::ArchivedUiAttachmentWire,
     stack: &[CoreMenuId],
+    available_width: usize,
 ) -> (RenderedText, Option<DegradedComponent>) {
     let crumbs = stack
         .iter()
@@ -1133,13 +1142,62 @@ fn render_breadcrumbs_or_fallback(
                 .map(rkyv::string::ArchivedString::as_str)
         })
         .collect::<Vec<_>>();
-    match renderer.render_breadcrumbs(BreadcrumbTemplate { crumbs: &crumbs }) {
+    match render_breadcrumbs_to_width(renderer, &crumbs, available_width) {
         Ok(breadcrumb_output) => (breadcrumb_output, None),
         Err(error) => {
-            let fallback = RenderedText::plain_fallback(&crumbs.join(" › "));
+            let selected = select_breadcrumb_tail(&crumbs, available_width);
+            let fallback = RenderedText::plain_fallback(&selected.join(" › "));
             (fallback, Some(("breadcrumbs", error)))
         }
     }
+}
+
+pub(crate) fn render_breadcrumbs_to_width(
+    renderer: &TemplateRenderer,
+    crumbs: &[&str],
+    available_width: usize,
+) -> Result<RenderedText, TemplateError> {
+    let full = renderer.render_breadcrumbs(BreadcrumbTemplate { crumbs })?;
+    if crumbs.len() < 2 || UnicodeWidthStr::width(full.plain.as_str()) <= available_width {
+        return Ok(full);
+    }
+    for start in 1..crumbs.len() {
+        let mut candidate = Vec::with_capacity(crumbs.len() - start + 1);
+        candidate.push("…");
+        candidate.extend_from_slice(&crumbs[start..]);
+        let candidate_output =
+            renderer.render_breadcrumbs(BreadcrumbTemplate { crumbs: &candidate })?;
+        if UnicodeWidthStr::width(candidate_output.plain.as_str()) <= available_width {
+            return Ok(candidate_output);
+        }
+    }
+    renderer.render_breadcrumbs(BreadcrumbTemplate {
+        crumbs: &crumbs[crumbs.len() - 1..],
+    })
+}
+
+fn select_breadcrumb_tail(crumbs: &[&str], available_width: usize) -> Vec<String> {
+    let full = crumbs.join(" › ");
+    if UnicodeWidthStr::width(full.as_str()) <= available_width {
+        return crumbs.iter().map(|crumb| (*crumb).to_owned()).collect();
+    }
+    for start in 1..crumbs.len() {
+        let mut candidate = Vec::with_capacity(crumbs.len() - start + 1);
+        candidate.push("…".to_owned());
+        candidate.extend(crumbs[start..].iter().map(|crumb| (*crumb).to_owned()));
+        if UnicodeWidthStr::width(candidate.join(" › ").as_str()) <= available_width {
+            return candidate;
+        }
+    }
+    crumbs
+        .last()
+        .map_or_else(Vec::new, |crumb| vec![(*crumb).to_owned()])
+}
+
+/// Computes the width left after the title and its `: ` separator.
+fn available_breadcrumb_width(area_width: u16, title: &str) -> usize {
+    let title_width = UnicodeWidthStr::width(title).min(usize::from(area_width));
+    usize::from(area_width).saturating_sub(title_width.saturating_add(2))
 }
 /// Renders the pager, degrading to plain `current/count` text when the
 /// load-valid template fails evaluation. The fallback uses the already-known
@@ -2867,6 +2925,32 @@ pub(crate) mod tests {
                 .expect("root rerenders")
                 .title,
             "Root"
+        );
+    }
+
+    #[test]
+    fn prepared_breadcrumb_preserves_current_menu_under_tight_width() {
+        let mut runtime = UiRuntime::attach(archived_attachment()).expect("archive attaches");
+        assert_eq!(
+            runtime.handle_input(&press('n')).expect("open is local"),
+            UiCommand::Redraw
+        );
+
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 17, 8))
+            .expect("tight surface still prepares");
+
+        assert_eq!(prepared.title, "Child");
+        assert_eq!(prepared.breadcrumbs.plain, "… › Child");
+        assert!(
+            prepared.breadcrumbs.plain.ends_with("Child"),
+            "the prepared breadcrumb must retain the current menu: {:?}",
+            prepared.breadcrumbs.plain
+        );
+        assert!(
+            !prepared.breadcrumbs.plain.contains("Root"),
+            "leading crumbs must be removed when the budget is tight: {:?}",
+            prepared.breadcrumbs.plain
         );
     }
     #[test]
