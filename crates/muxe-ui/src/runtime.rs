@@ -374,8 +374,18 @@ impl UiRuntime {
         input: &ConvertedInput,
         at: SessionInstant,
     ) -> Result<UiCommand, UiError> {
-        let ConvertedInput::Key(input) = input else {
-            return Ok(UiCommand::Ignored);
+        let input = match input {
+            ConvertedInput::Key(input) => input,
+            ConvertedInput::Unknown(_) => {
+                let output = self.menu_session.handle(MenuSessionEvent::Key {
+                    at,
+                    input: MenuSessionInput::Unknown,
+                });
+                return Ok(self.menu_output(output.as_ref()));
+            }
+            ConvertedInput::ProtocolResponse(_) | ConvertedInput::Malformed(_) => {
+                return Ok(UiCommand::Ignored);
+            }
         };
         if input.event.kind == EventKind::Release {
             let output = self.menu_session.handle(MenuSessionEvent::Key {
@@ -1309,7 +1319,7 @@ pub(crate) mod tests {
     };
     use muxe_terminal_input::{
         EventKind as RawEventKind, InputEvent, KeyIdentity as RawKeyIdentity, LockState,
-        Modifiers as RawModifiers, Parser, RawKeyEvent,
+        Modifiers as RawModifiers, Parser, ProtocolResponse, RawKeyEvent,
     };
 
     use super::*;
@@ -1804,7 +1814,54 @@ pub(crate) mod tests {
 
     #[test]
     fn unknown_input_resets_inactivity_before_the_session_dismisses() {
-        let mut runtime = UiRuntime::attach_at(
+        let mut unknown_runtime = UiRuntime::attach_at(
+            profiled_attachment_with_timeout(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![binding(1, "a", "A", BindingConditionsWire::default(), None)],
+                Some(10),
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+
+        assert_eq!(
+            unknown_runtime
+                .handle_input_at(&parsed_input(b"\x1b[>1u"), at(9))
+                .expect("well-formed unsupported input is swallowed"),
+            UiCommand::Ignored
+        );
+        assert_eq!(unknown_runtime.inactivity_deadline(), Some(at(19)));
+        // The reset keeps the menu alive at the original deadline; the inclusive
+        // core timer dismisses at the new deadline.
+        assert_eq!(unknown_runtime.tick(at(10)), UiCommand::Ignored);
+        assert_eq!(unknown_runtime.tick(at(19)), UiCommand::Detach);
+
+        let mut printable_runtime = UiRuntime::attach_at(
+            profiled_attachment_with_timeout(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                vec![binding(1, "a", "A", BindingConditionsWire::default(), None)],
+                Some(10),
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+        assert_eq!(
+            printable_runtime
+                .handle_input_at(&press('x'), at(9))
+                .expect("unmatched printable input is swallowed"),
+            UiCommand::Ignored
+        );
+        assert_eq!(printable_runtime.tick(at(10)), UiCommand::Ignored);
+        assert_eq!(printable_runtime.tick(at(19)), UiCommand::Detach);
+    }
+
+    #[test]
+    fn malformed_input_and_protocol_responses_do_not_reset_inactivity() {
+        let mut malformed_runtime = UiRuntime::attach_at(
             profiled_attachment_with_timeout(
                 KeyboardProfileWire::Vt100 {
                     escape_timeout_millis: 25,
@@ -1815,16 +1872,35 @@ pub(crate) mod tests {
             at(0),
         )
         .expect("attachment attaches");
-
         assert_eq!(
-            runtime
-                .handle_input_at(&press('x'), at(9))
-                .expect("unknown input is swallowed"),
+            malformed_runtime
+                .handle_input_at(&parsed_input(b"\x1b[55296u"), at(9))
+                .expect("malformed input is ignored"),
             UiCommand::Ignored
         );
-        assert_eq!(runtime.tick(at(10)), UiCommand::Ignored);
-        assert_eq!(runtime.tick(at(18)), UiCommand::Ignored);
-        assert_eq!(runtime.tick(at(19)), UiCommand::Detach);
+        assert_eq!(malformed_runtime.tick(at(10)), UiCommand::Detach);
+
+        let mut protocol_runtime = UiRuntime::attach_at(
+            profiled_attachment_with_timeout(
+                KeyboardProfileWire::Vt100 {
+                    escape_timeout_millis: 25,
+                },
+                Vec::new(),
+                Some(10),
+            ),
+            at(0),
+        )
+        .expect("attachment attaches");
+        assert_eq!(
+            protocol_runtime
+                .handle_input_at(
+                    &ConvertedInput::ProtocolResponse(ProtocolResponse::KittyKeyboardFlags(0),),
+                    at(9),
+                )
+                .expect("protocol response is ignored"),
+            UiCommand::Ignored
+        );
+        assert_eq!(protocol_runtime.tick(at(10)), UiCommand::Detach);
     }
 
     #[test]

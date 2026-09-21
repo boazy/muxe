@@ -1,7 +1,8 @@
 use muxe_core::{EventKind, KeyEvent, KeyIdentity, LockModifiers, Modifiers, NamedKey};
 use muxe_terminal_input::{
     EventKind as RawEventKind, FunctionalKey, InputEvent, KeyIdentity as RawKeyIdentity, KeypadKey,
-    MediaKey, ModifierKey, Modifiers as RawModifiers, ProtocolResponse, RawKeyEvent,
+    MalformedInput, MediaKey, ModifierKey, Modifiers as RawModifiers, ProtocolResponse,
+    RawKeyEvent, UnknownSequence,
 };
 
 /// A parsed input result after its representable identities have been converted for core matching.
@@ -9,7 +10,10 @@ use muxe_terminal_input::{
 pub enum ConvertedInput {
     Key(ConvertedKeyEvent),
     ProtocolResponse(ProtocolResponse),
-    Unknown,
+    /// A syntactically complete terminal sequence that is not a supported key.
+    Unknown(UnknownSequence),
+    /// Malformed or undecodable input, which is ignored for UI activity.
+    Malformed(MalformedInput),
 }
 
 /// A raw event and its core matching projection.
@@ -52,7 +56,8 @@ pub fn convert_input(input: InputEvent) -> ConvertedInput {
             raw,
         }),
         InputEvent::ProtocolResponse(response) => ConvertedInput::ProtocolResponse(response),
-        InputEvent::Unknown(_) | InputEvent::Malformed(_) => ConvertedInput::Unknown,
+        InputEvent::Unknown(sequence) => ConvertedInput::Unknown(sequence),
+        InputEvent::Malformed(input) => ConvertedInput::Malformed(input),
     }
 }
 
@@ -191,7 +196,8 @@ fn convert_event_kind(kind: RawEventKind) -> EventKind {
 mod tests {
     use super::*;
     use muxe_terminal_input::{
-        EventKind as RawEventKind, KeyIdentity as RawKeyIdentity, LockState, Parser,
+        EventKind as RawEventKind, KeyIdentity as RawKeyIdentity, LockState, MalformedReason,
+        Parser, SequenceClass,
     };
 
     #[test]
@@ -245,6 +251,29 @@ mod tests {
         assert_eq!(converted.event.primary, None);
         assert_eq!(converted.event.alternate, None);
         assert_eq!(converted.event.base_layout, None);
+    }
+
+    #[test]
+    fn conversion_distinguishes_unsupported_and_malformed_input() {
+        let unknown = UnknownSequence {
+            class: SequenceClass::Csi,
+            final_byte: b'u',
+            parameter_bytes: 1,
+        };
+        assert_eq!(
+            convert_input(InputEvent::Unknown(unknown)),
+            ConvertedInput::Unknown(unknown)
+        );
+
+        let malformed = MalformedInput {
+            class: SequenceClass::Csi,
+            reason: MalformedReason::InvalidScalar,
+            observed_bytes: 5,
+        };
+        assert_eq!(
+            convert_input(InputEvent::Malformed(malformed)),
+            ConvertedInput::Malformed(malformed)
+        );
     }
 
     #[test]
