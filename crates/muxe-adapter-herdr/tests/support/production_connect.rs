@@ -4,20 +4,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use muxe_adapter_api::{HostIdentity, HostKind};
-use muxe_adapter_herdr::{EndpointIdentity, HerdrAdapterConfig, generated::BUNDLED_PROTOCOL};
+use muxe_adapter_herdr::{HerdrAdapterConfig, generated::BUNDLED_PROTOCOL};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::net::UnixStream;
 
 use super::recorded_socket::{RecordedExchange, RecordedResponse, RecordedUnixServer};
 
 /// A fake-native vertical fixture for the production Herdr connection path.
 ///
-/// It owns a concrete executable that accepts only `herdr api schema --json`, a Unix socket
-/// recording `system.ping`, the raw endpoint probe, and a retained `events.subscribe` stream.
-/// It never starts or contacts a real Herdr host, and callers must create the adapter through
-/// `HerdrAdapter::connect(fixture.adapter_config())` rather than injecting internal parts.
+/// It owns a concrete executable that accepts only `herdr api schema --json`
+/// and a Unix socket recording the establishing `ping` plus retained
+/// `events.subscribe` stream. It never starts or contacts a real Herdr host,
+/// and callers must create the adapter through
+/// `HerdrAdapter::connect(fixture.adapter_config())` rather than injecting
+/// internal parts.
 pub struct ProductionConnectFixture {
     _schema_temp: TempDir,
     schema_binary: PathBuf,
@@ -31,10 +31,11 @@ impl ProductionConnectFixture {
         Self::start_scripted(Self::initial_handshake())
     }
 
-    /// Starts a production `HerdrAdapter::connect` fixture followed by exact additional RPC
-    /// exchanges. Every `ping` exchange is followed by the raw endpoint-probe connection made by
-    /// `HerdrRuntime::connect`; `KeepOpen` subscriptions can be closed with
-    /// [`Self::lose_retained_subscriptions`] to drive a reconnect.
+    /// Starts a production `HerdrAdapter::connect` fixture followed by exact
+    /// additional RPC exchanges. Each establishing ping now returns the
+    /// endpoint token captured from that same stream; `KeepOpen` subscriptions
+    /// can be closed with [`Self::lose_retained_subscriptions`] to drive a
+    /// reconnect.
     pub fn start_scripted(exchanges: Vec<RecordedExchange>) -> io::Result<Self> {
         let schema: Value = serde_json::from_str(include_str!(
             "../../../../fixtures/herdr/herdr-api.schema.json"
@@ -43,8 +44,8 @@ impl ProductionConnectFixture {
         Self::start_scripted_with_schema(exchanges, &schema)
     }
 
-    /// Uses an injected complete runtime schema document while retaining the same concrete schema
-    /// child executable, Unix transport, endpoint probe, and exact request recording.
+    /// Uses an injected complete runtime schema document while retaining the
+    /// same concrete schema child, Unix transport, and exact request recording.
     pub fn start_scripted_with_schema(
         exchanges: Vec<RecordedExchange>,
         schema: &Value,
@@ -58,8 +59,7 @@ impl ProductionConnectFixture {
             "#!/bin/sh\nif [ \"$1\" != api ] || [ \"$2\" != schema ] || [ \"$3\" != --json ] || [ \"$#\" != 3 ]; then\n  exit 64\nfi\nexec cat \"$(dirname \"$0\")/schema.json\"\n",
         )?;
         std::fs::set_permissions(&schema_binary, std::fs::Permissions::from_mode(0o700))?;
-        let server =
-            RecordedUnixServer::start_with_endpoint_probe(tempfile::tempdir()?, exchanges)?;
+        let server = RecordedUnixServer::start(tempfile::tempdir()?, exchanges)?;
         let cache_dir = schema_temp.path().join("cache");
         Ok(Self {
             _schema_temp: schema_temp,
@@ -69,8 +69,9 @@ impl ProductionConnectFixture {
         })
     }
 
-    /// The exact initial `HerdrAdapter::connect` transport sequence after its schema child:
-    /// one ping, raw endpoint probe, and one retained tab-focus and pane-close subscription.
+    /// The exact initial `HerdrAdapter::connect` transport sequence after its
+    /// schema child: one establishing ping and one retained tab-focus and
+    /// pane-close subscription.
     pub fn initial_handshake() -> Vec<RecordedExchange> {
         vec![Self::ping_exchange(), Self::subscription_exchange()]
     }
@@ -126,26 +127,6 @@ impl ProductionConnectFixture {
 
     pub fn socket(&self) -> &Path {
         self.server.socket()
-    }
-
-    /// Captures the same raw OS host identity that the adapter reports after its production
-    /// handshake. It is valid only after `HerdrAdapter::connect` has completed, so it cannot
-    /// steal the scripted ping or endpoint-probe connections.
-    pub async fn raw_identity(&self) -> io::Result<HostIdentity> {
-        let stream = UnixStream::connect(self.server.socket()).await?;
-        let endpoint = EndpointIdentity::capture(self.server.socket(), &stream)?;
-        drop(stream);
-        Ok(HostIdentity {
-            kind: HostKind::Herdr,
-            discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
-                self.server.socket().display().to_string(),
-            )
-            .expect("validated host discovery key"),
-            live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
-                endpoint.live_server_id(BUNDLED_PROTOCOL, "0.8.2"),
-            )
-            .expect("validated live server incarnation"),
-        })
     }
 
     pub async fn requests(&self) -> Vec<Value> {

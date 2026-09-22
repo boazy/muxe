@@ -32,15 +32,13 @@ pub use launch::{
     move_prepared_ui_pane, open_command_pane, open_command_tab, pane_by_id, pane_by_identity,
     prepare_ui_pane,
 };
-pub use runtime::{HerdrAdapterConfig, HerdrRuntime, probe_endpoint_identity, probe_live_identity};
+pub use runtime::{HerdrAdapterConfig, HerdrRuntime, HerdrServerVersion};
 pub use schema::{
     ApiSchema, MethodSchema, VALIDATOR_FORMAT_VERSION, ValidationCode, ValidationError,
     canonical_request_bytes_for_test as schema_canonical_request_bytes_for_test,
 };
 pub use subscription::{EventSubscription, SubscriptionConfig, SubscriptionEvent};
-pub use transport::{
-    DeliveryState, EndpointIdentity, HerdrResponse, HerdrSocketClient, PeerIdentity, SocketError,
-};
+pub use transport::{DeliveryState, HerdrResponse, SocketError};
 pub use validation::{CandidateValidationError, fields_to_json, validate_candidate};
 
 /// Extracts the typed `pane.get` payload from Herdr's success envelope.

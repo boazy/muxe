@@ -325,7 +325,11 @@ async fn bring_hosts(
 
     let continuity = ContinuityGuard::watch_herdr(
         &format!("{case}-herdr"),
-        herdr.socket().to_path_buf(),
+        muxe_adapter_herdr::HerdrAdapterConfig {
+            socket_path: herdr.socket().to_path_buf(),
+            herdr_binary: herdr_binary.to_path_buf(),
+            cache_dir: cache_dir.clone(),
+        },
         discovery.clone(),
     )
     .await?;
@@ -1219,12 +1223,9 @@ async fn prepare_herdr_menu_origin(
         })
         .await
         .map_err(|error| io::Error::other(format!("smoke: connect Herdr runtime: {error}")))?;
-    let workspace_method = muxe_adapter_herdr::generated::method_metadata("workspace.create")
-        .ok_or_else(|| io::Error::other("smoke: bundled Herdr metadata lacks workspace.create"))?;
     match runtime
-        .client()
-        .unary(
-            workspace_method,
+        .invoke_response(
+            "workspace.create",
             serde_json::json!({
                 "cwd": rig.workdir,
                 "env": {},
@@ -1257,7 +1258,7 @@ async fn prepare_herdr_menu_origin(
         "focused Herdr origin pane",
         std::time::Duration::from_secs(5),
         async || {
-            muxe_adapter_herdr::focused_pane(runtime.client(), runtime.schema())
+            muxe_adapter_herdr::focused_pane(&runtime)
                 .await
                 .map_err(|error| error.to_string())
         },
@@ -1307,7 +1308,7 @@ async fn assert_herdr_menu_stays_open(
         .find_map(|line| line.strip_prefix("opened "))
         .ok_or_else(|| io::Error::other(format!("smoke: launcher reported no pane: {stdout}")))?;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let menu_pane = muxe_adapter_herdr::pane_by_id(runtime.client(), runtime.schema(), pane)
+    let menu_pane = muxe_adapter_herdr::pane_by_id(&runtime, pane)
         .await
         .map_err(|error| {
             let transcript = std::fs::read(&typescript).map_or_else(
@@ -1357,7 +1358,11 @@ async fn run_herdr_menu_smoke() -> io::Result<()> {
     }
     let continuity = ContinuityGuard::watch_herdr(
         "herdr-menu",
-        herdr.socket().to_path_buf(),
+        muxe_adapter_herdr::HerdrAdapterConfig {
+            socket_path: herdr.socket().to_path_buf(),
+            herdr_binary: herdr_binary.clone(),
+            cache_dir: cache_dir.clone(),
+        },
         discovery.clone(),
     )
     .await?;

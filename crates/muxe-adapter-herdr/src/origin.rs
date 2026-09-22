@@ -9,7 +9,7 @@ use muxe_core::{
 };
 use serde_json::{Map, Value};
 
-use crate::{HerdrResponse, HerdrSocketClient, SocketError, generated::method_metadata};
+use crate::HerdrResponse;
 
 /// Validates the launcher-captured origin and the UI's caller identity against a fresh Herdr
 /// snapshot. Neither tuple is inferred from focus or from this process environment.
@@ -23,39 +23,33 @@ use crate::{HerdrResponse, HerdrSocketClient, SocketError, generated::method_met
 /// with cwd `/tmp` reports `/private/tmp`). The hint cwd is still required to be absolute when
 /// present and fills the gap only when the live pane reports no absolute cwd. Nothing here
 /// substitutes the UI caller pane or current focus: both tuples must resolve to live panes.
-pub async fn capture_origin(
-    client: &HerdrSocketClient,
+pub(crate) fn capture_origin_from_snapshot(
     request: &OriginCaptureRequest,
     server_id: ServerId,
-) -> Result<OriginContext, AdapterError> {
+    snapshot_response: HerdrResponse,
+) -> Result<OriginContext, Box<AdapterError>> {
     let origin_hint = request.origin_hint.as_ref().ok_or_else(|| {
-        context_error("Herdr AttachUi did not provide the saved origin bootstrap tuple")
+        Box::new(context_error(
+            "Herdr AttachUi did not provide the saved origin bootstrap tuple",
+        ))
     })?;
     let caller_identity = request.caller_identity.as_ref().ok_or_else(|| {
-        context_error("Herdr AttachUi did not provide the UI caller identity tuple")
+        Box::new(context_error(
+            "Herdr AttachUi did not provide the UI caller identity tuple",
+        ))
     })?;
     if caller_identity.pane_id != request.ui_pane {
-        return Err(context_error(
+        return Err(Box::new(context_error(
             "Herdr caller pane does not match the pane that is attaching the UI",
-        ));
+        )));
     }
 
-    let snapshot_method = method_metadata("session.snapshot").ok_or_else(|| {
-        AdapterError::new(
-            AdapterErrorKind::InvalidRequest,
-            "bundled Herdr metadata has no session.snapshot method",
-        )
-    })?;
-    let snapshot_result = match client
-        .unary(snapshot_method, Value::Object(Map::new()))
-        .await
-        .map_err(|error| socket_error(&error))?
-    {
+    let snapshot_result = match snapshot_response {
         HerdrResponse::Success(result) => result,
         HerdrResponse::Error { code, message } => {
-            return Err(context_error(format!(
+            return Err(Box::new(context_error(format!(
                 "Herdr rejected session.snapshot with {code}: {message}"
-            )));
+            ))));
         }
     };
     let snapshot = snapshot_from_result(&snapshot_result)?;
@@ -252,13 +246,6 @@ fn string_field_is(value: &Map<String, Value>, name: &str, expected: &str) -> bo
     value.get(name).and_then(Value::as_str) == Some(expected)
 }
 
-fn socket_error(error: &SocketError) -> AdapterError {
-    AdapterError::new(
-        AdapterErrorKind::Unavailable,
-        format!("Herdr session.snapshot transport failure: {error}"),
-    )
-}
-
 fn context_error(message: impl Into<String>) -> AdapterError {
     AdapterError::new(AdapterErrorKind::ContextUnavailable, message)
 }
@@ -268,17 +255,11 @@ mod tests {
     use muxe_adapter_api::{OriginCaptureRequest, OriginHintSource, UiSessionId};
     use muxe_core::{PaneId, ServerId, TabId, WorkspaceId};
     use serde_json::json;
-    use tempfile::TempDir;
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::UnixListener,
-    };
 
     use super::*;
 
     /// Live pane reports the server-canonicalized cwd (/private/tmp); the launcher hint
-    /// carries the textual alias (/tmp). Real Herdr canonicalizes exactly this way
-    /// (workspace.create with cwd /tmp reports /private/tmp over the socket).
+    /// carries the textual alias (/tmp). Real Herdr canonicalizes exactly this way.
     const LIVE_CWD: &str = "/private/tmp";
     const HINT_ALIAS_CWD: &str = "/tmp";
 
@@ -295,26 +276,11 @@ mod tests {
         })
     }
 
-    fn serve_snapshot(path: &std::path::Path, body: Value) -> tokio::task::JoinHandle<()> {
-        let listener = UnixListener::bind(path).unwrap();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = Vec::new();
-            reader.read_until(b'\n', &mut request).await.unwrap();
-            let id = serde_json::from_slice::<Value>(&request).unwrap()["id"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            let response = json!({
-                "id": id,
-                "result": {"type": "session_snapshot", "snapshot": body},
-            });
-            reader
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .unwrap();
-        })
+    fn snapshot_response(body: &Value) -> HerdrResponse {
+        HerdrResponse::Success(json!({
+            "type": "session_snapshot",
+            "snapshot": body,
+        }))
     }
 
     fn request_with_hint_cwd(hint_cwd: Option<&str>) -> OriginCaptureRequest {
@@ -337,91 +303,65 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn accepts_alias_cwd_hint_and_enriches_from_live_pane() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("herdr.sock");
-        let server = serve_snapshot(&path, snapshot_body());
-        let client = HerdrSocketClient::new(&path);
-        let origin = capture_origin(
-            &client,
+    #[test]
+    fn accepts_alias_cwd_hint_and_enriches_from_live_pane() {
+        let origin = capture_origin_from_snapshot(
             &request_with_hint_cwd(Some(HINT_ALIAS_CWD)),
             ServerId::new("test-server"),
+            snapshot_response(&snapshot_body()),
         )
-        .await
         .expect("aliased hint cwd must not reject capture");
-        server.await.unwrap();
         assert_eq!(origin.pane_cwd, Some(PathBuf::from(LIVE_CWD)));
         assert_eq!(origin.pane_id, Some(PaneId::new("w1:p1")));
     }
 
-    #[tokio::test]
-    async fn accepts_changed_cwd_hint_and_prefers_live_pane_cwd() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("herdr.sock");
-        let server = serve_snapshot(&path, snapshot_body());
-        let client = HerdrSocketClient::new(&path);
-        let origin = capture_origin(
-            &client,
+    #[test]
+    fn accepts_changed_cwd_hint_and_prefers_live_pane_cwd() {
+        let origin = capture_origin_from_snapshot(
             &request_with_hint_cwd(Some("/somewhere/else")),
             ServerId::new("test-server"),
+            snapshot_response(&snapshot_body()),
         )
-        .await
         .expect("a cwd that changed between launcher capture and attach must not reject capture");
-        server.await.unwrap();
         assert_eq!(origin.pane_cwd, Some(PathBuf::from(LIVE_CWD)));
     }
 
-    #[tokio::test]
-    async fn falls_back_to_hint_cwd_when_live_pane_reports_none() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("herdr.sock");
+    #[test]
+    fn falls_back_to_hint_cwd_when_live_pane_reports_none() {
         let mut body = snapshot_body();
         body["panes"][0].as_object_mut().unwrap().remove("cwd");
-        let server = serve_snapshot(&path, body);
-        let client = HerdrSocketClient::new(&path);
-        let origin = capture_origin(
-            &client,
+        let origin = capture_origin_from_snapshot(
             &request_with_hint_cwd(Some(HINT_ALIAS_CWD)),
             ServerId::new("test-server"),
+            snapshot_response(&body),
         )
-        .await
         .expect("missing live cwd must fall back to the absolute hint cwd");
-        server.await.unwrap();
         assert_eq!(origin.pane_cwd, Some(PathBuf::from(HINT_ALIAS_CWD)));
     }
 
-    #[tokio::test]
-    async fn rejects_relative_hint_cwd() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("herdr.sock");
-        let server = serve_snapshot(&path, snapshot_body());
-        let client = HerdrSocketClient::new(&path);
-        let error = capture_origin(
-            &client,
+    #[test]
+    fn rejects_relative_hint_cwd() {
+        let error = capture_origin_from_snapshot(
             &request_with_hint_cwd(Some("relative/path")),
             ServerId::new("test-server"),
+            snapshot_response(&snapshot_body()),
         )
-        .await
         .expect_err("relative hint cwd must still be rejected");
-        server.await.unwrap();
         assert_eq!(error.kind, AdapterErrorKind::ContextUnavailable);
     }
 
-    #[tokio::test]
-    async fn rejects_unknown_pane_identifiers() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("herdr.sock");
-        let server = serve_snapshot(&path, snapshot_body());
-        let client = HerdrSocketClient::new(&path);
+    #[test]
+    fn rejects_unknown_pane_identifiers() {
         let mut request = request_with_hint_cwd(None);
         request.origin_hint.as_mut().unwrap().pane_id = PaneId::new("w1:gone");
         request.caller_identity.as_mut().unwrap().pane_id = PaneId::new("w1:gone");
         request.ui_pane = PaneId::new("w1:gone");
-        let error = capture_origin(&client, &request, ServerId::new("test-server"))
-            .await
-            .expect_err("unknown pane ids must still be rejected");
-        server.await.unwrap();
+        let error = capture_origin_from_snapshot(
+            &request,
+            ServerId::new("test-server"),
+            snapshot_response(&snapshot_body()),
+        )
+        .expect_err("unknown pane ids must still be rejected");
         assert_eq!(error.kind, AdapterErrorKind::ContextUnavailable);
     }
 }

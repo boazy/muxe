@@ -7,7 +7,7 @@ use muxe_adapter_api::{AdapterError, AdapterErrorKind};
 use muxe_core::{PaneId, TabId, WorkspaceId};
 use serde_json::{Map, Value, json};
 
-use crate::{ApiSchema, HerdrResponse, HerdrSocketClient, generated::method_metadata};
+use crate::{HerdrResponse, HerdrRuntime, runtime::HerdrRequestAuthority};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiSplitDirection {
@@ -106,11 +106,14 @@ pub struct CommandTabLaunch {
 ///
 /// Returns `AdapterError` when the snapshot cannot be read or has no focused
 /// pane with an absolute cwd and live geometry.
-pub async fn focused_pane(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+pub async fn focused_pane(runtime: &HerdrRuntime) -> Result<FocusedPane, AdapterError> {
+    focused_pane_with(runtime).await
+}
+
+pub(crate) async fn focused_pane_with(
+    authority: &dyn HerdrRequestAuthority,
 ) -> Result<FocusedPane, AdapterError> {
-    let snapshot = session_snapshot(client, schema).await?;
+    let snapshot = session_snapshot(authority).await?;
     let workspace = WorkspaceId::new(required_id(
         &snapshot,
         "focused_workspace_id",
@@ -137,13 +140,21 @@ pub async fn focused_pane(
 /// Returns `AdapterError` when the snapshot cannot be read or the given
 /// identity has no live pane.
 pub async fn pane_by_identity(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    runtime: &HerdrRuntime,
     workspace: WorkspaceId,
     tab: TabId,
     pane: PaneId,
 ) -> Result<FocusedPane, AdapterError> {
-    let snapshot = session_snapshot(client, schema).await?;
+    pane_by_identity_with(runtime, workspace, tab, pane).await
+}
+
+pub(crate) async fn pane_by_identity_with(
+    authority: &dyn HerdrRequestAuthority,
+    workspace: WorkspaceId,
+    tab: TabId,
+    pane: PaneId,
+) -> Result<FocusedPane, AdapterError> {
+    let snapshot = session_snapshot(authority).await?;
     pane_from_snapshot(&snapshot, workspace, tab, pane)
 }
 
@@ -154,14 +165,20 @@ pub async fn pane_by_identity(
 /// Returns `AdapterError` when the pane ID is empty, the snapshot cannot be
 /// read, or the pane is not live.
 pub async fn pane_by_id(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    runtime: &HerdrRuntime,
+    pane_id: &str,
+) -> Result<FocusedPane, AdapterError> {
+    pane_by_id_with(runtime, pane_id).await
+}
+
+pub(crate) async fn pane_by_id_with(
+    authority: &dyn HerdrRequestAuthority,
     pane_id: &str,
 ) -> Result<FocusedPane, AdapterError> {
     if pane_id.is_empty() {
         return Err(invalid("Herdr parent pane ID must not be empty"));
     }
-    let snapshot = session_snapshot(client, schema).await?;
+    let snapshot = session_snapshot(authority).await?;
     let pane = snapshot
         .get("panes")
         .and_then(Value::as_array)
@@ -177,17 +194,10 @@ pub async fn pane_by_id(
     pane_from_snapshot(&snapshot, workspace, tab, PaneId::new(pane_id))
 }
 async fn session_snapshot(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    authority: &dyn HerdrRequestAuthority,
 ) -> Result<Map<String, Value>, AdapterError> {
     let result = result_object(
-        &invoke(
-            client,
-            schema,
-            "session.snapshot",
-            Value::Object(Map::new()),
-        )
-        .await?,
+        &invoke(authority, "session.snapshot", Value::Object(Map::new())).await?,
         "session.snapshot",
     )?;
     if result.get("type").and_then(Value::as_str) != Some("session_snapshot") {
@@ -276,8 +286,14 @@ fn pane_from_snapshot(
 /// Returns `AdapterError` when the launch is invalid or the layout or move
 /// requests fail.
 pub async fn open_command_pane(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    runtime: &HerdrRuntime,
+    launch: CommandPaneLaunch,
+) -> Result<CommandPanePlacement, AdapterError> {
+    open_command_pane_with(runtime, launch).await
+}
+
+pub(crate) async fn open_command_pane_with(
+    authority: &dyn HerdrRequestAuthority,
     launch: CommandPaneLaunch,
 ) -> Result<CommandPanePlacement, AdapterError> {
     if !launch.cwd.is_absolute() {
@@ -294,8 +310,7 @@ pub async fn open_command_pane(
         ));
     }
     let layout = invoke(
-        client,
-        schema,
+        authority,
         "layout.apply",
         json!({
             "focus": false,
@@ -324,8 +339,7 @@ pub async fn open_command_pane(
         ui_pane: PaneId::new(required_id(root, "pane_id", "layout.apply root")?),
     };
     let moved = invoke(
-        client,
-        schema,
+        authority,
         "pane.move",
         json!({
             "pane_id": prepared.ui_pane.as_str(),
@@ -351,7 +365,7 @@ pub async fn open_command_pane(
         }),
         Err(move_error) => {
             if let Err(cleanup_error) =
-                close_transient_tab(client, schema, &prepared.temporary_tab).await
+                close_transient_tab_with(authority, &prepared.temporary_tab).await
             {
                 return Err(AdapterError::new(
                     combined_move_error_kind(&move_error, &cleanup_error),
@@ -372,8 +386,14 @@ pub async fn open_command_pane(
 /// Returns [`AdapterError`] when the command or cwd is invalid, or Herdr
 /// rejects the single `layout.apply` request.
 pub async fn open_command_tab(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    runtime: &HerdrRuntime,
+    launch: CommandTabLaunch,
+) -> Result<(), AdapterError> {
+    open_command_tab_with(runtime, launch).await
+}
+
+pub(crate) async fn open_command_tab_with(
+    authority: &dyn HerdrRequestAuthority,
     launch: CommandTabLaunch,
 ) -> Result<(), AdapterError> {
     if !launch.cwd.is_absolute() {
@@ -385,8 +405,7 @@ pub async fn open_command_tab(
         ));
     }
     let layout = invoke(
-        client,
-        schema,
+        authority,
         "layout.apply",
         json!({
             "focus": launch.focus,
@@ -412,8 +431,14 @@ pub async fn open_command_tab(
 ///
 /// Returns `AdapterError` when the launch is invalid or the layout request fails.
 pub async fn prepare_ui_pane(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    runtime: &HerdrRuntime,
+    launch: &UiPaneLaunch,
+) -> Result<PreparedUiPane, AdapterError> {
+    prepare_ui_pane_with(runtime, launch).await
+}
+
+pub(crate) async fn prepare_ui_pane_with(
+    authority: &dyn HerdrRequestAuthority,
     launch: &UiPaneLaunch,
 ) -> Result<PreparedUiPane, AdapterError> {
     if !launch.cwd.is_absolute() {
@@ -428,8 +453,7 @@ pub async fn prepare_ui_pane(
     }
 
     let layout = invoke(
-        client,
-        schema,
+        authority,
         "layout.apply",
         json!({
             "focus": false,
@@ -466,14 +490,20 @@ pub async fn prepare_ui_pane(
 /// Returns `AdapterError` when the pane move fails; the transient tab is closed
 /// on failure and a failed cleanup is reported instead.
 pub async fn move_prepared_ui_pane(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    runtime: &HerdrRuntime,
+    launch: &UiPaneLaunch,
+    prepared: PreparedUiPane,
+) -> Result<UiPanePlacement, AdapterError> {
+    move_prepared_ui_pane_with(runtime, launch, prepared).await
+}
+
+pub(crate) async fn move_prepared_ui_pane_with(
+    authority: &dyn HerdrRequestAuthority,
     launch: &UiPaneLaunch,
     prepared: PreparedUiPane,
 ) -> Result<UiPanePlacement, AdapterError> {
     let moved = invoke(
-        client,
-        schema,
+        authority,
         "pane.move",
         json!({
             "pane_id": prepared.ui_pane.as_str(),
@@ -499,7 +529,7 @@ pub async fn move_prepared_ui_pane(
         }),
         Err(move_error) => {
             if let Err(cleanup_error) =
-                close_transient_tab(client, schema, &prepared.temporary_tab).await
+                close_transient_tab_with(authority, &prepared.temporary_tab).await
             {
                 return Err(AdapterError::new(
                     combined_move_error_kind(&move_error, &cleanup_error),
@@ -602,37 +632,25 @@ fn validate_bootstrap_env(env: &BTreeMap<String, String>) -> Result<(), AdapterE
 /// # Errors
 ///
 /// Returns `AdapterError` when the `tab.close` request fails.
-pub async fn close_transient_tab(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+pub async fn close_transient_tab(runtime: &HerdrRuntime, tab: &TabId) -> Result<(), AdapterError> {
+    close_transient_tab_with(runtime, tab).await
+}
+
+pub(crate) async fn close_transient_tab_with(
+    authority: &dyn HerdrRequestAuthority,
     tab: &TabId,
 ) -> Result<(), AdapterError> {
-    invoke(
-        client,
-        schema,
-        "tab.close",
-        json!({ "tab_id": tab.as_str() }),
-    )
-    .await
-    .map(|_| ())
+    invoke(authority, "tab.close", json!({ "tab_id": tab.as_str() }))
+        .await
+        .map(|_| ())
 }
 
 async fn invoke(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    authority: &dyn HerdrRequestAuthority,
     method: &str,
     params: Value,
 ) -> Result<Value, AdapterError> {
-    let metadata = method_metadata(method)
-        .ok_or_else(|| incompatible(format!("bundled Herdr metadata does not declare {method}")))?;
-    schema
-        .validate_method(metadata.method, &params)
-        .map_err(|error| incompatible(format!("active Herdr schema rejects {method}: {error}")))?;
-    match client
-        .unary(metadata, params)
-        .await
-        .map_err(|error| socket_error(&error))?
-    {
+    match authority.request(method, params).await? {
         HerdrResponse::Success(result) => Ok(result),
         HerdrResponse::Error { code, message } => Err(AdapterError::new(
             AdapterErrorKind::DispatchFailed,
@@ -744,21 +762,6 @@ fn combined_move_error_kind(
     } else {
         AdapterErrorKind::DispatchFailed
     }
-}
-
-fn socket_error(error: &crate::SocketError) -> AdapterError {
-    AdapterError::new(
-        if error.delivery() == crate::DeliveryState::MayHaveReachedHost {
-            AdapterErrorKind::OutcomeUnknown
-        } else {
-            AdapterErrorKind::Unavailable
-        },
-        error.to_string(),
-    )
-}
-
-fn incompatible(message: impl Into<String>) -> AdapterError {
-    AdapterError::new(AdapterErrorKind::Incompatible, message)
 }
 
 fn invalid(message: impl Into<String>) -> AdapterError {

@@ -1,10 +1,12 @@
 use std::{
+    fmt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
 };
 
+use async_trait::async_trait;
 use muxe_adapter_api::{AdapterError, AdapterErrorKind, HostIdentity, HostKind};
 use serde_json::{Map, Value};
 use tokio::{
@@ -13,9 +15,10 @@ use tokio::{
 };
 
 use crate::{
-    ApiSchema, DeliveryState, HerdrCache, HerdrResponse, HerdrSocketClient, SocketError,
-    generated::{BUNDLED_PROTOCOL, method_metadata},
-    transport::EndpointIdentity,
+    ApiSchema, DeliveryState, EventSubscription, HerdrCache, HerdrResponse, SocketError,
+    SubscriptionConfig,
+    generated::{BUNDLED_PROTOCOL, MethodMetadata, method_metadata},
+    transport::{EndpointContinuityToken, HerdrSocketClient},
 };
 
 /// Wall-clock bound for one `herdr api schema --json` invocation. Exceeding it fails
@@ -39,12 +42,73 @@ pub struct HerdrAdapterConfig {
     pub cache_dir: PathBuf,
 }
 
+/// The server version parsed directly from the establishing pong for one
+/// runtime epoch. Consumers never recover it by parsing the opaque live-server
+/// identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HerdrServerVersion(String);
+
+impl HerdrServerVersion {
+    fn parse(value: &str) -> Option<Self> {
+        (!value.is_empty()).then(|| Self(value.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HerdrServerVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IncarnationEpoch(u64);
+
+impl IncarnationEpoch {
+    pub(crate) const INITIAL: Self = Self(1);
+
+    #[must_use]
+    pub(crate) const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    #[must_use]
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Private authority joining one adapter epoch to the exact endpoint token
+/// observed by its runtime. It never exposes raw inode/process components.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IncarnationLease {
+    epoch: IncarnationEpoch,
+    expected: EndpointContinuityToken,
+}
+
+impl IncarnationLease {
+    #[must_use]
+    pub(crate) const fn epoch(&self) -> IncarnationEpoch {
+        self.epoch
+    }
+}
+
+#[async_trait]
+pub(crate) trait HerdrRequestAuthority: Sync {
+    async fn request(&self, method: &str, params: Value) -> Result<HerdrResponse, AdapterError>;
+}
+
 pub struct HerdrRuntime {
     client: Arc<HerdrSocketClient>,
     schema: Arc<ApiSchema>,
     schema_cache_hit: bool,
     identity: HostIdentity,
-    endpoint: EndpointIdentity,
+    expected: EndpointContinuityToken,
+    server_version: HerdrServerVersion,
 }
 impl HerdrRuntime {
     /// Acquires one runtime schema from the configured executable, verifies protocol compatibility,
@@ -61,23 +125,62 @@ impl HerdrRuntime {
             load_installed_schema(&config.herdr_binary, &config.cache_dir).await?;
 
         let client = Arc::new(HerdrSocketClient::new(config.socket_path.clone()));
-        let (identity, endpoint) = probe_endpoint_identity(&client).await?;
+        let (identity, expected, server_version) = establish_live_identity(&client).await?;
         Ok(Self {
             client,
             schema,
             schema_cache_hit,
             identity,
-            endpoint,
+            expected,
+            server_version,
+        })
+    }
+
+    /// Establishes a retained event subscription guarded by this runtime's
+    /// exact live endpoint observation. The guard is checked before the first
+    /// subscribe byte without exposing its private lease/token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SocketError`] for an endpoint replacement, transport failure,
+    /// rejected subscription, invalid response, or correlation mismatch.
+    pub async fn subscribe(
+        &self,
+        config: SubscriptionConfig,
+    ) -> Result<(EventSubscription, Value), SocketError> {
+        EventSubscription::connect_expected(self, self.lease(IncarnationEpoch::INITIAL), config)
+            .await
+    }
+    #[cfg(test)]
+    pub(crate) async fn for_subscription_test(socket: &Path) -> Result<Self, AdapterError> {
+        let client = Arc::new(HerdrSocketClient::new(socket));
+        let (identity, expected, server_version) = establish_live_identity(&client).await?;
+        let schema = Arc::new(
+            ApiSchema::parse(
+                serde_json::from_str(include_str!(
+                    "../../../fixtures/herdr/herdr-api.schema.json"
+                ))
+                .expect("bundled schema JSON"),
+            )
+            .expect("bundled schema parses"),
+        );
+        Ok(Self {
+            client,
+            schema,
+            schema_cache_hit: false,
+            identity,
+            expected,
+            server_version,
         })
     }
 
     #[must_use]
-    pub fn client(&self) -> &Arc<HerdrSocketClient> {
+    pub(crate) fn client(&self) -> &Arc<HerdrSocketClient> {
         &self.client
     }
 
     #[must_use]
-    pub fn schema(&self) -> &Arc<ApiSchema> {
+    pub(crate) fn schema(&self) -> &Arc<ApiSchema> {
         &self.schema
     }
 
@@ -93,15 +196,130 @@ impl HerdrRuntime {
         &self.identity
     }
 
-    /// The retained OS-visible incarnation of the server this runtime connected to.
-    /// Pending cleanup binds each pane probe and close request to this record and
-    /// rejects a proved replacement before writing bytes. An unchanged record
-    /// proves nothing on its own (inode numbers may be recycled); the continuity
-    /// authority is the retained subscription stream plus a new local epoch after
-    /// any loss.
     #[must_use]
-    pub fn endpoint(&self) -> &EndpointIdentity {
-        &self.endpoint
+    pub fn server_version(&self) -> &HerdrServerVersion {
+        &self.server_version
+    }
+
+    #[must_use]
+    pub(crate) fn lease(&self, epoch: IncarnationEpoch) -> IncarnationLease {
+        IncarnationLease {
+            epoch,
+            expected: self.expected.clone(),
+        }
+    }
+
+    pub(crate) async fn connect_expected_subscription(
+        &self,
+        lease: &IncarnationLease,
+    ) -> Result<tokio::net::UnixStream, SocketError> {
+        if self.expected.proven_replacement(&lease.expected) {
+            return Err(SocketError::EndpointReplaced {
+                socket: self.client.socket().to_path_buf(),
+            });
+        }
+        self.client.connect_on_expected_token(&lease.expected).await
+    }
+    pub(crate) async fn invoke_response_on_lease(
+        &self,
+        lease: &IncarnationLease,
+        metadata: &MethodMetadata,
+        params: Value,
+    ) -> Result<HerdrResponse, SocketError> {
+        if self.lease(lease.epoch()) != *lease {
+            return Err(SocketError::EndpointReplaced {
+                socket: self.client.socket().to_path_buf(),
+            });
+        }
+        self.client
+            .unary_on_expected_token(metadata, params, &lease.expected)
+            .await
+    }
+
+    /// Validates and sends one unary request only to this runtime's observed
+    /// endpoint incarnation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] for schema/metadata incompatibility, a proved
+    /// endpoint replacement before write, transport failure, or invalid reply.
+    pub async fn invoke_response(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<HerdrResponse, AdapterError> {
+        let metadata = self.checked_metadata(method, &params)?;
+        self.invoke_response_on_lease(&self.lease(IncarnationEpoch::INITIAL), metadata, params)
+            .await
+            .map_err(|error| socket_error(&error))
+    }
+
+    /// Timeout variant of [`Self::invoke_response`]. The expected-incarnation
+    /// check still occurs before any request byte is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] under the same conditions as
+    /// [`Self::invoke_response`], plus a bounded response timeout.
+    pub async fn invoke_response_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<HerdrResponse, AdapterError> {
+        let metadata = self.checked_metadata(method, &params)?;
+        let lease = self.lease(IncarnationEpoch::INITIAL);
+        if self.lease(lease.epoch()) != lease {
+            return Err(socket_error(&SocketError::EndpointReplaced {
+                socket: self.client.socket().to_path_buf(),
+            }));
+        }
+        self.client
+            .unary_on_expected_token_with_timeout(metadata, params, &lease.expected, timeout)
+            .await
+            .map_err(|error| socket_error(&error))
+    }
+
+    /// Returns the success payload of a guarded unary request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] for transport/schema errors or a host
+    /// rejection.
+    pub async fn invoke(&self, method: &str, params: Value) -> Result<Value, AdapterError> {
+        match self.invoke_response(method, params).await? {
+            HerdrResponse::Success(result) => Ok(result),
+            HerdrResponse::Error { code, message } => Err(AdapterError::new(
+                AdapterErrorKind::DispatchFailed,
+                format!("Herdr {method} rejected request with {code}: {message}"),
+            )),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
+    pub(crate) fn checked_metadata(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<&'static MethodMetadata, AdapterError> {
+        self.schema
+            .validate_method(method, params)
+            .map_err(|error| {
+                incompatible(format!("active Herdr schema rejects {method}: {error}"))
+            })?;
+        method_metadata(method).ok_or_else(|| {
+            incompatible(format!("bundled Herdr metadata does not declare {method}"))
+        })
+    }
+}
+
+#[async_trait]
+impl HerdrRequestAuthority for HerdrRuntime {
+    async fn request(&self, method: &str, params: Value) -> Result<HerdrResponse, AdapterError> {
+        self.invoke_response(method, params).await
     }
 }
 
@@ -280,37 +498,16 @@ async fn collect_schema_output(
     Ok((status, schema, diagnostics))
 }
 
-/// Probes the live server and returns its opaque host identity.
-///
-/// # Errors
-///
-/// Returns `AdapterError` when the ping is rejected, the schema does not declare
-/// it, or the endpoint cannot be observed.
-pub async fn probe_live_identity(client: &HerdrSocketClient) -> Result<HostIdentity, AdapterError> {
-    probe_endpoint_identity(client)
-        .await
-        .map(|(identity, _)| identity)
-}
-
-/// Probes the live server and returns its opaque host identity together with an OS-visible
-/// endpoint observation. An observed inequality can prove replacement even when the
-/// replacement reports the same protocol and version on the same socket path. Equality
-/// never proves continuity; the retained subscription stream and local epoch do.
-///
-/// # Errors
-///
-/// Returns `AdapterError` when the ping metadata is missing, the server rejects
-/// the ping, the protocol mismatches, or the endpoint cannot be observed.
-pub async fn probe_endpoint_identity(
+async fn establish_live_identity(
     client: &HerdrSocketClient,
-) -> Result<(HostIdentity, EndpointIdentity), AdapterError> {
+) -> Result<(HostIdentity, EndpointContinuityToken, HerdrServerVersion), AdapterError> {
     let metadata = method_metadata("ping")
         .ok_or_else(|| incompatible("bundled Herdr metadata does not declare ping"))?;
-    let result = match client
-        .unary(metadata, Value::Object(Map::new()))
+    let (response, expected) = client
+        .establish_unary(metadata, Value::Object(Map::new()))
         .await
-        .map_err(|error| socket_error(&error))?
-    {
+        .map_err(|error| socket_error(&error))?;
+    let result = match response {
         HerdrResponse::Success(result) => result,
         HerdrResponse::Error { code, message } => {
             return Err(AdapterError::new(
@@ -319,13 +516,9 @@ pub async fn probe_endpoint_identity(
             ));
         }
     };
-    let endpoint = client
-        .probe_endpoint()
-        .await
-        .map_err(|error| socket_error(&error))?;
-    let identity =
-        identity_from_ping_result(client.socket().display().to_string(), &endpoint, &result)?;
-    Ok((identity, endpoint))
+    let (identity, version) =
+        identity_from_ping_result(client.socket().display().to_string(), &expected, &result)?;
+    Ok((identity, expected, version))
 }
 
 #[expect(
@@ -334,9 +527,9 @@ pub async fn probe_endpoint_identity(
 )]
 fn identity_from_ping_result(
     discovery_key: String,
-    endpoint: &EndpointIdentity,
+    endpoint: &EndpointContinuityToken,
     result: &Value,
-) -> Result<HostIdentity, AdapterError> {
+) -> Result<(HostIdentity, HerdrServerVersion), AdapterError> {
     let object = result
         .as_object()
         .ok_or_else(|| incompatible("Herdr ping result is not an object"))?;
@@ -352,25 +545,26 @@ fn identity_from_ping_result(
             "live Herdr protocol {protocol} is incompatible with required protocol {BUNDLED_PROTOCOL}"
         )));
     }
-    let version = object
-        .get("version")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| incompatible("Herdr ping result lacks nonempty version"))?;
-    // Protocol 20 exposes no per-server identifier in a pong: only type, protocol,
-    // and version. The configured socket identifies the selected host, while the
-    // OS-visible endpoint observation contributes an opaque shared host identity.
-    // Its equality cannot establish continuity because POSIX can recycle inode and
-    // process identifiers; consumers must not use it as a continuity token.
-    Ok(HostIdentity {
+    let version = HerdrServerVersion::parse(
+        object
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+    .ok_or_else(|| incompatible("Herdr ping result lacks nonempty version"))?;
+    // Protocol 20 exposes no server nonce. The configured socket identifies
+    // discovery, while the observed-connect token contributes an opaque live
+    // identity. Equality remains inconclusive; only inequality proves change.
+    let identity = HostIdentity {
         kind: HostKind::Herdr,
         discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(discovery_key)
             .expect("validated Herdr discovery key"),
         live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
-            endpoint.live_server_id(protocol, version),
+            endpoint.live_server_id(protocol, version.as_str()),
         )
         .expect("validated Herdr endpoint incarnation"),
-    })
+    };
+    Ok((identity, version))
 }
 
 fn socket_error(error: &SocketError) -> AdapterError {
@@ -391,11 +585,56 @@ fn incompatible(message: impl Into<String>) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
 
-    async fn capture_at(path: &std::path::Path) -> EndpointIdentity {
+    fn test_schema() -> Arc<ApiSchema> {
+        Arc::new(
+            ApiSchema::parse(
+                serde_json::from_str(include_str!(
+                    "../../../fixtures/herdr/herdr-api.schema.json"
+                ))
+                .expect("bundled schema JSON"),
+            )
+            .expect("bundled schema parses"),
+        )
+    }
+
+    async fn answer_ping(listener: Arc<UnixListener>) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = Vec::new();
+        reader.read_until(b'\n', &mut request).await.unwrap();
+        let id = serde_json::from_slice::<Value>(&request).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        reader
+            .write_all(
+                format!(
+                    "{{\"id\":\"{id}\",\"result\":{{\"type\":\"pong\",\"protocol\":{BUNDLED_PROTOCOL},\"version\":\"0.8.2\"}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn accept_zero_bytes(listener: UnixListener) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut bytes))
+            .await
+            .expect("mismatched runtime stream closes promptly")
+            .unwrap();
+        bytes
+    }
+
+    async fn capture_at(path: &std::path::Path) -> EndpointContinuityToken {
         let listener = tokio::net::UnixListener::bind(path).unwrap();
-        let stream = tokio::net::UnixStream::connect(path).await.unwrap();
-        let endpoint = EndpointIdentity::capture(path, &stream).unwrap();
+        let endpoint = HerdrSocketClient::new(path).observed_token().await.unwrap();
         drop(listener);
         endpoint
     }
@@ -408,13 +647,15 @@ mod tests {
     async fn pong_identity_binds_to_endpoint_incarnation() {
         let temp = tempfile::TempDir::new().unwrap();
         let endpoint = capture_at(&temp.path().join("herdr.sock")).await;
-        let identity = identity_from_ping_result("/owned/socket".to_owned(), &endpoint, &pong())
-            .expect("protocol 20 pong has type, version, and protocol");
+        let (identity, version) =
+            identity_from_ping_result("/owned/socket".to_owned(), &endpoint, &pong())
+                .expect("protocol 20 pong has type, version, and protocol");
 
         assert_eq!(identity.discovery_key.as_str(), "/owned/socket");
+        assert_eq!(version.as_str(), "0.8.2");
         assert_eq!(
             identity.live_server_id.as_str(),
-            endpoint.live_server_id(BUNDLED_PROTOCOL, "0.8.2")
+            endpoint.live_server_id(BUNDLED_PROTOCOL, version.as_str())
         );
     }
 
@@ -427,6 +668,46 @@ mod tests {
             !endpoint.proven_replacement(&endpoint),
             "an equal observation is deliberately inconclusive, not continuity proof"
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_runtime_rejects_rebound_endpoint_before_write() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("herdr.sock");
+        let listener_a = Arc::new(UnixListener::bind(&path).unwrap());
+        let server_a = tokio::spawn(answer_ping(Arc::clone(&listener_a)));
+        let client = Arc::new(HerdrSocketClient::new(path.clone()));
+        let (identity, expected, server_version) =
+            establish_live_identity(client.as_ref()).await.unwrap();
+        server_a.await.unwrap();
+        let runtime = HerdrRuntime {
+            client,
+            schema: test_schema(),
+            schema_cache_hit: false,
+            identity,
+            expected,
+            server_version,
+        };
+
+        std::fs::remove_file(&path).unwrap();
+        let listener_b = UnixListener::bind(&path).unwrap();
+        let server_b = tokio::spawn(accept_zero_bytes(listener_b));
+        let error = runtime
+            .invoke_response("ping", Value::Object(Map::new()))
+            .await
+            .expect_err("runtime rejects replacement before request write");
+
+        assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+        assert!(
+            error
+                .message
+                .contains("replaced before the request was sent")
+        );
+        assert!(
+            server_b.await.unwrap().is_empty(),
+            "guarded runtime sends zero request bytes to the replacement"
+        );
+        drop(listener_a);
     }
 
     /// The timeout path owns one concrete nonterminating schema child, kills it, and reaps it

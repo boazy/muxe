@@ -13,11 +13,10 @@ use nix::{
     unistd::Pid,
 };
 
-use muxe_adapter_api::HostIdentity;
-use muxe_adapter_herdr::{HerdrSocketClient, probe_live_identity};
 use tempfile::TempDir;
 use tokio::{
     io::AsyncReadExt,
+    net::UnixStream,
     process::{Child, Command},
     task::JoinHandle,
     time::{Instant, sleep, timeout},
@@ -38,7 +37,6 @@ pub struct OwnedHerdrFixture {
     _temp: TempDir,
     child: Option<Child>,
     socket: PathBuf,
-    start_identity: Option<HostIdentity>,
     stdout: Option<JoinHandle<io::Result<PipeCapture>>>,
     stderr: Option<JoinHandle<io::Result<PipeCapture>>>,
 }
@@ -154,7 +152,6 @@ impl OwnedHerdrFixture {
             _temp: temp,
             child: Some(child),
             socket,
-            start_identity: None,
             stdout: stdout.map(|pipe| tokio::spawn(drain_pipe(pipe))),
             stderr: stderr.map(|pipe| tokio::spawn(drain_pipe(pipe))),
         };
@@ -165,25 +162,14 @@ impl OwnedHerdrFixture {
                 ))
                 .await);
         }
-        match fixture.wait_for_handshake().await {
-            Ok(identity) => {
-                fixture.start_identity = Some(identity);
-                Ok(fixture)
-            }
+        match fixture.wait_for_socket().await {
+            Ok(()) => Ok(fixture),
             Err(error) => Err(fixture.fail_startup(error).await),
         }
     }
 
     pub fn socket(&self) -> &Path {
         &self.socket
-    }
-
-    /// Identity proved by a ping over this fixture's exact socket while its retained child was
-    /// still running. It is never supplied by a caller.
-    pub fn start_identity(&self) -> &HostIdentity {
-        self.start_identity
-            .as_ref()
-            .expect("only a completed owned-child readiness handshake exposes fixture identity")
     }
 
     pub fn owned_child_pid(&self) -> Option<u32> {
@@ -255,9 +241,8 @@ impl OwnedHerdrFixture {
         })
     }
 
-    async fn wait_for_handshake(&mut self) -> io::Result<HostIdentity> {
+    async fn wait_for_socket(&mut self) -> io::Result<()> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
-        let client = HerdrSocketClient::new(&self.socket);
         loop {
             let child = self
                 .child
@@ -266,58 +251,39 @@ impl OwnedHerdrFixture {
             if let Some(status) = child.try_wait()? {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    format!("owned Herdr child exited before ping readiness: {status}"),
+                    format!("owned Herdr child exited before socket readiness: {status}"),
                 ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "owned Herdr child did not complete ping readiness before startup deadline",
+                    "owned Herdr child did not accept its fixture socket before startup deadline",
                 ));
             }
-            match timeout(remaining, probe_live_identity(&client)).await {
-                Ok(Ok(identity)) => {
-                    if identity.discovery_key.as_str() != self.socket.display().to_string() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Herdr readiness identity is not bound to the fixture socket",
-                        ));
-                    }
-                    return Ok(identity);
+            match timeout(remaining, UnixStream::connect(&self.socket)).await {
+                Ok(Ok(stream)) => {
+                    drop(stream);
+                    return Ok(());
                 }
                 Err(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "owned Herdr child ping readiness handshake exceeded startup deadline",
+                        "owned Herdr child socket readiness exceeded startup deadline",
                     ));
                 }
-                Ok(Err(error)) if error.kind == muxe_adapter_api::AdapterErrorKind::Unavailable => {
-                    let retry = deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(RETRY_DELAY);
-                    if retry.is_zero() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("owned Herdr child did not complete ping readiness: {error}"),
-                        ));
-                    }
+                Ok(Err(_)) => {
+                    let retry = remaining.min(RETRY_DELAY);
                     tokio::select! {
                         () = sleep(retry) => {}
                         status = child.wait() => {
                             let status = status?;
                             return Err(io::Error::new(
                                 io::ErrorKind::ConnectionAborted,
-                                format!("owned Herdr child exited before ping readiness: {status}"),
+                                format!("owned Herdr child exited before socket readiness: {status}"),
                             ));
                         }
                     }
-                }
-                Ok(Err(error)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("owned Herdr child did not complete ping readiness: {error}"),
-                    ));
                 }
             }
         }

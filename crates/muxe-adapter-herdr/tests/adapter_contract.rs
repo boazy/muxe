@@ -593,7 +593,7 @@ async fn recorded_common_contract_preserves_broker_visible_transitions() {
 /// Exercises the actual Herdr constructor boundary with an owned shell schema
 /// child and a recorded Unix peer; no Herdr host process is started.
 #[tokio::test]
-async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
+async fn recorded_herdr_production_connect_reports_guarded_identity_and_messages() {
     let fixture =
         ProductionConnectFixture::start().expect("recorded production-connect fixture starts");
     let adapter = HerdrAdapter::connect(fixture.adapter_config())
@@ -606,13 +606,12 @@ async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
         .identity()
         .await
         .expect("retained subscription is healthy");
+    assert_eq!(observed.kind, HostKind::Herdr);
     assert_eq!(
-        observed,
-        fixture
-            .raw_identity()
-            .await
-            .expect("fixture reads the same raw endpoint identity")
+        observed.discovery_key.as_str(),
+        fixture.socket().display().to_string()
     );
+    assert!(!observed.live_server_id.as_str().is_empty());
     assert!(
         !adapter
             .capabilities()

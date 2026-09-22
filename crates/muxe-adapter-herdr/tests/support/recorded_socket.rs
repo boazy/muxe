@@ -29,9 +29,14 @@ pub struct RecordedExchange {
 #[derive(Clone, Debug)]
 pub enum RecordedResponse {
     Result(Value),
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
     Close,
     KeepOpen(Value),
+    /// Accepts and records the request but never writes a response.
+    Hang,
 }
 
 /// A sequential, TempDir-owned Unix-socket fixture for concrete Herdr transport tests.
@@ -51,29 +56,10 @@ pub struct RecordedUnixServer {
 
 impl RecordedUnixServer {
     pub fn start(temp: TempDir, exchanges: Vec<RecordedExchange>) -> io::Result<Self> {
-        Self::start_inner(temp, exchanges, false)
+        Self::start_inner(temp, exchanges)
     }
 
-    /// Starts a recording server whose first request is followed by the raw connection made by
-    /// `HerdrRuntime::probe_endpoint`. That probe deliberately sends no JSON-RPC request.
-    pub fn start_with_endpoint_probe(
-        temp: TempDir,
-        exchanges: Vec<RecordedExchange>,
-    ) -> io::Result<Self> {
-        if exchanges.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "an endpoint-probe recording needs at least the ping exchange",
-            ));
-        }
-        Self::start_inner(temp, exchanges, true)
-    }
-
-    fn start_inner(
-        temp: TempDir,
-        exchanges: Vec<RecordedExchange>,
-        expect_endpoint_probe: bool,
-    ) -> io::Result<Self> {
+    fn start_inner(temp: TempDir, exchanges: Vec<RecordedExchange>) -> io::Result<Self> {
         let socket = temp.path().join("s");
         let listener = UnixListener::bind(&socket)?;
         let requests = Arc::new(Mutex::new(Vec::with_capacity(exchanges.len())));
@@ -87,7 +73,6 @@ impl RecordedUnixServer {
             Arc::clone(&requests_changed),
             close_receiver,
             retained_events.clone(),
-            expect_endpoint_probe,
         ));
         Ok(Self {
             _temp: temp,
@@ -139,16 +124,6 @@ impl RecordedUnixServer {
                 )
             })
     }
-
-    /// Waits for every finite scripted exchange and returns each complete raw request in order.
-    /// Callers with a `KeepOpen` response must inspect [`Self::requests`] and then drop the
-    /// fixture instead, because the retained stream intentionally does not complete.
-    pub async fn finish(mut self) -> io::Result<Vec<Value>> {
-        let task = self.task.take().expect("recorded socket task is retained");
-        task.await
-            .map_err(|error| io::Error::other(format!("recorded socket task failed: {error}")))??;
-        Ok(self.requests.lock().await.clone())
-    }
 }
 
 impl Drop for RecordedUnixServer {
@@ -166,7 +141,6 @@ async fn serve(
     requests_changed: Arc<Notify>,
     close_streams: watch::Receiver<u64>,
     retained_events: broadcast::Sender<Value>,
-    expect_endpoint_probe: bool,
 ) -> io::Result<()> {
     let mut retained_streams = JoinSet::new();
     for exchange in exchanges {
@@ -218,6 +192,11 @@ async fn serve(
                 reader.get_mut().flush().await?;
             }
             RecordedResponse::Close => {}
+            RecordedResponse::Hang => {
+                requests.lock().await.push(request.clone());
+                requests_changed.notify_waiters();
+                std::future::pending::<()>().await;
+            }
         }
         requests.lock().await.push(request);
         requests_changed.notify_waiters();
@@ -255,10 +234,6 @@ async fn serve(
             });
         } else {
             drop(reader);
-        }
-        if expect_endpoint_probe && exchange.method == "ping" {
-            let (probe, _) = listener.accept().await?;
-            drop(probe);
         }
     }
     while retained_streams.join_next().await.is_some() {}

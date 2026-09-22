@@ -702,22 +702,22 @@ pub async fn spawn_herdr_client(
     Ok(child)
 }
 
-/// Polls for the socket file, then proves liveness with a ping handshake
-/// inside the startup budget. Returns the live discovery key.
+/// Polls until the owned Herdr socket accepts a connection inside the startup
+/// budget. Protocol identity is established later by the guarded runtime.
 async fn wait_for_herdr_handshake(socket: &Path) -> io::Result<String> {
     let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
     loop {
-        if socket.exists() {
-            let client = muxe_adapter_herdr::HerdrSocketClient::new(socket);
-            if let Ok(identity) = muxe_adapter_herdr::probe_live_identity(&client).await {
-                return Ok(identity.discovery_key.as_str().to_owned());
-            }
+        if socket.exists()
+            && let Ok(stream) = tokio::net::UnixStream::connect(socket).await
+        {
+            drop(stream);
+            return Ok(socket.display().to_string());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "no live Herdr handshake at {} inside the startup budget",
+                    "no live Herdr socket at {} inside the startup budget",
                     socket.display()
                 ),
             ));
@@ -1524,20 +1524,30 @@ const WITNESS_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 impl ContinuityGuard {
     /// Opens the retained subscription (initial handshake fails fast) and
     /// starts the drain worker before returning.
-    pub async fn watch_herdr(tag: &str, socket: PathBuf, expected: String) -> io::Result<Self> {
-        let client = muxe_adapter_herdr::HerdrSocketClient::new(&socket);
+    pub async fn watch_herdr(
+        tag: &str,
+        runtime_config: muxe_adapter_herdr::HerdrAdapterConfig,
+        expected: String,
+    ) -> io::Result<Self> {
+        let socket = runtime_config.socket_path.clone();
+        let runtime = muxe_adapter_herdr::HerdrRuntime::connect(runtime_config)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "{tag}: witness runtime failed at {}: {error}",
+                    socket.display()
+                ))
+            })?;
         let config = muxe_adapter_herdr::SubscriptionConfig {
             params: serde_json::json!({ "subscriptions": [{ "type": "tab.focused" }] }),
             subscribe_timeout: WITNESS_SUBSCRIBE_TIMEOUT,
         };
-        let (subscription, _) = muxe_adapter_herdr::EventSubscription::connect(&client, config)
-            .await
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "{tag}: witness subscribe handshake failed at {}: {error}",
-                    socket.display()
-                ))
-            })?;
+        let (subscription, _) = runtime.subscribe(config).await.map_err(|error| {
+            io::Error::other(format!(
+                "{tag}: witness subscribe handshake failed at {}: {error}",
+                socket.display()
+            ))
+        })?;
         let events = std::sync::Arc::new(tokio::sync::Mutex::new((0u64, None)));
         let worker_events = events.clone();
         let task = tokio::spawn(async move {
@@ -1574,19 +1584,19 @@ impl ContinuityGuard {
                 self.tag
             )));
         }
-        let client = muxe_adapter_herdr::HerdrSocketClient::new(&self.socket);
-        let identity = muxe_adapter_herdr::probe_live_identity(&client)
+        let stream = tokio::net::UnixStream::connect(&self.socket)
             .await
             .map_err(|error| {
                 io::Error::other(format!(
-                    "continuity witness '{}': final ping failed at {}: {error}",
+                    "continuity witness '{}': final socket connection failed at {}: {error}",
                     self.tag,
                     self.socket.display()
                 ))
             })?;
-        if identity.discovery_key.as_str() != self.expected {
+        drop(stream);
+        if self.socket.display().to_string() != self.expected {
             return Err(io::Error::other(format!(
-                "continuity witness '{}': live identity changed mid-run",
+                "continuity witness '{}': configured socket changed mid-run",
                 self.tag
             )));
         }

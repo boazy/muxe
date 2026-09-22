@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::{Future, poll_fn},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex, RwLock,
@@ -26,10 +27,11 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::{
-    ApiSchema, CandidateValidationError, ComparisonKey, DeliveryState, EndpointIdentity,
-    EventSubscription, HerdrAdapterConfig, HerdrCache, HerdrResponse, HerdrRuntime,
-    HerdrSocketClient, SocketError, SubscriptionConfig, SubscriptionEvent, fields_to_json,
+    ApiSchema, CandidateValidationError, ComparisonKey, DeliveryState, EventSubscription,
+    HerdrAdapterConfig, HerdrCache, HerdrResponse, HerdrRuntime, SocketError, SubscriptionConfig,
+    SubscriptionEvent, fields_to_json,
     generated::{BUNDLED_REQUEST_SCHEMA_SHA256, method_metadata},
+    runtime::{HerdrRequestAuthority, IncarnationEpoch, IncarnationLease},
     validate_candidate,
 };
 
@@ -40,20 +42,22 @@ const RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const HOST_LOSS_GRACE: Duration = Duration::from_secs(10);
 
 pub struct HerdrAdapter {
-    runtime: RwLock<Arc<HerdrRuntime>>,
+    incarnation: RwLock<IncarnationState>,
     config: HerdrAdapterConfig,
     cache: HerdrCache,
-    identity: RwLock<HostIdentity>,
-    continuity: RwLock<ContinuityState>,
     events_tx: mpsc::Sender<AdapterHealthEvent>,
     events_rx: Mutex<mpsc::Receiver<AdapterHealthEvent>>,
+    continuity_loss_tx: mpsc::UnboundedSender<ContinuityLoss>,
     next_correlation: AtomicU64,
     shutdown: AtomicBool,
     suspended: AtomicBool,
     suspend_wake: Notify,
-    suspended_ack: Notify,
+    suspend: StdMutex<SuspendCoordinator>,
+    suspend_changed: Notify,
     resume_wake: Notify,
     resume_slot: Mutex<Option<EventSubscription>>,
+    resume_registry: StdMutex<ResumeRegistry>,
+    resumes_drained: Notify,
     // The monitor owns the retained subscription socket. Shutdown takes and awaits it
     // so return proves the subscription task stopped; witnesses can observe the stop
     // by the released adapter references.
@@ -69,6 +73,12 @@ pub struct HerdrAdapter {
     pending_leases: StdMutex<HashMap<PendingPaneLeaseId, PendingPaneLeaseRecord>>,
     post_dismissal: Mutex<HashMap<String, Vec<PostDismissalPortableDispatchRequest>>>,
     health_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    reconnect_install_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    resume_install_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    resume_drain_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    suspend_release_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    host_lost_reserve_pending_hook: StdMutex<Option<Arc<WaitHook>>>,
+    request_connect_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
 }
 
 struct DispatchTaskRegistry {
@@ -81,6 +91,29 @@ struct DispatchTaskRegistry {
 struct DispatchTerminal {
     execution: muxe_core::ExecutionId,
     completion: DispatchCompletion,
+}
+
+struct ResumeRegistry {
+    closed: bool,
+    active: usize,
+}
+
+struct ResumeGuard<'a> {
+    adapter: &'a HerdrAdapter,
+}
+
+impl Drop for ResumeGuard<'_> {
+    fn drop(&mut self) {
+        let mut resumes = self
+            .adapter
+            .resume_registry
+            .lock()
+            .expect("Herdr resume registry is not poisoned");
+        resumes.active = resumes.active.saturating_sub(1);
+        if resumes.active == 0 {
+            self.adapter.resumes_drained.notify_waiters();
+        }
+    }
 }
 
 /// Transport-free validator for inspecting configuration against the exact
@@ -117,9 +150,170 @@ impl WaitHook {
     }
 }
 
-struct ContinuityState {
-    epoch: u64,
+async fn wait_on_hook(hook: &StdMutex<Option<Arc<WaitHook>>>) {
+    let hook = hook
+        .lock()
+        .expect("Herdr lifecycle hook is not poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook.entered.notify_one();
+        hook.release.notified().await;
+    }
+}
+
+struct IncarnationState {
+    runtime: Arc<HerdrRuntime>,
+    epoch: IncarnationEpoch,
     healthy: bool,
+}
+impl IncarnationState {
+    fn transition_to_lost(&mut self, lease: &IncarnationLease) -> bool {
+        if !self.healthy || self.epoch != lease.epoch() || self.runtime.lease(self.epoch) != *lease
+        {
+            return false;
+        }
+        self.healthy = false;
+        self.epoch = self.epoch.next();
+        true
+    }
+
+    fn install(
+        &mut self,
+        runtime: Arc<HerdrRuntime>,
+        lease: &IncarnationLease,
+    ) -> Option<(HostIdentity, HostIdentity)> {
+        if self.healthy || self.epoch != lease.epoch() || runtime.lease(self.epoch) != *lease {
+            return None;
+        }
+        let previous = self.runtime.identity().clone();
+        let current = runtime.identity().clone();
+        self.runtime = runtime;
+        self.healthy = true;
+        Some((previous, current))
+    }
+}
+
+#[derive(Clone)]
+struct ContinuityLoss {
+    lease: IncarnationLease,
+    error: AdapterError,
+}
+
+#[derive(Clone)]
+struct IncarnationAuthority {
+    runtime: Arc<HerdrRuntime>,
+    lease: IncarnationLease,
+    continuity_loss_tx: mpsc::UnboundedSender<ContinuityLoss>,
+    request_connect_wait_hook: Option<Arc<WaitHook>>,
+}
+
+impl IncarnationAuthority {
+    async fn invoke_response_with_delivery(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<HerdrResponse, (AdapterError, DeliveryState)> {
+        let metadata = self
+            .runtime
+            .checked_metadata(method, &params)
+            .map_err(|error| (error, DeliveryState::NotSent))?;
+        if let Some(hook) = &self.request_connect_wait_hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+        match self
+            .runtime
+            .invoke_response_on_lease(&self.lease, metadata, params)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let delivery = error.delivery();
+                let replaced = matches!(error, SocketError::EndpointReplaced { .. });
+                let error = socket_error(&error);
+                if replaced {
+                    let _ = self.continuity_loss_tx.send(ContinuityLoss {
+                        lease: self.lease.clone(),
+                        error: error.clone(),
+                    });
+                }
+                Err((error, delivery))
+            }
+        }
+    }
+
+    async fn invoke_response(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<HerdrResponse, AdapterError> {
+        self.invoke_response_with_delivery(method, params)
+            .await
+            .map_err(|(error, _)| error)
+    }
+
+    async fn invoke(&self, method: &str, params: Value) -> Result<Value, AdapterError> {
+        match self.invoke_response(method, params).await? {
+            HerdrResponse::Success(result) => Ok(result),
+            HerdrResponse::Error { code, message } => Err(host_rejection(method, &code, &message)),
+        }
+    }
+}
+
+#[async_trait]
+impl HerdrRequestAuthority for IncarnationAuthority {
+    async fn request(&self, method: &str, params: Value) -> Result<HerdrResponse, AdapterError> {
+        self.invoke_response(method, params).await
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SuspendGeneration(u64);
+
+impl SuspendGeneration {
+    fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SuspendPhase {
+    Requested,
+    Released,
+    HostLost(AdapterError),
+    Shutdown,
+}
+
+#[derive(Clone, Debug)]
+struct SuspendAttempt {
+    generation: SuspendGeneration,
+    lease: IncarnationLease,
+    phase: SuspendPhase,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalLoss {
+    lease: IncarnationLease,
+    error: AdapterError,
+}
+
+struct SuspendCoordinator {
+    next_generation: SuspendGeneration,
+    current: Option<SuspendAttempt>,
+    terminal_loss: Option<TerminalLoss>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostLostSendOutcome {
+    Published,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IncarnationInstallOutcome {
+    Installed,
+    Retry,
+    LifecycleChanged,
+    Stop,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,8 +324,7 @@ enum PendingPaneCloseState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingPaneLeaseRecord {
-    host_epoch: u64,
-    endpoint: EndpointIdentity,
+    incarnation: IncarnationLease,
     ui_session: muxe_adapter_api::UiSessionId,
     pane: muxe_core::PaneId,
     temporary_tab: Option<muxe_core::TabId>,
@@ -149,33 +342,52 @@ impl HerdrAdapter {
     pub async fn connect(config: HerdrAdapterConfig) -> Result<Arc<Self>, AdapterError> {
         let cache = HerdrCache::new(&config.cache_dir);
         let runtime = Arc::new(HerdrRuntime::connect(config.clone()).await?);
+        let lease = runtime.lease(IncarnationEpoch::INITIAL);
         let subscription_config = subscription_config();
-        let (subscription, _) = EventSubscription::connect(runtime.client(), subscription_config)
-            .await
-            .map_err(|error| socket_error(&error))?;
+        let (subscription, _) =
+            EventSubscription::connect_expected(&runtime, lease, subscription_config)
+                .await
+                .map_err(|error| socket_error(&error))?;
         let identity = runtime.identity().clone();
         let (events_tx, events_rx) = mpsc::channel(64);
+        let (continuity_loss_tx, continuity_loss_rx) = mpsc::unbounded_channel();
         let (dispatch_results_tx, dispatch_results_rx) = mpsc::unbounded_channel();
         let adapter = Arc::new(Self {
-            runtime: RwLock::new(runtime),
-            config,
-            cache,
-            identity: RwLock::new(identity.clone()),
-            continuity: RwLock::new(ContinuityState {
-                epoch: 1,
+            incarnation: RwLock::new(IncarnationState {
+                runtime,
+                epoch: IncarnationEpoch::INITIAL,
                 healthy: true,
             }),
+            config,
+            cache,
             events_tx,
             events_rx: Mutex::new(events_rx),
+            continuity_loss_tx,
             next_correlation: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             suspend_wake: Notify::new(),
+            suspend: StdMutex::new(SuspendCoordinator {
+                next_generation: SuspendGeneration(1),
+                current: None,
+                terminal_loss: None,
+            }),
+            suspend_changed: Notify::new(),
             health_wait_hook: StdMutex::new(None),
+            reconnect_install_wait_hook: StdMutex::new(None),
+            resume_install_wait_hook: StdMutex::new(None),
+            resume_drain_wait_hook: StdMutex::new(None),
+            suspend_release_wait_hook: StdMutex::new(None),
+            host_lost_reserve_pending_hook: StdMutex::new(None),
+            request_connect_wait_hook: StdMutex::new(None),
             pending_leases: StdMutex::new(HashMap::new()),
-            suspended_ack: Notify::new(),
             resume_wake: Notify::new(),
             resume_slot: Mutex::new(None),
+            resume_registry: StdMutex::new(ResumeRegistry {
+                closed: false,
+                active: 0,
+            }),
+            resumes_drained: Notify::new(),
             monitor: Mutex::new(None),
             dispatch_results_tx,
             dispatch_results_rx: Mutex::new(dispatch_results_rx),
@@ -198,22 +410,275 @@ impl HerdrAdapter {
             .replace(tokio::spawn(monitor_subscription(
                 Arc::clone(&adapter),
                 subscription,
+                continuity_loss_rx,
             )));
         Ok(adapter)
     }
 
-    pub fn runtime(&self) -> Arc<HerdrRuntime> {
-        self.runtime
+    fn runtime(&self) -> Arc<HerdrRuntime> {
+        self.incarnation
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runtime
             .clone()
     }
 
     fn identity(&self) -> HostIdentity {
-        self.identity
+        self.incarnation
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runtime
+            .identity()
             .clone()
+    }
+    fn transition_to_lost(&self, lease: &IncarnationLease) -> bool {
+        let mut incarnation = self
+            .incarnation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.load(Ordering::Relaxed) || self.suspended.load(Ordering::SeqCst) {
+            return false;
+        }
+        incarnation.transition_to_lost(lease)
+    }
+
+    fn reconnect_epoch(&self) -> Option<IncarnationEpoch> {
+        let incarnation = self
+            .incarnation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!incarnation.healthy).then_some(incarnation.epoch)
+    }
+
+    async fn install_reconnected(
+        &self,
+        runtime: Arc<HerdrRuntime>,
+        lease: &IncarnationLease,
+    ) -> IncarnationInstallOutcome {
+        wait_on_hook(&self.reconnect_install_wait_hook).await;
+        let permit = match self.events_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return IncarnationInstallOutcome::Retry;
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return IncarnationInstallOutcome::Stop;
+            }
+        };
+        let mut incarnation = self
+            .incarnation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.load(Ordering::Relaxed) || self.suspended.load(Ordering::SeqCst) {
+            return IncarnationInstallOutcome::LifecycleChanged;
+        }
+        let Some((previous, current)) = incarnation.install(runtime, lease) else {
+            return IncarnationInstallOutcome::Retry;
+        };
+        permit.send(AdapterHealthEvent::Reconnected { previous, current });
+        IncarnationInstallOutcome::Installed
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would make resume admission inconsistent with the adapter lifecycle API"
+    )]
+    fn admit_resume(&self) -> Result<ResumeGuard<'_>, AdapterError> {
+        let mut resumes = self
+            .resume_registry
+            .lock()
+            .expect("Herdr resume registry is not poisoned");
+        if resumes.closed || self.shutdown.load(Ordering::Relaxed) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Herdr adapter is shut down; refusing to start activation resume",
+            ));
+        }
+        resumes.active = resumes.active.saturating_add(1);
+        Ok(ResumeGuard { adapter: self })
+    }
+
+    async fn shutdown_cancellable<T>(
+        &self,
+        future: impl Future<Output = T>,
+    ) -> Result<T, AdapterError> {
+        tokio::pin!(future);
+        loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Shutdown,
+                    "Herdr adapter shut down during activation resume",
+                ));
+            }
+            tokio::select! {
+                result = &mut future => return Ok(result),
+                () = self.suspend_wake.notified() => {
+                    if self.shutdown.load(Ordering::Relaxed) {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Shutdown,
+                            "Herdr adapter shut down during activation resume",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn close_resumes_and_wait(&self) {
+        {
+            let mut resumes = self
+                .resume_registry
+                .lock()
+                .expect("Herdr resume registry is not poisoned");
+            resumes.closed = true;
+        }
+        self.suspend_wake.notify_waiters();
+        loop {
+            let drained = self.resumes_drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self
+                .resume_registry
+                .lock()
+                .expect("Herdr resume registry is not poisoned")
+                .active
+                == 0
+            {
+                return;
+            }
+            wait_on_hook(&self.resume_drain_wait_hook).await;
+            drained.await;
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would make suspend admission inconsistent with the lifecycle API"
+    )]
+    fn begin_or_join_suspend(&self) -> Result<(SuspendGeneration, bool), AdapterError> {
+        let mut incarnation = self
+            .incarnation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Herdr adapter is shut down; refusing to suspend it",
+            ));
+        }
+        let mut suspend = self
+            .suspend
+            .lock()
+            .expect("Herdr suspend coordinator is not poisoned");
+        if let Some(attempt) = &suspend.current {
+            return Ok((attempt.generation, false));
+        }
+        let generation = suspend.next_generation;
+        suspend.next_generation = generation.next();
+        let (lease, phase, requested) = if let Some(loss) = &suspend.terminal_loss {
+            (
+                loss.lease.clone(),
+                SuspendPhase::HostLost(loss.error.clone()),
+                false,
+            )
+        } else {
+            (
+                incarnation.runtime.lease(incarnation.epoch),
+                SuspendPhase::Requested,
+                true,
+            )
+        };
+        suspend.current = Some(SuspendAttempt {
+            generation,
+            lease,
+            phase,
+        });
+        self.suspended.store(true, Ordering::SeqCst);
+        incarnation.healthy = false;
+        Ok((generation, requested))
+    }
+
+    async fn wait_for_suspend(&self, generation: SuspendGeneration) -> Result<(), AdapterError> {
+        loop {
+            let changed = self.suspend_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let phase = self
+                .suspend
+                .lock()
+                .expect("Herdr suspend coordinator is not poisoned")
+                .current
+                .as_ref()
+                .filter(|attempt| attempt.generation == generation)
+                .map(|attempt| attempt.phase.clone());
+            match phase {
+                Some(SuspendPhase::Requested) => changed.await,
+                Some(SuspendPhase::Released) => return Ok(()),
+                Some(SuspendPhase::HostLost(error)) => return Err(error),
+                Some(SuspendPhase::Shutdown) | None => {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Shutdown,
+                        "Herdr suspend attempt ended during shutdown",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn requested_suspend_for(&self, lease: Option<&IncarnationLease>) -> Option<SuspendGeneration> {
+        self.suspend
+            .lock()
+            .expect("Herdr suspend coordinator is not poisoned")
+            .current
+            .as_ref()
+            .filter(|attempt| {
+                lease.is_none_or(|lease| attempt.lease == *lease)
+                    && matches!(attempt.phase, SuspendPhase::Requested)
+            })
+            .map(|attempt| attempt.generation)
+    }
+
+    fn complete_suspend(&self, generation: SuspendGeneration, phase: SuspendPhase) {
+        let mut suspend = self
+            .suspend
+            .lock()
+            .expect("Herdr suspend coordinator is not poisoned");
+        if let Some(attempt) = &mut suspend.current
+            && attempt.generation == generation
+            && matches!(attempt.phase, SuspendPhase::Requested)
+        {
+            attempt.phase = phase;
+            self.suspend_changed.notify_waiters();
+        }
+    }
+
+    fn record_terminal_loss(&self, lease: &IncarnationLease, error: &AdapterError) {
+        let mut suspend = self
+            .suspend
+            .lock()
+            .expect("Herdr suspend coordinator is not poisoned");
+        suspend.terminal_loss = Some(TerminalLoss {
+            lease: lease.clone(),
+            error: error.clone(),
+        });
+        if let Some(attempt) = &mut suspend.current
+            && attempt.lease == *lease
+            && matches!(attempt.phase, SuspendPhase::Requested)
+        {
+            attempt.phase = SuspendPhase::HostLost(error.clone());
+        }
+        self.suspend_changed.notify_waiters();
+    }
+
+    fn complete_suspend_shutdown(&self) {
+        let mut suspend = self
+            .suspend
+            .lock()
+            .expect("Herdr suspend coordinator is not poisoned");
+        if let Some(attempt) = &mut suspend.current {
+            attempt.phase = SuspendPhase::Shutdown;
+        }
+        self.suspend_changed.notify_waiters();
     }
 
     #[doc(hidden)]
@@ -222,6 +687,93 @@ impl HerdrAdapter {
             .health_wait_hook
             .lock()
             .expect("Herdr health hook is not poisoned") = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn set_reconnect_install_wait_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .reconnect_install_wait_hook
+            .lock()
+            .expect("Herdr reconnect-install hook is not poisoned") = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn set_resume_install_wait_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .resume_install_wait_hook
+            .lock()
+            .expect("Herdr resume-install hook is not poisoned") = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn set_resume_drain_wait_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .resume_drain_wait_hook
+            .lock()
+            .expect("Herdr resume-drain hook is not poisoned") = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn set_suspend_release_wait_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .suspend_release_wait_hook
+            .lock()
+            .expect("Herdr suspend-release hook is not poisoned") = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn set_host_lost_reserve_pending_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .host_lost_reserve_pending_hook
+            .lock()
+            .expect("Herdr HostLost reserve-pending hook is not poisoned") = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn set_request_connect_wait_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .request_connect_wait_hook
+            .lock()
+            .expect("Herdr request-connect hook is not poisoned") = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn fill_health_queue_for_test(&self) -> usize {
+        let mut filled = 0;
+        while self
+            .events_tx
+            .try_send(AdapterHealthEvent::Unhealthy {
+                modal_scope: None,
+                error: AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "deterministic health-queue filler",
+                ),
+            })
+            .is_ok()
+        {
+            filled += 1;
+        }
+        filled
+    }
+
+    #[doc(hidden)]
+    pub async fn drain_health_queue_for_test(&self) -> Vec<AdapterHealthEvent> {
+        let mut events = self.events_rx.lock().await;
+        let mut drained = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            drained.push(event);
+        }
+        drained
+    }
+
+    #[doc(hidden)]
+    pub fn shutdown_started_for_test(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn suspended_for_test(&self) -> bool {
+        self.suspended.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]
@@ -291,15 +843,15 @@ impl HerdrAdapter {
     /// One explicit adapter lifecycle gate for every host-bound operation,
     /// mirroring Zellij's `require_active` shape: a shut-down adapter fails
     /// closed with `Shutdown` first, a suspended adapter is `Unavailable`
-    /// while its retained stream is released, and only then does the retained
-    /// continuity epoch authorize the call. `identity` stays on continuity
+    /// while its retained stream is released, and only then does the exact
+    /// runtime/epoch lease authorize the call. `identity` stays on continuity
     /// alone (it returns the retained identity, never a new host request) so
     /// its error behavior is unchanged.
     #[expect(
         clippy::result_large_err,
         reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
     )]
-    fn require_lifecycle(&self) -> Result<u64, AdapterError> {
+    fn require_lifecycle(&self) -> Result<IncarnationAuthority, AdapterError> {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(AdapterError::new(
                 AdapterErrorKind::Shutdown,
@@ -319,13 +871,22 @@ impl HerdrAdapter {
         clippy::result_large_err,
         reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
     )]
-    fn require_continuity(&self) -> Result<u64, AdapterError> {
-        let continuity = self
-            .continuity
+    fn require_continuity(&self) -> Result<IncarnationAuthority, AdapterError> {
+        let incarnation = self
+            .incarnation
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if continuity.healthy {
-            Ok(continuity.epoch)
+        if incarnation.healthy {
+            Ok(IncarnationAuthority {
+                runtime: Arc::clone(&incarnation.runtime),
+                lease: incarnation.runtime.lease(incarnation.epoch),
+                continuity_loss_tx: self.continuity_loss_tx.clone(),
+                request_connect_wait_hook: self
+                    .request_connect_wait_hook
+                    .lock()
+                    .expect("Herdr request-connect hook is not poisoned")
+                    .clone(),
+            })
         } else {
             Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
@@ -341,15 +902,19 @@ impl HerdrAdapter {
     fn require_current_origin(
         &self,
         origin: &muxe_core::OriginContext,
-    ) -> Result<u64, AdapterError> {
-        let epoch = self.require_lifecycle()?;
-        if !origin_is_current(origin, &self.identity(), epoch) {
+    ) -> Result<IncarnationAuthority, AdapterError> {
+        let authority = self.require_lifecycle()?;
+        if !origin_is_current(
+            origin,
+            authority.runtime.identity(),
+            authority.lease.epoch(),
+        ) {
             return Err(AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
                 "captured Herdr origin belongs to a prior continuity epoch",
             ));
         }
-        Ok(epoch)
+        Ok(authority)
     }
 
     fn validate_native_batch_cached(
@@ -455,34 +1020,22 @@ impl HerdrAdapter {
     )]
     fn dispatch(
         &self,
+        authority: IncarnationAuthority,
         execution: muxe_core::ExecutionId,
         invocation: Invocation,
     ) -> Result<DispatchAccepted, AdapterError> {
-        // The closed registry already rejects admission after shutdown, but
-        // the lifecycle gate owns the ordering (shutdown → suspended →
-        // continuity) and covers the window before shutdown closes it.
-        self.require_lifecycle()?;
-        let runtime = self.runtime();
-        runtime
-            .schema()
-            .validate_method(invocation.method, &invocation.params)
-            .map_err(|error| {
-                incompatible(format!(
-                    "active Herdr schema rejects {}: {error}",
-                    invocation.method
-                ))
-            })?;
-        let metadata = method_metadata(invocation.method).ok_or_else(|| {
-            incompatible(format!(
-                "bundled Herdr metadata does not declare {}",
-                invocation.method
-            ))
-        })?;
-        let client = Arc::clone(runtime.client());
+        // The authority joins the origin validation, schema, and exact
+        // endpoint lease used by the background write.
+        authority
+            .runtime
+            .checked_metadata(invocation.method, &invocation.params)?;
         let results = self.dispatch_results_tx.clone();
         self.admit_dispatch_task(execution, move || {
             tokio::spawn(async move {
-                let completion = match client.unary(metadata, invocation.params).await {
+                let completion = match authority
+                    .invoke_response_with_delivery(invocation.method, invocation.params)
+                    .await
+                {
                     Ok(HerdrResponse::Success(_)) => DispatchCompletion::Succeeded { execution },
                     Ok(HerdrResponse::Error { code, message }) => DispatchCompletion::Failed {
                         execution,
@@ -490,20 +1043,16 @@ impl HerdrAdapter {
                             AdapterErrorKind::DispatchFailed,
                             format!(
                                 "Herdr {} rejected request with {code}: {message}",
-                                metadata.method
+                                invocation.method
                             ),
                         ),
                     },
-                    Err(error) if error.delivery() == DeliveryState::MayHaveReachedHost => {
-                        DispatchCompletion::OutcomeUnknown {
-                            execution,
-                            error: socket_error(&error),
-                        }
+                    Err((error, DeliveryState::MayHaveReachedHost)) => {
+                        DispatchCompletion::OutcomeUnknown { execution, error }
                     }
-                    Err(error) => DispatchCompletion::Failed {
-                        execution,
-                        error: socket_error(&error),
-                    },
+                    Err((error, DeliveryState::NotSent)) => {
+                        DispatchCompletion::Failed { execution, error }
+                    }
                 };
                 let _ = results.send(DispatchTerminal {
                     execution,
@@ -531,8 +1080,7 @@ impl HerdrAdapter {
         origin: &muxe_core::OriginContext,
         target_index: u64,
     ) -> Result<DispatchAccepted, AdapterError> {
-        self.require_lifecycle()?;
-        let runtime = self.runtime();
+        let authority = self.require_current_origin(origin)?;
         let source_tab = origin_tab(origin)?.to_owned();
         let workspace = origin
             .workspace_id
@@ -545,7 +1093,7 @@ impl HerdrAdapter {
                 )
             })?;
         for method in ["tab.list", "tab.move"] {
-            if runtime.schema().method(method).is_none() {
+            if authority.runtime.schema().method(method).is_none() {
                 return Err(incompatible(format!(
                     "active Herdr schema does not declare required method {method}"
                 )));
@@ -556,14 +1104,11 @@ impl HerdrAdapter {
                 )));
             }
         }
-        let client = Arc::clone(runtime.client());
-        let schema = Arc::clone(runtime.schema());
         let results = self.dispatch_results_tx.clone();
         self.admit_dispatch_task(execution, move || {
             tokio::spawn(async move {
                 let completion =
-                    match perform_tab_swap(&client, &schema, &workspace, &source_tab, target_index)
-                        .await
+                    match perform_tab_swap(&authority, &workspace, &source_tab, target_index).await
                     {
                         Ok(()) => DispatchCompletion::Succeeded { execution },
                         Err(TabSwapError::Known(message)) => DispatchCompletion::Failed {
@@ -615,7 +1160,7 @@ impl HerdrAdapter {
         &self,
         request: &PostDismissalPortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
-        self.require_current_origin(&request.origin)?;
+        let authority = self.require_current_origin(&request.origin)?;
         if creation_has_program(&request.action.action) {
             return self.dispatch_command_creation(
                 request.execution,
@@ -624,7 +1169,7 @@ impl HerdrAdapter {
             );
         }
         let invocation = portable_invocation(&request.action.action, &request.origin)?;
-        self.dispatch(request.execution, invocation)
+        self.dispatch(authority, request.execution, invocation)
     }
 
     #[expect(
@@ -637,20 +1182,13 @@ impl HerdrAdapter {
         action: &PortableAction,
         origin: &muxe_core::OriginContext,
     ) -> Result<DispatchAccepted, AdapterError> {
-        self.require_lifecycle()?;
-        let runtime = self.runtime();
+        let authority = self.require_current_origin(origin)?;
         let results = self.dispatch_results_tx.clone();
         let action = action.clone();
         let origin = origin.clone();
         self.admit_dispatch_task(execution, move || {
             tokio::spawn(async move {
-                let completion = match perform_command_creation(
-                    runtime.client(),
-                    runtime.schema(),
-                    &action,
-                    &origin,
-                )
-                .await
+                let completion = match perform_command_creation(&authority, &action, &origin).await
                 {
                     Ok(()) => DispatchCompletion::Succeeded { execution },
                     Err(error) if error.kind == AdapterErrorKind::OutcomeUnknown => {
@@ -744,58 +1282,8 @@ impl HerdrAdapter {
         }
     }
 
-    async fn invoke_unary_response(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<HerdrResponse, AdapterError> {
-        self.require_lifecycle()?;
-        let runtime = self.runtime();
-        runtime
-            .schema()
-            .validate_method(method, &params)
-            .map_err(|error| {
-                incompatible(format!("active Herdr schema rejects {method}: {error}"))
-            })?;
-        let metadata = method_metadata(method).ok_or_else(|| {
-            incompatible(format!("bundled Herdr metadata does not declare {method}"))
-        })?;
-        runtime
-            .client()
-            .unary(metadata, params)
-            .await
-            .map_err(|error| socket_error(&error))
-    }
-
-    async fn invoke_unary_response_on_endpoint(
-        &self,
-        method: &str,
-        params: Value,
-        endpoint: &EndpointIdentity,
-    ) -> Result<HerdrResponse, AdapterError> {
-        self.require_lifecycle()?;
-        let runtime = self.runtime();
-        runtime
-            .schema()
-            .validate_method(method, &params)
-            .map_err(|error| {
-                incompatible(format!("active Herdr schema rejects {method}: {error}"))
-            })?;
-        let metadata = method_metadata(method).ok_or_else(|| {
-            incompatible(format!("bundled Herdr metadata does not declare {method}"))
-        })?;
-        runtime
-            .client()
-            .unary_on_expected_endpoint(metadata, params, endpoint)
-            .await
-            .map_err(|error| socket_error(&error))
-    }
-
     async fn invoke_unary(&self, method: &str, params: Value) -> Result<Value, AdapterError> {
-        match self.invoke_unary_response(method, params).await? {
-            HerdrResponse::Success(result) => Ok(result),
-            HerdrResponse::Error { code, message } => Err(host_rejection(method, &code, &message)),
-        }
+        self.require_lifecycle()?.invoke(method, params).await
     }
 
     #[expect(
@@ -806,7 +1294,7 @@ impl HerdrAdapter {
         &self,
         registration: &PendingPaneRegistration,
         lease: &PendingPaneLease,
-        epoch: u64,
+        incarnation: &IncarnationLease,
     ) -> Result<PendingPaneLeaseRecord, AdapterError> {
         self.pending_leases
             .lock()
@@ -815,7 +1303,7 @@ impl HerdrAdapter {
             .cloned()
             .filter(|record| {
                 lease.ui_session == registration.ui_session
-                    && record.host_epoch == epoch
+                    && record.incarnation == *incarnation
                     && record.ui_session == lease.ui_session
                     && record.pane == registration.pane
                     && record.temporary_tab == registration.temporary_tab
@@ -1521,9 +2009,9 @@ impl HostAdapter for HerdrAdapter {
         &self,
         registration: PendingPaneRegistration,
     ) -> Result<PendingPaneLease, AdapterError> {
-        let epoch = self.require_lifecycle()?;
-        let pane = self
-            .invoke_unary("pane.get", json!({ "pane_id": registration.pane.as_str() }))
+        let authority = self.require_lifecycle()?;
+        let pane = authority
+            .invoke("pane.get", json!({ "pane_id": registration.pane.as_str() }))
             .await?;
         let object = crate::pane_info(&pane).ok_or_else(|| {
             AdapterError::new(
@@ -1547,8 +2035,10 @@ impl HostAdapter for HerdrAdapter {
             ));
         }
         let id = PendingPaneLeaseId::new(format!(
-            "herdr:{epoch}:{}:{}",
-            registration.ui_session, registration.pane
+            "herdr:{}:{}:{}",
+            authority.lease.epoch().get(),
+            registration.ui_session,
+            registration.pane
         ));
         self.pending_leases
             .lock()
@@ -1556,8 +2046,7 @@ impl HostAdapter for HerdrAdapter {
             .insert(
                 id.clone(),
                 PendingPaneLeaseRecord {
-                    host_epoch: epoch,
-                    endpoint: self.runtime().endpoint().clone(),
+                    incarnation: authority.lease,
                     ui_session: registration.ui_session.clone(),
                     pane: registration.pane.clone(),
                     temporary_tab: registration.temporary_tab.clone(),
@@ -1575,14 +2064,10 @@ impl HostAdapter for HerdrAdapter {
         registration: PendingPaneRegistration,
         lease: PendingPaneLease,
     ) -> Result<(), AdapterError> {
-        let epoch = self.require_lifecycle()?;
-        let record = self.pending_close_record(&registration, &lease, epoch)?;
-        let pane = match self
-            .invoke_unary_response_on_endpoint(
-                "pane.get",
-                json!({ "pane_id": record.pane.as_str() }),
-                &record.endpoint,
-            )
+        let authority = self.require_lifecycle()?;
+        let record = self.pending_close_record(&registration, &lease, &authority.lease)?;
+        let pane = match authority
+            .invoke_response("pane.get", json!({ "pane_id": record.pane.as_str() }))
             .await?
         {
             HerdrResponse::Success(pane) => pane,
@@ -1612,27 +2097,20 @@ impl HostAdapter for HerdrAdapter {
                 "pending Herdr pane identity changed",
             ));
         }
-        if self.require_lifecycle()? != record.host_epoch {
+        let authority = self.require_lifecycle()?;
+        if authority.lease != record.incarnation {
             return Err(pending_cleanup_lease_stale());
         }
-        // Re-check immediately before the state-changing send: a shutdown
-        // that raced the pane.get probe must not let a cloned lease's
-        // endpoint request reach the host after shutdown returned.
-        self.require_lifecycle()?;
-        let runtime = self.runtime();
-        let close_params = json!({ "pane_id": record.pane.as_str() });
-        runtime
-            .schema()
-            .validate_method("pane.close", &close_params)
-            .map_err(|error| {
-                incompatible(format!("active Herdr schema rejects pane.close: {error}"))
-            })?;
-        let metadata = method_metadata("pane.close")
-            .ok_or_else(|| incompatible("bundled Herdr metadata does not declare pane.close"))?;
+        // Re-check immediately before the state-changing send: a lifecycle
+        // transition that raced the pane.get probe must fail the exact lease
+        // before any close byte is written.
+        let authority = self.require_lifecycle()?;
+        if authority.lease != record.incarnation {
+            return Err(pending_cleanup_lease_stale());
+        }
         self.claim_pending_close(&lease.id, &record)?;
-        match runtime
-            .client()
-            .unary_on_expected_endpoint(metadata, close_params, &record.endpoint)
+        match authority
+            .invoke_response_with_delivery("pane.close", json!({ "pane_id": record.pane.as_str() }))
             .await
         {
             Ok(HerdrResponse::Success(_)) => {
@@ -1653,11 +2131,11 @@ impl HostAdapter for HerdrAdapter {
                 self.reopen_pending_close(&lease.id, &record);
                 Err(host_rejection("pane.close", &code, &message))
             }
-            Err(error) => {
-                if error.delivery() == DeliveryState::NotSent {
+            Err((error, delivery)) => {
+                if delivery == DeliveryState::NotSent {
                     self.reopen_pending_close(&lease.id, &record);
                 }
-                Err(socket_error(&error))
+                Err(error)
             }
         }
     }
@@ -1673,22 +2151,26 @@ impl HostAdapter for HerdrAdapter {
         &self,
         request: OriginCaptureRequest,
     ) -> Result<muxe_core::OriginContext, AdapterError> {
-        let epoch = self.require_lifecycle()?;
-        let runtime = self.runtime();
-        let origin = crate::origin::capture_origin(
-            runtime.client(),
+        let authority = self.require_lifecycle()?;
+        let snapshot = authority
+            .invoke_response("session.snapshot", Value::Object(serde_json::Map::new()))
+            .await?;
+        crate::origin::capture_origin_from_snapshot(
             &request,
-            muxe_core::ServerId::new(origin_epoch_token(&self.identity(), epoch)),
+            muxe_core::ServerId::new(origin_epoch_token(
+                authority.runtime.identity(),
+                authority.lease.epoch(),
+            )),
+            snapshot,
         )
-        .await?;
-        Ok(origin)
+        .map_err(|error| *error)
     }
 
     async fn dispatch_portable(
         &self,
         request: PortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
-        self.require_current_origin(&request.origin)?;
+        let authority = self.require_current_origin(&request.origin)?;
         if let PortableAction::Tab(TabAction::Swap(muxe_core::IndexOrDirection::Index(index))) =
             &request.action.action
         {
@@ -1712,7 +2194,7 @@ impl HostAdapter for HerdrAdapter {
             );
         }
         let invocation = portable_invocation(&request.action.action, &request.origin)?;
-        self.dispatch(request.execution, invocation)
+        self.dispatch(authority, request.execution, invocation)
     }
 
     async fn dispatch_portable_after_ui_dismissal(
@@ -1726,10 +2208,9 @@ impl HostAdapter for HerdrAdapter {
         &self,
         request: NativeDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
-        self.require_current_origin(&request.origin)?;
-        let runtime = self.runtime();
-        let metadata =
-            validate_candidate(runtime.schema(), &request.action.candidate).map_err(|error| {
+        let authority = self.require_current_origin(&request.origin)?;
+        let metadata = validate_candidate(authority.runtime.schema(), &request.action.candidate)
+            .map_err(|error| {
                 incompatible(format!(
                     "active Herdr schema rejects native action: {}",
                     error.error
@@ -1741,6 +2222,7 @@ impl HostAdapter for HerdrAdapter {
                 incompatible(format!("could not serialize native Herdr action: {error}"))
             })?;
         self.dispatch(
+            authority,
             request.execution,
             Invocation {
                 method: metadata.method,
@@ -1817,122 +2299,134 @@ impl HostAdapter for HerdrAdapter {
     }
 
     async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
-        if self.suspended.swap(true, Ordering::SeqCst) {
-            return Ok(());
+        let (generation, requested) = self.begin_or_join_suspend()?;
+        if requested {
+            self.pending_leases
+                .lock()
+                .expect("Herdr pending lease registry is not poisoned")
+                .clear();
+            self.suspend_wake.notify_one();
         }
-        // Fail closed while the old stream drains: no host-bound operation may
-        // proceed on a subscription that is about to be released to a target.
-        {
-            let mut continuity = self
-                .continuity
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            continuity.healthy = false;
-        }
-        self.pending_leases
-            .lock()
-            .expect("Herdr pending lease registry is not poisoned")
-            .clear();
-
-        self.suspend_wake.notify_one();
-        // The monitor acks only after dropping the subscription socket, so this
-        // await proves the old server observed the disconnect before any target
-        // connects. Single-flight: the coordinator serializes Prepare/Abort.
-        self.suspended_ack.notified().await;
-        let _ = self
-            .events_tx
-            .send(AdapterHealthEvent::Unhealthy {
-                modal_scope: None,
-                error: AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    "Herdr retained event-subscription suspended for activation",
-                ),
-            })
-            .await;
-        Ok(())
+        self.wait_for_suspend(generation).await
     }
 
     async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
-        if self.shutdown.load(Ordering::Relaxed) {
-            return Err(AdapterError::new(
-                AdapterErrorKind::Shutdown,
-                "Herdr adapter is shut down; refusing to install a resumed subscription",
-            ));
-        }
-        if !self.suspended.load(Ordering::SeqCst) {
+        let _resume_guard = self.admit_resume()?;
+        let (prior_epoch, prior_lease) = {
+            let incarnation = self
+                .incarnation
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                incarnation.epoch,
+                incarnation.runtime.lease(incarnation.epoch),
+            )
+        };
+        let released = self
+            .suspend
+            .lock()
+            .expect("Herdr suspend coordinator is not poisoned")
+            .current
+            .as_ref()
+            .is_some_and(|attempt| {
+                attempt.lease == prior_lease && matches!(attempt.phase, SuspendPhase::Released)
+            });
+        if !released {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Herdr adapter is not suspended for activation; refusing to fabricate a resumed subscription",
+                "Herdr activation resume requires a completed exact-subscription suspension",
             ));
         }
-        let previous = self.identity();
-        // Fresh schema validation from the exact installed executable plus a live
-        // probe. Any failure leaves the adapter unhealthy with the journal
-        // preserved; rollback is never claimed healthy.
-        let refreshed = HerdrRuntime::connect(self.config.clone())
-            .await
-            .map_err(|error| {
-                AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    format!(
-                        "Herdr activation resume could not revalidate the retained host: {error}"
-                    ),
-                )
-            })?;
-        let refreshed = Arc::new(refreshed);
-        let (subscription, _) =
-            EventSubscription::connect(refreshed.client(), subscription_config())
-                .await
-                .map_err(|error| socket_error(&error))?;
-        let current = refreshed.identity().clone();
+        let fresh_epoch = prior_epoch.next();
+        // Fresh schema validation, live identity, and the successful guarded
+        // subscription are assembled before any part becomes current. Both
+        // futures are adapter-owned and dropped immediately when shutdown wins.
+        let refreshed = Arc::new(
+            self.shutdown_cancellable(HerdrRuntime::connect(self.config.clone()))
+                .await??,
+        );
+        let lease = refreshed.lease(fresh_epoch);
+        let (subscription, _) = self
+            .shutdown_cancellable(EventSubscription::connect_expected(
+                &refreshed,
+                lease,
+                subscription_config(),
+            ))
+            .await?
+            .map_err(|error| socket_error(&error))?;
+        self.shutdown_cancellable(wait_on_hook(&self.resume_install_wait_hook))
+            .await?;
+        let permit = self.events_tx.try_reserve().map_err(|error| {
+            let kind = match error {
+                mpsc::error::TrySendError::Full(()) => AdapterErrorKind::Unavailable,
+                mpsc::error::TrySendError::Closed(()) => AdapterErrorKind::Shutdown,
+            };
+            AdapterError::new(
+                kind,
+                "Herdr activation resume could not reserve coherent health publication",
+            )
+        })?;
+        let mut slot = self.shutdown_cancellable(self.resume_slot.lock()).await?;
         {
-            let mut runtime = self
-                .runtime
+            let mut incarnation = self
+                .incarnation
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *runtime = refreshed;
-        }
-        {
-            let mut identity = self
-                .identity
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *identity = current.clone();
-        }
-        {
-            // A fresh local epoch: raw endpoint equality is diagnostic only and
-            // never continuity proof, so stale origins stay rejected. A shutdown
-            // that raced the resume must win: re-check before installing a new
-            // epoch so no fresh subscription revives a shut-down adapter.
+            let mut suspend = self
+                .suspend
+                .lock()
+                .expect("Herdr suspend coordinator is not poisoned");
             if self.shutdown.load(Ordering::Relaxed) {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Shutdown,
                     "Herdr adapter shut down during activation resume; refusing to install a resumed subscription",
                 ));
             }
-            let mut continuity = self
-                .continuity
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            continuity.epoch = continuity.epoch.saturating_add(1);
-            continuity.healthy = true;
-        }
-        {
-            let mut slot = self.resume_slot.lock().await;
+            let released = suspend.current.as_ref().is_some_and(|attempt| {
+                attempt.lease == prior_lease && matches!(attempt.phase, SuspendPhase::Released)
+            });
+            if !self.suspended.load(Ordering::SeqCst)
+                || incarnation.epoch != prior_epoch
+                || incarnation.healthy
+                || !released
+            {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Herdr activation resume raced another incarnation transition",
+                ));
+            }
+            let previous = incarnation.runtime.identity().clone();
+            let current = refreshed.identity().clone();
             *slot = Some(subscription);
+            incarnation.runtime = refreshed;
+            incarnation.epoch = fresh_epoch;
+            incarnation.healthy = true;
+            suspend.current = None;
+            suspend.terminal_loss = None;
+            self.suspended.store(false, Ordering::SeqCst);
+            permit.send(AdapterHealthEvent::Reconnected { previous, current });
+            self.suspend_changed.notify_waiters();
         }
-        // Clear the flag before waking: the parked monitor must observe a live
-        // adapter when it takes the handed-over subscription.
-        self.suspended.store(false, Ordering::SeqCst);
+        drop(slot);
         self.resume_wake.notify_one();
-        let _ = self
-            .events_tx
-            .send(AdapterHealthEvent::Reconnected { previous, current })
-            .await;
         Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
+        // Lifecycle flags and incarnation health change under one write
+        // authority. An install linearized before this point is invalidated;
+        // one arriving after it must observe shutdown and reject publication.
+        {
+            let mut incarnation = self
+                .incarnation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.shutdown.store(true, Ordering::Relaxed);
+            incarnation.healthy = false;
+        }
+        self.complete_suspend_shutdown();
+        self.resume_wake.notify_waiters();
+        self.close_resumes_and_wait().await;
         let tasks = {
             let mut registry = self
                 .dispatch_tasks
@@ -1942,18 +2436,6 @@ impl HostAdapter for HerdrAdapter {
             registry.joining = registry.joining.saturating_add(registry.tasks.len());
             std::mem::take(&mut registry.tasks)
         };
-        self.shutdown.store(true, Ordering::Relaxed);
-        // Invalidate continuity before stopping the stream: no later path may
-        // see a healthy epoch, and a racing resume/reconnect cannot install a
-        // fresh subscription after this point. The parked monitor also drops
-        // its resume slot below so a handed-over subscription cannot revive it.
-        {
-            let mut continuity = self
-                .continuity
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            continuity.healthy = false;
-        }
         self.pending_leases
             .lock()
             .expect("Herdr pending lease registry is not poisoned")
@@ -1988,9 +2470,86 @@ impl HostAdapter for HerdrAdapter {
 }
 
 async fn send_health_or_shutdown(adapter: &Arc<HerdrAdapter>, event: AdapterHealthEvent) -> bool {
-    tokio::select! {
-        sent = adapter.events_tx.send(event) => sent.is_ok(),
-        () = adapter.suspend_wake.notified() => !adapter.shutdown.load(Ordering::Relaxed),
+    let mut event = Some(event);
+    loop {
+        if adapter.shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        let reserve = adapter.events_tx.reserve();
+        tokio::pin!(reserve);
+        tokio::select! {
+            permit = &mut reserve => {
+                let Ok(permit) = permit else {
+                    return false;
+                };
+                let _incarnation = adapter
+                    .incarnation
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if adapter.shutdown.load(Ordering::Relaxed) {
+                    return false;
+                }
+                permit.send(event.take().expect("health event is published once"));
+                return true;
+            }
+            () = adapter.suspend_wake.notified() => {
+                if adapter.shutdown.load(Ordering::Relaxed) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+async fn send_host_lost_or_shutdown(
+    adapter: &Arc<HerdrAdapter>,
+    event: AdapterHealthEvent,
+) -> HostLostSendOutcome {
+    let pending_hook = adapter
+        .host_lost_reserve_pending_hook
+        .lock()
+        .expect("Herdr HostLost reserve-pending hook is not poisoned")
+        .clone();
+    let mut event = Some(event);
+    loop {
+        if adapter.shutdown.load(Ordering::Relaxed) {
+            return HostLostSendOutcome::Shutdown;
+        }
+        let reserve = adapter.events_tx.reserve();
+        tokio::pin!(reserve);
+        let mut pending_reported = false;
+        let observed_reserve = poll_fn(|context| {
+            let result = reserve.as_mut().poll(context);
+            if result.is_pending() && !pending_reported {
+                pending_reported = true;
+                if let Some(hook) = &pending_hook {
+                    hook.entered.notify_one();
+                }
+            }
+            result
+        });
+        tokio::pin!(observed_reserve);
+        tokio::select! {
+            permit = &mut observed_reserve => {
+                let Ok(permit) = permit else {
+                    return HostLostSendOutcome::Shutdown;
+                };
+                let _incarnation = adapter
+                    .incarnation
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if adapter.shutdown.load(Ordering::Relaxed) {
+                    return HostLostSendOutcome::Shutdown;
+                }
+                permit.send(event.take().expect("HostLost event is published once"));
+                return HostLostSendOutcome::Published;
+            }
+            () = adapter.suspend_wake.notified() => {
+                if adapter.shutdown.load(Ordering::Relaxed) {
+                    return HostLostSendOutcome::Shutdown;
+                }
+            }
+        }
     }
 }
 fn subscription_config() -> SubscriptionConfig {
@@ -2005,60 +2564,106 @@ fn subscription_config() -> SubscriptionConfig {
     }
 }
 
-fn origin_epoch_token(identity: &HostIdentity, epoch: u64) -> String {
-    format!("{}#continuity-{epoch}", identity.live_server_id)
+fn origin_epoch_token(identity: &HostIdentity, epoch: IncarnationEpoch) -> String {
+    format!("{}#continuity-{}", identity.live_server_id, epoch.get())
 }
 
 fn origin_is_current(
     origin: &muxe_core::OriginContext,
     identity: &HostIdentity,
-    epoch: u64,
+    epoch: IncarnationEpoch,
 ) -> bool {
     origin.server_id.as_str() == origin_epoch_token(identity, epoch)
 }
 
-async fn monitor_subscription(adapter: Arc<HerdrAdapter>, mut subscription: EventSubscription) {
+async fn park_suspended_monitor(
+    adapter: &Arc<HerdrAdapter>,
+    subscription: &mut Option<EventSubscription>,
+) -> bool {
+    let lease = subscription.as_ref().map(EventSubscription::lease);
+    let Some(generation) = adapter.requested_suspend_for(lease) else {
+        return true;
+    };
+    wait_on_hook(&adapter.suspend_release_wait_hook).await;
+    // The exact monitor-owned stream is gone before the generation can be
+    // released. A reconnect path may already have dropped it; that is the
+    // same proof for the lease captured by the suspend attempt.
+    drop(subscription.take());
+    let published = send_health_or_shutdown(
+        adapter,
+        AdapterHealthEvent::Unhealthy {
+            modal_scope: None,
+            error: AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Herdr event subscription is suspended for activation",
+            ),
+        },
+    )
+    .await;
+    if !published {
+        adapter.complete_suspend(generation, SuspendPhase::Shutdown);
+        return false;
+    }
+    adapter.complete_suspend(generation, SuspendPhase::Released);
+    let Some(next) = take_resumed_subscription(adapter).await else {
+        adapter.complete_suspend_shutdown();
+        return false;
+    };
+    *subscription = Some(next);
+    true
+}
+
+async fn monitor_subscription(
+    adapter: Arc<HerdrAdapter>,
+    subscription: EventSubscription,
+    mut continuity_loss_rx: mpsc::UnboundedReceiver<ContinuityLoss>,
+) {
+    let mut subscription = Some(subscription);
     loop {
-        if adapter.suspended.load(Ordering::SeqCst) {
-            // Prove the retained stream is closed before a target connects:
-            // dropping the subscription closes its socket, then ack. The
-            // suspender waits for exactly this ack, so suspend returns only
-            // after the old server observes the disconnect.
-            drop(subscription);
-            adapter.suspended_ack.notify_one();
-            match take_resumed_subscription(&adapter).await {
-                Some(next) => {
-                    subscription = next;
-                    continue;
-                }
-                None => return,
-            }
-        }
         if adapter.shutdown.load(Ordering::Relaxed) {
+            adapter.complete_suspend_shutdown();
             return;
         }
-        let failed = tokio::select! {
-            result = subscription.next_event() => match result {
-                Ok(SubscriptionEvent::Event(event)) => {
-                    adapter.observe_subscription_event(event).await;
-                    false
-                }
-                Err(_) => true,
-            },
-            () = adapter.suspend_wake.notified() => false,
-        };
-        if !failed {
+        if adapter.suspended.load(Ordering::SeqCst) {
+            if !park_suspended_monitor(&adapter, &mut subscription).await {
+                return;
+            }
             continue;
         }
-
-        {
-            let mut continuity = adapter
-                .continuity
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            continuity.epoch = continuity.epoch.saturating_add(1);
-            continuity.healthy = false;
+        let lease = subscription
+            .as_ref()
+            .expect("active Herdr monitor owns a subscription")
+            .lease()
+            .clone();
+        let loss = tokio::select! {
+            biased;
+            report = continuity_loss_rx.recv() => report,
+            result = subscription
+                .as_mut()
+                .expect("active Herdr monitor owns a subscription")
+                .next_event() => match result {
+                    Ok(SubscriptionEvent::Event(event)) => {
+                        adapter.observe_subscription_event(event).await;
+                        None
+                    }
+                    Err(error) => {
+                        let _ = adapter.continuity_loss_tx.send(ContinuityLoss {
+                            lease,
+                            error: socket_error(&error),
+                        });
+                        None
+                    }
+                },
+            () = adapter.suspend_wake.notified() => None,
+        };
+        let Some(loss) = loss else {
+            continue;
+        };
+        if !adapter.transition_to_lost(&loss.lease) {
+            continue;
         }
+        let lost_lease = loss.lease.clone();
+        drop(subscription.take());
         adapter
             .pending_leases
             .lock()
@@ -2071,28 +2676,36 @@ async fn monitor_subscription(adapter: Arc<HerdrAdapter>, mut subscription: Even
             &adapter,
             AdapterHealthEvent::Unhealthy {
                 modal_scope: None,
-                error: AdapterError::new(
-                    AdapterErrorKind::Unavailable,
-                    "Herdr retained event-subscription continuity was lost",
-                ),
+                error: loss.error,
             },
         )
         .await
         {
+            adapter.complete_suspend_shutdown();
             return;
         }
 
         match reconnect_subscription(&adapter, &mut subscription).await {
             ReconnectOutcome::Reconnected | ReconnectOutcome::SuspendRequested => {}
-            ReconnectOutcome::Stop => return,
+            ReconnectOutcome::Stop => {
+                adapter.complete_suspend_shutdown();
+                return;
+            }
             ReconnectOutcome::HostLost(error) => {
-                let _ = adapter
-                    .events_tx
-                    .send(AdapterHealthEvent::HostLost {
-                        identity: adapter.identity(),
-                        error,
-                    })
-                    .await;
+                adapter.record_terminal_loss(&lost_lease, &error);
+                if matches!(
+                    send_host_lost_or_shutdown(
+                        &adapter,
+                        AdapterHealthEvent::HostLost {
+                            identity: adapter.identity(),
+                            error,
+                        },
+                    )
+                    .await,
+                    HostLostSendOutcome::Shutdown
+                ) {
+                    adapter.complete_suspend_shutdown();
+                }
                 return;
             }
         }
@@ -2113,7 +2726,7 @@ enum ReconnectOutcome {
 
 async fn reconnect_subscription(
     adapter: &Arc<HerdrAdapter>,
-    subscription: &mut EventSubscription,
+    subscription: &mut Option<EventSubscription>,
 ) -> ReconnectOutcome {
     let deadline = tokio::time::Instant::now() + HOST_LOSS_GRACE;
     let mut last_error = None;
@@ -2135,9 +2748,8 @@ async fn reconnect_subscription(
             attempt = tokio::time::timeout(remaining, reconnect_attempt(adapter)) => Some(attempt),
             () = adapter.suspend_wake.notified() => None,
         };
-        // A suspend wake re-checks the flag at the loop head so the old stream
-        // is dropped and acked promptly. Dropping the attempt future kills only
-        // the owned schema child via `kill_on_drop`; no global cleanup runs.
+        // A suspend wake re-checks the flag at the loop head. Dropping the
+        // attempt future kills only the owned schema child via `kill_on_drop`.
         let Some(attempt) = attempt else {
             continue;
         };
@@ -2161,49 +2773,35 @@ async fn reconnect_subscription(
             }
             continue;
         };
-        let refreshed = Arc::new(refreshed);
-        // Endpoint metadata is diagnostic observation only. A new subscription plus this
-        // monotonically increasing local epoch is the sole authority after continuity loss:
-        // no equal device/inode/peer/version observation can revive stale origins.
-        let previous = adapter.identity();
-        let current = refreshed.identity().clone();
-        {
-            let mut runtime = adapter
-                .runtime
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *runtime = refreshed;
-        }
-        {
-            let mut identity = adapter
-                .identity
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *identity = current.clone();
-        }
-        {
-            // A shutdown that raced the reconnect must win: re-check before
-            // marking continuity healthy so no fresh subscription revives a
-            // shut-down adapter.
-            if adapter.shutdown.load(Ordering::Relaxed) {
-                return ReconnectOutcome::Stop;
+        let lease = next_subscription.lease().clone();
+        *subscription = Some(next_subscription);
+        match adapter.install_reconnected(refreshed, &lease).await {
+            IncarnationInstallOutcome::Installed => return ReconnectOutcome::Reconnected,
+            IncarnationInstallOutcome::Stop => return ReconnectOutcome::Stop,
+            IncarnationInstallOutcome::LifecycleChanged => {
+                if adapter.shutdown.load(Ordering::Relaxed) {
+                    return ReconnectOutcome::Stop;
+                }
+                if adapter.suspended.load(Ordering::SeqCst) {
+                    return ReconnectOutcome::SuspendRequested;
+                }
             }
-            let mut continuity = adapter
-                .continuity
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            continuity.healthy = true;
+            IncarnationInstallOutcome::Retry => {}
         }
-        if !send_health_or_shutdown(
-            adapter,
-            AdapterHealthEvent::Reconnected { previous, current },
-        )
-        .await
-        {
+        drop(subscription.take());
+        last_error = Some(AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            "Herdr reconnect candidate became stale before coherent installation",
+        ));
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        if !interruptible_sleep(adapter, RECONNECT_RETRY.min(remaining)).await {
             return ReconnectOutcome::Stop;
         }
-        *subscription = next_subscription;
-        return ReconnectOutcome::Reconnected;
     }
 
     ReconnectOutcome::HostLost(last_error.unwrap_or_else(|| {
@@ -2216,10 +2814,17 @@ async fn reconnect_subscription(
 
 async fn reconnect_attempt(
     adapter: &Arc<HerdrAdapter>,
-) -> Result<(HerdrRuntime, EventSubscription), AdapterError> {
-    let refreshed = HerdrRuntime::connect(adapter.config.clone()).await?;
+) -> Result<(Arc<HerdrRuntime>, EventSubscription), AdapterError> {
+    let epoch = adapter.reconnect_epoch().ok_or_else(|| {
+        AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            "Herdr reconnect was requested without a lost incarnation",
+        )
+    })?;
+    let refreshed = Arc::new(HerdrRuntime::connect(adapter.config.clone()).await?);
+    let lease = refreshed.lease(epoch);
     let (next_subscription, _) =
-        EventSubscription::connect(refreshed.client(), subscription_config())
+        EventSubscription::connect_expected(&refreshed, lease, subscription_config())
             .await
             .map_err(|error| socket_error(&error))?;
     Ok((refreshed, next_subscription))
@@ -2698,8 +3303,7 @@ fn creation_requires_post_dismissal(action: &PortableAction) -> Result<bool, Ada
 }
 
 async fn perform_command_creation(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    authority: &IncarnationAuthority,
     action: &PortableAction,
     origin: &muxe_core::OriginContext,
 ) -> Result<(), AdapterError> {
@@ -2727,9 +3331,8 @@ async fn perform_command_creation(
                 .map(scalar_string)
                 .transpose()?
                 .map(str::to_owned);
-            crate::open_command_tab(
-                client,
-                schema,
+            crate::launch::open_command_tab_with(
+                authority,
                 crate::CommandTabLaunch {
                     workspace,
                     label,
@@ -2763,7 +3366,8 @@ async fn perform_command_creation(
                     "Herdr command pane creation requires the captured origin pane",
                 )
             })?;
-            let destination = crate::pane_by_identity(client, schema, workspace, tab, pane).await?;
+            let destination =
+                crate::launch::pane_by_identity_with(authority, workspace, tab, pane).await?;
             let direction = match scalar_split_direction(direction)? {
                 "right" => crate::UiSplitDirection::Right,
                 "down" => crate::UiSplitDirection::Down,
@@ -2771,9 +3375,8 @@ async fn perform_command_creation(
                     unreachable!("scalar_split_direction validates the closed Herdr direction set")
                 }
             };
-            crate::open_command_pane(
-                client,
-                schema,
+            crate::launch::open_command_pane_with(
+                authority,
                 crate::CommandPaneLaunch {
                     origin: destination.clone(),
                     destination,
@@ -2848,16 +3451,14 @@ enum TabSwapError {
 }
 
 async fn perform_tab_swap(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    authority: &IncarnationAuthority,
     workspace: &str,
     source_tab: &str,
     target_index: u64,
 ) -> Result<(), TabSwapError> {
     let initial = tab_list(
         &request_tab_swap(
-            client,
-            schema,
+            authority,
             "tab.list",
             json!({ "workspace_id": workspace }),
             "reading initial tab order",
@@ -2874,8 +3475,7 @@ async fn perform_tab_swap(
 
     let after_first = tab_list(
         &request_tab_swap(
-            client,
-            schema,
+            authority,
             "tab.move",
             json!({ "tab_id": target.id, "insert_index": source.number }),
             "moving target tab to captured tab index",
@@ -2893,8 +3493,7 @@ async fn perform_tab_swap(
 
     let after_second = tab_list(
         &request_tab_swap(
-            client,
-            schema,
+            authority,
             "tab.move",
             json!({ "tab_id": source.id, "insert_index": target.number }),
             "moving captured tab to requested index",
@@ -2915,24 +3514,13 @@ async fn perform_tab_swap(
 }
 
 async fn request_tab_swap(
-    client: &HerdrSocketClient,
-    schema: &ApiSchema,
+    authority: &IncarnationAuthority,
     method: &str,
     params: Value,
     phase: &str,
     state_changing: bool,
 ) -> Result<Value, TabSwapError> {
-    schema.validate_method(method, &params).map_err(|error| {
-        TabSwapError::Known(format!(
-            "active Herdr schema rejects {method} during tab swap {phase}: {error}"
-        ))
-    })?;
-    let metadata = method_metadata(method).ok_or_else(|| {
-        TabSwapError::Known(format!(
-            "bundled Herdr metadata does not declare {method} during tab swap"
-        ))
-    })?;
-    match client.unary(metadata, params).await {
+    match authority.invoke_response(method, params).await {
         Ok(HerdrResponse::Success(result)) => Ok(result),
         Ok(HerdrResponse::Error { code, message }) => Err(TabSwapError::Known(format!(
             "Herdr rejected {method} during tab swap {phase} with {code}: {message}; {}",
@@ -2942,7 +3530,7 @@ async fn request_tab_swap(
                 "no tab move was accepted for this request"
             }
         ))),
-        Err(error) if state_changing && error.delivery() == DeliveryState::MayHaveReachedHost => {
+        Err(error) if state_changing && error.kind == AdapterErrorKind::OutcomeUnknown => {
             Err(TabSwapError::Unknown(format!(
                 "Herdr response was lost during tab swap {phase}; this tab.move may have applied and Muxe will not replay: {error}"
             )))
@@ -3319,6 +3907,10 @@ mod tests {
         ConfigValue, ContextReference, OriginContext, OriginHostKind, OriginInvocationSource,
         ServerId, SourceId, SourceSpan,
     };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
 
     fn origin() -> OriginContext {
         OriginContext {
@@ -3341,6 +3933,81 @@ mod tests {
             link_handler_id: None,
         }
     }
+    async fn test_incarnation_runtime(
+        temp: &tempfile::TempDir,
+        socket_name: &str,
+    ) -> (Arc<HerdrRuntime>, Arc<UnixListener>) {
+        let socket = temp.path().join(socket_name);
+        let listener = Arc::new(UnixListener::bind(&socket).unwrap());
+        let answer = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            let request: Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(request["method"], "ping");
+            let id = request["id"].as_str().unwrap();
+            reader
+                .write_all(
+                    format!(
+                        "{{\"id\":\"{id}\",\"result\":{{\"type\":\"pong\",\"protocol\":{},\"version\":\"0.8.2\"}}}}\n",
+                        crate::generated::BUNDLED_PROTOCOL
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        };
+        let (runtime, ()) = tokio::join!(HerdrRuntime::for_subscription_test(&socket), answer);
+        (Arc::new(runtime.unwrap()), listener)
+    }
+
+    #[tokio::test]
+    async fn stale_eof_from_old_lease_is_a_noop_after_new_runtime_installation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (old_runtime, _old_listener) = test_incarnation_runtime(&temp, "old-herdr.sock").await;
+        let mut state = IncarnationState {
+            runtime: Arc::clone(&old_runtime),
+            epoch: IncarnationEpoch::INITIAL,
+            healthy: true,
+        };
+        let old_lease = old_runtime.lease(IncarnationEpoch::INITIAL);
+        assert!(state.transition_to_lost(&old_lease));
+
+        let (new_runtime, _new_listener) = test_incarnation_runtime(&temp, "new-herdr.sock").await;
+        let new_epoch = IncarnationEpoch::INITIAL.next();
+        let new_lease = new_runtime.lease(new_epoch);
+        assert!(
+            state
+                .install(Arc::clone(&new_runtime), &new_lease)
+                .is_some()
+        );
+
+        assert!(!state.transition_to_lost(&old_lease));
+        assert!(state.healthy);
+        assert_eq!(state.epoch, new_epoch);
+        assert!(Arc::ptr_eq(&state.runtime, &new_runtime));
+    }
+
+    #[tokio::test]
+    async fn eof_and_guard_mismatch_share_one_idempotent_loss_transition() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (runtime, _listener) = test_incarnation_runtime(&temp, "herdr.sock").await;
+        let lease = runtime.lease(IncarnationEpoch::INITIAL);
+        let mut state = IncarnationState {
+            runtime,
+            epoch: IncarnationEpoch::INITIAL,
+            healthy: true,
+        };
+
+        assert!(state.transition_to_lost(&lease), "EOF wins the transition");
+        assert!(
+            !state.transition_to_lost(&lease),
+            "a simultaneous guarded mismatch is stale after the winning loss"
+        );
+        assert!(!state.healthy);
+        assert_eq!(state.epoch, IncarnationEpoch::INITIAL.next());
+    }
 
     #[test]
     fn a_new_local_epoch_blocks_an_origin_with_the_same_observed_server() {
@@ -3356,9 +4023,14 @@ mod tests {
             .expect("validated live server incarnation"),
         };
         let mut captured = origin();
-        captured.server_id = ServerId::new(origin_epoch_token(&identity, 1));
+        captured.server_id =
+            ServerId::new(origin_epoch_token(&identity, IncarnationEpoch::INITIAL));
 
-        assert!(!origin_is_current(&captured, &identity, 2));
+        assert!(!origin_is_current(
+            &captured,
+            &identity,
+            IncarnationEpoch::INITIAL.next()
+        ));
         assert_eq!(identity.live_server_id.as_str(), "observed-server");
     }
 

@@ -5,8 +5,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::{Arc, Mutex as StdMutex};
+
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -105,177 +110,302 @@ impl SocketError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SocketFileIdentity {
+    socket: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl SocketFileIdentity {
+    fn capture(socket: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let canonical = fs::canonicalize(socket).unwrap_or_else(|_| socket.to_path_buf());
+        let metadata = fs::metadata(&canonical)?;
+        Ok(Self {
+            socket: canonical,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+/// One typed observation of the exact socket file and peer joined by an
+/// observed connect. Inequality proves replacement; equality is only an
+/// observation because the OS may recycle inode and process identifiers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EndpointContinuityToken {
+    socket_file: SocketFileIdentity,
+    peer: PeerIdentity,
+}
+
+impl EndpointContinuityToken {
+    fn capture(socket_file: SocketFileIdentity, stream: &UnixStream) -> io::Result<Self> {
+        Ok(Self {
+            socket_file,
+            peer: PeerIdentity::capture(stream)?,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn proven_replacement(&self, other: &Self) -> bool {
+        self != other
+    }
+
+    #[must_use]
+    pub(crate) fn live_server_id(&self, protocol: u64, version: &str) -> String {
+        live_server_id(
+            self.socket_file.device,
+            self.socket_file.inode,
+            self.peer,
+            protocol,
+            version,
+        )
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ObservedConnectHook {
+    entered: Notify,
+    release: Notify,
+}
+
+struct PreparedUnary {
+    id: String,
+    line: Vec<u8>,
+}
+
+enum ResponseDeadline {
+    Unbounded,
+    Bounded(Duration),
+}
+
+#[cfg(test)]
+impl ObservedConnectHook {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// A direct, one-request-per-connection Herdr client. It intentionally owns no retry policy:
 /// higher layers may retry read-only requests only after observing `NotSent`.
 #[derive(Debug)]
-pub struct HerdrSocketClient {
+pub(crate) struct HerdrSocketClient {
     socket: PathBuf,
     next_request: AtomicU64,
+    #[cfg(test)]
+    observed_connect_hook: StdMutex<Option<Arc<ObservedConnectHook>>>,
 }
 
 impl HerdrSocketClient {
-    pub fn new(socket: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
             next_request: AtomicU64::new(0),
+            #[cfg(test)]
+            observed_connect_hook: StdMutex::new(None),
         }
     }
 
-    pub fn socket(&self) -> &Path {
+    pub(crate) fn socket(&self) -> &Path {
         &self.socket
     }
 
-    /// Sends one generated unary method and verifies that the server closes the connection after
-    /// exactly one response with the generated request ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SocketError` when the request cannot be sent, the response is not
-    /// exactly one correlated line, or trailing bytes follow it.
-    pub async fn unary(
+    #[cfg(test)]
+    async fn unary(
         &self,
         metadata: &MethodMetadata,
         params: Value,
     ) -> Result<HerdrResponse, SocketError> {
-        let (reader, id) = self.send_request(metadata, params).await?;
-        Self::finish_unary(reader, &id).await
+        self.establish_unary(metadata, params)
+            .await
+            .map(|(response, _)| response)
     }
 
-    /// Sends one unary request after rejecting a proved replacement of the
-    /// recorded endpoint. An equal endpoint does not prove continuity; the
-    /// retained subscription stream and local epoch remain the authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SocketError::EndpointReplaced`] with [`DeliveryState::NotSent`]
-    /// when the connected endpoint differs from `expected`.
-    pub async fn unary_on_expected_endpoint(
+    /// Establishes one endpoint observation by sending the request on the
+    /// exact stream whose socket file and peer form the returned token.
+    pub(crate) async fn establish_unary(
         &self,
         metadata: &MethodMetadata,
         params: Value,
-        expected: &EndpointIdentity,
+    ) -> Result<(HerdrResponse, EndpointContinuityToken), SocketError> {
+        let request = self.prepare_unary(metadata, &params)?;
+        let (stream, token) = self.observed_connect().await?;
+        let response = Self::exchange(stream, request, ResponseDeadline::Unbounded).await?;
+        Ok((response, token))
+    }
+
+    /// Sends only when a fresh observed connection matches `expected`.
+    /// A mismatch drops the still-unwritten stream and reports `NotSent`.
+    pub(crate) async fn unary_on_expected_token(
+        &self,
+        metadata: &MethodMetadata,
+        params: Value,
+        expected: &EndpointContinuityToken,
     ) -> Result<HerdrResponse, SocketError> {
-        if metadata.transport != MethodTransport::Unary {
-            return Err(SocketError::StreamingMethod {
-                method: metadata.method.to_owned(),
-            });
-        }
-        let id = self.next_id()?;
-        let mut line = encode_request(metadata.method, &id, &params)?;
-        line.push(b'\n');
-        let mut stream = self.connect_stream().await?;
-        let actual = EndpointIdentity::capture(&self.socket, &stream).map_err(|source| {
-            SocketError::Endpoint {
-                socket: self.socket.clone(),
-                source,
-            }
-        })?;
+        let request = self.prepare_unary(metadata, &params)?;
+        let (stream, actual) = self.observed_connect().await?;
         if expected.proven_replacement(&actual) {
             return Err(SocketError::EndpointReplaced {
                 socket: self.socket.clone(),
             });
         }
-        write_line(&mut stream, &line).await?;
-        Self::finish_unary(BufReader::new(stream), &id).await
+        Self::exchange(stream, request, ResponseDeadline::Unbounded).await
     }
 
-    /// Sends one generated unary method, then waits for its single response only until
-    /// `timeout` elapses. The deadline is a transport wait bound, not a Muxe detach:
-    /// the request bytes were already flushed, so an elapsed deadline reports
-    /// `MayHaveReachedHost` and the caller must surface `outcome_unknown` instead of
-    /// retrying a state-changing request.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SocketError` when the request cannot be sent, the wait deadline
-    /// elapses, or the response is not exactly one correlated line.
-    pub async fn unary_with_timeout(
+    /// Timeout variant of [`Self::unary_on_expected_token`]. The endpoint
+    /// comparison still precedes the first request byte; only the response wait
+    /// is bounded, so a timeout remains `MayHaveReachedHost`.
+    pub(crate) async fn unary_on_expected_token_with_timeout(
+        &self,
+        metadata: &MethodMetadata,
+        params: Value,
+        expected: &EndpointContinuityToken,
+        timeout: Duration,
+    ) -> Result<HerdrResponse, SocketError> {
+        let request = self.prepare_unary(metadata, &params)?;
+        let (stream, actual) = self.observed_connect().await?;
+        if expected.proven_replacement(&actual) {
+            return Err(SocketError::EndpointReplaced {
+                socket: self.socket.clone(),
+            });
+        }
+        Self::exchange(stream, request, ResponseDeadline::Bounded(timeout)).await
+    }
+
+    #[cfg(test)]
+    async fn unary_with_timeout(
         &self,
         metadata: &MethodMetadata,
         params: Value,
         timeout: Duration,
     ) -> Result<HerdrResponse, SocketError> {
-        let (mut reader, id) = self.send_request(metadata, params).await?;
-        let response_line = tokio::time::timeout(timeout, read_response_line(&mut reader))
-            .await
-            .map_err(|_| SocketError::Timeout {
-                delivery: DeliveryState::MayHaveReachedHost,
-            })??;
-        let response =
-            serde_json::from_slice(&response_line).map_err(|source| SocketError::InvalidJson {
-                delivery: DeliveryState::MayHaveReachedHost,
-                source,
-            })?;
-        let outcome = parse_response(&response, &id)?;
-        reject_trailing_data(&mut reader).await?;
-        Ok(outcome)
+        let request = self.prepare_unary(metadata, &params)?;
+        let (stream, _) = self.observed_connect().await?;
+        Self::exchange(stream, request, ResponseDeadline::Bounded(timeout)).await
     }
 
-    /// Opens one fresh connection without sending bytes. The subscription monitor uses this to
-    /// hold its own long-lived `events.subscribe` stream; no ordinary request is multiplexed
-    /// onto that stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SocketError` when the socket cannot be connected.
-    pub async fn connect_stream(&self) -> Result<UnixStream, SocketError> {
-        UnixStream::connect(&self.socket)
-            .await
-            .map_err(|source| SocketError::Connect {
+    /// Opens one observed stream only when it matches `expected`. The stream
+    /// remains unwritten so the subscription layer can encode and send its
+    /// retained request after this guard.
+    pub(crate) async fn connect_on_expected_token(
+        &self,
+        expected: &EndpointContinuityToken,
+    ) -> Result<UnixStream, SocketError> {
+        let (stream, actual) = self.observed_connect().await?;
+        if expected.proven_replacement(&actual) {
+            return Err(SocketError::EndpointReplaced {
+                socket: self.socket.clone(),
+            });
+        }
+        Ok(stream)
+    }
+
+    /// One observed connect. The socket path is stat'ed before and after
+    /// `connect`; only an unchanged device/inode pair may be joined to peer
+    /// credentials from that exact stream. Inequality proves replacement and
+    /// drops the stream before any request write. Equality is still only an
+    /// observation because the OS may recycle both file and process IDs.
+    async fn observed_connect(&self) -> Result<(UnixStream, EndpointContinuityToken), SocketError> {
+        let before =
+            SocketFileIdentity::capture(&self.socket).map_err(|source| SocketError::Endpoint {
                 socket: self.socket.clone(),
                 source,
-            })
+            })?;
+        #[cfg(test)]
+        {
+            let hook = self
+                .observed_connect_hook
+                .lock()
+                .expect("observed-connect hook is not poisoned")
+                .clone();
+            if let Some(hook) = hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+            }
+        }
+        let stream =
+            UnixStream::connect(&self.socket)
+                .await
+                .map_err(|source| SocketError::Connect {
+                    socket: self.socket.clone(),
+                    source,
+                })?;
+        let Ok(after) = SocketFileIdentity::capture(&self.socket) else {
+            return Err(SocketError::EndpointReplaced {
+                socket: self.socket.clone(),
+            });
+        };
+        if before != after {
+            return Err(SocketError::EndpointReplaced {
+                socket: self.socket.clone(),
+            });
+        }
+        let token = EndpointContinuityToken::capture(after, &stream).map_err(|source| {
+            SocketError::Endpoint {
+                socket: self.socket.clone(),
+                source,
+            }
+        })?;
+        Ok((stream, token))
     }
 
-    /// Captures the OS-visible endpoint observation of the exact server behind the socket:
-    /// canonical path, socket-file device and inode, and best-effort peer credentials from one
-    /// fresh connection. A changed observation proves replacement; an equal observation is
-    /// deliberately inconclusive because inode and process identifiers can be recycled.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SocketError` when the socket cannot be connected or observed.
-    pub async fn probe_endpoint(&self) -> Result<EndpointIdentity, SocketError> {
-        let stream = self.connect_stream().await?;
-        EndpointIdentity::capture(&self.socket, &stream).map_err(|source| SocketError::Endpoint {
-            socket: self.socket.clone(),
-            source,
-        })
-    }
-
-    /// Encodes, size-checks, and fully flushes one request line on a fresh connection,
-    /// returning the buffered stream and the generated request ID for response correlation.
-    pub(crate) async fn send_request(
+    fn prepare_unary(
         &self,
         metadata: &MethodMetadata,
-        params: Value,
-    ) -> Result<(BufReader<UnixStream>, String), SocketError> {
+        params: &Value,
+    ) -> Result<PreparedUnary, SocketError> {
         if metadata.transport != MethodTransport::Unary {
             return Err(SocketError::StreamingMethod {
                 method: metadata.method.to_owned(),
             });
         }
         let id = self.next_id()?;
-        let mut line = encode_request(metadata.method, &id, &params)?;
+        let mut line = encode_request(metadata.method, &id, params)?;
         line.push(b'\n');
-        let mut stream = self.connect_stream().await?;
-        write_line(&mut stream, &line).await?;
-        Ok((BufReader::new(stream), id))
+        Ok(PreparedUnary { id, line })
     }
 
-    async fn finish_unary(
-        mut reader: BufReader<UnixStream>,
-        id: &str,
+    async fn exchange(
+        mut stream: UnixStream,
+        request: PreparedUnary,
+        deadline: ResponseDeadline,
     ) -> Result<HerdrResponse, SocketError> {
-        let response_line = read_response_line(&mut reader).await?;
+        write_line(&mut stream, &request.line).await?;
+        let mut reader = BufReader::new(stream);
+        let response_line = match deadline {
+            ResponseDeadline::Unbounded => read_response_line(&mut reader).await?,
+            ResponseDeadline::Bounded(timeout) => {
+                tokio::time::timeout(timeout, read_response_line(&mut reader))
+                    .await
+                    .map_err(|_| SocketError::Timeout {
+                        delivery: DeliveryState::MayHaveReachedHost,
+                    })??
+            }
+        };
         let response =
             serde_json::from_slice(&response_line).map_err(|source| SocketError::InvalidJson {
                 delivery: DeliveryState::MayHaveReachedHost,
                 source,
             })?;
-        let outcome = parse_response(&response, id)?;
+        let outcome = parse_response(&response, &request.id)?;
         reject_trailing_data(&mut reader).await?;
         Ok(outcome)
+    }
+
+    #[cfg(test)]
+    fn set_observed_connect_hook(&self, hook: Option<Arc<ObservedConnectHook>>) {
+        *self
+            .observed_connect_hook
+            .lock()
+            .expect("observed-connect hook is writable") = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observed_token(&self) -> Result<EndpointContinuityToken, SocketError> {
+        self.observed_connect().await.map(|(_, token)| token)
     }
 
     pub(crate) fn next_id(&self) -> Result<String, SocketError> {
@@ -346,145 +476,35 @@ pub(crate) async fn write_line(stream: &mut UnixStream, line: &[u8]) -> Result<(
 /// rebound to the same path normally compares unequal through its fresh inode, but
 /// inode numbers may be recycled, so peer evidence is never continuity proof alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PeerIdentity {
-    pub uid: u32,
-    pub gid: u32,
-    pub pid: Option<u32>,
+struct PeerIdentity {
+    uid: u32,
+    gid: u32,
+    pid: Option<u32>,
 }
 
-/// The OS-visible identity of one Herdr server incarnation behind a socket path.
-///
-/// Comparison semantics follow the continuity rule: inequality is sound proof of
-/// replacement (the live socket file or its peer changed), while equality is
-/// observation only and never continuity proof, because POSIX may recycle inode
-/// numbers after unlink. The continuity authority is the retained subscription
-/// stream staying alive plus a new local epoch after any loss; this record only
-/// ever proves change, never sameness. See [`EndpointIdentity::proven_replacement`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EndpointIdentity {
-    socket: PathBuf,
-    device: u64,
-    inode: u64,
-    peer: Option<PeerIdentity>,
-}
-
-impl EndpointIdentity {
-    /// Stats the socket path and attaches best-effort peer credentials from one already
-    /// connected stream. A missing or unreadable socket path fails; unavailable peer
-    /// credentials degrade to `None` and are reported through
-    /// [`EndpointIdentity::has_peer_evidence`] so the broker can fail closed where its
-    /// policy requires peer evidence.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error when the socket path cannot be canonicalized or stat'ed.
-    pub fn capture(socket: &Path, stream: &UnixStream) -> io::Result<Self> {
-        let canonical = fs::canonicalize(socket).unwrap_or_else(|_| socket.to_path_buf());
-        let peer = stream.peer_cred().ok().map(|credentials| PeerIdentity {
+impl PeerIdentity {
+    fn capture(stream: &UnixStream) -> io::Result<Self> {
+        let credentials = stream.peer_cred()?;
+        Ok(Self {
             uid: credentials.uid(),
             gid: credentials.gid(),
             pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()),
-        });
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = fs::metadata(&canonical)?;
-            Ok(Self {
-                socket: canonical,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                peer,
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = fs::metadata(&canonical)?;
-            return Ok(Self {
-                socket: canonical,
-                device: 0,
-                inode: 0,
-                peer,
-            });
-        }
+        })
     }
+}
 
-    #[must_use]
-    pub fn socket(&self) -> &Path {
-        &self.socket
-    }
-
-    #[must_use]
-    pub fn device(&self) -> u64 {
-        self.device
-    }
-
-    #[must_use]
-    pub fn inode(&self) -> u64 {
-        self.inode
-    }
-
-    #[must_use]
-    pub fn peer(&self) -> Option<PeerIdentity> {
-        self.peer
-    }
-
-    /// Whether OS peer credentials were available at capture. Without them the
-    /// device/inode boundary still observes replacement, but broker policy may
-    /// require this evidence before trusting even the observation.
-    #[must_use]
-    pub fn has_peer_evidence(&self) -> bool {
-        self.peer.is_some()
-    }
-
-    /// Reports whether `other` provably identifies a different server incarnation.
-    /// Inequality is sound proof of replacement: the live socket file or its peer
-    /// changed. Equality is explicitly NOT proof of continuity: POSIX may recycle
-    /// inode numbers after unlink, so a rebound server can in theory present the
-    /// same device, inode, and peer. The continuity authority is the retained
-    /// subscription stream staying alive plus a new local epoch after any loss;
-    /// callers must never treat `!proven_replacement(a, b)` as proof that `a`
-    /// and `b` are the same live server.
-    #[must_use]
-    pub fn proven_replacement(&self, other: &Self) -> bool {
-        self != other
-    }
-
-    /// Re-stats the captured socket path and reports whether its device and inode still
-    /// match. `false` proves replacement; `true` is only a cheap gate and never a
-    /// continuity proof on its own.
-    #[must_use]
-    pub fn recheck(&self) -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            fs::metadata(&self.socket)
-                .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
-        }
-        #[cfg(not(unix))]
-        {
-            fs::metadata(&self.socket).is_ok()
-        }
-    }
-
-    /// Renders the opaque server-incarnation identifier carried in `HostIdentity`.
-    /// The value is only equality-compared; no consumer may parse or persist structure
-    /// from it. Equality is necessary but never sufficient for continuity: a changed
-    /// value proves replacement, an unchanged value proves nothing (see
-    /// [`EndpointIdentity::proven_replacement`]).
-    #[must_use]
-    pub fn live_server_id(&self, protocol: u64, version: &str) -> String {
-        let peer = match self.peer {
-            Some(peer) => match peer.pid {
-                Some(pid) => format!("peer-pid-{pid}-uid-{}-gid-{}", peer.uid, peer.gid),
-                None => format!("peer-uid-{}-gid-{}-nopid", peer.uid, peer.gid),
-            },
-            None => "peer-unavailable".to_owned(),
-        };
-        format!(
-            "herdr/dev:{}-ino:{}/proto:{protocol}/ver:{version}/{peer}",
-            self.device, self.inode
-        )
-    }
+fn live_server_id(
+    device: u64,
+    inode: u64,
+    peer: PeerIdentity,
+    protocol: u64,
+    version: &str,
+) -> String {
+    let peer = match peer.pid {
+        Some(pid) => format!("peer-pid-{pid}-uid-{}-gid-{}", peer.uid, peer.gid),
+        None => format!("peer-uid-{}-gid-{}-nopid", peer.uid, peer.gid),
+    };
+    format!("herdr/dev:{device}-ino:{inode}/proto:{protocol}/ver:{version}/{peer}")
 }
 
 fn delivery_after(written: usize) -> DeliveryState {
@@ -603,7 +623,7 @@ mod tests {
 
     use tempfile::TempDir;
     use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::{UnixListener, UnixStream},
     };
 
@@ -627,6 +647,30 @@ mod tests {
             .unwrap()
             .to_owned();
         (reader, id)
+    }
+
+    async fn answer_ping(listener: Arc<UnixListener>, version: &'static str) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut reader, id) = read_request(stream).await;
+        reader
+            .write_all(
+                format!(
+                    "{{\"id\":\"{id}\",\"result\":{{\"type\":\"pong\",\"protocol\":20,\"version\":\"{version}\"}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn accept_zero_bytes(listener: UnixListener) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut bytes))
+            .await
+            .expect("mismatched observed stream closes promptly")
+            .unwrap();
+        bytes
     }
 
     #[tokio::test]
@@ -734,45 +778,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_identity_recheck_and_comparison_are_one_way() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("herdr.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let first_stream = UnixStream::connect(&path).await.unwrap();
-        let first = EndpointIdentity::capture(&path, &first_stream).unwrap();
-        assert!(first.recheck());
-        drop(listener);
-        drop(first_stream);
-        std::fs::remove_file(&path).unwrap();
-        assert!(
-            !first.recheck(),
-            "a missing socket is affirmative evidence that the old observation is stale"
-        );
+    async fn establishment_ping_binds_response_and_token_to_one_observed_stream() {
+        use std::os::unix::fs::MetadataExt;
 
-        let replacement = UnixListener::bind(&path).unwrap();
-        let second_stream = UnixStream::connect(&path).await.unwrap();
-        let second = EndpointIdentity::capture(&path, &second_stream).unwrap();
-        assert!(
-            second.recheck(),
-            "a fresh observation can pass the stat gate without proving continuity"
+        let temp = TempDir::new().unwrap();
+        let (listener, path) = listen(&temp);
+        let metadata = std::fs::metadata(&path).unwrap();
+        let listener = Arc::new(listener);
+        let server = tokio::spawn(answer_ping(Arc::clone(&listener), "server-a"));
+        let client = HerdrSocketClient::new(path);
+
+        let (response, token) = client.establish_unary(ping(), json!({})).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            response,
+            HerdrResponse::Success(json!({
+                "type": "pong",
+                "protocol": 20,
+                "version": "server-a"
+            }))
         );
-        let observed_difference = EndpointIdentity {
-            peer: Some(PeerIdentity {
-                uid: 1,
-                gid: 2,
-                pid: Some(3),
-            }),
-            ..second.clone()
-        };
+        assert_eq!(token.socket_file.device, metadata.dev());
+        assert_eq!(token.socket_file.inode, metadata.ino());
         assert!(
-            second.proven_replacement(&observed_difference),
-            "only an observed inequality is affirmative replacement evidence"
+            !token
+                .live_server_id(20, "server-a")
+                .contains("peer-unavailable"),
+            "the establishing stream contributes required peer credentials"
         );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn expected_unary_rejects_rebound_socket_before_writing() {
+        let temp = TempDir::new().unwrap();
+        let (listener_a, path) = listen(&temp);
+        let listener_a = Arc::new(listener_a);
+        let server_a = tokio::spawn(answer_ping(Arc::clone(&listener_a), "server-a"));
+        let client = HerdrSocketClient::new(path.clone());
+        let (_, expected) = client.establish_unary(ping(), json!({})).await.unwrap();
+        server_a.await.unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let listener_b = UnixListener::bind(&path).unwrap();
+        let server_b = tokio::spawn(accept_zero_bytes(listener_b));
+        let error = client
+            .unary_on_expected_token(ping(), json!({}), &expected)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SocketError::EndpointReplaced { .. }));
+        assert_eq!(error.delivery(), DeliveryState::NotSent);
         assert!(
-            !second.proven_replacement(&second),
-            "equal observations remain inconclusive"
+            server_b.await.unwrap().is_empty(),
+            "replacement receives a connection close with zero request bytes"
         );
-        drop(second_stream);
-        drop(replacement);
+        drop(listener_a);
+    }
+
+    #[tokio::test]
+    async fn observed_connect_rejects_pre_stat_connect_post_stat_rebind_without_write() {
+        let temp = TempDir::new().unwrap();
+        let (listener_a, path) = listen(&temp);
+        let hook = Arc::new(ObservedConnectHook::new());
+        let client = Arc::new(HerdrSocketClient::new(path.clone()));
+        client.set_observed_connect_hook(Some(Arc::clone(&hook)));
+        let connecting = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.establish_unary(ping(), json!({})).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .expect("connect pauses after the pre-stat observation");
+
+        std::fs::remove_file(&path).unwrap();
+        let listener_b = UnixListener::bind(&path).unwrap();
+        let server_b = tokio::spawn(accept_zero_bytes(listener_b));
+        client.set_observed_connect_hook(None);
+        hook.release.notify_one();
+        let error = connecting
+            .await
+            .expect("connect task joins")
+            .expect_err("pre/post socket identity mismatch rejects establishment");
+
+        assert!(matches!(error, SocketError::EndpointReplaced { .. }));
+        assert_eq!(error.delivery(), DeliveryState::NotSent);
+        assert!(
+            server_b.await.unwrap().is_empty(),
+            "the post-stat mismatch drops the stream before request write"
+        );
+        drop(listener_a);
     }
 }

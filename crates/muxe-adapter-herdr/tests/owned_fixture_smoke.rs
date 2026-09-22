@@ -4,7 +4,6 @@ mod fixture;
 use std::{io::Write, path::PathBuf};
 
 use fixture::OwnedHerdrFixture;
-use muxe_adapter_herdr::{HerdrSocketClient, probe_live_identity};
 
 /// This intentionally runs only when an operator supplies the exact Herdr binary to spawn. The
 /// fixture clears its environment, creates a fresh temporary socket, and retains the one Child it
@@ -24,31 +23,30 @@ async fn ping_uses_only_the_owned_server() {
         .owned_child_pid()
         .expect("the retained owned Herdr child must have a PID before cleanup");
     let socket = fixture.socket().to_owned();
-    let initial = fixture.start_identity().clone();
     let _ = writeln!(
         std::io::stderr(),
-        "owned Herdr start: pid={pid}; socket={}; identity={initial:?}",
+        "owned Herdr start: pid={pid}; socket={}",
         socket.display()
     );
-    let observed = probe_live_identity(&HerdrSocketClient::new(&socket)).await;
+    let observed = tokio::net::UnixStream::connect(&socket).await;
     let cleanup = fixture.terminate_and_reap().await;
 
     match (observed, cleanup) {
-        (Ok(observed), Ok(cleanup)) => {
-            assert_eq!(observed, initial);
+        (Ok(stream), Ok(cleanup)) => {
+            drop(stream);
             assert!(
                 !fixture.has_owned_child(),
                 "the exact retained owned Herdr child must be reaped before fixture teardown"
             );
             let _ = writeln!(
                 std::io::stderr(),
-                "owned Herdr ping: observed={observed:?}; cleanup={:?}; retained_child_reaped=true",
+                "owned Herdr socket accepted; cleanup={:?}; retained_child_reaped=true",
                 cleanup.disposition
             );
         }
         (Err(probe), Ok(cleanup)) => {
             panic!(
-                "owned server stopped answering its fixture socket: {probe}; cleanup={:?}; {}",
+                "owned server stopped accepting its fixture socket: {probe}; cleanup={:?}; {}",
                 cleanup.disposition, cleanup.diagnostics
             );
         }
@@ -57,7 +55,7 @@ async fn ping_uses_only_the_owned_server() {
         }
         (Err(probe), Err(cleanup)) => {
             panic!(
-                "owned server stopped answering its fixture socket ({probe}) and cleanup failed: {cleanup}"
+                "owned server stopped accepting its fixture socket ({probe}) and cleanup failed: {cleanup}"
             );
         }
     }

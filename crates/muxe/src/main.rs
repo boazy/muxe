@@ -1932,29 +1932,22 @@ async fn herdr_open_pane(
     let origin = match launcher_origin(&runtime).await {
         Ok(origin) => origin,
         Err(error) => {
-            notify_launcher_failure(Some(runtime.client()), "pane-open", &error.to_string()).await;
+            notify_launcher_failure(Some(&runtime), "pane-open", &error.to_string()).await;
             return Err(error);
         }
     };
     let destination = match &open.placement.parent_pane {
         ParentPane::Current => origin.clone(),
-        ParentPane::Id(pane) => {
-            match muxe_adapter_herdr::pane_by_id(runtime.client(), runtime.schema(), pane).await {
-                Ok(destination) => destination,
-                Err(error) => {
-                    let error = color_eyre::eyre::eyre!(
-                        "the explicit Herdr parent pane is not a valid live destination: {error}"
-                    );
-                    notify_launcher_failure(
-                        Some(runtime.client()),
-                        "pane-open",
-                        &error.to_string(),
-                    )
-                    .await;
-                    return Err(error);
-                }
+        ParentPane::Id(pane) => match muxe_adapter_herdr::pane_by_id(&runtime, pane).await {
+            Ok(destination) => destination,
+            Err(error) => {
+                let error = color_eyre::eyre::eyre!(
+                    "the explicit Herdr parent pane is not a valid live destination: {error}"
+                );
+                notify_launcher_failure(Some(&runtime), "pane-open", &error.to_string()).await;
+                return Err(error);
             }
-        }
+        },
     };
     let argv = match open
         .argv
@@ -1969,7 +1962,7 @@ async fn herdr_open_pane(
         .collect::<Result<Vec<_>>>() {
         Ok(argv) => argv,
         Err(error) => {
-            notify_launcher_failure(Some(runtime.client()), "pane-open", &error.to_string()).await;
+            notify_launcher_failure(Some(&runtime), "pane-open", &error.to_string()).await;
             return Err(error);
         }
     };
@@ -1992,11 +1985,11 @@ async fn herdr_open_pane(
     let launch = match command_pane_launch(open, origin, destination) {
         Ok(launch) => launch,
         Err(error) => {
-            notify_launcher_failure(Some(runtime.client()), "pane-open", &error.to_string()).await;
+            notify_launcher_failure(Some(&runtime), "pane-open", &error.to_string()).await;
             return Err(error);
         }
     };
-    match muxe_adapter_herdr::open_command_pane(runtime.client(), runtime.schema(), launch).await {
+    match muxe_adapter_herdr::open_command_pane(&runtime, launch).await {
         Ok(placement) => {
             if let Ok(event) = muxe::logging::LogEvent::new(
                 env!("CARGO_PKG_VERSION"),
@@ -2012,7 +2005,7 @@ async fn herdr_open_pane(
         Err(error) => {
             let error =
                 color_eyre::eyre::eyre!("could not open the requested Herdr command pane: {error}");
-            notify_launcher_failure(Some(runtime.client()), "pane-open", &error.to_string()).await;
+            notify_launcher_failure(Some(&runtime), "pane-open", &error.to_string()).await;
             Err(error)
         }
     }
@@ -2028,7 +2021,7 @@ async fn commit_herdr_ui_pane(
     launch: muxe_adapter_herdr::UiPaneLaunch,
     token: muxe_protocol::PendingLaunchToken,
 ) -> Result<String> {
-    let prepared = muxe_adapter_herdr::prepare_ui_pane(runtime.client(), runtime.schema(), &launch)
+    let prepared = muxe_adapter_herdr::prepare_ui_pane(runtime, &launch)
         .await
         .map_err(|error| {
             color_eyre::eyre::eyre!("could not prepare the requested Herdr UI pane: {error}")
@@ -2056,12 +2049,8 @@ async fn commit_herdr_ui_pane(
         Err(error) => Some(format!("could not register the placed UI pane: {error}")),
     };
     if let Some(error) = registration_error {
-        let cleanup = muxe_adapter_herdr::close_transient_tab(
-            runtime.client(),
-            runtime.schema(),
-            &prepared.temporary_tab,
-        )
-        .await;
+        let cleanup =
+            muxe_adapter_herdr::close_transient_tab(runtime, &prepared.temporary_tab).await;
         return Err(match cleanup {
             Ok(()) => color_eyre::eyre::eyre!("{error}"),
             Err(cleanup_error) => color_eyre::eyre::eyre!(
@@ -2069,14 +2058,11 @@ async fn commit_herdr_ui_pane(
             ),
         });
     }
-    let placement = muxe_adapter_herdr::move_prepared_ui_pane(
-        runtime.client(),
-        runtime.schema(),
-        &launch,
-        prepared,
-    )
-    .await
-    .map_err(|error| color_eyre::eyre::eyre!("could not move the placed Herdr UI pane: {error}"))?;
+    let placement = muxe_adapter_herdr::move_prepared_ui_pane(runtime, &launch, prepared)
+        .await
+        .map_err(|error| {
+            color_eyre::eyre::eyre!("could not move the placed Herdr UI pane: {error}")
+        })?;
     match client
         .request(muxe_protocol::ClientRequest::CommitUiLaunch(
             muxe_protocol::CommitUiLaunch {
@@ -2174,7 +2160,7 @@ async fn herdr_open_ui_pane(
                     muxe_protocol::AbortUiLaunch { token },
                 ))
                 .await;
-            notify_launcher_failure(Some(runtime.client()), "menu-open", &error.to_string()).await;
+            notify_launcher_failure(Some(&runtime), "menu-open", &error.to_string()).await;
             Err(error)
         }
     }
@@ -2467,24 +2453,24 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
 /// logging occurs at the CLI composition root, so notification failure never
 /// replaces or hides the original error returned by the caller.
 async fn notify_launcher_failure(
-    client: Option<&muxe_adapter_herdr::HerdrSocketClient>,
+    runtime: Option<&muxe_adapter_herdr::HerdrRuntime>,
     operation: &str,
     message: &str,
 ) {
-    if let Some(client) = client {
-        best_effort_notify(client, &format!("{operation} failed: {message}")).await;
+    if let Some(runtime) = runtime {
+        best_effort_notify(runtime, &format!("{operation} failed: {message}")).await;
     }
 }
 
 /// Best-effort `notification.show` capped at Herdr's 240-character limit. The
 /// caller's persistent audit event remains authoritative.
-async fn best_effort_notify(client: &muxe_adapter_herdr::HerdrSocketClient, text: &str) {
+async fn best_effort_notify(runtime: &muxe_adapter_herdr::HerdrRuntime, text: &str) {
     let body: String = text.chars().take(240).collect();
-    let Some(metadata) = muxe_adapter_herdr::generated::method_metadata("notification.show") else {
-        return;
-    };
-    let _ = client
-        .unary(metadata, serde_json::json!({"title": "Muxe", "body": body}))
+    let _ = runtime
+        .invoke_response(
+            "notification.show",
+            serde_json::json!({"title": "Muxe", "body": body}),
+        )
         .await;
 }
 
@@ -2551,20 +2537,18 @@ fn required_absolute_environment_path(name: &str) -> Result<PathBuf> {
 async fn launcher_origin(
     runtime: &muxe_adapter_herdr::HerdrRuntime,
 ) -> Result<muxe_adapter_herdr::FocusedPane> {
-    launcher_origin_from(runtime.client(), runtime.schema(), &env_lookup).await
+    launcher_origin_from(runtime, &env_lookup).await
 }
 
 /// Resolves the launcher origin against one fresh snapshot. The environment lookup is
 /// injected so the selection boundary is unit-testable without mutating process state.
 async fn launcher_origin_from(
-    client: &muxe_adapter_herdr::HerdrSocketClient,
-    schema: &muxe_adapter_herdr::ApiSchema,
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Result<muxe_adapter_herdr::FocusedPane> {
     let selected = select_launcher_origin(get)?;
     let mut origin = muxe_adapter_herdr::pane_by_identity(
-        client,
-        schema,
+        runtime,
         muxe_core::WorkspaceId::new(selected.workspace),
         muxe_core::TabId::new(selected.tab),
         muxe_core::PaneId::new(selected.pane),
@@ -2912,7 +2896,7 @@ async fn ui_attach_request(
     // inherited workspace/tab tuple may therefore be stale. Resolve its current tuple by that
     // pane only; never substitute saved origin data or current focus.
     let pane = HostPaneId::new(required_environment("HERDR_PANE_ID")?);
-    let caller = muxe_adapter_herdr::pane_by_id(runtime.client(), runtime.schema(), pane.as_str())
+    let caller = muxe_adapter_herdr::pane_by_id(runtime, pane.as_str())
         .await
         .wrap_err("the Herdr UI caller pane is not live after its launcher move")?;
     let workspace = WorkspaceId::new(caller.workspace.as_str());
@@ -3169,6 +3153,33 @@ mod launcher_tests {
         })
     }
 
+    async fn recorded_runtime(
+        directory: &tempfile::TempDir,
+        socket: &std::path::Path,
+    ) -> muxe_adapter_herdr::HerdrRuntime {
+        let schema = directory.path().join("schema.json");
+        std::fs::write(
+            &schema,
+            include_str!("../../../fixtures/herdr/herdr-api.schema.json"),
+        )
+        .expect("write recorded runtime schema");
+        let binary = directory.path().join("herdr");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nexec cat \"$(dirname \"$0\")/schema.json\"\n",
+        )
+        .expect("write recorded schema executable");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("make recorded schema executable");
+        muxe_adapter_herdr::HerdrRuntime::connect(muxe_adapter_herdr::HerdrAdapterConfig {
+            socket_path: socket.to_path_buf(),
+            herdr_binary: binary,
+            cache_dir: directory.path().join("cache"),
+        })
+        .await
+        .expect("guarded recorded runtime connects")
+    }
+
     fn serve_snapshot(
         path: &std::path::Path,
         body: serde_json::Value,
@@ -3187,19 +3198,23 @@ mod launcher_tests {
                     if reader.read_until(b'\n', &mut request).await.is_err() {
                         return;
                     }
-                    let id = serde_json::from_slice::<serde_json::Value>(&request)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("id")
-                                .and_then(|id| id.as_str())
-                                .map(str::to_owned)
-                        })
+                    let payload =
+                        serde_json::from_slice::<serde_json::Value>(&request).unwrap_or_default();
+                    let id = payload
+                        .get("id")
+                        .and_then(|id| id.as_str())
                         .unwrap_or_default();
-                    let response = serde_json::json!({
-                        "id": id,
-                        "result": {"type": "session_snapshot", "snapshot": body},
-                    });
+                    let result =
+                        if payload.get("method").and_then(|value| value.as_str()) == Some("ping") {
+                            serde_json::json!({
+                                "type": "pong",
+                                "protocol": 20,
+                                "version": "0.8.2",
+                            })
+                        } else {
+                            serde_json::json!({"type": "session_snapshot", "snapshot": body})
+                        };
+                    let response = serde_json::json!({"id": id, "result": result});
                     let _ = reader.write_all(format!("{response}\n").as_bytes()).await;
                 });
             }
@@ -3211,16 +3226,9 @@ mod launcher_tests {
         let directory = tempfile::tempdir().expect("owned launcher boundary directory");
         let path = directory.path().join("herdr.sock");
         let server = serve_snapshot(&path, snapshot_body());
-        let client = muxe_adapter_herdr::HerdrSocketClient::new(&path);
-        let schema = muxe_adapter_herdr::ApiSchema::parse(
-            serde_json::from_str(include_str!(
-                "../../../fixtures/herdr/herdr-api.schema.json"
-            ))
-            .expect("bundled schema JSON"),
-        )
-        .expect("bundled schema parses");
+        let runtime = recorded_runtime(&directory, &path).await;
 
-        let origin = launcher_origin_from(&client, &schema, &lookup(&active_map()))
+        let origin = launcher_origin_from(&runtime, &lookup(&active_map()))
             .await
             .expect("inherited ACTIVE pane resolves");
         assert_eq!(origin.pane.as_str(), "w1:pA");
@@ -3232,7 +3240,7 @@ mod launcher_tests {
             ("MUXE_HERDR_ORIGIN_TAB_ID".to_owned(), "w1:tA".to_owned()),
             ("MUXE_HERDR_ORIGIN_PANE_ID".to_owned(), "w1:pA".to_owned()),
         ]);
-        let origin = launcher_origin_from(&client, &schema, &lookup(&saved))
+        let origin = launcher_origin_from(&runtime, &lookup(&saved))
             .await
             .expect("saved origin without cwd keeps live enrichment");
         assert_eq!(origin.pane.as_str(), "w1:pA");
@@ -3240,7 +3248,7 @@ mod launcher_tests {
 
         let empty: HashMap<String, String> = HashMap::new();
         assert!(
-            launcher_origin_from(&client, &schema, &lookup(&empty))
+            launcher_origin_from(&runtime, &lookup(&empty))
                 .await
                 .is_err(),
             "absent origin never recaptures changed focus"
@@ -3287,7 +3295,13 @@ mod launcher_tests {
                     seen.lock()
                         .expect("method log is writable")
                         .push(method.clone());
-                    let result = if method.as_str() == "session.snapshot" {
+                    let result = if method.as_str() == "ping" {
+                        serde_json::json!({
+                            "type": "pong",
+                            "protocol": 20,
+                            "version": "0.8.2",
+                        })
+                    } else if method.as_str() == "session.snapshot" {
                         serde_json::json!({
                             "type": "session_snapshot",
                             "snapshot": snapshot,
@@ -3330,22 +3344,15 @@ mod launcher_tests {
             std::sync::Arc::clone(&seen),
             std::sync::Arc::clone(&bodies),
         );
-        let client = muxe_adapter_herdr::HerdrSocketClient::new(&path);
-        let schema = muxe_adapter_herdr::ApiSchema::parse(
-            serde_json::from_str(include_str!(
-                "../../../fixtures/herdr/herdr-api.schema.json"
-            ))
-            .expect("bundled schema parses"),
-        )
-        .expect("bundled schema validates");
-        let error = launcher_origin_from(&client, &schema, &lookup(&active_map()))
+        let runtime = recorded_runtime(&directory, &path).await;
+        let error = launcher_origin_from(&runtime, &lookup(&active_map()))
             .await
             .expect_err("absent ACTIVE pane fails before UI creation");
         assert!(error.to_string().contains("not live"));
-        notify_launcher_failure(Some(&client), "pane-open", &error.to_string()).await;
+        notify_launcher_failure(Some(&runtime), "pane-open", &error.to_string()).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if seen.lock().expect("method log is readable").len() >= 2 {
+                if seen.lock().expect("method log is readable").len() >= 3 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -3357,6 +3364,7 @@ mod launcher_tests {
         assert_eq!(
             seen,
             vec![
+                "ping".to_owned(),
                 "session.snapshot".to_owned(),
                 "notification.show".to_owned()
             ],

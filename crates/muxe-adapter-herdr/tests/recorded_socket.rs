@@ -11,9 +11,8 @@ use muxe_adapter_api::{
     PostDismissalPortableDispatchRequest, ResolvedPortableAction, UiSessionId, UntrustedOriginHint,
 };
 use muxe_adapter_herdr::{
-    ApiSchema, CommandPaneLaunch, CommandTabLaunch, FocusedPane, HerdrAdapter, HerdrResponse,
-    HerdrRuntime, HerdrSocketClient, UiSplitDirection, focused_pane, generated::method_metadata,
-    open_command_pane, open_command_tab,
+    CommandPaneLaunch, CommandTabLaunch, FocusedPane, HerdrAdapter, HerdrResponse, HerdrRuntime,
+    UiSplitDirection, focused_pane, open_command_pane, open_command_tab,
 };
 use muxe_core::{
     ActionScalar, ActionValidator, ConfigValue, ConfigValueKind, CreateCommand, ExecutionId,
@@ -23,37 +22,8 @@ use muxe_core::{
 use serde_json::json;
 use support::{
     production_connect::ProductionConnectFixture,
-    recorded_socket::{RecordedExchange, RecordedResponse, RecordedUnixServer},
+    recorded_socket::{RecordedExchange, RecordedResponse},
 };
-
-#[tokio::test]
-async fn captures_the_client_generated_id_for_an_exact_ping_exchange() {
-    let server = RecordedUnixServer::start(
-        tempfile::tempdir().expect("owned fixture directory"),
-        vec![RecordedExchange {
-            method: "ping",
-            params: json!({}),
-            response: RecordedResponse::Result(json!({
-                "type": "pong",
-                "protocol": 20,
-                "version": "0.8.2",
-            })),
-        }],
-    )
-    .expect("recorded server starts");
-    let client = HerdrSocketClient::new(server.socket());
-    let metadata = method_metadata("ping").expect("bundled ping metadata");
-
-    let response = client
-        .unary(metadata, json!({}))
-        .await
-        .expect("exact recorded request succeeds");
-    assert!(matches!(response, HerdrResponse::Success(_)));
-
-    let requests = server.finish().await.expect("recorded exchange finishes");
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0]["id"].as_str().is_some_and(|id| !id.is_empty()));
-}
 
 #[tokio::test]
 async fn connects_the_production_adapter_through_schema_ping_probe_and_retained_subscription() {
@@ -64,11 +34,12 @@ async fn connects_the_production_adapter_through_schema_ping_probe_and_retained_
     let actual = HostAdapter::identity(adapter.as_ref())
         .await
         .expect("retained subscription keeps the adapter healthy");
-    let expected = fixture
-        .raw_identity()
-        .await
-        .expect("fixture can observe the same raw host identity");
-    assert_eq!(actual, expected);
+    assert_eq!(actual.kind, muxe_adapter_api::HostKind::Herdr);
+    assert_eq!(
+        actual.discovery_key.as_str(),
+        fixture.socket().display().to_string()
+    );
+    assert!(!actual.live_server_id.as_str().is_empty());
     assert_eq!(
         fixture
             .requests()
@@ -77,7 +48,7 @@ async fn connects_the_production_adapter_through_schema_ping_probe_and_retained_
             .map(|request| request["method"].clone())
             .collect::<Vec<_>>(),
         vec![json!("ping"), json!("events.subscribe")],
-        "production connect must use its schema child, ping, raw probe, then retained subscription"
+        "production connect must use its schema child, ping, then retained subscription"
     );
     drop(adapter);
     drop(fixture);
@@ -199,6 +170,7 @@ async fn pending_cleanup_closes_only_the_registered_pane_in_a_shared_temporary_t
         params: json!({ "pane_id": "pane-a" }),
         response: RecordedResponse::Result(json!({ "type": "pane_closed", "pane_id": "pane-a" })),
     });
+    script.push(ProductionConnectFixture::ping_exchange());
     script.push(RecordedExchange {
         method: "pane.get",
         params: json!({ "pane_id": "pane-b" }),
@@ -227,11 +199,11 @@ async fn pending_cleanup_closes_only_the_registered_pane_in_a_shared_temporary_t
         .await
         .expect("cleanup closes the registered pane");
 
-    let response = HerdrSocketClient::new(fixture.adapter_config().socket_path)
-        .unary(
-            method_metadata("pane.get").expect("bundled pane.get metadata"),
-            json!({ "pane_id": "pane-b" }),
-        )
+    let runtime = HerdrRuntime::connect(fixture.adapter_config())
+        .await
+        .expect("a second guarded runtime connects to the same recorded incarnation");
+    let response = runtime
+        .invoke_response("pane.get", json!({ "pane_id": "pane-b" }))
         .await
         .expect("the unrelated pane remains queryable after cleanup");
     assert!(matches!(
@@ -476,6 +448,10 @@ async fn pending_cleanup_rejects_a_rebound_endpoint_before_probing_typed_absence
     let adapter = HerdrAdapter::connect(first_host.adapter_config_at(endpoint.clone()))
         .await
         .expect("production adapter connects through the owned endpoint alias");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
     let registration = pending_pane_registration();
     let lease = adapter
         .register_pending_pane(registration.clone())
@@ -489,6 +465,10 @@ async fn pending_cleanup_rejects_a_rebound_endpoint_before_probing_typed_absence
         .await
         .expect_err("a replaced endpoint must not report its pane absence as convergence");
     assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
     adapter.release_pending_pane(lease.clone());
     adapter.release_pending_pane(lease);
     assert!(
@@ -499,6 +479,55 @@ async fn pending_cleanup_rejects_a_rebound_endpoint_before_probing_typed_absence
         .shutdown()
         .await
         .expect("owned adapter monitor stops");
+}
+
+#[tokio::test]
+async fn admitted_request_rejects_replacement_before_write_and_reports_one_lease_loss() {
+    let first_host =
+        ProductionConnectFixture::start().expect("first owned request endpoint starts");
+    let second_host = ProductionConnectFixture::start_scripted(vec![pending_pane_get()])
+        .expect("replacement owned request endpoint starts");
+    let endpoint_dir = tempfile::tempdir().expect("owned endpoint alias directory");
+    let endpoint = endpoint_dir.path().join("herdr.sock");
+    symlink(first_host.socket(), &endpoint).expect("alias initially selects the first host");
+    let adapter = HerdrAdapter::connect(first_host.adapter_config_at(endpoint.clone()))
+        .await
+        .expect("production adapter connects through the owned endpoint alias");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+
+    let hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_request_connect_wait_hook(Some(Arc::clone(&hook)));
+    let request_waiting = hook.entered.notified();
+    tokio::pin!(request_waiting);
+    let request = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.modal_scope(&PaneId::new("pane-a")).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), &mut request_waiting)
+        .await
+        .expect("request reaches its exact pre-connect guard");
+    fs::remove_file(&endpoint).expect("replace the owned endpoint alias");
+    symlink(second_host.socket(), &endpoint).expect("alias now selects the replacement host");
+    adapter.set_request_connect_wait_hook(None);
+    hook.release.notify_one();
+
+    let error = request
+        .await
+        .expect("guarded request task joins")
+        .expect_err("replacement rejects the admitted request");
+    assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+    assert!(
+        second_host.requests().await.is_empty(),
+        "the replacement receives no request byte and no replay"
+    );
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    adapter.shutdown().await.expect("lost adapter shuts down");
 }
 
 #[tokio::test]
@@ -1161,6 +1190,26 @@ async fn production_structural_batch_reports_every_candidate_like_the_uncached_v
     drop(adapter);
     drop(fixture);
 }
+
+async fn wait_until_suspended(adapter: &HerdrAdapter) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !adapter.suspended_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("suspend reaches its incarnation invalidation");
+}
+
+async fn wait_until_shutdown_started(adapter: &HerdrAdapter) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !adapter.shutdown_started_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown reaches its incarnation invalidation");
+}
 #[tokio::test]
 async fn reconnects_the_production_adapter_only_after_retained_subscription_loss() {
     let mut script = ProductionConnectFixture::initial_handshake();
@@ -1208,6 +1257,405 @@ async fn reconnects_the_production_adapter_only_after_retained_subscription_loss
             json!("ping"),
             json!("events.subscribe"),
         ]
+    );
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn reconnect_install_cannot_revive_a_completed_suspend_invalidation() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.extend(ProductionConnectFixture::initial_handshake());
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned reconnect-suspend fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_reconnect_install_wait_hook(Some(Arc::clone(&hook)));
+    let install_waiting = hook.entered.notified();
+    tokio::pin!(install_waiting);
+
+    fixture.lose_retained_subscriptions();
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(2), &mut install_waiting)
+        .await
+        .expect("reconnect reaches the exact pre-install barrier");
+    let suspending = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.suspend_for_activation().await })
+    };
+    wait_until_suspended(&adapter).await;
+    hook.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), suspending)
+        .await
+        .expect("suspend joins the monitor handoff")
+        .expect("suspend task joins")
+        .expect("suspend succeeds");
+
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    assert!(
+        matches!(
+            adapter.identity().await,
+            Err(error) if error.kind == AdapterErrorKind::Unavailable
+        ),
+        "rejected reconnect leaves the suspended incarnation unhealthy"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+            .await
+            .is_err(),
+        "reconnect must not publish Reconnected after suspend"
+    );
+    adapter
+        .shutdown()
+        .await
+        .expect("shutdown joins parked monitor");
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn reconnect_install_cannot_revive_a_completed_shutdown_invalidation() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.extend(ProductionConnectFixture::initial_handshake());
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned reconnect-shutdown fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_reconnect_install_wait_hook(Some(Arc::clone(&hook)));
+    let install_waiting = hook.entered.notified();
+    tokio::pin!(install_waiting);
+
+    fixture.lose_retained_subscriptions();
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(2), &mut install_waiting)
+        .await
+        .expect("reconnect reaches the exact pre-install barrier");
+    let shutting_down = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.shutdown().await })
+    };
+    wait_until_shutdown_started(&adapter).await;
+    hook.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), shutting_down)
+        .await
+        .expect("shutdown joins the blocked reconnect monitor")
+        .expect("shutdown task joins")
+        .expect("shutdown succeeds");
+
+    let drained = adapter.drain_health_queue_for_test().await;
+    assert!(
+        !drained
+            .iter()
+            .any(|event| matches!(event, AdapterHealthEvent::Reconnected { .. })),
+        "rejected reconnect publishes no Reconnected event"
+    );
+    assert!(adapter.shutdown_started_for_test());
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn activation_resume_cannot_succeed_after_racing_shutdown() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.extend(ProductionConnectFixture::initial_handshake());
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned resume-shutdown fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    adapter
+        .suspend_for_activation()
+        .await
+        .expect("activation suspend succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    let hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_resume_install_wait_hook(Some(Arc::clone(&hook)));
+    let install_waiting = hook.entered.notified();
+    tokio::pin!(install_waiting);
+    let drain_hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_resume_drain_wait_hook(Some(Arc::clone(&drain_hook)));
+    let drain_waiting = drain_hook.entered.notified();
+    tokio::pin!(drain_waiting);
+    let resuming = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.resume_after_activation_abort().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), &mut install_waiting)
+        .await
+        .expect("resume reaches the exact pre-install barrier");
+    let shutting_down = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.shutdown().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), &mut drain_waiting)
+        .await
+        .expect("shutdown enables its resume-drained notification before checking the registry");
+    wait_until_shutdown_started(&adapter).await;
+    hook.release.notify_one();
+    drain_hook.release.notify_one();
+    let resume = tokio::time::timeout(Duration::from_secs(2), resuming)
+        .await
+        .expect("racing resume finishes")
+        .expect("resume task joins");
+    assert!(
+        matches!(resume, Err(error) if error.kind == AdapterErrorKind::Shutdown),
+        "shutdown wins the resume install race"
+    );
+    tokio::time::timeout(Duration::from_secs(2), shutting_down)
+        .await
+        .expect("shutdown waits for the resume candidate to be dropped")
+        .expect("shutdown task joins")
+        .expect("shutdown succeeds");
+    let drained = adapter.drain_health_queue_for_test().await;
+    assert!(
+        !drained
+            .iter()
+            .any(|event| matches!(event, AdapterHealthEvent::Reconnected { .. })),
+        "failed resume publishes no Reconnected event"
+    );
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn cancelled_suspend_is_joined_by_retry_and_does_not_release_the_next_generation() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.extend(ProductionConnectFixture::initial_handshake());
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned suspend-cancellation fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+
+    let first_hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_suspend_release_wait_hook(Some(Arc::clone(&first_hook)));
+    let first_release_waiting = first_hook.entered.notified();
+    tokio::pin!(first_release_waiting);
+    let first_suspend = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.suspend_for_activation().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), &mut first_release_waiting)
+        .await
+        .expect("monitor observes the exact first suspension generation");
+    first_suspend.abort();
+    first_suspend
+        .await
+        .expect_err("the first suspend caller is cancelled");
+
+    let retry = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.suspend_for_activation().await })
+    };
+    first_hook.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), retry)
+        .await
+        .expect("retry joins the durable first attempt")
+        .expect("retry task joins")
+        .expect("retry observes exact stream release");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    adapter
+        .resume_after_activation_abort()
+        .await
+        .expect("resume installs a fresh incarnation");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Reconnected { .. }
+    ));
+
+    let next_hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_suspend_release_wait_hook(Some(Arc::clone(&next_hook)));
+    let next_release_waiting = next_hook.entered.notified();
+    tokio::pin!(next_release_waiting);
+    let next_suspend = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.suspend_for_activation().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), &mut next_release_waiting)
+        .await
+        .expect("a later suspension reaches its own exact release barrier");
+    assert!(
+        !next_suspend.is_finished(),
+        "the later generation cannot consume the earlier release"
+    );
+    next_hook.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), next_suspend)
+        .await
+        .expect("later suspension completes")
+        .expect("later suspend task joins")
+        .expect("later exact stream is released");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    adapter.shutdown().await.expect("parked adapter shuts down");
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn concurrent_suspend_callers_join_one_generation_and_publish_once() {
+    let fixture =
+        ProductionConnectFixture::start().expect("owned concurrent-suspend fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_suspend_release_wait_hook(Some(Arc::clone(&hook)));
+    let release_waiting = hook.entered.notified();
+    tokio::pin!(release_waiting);
+    let first = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.suspend_for_activation().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), &mut release_waiting)
+        .await
+        .expect("monitor reaches the shared generation release barrier");
+    let second = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.suspend_for_activation().await })
+    };
+    tokio::task::yield_now().await;
+    hook.release.notify_one();
+    for caller in [first, second] {
+        tokio::time::timeout(Duration::from_secs(2), caller)
+            .await
+            .expect("concurrent suspend completes")
+            .expect("concurrent suspend task joins")
+            .expect("concurrent caller observes release");
+    }
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), adapter.next_health_event())
+            .await
+            .is_err(),
+        "one suspend generation publishes exactly one health event"
+    );
+    adapter.shutdown().await.expect("parked adapter shuts down");
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn shutdown_cancels_resume_after_server_accepts_ping_without_replying() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(RecordedExchange {
+        method: "ping",
+        params: json!({}),
+        response: RecordedResponse::Hang,
+    });
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned hanging-resume fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    adapter
+        .suspend_for_activation()
+        .await
+        .expect("activation suspend succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+
+    let resuming = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.resume_after_activation_abort().await })
+    };
+    fixture.wait_for_requests(3).await;
+    let shutting_down = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.shutdown().await })
+    };
+    wait_until_shutdown_started(&adapter).await;
+    tokio::time::timeout(Duration::from_secs(2), shutting_down)
+        .await
+        .expect("shutdown cancels the accepted no-pong resume")
+        .expect("shutdown task joins")
+        .expect("shutdown succeeds");
+    let resume = tokio::time::timeout(Duration::from_secs(2), resuming)
+        .await
+        .expect("cancelled resume returns")
+        .expect("resume task joins");
+    assert!(matches!(
+        resume,
+        Err(error) if error.kind == AdapterErrorKind::Shutdown
+    ));
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn explicit_shutdown_of_live_subscription_emits_no_host_loss() {
+    let fixture = ProductionConnectFixture::start().expect("owned shutdown fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects before shutdown");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+
+    adapter
+        .shutdown()
+        .await
+        .expect("shutdown closes the retained subscription");
+    fixture.lose_retained_subscriptions();
+    assert!(
+        matches!(
+            adapter.next_health_event().await,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+        ),
+        "intentional shutdown terminates health delivery without Unhealthy or HostLost"
     );
     drop(adapter);
     drop(fixture);
@@ -1270,6 +1718,181 @@ async fn production_reconnect_emits_one_terminal_host_loss_after_bounded_grace()
             .await
             .is_err(),
         "host loss must be emitted exactly once"
+    );
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn suspend_after_terminal_monitor_exit_returns_typed_host_loss() {
+    let fixture =
+        ProductionConnectFixture::start_scripted(ProductionConnectFixture::initial_handshake())
+            .expect("owned terminal-suspend fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    tokio::time::pause();
+    fixture.lose_retained_subscriptions();
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    let terminal = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.next_health_event().await })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(11)).await;
+    assert!(matches!(
+        terminal.await.unwrap().unwrap(),
+        AdapterHealthEvent::HostLost { .. }
+    ));
+
+    let suspend = tokio::time::timeout(Duration::from_secs(1), adapter.suspend_for_activation())
+        .await
+        .expect("suspend observes the exited monitor outcome");
+    assert!(matches!(
+        suspend,
+        Err(error) if error.kind == AdapterErrorKind::Unavailable
+    ));
+    adapter
+        .shutdown()
+        .await
+        .expect("shutdown joins exited monitor");
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn suspend_racing_full_queue_host_loss_preserves_event_and_completes() {
+    let fixture =
+        ProductionConnectFixture::start_scripted(ProductionConnectFixture::initial_handshake())
+            .expect("owned full-queue suspend fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    assert_eq!(adapter.fill_health_queue_for_test(), 64);
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    let hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_host_lost_reserve_pending_hook(Some(Arc::clone(&hook)));
+    let reserve_pending = hook.entered.notified();
+    tokio::pin!(reserve_pending);
+    tokio::time::pause();
+
+    fixture.lose_retained_subscriptions();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while adapter.identity().await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("subscription loss invalidates the incarnation");
+    for _ in 0..11 {
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    tokio::time::timeout(Duration::from_secs(1), &mut reserve_pending)
+        .await
+        .expect("HostLost reserve is genuinely pending on the full queue");
+
+    let suspend = tokio::time::timeout(Duration::from_secs(1), adapter.suspend_for_activation())
+        .await
+        .expect("suspend receives terminal monitor outcome");
+    assert!(matches!(
+        suspend,
+        Err(error) if error.kind == AdapterErrorKind::Unavailable
+    ));
+    for _ in 0..64 {
+        assert!(
+            matches!(
+                adapter.next_health_event().await.unwrap(),
+                AdapterHealthEvent::Unhealthy { .. }
+            ),
+            "bounded health events retain FIFO order ahead of HostLost"
+        );
+    }
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::HostLost { .. }
+    ));
+    adapter
+        .shutdown()
+        .await
+        .expect("shutdown joins exited monitor");
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_terminal_host_loss_when_health_queue_is_full() {
+    let fixture =
+        ProductionConnectFixture::start_scripted(ProductionConnectFixture::initial_handshake())
+            .expect("owned full-health-queue fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial adapter connection succeeds");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    assert_eq!(
+        adapter.fill_health_queue_for_test(),
+        64,
+        "test fills the bounded health queue exactly"
+    );
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    let hook = Arc::new(muxe_adapter_herdr::WaitHook::new());
+    adapter.set_host_lost_reserve_pending_hook(Some(Arc::clone(&hook)));
+    let host_lost_waiting = hook.entered.notified();
+    tokio::pin!(host_lost_waiting);
+    tokio::time::pause();
+
+    fixture.lose_retained_subscriptions();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while adapter.identity().await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("subscription loss invalidates the incarnation");
+    for _ in 0..11 {
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    tokio::time::timeout(Duration::from_secs(1), &mut host_lost_waiting)
+        .await
+        .expect("bounded grace reaches terminal HostLost publication");
+
+    let shutting_down = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.shutdown().await })
+    };
+    wait_until_shutdown_started(&adapter).await;
+    tokio::time::timeout(Duration::from_secs(2), shutting_down)
+        .await
+        .expect("shutdown interrupts the full-queue HostLost send")
+        .expect("shutdown task joins")
+        .expect("shutdown joins the monitor without deadlock");
+    let drained = adapter.drain_health_queue_for_test().await;
+    assert!(
+        !drained
+            .iter()
+            .any(|event| matches!(event, AdapterHealthEvent::HostLost { .. })),
+        "shutdown cancellation publishes no stale HostLost"
     );
     drop(adapter);
     drop(fixture);
@@ -1349,21 +1972,16 @@ fn command_launch_exchanges() -> Vec<RecordedExchange> {
 
 #[tokio::test]
 async fn launches_an_exact_command_from_the_live_focused_origin() {
-    let server = RecordedUnixServer::start(
-        tempfile::tempdir().expect("owned fixture directory"),
-        command_launch_exchanges(),
-    )
-    .expect("recorded server starts");
-    let client = HerdrSocketClient::new(server.socket());
-    let schema = ApiSchema::parse(
-        serde_json::from_str(include_str!(
-            "../../../fixtures/herdr/herdr-api.schema.json"
-        ))
-        .expect("bundled schema JSON"),
-    )
-    .expect("bundled schema parses");
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.truncate(1);
+    script.extend(command_launch_exchanges());
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned command-pane fixture starts");
+    let runtime = HerdrRuntime::connect(fixture.adapter_config())
+        .await
+        .expect("guarded runtime connects");
 
-    let origin = focused_pane(&client, &schema)
+    let origin = focused_pane(&runtime)
         .await
         .expect("focused origin is captured from the live snapshot");
     assert_eq!(
@@ -1378,8 +1996,7 @@ async fn launches_an_exact_command_from_the_live_focused_origin() {
         }
     );
     let placement = open_command_pane(
-        &client,
-        &schema,
+        &runtime,
         CommandPaneLaunch {
             destination: origin.clone(),
             cwd: "/captured/origin".into(),
@@ -1393,58 +2010,47 @@ async fn launches_an_exact_command_from_the_live_focused_origin() {
     .await
     .expect("captured command launches");
     assert_eq!(placement.pane.as_str(), "new-pane");
-    assert_eq!(
-        server
-            .finish()
-            .await
-            .expect("all recorded requests complete")
-            .len(),
-        3
-    );
+    assert_eq!(fixture.requests().await.len(), 4);
+    drop(runtime);
+    drop(fixture);
 }
 
 #[tokio::test]
 async fn launches_an_exact_command_as_a_labeled_unfocused_tab() {
-    let server = RecordedUnixServer::start(
-        tempfile::tempdir().expect("owned fixture directory"),
-        vec![RecordedExchange {
-            method: "layout.apply",
-            params: json!({
-                "focus": false,
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.truncate(1);
+    script.push(RecordedExchange {
+        method: "layout.apply",
+        params: json!({
+            "focus": false,
+            "workspace_id": "workspace-1",
+            "tab_label": "logs",
+            "root": {
+                "type": "pane",
+                "command": ["tail", "--follow"],
+                "cwd": "/captured/origin",
+                "env": {},
+            },
+        }),
+        response: RecordedResponse::Result(json!({
+            "type": "layout_apply",
+            "layout": {
                 "workspace_id": "workspace-1",
-                "tab_label": "logs",
-                "root": {
-                    "type": "pane",
-                    "command": ["tail", "--follow"],
-                    "cwd": "/captured/origin",
-                    "env": {},
-                },
-            }),
-            response: RecordedResponse::Result(json!({
-                "type": "layout_apply",
-                "layout": {
-                    "workspace_id": "workspace-1",
-                    "tab_id": "logs-tab",
-                    "zoomed": false,
-                    "focused_pane_id": "logs-pane",
-                    "root": { "type": "pane", "pane_id": "logs-pane" },
-                },
-            })),
-        }],
-    )
-    .expect("recorded server starts");
-    let client = HerdrSocketClient::new(server.socket());
-    let schema = ApiSchema::parse(
-        serde_json::from_str(include_str!(
-            "../../../fixtures/herdr/herdr-api.schema.json"
-        ))
-        .expect("bundled schema JSON"),
-    )
-    .expect("bundled schema parses");
+                "tab_id": "logs-tab",
+                "zoomed": false,
+                "focused_pane_id": "logs-pane",
+                "root": { "type": "pane", "pane_id": "logs-pane" },
+            },
+        })),
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned command-tab fixture starts");
+    let runtime = HerdrRuntime::connect(fixture.adapter_config())
+        .await
+        .expect("guarded runtime connects");
 
     open_command_tab(
-        &client,
-        &schema,
+        &runtime,
         CommandTabLaunch {
             workspace: muxe_core::WorkspaceId::new("workspace-1"),
             label: Some("logs".to_owned()),
@@ -1455,14 +2061,9 @@ async fn launches_an_exact_command_as_a_labeled_unfocused_tab() {
     )
     .await
     .expect("exact tab command launches");
-    assert_eq!(
-        server
-            .finish()
-            .await
-            .expect("recorded request completes")
-            .len(),
-        1
-    );
+    assert_eq!(fixture.requests().await.len(), 2);
+    drop(runtime);
+    drop(fixture);
 }
 
 /// One-consumer invariant: `next_health_event` is called only by the broker
