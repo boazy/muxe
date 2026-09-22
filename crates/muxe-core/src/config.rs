@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use crate::menu::{
     BindingId, BindingLocation, CompiledBinding, CompiledGeneration, CompiledMenu, MenuId,
     UiAttachmentView, menu_view,
 };
-use crate::theme::CompiledTheme;
+use crate::theme::{CompiledTheme, CompiledThemeCatalog, ThemeSelectionError};
 
 /// One configuration value with the exact source range that produced it.
 #[derive(Clone, Debug, PartialEq)]
@@ -509,11 +510,39 @@ pub struct CompiledConfig {
     pub host: HostSettings,
     pub theme_selection: ThemeSelection,
     pub theme: CompiledTheme,
+    /// Every parsed theme and color scheme available to attachments in this generation.
+    pub(crate) theme_catalog: CompiledThemeCatalog,
     /// The sole owner of compiled action payloads.
     pub menus: Vec<CompiledMenu>,
     /// Compact generation-scoped locations into `menus`, never cloned payloads.
     pub bindings: BTreeMap<BindingId, BindingLocation>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedAttachmentTheme {
+    selection: ThemeSelection,
+    theme: Arc<CompiledTheme>,
+    origin: Arc<()>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttachmentViewError {
+    MissingMenu(MenuId),
+    Theme(ThemeSelectionError),
+}
+
+impl fmt::Display for AttachmentViewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingMenu(root) => {
+                write!(formatter, "requested root menu does not exist: {root:?}")
+            }
+            Self::Theme(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for AttachmentViewError {}
 
 impl CompiledConfig {
     #[must_use]
@@ -521,14 +550,70 @@ impl CompiledConfig {
         self.menus.iter().find(|menu| &menu.id == id)
     }
 
-    #[must_use]
-    pub fn attachment_view(&self, root: &MenuId) -> Option<UiAttachmentView> {
-        Some(UiAttachmentView {
-            menu: menu_view(self.generation, root, &self.menus)?,
+    /// Resolves one attachment's immutable theme selection from this generation's catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ThemeSelectionError`] when an asset is unknown, malformed, or the mixed pair
+    /// is invalid.
+    pub fn resolve_theme(
+        &self,
+        selection: &ThemeSelection,
+    ) -> Result<ResolvedAttachmentTheme, ThemeSelectionError> {
+        let theme = self
+            .theme_catalog
+            .resolve(&selection.theme, &selection.color_scheme)?;
+        Ok(ResolvedAttachmentTheme {
+            selection: selection.clone(),
+            theme: Arc::new(theme),
+            origin: self.theme_catalog.origin_token(),
+        })
+    }
+
+    /// Builds the complete immutable view for one explicit theme selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttachmentViewError::MissingMenu`] for an unknown root or
+    /// [`AttachmentViewError::Theme`] when selection resolution fails.
+    pub fn attachment_view(
+        &self,
+        root: &MenuId,
+        selection: &ThemeSelection,
+    ) -> Result<UiAttachmentView, AttachmentViewError> {
+        let resolved = self
+            .resolve_theme(selection)
+            .map_err(AttachmentViewError::Theme)?;
+        self.attachment_view_resolved(root, &resolved)
+    }
+
+    /// Composes an attachment from a resolution produced by this exact compiled generation.
+    ///
+    /// The opaque resolution couples the selected names, compiled payload, and catalog identity;
+    /// no catalog lookup or pair compilation occurs here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttachmentViewError::Theme`] when the resolution belongs to a different
+    /// compiled generation and [`AttachmentViewError::MissingMenu`] for an unknown root.
+    pub fn attachment_view_resolved(
+        &self,
+        root: &MenuId,
+        resolved: &ResolvedAttachmentTheme,
+    ) -> Result<UiAttachmentView, AttachmentViewError> {
+        if !Arc::ptr_eq(&resolved.origin, &self.theme_catalog.origin_token()) {
+            return Err(AttachmentViewError::Theme(
+                ThemeSelectionError::StaleResolution,
+            ));
+        }
+        let menu = menu_view(self.generation, root, &self.menus)
+            .ok_or_else(|| AttachmentViewError::MissingMenu(root.clone()))?;
+        Ok(UiAttachmentView {
+            menu,
             keyboard: self.keyboard.clone(),
             inactivity_timeout: self.inactivity_timeout,
-            theme_selection: self.theme_selection.clone(),
-            theme: self.theme.clone(),
+            theme_selection: resolved.selection.clone(),
+            theme: Arc::clone(&resolved.theme),
         })
     }
 

@@ -29,8 +29,8 @@ use crate::menu::{
     CompiledMenu, InlineMenuId, LayoutSettings, MenuId, MenuName, binding_index,
 };
 use crate::theme::{
-    Color, ColorScheme, CompiledTheme, Style, Theme, ThemeSection, default_color_scheme,
-    default_theme,
+    Color, ColorScheme, CompiledTheme, CompiledThemeCatalog, Style, Theme, ThemeSection,
+    default_color_scheme, default_theme,
 };
 
 const BUILTINS: &str = r#"
@@ -137,7 +137,8 @@ pub(crate) fn compile_effective(
     let inactivity_timeout = global_settings.timeout;
     let reload = global_settings.reload;
     let host = global_settings.host;
-    let (theme_selection, theme) = compile_theme_pair(&root, &theme_assets)?;
+    let theme_catalog = compile_theme_catalog(&theme_assets);
+    let (theme_selection, theme) = compile_theme_pair(&root, &theme_catalog)?;
     let global_layout = compile_layout(
         root.field("layout").map(|field| &field.value),
         LayoutSettings::default(),
@@ -237,6 +238,7 @@ pub(crate) fn compile_effective(
         host,
         theme_selection,
         theme,
+        theme_catalog,
         menus,
         bindings,
     })
@@ -588,51 +590,77 @@ fn compile_layout(
     }
     Ok(layout)
 }
+fn compile_theme_catalog(assets: &ThemeAssets) -> CompiledThemeCatalog {
+    let mut themes: BTreeMap<_, _> = assets
+        .themes
+        .iter()
+        .map(|(name, document)| {
+            (
+                name.clone(),
+                (parse_theme_document(document), document.root.span.clone()),
+            )
+        })
+        .collect();
+    let mut color_schemes: BTreeMap<_, _> = assets
+        .color_schemes
+        .iter()
+        .map(|(name, document)| {
+            (
+                name.clone(),
+                (
+                    parse_color_scheme_document(document),
+                    document.root.span.clone(),
+                ),
+            )
+        })
+        .collect();
+    let default_span = SourceSpan::new(SourceId::new("<muxe built-in>"), 0, 0);
+    themes
+        .entry("default".to_owned())
+        .or_insert_with(|| (Ok(default_theme()), default_span.clone()));
+    color_schemes
+        .entry("default".to_owned())
+        .or_insert_with(|| (Ok(default_color_scheme()), default_span));
+    CompiledThemeCatalog::new(themes, color_schemes)
+}
 
 fn compile_theme_pair(
     root: &ConfigValue,
-    assets: &ThemeAssets,
+    catalog: &CompiledThemeCatalog,
 ) -> Result<(ThemeSelection, CompiledTheme), Vec<ConfigDiagnostic>> {
     let (theme_name, theme_span) = selected_asset_name(root, "theme")?;
     let (color_scheme_name, scheme_span) = selected_asset_name(root, "color-scheme")?;
-    let theme = match assets.themes.get(&theme_name) {
-        Some(document) => parse_theme_document(document)?,
-        None if theme_name == "default" => default_theme(),
-        None => {
-            return Err(vec![ConfigDiagnostic::error(
-                DiagnosticCode::InvalidTheme,
-                format!("unknown theme `{theme_name}`"),
-                theme_span,
-            )]);
-        }
+    let selection = ThemeSelection {
+        theme: theme_name,
+        color_scheme: color_scheme_name,
     };
-    let scheme = match assets.color_schemes.get(&color_scheme_name) {
-        Some(document) => parse_color_scheme_document(document)?,
-        None if color_scheme_name == "default" => default_color_scheme(),
-        None => {
-            return Err(vec![ConfigDiagnostic::error(
-                DiagnosticCode::InvalidColorScheme,
-                format!("unknown color scheme `{color_scheme_name}`"),
-                scheme_span,
-            )]);
-        }
-    };
-    let compiled = CompiledTheme::compile(theme, scheme).map_err(|error| {
-        vec![ConfigDiagnostic::error(
-            DiagnosticCode::InvalidTheme,
-            format!(
-                "theme `{theme_name}` cannot pair with color scheme `{color_scheme_name}`: {error}"
-            ),
-            theme_span,
-        )]
-    })?;
-    Ok((
-        ThemeSelection {
-            theme: theme_name,
-            color_scheme: color_scheme_name,
-        },
-        compiled,
-    ))
+    let compiled = catalog
+        .resolve(&selection.theme, &selection.color_scheme)
+        .map_err(|error| match error {
+            crate::theme::ThemeSelectionError::InvalidTheme { diagnostics, .. }
+            | crate::theme::ThemeSelectionError::InvalidColorScheme { diagnostics, .. } => {
+                diagnostics
+            }
+            crate::theme::ThemeSelectionError::UnknownTheme { .. }
+            | crate::theme::ThemeSelectionError::InvalidPair { .. } => {
+                vec![ConfigDiagnostic::error(
+                    DiagnosticCode::InvalidTheme,
+                    error.to_string(),
+                    theme_span.clone(),
+                )]
+            }
+            crate::theme::ThemeSelectionError::UnknownColorScheme { .. } => {
+                vec![ConfigDiagnostic::error(
+                    DiagnosticCode::InvalidColorScheme,
+                    error.to_string(),
+                    scheme_span.clone(),
+                )]
+            }
+            crate::theme::ThemeSelectionError::StaleResolution => {
+                unreachable!("stale resolution cannot come from catalog resolution")
+            }
+        })?;
+    Ok((selection, compiled))
 }
 
 fn selected_asset_name(

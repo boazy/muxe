@@ -3882,7 +3882,8 @@ mod mixed_recovery_production_tests {
         .expect("diagnostic configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)

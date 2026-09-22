@@ -1,5 +1,7 @@
+use crate::diagnostic::{ConfigDiagnostic, SourceSpan};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 /// Resolved theme color. `Inherit` delegates foreground or background selection to the host
 /// terminal; `Rgb` is an explicit truecolor value.
@@ -153,6 +155,155 @@ pub const REQUIRED_COMPONENT_TEMPLATES: [&str; 5] = [
 pub struct CompiledTheme {
     pub theme: Theme,
     pub scheme: ColorScheme,
+}
+/// Immutable parsed theme and color-scheme assets retained by one compiled generation.
+///
+/// Each entry retains either its parsed value or the exact source diagnostics produced while
+/// parsing it. The broker can therefore reject a malformed attach override without filesystem I/O.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledThemeCatalog {
+    themes: BTreeMap<String, ThemeAsset<Theme>>,
+    color_schemes: BTreeMap<String, ThemeAsset<ColorScheme>>,
+    origin: Arc<()>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ThemeAsset<T> {
+    parsed: Result<T, Vec<ConfigDiagnostic>>,
+    span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ThemeSelectionError {
+    UnknownTheme {
+        name: String,
+    },
+    UnknownColorScheme {
+        name: String,
+    },
+    InvalidTheme {
+        name: String,
+        diagnostics: Vec<ConfigDiagnostic>,
+    },
+    InvalidColorScheme {
+        name: String,
+        diagnostics: Vec<ConfigDiagnostic>,
+    },
+    InvalidPair {
+        theme: String,
+        color_scheme: String,
+        error: ThemePairError,
+        span: SourceSpan,
+    },
+    StaleResolution,
+}
+
+impl fmt::Display for ThemeSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTheme { name } => write!(formatter, "unknown theme `{name}`"),
+            Self::UnknownColorScheme { name } => {
+                write!(formatter, "unknown color scheme `{name}`")
+            }
+            Self::InvalidTheme { name, diagnostics } => write!(
+                formatter,
+                "theme `{name}` is invalid: {}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Self::InvalidColorScheme { name, diagnostics } => write!(
+                formatter,
+                "color scheme `{name}` is invalid: {}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Self::InvalidPair {
+                theme,
+                color_scheme,
+                error,
+                ..
+            } => write!(
+                formatter,
+                "theme `{theme}` cannot pair with color scheme `{color_scheme}`: {error}"
+            ),
+            Self::StaleResolution => {
+                formatter.write_str("theme resolution belongs to another generation")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ThemeSelectionError {}
+
+impl CompiledThemeCatalog {
+    pub(crate) fn new(
+        themes: BTreeMap<String, (Result<Theme, Vec<ConfigDiagnostic>>, SourceSpan)>,
+        color_schemes: BTreeMap<String, (Result<ColorScheme, Vec<ConfigDiagnostic>>, SourceSpan)>,
+    ) -> Self {
+        Self {
+            themes: themes
+                .into_iter()
+                .map(|(name, (parsed, span))| (name, ThemeAsset { parsed, span }))
+                .collect(),
+            color_schemes: color_schemes
+                .into_iter()
+                .map(|(name, (parsed, span))| (name, ThemeAsset { parsed, span }))
+                .collect(),
+            origin: Arc::new(()),
+        }
+    }
+
+    pub(crate) fn origin_token(&self) -> Arc<()> {
+        Arc::clone(&self.origin)
+    }
+
+    /// Resolves and validates one exact theme/color-scheme pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ThemeSelectionError`] when either asset is absent or malformed, or when
+    /// the mixed pair violates the shared [`CompiledTheme`] validation contract.
+    pub fn resolve(
+        &self,
+        theme_name: &str,
+        color_scheme_name: &str,
+    ) -> Result<CompiledTheme, ThemeSelectionError> {
+        let theme_asset =
+            self.themes
+                .get(theme_name)
+                .ok_or_else(|| ThemeSelectionError::UnknownTheme {
+                    name: theme_name.to_owned(),
+                })?;
+        let theme = theme_asset.parsed.clone().map_err(|diagnostics| {
+            ThemeSelectionError::InvalidTheme {
+                name: theme_name.to_owned(),
+                diagnostics,
+            }
+        })?;
+        let scheme_asset = self.color_schemes.get(color_scheme_name).ok_or_else(|| {
+            ThemeSelectionError::UnknownColorScheme {
+                name: color_scheme_name.to_owned(),
+            }
+        })?;
+        let scheme = scheme_asset.parsed.clone().map_err(|diagnostics| {
+            ThemeSelectionError::InvalidColorScheme {
+                name: color_scheme_name.to_owned(),
+                diagnostics,
+            }
+        })?;
+        CompiledTheme::compile(theme, scheme).map_err(|error| ThemeSelectionError::InvalidPair {
+            theme: theme_name.to_owned(),
+            color_scheme: color_scheme_name.to_owned(),
+            error,
+            span: theme_asset.span.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

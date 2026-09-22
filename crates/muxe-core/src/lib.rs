@@ -29,10 +29,10 @@ pub use condition::{
     ConditionEvaluationError, ConditionIr, ConditionProgram, PagesContext, evaluate_condition_ir,
 };
 pub use config::{
-    ActionValidation, ActionValidator, CompileInput, CompiledConfig, Compiler, ConfigDocument,
-    ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError, HostSettings,
-    HostVersionCheck, KeyboardProfile, RawConfig, ReloadSettings, ThemeAssets, ThemeSelection,
-    compile_yaml, merge_values,
+    ActionValidation, ActionValidator, AttachmentViewError, CompileInput, CompiledConfig, Compiler,
+    ConfigDocument, ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError,
+    HostSettings, HostVersionCheck, KeyboardProfile, RawConfig, ReloadSettings,
+    ResolvedAttachmentTheme, ThemeAssets, ThemeSelection, compile_yaml, merge_values,
 };
 pub use context::{
     AgentId, ClientId, ContextPath, ContextReference, ContextType, ContextValue, LinkHandlerId,
@@ -61,7 +61,7 @@ pub use session::{
     MenuSessionState, SessionInstant,
 };
 pub use theme::{
-    Color, ColorScheme, CompiledTheme, REQUIRED_COMPONENT_TEMPLATES, Style, Theme, ThemePairError,
-    ThemeSection, compiled_default_theme, default_color_scheme, default_theme,
-    has_loader_backed_construct,
+    Color, ColorScheme, CompiledTheme, CompiledThemeCatalog, REQUIRED_COMPONENT_TEMPLATES, Style,
+    Theme, ThemePairError, ThemeSection, ThemeSelectionError, compiled_default_theme,
+    default_color_scheme, default_theme, has_loader_backed_construct,
 };

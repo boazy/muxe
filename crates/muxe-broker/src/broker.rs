@@ -23,8 +23,9 @@ use muxe_adapter_api::{
     UntrustedOriginHint,
 };
 use muxe_core::{
-    ActionSpec, CommandAction, CompiledConfig, CompiledGeneration, ConfigAction,
-    ExecutionId as CoreExecutionId, ExecutionPolicy, MenuAction, PaneId, TabId, TimeoutAction,
+    ActionSpec, CommandAction, CompiledConfig, CompiledGeneration, ConfigAction, ConfigDiagnostic,
+    ExecutionId as CoreExecutionId, ExecutionPolicy, MenuAction, PaneId, ResolvedAttachmentTheme,
+    SourceId, SourceSpan, TabId, ThemeSelection, TimeoutAction,
 };
 use muxe_protocol::{
     AbortUiLaunch, AttachUi, BrokerEvent, BrokerResponse, ClientRequest, DiagnosticCode, EventId,
@@ -349,6 +350,69 @@ fn core_menu_id_to_wire(value: &muxe_core::MenuId) -> muxe_protocol::MenuId {
         }
     }
 }
+fn theme_selection_broker_error(error: muxe_core::ThemeSelectionError) -> BrokerError {
+    let fallback_span = || SourceSpan::new(SourceId::new("<ui attach>"), 0, 0);
+    let config_error = match error {
+        muxe_core::ThemeSelectionError::InvalidTheme { diagnostics, .. }
+        | muxe_core::ThemeSelectionError::InvalidColorScheme { diagnostics, .. } => {
+            ConfigError::Diagnostics(diagnostics)
+        }
+        muxe_core::ThemeSelectionError::InvalidPair {
+            error,
+            theme,
+            color_scheme,
+            span,
+        } => ConfigError::Diagnostics(vec![ConfigDiagnostic::error(
+            muxe_core::DiagnosticCode::InvalidTheme,
+            format!("theme `{theme}` cannot pair with color scheme `{color_scheme}`: {error}"),
+            span,
+        )]),
+        muxe_core::ThemeSelectionError::StaleResolution => {
+            ConfigError::Diagnostics(vec![ConfigDiagnostic::error(
+                muxe_core::DiagnosticCode::InvalidTheme,
+                "theme resolution belongs to another generation",
+                fallback_span(),
+            )])
+        }
+        error @ (muxe_core::ThemeSelectionError::UnknownTheme { .. }
+        | muxe_core::ThemeSelectionError::UnknownColorScheme { .. }) => {
+            let code = match &error {
+                muxe_core::ThemeSelectionError::UnknownTheme { .. } => {
+                    muxe_core::DiagnosticCode::InvalidTheme
+                }
+                muxe_core::ThemeSelectionError::UnknownColorScheme { .. } => {
+                    muxe_core::DiagnosticCode::InvalidColorScheme
+                }
+                _ => unreachable!("unknown selection error covered above"),
+            };
+            ConfigError::Diagnostics(vec![ConfigDiagnostic::error(
+                code,
+                error.to_string(),
+                fallback_span(),
+            )])
+        }
+    };
+    BrokerError::Configuration(Box::new(config_error))
+}
+
+fn resolve_attachment_theme(
+    config: &CompiledConfig,
+    request: &AttachUi,
+) -> Result<ResolvedAttachmentTheme, BrokerError> {
+    let selection = ThemeSelection {
+        theme: request
+            .theme
+            .clone()
+            .unwrap_or_else(|| config.theme_selection.theme.clone()),
+        color_scheme: request
+            .color_scheme
+            .clone()
+            .unwrap_or_else(|| config.theme_selection.color_scheme.clone()),
+    };
+    config
+        .resolve_theme(&selection)
+        .map_err(theme_selection_broker_error)
+}
 
 struct SessionRecord {
     config: Arc<CompiledConfig>,
@@ -356,6 +420,7 @@ struct SessionRecord {
     scope: muxe_adapter_api::ModalScopeId,
     origin: muxe_core::OriginContext,
     ui_pane: PaneId,
+    resolved_theme: ResolvedAttachmentTheme,
     capture: Option<CaptureLease>,
     readiness: watch::Sender<SessionReadiness>,
     events: mpsc::Sender<muxe_protocol::WireMessage>,
@@ -1968,6 +2033,11 @@ impl Broker {
         request: AttachUi,
         events: mpsc::Sender<muxe_protocol::WireMessage>,
     ) -> Result<RequestResult, BrokerError> {
+        let config = self.config.snapshot().await.config;
+        if wire_menu_id_to_core(&request.root).is_none_or(|root| config.menu(&root).is_none()) {
+            return Err(BrokerError::UnknownMenu(request.root));
+        }
+        let resolved_theme = resolve_attachment_theme(&config, &request)?;
         let pane = PaneId::new(request.pane.as_str());
         let scope = self
             .adapter
@@ -1975,10 +2045,6 @@ impl Broker {
             .await
             .map_err(BrokerError::from)?;
         let wire_scope = ModalScopeId::new(scope.as_str());
-        let config = self.config.snapshot().await.config;
-        if wire_menu_id_to_core(&request.root).is_none_or(|root| config.menu(&root).is_none()) {
-            return Err(BrokerError::UnknownMenu(request.root));
-        }
 
         let (origin_hint, caller_identity) = Self::origin_hints(&request);
         let session = {
@@ -2081,6 +2147,7 @@ impl Broker {
             scope,
             origin,
             ui_pane: pane,
+            resolved_theme,
             capture: None,
             readiness,
             events,
@@ -2396,8 +2463,13 @@ impl Broker {
             .ok_or_else(|| BrokerError::UnknownSession(session.clone()))?;
         let view = record
             .config
-            .attachment_view(&record.root)
-            .ok_or_else(|| BrokerError::UnknownMenu(core_menu_id_to_wire(&record.root)))?;
+            .attachment_view_resolved(&record.root, &record.resolved_theme)
+            .map_err(|error| match error {
+                muxe_core::AttachmentViewError::MissingMenu(root) => {
+                    BrokerError::UnknownMenu(core_menu_id_to_wire(&root))
+                }
+                muxe_core::AttachmentViewError::Theme(error) => theme_selection_broker_error(error),
+            })?;
         Ok(BrokerResponse::UiAttached {
             session: session.clone(),
             snapshot: wire::attachment(&view),
@@ -4023,7 +4095,8 @@ menus:
         .expect("detached adapter configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -4282,6 +4355,8 @@ menus:
 
     struct ScopedTestAdapter {
         dispatches: AtomicUsize,
+        modal_scope_calls: AtomicUsize,
+        capture_calls: AtomicUsize,
         pending_releases: AtomicUsize,
         cancellable: AtomicBool,
         block_cancel: AtomicBool,
@@ -4368,6 +4443,7 @@ menus:
         }
 
         async fn modal_scope(&self, ui_pane: &PaneId) -> Result<ModalScopeId, AdapterError> {
+            self.modal_scope_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ModalScopeId::new(ui_pane.as_str()))
         }
 
@@ -4375,6 +4451,7 @@ menus:
             &self,
             request: CaptureRequest,
         ) -> Result<CaptureLease, AdapterError> {
+            self.capture_calls.fetch_add(1, Ordering::SeqCst);
             if self.block_capture.load(Ordering::SeqCst) {
                 self.capture_entered.notify_one();
                 self.capture_release.notified().await;
@@ -4543,7 +4620,8 @@ menus:
         .expect("test configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -4695,7 +4773,8 @@ menus:
         .expect("await adapter configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -4866,7 +4945,8 @@ menus:
         .expect("test configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -4953,7 +5033,8 @@ menus:
         .expect("test configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -5092,7 +5173,8 @@ menus:
             .expect("deadline configuration compiles");
             let root = named("main");
             let binding = config
-                .attachment_view(&root)
+                .attachment_view(&root, &config.theme_selection)
+                .ok()
                 .and_then(|view| {
                     view.menu
                         .menu(&root)
@@ -5226,7 +5308,8 @@ menus:
         .expect("full-queue timeout configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -5506,7 +5589,8 @@ menus:
         .expect("isolation configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -5688,7 +5772,8 @@ menus:
         .expect("teardown configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -6065,7 +6150,8 @@ menus:
         .expect("config compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -6189,7 +6275,8 @@ menus:
         .expect("creation configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -6278,7 +6365,8 @@ menus:
         .expect("deferred configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -6386,7 +6474,8 @@ menus:
         .expect("test configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -6560,7 +6649,9 @@ menus:
             )
             .expect("quoted whitespace menu name compiles");
         let root = named("my menu");
-        let view = config.attachment_view(&root).expect("whitespace root view");
+        let view = config
+            .attachment_view(&root, &config.theme_selection)
+            .expect("whitespace root view");
         assert_eq!(view.menu.root, root);
         // Core -> wire preserves the variant; the owned view validates
         // (whitespace names are in the wire domain, matching core).
@@ -7889,6 +7980,8 @@ menus:
     ) {
         let adapter = Arc::new(ScopedTestAdapter {
             dispatches: AtomicUsize::new(0),
+            modal_scope_calls: AtomicUsize::new(0),
+            capture_calls: AtomicUsize::new(0),
             cancellable: AtomicBool::new(true),
             block_cancel: AtomicBool::new(false),
             cancel_entered: Arc::new(Notify::new()),
@@ -7935,7 +8028,8 @@ menus:
         .expect("test configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -8417,7 +8511,8 @@ menus:
         .expect("generic drain configuration compiles");
         let root = named("main");
         let binding = config
-            .attachment_view(&root)
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
             .and_then(|view| {
                 view.menu
                     .menu(&root)
@@ -8799,6 +8894,556 @@ while :; do sleep 1; done
         })
         .await
         .expect("TERM-resistant descendant receives group SIGKILL and is reaped");
+    }
+
+    async fn theme_override_test_fixture()
+    -> (Arc<ScopedTestAdapter>, Arc<Broker>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("owned configuration directory");
+        let config_dir = directory.path();
+        std::fs::create_dir_all(config_dir.join("themes")).unwrap();
+        std::fs::create_dir_all(config_dir.join("color-schemes")).unwrap();
+        std::fs::write(
+            config_dir.join("config.yml"),
+            r#"
+version: 1
+theme: theme-one
+color-scheme: scheme-one
+menus:
+  main:
+    bindings:
+      q:
+        label: quit
+        action: menu:quit
+      r:
+        label: reload
+        action: config:reload
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("themes/theme-one.yml"),
+            r#"
+common:
+  styles:
+    default: { foreground: base.text }
+menu:
+  styles:
+    title: { foreground: menu.hotkey, bold: true }
+  templates:
+    cell: "T1: {{ title }}"
+    breadcrumbs: "{{ crumbs }}"
+    pagination:
+      full: "{{ pages.current }}/{{ pages.count }}"
+      short: "{{ pages.current }}/{{ pages.count }}"
+    status: "{{ message }}"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("themes/theme-two.yml"),
+            r#"
+common:
+  styles:
+    default: { foreground: base.text, italic: true }
+menu:
+  styles:
+    title: { foreground: menu.hotkey, underline: true }
+  templates:
+    cell: "T2: {{ title }}"
+    breadcrumbs: "{{ crumbs }}"
+    pagination:
+      full: "{{ pages.current }}/{{ pages.count }}"
+      short: "{{ pages.current }}/{{ pages.count }}"
+    status: "{{ message }}"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("themes/theme-invalid-pair.yml"),
+            r#"
+common:
+  styles:
+    default: { foreground: only.one }
+menu:
+  templates:
+    cell: "invalid: {{ title }}"
+    breadcrumbs: "{{ crumbs }}"
+    pagination:
+      full: "{{ pages.current }}/{{ pages.count }}"
+      short: "{{ pages.current }}/{{ pages.count }}"
+    status: "{{ message }}"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("color-schemes/scheme-one.yml"),
+            r##"
+title: Scheme One
+palette:
+  c1: "#111111"
+  c2: "#222222"
+colors:
+  base: { text: c1 }
+  only: { one: c1 }
+  menu: { hotkey: c2 }
+"##,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("color-schemes/scheme-two.yml"),
+            r##"
+title: Scheme Two
+palette:
+  c3: "#333333"
+  c4: "#444444"
+colors:
+  base: { text: c3 }
+  menu: { hotkey: c4 }
+"##,
+        )
+        .unwrap();
+        let adapter = Arc::new(ScopedTestAdapter {
+            dispatches: AtomicUsize::new(0),
+            modal_scope_calls: AtomicUsize::new(0),
+            capture_calls: AtomicUsize::new(0),
+            cancellable: AtomicBool::new(true),
+            block_cancel: AtomicBool::new(false),
+            cancel_entered: Arc::new(Notify::new()),
+            cancel_release: Arc::new(Notify::new()),
+            capture_entered: Arc::new(Notify::new()),
+            capture_release: Arc::new(Notify::new()),
+            block_capture: AtomicBool::new(false),
+            pending_releases: AtomicUsize::new(0),
+            ended_captures: Mutex::new(Vec::new()),
+            closed_panes: Mutex::new(Vec::new()),
+            close_entered: Arc::new(Notify::new()),
+            close_release: Arc::new(Notify::new()),
+            block_close: AtomicBool::new(false),
+            fail_close_once: AtomicBool::new(false),
+            fail_close_always: AtomicBool::new(false),
+            block_end: AtomicBool::new(false),
+            end_entered: Arc::new(Notify::new()),
+            end_release: Arc::new(Notify::new()),
+            fail_end_once: AtomicBool::new(false),
+            fail_end_always: AtomicBool::new(false),
+            origin_entered: Arc::new(Notify::new()),
+            origin_release: Arc::new(Notify::new()),
+            block_origin: AtomicBool::new(false),
+            fail_origin: AtomicBool::new(false),
+        });
+        let store = ConfigStore::load_inputs(
+            crate::config::ConfigInputs::for_host(
+                config_dir.join("config.yml"),
+                muxe_adapter_api::HostKind::Zellij,
+            )
+            .unwrap(),
+            adapter.as_ref(),
+        )
+        .await
+        .unwrap();
+        let broker = Arc::new(Broker {
+            adapter: adapter.clone(),
+            config: store,
+            state: Arc::new(Mutex::new(BrokerState::default())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            generic: Arc::new(GenericSupervisor::default()),
+            cleanup: Arc::new(CleanupSupervisor::default()),
+            execution_transitions: Arc::new(Notify::new()),
+            diagnostics_tx: mpsc::unbounded_channel().0,
+            diagnostics_rx: Mutex::new(None),
+            token_source: Mutex::new(OsTokenSource::default()),
+            next_session: AtomicU64::new(1),
+            next_execution: AtomicU64::new(1),
+            next_event: Arc::new(AtomicU64::new(1)),
+            host_loss_retirement: Arc::new(Notify::new()),
+            host_loss_armed: AtomicBool::new(false),
+            self_weak: Weak::new(),
+            cleanup_enqueue_hook: StdMutex::new(None),
+            commit_ui_launch_hook: StdMutex::new(None),
+        });
+        (adapter, broker, directory)
+    }
+
+    #[tokio::test]
+    async fn attach_overrides_produce_different_snapshots_on_same_generation() {
+        let (_adapter, broker, _dir) = theme_override_test_fixture().await;
+        let (events_a, _rx_a) = mpsc::channel(8);
+        let (events_b, _rx_b) = mpsc::channel(8);
+
+        let res_a = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-a"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: Some("theme-one".to_owned()),
+                    color_scheme: Some("scheme-one".to_owned()),
+                }),
+                events_a,
+            )
+            .await
+            .expect("attach A succeeds");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            snapshot: snap_a, ..
+        }) = res_a
+        else {
+            panic!("expected Immediate UiAttached for A");
+        };
+
+        let res_b = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-b"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: Some("theme-two".to_owned()),
+                    color_scheme: Some("scheme-two".to_owned()),
+                }),
+                events_b,
+            )
+            .await
+            .expect("attach B succeeds");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            snapshot: snap_b, ..
+        }) = res_b
+        else {
+            panic!("expected Immediate UiAttached for B");
+        };
+
+        // Snapshots differ
+        assert_ne!(snap_a.theme, snap_b.theme);
+        assert_eq!(snap_a.theme.scheme.title, "Scheme One");
+        assert_eq!(snap_b.theme.scheme.title, "Scheme Two");
+        assert!(
+            snap_a
+                .theme
+                .menu
+                .templates
+                .iter()
+                .any(|t| t.name == "cell" && t.value == "T1: {{ title }}")
+        );
+        assert!(
+            snap_b
+                .theme
+                .menu
+                .templates
+                .iter()
+                .any(|t| t.name == "cell" && t.value == "T2: {{ title }}")
+        );
+
+        // Generation default remains untouched
+        let current_config = broker.config.snapshot().await.config;
+        assert_eq!(current_config.theme_selection.theme, "theme-one");
+        assert_eq!(current_config.theme_selection.color_scheme, "scheme-one");
+    }
+
+    #[tokio::test]
+    async fn partial_overrides_use_generation_defaults() {
+        let (_adapter, broker, _dir) = theme_override_test_fixture().await;
+        let (events_a, _rx_a) = mpsc::channel(8);
+        let (events_b, _rx_b) = mpsc::channel(8);
+
+        // Theme-only override uses default scheme (scheme-one)
+        let res_a = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-a"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: Some("theme-two".to_owned()),
+                    color_scheme: None,
+                }),
+                events_a,
+            )
+            .await
+            .expect("attach theme-only succeeds");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            snapshot: snap_a, ..
+        }) = res_a
+        else {
+            panic!("expected Immediate UiAttached");
+        };
+        assert_eq!(snap_a.theme.scheme.title, "Scheme One");
+        assert!(
+            snap_a
+                .theme
+                .menu
+                .templates
+                .iter()
+                .any(|t| t.name == "cell" && t.value == "T2: {{ title }}")
+        );
+
+        // Scheme-only override uses default theme (theme-one)
+        let res_b = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-b"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: Some("scheme-two".to_owned()),
+                }),
+                events_b,
+            )
+            .await
+            .expect("attach scheme-only succeeds");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            snapshot: snap_b, ..
+        }) = res_b
+        else {
+            panic!("expected Immediate UiAttached");
+        };
+        assert_eq!(snap_b.theme.scheme.title, "Scheme Two");
+        assert!(
+            snap_b
+                .theme
+                .menu
+                .templates
+                .iter()
+                .any(|t| t.name == "cell" && t.value == "T1: {{ title }}")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_theme_or_scheme_rejects_before_session_or_capture() {
+        let (adapter, broker, _dir) = theme_override_test_fixture().await;
+        let (events, _rx) = mpsc::channel(8);
+
+        let res = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-unknown"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: Some("non-existent-theme".to_owned()),
+                    color_scheme: None,
+                }),
+                events,
+            )
+            .await;
+        let err = match res {
+            Err(err) => err,
+            Ok(_) => panic!("unknown theme must be rejected"),
+        };
+        assert!(matches!(err, BrokerError::Configuration(_)));
+        // Assert no sessions leaked
+        assert!(broker.sessions.lock().await.is_empty());
+        // Assert no captures leaked or initiated
+        assert_eq!(adapter.ended_captures.lock().await.len(), 0);
+        assert_eq!(adapter.modal_scope_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.capture_calls.load(Ordering::SeqCst), 0);
+
+        let (events, _rx) = mpsc::channel(8);
+        let scheme_result = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-unknown-scheme"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: Some("non-existent-scheme".to_owned()),
+                }),
+                events,
+            )
+            .await;
+        assert!(matches!(scheme_result, Err(BrokerError::Configuration(_))));
+        assert_eq!(adapter.modal_scope_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.capture_calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn invalid_mixed_pair_rejects_before_modal_scope() {
+        let (adapter, broker, _dir) = theme_override_test_fixture().await;
+        let (events, _rx) = mpsc::channel(8);
+        let result = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-invalid-pair"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: Some("theme-invalid-pair".to_owned()),
+                    color_scheme: Some("scheme-two".to_owned()),
+                }),
+                events,
+            )
+            .await;
+        let error = match result {
+            Err(BrokerError::Configuration(error)) => error,
+            Err(_) => panic!("mixed pair should return a configuration diagnostic"),
+            Ok(_) => panic!("mixed pair must fail"),
+        };
+        assert!(error.to_string().contains("theme-invalid-pair"));
+        assert!(
+            error
+                .to_string()
+                .contains("unknown palette or semantic color")
+        );
+        assert_eq!(adapter.modal_scope_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.capture_calls.load(Ordering::SeqCst), 0);
+        assert!(broker.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_launch_commit_returns_originally_requested_pair() {
+        let (_adapter, broker, _dir) = theme_override_test_fixture().await;
+        let token = prepared_registered_launch(&broker, "pane-pending", None).await;
+
+        let (events, _rx) = mpsc::channel(8);
+        let attach_res = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-pending"),
+                    pending_launch: Some(token),
+                    origin: None,
+                    caller_identity: None,
+                    theme: Some("theme-two".to_owned()),
+                    color_scheme: Some("scheme-two".to_owned()),
+                }),
+                events,
+            )
+            .await
+            .expect("attach gated launch");
+        let RequestResult::WaitForAttachment(mut pending_waiter) = attach_res else {
+            panic!("expected WaitForAttachment");
+        };
+
+        // Commit launch from launcher
+        broker
+            .commit(token, HostPaneId::new("pane-pending"))
+            .await
+            .expect("commit succeeds");
+
+        let response = pending_waiter.receiver.borrow_and_update().clone();
+        let SessionReadiness::Ready(boxed_resp) = response else {
+            panic!("expected SessionReadiness::Ready");
+        };
+        let BrokerResponse::UiAttached { snapshot, .. } = *boxed_resp else {
+            panic!("expected UiAttached");
+        };
+        assert_eq!(snapshot.theme.scheme.title, "Scheme Two");
+        assert!(
+            snapshot
+                .theme
+                .menu
+                .templates
+                .iter()
+                .any(|t| t.name == "cell" && t.value == "T2: {{ title }}")
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_alter_existing_session_theme_pair() {
+        let (_adapter, broker, dir) = theme_override_test_fixture().await;
+        let (events_existing, _rx_existing) = mpsc::channel(8);
+
+        let attach_existing = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-existing"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: Some("theme-one".to_owned()),
+                    color_scheme: Some("scheme-one".to_owned()),
+                }),
+                events_existing,
+            )
+            .await
+            .expect("existing attach succeeds");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            session: session_existing,
+            snapshot: snap_existing,
+        }) = attach_existing
+        else {
+            panic!("expected UiAttached");
+        };
+        assert_eq!(snap_existing.theme.scheme.title, "Scheme One");
+
+        // Rewrite config.yml to change default theme
+        std::fs::write(
+            dir.path().join("config.yml"),
+            r#"
+version: 1
+theme: theme-two
+color-scheme: scheme-two
+menus:
+  main:
+    bindings:
+      q:
+        label: quit
+        action: menu:quit
+"#,
+        )
+        .unwrap();
+
+        // Perform reload
+        broker.reload().await.expect("reload succeeds");
+
+        // Check that existing session retains its original generation and theme snapshot
+        let resp = broker
+            .attached_response(&session_existing)
+            .await
+            .expect("attached response");
+        let BrokerResponse::UiAttached {
+            snapshot: snap_after_reload,
+            ..
+        } = resp
+        else {
+            panic!("expected UiAttached");
+        };
+        assert_eq!(snap_after_reload.theme.scheme.title, "Scheme One");
+        assert_eq!(snap_after_reload.theme, snap_existing.theme);
+
+        // New attach with no override now gets generation 2 defaults (theme-two / scheme-two)
+        let (events_new, _rx_new) = mpsc::channel(8);
+        let attach_new = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-new"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events_new,
+            )
+            .await
+            .expect("new attach succeeds");
+        let RequestResult::Immediate(BrokerResponse::UiAttached {
+            snapshot: snap_new, ..
+        }) = attach_new
+        else {
+            panic!("expected UiAttached");
+        };
+        assert_eq!(snap_new.theme.scheme.title, "Scheme Two");
+        assert_eq!(snap_new.menu.generation, 2);
     }
 }
 

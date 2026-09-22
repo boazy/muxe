@@ -819,12 +819,87 @@ fn selected_theme_and_color_scheme_are_carried_to_attachment() {
     assert_eq!(config.theme_selection.theme, "custom");
     assert_eq!(config.theme_selection.color_scheme, "ink");
     let attachment = config
-        .attachment_view(&id("main"))
+        .attachment_view(&id("main"), &config.theme_selection)
         .expect("compiled main menu has an attachment");
     assert_eq!(attachment.theme_selection, config.theme_selection);
-    assert_eq!(attachment.theme, config.theme);
+    assert_eq!(attachment.theme.as_ref(), &config.theme);
 }
 
+#[test]
+fn unused_malformed_asset_does_not_block_generation_but_preserves_attach_diagnostic() {
+    let mut assets = custom_theme_assets(COMPLETE_CUSTOM_THEME_YAML);
+    assets.themes.insert(
+        "unused-malformed".to_owned(),
+        document("themes/unused-malformed.yml", "common:\n  unknown: true\n"),
+    );
+    let config = Compiler
+        .compile(
+            CompileInput {
+                generation: CompiledGeneration(10),
+                base: document(
+                    "config.yml",
+                    r"
+version: 1
+theme: custom
+color-scheme: ink
+menus:
+  main:
+    bindings:
+      q: { label: quit, action: menu:quit }
+",
+                ),
+                host_override: None,
+                key_capabilities: KeyCapabilities::default(),
+                theme_assets: assets,
+            },
+            None,
+        )
+        .expect("unused malformed assets do not block the selected generation pair");
+    let error = config
+        .resolve_theme(&muxe_core::ThemeSelection {
+            theme: "unused-malformed".to_owned(),
+            color_scheme: "ink".to_owned(),
+        })
+        .expect_err("selecting malformed asset reports its pinned diagnostics");
+    let muxe_core::ThemeSelectionError::InvalidTheme { diagnostics, .. } = error else {
+        panic!("expected exact malformed-theme diagnostics");
+    };
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, DiagnosticCode::UnknownField);
+    assert_eq!(
+        diagnostics[0].labels[0].span.source.as_str(),
+        "themes/unused-malformed.yml"
+    );
+}
+
+#[test]
+fn attachment_view_distinguishes_missing_menu_from_theme_resolution() {
+    let config = custom_theme_config(COMPLETE_CUSTOM_THEME_YAML);
+    assert!(matches!(
+        config.attachment_view(&id("missing"), &config.theme_selection),
+        Err(muxe_core::AttachmentViewError::MissingMenu(_))
+    ));
+    let unknown = muxe_core::ThemeSelection {
+        theme: "missing".to_owned(),
+        color_scheme: config.theme_selection.color_scheme.clone(),
+    };
+    assert!(matches!(
+        config.attachment_view(&id("main"), &unknown),
+        Err(muxe_core::AttachmentViewError::Theme(
+            muxe_core::ThemeSelectionError::UnknownTheme { .. }
+        ))
+    ));
+    let resolved = config
+        .resolve_theme(&config.theme_selection)
+        .expect("selected pair resolves");
+    let other = custom_theme_config(COMPLETE_CUSTOM_THEME_YAML);
+    assert!(matches!(
+        other.attachment_view_resolved(&id("main"), &resolved),
+        Err(muxe_core::AttachmentViewError::Theme(
+            muxe_core::ThemeSelectionError::StaleResolution
+        ))
+    ));
+}
 #[test]
 fn unknown_or_invalid_theme_assets_are_rejected() {
     let unknown = Compiler
@@ -1697,7 +1772,9 @@ fn quoted_whitespace_menu_name_compiles_and_round_trips_through_wire() {
     let yaml = "version: 1\nmenus:\n  \"my menu\":\n    bindings:\n      a:\n        label: alpha\n        action: menu:quit\n";
     let config = compile(yaml, None, KeyCapabilities::default()).expect("whitespace name compiles");
     let root = id("my menu");
-    let view = config.attachment_view(&root).expect("whitespace root view");
+    let view = config
+        .attachment_view(&root, &config.theme_selection)
+        .expect("whitespace root view");
     assert_eq!(view.menu.root, root);
     // The wire half (validation + lossless variant round-trip of this exact
     // compiled view) is covered by
@@ -1763,7 +1840,9 @@ fn named_main_at_zero_coexists_with_inline_submenu_as_distinct_identities() {
     assert_eq!(inline_targets.len(), 1);
     assert_ne!(inline_targets[0], id("main@0"));
     assert!(config.menu(&id("main@0")).is_some());
-    let view = config.attachment_view(&id("main")).expect("root view");
+    let view = config
+        .attachment_view(&id("main"), &config.theme_selection)
+        .expect("root view");
     assert_eq!(view.menu.menus.len(), 3);
 }
 

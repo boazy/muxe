@@ -413,7 +413,7 @@ pub struct UiAttachmentView {
     pub keyboard: KeyboardProfile,
     pub inactivity_timeout: Option<Duration>,
     pub theme_selection: ThemeSelection,
-    pub theme: CompiledTheme,
+    pub theme: Arc<CompiledTheme>,
 }
 
 impl CompiledMenu {
