@@ -15,6 +15,7 @@ use muxe_core::{
     ContextResolutionError, ExecutionCapabilities, ExecutionId, NativeActionCandidate,
     OriginContext, PaneId, PortableAction, PortableActionResolutionError, TabId, WorkspaceId,
 };
+use muxe_protocol::AsOfTick;
 
 macro_rules! opaque_id {
     ($name:ident, $description:literal) => {
@@ -691,6 +692,18 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
     /// registration leave the broker gating on adapter health.
     async fn activation_readiness(&self) -> Result<Option<ActivationReadiness>, AdapterError> {
         Ok(None)
+    }
+
+    /// Returns readiness for one coordinator-owned OS monotonic snapshot.
+    /// Adapters without an as-of certificate fail closed.
+    async fn activation_readiness_at(
+        &self,
+        _as_of: AsOfTick,
+    ) -> Result<Option<ActivationReadiness>, AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "this host adapter cannot attest an as-of activation readiness epoch",
+        ))
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError>;

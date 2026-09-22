@@ -3,6 +3,10 @@
 ### 🐛 Bug Fixes
 
 - *(ui)* Honor menu-scoped inactivity timeouts and reject binding-scoped inactivity settings
+- *(broker)* Reconcile authenticated cold-start endpoints before spawning, preserving live registration ownership and refusing ambiguous recovery
+- *(ui)* Honor per-invocation theme and color-scheme overrides without changing the pinned menu-session choice
+- *(broker)* Reject requests for replaced host incarnations and rebuild native-binding availability after reconnect
+- *(activation)* Require exact target-incarnation Ready authority and replay crash recovery through ordered barriers
 - *(zellij)* Bind uninstall configuration ownership to the recorded path
 - *(zellij)* Preserve receipt-owned configuration provenance across reinstalls
 - *(broker)* Propagate retirement and registry cleanup failures

@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use muxe::lifecycle::control::ControlClient;
 use muxe_adapter_api::{AdapterError, HostAdapter, HostIdentity};
 use muxe_adapter_zellij::{
-    MembershipSource, PipeChannel, ScriptedChannel, ZellijAdapter, ZellijAdapterConfig,
+    MembershipSource, PipeChannel, ReadinessGate, ScriptedChannel, ZellijAdapter,
+    ZellijAdapterConfig,
 };
 use muxe_broker::{
     ActivationBootstrap, Broker, BrokerClient, BrokerServer, ClientError, RuntimeEndpoint,
@@ -55,12 +56,11 @@ fn register_event(seed: u8, generation: ChannelGeneration) -> PipeEvent {
 fn push_registration(event: &ScriptedChannel, seed: u8) {
     let generation = event
         .initial_payload()
-        .map(|payload| {
+        .map_or(ChannelGeneration::INITIAL, |payload| {
             decode_event_subscription(&payload)
                 .expect("subscription payload decodes")
                 .channel_generation()
-        })
-        .unwrap_or(ChannelGeneration::INITIAL);
+        });
     event
         .push_line(encode_event_line(&register_event(seed, generation)).expect("register encodes"));
 }
@@ -86,20 +86,35 @@ fn wire_identity(identity: &HostIdentity) -> LiveServerIdentity {
     }
 }
 
-#[tokio::test]
-async fn zellij_rotation_rejects_old_hello_and_accepts_current_status_identity() {
+async fn rotated_adapter() -> (
+    Arc<ZellijAdapter>,
+    HostIdentity,
+    HostIdentity,
+    tempfile::TempDir,
+) {
     let request = ScriptedChannel::new();
     let event = ScriptedChannel::new();
+    let gate_root = tempfile::tempdir().expect("readiness gate root");
+    let gate_cache = gate_root.path().join("cache");
+    std::fs::create_dir(&gate_cache).unwrap();
+    std::fs::set_permissions(
+        &gate_cache,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let adapter = Arc::new(ZellijAdapter::new_with_membership(
         ZellijAdapterConfig {
             session_name: "session-alpha".to_owned(),
             zellij_exe: PathBuf::from("/nonexistent/zellij"),
+            readiness_gate: ReadinessGate::new(
+                gate_cache,
+                muxe_protocol::BridgeUnitId::from_canonical_bytes(b"zellij-identity-test"),
+            ),
         },
         Arc::clone(&request) as Arc<dyn PipeChannel>,
         Arc::clone(&event) as Arc<dyn PipeChannel>,
         Arc::new(SingleClientMembership),
     ));
-
     push_registration(&event, 7);
     let identity_a = await_identity(&adapter).await;
     adapter
@@ -133,6 +148,12 @@ async fn zellij_rotation_rejects_old_hello_and_accepts_current_status_identity()
     let identity_b = await_identity(&adapter).await;
     assert_eq!(identity_a.discovery_key, identity_b.discovery_key);
     assert_ne!(identity_a.live_server_id, identity_b.live_server_id);
+    (adapter, identity_a, identity_b, gate_root)
+}
+
+#[tokio::test]
+async fn zellij_rotation_rejects_old_hello_and_accepts_current_status_identity() {
+    let (adapter, identity_a, identity_b, _gate_root) = rotated_adapter().await;
 
     let directory = tempfile::tempdir().expect("owned broker config directory");
     let runtime = tempfile::tempdir().expect("owned broker runtime directory");
@@ -162,7 +183,10 @@ async fn zellij_rotation_rejects_old_hello_and_accepts_current_status_identity()
     let server = BrokerServer::start_activation(
         Arc::clone(&broker),
         endpoint.clone(),
-        ActivationBootstrap::Running { current: record },
+        ActivationBootstrap::Running {
+            current: record,
+            bridge_unit: None,
+        },
         None,
     )
     .await
@@ -176,16 +200,15 @@ async fn zellij_rotation_rejects_old_hello_and_accepts_current_status_identity()
     let status = control.status().await.expect("read broker control status");
     assert_eq!(status.live_server, wire_identity(&identity_b));
 
-    let rejected = match BrokerClient::connect(
+    let Err(rejected) = BrokerClient::connect(
         endpoint.socket(),
         PeerRole::Ui,
         env!("CARGO_PKG_VERSION"),
         wire_identity(&identity_a),
     )
     .await
-    {
-        Ok(_) => panic!("status-A identity is rejected after continuity rotation"),
-        Err(error) => error,
+    else {
+        panic!("status-A identity is rejected after continuity rotation");
     };
     assert!(matches!(
         rejected,

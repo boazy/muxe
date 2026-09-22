@@ -30,7 +30,7 @@ use crate::{
     fsutil::{self, FsError},
     lifecycle::journal::{self, JournalError, UnitKind, UnitLock},
     logging::Logger,
-    paths::ConfigPath,
+    paths::{BridgeIdentity, ConfigPath, PathError},
 };
 
 pub use bridge::{BRIDGE_FILE_NAME, PREVIOUS_SUFFIX};
@@ -156,6 +156,8 @@ pub enum IntegrationError {
     Kdl(#[from] kdl::KdlError),
     #[error(transparent)]
     Asset(#[from] compatibility::AssetVerificationError),
+    #[error(transparent)]
+    BridgeIdentity(#[from] PathError),
     #[error("cannot resolve Zellij configuration: {0}")]
     ConfigDiscovery(String),
     #[error(
@@ -286,6 +288,7 @@ fn uninstall_gate(
     reached: std::sync::Arc<std::sync::Barrier>,
     release: std::sync::Arc<std::sync::Barrier>,
 ) -> std::sync::Arc<UninstallGate> {
+    let directory = fs::canonicalize(&directory).unwrap_or(directory);
     std::sync::Arc::new(UninstallGate {
         directory,
         reached,
@@ -347,6 +350,8 @@ pub const fn resolve_policy(
 pub struct InstallInputs<'a> {
     /// Validated absolute Muxe configuration directory.
     pub config_dir: &'a Path,
+    /// Validated absolute Muxe cache directory for exact activation exclusion.
+    pub cache_dir: &'a Path,
     /// Packaged `lib/muxe/muxe-zellij.wasm` bytes.
     pub packaged_wasm: &'a [u8],
     /// Muxe version being installed.
@@ -433,11 +438,52 @@ pub fn integration_dir(config_dir: &Path) -> PathBuf {
         .join("integrations")
         .join(ZELLIJ_INTEGRATION_NAME)
 }
+/// Resolves the descriptor-validated physical bridge authority.
+///
+/// Unlike [`ConfigPath`], this collapses symlinked ancestors and is the sole
+/// authority for registry, locking, receipt, and bridge-byte operations.
+///
+/// # Errors
+///
+/// Returns [`PathError`] when the bridge directory cannot be safely resolved.
+pub fn bridge_identity(config_dir: &Path) -> Result<BridgeIdentity, PathError> {
+    BridgeIdentity::resolve(
+        &integration_dir(config_dir),
+        std::ffi::OsStr::new(BRIDGE_FILE_NAME),
+    )
+}
+/// Resolves an existing bridge authority without creating configuration state.
+///
+/// # Errors
+///
+/// Returns [`PathError`] when an existing integration path is unsafe or cannot
+/// be inspected.
+pub fn existing_bridge_identity(config_dir: &Path) -> Result<Option<BridgeIdentity>, PathError> {
+    let directory = integration_dir(config_dir);
+    match fs::symlink_metadata(&directory) {
+        Ok(_) => {
+            BridgeIdentity::resolve_existing(&directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))
+                .map(Some)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(PathError::BridgeIo {
+            operation: "inspect existing",
+            path: directory,
+            source,
+        }),
+    }
+}
 
-/// Returns the canonical stable bridge path.
+/// Returns the descriptor-validated canonical stable bridge path.
+///
+/// # Panics
+///
+/// Panics when the bridge directory cannot be safely resolved.
 #[must_use]
 pub fn stable_bridge_path(config_dir: &Path) -> PathBuf {
-    integration_dir(config_dir).join(BRIDGE_FILE_NAME)
+    bridge_identity(config_dir)
+        .expect("stable bridge path requires a validated integration directory")
+        .stable_path(std::ffi::OsStr::new(BRIDGE_FILE_NAME))
 }
 
 /// Resolves which Zellij configuration to inspect or edit.
@@ -456,25 +502,33 @@ pub fn zellij_config_path(override_path: Option<&Path>) -> Result<ConfigPath, In
         .map_err(|error| IntegrationError::ConfigDiscovery(error.to_string()))
 }
 
-/// Installs the Zellij bridge transactionally.
-///
-/// A pending install journal is resumed first: a completed resume is returned
-/// directly, a rolled-back one proceeds with the fresh install.
+/// Installs the Zellij bridge transactionally under the canonical activation
+/// unit lock. A pending activation journal refuses every install or resume
+/// mutation. A pending install journal is resumed first: a completed resume
+/// is returned directly, a rolled-back one proceeds with the fresh install.
 ///
 /// # Errors
 ///
-/// Returns an error when the packaged asset fails verification, the journal,
-/// bridge, configuration, or receipt cannot be read or written, or a test
-/// hook injects a fault.
+/// Returns an error when activation owns this bridge, the packaged asset
+/// fails verification, the journal, bridge, configuration, or receipt cannot
+/// be read or written, or a test hook injects a fault.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "public install shape: by-value inputs match public uninstall and keep CLI call-site moves simple; the transaction only borrows"
 )]
 pub fn install(inputs: InstallInputs<'_>) -> Result<InstallOutcome, IntegrationError> {
     let verification = compatibility::verify_packaged_asset(inputs.packaged_wasm)?;
-    let directory = integration_dir(inputs.config_dir);
-    let _integration_lock = acquire_integration_lock(&directory)?;
-    install_verified(&inputs, verification)
+    install_locked_verified(&inputs, verification)
+}
+
+fn install_locked_verified(
+    inputs: &InstallInputs<'_>,
+    verification: compatibility::NativeAssetVerification,
+) -> Result<InstallOutcome, IntegrationError> {
+    let identity = bridge_identity(inputs.config_dir)?;
+    let _integration_lock = acquire_integration_lock(identity.directory())?;
+    let _unit_lock = refuse_when_activation_live(inputs.cache_dir, &identity)?;
+    install_verified(inputs, verification, &identity)
 }
 fn validated_receipt_digest(value: String) -> Result<Sha256Digest, IntegrationError> {
     Sha256Digest::parse(value).map_err(|error| {
@@ -487,19 +541,20 @@ fn validated_receipt_digest(value: String) -> Result<Sha256Digest, IntegrationEr
 fn install_verified(
     inputs: &InstallInputs<'_>,
     verification: compatibility::NativeAssetVerification,
+    identity: &BridgeIdentity,
 ) -> Result<InstallOutcome, IntegrationError> {
-    let directory = integration_dir(inputs.config_dir);
-    if journal_path(&directory).exists() {
-        let resumed = resume_with(&directory, &inputs.hooks, inputs.logger)?;
+    let directory = identity.directory();
+    if journal_path(directory).exists() {
+        let resumed = resume_with(directory, &inputs.hooks, inputs.logger)?;
         match resumed {
             ResumeOutcome::Completed(outcome) => return Ok(*outcome),
             ResumeOutcome::RolledBack => {}
         }
-        let mut outcome = install_fresh(inputs, &directory, verification)?;
+        let mut outcome = install_fresh(inputs, identity, verification)?;
         outcome.resumed = Some(ResumeOutcome::RolledBack);
         return Ok(outcome);
     }
-    install_fresh(inputs, &directory, verification)
+    install_fresh(inputs, identity, verification)
 }
 
 #[expect(
@@ -508,10 +563,11 @@ fn install_verified(
 )]
 fn install_fresh(
     inputs: &InstallInputs<'_>,
-    directory: &Path,
+    identity: &BridgeIdentity,
     verification: compatibility::NativeAssetVerification,
 ) -> Result<InstallOutcome, IntegrationError> {
-    let stable = directory.join(BRIDGE_FILE_NAME);
+    let directory = identity.directory();
+    let stable = identity.stable_path(std::ffi::OsStr::new(BRIDGE_FILE_NAME));
     let receipt = receipt::load(directory)?;
     let receipt_digest = receipt
         .as_ref()
@@ -622,7 +678,7 @@ fn install_fresh(
     let next = Receipt {
         schema_version: receipt::RECEIPT_SCHEMA_VERSION,
         bridge: receipt::BridgeRecord {
-            canonical_path: stable,
+            bridge_identity: identity.clone(),
             installed_version: inputs.version.to_owned(),
             installed_digest: Sha256Digest::from_bytes(inputs.packaged_wasm),
             previous_digest: previous_digest
@@ -916,27 +972,29 @@ fn staged_name(staged: &Path) -> Result<String, IntegrationError> {
         })
 }
 
-/// Completes or rolls back an interrupted install transaction.
-///
-/// Recovery is idempotent and converges to either the fully installed state
-/// or the untouched prior state; inconsistent journals fail closed with the
-/// staging file, backup, and journal preserved for diagnosis.
+/// Completes or rolls back an interrupted install transaction under the
+/// exact activation-unit lock supplied by `cache_dir`. An activation journal
+/// blocks resumption. Otherwise recovery converges to the installed or prior
+/// state; inconsistent journals preserve staging and backup for diagnosis.
 ///
 /// # Errors
 ///
-/// Returns an error when the journal cannot be read or validated, the prior
-/// receipt or bridge state contradicts it, or any recovery write fails.
+/// Returns an error when activation owns this bridge, the journal cannot be
+/// read or validated, authority contradicts it, or a recovery write fails.
 pub fn resume_install(
     config_dir: &Path,
+    cache_dir: &Path,
     hooks: &Hooks,
     logger: Option<&Logger>,
 ) -> Result<Option<ResumeOutcome>, IntegrationError> {
-    let directory = integration_dir(config_dir);
-    let _integration_lock = acquire_integration_lock(&directory)?;
-    if !journal_path(&directory).exists() {
+    let identity = bridge_identity(config_dir)?;
+    let directory = identity.directory();
+    let _integration_lock = acquire_integration_lock(directory)?;
+    let _unit_lock = refuse_when_activation_live(cache_dir, &identity)?;
+    if !journal_path(directory).exists() {
         return Ok(None);
     }
-    resume_with(&directory, hooks, logger).map(Some)
+    resume_with(directory, hooks, logger).map(Some)
 }
 
 // Full resume needs no fresh packaged bytes: the staged file carries them.
@@ -1170,12 +1228,13 @@ fn check_prior_receipt(
             "receipt changed outside the transaction".to_owned(),
         ));
     }
-    if let Some(receipt) = receipt.as_ref()
-        && receipt.bridge.canonical_path != directory.join(BRIDGE_FILE_NAME)
-    {
-        return Err(IntegrationError::InconsistentJournal(
-            "receipt canonical path mismatch".to_owned(),
-        ));
+    if let Some(receipt) = receipt.as_ref() {
+        let identity = BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))?;
+        if receipt.bridge.bridge_identity != identity {
+            return Err(IntegrationError::InconsistentJournal(
+                "receipt bridge identity mismatch".to_owned(),
+            ));
+        }
     }
     Ok(receipt)
 }
@@ -1435,12 +1494,13 @@ fn commit_resumed(
             "embedded record lacks Zellij compatibility".to_owned(),
         ));
     }
+    let identity = BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))?;
     receipt::store(
         directory,
         &Receipt {
             schema_version: receipt::RECEIPT_SCHEMA_VERSION,
             bridge: receipt::BridgeRecord {
-                canonical_path: stable.to_path_buf(),
+                bridge_identity: identity,
                 installed_version: journal.version.clone(),
                 installed_digest: validated_receipt_digest(journal.packaged_digest.clone())?,
                 previous_digest: previous_digest.or_else(|| {
@@ -1500,7 +1560,6 @@ fn commit_resumed(
 ///
 /// # Errors
 ///
-/// Returns an error when the receipt cannot be read, an activation journal
 /// for this bridge is still live, or bridge, staging, or receipt cleanup fails.
 /// KDL deviations are reported as unresolved records, not errors.
 #[expect(
@@ -1508,12 +1567,13 @@ fn commit_resumed(
     reason = "public API takes `UninstallInputs` by value for call-site ergonomics; changing it would break external callers."
 )]
 pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, IntegrationError> {
-    let directory = integration_dir(inputs.config_dir);
-    let _integration_lock = acquire_integration_lock(&directory)?;
-    let stable = directory.join(BRIDGE_FILE_NAME);
-    refuse_interrupted_install(&directory)?;
-    let receipt = receipt::load(&directory)?;
-    let _unit_lock = refuse_when_activation_live(inputs.cache_dir, &stable)?;
+    let identity = bridge_identity(inputs.config_dir)?;
+    let directory = identity.directory();
+    let _integration_lock = acquire_integration_lock(directory)?;
+    let stable = identity.stable_path(std::ffi::OsStr::new(BRIDGE_FILE_NAME));
+    refuse_interrupted_install(directory)?;
+    let receipt = receipt::load(directory)?;
+    let _unit_lock = refuse_when_activation_live(inputs.cache_dir, &identity)?;
     let Some(receipt) = receipt else {
         return Ok(UninstallOutcome {
             bridge_removed: false,
@@ -1550,7 +1610,7 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
     preflight_bridge_artifacts(&stable, &receipt.bridge)?;
 
     #[cfg(test)]
-    wait_uninstall_gate(&directory);
+    wait_uninstall_gate(directory);
 
     let mut outcome = UninstallOutcome {
         bridge_removed: false,
@@ -1592,17 +1652,16 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
 
     let previous = bridge::previous_path(&stable);
     if let Some(expected) = receipt.bridge.previous_digest.as_ref() {
-        outcome.previous_removed = bridge::remove_if_matching(&previous, expected.as_str())?;
+        outcome.previous_removed = bridge::remove_if_matching(&previous, expected)?;
     }
-    outcome.bridge_removed =
-        bridge::remove_if_matching(&stable, receipt.bridge.installed_digest.as_str())?;
+    outcome.bridge_removed = bridge::remove_if_matching(&stable, &receipt.bridge.installed_digest)?;
     #[cfg(test)]
     if fail_uninstall_after_bridge_removal() {
         return Err(IntegrationError::UninstallFaultInjected);
     }
 
     if outcome.unresolved.is_empty() && bridge_absent(&stable)? {
-        receipt::remove(&directory)?;
+        receipt::remove(directory)?;
         outcome.receipt_removed = true;
     }
     log(
@@ -1640,10 +1699,10 @@ fn refuse_interrupted_install(directory: &Path) -> Result<(), IntegrationError> 
 /// reader and is never mistaken for an absent journal.
 fn refuse_when_activation_live(
     cache_dir: &Path,
-    stable: &Path,
+    identity: &BridgeIdentity,
 ) -> Result<UnitLock, IntegrationError> {
     let unit = UnitKind::Zellij {
-        bridge_path_hash: journal::unit_hash(&stable.display().to_string()),
+        bridge_unit: identity.unit(),
     };
     let lock = journal::acquire_unit_lock(cache_dir, &unit)?;
     for (path, entry) in journal::list_journals(cache_dir)? {
@@ -2026,9 +2085,12 @@ fn plan_uninstall_node(
 mod tests {
     use super::*;
 
+    // Each ordinary fixture explicitly uses its owner-only root as both the
+    // configuration and cache boundary; concurrency cases supply a separate cache.
     fn install_inputs<'a>(config_dir: &'a Path, wasm: &'a [u8]) -> InstallInputs<'a> {
         InstallInputs {
             config_dir,
+            cache_dir: config_dir,
             packaged_wasm: wasm,
             version: "0.1.0",
             zellij_config: None,
@@ -2049,9 +2111,7 @@ mod tests {
         let verification = compatibility::NativeAssetVerification {
             packaged_digest: fsutil::sha256_hex(inputs.packaged_wasm),
         };
-        let directory = integration_dir(inputs.config_dir);
-        let _integration_lock = acquire_integration_lock(&directory)?;
-        install_verified(&inputs, verification)
+        install_locked_verified(&inputs, verification)
     }
 
     fn uninstall_inputs<'a>(
@@ -2092,22 +2152,74 @@ mod tests {
     }
 
     fn write_announced_journal(cache: &Path, stable: &Path) -> PathBuf {
+        let identity = BridgeIdentity::resolve(
+            stable.parent().unwrap(),
+            std::ffi::OsStr::new(BRIDGE_FILE_NAME),
+        )
+        .unwrap();
         let unit = UnitKind::Zellij {
-            bridge_path_hash: journal::unit_hash(&stable.display().to_string()),
+            bridge_unit: identity.unit(),
         };
-        let mut journal = journal::ActivationJournal::new(
-            unit,
+        let activation = journal::ActivationId::from_bytes([1; 16]).unwrap();
+        let member = journal::TransactionMember::new(
+            activation,
+            journal::ActivationMemberId::new("zellij-session".to_owned()).unwrap(),
+            journal::MemberEndpoint::new(PathBuf::from("/tmp/zellij-old.sock")).unwrap(),
+            muxe_protocol::control::HandoffId([2; 16]),
             lifecycle_record(),
-            lifecycle_record(),
-            vec![journal::MemberState {
-                host_identity: "zellij-session".to_owned(),
-                old_socket: PathBuf::from("/tmp/zellij-old.sock"),
-                target_socket: None,
-                handoff_id: None,
-                state: journal::MemberTransition::Prepared,
-            }],
+        )
+        .unwrap();
+        let mut journal =
+            journal::ActivationJournal::new(activation, unit, lifecycle_record(), vec![member])
+                .unwrap();
+        let census = crate::lifecycle::MemberCensus::from_members(vec![
+            crate::lifecycle::BridgeMemberId::new("zellij-session".to_owned()).unwrap(),
+        ])
+        .unwrap();
+        let digest = receipt::Sha256Digest::from_bytes(b"bridge");
+        let receipt_preimage = receipt::BridgeRecord {
+            bridge_identity: identity.clone(),
+            installed_version: "0.1.0".to_owned(),
+            installed_digest: digest.clone(),
+            previous_digest: None,
+            bridge_compat: None,
+        };
+        let receipt_target = receipt::BridgeRecord {
+            previous_digest: Some(digest.clone()),
+            ..receipt_preimage.clone()
+        };
+        let receipt_rollback = receipt_target.clone();
+        journal
+            .bind_zellij_authority(
+                identity.clone(),
+                census,
+                journal::BridgeArtifacts {
+                    old: journal::BridgeArtifactId::new(
+                        activation,
+                        journal::BridgeArtifactRole::Old,
+                    ),
+                    target: journal::BridgeArtifactId::new(
+                        activation,
+                        journal::BridgeArtifactRole::Target,
+                    ),
+                    old_digest: digest.clone(),
+                    target_digest: digest,
+                    receipt_preimage,
+                    receipt_target,
+                    receipt_rollback,
+                },
+            )
+            .unwrap();
+        let mut old = crate::lifecycle::BrokerEntry::now(
+            "zellij",
+            "zellij-session",
+            PathBuf::from("/tmp/zellij-old.sock"),
+            1,
         );
-        journal.state = journal::JournalState::Announced;
+        old.bridge_identity = Some(identity);
+        old.bridge_member =
+            Some(crate::lifecycle::BridgeMemberId::new("zellij-session".to_owned()).unwrap());
+        journal.old_registry = vec![old];
         journal::write_journal(cache, &journal).unwrap()
     }
 
@@ -2561,7 +2673,7 @@ mod tests {
                 fs::remove_file(&path).unwrap();
             }
         }
-        let outcome = resume_install(temp.path(), &Hooks::default(), None)
+        let outcome = resume_install(temp.path(), temp.path(), &Hooks::default(), None)
             .unwrap()
             .expect("journal present");
         assert!(matches!(outcome, ResumeOutcome::RolledBack));
@@ -2615,7 +2727,7 @@ mod tests {
         }
         fs::write(stable_bridge_path(temp.path()), b"out-of-band-bridge").unwrap();
 
-        let error = resume_install(temp.path(), &Hooks::default(), None).unwrap_err();
+        let error = resume_install(temp.path(), temp.path(), &Hooks::default(), None).unwrap_err();
         assert!(matches!(error, IntegrationError::InconsistentJournal(_)));
         assert!(journal_path(&integration_dir(temp.path())).exists());
     }
@@ -2689,7 +2801,7 @@ mod tests {
             .unwrap_or_else(|| Receipt {
                 schema_version: receipt::RECEIPT_SCHEMA_VERSION,
                 bridge: receipt::BridgeRecord {
-                    canonical_path: stable_bridge_path(temp.path()),
+                    bridge_identity: bridge_identity(temp.path()).unwrap(),
                     installed_version: "9.9.9".to_owned(),
                     installed_digest: Sha256Digest::parse("f".repeat(64)).unwrap(),
                     previous_digest: None,
@@ -2732,7 +2844,7 @@ mod tests {
             pending: Vec::new(),
         };
         write_journal(&directory, &journal).unwrap();
-        let error = resume_install(temp.path(), &Hooks::default(), None).unwrap_err();
+        let error = resume_install(temp.path(), temp.path(), &Hooks::default(), None).unwrap_err();
         assert!(
             matches!(error, IntegrationError::InconsistentJournal(_)),
             "{error}"
@@ -3428,8 +3540,9 @@ mod tests {
         install(inputs).unwrap();
         let stable = stable_bridge_path(temp.path());
         let receipt_path = integration_dir(temp.path()).join(receipt::RECEIPT_FILE_NAME);
+        let identity = bridge_identity(temp.path()).unwrap();
         let unit = UnitKind::Zellij {
-            bridge_path_hash: journal::unit_hash(&stable.display().to_string()),
+            bridge_unit: identity.unit(),
         };
         let activation = journal::activation_dir(&cache);
         fsutil::ensure_owner_dir(&activation).unwrap();
@@ -3553,14 +3666,9 @@ mod tests {
 
         let replacement = temp.path().join("user-bridge.wasm");
         std::os::unix::fs::symlink(&replacement, &stable).unwrap();
-        let error = uninstall(uninstall_inputs(temp.path(), &cache, config)).unwrap_err();
-
-        assert!(matches!(
-            error,
-            IntegrationError::Bridge(bridge::BridgeError::UnsafeDestination { .. })
-        ));
+        let _error = uninstall(uninstall_inputs(temp.path(), &cache, config)).unwrap_err();
         assert!(!bridge_absent(&stable).unwrap());
-        assert!(receipt::load(&directory).unwrap().is_some());
+        assert!(directory.join(receipt::RECEIPT_FILE_NAME).exists());
         assert!(
             fs::symlink_metadata(&stable)
                 .unwrap()
@@ -3764,5 +3872,132 @@ mod tests {
             receipt.bridge.installed_digest,
             Sha256Digest::from_bytes(b"wasm-v2")
         );
+    }
+
+    #[test]
+    fn activation_and_install_hold_the_same_bridge_unit_in_both_orders() {
+        let temp = owner_temp();
+        let cache = temp.path().join("cache");
+        fsutil::ensure_owner_dir(&cache).unwrap();
+        let mut first = install_inputs(temp.path(), b"wasm-v1");
+        first.cache_dir = &cache;
+        install(first).unwrap();
+        let identity = bridge_identity(temp.path()).unwrap();
+        let stable = stable_bridge_path(temp.path());
+        let directory = identity.directory();
+        let receipt_before = fs::read(directory.join(receipt::RECEIPT_FILE_NAME)).unwrap();
+        let unit = UnitKind::Zellij {
+            bridge_unit: identity.unit(),
+        };
+        let activation_guard = journal::acquire_unit_lock(&cache, &unit).unwrap();
+        let pending = write_announced_journal(&cache, &stable);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let mut inputs = install_inputs(temp.path(), b"wasm-v2");
+                inputs.cache_dir = &cache;
+                install(inputs)
+            });
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(IntegrationError::ActivationJournal(_))
+            ));
+        });
+        assert_eq!(fs::read(&stable).unwrap(), b"wasm-v1");
+        assert_eq!(
+            fs::read(directory.join(receipt::RECEIPT_FILE_NAME)).unwrap(),
+            receipt_before
+        );
+        drop(activation_guard);
+        let mut blocked = install_inputs(temp.path(), b"wasm-v2");
+        blocked.cache_dir = &cache;
+        assert!(matches!(
+            install(blocked),
+            Err(IntegrationError::ActivationJournalLive { .. })
+        ));
+        journal::remove_journal(&pending).unwrap();
+
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let reached_worker = reached.clone();
+            let release_worker = release.clone();
+            let worker = scope.spawn(|| {
+                let mut inputs = install_inputs(temp.path(), b"wasm-v2");
+                inputs.cache_dir = &cache;
+                inputs.hooks.gate = Some(install_gate(
+                    InstallStep::BeforeBridgeSwap,
+                    reached_worker,
+                    release_worker,
+                ));
+                install(inputs)
+            });
+            reached.wait();
+            assert!(journal::acquire_unit_lock(&cache, &unit).is_err());
+            assert!(journal::list_journals(&cache).unwrap().is_empty());
+            assert_eq!(fs::read(&stable).unwrap(), b"wasm-v1");
+            assert_eq!(
+                fs::read(directory.join(receipt::RECEIPT_FILE_NAME)).unwrap(),
+                receipt_before
+            );
+            release.wait();
+            worker.join().unwrap().unwrap();
+        });
+        assert_eq!(fs::read(&stable).unwrap(), b"wasm-v2");
+        assert!(journal::list_journals(&cache).unwrap().is_empty());
+        let activation_guard = journal::acquire_unit_lock(&cache, &unit).unwrap();
+        let pending = write_announced_journal(&cache, &stable);
+        drop(activation_guard);
+        let current_receipt = fs::read(directory.join(receipt::RECEIPT_FILE_NAME)).unwrap();
+        let mut blocked = install_inputs(temp.path(), b"wasm-v3");
+        blocked.cache_dir = &cache;
+        assert!(matches!(
+            install(blocked),
+            Err(IntegrationError::ActivationJournalLive { .. })
+        ));
+        assert_eq!(fs::read(&stable).unwrap(), b"wasm-v2");
+        assert_eq!(
+            fs::read(directory.join(receipt::RECEIPT_FILE_NAME)).unwrap(),
+            current_receipt
+        );
+        assert!(pending.exists());
+    }
+
+    #[test]
+    fn resume_install_refuses_exact_activation_before_replaying_bridge_or_receipt() {
+        let temp = owner_temp();
+        let cache = temp.path().join("cache");
+        fsutil::ensure_owner_dir(&cache).unwrap();
+        let mut initial = install_inputs(temp.path(), b"wasm-v1");
+        initial.cache_dir = &cache;
+        install(initial).unwrap();
+        let mut interrupted = install_inputs(temp.path(), b"wasm-v2");
+        interrupted.cache_dir = &cache;
+        interrupted.hooks.fail_after = Some(InstallStep::BeforeBridgeSwap);
+        assert!(matches!(
+            install(interrupted),
+            Err(IntegrationError::FaultInjected {
+                step: InstallStep::BeforeBridgeSwap
+            })
+        ));
+        let stable = stable_bridge_path(temp.path());
+        let directory = integration_dir(temp.path());
+        let receipt_before = fs::read(directory.join(receipt::RECEIPT_FILE_NAME)).unwrap();
+        let pending = write_announced_journal(&cache, &stable);
+        assert!(matches!(
+            resume_install(temp.path(), &cache, &Hooks::default(), None),
+            Err(IntegrationError::ActivationJournalLive { .. })
+        ));
+        assert_eq!(fs::read(&stable).unwrap(), b"wasm-v1");
+        assert_eq!(
+            fs::read(directory.join(receipt::RECEIPT_FILE_NAME)).unwrap(),
+            receipt_before
+        );
+        assert!(journal_path(&directory).exists());
+        journal::remove_journal(&pending).unwrap();
+        assert!(matches!(
+            resume_install(temp.path(), &cache, &Hooks::default(), None).unwrap(),
+            Some(ResumeOutcome::Completed(_))
+        ));
+        assert_eq!(fs::read(&stable).unwrap(), b"wasm-v2");
     }
 }

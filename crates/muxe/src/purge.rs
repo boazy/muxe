@@ -26,8 +26,13 @@ use crate::{
         self,
         receipt::{ReceiptError, load as load_receipt},
     },
-    lifecycle::journal::{self, JournalError},
+    lifecycle::{
+        BridgeUnitGuard,
+        journal::{self, JournalError, UnitKind},
+        registry::RegistryError,
+    },
     logging::{LogError, LogEvent, Logger},
+    paths::PathError,
 };
 
 #[derive(Debug, Error)]
@@ -38,6 +43,10 @@ pub enum PurgeError {
     Receipt(#[from] ReceiptError),
     #[error(transparent)]
     Log(#[from] LogError),
+    #[error(transparent)]
+    Path(#[from] PathError),
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
     #[error("could not scan receipt-listed Zellij reference in {path}: {detail}")]
     ReferenceScan { path: PathBuf, detail: String },
     #[error("muxe purge requires at least one of --config or --cache")]
@@ -127,6 +136,11 @@ pub fn purge(inputs: PurgeInputs<'_>) -> Result<PurgeReport, PurgeError> {
             kind: "config",
         });
     }
+    let config_identity = if inputs.config {
+        integration::existing_bridge_identity(inputs.config_dir)?
+    } else {
+        None
+    };
     if inputs.cache {
         let journal = live_activation_journal(inputs.cache_dir)?;
         if let Some(journal) = journal {
@@ -157,6 +171,7 @@ pub fn purge(inputs: PurgeInputs<'_>) -> Result<PurgeReport, PurgeError> {
             return Err(PurgeError::Declined);
         }
     }
+    let mut _config_unit_guard = None;
     let _cache_lease = if inputs.cache {
         let lease = match journal::acquire_cache_purge_lock(inputs.cache_dir) {
             Ok(lease) => lease,
@@ -170,6 +185,16 @@ pub fn purge(inputs: PurgeInputs<'_>) -> Result<PurgeReport, PurgeError> {
         }
         Some(lease)
     } else {
+        if let Some(identity) = config_identity {
+            let guard = BridgeUnitGuard::acquire(inputs.cache_dir, identity.clone())?;
+            let unit = UnitKind::Zellij {
+                bridge_unit: identity.unit(),
+            };
+            if let Some(journal) = exact_activation_journal(inputs.cache_dir, &unit)? {
+                return Err(PurgeError::ActivationJournalLive { journal });
+            }
+            _config_unit_guard = Some(guard);
+        }
         None
     };
 
@@ -227,6 +252,21 @@ fn live_activation_journal(cache_dir: &Path) -> Result<Option<PathBuf>, PurgeErr
         }
     }
     Ok(None)
+}
+fn exact_activation_journal(
+    cache_dir: &Path,
+    unit: &UnitKind,
+) -> Result<Option<PathBuf>, PurgeError> {
+    let path = journal::activation_dir(cache_dir).join(unit.journal_name());
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(PurgeError::Fs(fsutil::io_error(
+            "inspecting exact activation journal",
+            &path,
+            source,
+        ))),
+    }
 }
 
 /// Returns receipt-backed, still-present Zellij nodes outside the Muxe configuration tree.
@@ -360,7 +400,7 @@ mod tests {
         fs::create_dir_all(&cache).unwrap();
         secure_test_root(&config);
         let unit = crate::lifecycle::journal::UnitKind::Herdr {
-            host_hash: "purge-lock".to_owned(),
+            host_hash: crate::lifecycle::journal::HerdrUnitId::derive("purge-lock"),
         };
         let lock = crate::lifecycle::journal::acquire_unit_lock(&cache, &unit).unwrap();
         let error = purge(inputs(&config, &cache, false, true)).unwrap_err();
@@ -370,6 +410,47 @@ mod tests {
         let report = purge(inputs(&config, &cache, false, true)).unwrap();
         assert_eq!(report.removed.len(), 1);
         assert!(!cache.exists());
+    }
+    #[test]
+    fn config_purge_refuses_while_exact_bridge_unit_is_held() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = temp.path().join("config");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        secure_test_root(&config);
+        let identity = integration::bridge_identity(&config).unwrap();
+        let guard = BridgeUnitGuard::acquire(&cache, identity).unwrap();
+
+        let error = purge(inputs(&config, &cache, true, false)).unwrap_err();
+        assert!(matches!(error, PurgeError::Registry(_)));
+        assert!(config.exists());
+
+        drop(guard);
+        let report = purge(inputs(&config, &cache, true, false)).unwrap();
+        assert_eq!(report.removed.len(), 1);
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn config_purge_preserves_exact_bridge_journal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = temp.path().join("config");
+        let cache = temp.path().join("cache");
+        secure_test_root(&config);
+        let identity = integration::bridge_identity(&config).unwrap();
+        let path = journal::activation_dir(&cache).join(
+            UnitKind::Zellij {
+                bridge_unit: identity.unit(),
+            }
+            .journal_name(),
+        );
+        fsutil::ensure_owner_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{ corrupt but live }").unwrap();
+
+        let error = purge(inputs(&config, &cache, true, false)).unwrap_err();
+        assert!(matches!(error, PurgeError::ActivationJournalLive { .. }));
+        assert!(config.exists());
+        assert!(path.exists());
     }
 
     #[test]
@@ -575,7 +656,7 @@ mod tests {
         let receipt = Receipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             bridge: BridgeRecord {
-                canonical_path: crate::integration::stable_bridge_path(config),
+                bridge_identity: crate::integration::bridge_identity(config).unwrap(),
                 installed_version: "test".to_owned(),
                 installed_digest: Sha256Digest::parse("a".repeat(64)).unwrap(),
                 previous_digest: None,

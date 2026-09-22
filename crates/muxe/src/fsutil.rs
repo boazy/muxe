@@ -15,6 +15,83 @@ pub const OWNER_FILE_MODE: u32 = 0o600;
 /// Owner-only directory mode for integration, activation, and log directories.
 pub const OWNER_DIR_MODE: u32 = 0o700;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurabilityFault {
+    BeforeRename,
+    AfterRenameBeforeDirectorySync,
+    AfterUnlinkBeforeDirectorySync,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DURABILITY_FAULT: std::cell::Cell<Option<DurabilityFault>> =
+        const { std::cell::Cell::new(None) };
+    static TAGGED_DURABILITY_FAULT:
+        std::cell::Cell<Option<(&'static str, DurabilityFault)>> =
+        const { std::cell::Cell::new(None) };
+    static FAIL_DURABILITY_REPLAY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_durability_fault(fault: DurabilityFault) {
+    DURABILITY_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_tagged_durability_fault(tag: &'static str, fault: DurabilityFault) {
+    TAGGED_DURABILITY_FAULT.with(|slot| slot.set(Some((tag, fault))));
+}
+#[cfg(test)]
+pub(crate) fn inject_persistent_durability_replay_failure(enabled: bool) {
+    FAIL_DURABILITY_REPLAY.with(|slot| slot.set(enabled));
+}
+
+#[cfg(test)]
+fn fail_at_durability_boundary(fault: DurabilityFault, path: &Path) -> Result<(), FsError> {
+    let injected = DURABILITY_FAULT.with(|slot| {
+        if slot.get() == Some(fault) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        return Err(io_error(
+            "injecting durability fault",
+            path,
+            io::Error::other("injected after namespace mutation before directory sync"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn fail_at_tagged_durability_boundary(
+    fault: DurabilityFault,
+    path: &Path,
+    tag: &str,
+) -> Result<(), FsError> {
+    let injected = TAGGED_DURABILITY_FAULT.with(|slot| {
+        if slot.get() == Some((tag, fault)) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        return Err(io_error(
+            "injecting tagged durability fault",
+            path,
+            io::Error::other("injected before atomic namespace mutation"),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum FsError {
     #[error("could not {operation} {}", path.display())]
@@ -284,9 +361,53 @@ pub fn create_staging_file(
 pub fn commit_staging(staging: &Path, target: &Path) -> Result<(), FsError> {
     check_owner_file(staging)?;
     fs::rename(staging, target).map_err(|source| io_error("installing file", target, source))?;
+    #[cfg(test)]
+    fail_at_durability_boundary(DurabilityFault::AfterRenameBeforeDirectorySync, target)?;
     sync_dir_of(target)
 }
 
+/// Re-syncs an already-installed owner-only file and its parent namespace.
+pub fn sync_file_and_parent(path: &Path) -> Result<(), FsError> {
+    check_owner_file(path)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .map_err(|source| io_error("opening file for durability replay", path, source))?;
+    verify_opened_owner_file(path, &file)?;
+    #[cfg(test)]
+    if FAIL_DURABILITY_REPLAY.with(std::cell::Cell::get) {
+        return Err(io_error(
+            "synchronizing file for durability replay",
+            path,
+            io::Error::other("injected persistent durability replay failure"),
+        ));
+    }
+    file.sync_all()
+        .map_err(|source| io_error("synchronizing file for durability replay", path, source))?;
+    sync_dir_of(path)
+}
+
+/// Removes one owner-only file and durably syncs its parent. An already-absent
+/// file still re-syncs the parent so replay closes an unlink-before-fsync
+/// failure window.
+pub fn remove_file_durable(path: &Path, operation: &'static str) -> Result<bool, FsError> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            #[cfg(test)]
+            fail_at_durability_boundary(DurabilityFault::AfterUnlinkBeforeDirectorySync, path)?;
+            sync_dir_of(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            sync_dir_of(path)?;
+            Ok(false)
+        }
+        Err(source) => Err(io_error(operation, path, source)),
+    }
+}
 /// Syncs the parent directory of `path` so a rename is crash-durable.
 pub fn sync_dir_of(path: &Path) -> Result<(), FsError> {
     let directory = path
@@ -373,7 +494,47 @@ pub fn write_atomic(target: &Path, bytes: &[u8], tag: &str) -> Result<(), FsErro
         file.sync_all()
             .map_err(|source| io_error("synchronizing staging file", &staging, source))?;
         drop(file);
+        #[cfg(test)]
+        fail_at_tagged_durability_boundary(DurabilityFault::BeforeRename, target, tag)?;
         commit_staging(&staging, target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    result
+}
+
+/// Writes a fresh owner-only file durably without replacing any directory entry.
+///
+/// The staged file is linked into place atomically. A regular file, symlink, or
+/// other entry that appears at `target` is preserved and causes an error.
+pub fn write_atomic_new(target: &Path, bytes: &[u8], tag: &str) -> Result<(), FsError> {
+    let directory = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| FsError::Io {
+            operation: "resolving parent directory",
+            path: target.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
+        })?;
+    ensure_owner_dir(directory)?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let (staging, mut file) = create_staging_file(directory, name, tag)?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|source| io_error("writing staging file", &staging, source))?;
+        file.sync_all()
+            .map_err(|source| io_error("synchronizing staging file", &staging, source))?;
+        drop(file);
+        fs::hard_link(&staging, target)
+            .map_err(|source| io_error("publishing new file", target, source))?;
+        sync_dir_of(target)?;
+        fs::remove_file(&staging)
+            .map_err(|source| io_error("removing published staging link", &staging, source))?;
+        sync_dir(directory)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&staging);

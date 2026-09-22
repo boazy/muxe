@@ -28,7 +28,12 @@ use std::{
 
 use thiserror::Error;
 
-use crate::fsutil::{self, FsError};
+use crate::{
+    fsutil::{self, FsError},
+    integration::receipt::Sha256Digest,
+    lifecycle::journal::BridgeArtifactId,
+    paths::BridgeIdentity,
+};
 
 /// Stable bridge file name inside the integration directory.
 pub const BRIDGE_FILE_NAME: &str = "muxe-zellij.wasm";
@@ -413,6 +418,211 @@ pub fn commit(
     Ok(())
 }
 
+/// Returns the descriptor-authorized path for one transaction artifact.
+#[must_use]
+pub fn artifact_path(identity: &BridgeIdentity, artifact: BridgeArtifactId) -> PathBuf {
+    identity.directory().join(artifact.file_name())
+}
+
+/// Creates or verifies an immutable transaction artifact.
+///
+/// # Errors
+///
+/// Refuses symlinks, foreign bytes, ownership/mode drift, and every sync error.
+pub fn ensure_artifact(
+    identity: &BridgeIdentity,
+    artifact: BridgeArtifactId,
+    bytes: &[u8],
+    expected_digest: &Sha256Digest,
+) -> Result<PathBuf, BridgeError> {
+    let found = fsutil::sha256_hex(bytes);
+    if found != expected_digest.as_str() {
+        return Err(BridgeError::StagedDigestChanged {
+            expected: expected_digest.as_str().to_owned(),
+            found,
+        });
+    }
+    let path = artifact_path(identity, artifact);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(BridgeError::UnsafeDestination { path });
+            }
+            let existing = fsutil::read_owner_file(&path)?;
+            let found = fsutil::sha256_hex(&existing);
+            if found != expected_digest.as_str() {
+                return Err(BridgeError::ForeignBytes {
+                    path,
+                    found,
+                    expected: expected_digest.as_str().to_owned(),
+                });
+            }
+            fsutil::sync_file_and_parent(&path)?;
+            return Ok(path);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(BridgeError::Fs(fsutil::io_error(
+                "inspecting bridge transaction artifact",
+                &path,
+                source,
+            )));
+        }
+    }
+    fsutil::write_atomic(&path, bytes, "bridge-artifact")?;
+    let stored = fsutil::read_owner_file(&path)?;
+    let found = fsutil::sha256_hex(&stored);
+    if found != expected_digest.as_str() {
+        return Err(BridgeError::StagedDigestChanged {
+            expected: expected_digest.as_str().to_owned(),
+            found,
+        });
+    }
+    Ok(path)
+}
+
+/// Copies a verified owner-only bridge file into an immutable transaction
+/// artifact without consuming the source.
+///
+/// # Errors
+///
+/// Propagates unsafe source, digest, write, file-sync, rename, and directory-sync failures.
+pub fn ensure_artifact_from_file(
+    identity: &BridgeIdentity,
+    artifact: BridgeArtifactId,
+    source: &Path,
+    expected_digest: &Sha256Digest,
+) -> Result<PathBuf, BridgeError> {
+    let bytes = fsutil::read_owner_file(source)?;
+    ensure_artifact(identity, artifact, &bytes, expected_digest)
+}
+
+/// Installs an immutable artifact through the atomic owner-only write path.
+/// The artifact is retained for crash retry.
+///
+/// `allowed_current` enumerates the only restart states accepted at the
+/// destination. A foreign digest, missing required destination, or symlink is
+/// preserved and refused.
+///
+/// # Errors
+///
+/// Propagates verification, file sync, rename, directory fsync, and post-write errors.
+pub fn install_artifact(
+    identity: &BridgeIdentity,
+    artifact: BridgeArtifactId,
+    expected_digest: &Sha256Digest,
+    destination: &Path,
+    allowed_current: &[&Sha256Digest],
+    allow_absent: bool,
+) -> Result<(), BridgeError> {
+    let source = artifact_path(identity, artifact);
+    let bytes = fsutil::read_owner_file(&source)?;
+    let source_digest = fsutil::sha256_hex(&bytes);
+    if source_digest != expected_digest.as_str() {
+        return Err(BridgeError::ForeignBytes {
+            path: source,
+            found: source_digest,
+            expected: expected_digest.as_str().to_owned(),
+        });
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(BridgeError::UnsafeDestination {
+                    path: destination.to_path_buf(),
+                });
+            }
+            let current = fsutil::read_owner_file(destination)?;
+            let current_digest = fsutil::sha256_hex(&current);
+            if current_digest == expected_digest.as_str() {
+                fsutil::sync_file_and_parent(destination)?;
+                return Ok(());
+            }
+            if !allowed_current
+                .iter()
+                .any(|digest| digest.as_str() == current_digest)
+            {
+                return Err(BridgeError::ForeignBytes {
+                    path: destination.to_path_buf(),
+                    found: current_digest,
+                    expected: allowed_current
+                        .iter()
+                        .map(|digest| digest.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" or "),
+                });
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && allow_absent => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(BridgeError::ConcurrentChange {
+                path: destination.to_path_buf(),
+                expected: allowed_current
+                    .iter()
+                    .map(|digest| digest.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                found: "<absent>".to_owned(),
+            });
+        }
+        Err(source) => {
+            return Err(BridgeError::Fs(fsutil::io_error(
+                "inspecting bridge artifact destination",
+                destination,
+                source,
+            )));
+        }
+    }
+    fsutil::write_atomic(destination, &bytes, "bridge-install")?;
+    let installed = fsutil::read_owner_file(destination)?;
+    let found = fsutil::sha256_hex(&installed);
+    if found != expected_digest.as_str() {
+        return Err(BridgeError::ConcurrentChange {
+            path: destination.to_path_buf(),
+            expected: expected_digest.as_str().to_owned(),
+            found,
+        });
+    }
+    Ok(())
+}
+
+/// Publishes the requested artifact as the receipt-owned `.previous` bytes.
+///
+/// # Errors
+///
+/// Refuses foreign existing bytes and propagates every durability error.
+pub fn publish_previous(
+    identity: &BridgeIdentity,
+    artifact: BridgeArtifactId,
+    expected_digest: &Sha256Digest,
+    stable: &Path,
+    current_authority: Option<&Sha256Digest>,
+) -> Result<(), BridgeError> {
+    let previous = previous_path(stable);
+    let allowed = current_authority.into_iter().collect::<Vec<_>>();
+    install_artifact(
+        identity,
+        artifact,
+        expected_digest,
+        &previous,
+        &allowed,
+        current_authority.is_none(),
+    )
+}
+
+/// Removes one exact private artifact and durably syncs its directory.
+///
+/// # Errors
+///
+/// Refuses foreign bytes or symlinks and propagates unlink/directory-sync failures.
+pub fn remove_artifact(
+    identity: &BridgeIdentity,
+    artifact: BridgeArtifactId,
+    expected_digest: &Sha256Digest,
+) -> Result<bool, BridgeError> {
+    remove_if_matching(&artifact_path(identity, artifact), expected_digest)
+}
+
 fn check_owner_only(path: &Path, metadata: &fs::Metadata) -> Result<(), BridgeError> {
     let mode = metadata.permissions().mode() & 0o777;
     if mode != BRIDGE_FILE_MODE {
@@ -453,10 +663,13 @@ pub fn previous_path(stable: &Path) -> PathBuf {
 /// # Errors
 ///
 /// Returns [`BridgeError`] when the file is unsafe, foreign, or removal IO fails.
-pub fn remove_if_matching(path: &Path, expected: &str) -> Result<bool, BridgeError> {
+pub fn remove_if_matching(path: &Path, expected: &Sha256Digest) -> Result<bool, BridgeError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fsutil::sync_dir_of(path)?;
+            return Ok(false);
+        }
         Err(source) => {
             return Err(BridgeError::Fs(fsutil::io_error(
                 "reading bridge artifact",
@@ -470,20 +683,19 @@ pub fn remove_if_matching(path: &Path, expected: &str) -> Result<bool, BridgeErr
             path: path.to_path_buf(),
         });
     }
-    let current = fs::read(path)
-        .map_err(|source| fsutil::io_error("reading bridge artifact", path, source))?;
+    let current = fsutil::read_owner_file(path)?;
     let found = fsutil::sha256_hex(&current);
-    if found != expected {
+    if found != expected.as_str() {
         return Err(BridgeError::ForeignBytes {
             path: path.to_path_buf(),
             found,
-            expected: expected.to_owned(),
+            expected: expected.as_str().to_owned(),
         });
     }
-    fs::remove_file(path)
-        .map_err(|source| fsutil::io_error("removing bridge artifact", path, source))?;
-    fsutil::sync_dir_of(path)?;
-    Ok(true)
+    Ok(fsutil::remove_file_durable(
+        path,
+        "removing bridge artifact",
+    )?)
 }
 
 #[cfg(test)]
@@ -638,11 +850,144 @@ mod tests {
         .unwrap();
         let stable = stable(temp.path());
         fs::write(&stable, b"wasm-v1").unwrap();
-        let digest = fsutil::sha256_hex(b"wasm-v1");
+        std::fs::set_permissions(
+            &stable,
+            std::os::unix::fs::PermissionsExt::from_mode(BRIDGE_FILE_MODE),
+        )
+        .unwrap();
+        let digest = Sha256Digest::from_bytes(b"wasm-v1");
         assert!(remove_if_matching(&stable, &digest).unwrap());
         assert!(!stable.exists());
         fs::write(&stable, b"changed").unwrap();
+        std::fs::set_permissions(
+            &stable,
+            std::os::unix::fs::PermissionsExt::from_mode(BRIDGE_FILE_MODE),
+        )
+        .unwrap();
         assert!(remove_if_matching(&stable, &digest).is_err());
         assert_eq!(fs::read(&stable).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn transaction_artifacts_are_idempotent_and_fail_closed_on_foreign_state() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let identity =
+            BridgeIdentity::resolve(temp.path(), std::ffi::OsStr::new(BRIDGE_FILE_NAME)).unwrap();
+        let activation = crate::lifecycle::journal::ActivationId::from_bytes([0x31; 16]).unwrap();
+        let old = BridgeArtifactId::new(
+            activation,
+            crate::lifecycle::journal::BridgeArtifactRole::Old,
+        );
+        let target = BridgeArtifactId::new(
+            activation,
+            crate::lifecycle::journal::BridgeArtifactRole::Target,
+        );
+        let old_digest = Sha256Digest::from_bytes(b"old");
+        let target_digest = Sha256Digest::from_bytes(b"target");
+
+        let old_path = ensure_artifact(&identity, old, b"old", &old_digest).unwrap();
+        assert_eq!(
+            ensure_artifact(&identity, old, b"old", &old_digest).unwrap(),
+            old_path,
+            "artifact creation is restart-idempotent"
+        );
+        ensure_artifact(&identity, target, b"target", &target_digest).unwrap();
+        let stable = identity.stable_path(std::ffi::OsStr::new(BRIDGE_FILE_NAME));
+        fsutil::write_atomic(&stable, b"old", "bridge-test").unwrap();
+        install_artifact(
+            &identity,
+            target,
+            &target_digest,
+            &stable,
+            &[&old_digest, &target_digest],
+            false,
+        )
+        .unwrap();
+        install_artifact(
+            &identity,
+            target,
+            &target_digest,
+            &stable,
+            &[&old_digest, &target_digest],
+            false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&stable).unwrap(), b"target");
+
+        fsutil::write_atomic(&stable, b"foreign", "bridge-test").unwrap();
+        assert!(matches!(
+            install_artifact(
+                &identity,
+                old,
+                &old_digest,
+                &stable,
+                &[&old_digest, &target_digest],
+                false,
+            ),
+            Err(BridgeError::ForeignBytes { .. })
+        ));
+        assert_eq!(fs::read(&stable).unwrap(), b"foreign");
+
+        fs::remove_file(&old_path).unwrap();
+        let symlink_target = temp.path().join("foreign-artifact");
+        fs::write(&symlink_target, b"old").unwrap();
+        std::os::unix::fs::symlink(&symlink_target, &old_path).unwrap();
+        assert!(matches!(
+            ensure_artifact(&identity, old, b"old", &old_digest),
+            Err(BridgeError::UnsafeDestination { .. })
+        ));
+        assert_eq!(fs::read(&symlink_target).unwrap(), b"old");
+    }
+
+    #[test]
+    fn durability_replay_resyncs_completed_rename_and_unlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let identity =
+            BridgeIdentity::resolve(temp.path(), std::ffi::OsStr::new(BRIDGE_FILE_NAME)).unwrap();
+        let activation = crate::lifecycle::journal::ActivationId::from_bytes([0x41; 16]).unwrap();
+        let artifact = BridgeArtifactId::new(
+            activation,
+            crate::lifecycle::journal::BridgeArtifactRole::Target,
+        );
+        let digest = Sha256Digest::from_bytes(b"target");
+        ensure_artifact(&identity, artifact, b"target", &digest).unwrap();
+        let stable = identity.stable_path(std::ffi::OsStr::new(BRIDGE_FILE_NAME));
+
+        crate::fsutil::inject_durability_fault(
+            crate::fsutil::DurabilityFault::AfterRenameBeforeDirectorySync,
+        );
+        assert!(
+            install_artifact(&identity, artifact, &digest, &stable, &[&digest], true,).is_err()
+        );
+        assert_eq!(
+            fs::read(&stable).unwrap(),
+            b"target",
+            "rename completed before the injected directory-sync failure"
+        );
+        install_artifact(&identity, artifact, &digest, &stable, &[&digest], true)
+            .expect("replay re-syncs the installed file and parent");
+
+        crate::fsutil::inject_durability_fault(
+            crate::fsutil::DurabilityFault::AfterUnlinkBeforeDirectorySync,
+        );
+        assert!(remove_artifact(&identity, artifact, &digest).is_err());
+        assert!(
+            !artifact_path(&identity, artifact).exists(),
+            "unlink completed before the injected directory-sync failure"
+        );
+        assert!(
+            !remove_artifact(&identity, artifact, &digest)
+                .expect("replay re-syncs the absent artifact parent")
+        );
     }
 }

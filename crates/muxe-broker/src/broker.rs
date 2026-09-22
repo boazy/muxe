@@ -1970,6 +1970,23 @@ impl Broker {
                 registered_clients: evidence.registered_clients,
                 member_clients: u64::try_from(evidence.member_clients.len()).unwrap_or(u64::MAX),
                 member_ids: Some(evidence.member_clients),
+                proof_epoch: None,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn activation_readiness_at(
+        &self,
+        as_of: muxe_protocol::AsOfTick,
+        epoch: muxe_protocol::UnitReadinessEpochId,
+    ) -> Option<muxe_protocol::TargetReadiness> {
+        match self.adapter.activation_readiness_at(as_of).await {
+            Ok(Some(evidence)) => Some(muxe_protocol::TargetReadiness {
+                registered_clients: evidence.registered_clients,
+                member_clients: u64::try_from(evidence.member_clients.len()).unwrap_or(u64::MAX),
+                member_ids: Some(evidence.member_clients),
+                proof_epoch: Some(epoch),
             }),
             _ => None,
         }
@@ -9901,7 +9918,7 @@ colors:
             execution_transitions: Arc::new(Notify::new()),
             diagnostics_tx: mpsc::unbounded_channel().0,
             diagnostics_rx: Mutex::new(None),
-            token_source: Mutex::new(OsTokenSource::default()),
+            token_source: Mutex::new(OsTokenSource),
             next_session: AtomicU64::new(1),
             next_execution: AtomicU64::new(1),
             next_event: Arc::new(AtomicU64::new(1)),

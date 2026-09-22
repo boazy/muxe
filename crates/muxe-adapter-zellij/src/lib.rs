@@ -25,6 +25,7 @@ mod origin;
 mod parse;
 mod pipes;
 mod portable;
+mod readiness_gate;
 mod registry;
 mod validation;
 
@@ -54,5 +55,6 @@ pub use portable::{
     Cardinal, FocusRequest, PortableError, PortableMapping, map_portable, to_validated_action,
     validate_portable_structure,
 };
+pub use readiness_gate::{ReadinessGate, ReadinessGateError, ReadinessGateGuard};
 pub use registry::{BridgeRecord, HEARTBEAT_LEASE, RegistryError, ZellijRegistry};
 pub use validation::{ZellijValidator, check_keyboard_profile};

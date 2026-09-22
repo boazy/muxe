@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 muxe-condition = { path = "../muxe-condition" }
+getrandom.workspace = true
 rkyv.workspace = true
 serde.workspace = true
 serde_json.workspace = true

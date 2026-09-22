@@ -17,9 +17,10 @@ pub use bridge::{
 };
 
 pub use control::{
-    ActivationStatus, CompatibilityRecord, ControlDecoder, ControlDirection, ControlMessage,
-    ControlOperation, ControlPolicy, ControlRequest, ControlRequestId, ControlResponse, HandoffId,
-    TargetReadiness,
+    ActivationStatus, AsOfTick, BridgeUnitId, CompatibilityRecord, ControlDecoder,
+    ControlDirection, ControlMessage, ControlOperation, ControlPolicy, ControlRequest,
+    ControlRequestId, ControlResponse, HandoffId, PrepareHandoffProtocol, TargetReadiness,
+    UnitReadinessEpochId,
 };
 pub use frame::{
     ArchivedFrame, ConnectionDecoder, ConnectionPolicy, DecodeError, EncodedFrame, PRELUDE_LEN,

@@ -31,7 +31,8 @@ use muxe_adapter_api::{
 };
 use muxe_adapter_herdr::HerdrAdapter;
 use muxe_adapter_zellij::{
-    MembershipSource, PipeChannel, PipeTransportError, ZellijAdapter, ZellijAdapterConfig,
+    MembershipSource, PipeChannel, PipeTransportError, ReadinessGate, ZellijAdapter,
+    ZellijAdapterConfig,
 };
 use muxe_core::{
     ActionValidation, ActionValidator, ConfigDiagnostic, DiagnosticCode, ExecutionCapabilities,
@@ -663,22 +664,32 @@ impl MembershipSource for SingleClientMembership {
 fn recorded_zellij_adapter(
     request: &Arc<RecordedPipeChannel>,
     event: &Arc<RecordedPipeChannel>,
-) -> ZellijAdapter {
-    ZellijAdapter::new_with_membership(
+) -> (tempfile::TempDir, ZellijAdapter) {
+    let root = tempfile::tempdir().expect("recorded readiness root");
+    let cache = root.path().join("cache");
+    std::fs::create_dir(&cache).expect("recorded readiness cache");
+    std::fs::set_permissions(&cache, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("owner-only readiness cache");
+    let adapter = ZellijAdapter::new_with_membership(
         ZellijAdapterConfig {
             session_name: "session-alpha".to_owned(),
             zellij_exe: PathBuf::from("/nonexistent/zellij"),
+            readiness_gate: ReadinessGate::new(
+                cache,
+                muxe_protocol::BridgeUnitId::from_canonical_bytes(b"recorded-zellij"),
+            ),
         },
         Arc::clone(request) as Arc<dyn PipeChannel>,
         Arc::clone(event) as Arc<dyn PipeChannel>,
         Arc::new(SingleClientMembership),
-    )
+    );
+    (root, adapter)
 }
 
 async fn self_attested_registration_is_contained() {
     let request = RecordedPipeChannel::new();
     let event = RecordedPipeChannel::new();
-    let contained = recorded_zellij_adapter(&request, &event);
+    let (_readiness_root, contained) = recorded_zellij_adapter(&request, &event);
     event.push_line(
         encode_event_line(&register_event([7; 16], bridge_build_id()))
             .expect("compatible registration encodes"),
@@ -771,7 +782,7 @@ async fn await_registration_accepted(
 async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_attestation() {
     let request = RecordedPipeChannel::new();
     let event = RecordedPipeChannel::new();
-    let adapter = recorded_zellij_adapter(&request, &event);
+    let (_readiness_root, adapter) = recorded_zellij_adapter(&request, &event);
     assert!(
         !adapter
             .capabilities()

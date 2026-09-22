@@ -195,11 +195,11 @@ mod tests {
         for action in &actions {
             for method in production_required_methods(action) {
                 assert!(
-                    generated::method_metadata(&method).is_some(),
+                    generated::method_metadata(method).is_some(),
                     "production method {method} must exist in the bundled schema metadata"
                 );
                 assert!(
-                    VERIFIED_HERDR_METHODS.contains(&method.as_ref()),
+                    VERIFIED_HERDR_METHODS.contains(&method),
                     "verified set omits production-required method {method}"
                 );
             }

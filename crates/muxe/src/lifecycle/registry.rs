@@ -14,17 +14,22 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use muxe_protocol::control::{BrokerRegistrationId, HandoffId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::fsutil::{self, FsError};
+use crate::{
+    fsutil::{self, FsError},
+    lifecycle::journal::{self, UnitKind, UnitLock, UnitLockAttempt},
+    paths::BridgeIdentity,
+};
 
 /// Registry directory name under `$CACHE_DIR`.
 pub const REGISTRY_DIR_NAME: &str = "brokers";
 /// Registry file name.
 pub const REGISTRY_FILE_NAME: &str = "registry.json";
 /// Registry schema version.
-pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
+pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
 /// Advisory-lock file name beside the registry. The lock serializes every
 /// read-modify-write so concurrent broker startups cannot overwrite each
 /// other's entries. The inode is persistent: it is never deleted.
@@ -42,6 +47,12 @@ pub enum RegistryError {
     },
     #[error("registry at {} uses unsupported schema version {version}", path.display())]
     UnsupportedVersion { path: PathBuf, version: u32 },
+    #[error("Zellij registry mutation is not authorized: {0}")]
+    Unauthorized(String),
+    #[error("broker registry ownership conflict: {0}")]
+    Conflict(String),
+    #[error("cannot mint broker registration identity: {0}")]
+    Entropy(String),
 }
 
 /// One registered broker endpoint.
@@ -57,8 +68,15 @@ pub struct BrokerEntry {
     pub server_pid: u32,
     /// Registration time as Unix epoch seconds.
     pub started_at: u64,
-    /// Canonical stable bridge path (Zellij entries only; drives group selection).
-    pub bridge_path: Option<PathBuf>,
+    /// Fresh process-scoped registration identity; absent on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<BrokerRegistrationId>,
+    /// Descriptor-validated physical bridge authority (Zellij only).
+    pub bridge_identity: Option<BridgeIdentity>,
+    /// Logical bridge-group member (Zellij only).
+    pub bridge_member: Option<BridgeMemberId>,
+    /// Journal-authorized target handoff, absent for ordinary registration.
+    pub handoff_id: Option<HandoffId>,
     /// Live-server identity string (Zellij session name or Herdr server ID).
     pub live_server: Option<String>,
 }
@@ -77,9 +95,212 @@ impl BrokerEntry {
             discovery_key: discovery_key.into(),
             socket,
             server_pid,
+            registration_id: None,
             started_at: unix_now(),
-            bridge_path: None,
+            bridge_identity: None,
+            bridge_member: None,
+            handoff_id: None,
             live_server: None,
+        }
+    }
+}
+/// Stable logical member of a bridge-sharing group.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct BridgeMemberId(String);
+
+impl BridgeMemberId {
+    /// Constructs a member from the validated discovery key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the member is empty or contains NUL.
+    pub fn new(value: String) -> Result<Self, RegistryError> {
+        if value.is_empty() || value.contains('\0') {
+            return Err(RegistryError::Unauthorized(
+                "bridge member is empty or contains NUL".to_owned(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the discovery spelling at a process/wire boundary.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Sorted, duplicate-free logical bridge membership.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct MemberCensus(Vec<BridgeMemberId>);
+
+impl MemberCensus {
+    /// Normalizes an exact census and rejects duplicate logical members.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when an entry carries another identity,
+    /// lacks a typed member, or duplicates a logical member.
+    pub fn from_entries<'a>(
+        identity: &BridgeIdentity,
+        entries: impl IntoIterator<Item = &'a BrokerEntry>,
+    ) -> Result<Self, RegistryError> {
+        let mut members = Vec::new();
+        for entry in entries {
+            if entry.bridge_identity.as_ref() != Some(identity) {
+                return Err(RegistryError::Unauthorized(
+                    "registry entry carries another bridge identity".to_owned(),
+                ));
+            }
+            let member = entry.bridge_member.clone().ok_or_else(|| {
+                RegistryError::Unauthorized("Zellij entry lacks a typed bridge member".to_owned())
+            })?;
+            if member.as_str() != entry.discovery_key {
+                return Err(RegistryError::Unauthorized(
+                    "typed bridge member disagrees with discovery key".to_owned(),
+                ));
+            }
+            members.push(member);
+        }
+        members.sort_unstable();
+        let original_len = members.len();
+        members.dedup();
+        if members.len() != original_len {
+            return Err(RegistryError::Unauthorized(
+                "bridge census contains duplicate logical members".to_owned(),
+            ));
+        }
+        Ok(Self(members))
+    }
+    /// Normalizes an explicit logical member list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the member list contains duplicates.
+    pub fn from_members(mut members: Vec<BridgeMemberId>) -> Result<Self, RegistryError> {
+        members.sort_unstable();
+        let original_len = members.len();
+        members.dedup();
+        if members.len() != original_len {
+            return Err(RegistryError::Unauthorized(
+                "bridge census contains duplicate logical members".to_owned(),
+            ));
+        }
+        Ok(Self(members))
+    }
+
+    /// Returns the normalized members.
+    #[must_use]
+    pub fn members(&self) -> &[BridgeMemberId] {
+        &self.0
+    }
+}
+
+/// Cache lease plus exclusive bridge-unit ownership.
+#[derive(Debug)]
+pub struct BridgeUnitGuard {
+    identity: BridgeIdentity,
+    _lock: UnitLock,
+}
+
+impl BridgeUnitGuard {
+    /// Acquires the bridge-unit guard in the required cache -> unit order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the cache lease or bridge-unit lock
+    /// cannot be acquired.
+    pub fn acquire(cache_dir: &Path, identity: BridgeIdentity) -> Result<Self, RegistryError> {
+        let unit = UnitKind::Zellij {
+            bridge_unit: identity.unit(),
+        };
+        let lock = journal::acquire_unit_lock(cache_dir, &unit)
+            .map_err(|error| RegistryError::Unauthorized(error.to_string()))?;
+        Ok(Self {
+            identity,
+            _lock: lock,
+        })
+    }
+    /// Tries the same bridge-unit lock without blocking a live coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error for invalid lock/cache ownership.
+    pub fn try_acquire(
+        cache_dir: &Path,
+        identity: BridgeIdentity,
+    ) -> Result<Option<Self>, RegistryError> {
+        let unit = UnitKind::Zellij {
+            bridge_unit: identity.unit(),
+        };
+        match journal::try_acquire_unit_lock(cache_dir, &unit)
+            .map_err(|error| RegistryError::Unauthorized(error.to_string()))?
+        {
+            UnitLockAttempt::Acquired(lock) => Ok(Some(Self {
+                identity,
+                _lock: lock,
+            })),
+            UnitLockAttempt::Active => Ok(None),
+        }
+    }
+
+    /// Acquires the same guard with a blocking flock for serialized cleanup.
+    ///
+    /// Call only from a blocking thread; activation targets must not use this
+    /// while their parent coordinator owns the unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the cache lease or bridge-unit lock
+    /// cannot be acquired.
+    pub fn acquire_blocking(
+        cache_dir: &Path,
+        identity: BridgeIdentity,
+    ) -> Result<Self, RegistryError> {
+        let unit = UnitKind::Zellij {
+            bridge_unit: identity.unit(),
+        };
+        let lock = journal::acquire_unit_lock_blocking(cache_dir, &unit)
+            .map_err(|error| RegistryError::Unauthorized(error.to_string()))?;
+        Ok(Self {
+            identity,
+            _lock: lock,
+        })
+    }
+
+    /// The exact physical bridge authority protected by this guard.
+    #[must_use]
+    pub fn identity(&self) -> &BridgeIdentity {
+        &self.identity
+    }
+}
+
+/// Exact journal-derived permission for one same-member target replacement.
+#[derive(Clone, Debug)]
+pub struct TargetRegistrationCapability {
+    bridge_identity: BridgeIdentity,
+    member: BridgeMemberId,
+    endpoint: PathBuf,
+    discovery_key: String,
+    handoff_id: HandoffId,
+}
+
+impl TargetRegistrationCapability {
+    pub(crate) fn new(
+        bridge_identity: BridgeIdentity,
+        member: BridgeMemberId,
+        endpoint: PathBuf,
+        discovery_key: String,
+        handoff_id: HandoffId,
+    ) -> Self {
+        Self {
+            bridge_identity,
+            member,
+            endpoint,
+            discovery_key,
+            handoff_id,
         }
     }
 }
@@ -169,13 +390,143 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`RegistryError`] when the registry cannot be locked, read, or written.
-    pub fn register(&self, entry: BrokerEntry) -> Result<Registration, RegistryError> {
+    pub fn register_herdr(&self, entry: BrokerEntry) -> Result<Registration, RegistryError> {
+        if entry.host_kind != "herdr"
+            || entry.bridge_identity.is_some()
+            || entry.bridge_member.is_some()
+            || entry.handoff_id.is_some()
+        {
+            return Err(RegistryError::Unauthorized(
+                "Herdr registration carries Zellij bridge authority".to_owned(),
+            ));
+        }
+        self.register_inner(entry)
+    }
+
+    /// Registers an ordinary Zellij member while holding its bridge-unit guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the guard or entry authority is invalid
+    /// or the registry cannot be updated.
+    pub fn register_zellij(
+        &self,
+        guard: &BridgeUnitGuard,
+        entry: BrokerEntry,
+    ) -> Result<Registration, RegistryError> {
+        validate_zellij_entry(&entry, guard.identity(), None)?;
+        self.register_inner(entry)
+    }
+
+    /// Replaces exactly one existing logical member under journal authority.
+    ///
+    /// This capability cannot add a member to the census.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the capability does not authorize an
+    /// exact replacement or the registry cannot be updated.
+    pub fn register_zellij_target(
+        &self,
+        capability: &TargetRegistrationCapability,
+        entry: BrokerEntry,
+    ) -> Result<Registration, RegistryError> {
+        validate_zellij_entry(
+            &entry,
+            &capability.bridge_identity,
+            Some(capability.handoff_id),
+        )?;
+        if entry.bridge_member.as_ref() != Some(&capability.member)
+            || entry.socket != capability.endpoint
+            || entry.discovery_key != capability.discovery_key
+        {
+            return Err(RegistryError::Unauthorized(
+                "target registration exceeds its exact member capability".to_owned(),
+            ));
+        }
+        let _lock = RegistryLock::acquire(&self.lock_path)?;
+        let mut file = self.read()?;
+        let replaceable = file.brokers.iter().any(|known| {
+            known.host_kind == "zellij"
+                && known.bridge_identity.as_ref() == Some(&capability.bridge_identity)
+                && known.bridge_member.as_ref() == Some(&capability.member)
+                && known.socket == capability.endpoint
+        });
+        if !replaceable {
+            return Err(RegistryError::Unauthorized(
+                "target capability cannot add a logical bridge member".to_owned(),
+            ));
+        }
+        file.brokers.retain(|known| known.socket != entry.socket);
+        file.brokers.push(entry.clone());
+        self.write(&file)?;
+        Ok(Registration { entry })
+    }
+
+    /// Atomically replaces the exact journal-authorized target incarnation
+    /// with the exact old row while the coordinator owns the bridge unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the old row or current registry
+    /// incarnation is not authorized by the capability.
+    pub fn restore_zellij_target(
+        &self,
+        capability: &TargetRegistrationCapability,
+        old_entry: &BrokerEntry,
+    ) -> Result<bool, RegistryError> {
+        validate_zellij_entry(old_entry, &capability.bridge_identity, old_entry.handoff_id)?;
+        if old_entry.bridge_member.as_ref() != Some(&capability.member)
+            || old_entry.socket != capability.endpoint
+            || old_entry.discovery_key != capability.discovery_key
+        {
+            return Err(RegistryError::Unauthorized(
+                "old row exceeds the target capability's exact member".to_owned(),
+            ));
+        }
+        let _lock = RegistryLock::acquire(&self.lock_path)?;
+        let mut file = self.read()?;
+        if file.brokers.contains(old_entry) {
+            return Ok(false);
+        }
+        let target_index = file.brokers.iter().position(|known| {
+            known.host_kind == "zellij"
+                && known.bridge_identity.as_ref() == Some(&capability.bridge_identity)
+                && known.bridge_member.as_ref() == Some(&capability.member)
+                && known.socket == capability.endpoint
+                && known.discovery_key == capability.discovery_key
+                && known.handoff_id == Some(capability.handoff_id)
+        });
+        if let Some(target_index) = target_index {
+            file.brokers[target_index] = old_entry.clone();
+        } else {
+            let conflicting = file.brokers.iter().any(|known| {
+                known.socket == capability.endpoint
+                    || (known.bridge_identity.as_ref() == Some(&capability.bridge_identity)
+                        && known.bridge_member.as_ref() == Some(&capability.member))
+            });
+            if conflicting {
+                return Err(RegistryError::Unauthorized(
+                    "another registry incarnation occupies the journal member".to_owned(),
+                ));
+            }
+            file.brokers.push(old_entry.clone());
+        }
+        self.write(&file)?;
+        Ok(true)
+    }
+
+    fn register_inner(&self, entry: BrokerEntry) -> Result<Registration, RegistryError> {
         let _lock = RegistryLock::acquire(&self.lock_path)?;
         let mut file = self.read()?;
         file.brokers.retain(|known| known.socket != entry.socket);
         file.brokers.push(entry.clone());
         self.write(&file)?;
         Ok(Registration { entry })
+    }
+    #[cfg(test)]
+    pub(crate) fn register(&self, entry: BrokerEntry) -> Result<Registration, RegistryError> {
+        self.register_inner(entry)
     }
 
     /// Removes only the exact entry owned by `registration`. Returns true
@@ -185,8 +536,207 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`RegistryError`] when the registry cannot be locked, read, or written.
-    pub fn unregister(&self, registration: &Registration) -> Result<bool, RegistryError> {
-        self.unregister_entry(&registration.entry)
+    pub fn unregister_herdr(&self, registration: &Registration) -> Result<bool, RegistryError> {
+        if registration.entry.host_kind != "herdr" {
+            return Err(RegistryError::Unauthorized(
+                "non-Herdr cleanup requires a bridge-unit guard".to_owned(),
+            ));
+        }
+        self.unregister_owned_inner(&registration.entry)
+    }
+
+    /// Removes an exact Zellij registration under the same unit guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the registration does not match the
+    /// guard or the registry cannot be updated.
+    pub fn unregister_zellij(
+        &self,
+        guard: &BridgeUnitGuard,
+        registration: &Registration,
+    ) -> Result<bool, RegistryError> {
+        validate_zellij_entry(
+            &registration.entry,
+            guard.identity(),
+            registration.entry.handoff_id,
+        )?;
+        self.unregister_owned_inner(&registration.entry)
+    }
+    #[cfg(test)]
+    fn unregister(&self, registration: &Registration) -> Result<bool, RegistryError> {
+        self.unregister_owned_inner(&registration.entry)
+    }
+
+    /// Removes this exact process registration even after atomic relocation.
+    /// A successor's fresh token cannot match the old broker's cleanup token.
+    fn unregister_owned_inner(&self, entry: &BrokerEntry) -> Result<bool, RegistryError> {
+        let id = entry.registration_id.ok_or_else(|| {
+            RegistryError::Conflict("owned cleanup lacks registration identity".to_owned())
+        })?;
+        let _lock = RegistryLock::acquire(&self.lock_path)?;
+        let mut file = self.read()?;
+        let before = file.brokers.len();
+        file.brokers.retain(|known| {
+            known.registration_id != Some(id)
+                || known.server_pid != entry.server_pid
+                || known.started_at != entry.started_at
+                || known.host_kind != entry.host_kind
+                || known.discovery_key != entry.discovery_key
+                || known.live_server != entry.live_server
+                || known.bridge_identity != entry.bridge_identity
+                || known.bridge_member != entry.bridge_member
+                || known.handoff_id != entry.handoff_id
+        });
+        let removed = file.brokers.len() != before;
+        if removed {
+            self.write(&file)?;
+        }
+        Ok(removed)
+    }
+
+    /// Reconciles a same-stream authenticated broker in one guarded write.
+    /// The caller owns unit then endpoint locks. `revalidate` inspects the
+    /// retained stream's socket identity while this registry lock is held.
+    ///
+    /// # Errors
+    ///
+    /// Any snapshot, path, owner, or peer drift refuses mutation.
+    pub fn reconcile_live(
+        &self,
+        guard: Option<&BridgeUnitGuard>,
+        observed: &[BrokerEntry],
+        candidate: BrokerEntry,
+        revalidate: impl FnOnce() -> Result<(), RegistryError>,
+    ) -> Result<BrokerEntry, RegistryError> {
+        if candidate.host_kind == "zellij" {
+            let guard = guard.ok_or_else(|| {
+                RegistryError::Conflict("Zellij reconciliation lacks bridge-unit guard".to_owned())
+            })?;
+            validate_zellij_entry(&candidate, guard.identity(), candidate.handoff_id)?;
+        } else if candidate.host_kind != "herdr"
+            || candidate.bridge_identity.is_some()
+            || candidate.bridge_member.is_some()
+            || candidate.handoff_id.is_some()
+        {
+            return Err(RegistryError::Conflict(
+                "live candidate has conflicting host authority".to_owned(),
+            ));
+        }
+        if candidate
+            .registration_id
+            .is_none_or(BrokerRegistrationId::is_zero)
+            || candidate.server_pid == 0
+            || candidate.started_at == 0
+            || candidate.live_server.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(RegistryError::Conflict(
+                "live candidate lacks exact process registration".to_owned(),
+            ));
+        }
+        let _lock = RegistryLock::acquire(&self.lock_path)?;
+        let mut file = self.read()?;
+        if file.brokers != observed {
+            return Err(RegistryError::Conflict(
+                "registry changed since endpoint observation".to_owned(),
+            ));
+        }
+        let mut owners = file.brokers.iter().enumerate().filter(|(_, known)| {
+            known.host_kind == candidate.host_kind && known.discovery_key == candidate.discovery_key
+        });
+        let owner = owners.next().map(|(index, _)| index);
+        if owners.next().is_some() {
+            return Err(RegistryError::Conflict(
+                "ambiguous logical broker owner".to_owned(),
+            ));
+        }
+        if let Some(index) = owner {
+            let mut expected = file.brokers[index].clone();
+            expected.socket.clone_from(&candidate.socket);
+            if expected != candidate {
+                return Err(RegistryError::Conflict(
+                    "live endpoint differs from the exact recorded owner".to_owned(),
+                ));
+            }
+        }
+        if file
+            .brokers
+            .iter()
+            .enumerate()
+            .any(|(index, known)| known.socket == candidate.socket && Some(index) != owner)
+        {
+            return Err(RegistryError::Conflict(
+                "another registry owner occupies the live endpoint".to_owned(),
+            ));
+        }
+        revalidate()?;
+        match owner {
+            Some(index) if file.brokers[index] == candidate => return Ok(candidate),
+            Some(index) => file.brokers[index] = candidate.clone(),
+            None => file.brokers.push(candidate.clone()),
+        }
+        self.write(&file)?;
+        Ok(candidate)
+    }
+
+    /// Verifies an already-recorded legacy peer without adopting or rewriting
+    /// its absent process registration token.
+    ///
+    /// # Errors
+    ///
+    /// Refuses snapshot, bridge, or endpoint drift under the registry lock.
+    pub fn verify_existing(
+        &self,
+        guard: Option<&BridgeUnitGuard>,
+        observed: &[BrokerEntry],
+        entry: &BrokerEntry,
+        revalidate: impl FnOnce() -> Result<(), RegistryError>,
+    ) -> Result<(), RegistryError> {
+        if entry.host_kind == "zellij" {
+            let guard = guard.ok_or_else(|| {
+                RegistryError::Conflict("Zellij reuse lacks bridge-unit guard".to_owned())
+            })?;
+            validate_zellij_entry(entry, guard.identity(), entry.handoff_id)?;
+        }
+        let _lock = RegistryLock::acquire(&self.lock_path)?;
+        let file = self.read()?;
+        if file.brokers != observed || !file.brokers.contains(entry) {
+            return Err(RegistryError::Conflict(
+                "legacy registry owner changed before reuse".to_owned(),
+            ));
+        }
+        revalidate()
+    }
+
+    /// Removes one exact dead row only after an endpoint/PID recheck executed
+    /// under the registry lock. No bulk prune bypasses this authority.
+    ///
+    /// # Errors
+    ///
+    /// A changed snapshot, foreign row, or failed recheck refuses removal.
+    pub fn remove_exact_stale(
+        &self,
+        guard: Option<&BridgeUnitGuard>,
+        observed: &[BrokerEntry],
+        stale: &BrokerEntry,
+        revalidate: impl FnOnce() -> Result<(), RegistryError>,
+    ) -> Result<(), RegistryError> {
+        if stale.host_kind == "zellij" {
+            let guard = guard.ok_or_else(|| {
+                RegistryError::Conflict("Zellij stale removal lacks bridge-unit guard".to_owned())
+            })?;
+            validate_zellij_entry(stale, guard.identity(), stale.handoff_id)?;
+        }
+        let _lock = RegistryLock::acquire(&self.lock_path)?;
+        let mut file = self.read()?;
+        if file.brokers != observed || !file.brokers.contains(stale) {
+            return Err(RegistryError::Conflict(
+                "stale registry observation changed before removal".to_owned(),
+            ));
+        }
+        revalidate()?;
+        file.brokers.retain(|known| known != stale);
+        self.write(&file)
     }
 
     /// Removes only the exact observed `entry`. Coordinator form of
@@ -196,7 +746,23 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`RegistryError`] when the registry cannot be locked, read, or written.
-    pub fn unregister_entry(&self, entry: &BrokerEntry) -> Result<bool, RegistryError> {
+    pub fn unregister_entry(
+        &self,
+        entry: &BrokerEntry,
+        guard: Option<&BridgeUnitGuard>,
+    ) -> Result<bool, RegistryError> {
+        if entry.host_kind == "zellij" {
+            let guard = guard.ok_or_else(|| {
+                RegistryError::Unauthorized(
+                    "Zellij membership cleanup requires its bridge-unit guard".to_owned(),
+                )
+            })?;
+            validate_zellij_entry(entry, guard.identity(), entry.handoff_id)?;
+        }
+        self.unregister_entry_inner(entry)
+    }
+
+    fn unregister_entry_inner(&self, entry: &BrokerEntry) -> Result<bool, RegistryError> {
         let _lock = RegistryLock::acquire(&self.lock_path)?;
         let mut file = self.read()?;
         let before = file.brokers.len();
@@ -236,36 +802,6 @@ impl Registry {
             }
         }
         Ok(liveness)
-    }
-
-    /// Removes every observed-stale entry that still refuses connections.
-    ///
-    /// Each observed entry is re-probed under the registry lock and only the
-    /// exact observed entry is removed, so a replacement that rebound the
-    /// same socket after the probe is never deleted.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistryError`] when the registry cannot be locked, read, written, or probed.
-    pub fn prune_stale(&self) -> Result<usize, RegistryError> {
-        let stale: Vec<BrokerEntry> = self.probe()?.stale;
-        let _lock = RegistryLock::acquire(&self.lock_path)?;
-        let mut file = self.read()?;
-        let mut removed = 0;
-        for observed in stale {
-            if !file.brokers.contains(&observed) {
-                continue;
-            }
-            if !socket_is_stale(&observed.socket)? {
-                continue;
-            }
-            file.brokers.retain(|known| *known != observed);
-            removed += 1;
-        }
-        if removed > 0 {
-            self.write(&file)?;
-        }
-        Ok(removed)
     }
 
     fn read(&self) -> Result<RegistryFile, RegistryError> {
@@ -311,6 +847,30 @@ impl Registry {
 }
 
 /// Connect-probes one broker socket: refused or missing is stale, accepted is
+fn validate_zellij_entry(
+    entry: &BrokerEntry,
+    identity: &BridgeIdentity,
+    handoff: Option<HandoffId>,
+) -> Result<(), RegistryError> {
+    if entry.host_kind != "zellij"
+        || entry.bridge_identity.as_ref() != Some(identity)
+        || entry.handoff_id != handoff
+    {
+        return Err(RegistryError::Unauthorized(
+            "Zellij entry does not match its bridge authority".to_owned(),
+        ));
+    }
+    let member = entry.bridge_member.as_ref().ok_or_else(|| {
+        RegistryError::Unauthorized("Zellij entry lacks a typed bridge member".to_owned())
+    })?;
+    if member.as_str() != entry.discovery_key {
+        return Err(RegistryError::Unauthorized(
+            "typed bridge member disagrees with discovery key".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// live. Any other socket error fails closed instead of guessing.
 fn socket_is_stale(socket: &Path) -> Result<bool, RegistryError> {
     match UnixStream::connect(socket) {
@@ -347,7 +907,22 @@ mod tests {
     }
 
     fn entry(socket: PathBuf) -> BrokerEntry {
-        BrokerEntry::now("herdr", "server", socket, 1)
+        let mut entry = BrokerEntry::now("herdr", "server", socket, 1);
+        entry.registration_id = Some(BrokerRegistrationId::generate().unwrap());
+        entry.live_server = Some("server-test".to_owned());
+        entry
+    }
+
+    #[test]
+    fn broker_registration_identity_rejects_zero_on_disk() {
+        let zero = serde_json::to_value([0_u8; 16]).unwrap();
+        assert!(serde_json::from_value::<BrokerRegistrationId>(zero).is_err());
+        let id = BrokerRegistrationId::generate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<BrokerRegistrationId>(serde_json::to_value(id).unwrap())
+                .unwrap(),
+            id
+        );
     }
 
     #[test]
@@ -383,6 +958,64 @@ mod tests {
     }
 
     #[test]
+    fn guarded_live_reconciliation_preserves_owner_and_rejects_changed_snapshot() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let registry = test_registry(temp.path());
+        let endpoint = temp.path().join("endpoint.sock");
+        let mut candidate = entry(endpoint);
+        candidate.server_pid = std::process::id();
+        assert_eq!(
+            registry
+                .reconcile_live(None, &[], candidate.clone(), || Ok(()))
+                .unwrap(),
+            candidate,
+            "no-row adoption retains attested token and timestamp"
+        );
+        let original = candidate.clone();
+        assert!(
+            registry
+                .unregister(&Registration {
+                    entry: original.clone()
+                })
+                .unwrap()
+        );
+        let mut elsewhere = original;
+        elsewhere.socket = temp.path().join("elsewhere.sock");
+        let token = registry.register(elsewhere).unwrap();
+        let observed = registry.entries().unwrap();
+        assert_eq!(
+            registry
+                .reconcile_live(None, &observed, candidate.clone(), || Ok(()))
+                .unwrap(),
+            candidate
+        );
+        assert_eq!(registry.entries().unwrap(), vec![candidate.clone()]);
+        assert!(
+            registry.unregister(&token).unwrap(),
+            "original token removes relocated row"
+        );
+        let stale_snapshot = observed;
+        registry.register(candidate.clone()).unwrap();
+        assert!(
+            registry
+                .reconcile_live(None, &stale_snapshot, candidate.clone(), || Ok(()))
+                .is_err()
+        );
+        assert_eq!(registry.entries().unwrap(), vec![candidate.clone()]);
+        let observed = registry.entries().unwrap();
+        let mut changed = candidate.clone();
+        changed.socket = temp.path().join("rebound.sock");
+        assert!(
+            registry
+                .reconcile_live(None, &observed, changed, || {
+                    Err(RegistryError::Conflict("injected socket rebind".to_owned()))
+                })
+                .is_err()
+        );
+        assert_eq!(registry.entries().unwrap(), vec![candidate]);
+    }
+
+    #[test]
     fn missing_socket_probes_stale() {
         let temp = tempfile::TempDir::new().unwrap();
         let registry = test_registry(temp.path());
@@ -392,56 +1025,17 @@ mod tests {
         let liveness = registry.probe().unwrap();
         assert!(liveness.live.is_empty());
         assert_eq!(liveness.stale.len(), 1);
-        assert_eq!(registry.prune_stale().unwrap(), 1);
     }
 
     #[test]
     fn live_socket_probes_live() {
         let temp = tempfile::TempDir::new().unwrap();
         let socket = temp.path().join("live.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let registry = test_registry(temp.path());
         registry.register(entry(socket)).unwrap();
         let liveness = registry.probe().unwrap();
         assert_eq!(liveness.live.len(), 1);
-        drop(listener);
-    }
-
-    #[test]
-    fn prune_keeps_entry_whose_socket_rebound_live() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let registry = test_registry(temp.path());
-        let socket = temp.path().join("rebound.sock");
-        registry.register(entry(socket.clone())).unwrap();
-        assert!(
-            registry
-                .probe()
-                .unwrap()
-                .stale
-                .iter()
-                .any(|stale| stale.socket == socket)
-        );
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        assert_eq!(registry.prune_stale().unwrap(), 0);
-        assert_eq!(registry.entries().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn prune_keeps_live_replacement_over_stale_observation() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let registry = test_registry(temp.path());
-        let socket = temp.path().join("normal.sock");
-        let mut old = entry(socket.clone());
-        old.server_pid = 100;
-        old.started_at = 1;
-        registry.register(old).unwrap();
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let mut target = entry(socket);
-        target.server_pid = 200;
-        target.started_at = 2;
-        registry.register(target.clone()).unwrap();
-        assert_eq!(registry.prune_stale().unwrap(), 0);
-        assert_eq!(registry.entries().unwrap(), vec![target]);
     }
 
     #[test]
@@ -452,7 +1046,6 @@ mod tests {
         let child_id = std::env::var("MUXE_REGISTRY_TEST_CHILD_ID").unwrap();
         let registry = Registry::open(Path::new(&directory)).unwrap();
         let mut child_entry = entry(Path::new(&directory).join(format!("child-{child_id}.sock")));
-        child_entry.server_pid = std::process::id();
         child_entry.started_at = 1 + child_id.parse::<u64>().unwrap();
         registry.register(child_entry).unwrap();
     }
@@ -498,5 +1091,229 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(sockets, expected);
+    }
+
+    fn zellij_entry(
+        identity: &BridgeIdentity,
+        member: &str,
+        socket: PathBuf,
+        handoff_id: Option<HandoffId>,
+    ) -> BrokerEntry {
+        let mut entry = BrokerEntry::now("zellij", member, socket, 1);
+        entry.bridge_identity = Some(identity.clone());
+        entry.bridge_member = Some(BridgeMemberId::new(member.to_owned()).unwrap());
+        entry.handoff_id = handoff_id;
+        entry.live_server = Some(format!("{member}-server"));
+        entry.registration_id = Some(BrokerRegistrationId::generate().unwrap());
+        entry
+    }
+
+    #[test]
+    fn canonical_aliases_share_one_unit_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let physical = temp.path().join("physical");
+        std::fs::create_dir(&physical).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let leaf = std::ffi::OsStr::new(crate::integration::BRIDGE_FILE_NAME);
+        let physical_identity =
+            BridgeIdentity::resolve(&physical.join("integrations/zellij"), leaf).unwrap();
+        let alias_identity =
+            BridgeIdentity::resolve(&alias.join("integrations/zellij"), leaf).unwrap();
+
+        let _guard = BridgeUnitGuard::acquire(temp.path(), physical_identity).unwrap();
+        assert!(BridgeUnitGuard::acquire(temp.path(), alias_identity).is_err());
+    }
+
+    #[test]
+    fn target_replacement_and_rollback_preserve_exact_registration_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = test_registry(temp.path());
+        let identity = BridgeIdentity::resolve(
+            &temp.path().join("integration"),
+            std::ffi::OsStr::new(crate::integration::BRIDGE_FILE_NAME),
+        )
+        .unwrap();
+        let guard = BridgeUnitGuard::acquire(temp.path(), identity.clone()).unwrap();
+        let endpoint = temp.path().join("member.sock");
+        let old = zellij_entry(&identity, "session-a", endpoint.clone(), None);
+        let old_registration = registry.register_zellij(&guard, old.clone()).unwrap();
+        let first_handoff = HandoffId([7; 16]);
+        let first_capability = TargetRegistrationCapability::new(
+            identity.clone(),
+            BridgeMemberId::new("session-a".to_owned()).unwrap(),
+            endpoint.clone(),
+            "session-a".to_owned(),
+            first_handoff,
+        );
+        let first_target = zellij_entry(
+            &identity,
+            "session-a",
+            endpoint.clone(),
+            Some(first_handoff),
+        );
+        let first_target_registration = registry
+            .register_zellij_target(&first_capability, first_target.clone())
+            .unwrap();
+        assert!(
+            !registry
+                .unregister_zellij(&guard, &old_registration)
+                .unwrap()
+        );
+        assert_eq!(registry.entries().unwrap(), vec![first_target.clone()]);
+
+        assert!(
+            registry
+                .restore_zellij_target(&first_capability, &old)
+                .unwrap()
+        );
+        assert_eq!(registry.entries().unwrap(), vec![old]);
+        assert!(
+            !registry
+                .unregister_zellij(&guard, &first_target_registration)
+                .unwrap()
+        );
+
+        let restored_first = registry
+            .register_zellij_target(&first_capability, first_target.clone())
+            .unwrap();
+        let second_handoff = HandoffId([8; 16]);
+        let second_capability = TargetRegistrationCapability::new(
+            identity.clone(),
+            BridgeMemberId::new("session-a".to_owned()).unwrap(),
+            endpoint.clone(),
+            "session-a".to_owned(),
+            second_handoff,
+        );
+        let second_target = zellij_entry(&identity, "session-a", endpoint, Some(second_handoff));
+        let second_registration = registry
+            .register_zellij_target(&second_capability, second_target.clone())
+            .unwrap();
+        assert!(!registry.unregister_zellij(&guard, &restored_first).unwrap());
+        assert_eq!(registry.entries().unwrap(), vec![second_target]);
+        assert!(
+            registry
+                .restore_zellij_target(&second_capability, &first_target)
+                .unwrap()
+        );
+        assert_eq!(registry.entries().unwrap(), vec![first_target]);
+        assert!(
+            !registry
+                .unregister_zellij(&guard, &second_registration)
+                .unwrap()
+        );
+        assert!(registry.unregister_zellij(&guard, &restored_first).unwrap());
+        assert!(registry.entries().unwrap().is_empty());
+
+        let other_endpoint = temp.path().join("other.sock");
+        let other_capability = TargetRegistrationCapability::new(
+            identity.clone(),
+            BridgeMemberId::new("session-b".to_owned()).unwrap(),
+            other_endpoint.clone(),
+            "session-b".to_owned(),
+            first_handoff,
+        );
+        let addition = zellij_entry(&identity, "session-b", other_endpoint, Some(first_handoff));
+        assert!(
+            registry
+                .register_zellij_target(&other_capability, addition)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_registration_waits_for_held_unit_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = test_registry(temp.path());
+        let identity = BridgeIdentity::resolve(
+            &temp.path().join("integration"),
+            std::ffi::OsStr::new(crate::integration::BRIDGE_FILE_NAME),
+        )
+        .unwrap();
+        let activation_guard = BridgeUnitGuard::acquire(temp.path(), identity.clone()).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let cache = temp.path().to_path_buf();
+        let worker_registry = registry.clone();
+        let worker_identity = identity;
+        let endpoint = temp.path().join("member.sock");
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let registration_guard =
+                BridgeUnitGuard::acquire_blocking(&cache, worker_identity.clone()).unwrap();
+            worker_registry
+                .register_zellij(
+                    &registration_guard,
+                    zellij_entry(&worker_identity, "session-a", endpoint, None),
+                )
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        assert!(registry.entries().unwrap().is_empty());
+        drop(activation_guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(registry.entries().unwrap().len(), 1);
+    }
+    #[test]
+
+    fn membership_cleanup_waits_for_unit_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = test_registry(temp.path());
+        let identity = BridgeIdentity::resolve(
+            &temp.path().join("integration"),
+            std::ffi::OsStr::new(crate::integration::BRIDGE_FILE_NAME),
+        )
+        .unwrap();
+        let guard = BridgeUnitGuard::acquire(temp.path(), identity.clone()).unwrap();
+        let registration = registry
+            .register_zellij(
+                &guard,
+                zellij_entry(
+                    &identity,
+                    "session-a",
+                    temp.path().join("member.sock"),
+                    None,
+                ),
+            )
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let cache = temp.path().to_path_buf();
+        let worker_registry = registry;
+        let worker_identity = identity;
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let cleanup_guard = BridgeUnitGuard::acquire_blocking(&cache, worker_identity).unwrap();
+            let removed = worker_registry
+                .unregister_zellij(&cleanup_guard, &registration)
+                .unwrap();
+            done_tx.send(removed).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "cleanup published while activation owned the unit"
+        );
+        drop(guard);
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        );
     }
 }

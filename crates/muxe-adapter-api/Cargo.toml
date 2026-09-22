@@ -8,4 +8,5 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 muxe-core = { path = "../muxe-core" }
+muxe-protocol = { path = "../muxe-protocol" }
 thiserror.workspace = true

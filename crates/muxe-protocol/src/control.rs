@@ -1,6 +1,7 @@
-use std::mem;
+use std::{fmt, mem};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -31,6 +32,199 @@ macro_rules! control_nonce {
 
 control_nonce!(ControlRequestId);
 control_nonce!(HandoffId);
+
+/// Coordinator-minted identity of one unit-wide broker-observed readiness proof.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UnitReadinessEpochId([u8; 16]);
+
+impl UnitReadinessEpochId {
+    /// Validates a new proof epoch at its random-source boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the all-zero epoch.
+    pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, ControlSemanticError> {
+        (bytes != [0; 16])
+            .then_some(Self(bytes))
+            .ok_or(ControlSemanticError::ZeroNonce("unit readiness epoch"))
+    }
+
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        self.0 == [0; 16]
+    }
+}
+
+/// Milliseconds on the OS-wide monotonic clock, comparable across local brokers.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AsOfTick(u64);
+
+impl AsOfTick {
+    /// Wraps a nonzero OS monotonic millisecond tick.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero tick.
+    pub fn from_millis(value: u64) -> Result<Self, ControlSemanticError> {
+        (value != 0)
+            .then_some(Self(value))
+            .ok_or(ControlSemanticError::InvalidCompatibility)
+    }
+
+    #[must_use]
+    pub const fn millis(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn age_since(self, earlier: Self) -> Option<u64> {
+        self.0.checked_sub(earlier.0)
+    }
+}
+/// Stable identity of one physical Zellij bridge integration directory.
+///
+/// The native resolver hashes the lossless canonical OS bytes. Control frames
+/// carry only this fixed-size attestation, never a display/lossy path.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BridgeUnitId([u8; 32]);
+
+impl BridgeUnitId {
+    /// Derives an identity from canonical, lossless OS path bytes.
+    #[must_use]
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
+        Self(Sha256::digest(bytes).into())
+    }
+
+    /// Parses the canonical lowercase hexadecimal wire form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlSemanticError::InvalidBridgeUnit`] unless `value` is
+    /// exactly 64 lowercase hexadecimal characters.
+    pub fn parse(value: &str) -> Result<Self, ControlSemanticError> {
+        if value.len() != 64 {
+            return Err(ControlSemanticError::InvalidBridgeUnit);
+        }
+        let mut bytes = [0_u8; 32];
+        for (slot, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let high = decode_hex(pair[0]).ok_or(ControlSemanticError::InvalidBridgeUnit)?;
+            let low = decode_hex(pair[1]).ok_or(ControlSemanticError::InvalidBridgeUnit)?;
+            *slot = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the canonical lowercase hexadecimal wire form.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        let mut value = String::with_capacity(64);
+        for byte in self.0 {
+            use fmt::Write as _;
+            write!(&mut value, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        value
+    }
+}
+
+fn decode_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+impl fmt::Display for BridgeUnitId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.to_hex())
+    }
+}
+
+impl Serialize for BridgeUnitId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for BridgeUnitId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Process-scoped registry identity attested by a broker over control status.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct BrokerRegistrationId([u8; 16]);
+
+impl BrokerRegistrationId {
+    /// Mints a nonzero identity using operating-system entropy.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when entropy is unavailable or yields the reserved zero ID.
+    pub fn generate() -> Result<Self, ControlSemanticError> {
+        let mut bytes = [0; 16];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|error| ControlSemanticError::RegistrationEntropy(error.to_string()))?;
+        Self::from_bytes(bytes)
+    }
+
+    /// Wraps a validated boundary identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the reserved all-zero ID.
+    pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, ControlSemanticError> {
+        (bytes != [0; 16])
+            .then_some(Self(bytes))
+            .ok_or(ControlSemanticError::ZeroNonce("broker registration ID"))
+    }
+
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        self.0 == [0; 16]
+    }
+}
+
+impl<'de> Deserialize<'de> for BrokerRegistrationId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = <[u8; 16]>::deserialize(deserializer)?;
+        Self::from_bytes(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Original registration authority; preserved across adoption or relocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BrokerRegistrationProof {
+    pub id: BrokerRegistrationId,
+    pub started_at: u64,
+}
+
+impl BrokerRegistrationProof {
+    /// Retains the originally registered token and nonzero timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Refuses incomplete process ownership.
+    pub fn new(id: BrokerRegistrationId, started_at: u64) -> Result<Self, ControlSemanticError> {
+        (started_at != 0)
+            .then_some(Self { id, started_at })
+            .ok_or(ControlSemanticError::InvalidRegistration)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZellijCompatibility {
@@ -89,13 +283,51 @@ impl CompatibilityRecord {
     }
 }
 
+/// Prepare protocol negotiated before any drain mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrepareHandoffProtocol {
+    /// The coordinator allocates and supplies the exact handoff identity.
+    CoordinatorSuppliedV1,
+}
+
+/// Exact broker admission phase; an omitted phase decodes as `Legacy`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationPhase {
+    #[default]
+    Legacy,
+    Ordinary,
+    Preparing,
+    Draining,
+    SupervisorOnly,
+    TargetGated,
+    TargetCommitted,
+    Retired,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivationStatus {
     pub lifecycle: LifecycleState,
+    #[serde(default)]
+    pub phase: ActivationPhase,
     pub live_server: LiveServerIdentity,
     pub current: CompatibilityRecord,
     pub target: Option<CompatibilityRecord>,
     pub handoff_id: Option<HandoffId>,
+    /// Additive negotiation for coordinator-supplied handoffs. Omitted by
+    /// pre-H22 peers and therefore treated as unsupported before Prepare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare_handoff: Option<PrepareHandoffProtocol>,
+    /// Process-scoped identity retained by the broker across registry
+    /// reconciliation. Older peers omit this and cannot be adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<BrokerRegistrationProof>,
+    /// Canonical bridge authority attested by Zellij brokers. Herdr and legacy
+    /// control peers carry `None`; callers requiring Zellij authority fail
+    /// closed on absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_unit: Option<BridgeUnitId>,
     /// Optional commit-gate readiness evidence, DES2137-additive: missing on old
     /// records and None where the host reports no per-client evidence. Coordinators
     /// treat None as "no per-client evidence" and apply the host-appropriate gate;
@@ -119,6 +351,9 @@ pub struct TargetReadiness {
     /// for a legitimate zero-client unit) is authoritative for its round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_ids: Option<Vec<String>>,
+    /// Present only in a `StatusAt` response for the exact coordinator epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_epoch: Option<UnitReadinessEpochId>,
 }
 impl ActivationStatus {
     fn validate(&self) -> Result<(), ControlSemanticError> {
@@ -133,7 +368,54 @@ impl ActivationStatus {
         if let Some(ready) = &self.ready {
             validate_readiness(ready)?;
         }
-        Ok(())
+        if self.registration.is_some_and(|proof| proof.started_at == 0) {
+            return Err(ControlSemanticError::InvalidRegistration);
+        }
+        let valid = match self.phase {
+            ActivationPhase::Legacy => match self.lifecycle {
+                LifecycleState::Running => self.target.is_none(),
+                LifecycleState::Preparing | LifecycleState::Draining => {
+                    self.target.is_some() && self.handoff_id.is_some()
+                }
+                LifecycleState::SupervisorOnly => {
+                    self.target.is_none() && self.handoff_id.is_some()
+                }
+                LifecycleState::Retired => self.target.is_none() && self.handoff_id.is_none(),
+            },
+            ActivationPhase::Ordinary => {
+                self.lifecycle == LifecycleState::Running
+                    && self.target.is_none()
+                    && self.handoff_id.is_none()
+            }
+            ActivationPhase::Preparing => {
+                self.lifecycle == LifecycleState::Preparing
+                    && self.target.is_some()
+                    && self.handoff_id.is_some()
+            }
+            ActivationPhase::Draining => {
+                self.lifecycle == LifecycleState::Draining
+                    && self.target.is_some()
+                    && self.handoff_id.is_some()
+            }
+            ActivationPhase::SupervisorOnly => {
+                self.lifecycle == LifecycleState::SupervisorOnly
+                    && self.target.is_none()
+                    && self.handoff_id.is_some()
+            }
+            ActivationPhase::TargetGated | ActivationPhase::TargetCommitted => {
+                self.lifecycle == LifecycleState::Running
+                    && self.target.is_none()
+                    && self.handoff_id.is_some()
+            }
+            ActivationPhase::Retired => {
+                self.lifecycle == LifecycleState::Retired
+                    && self.target.is_none()
+                    && self.handoff_id.is_none()
+            }
+        };
+        valid
+            .then_some(())
+            .ok_or(ControlSemanticError::InvalidActivationPhase)
     }
 }
 
@@ -164,6 +446,9 @@ fn validate_readiness(ready: &TargetReadiness) -> Result<(), ControlSemanticErro
             return Err(ControlSemanticError::InvalidCompatibility);
         }
     }
+    if ready.proof_epoch.is_some_and(UnitReadinessEpochId::is_zero) {
+        return Err(ControlSemanticError::InvalidCompatibility);
+    }
     Ok(())
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,9 +472,21 @@ pub struct ControlRequest {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum ControlOperation {
     Status,
-    Prepare { target: Box<CompatibilityRecord> },
-    Commit { handoff_id: HandoffId },
-    Abort { handoff_id: HandoffId },
+    StatusAt {
+        handoff_id: HandoffId,
+        epoch: UnitReadinessEpochId,
+        as_of: AsOfTick,
+    },
+    Prepare {
+        target: Box<CompatibilityRecord>,
+        handoff_id: HandoffId,
+    },
+    Commit {
+        handoff_id: HandoffId,
+    },
+    Abort {
+        handoff_id: HandoffId,
+    },
     Retire,
 }
 
@@ -203,6 +500,7 @@ pub struct ControlResponse {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ControlResult {
     Status(ActivationStatus),
+    StatusAt(ActivationStatus),
     Prepared(ActivationStatus),
     Committed(ActivationStatus),
     Aborted(ActivationStatus),
@@ -237,7 +535,21 @@ impl ControlRequest {
         self.request_id.validate("control request ID")?;
         match &self.operation {
             ControlOperation::Status | ControlOperation::Retire => Ok(()),
-            ControlOperation::Prepare { target } => target.validate(),
+            ControlOperation::StatusAt {
+                handoff_id,
+                epoch,
+                as_of,
+            } => {
+                handoff_id.validate("handoff ID")?;
+                if epoch.is_zero() || as_of.millis() == 0 {
+                    return Err(ControlSemanticError::InvalidCompatibility);
+                }
+                Ok(())
+            }
+            ControlOperation::Prepare { target, handoff_id } => {
+                target.validate()?;
+                handoff_id.validate("handoff ID")
+            }
             ControlOperation::Commit { handoff_id } | ControlOperation::Abort { handoff_id } => {
                 handoff_id.validate("handoff ID")
             }
@@ -250,6 +562,7 @@ impl ControlResponse {
         self.request_id.validate("control request ID")?;
         match &self.result {
             ControlResult::Status(status)
+            | ControlResult::StatusAt(status)
             | ControlResult::Prepared(status)
             | ControlResult::Committed(status)
             | ControlResult::Aborted(status)
@@ -556,6 +869,14 @@ pub enum ControlSemanticError {
     InvalidLiveServerIdentity,
     #[error("invalid compatibility record")]
     InvalidCompatibility,
+    #[error("invalid canonical bridge unit identity")]
+    InvalidBridgeUnit,
+    #[error("invalid broker registration authority")]
+    InvalidRegistration,
+    #[error("cannot mint broker registration identity: {0}")]
+    RegistrationEntropy(String),
+    #[error("invalid activation phase")]
+    InvalidActivationPhase,
     #[error("invalid {0}")]
     InvalidText(&'static str),
     #[error("control diagnostic exceeds bound: {0}")]
@@ -614,6 +935,7 @@ mod tests {
             request_id: ControlRequestId([1; 16]),
             operation: ControlOperation::Prepare {
                 target: Box::new(record()),
+                handoff_id: HandoffId([2; 16]),
             },
         })
     }
@@ -725,11 +1047,15 @@ mod tests {
     fn coordinator_accepts_only_broker_responses() {
         let status = ActivationStatus {
             lifecycle: LifecycleState::Running,
+            phase: ActivationPhase::Ordinary,
+            registration: None,
             live_server: identity(),
             current: record(),
             target: None,
             handoff_id: None,
+            bridge_unit: None,
             ready: None,
+            prepare_handoff: Some(PrepareHandoffProtocol::CoordinatorSuppliedV1),
         };
         let response = ControlMessage::Response(ControlResponse {
             request_id: ControlRequestId([2; 16]),
@@ -749,24 +1075,44 @@ mod tests {
         // still decode and validate; None serializes to omission on the wire.
         let status = ActivationStatus {
             lifecycle: LifecycleState::Running,
+            phase: ActivationPhase::Legacy,
+            registration: None,
             live_server: identity(),
             current: record(),
             target: None,
             handoff_id: None,
+            bridge_unit: None,
             ready: None,
+            prepare_handoff: None,
         };
         let mut payload = serde_json::to_value(&status).expect("status serializes");
         assert!(
             payload.get("ready").is_none(),
             "absent readiness is omitted, never null"
         );
-        payload
-            .as_object_mut()
-            .expect("status is an object")
-            .remove("target");
+        assert!(
+            payload.get("prepare_handoff").is_none(),
+            "absent prepare capability is omitted, never null"
+        );
+        let object = payload.as_object_mut().expect("status is an object");
+        object.remove("target");
+        object.remove("phase");
+        object.remove("registration");
         let decoded: ActivationStatus =
             serde_json::from_value(payload).expect("v1-shaped status decodes");
         assert_eq!(decoded.ready, None);
+        assert_eq!(decoded.prepare_handoff, None);
+        assert_eq!(decoded.phase, ActivationPhase::Legacy);
+        let mut ambiguous = decoded.clone();
+        ambiguous.handoff_id = Some(HandoffId([7; 16]));
+        let mut old_wire = serde_json::to_value(&ambiguous).unwrap();
+        old_wire.as_object_mut().unwrap().remove("phase");
+        let decoded_ambiguous: ActivationStatus =
+            serde_json::from_value(old_wire).expect("legacy handoff decodes without invention");
+        assert_eq!(decoded_ambiguous.phase, ActivationPhase::Legacy);
+        decoded_ambiguous
+            .validate()
+            .expect("legacy shape remains decodable");
         decoded.validate().expect("v1-shaped status validates");
     }
 
@@ -807,7 +1153,28 @@ mod tests {
             registered_clients: vec!["c1".to_owned(), "c1".to_owned()],
             member_clients: 1,
             member_ids: Some(vec!["c1".to_owned()]),
+            proof_epoch: None,
         };
         assert!(validate_readiness(&duplicate).is_err());
+    }
+
+    #[test]
+    fn status_at_epoch_and_tick_are_typed_and_nonzero() {
+        assert!(UnitReadinessEpochId::from_bytes([0; 16]).is_err());
+        assert!(AsOfTick::from_millis(0).is_err());
+        let request = ControlRequest {
+            request_id: ControlRequestId([1; 16]),
+            operation: ControlOperation::StatusAt {
+                handoff_id: HandoffId([2; 16]),
+                epoch: UnitReadinessEpochId::from_bytes([3; 16]).unwrap(),
+                as_of: AsOfTick::from_millis(42).unwrap(),
+            },
+        };
+        request.validate().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ControlRequest>(&serde_json::to_vec(&request).unwrap())
+                .unwrap(),
+            request
+        );
     }
 }

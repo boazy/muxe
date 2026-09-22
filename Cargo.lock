@@ -1849,6 +1849,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "eyre",
+ "getrandom 0.2.17",
  "kdl 6.7.1",
  "muxe-adapter-api",
  "muxe-adapter-herdr",
@@ -1859,6 +1860,7 @@ dependencies = [
  "muxe-ui",
  "muxe-zellij-protocol",
  "nix",
+ "parking_lot",
  "platform-dirs",
  "serde",
  "serde_json",
@@ -1874,6 +1876,7 @@ version = "0.1.4"
 dependencies = [
  "async-trait",
  "muxe-core",
+ "muxe-protocol",
  "thiserror 2.0.20",
 ]
 
@@ -1908,6 +1911,7 @@ dependencies = [
  "muxe-core",
  "muxe-protocol",
  "muxe-zellij-protocol",
+ "nix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1978,6 +1982,7 @@ dependencies = [
 name = "muxe-protocol"
 version = "0.1.4"
 dependencies = [
+ "getrandom 0.2.17",
  "muxe-condition",
  "proptest",
  "rkyv",

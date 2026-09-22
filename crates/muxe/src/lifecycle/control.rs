@@ -12,9 +12,11 @@
 //! fails the operation without any coordinator-side mutation.
 
 use std::{
-    fs::File,
+    fs::{self, File},
     io::Read,
-    path::Path,
+    num::NonZeroU32,
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +30,7 @@ use muxe_protocol::{
     frame::Prelude,
     wire::PeerRole,
 };
+use nix::unistd::Uid;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -60,6 +63,12 @@ pub enum ControlError {
     UnexpectedResult(&'static str),
     #[error("control operation timed out")]
     Timeout,
+    #[error("broker control peer has wrong UID or lacks a process identity")]
+    PeerIdentity,
+    #[error("broker control endpoint is not an owner-only socket: {}", .0.display())]
+    InvalidEndpoint(PathBuf),
+    #[error("broker control endpoint changed during verification: {}", .0.display())]
+    EndpointReplaced(PathBuf),
 }
 impl ControlError {
     /// Returns whether connecting failed because the endpoint path is absent.
@@ -124,10 +133,93 @@ pub fn handoff_from_hex(hex: &str) -> Result<HandoffId, ControlError> {
     Ok(HandoffId(raw))
 }
 
+/// Process identity authenticated from the retained control stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrokerProcessId(NonZeroU32);
+
+impl BrokerProcessId {
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Nofollow filesystem identity of the endpoint observed by one control stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EndpointIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+}
+
+impl EndpointIdentity {
+    fn inspect(path: &Path) -> Result<Self, ControlError> {
+        let metadata = fs::symlink_metadata(path).map_err(|source| ControlError::Connect {
+            socket: path.to_path_buf(),
+            source,
+        })?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != Uid::current().as_raw()
+            || mode != 0o600
+        {
+            return Err(ControlError::InvalidEndpoint(path.to_path_buf()));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            mode,
+        })
+    }
+}
+
+/// Authority bound to one retained authenticated control connection.
+#[derive(Clone, Debug)]
+pub struct ControlAuthority {
+    process: BrokerProcessId,
+    endpoint: EndpointIdentity,
+}
+
+impl ControlAuthority {
+    #[must_use]
+    pub fn process(&self) -> BrokerProcessId {
+        self.process
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &Path {
+        &self.endpoint.path
+    }
+
+    /// Rechecks the same owner-only socket inode before registry mutation.
+    ///
+    /// # Errors
+    ///
+    /// Any replacement, symlink, disappearance, or owner/mode drift fails closed.
+    pub fn verify_path(&self) -> Result<(), ControlError> {
+        match EndpointIdentity::inspect(&self.endpoint.path) {
+            Ok(current) if current == self.endpoint => Ok(()),
+            Ok(_) | Err(_) => Err(ControlError::EndpointReplaced(self.endpoint.path.clone())),
+        }
+    }
+}
+
+/// Status plus same-stream peer and path attestation.
+#[derive(Clone, Debug)]
+pub struct VerifiedControlStatus {
+    pub status: ActivationStatus,
+    pub authority: ControlAuthority,
+}
+
 /// Coordinator control connection to one broker.
 pub struct ControlClient {
     stream: UnixStream,
     decoder: ControlDecoder,
+    authority: ControlAuthority,
     counter: AtomicU64,
 }
 
@@ -138,6 +230,7 @@ impl ControlClient {
     ///
     /// Returns [`ControlError::Connect`] when the socket cannot be reached, or [`ControlError::Io`] when the prelude write fails.
     pub async fn connect(socket: &Path) -> Result<Self, ControlError> {
+        let endpoint = EndpointIdentity::inspect(socket)?;
         let mut stream =
             UnixStream::connect(socket)
                 .await
@@ -145,6 +238,19 @@ impl ControlClient {
                     socket: socket.to_path_buf(),
                     source,
                 })?;
+        let credentials = stream.peer_cred().map_err(|_| ControlError::PeerIdentity)?;
+        if credentials.uid() != Uid::current().as_raw() {
+            return Err(ControlError::PeerIdentity);
+        }
+        let process = credentials
+            .pid()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .and_then(NonZeroU32::new)
+            .map(BrokerProcessId)
+            .ok_or(ControlError::PeerIdentity)?;
+        if EndpointIdentity::inspect(socket)? != endpoint {
+            return Err(ControlError::EndpointReplaced(socket.to_path_buf()));
+        }
         let prelude = Prelude::control(PeerRole::ActivationCoordinator).encode();
         stream.write_all(&prelude).await?;
         stream.flush().await?;
@@ -152,6 +258,7 @@ impl ControlClient {
             stream,
             decoder: ControlDecoder::new(ControlPolicy::coordinator()),
             counter: AtomicU64::new(1),
+            authority: ControlAuthority { process, endpoint },
         })
     }
 
@@ -167,6 +274,54 @@ impl ControlClient {
         }
     }
 
+    /// Returns status and peer/path authority observed on this same stream.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an endpoint rebind after the response.
+    pub async fn verified_status(&mut self) -> Result<VerifiedControlStatus, ControlError> {
+        let status = self.status().await?;
+        self.authority.verify_path()?;
+        Ok(VerifiedControlStatus {
+            status,
+            authority: self.authority.clone(),
+        })
+    }
+
+    /// Requests readiness at one coordinator-owned monotonic unit epoch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects peers that lack `StatusAt` or omit the exact proof epoch.
+    pub async fn status_at(
+        &mut self,
+        handoff_id: HandoffId,
+        epoch: muxe_protocol::UnitReadinessEpochId,
+        as_of: muxe_protocol::AsOfTick,
+    ) -> Result<ActivationStatus, ControlError> {
+        match self
+            .round_trip(ControlOperation::StatusAt {
+                handoff_id,
+                epoch,
+                as_of,
+            })
+            .await?
+        {
+            ControlResult::StatusAt(status)
+                if status.handoff_id == Some(handoff_id)
+                    && status
+                        .ready
+                        .as_ref()
+                        .is_some_and(|ready| ready.proof_epoch == Some(epoch)) =>
+            {
+                Ok(status)
+            }
+            _ => Err(ControlError::UnexpectedResult(
+                "missing exact as-of readiness proof",
+            )),
+        }
+    }
+
     /// Sends `prepare` with the target compatibility record.
     ///
     /// # Errors
@@ -175,10 +330,12 @@ impl ControlClient {
     pub async fn prepare(
         &mut self,
         target: CompatibilityRecord,
+        handoff_id: HandoffId,
     ) -> Result<ActivationStatus, ControlError> {
         match self
             .round_trip(ControlOperation::Prepare {
                 target: Box::new(target),
+                handoff_id,
             })
             .await?
         {
@@ -295,6 +452,8 @@ mod tests {
     fn test_status() -> ActivationStatus {
         ActivationStatus {
             lifecycle: LifecycleState::Running,
+            phase: muxe_protocol::control::ActivationPhase::Ordinary,
+            registration: None,
             live_server: LiveServerIdentity {
                 host: HostKind::Herdr,
                 discovery_key: "server".to_owned(),
@@ -303,7 +462,11 @@ mod tests {
             current: current_record(),
             target: None,
             handoff_id: None,
+            bridge_unit: None,
             ready: None,
+            prepare_handoff: Some(
+                muxe_protocol::control::PrepareHandoffProtocol::CoordinatorSuppliedV1,
+            ),
         }
     }
     fn current_record() -> CompatibilityRecord {
@@ -319,7 +482,9 @@ mod tests {
     /// Waits until a test server has bound its socket.
     async fn wait_for_socket(socket: &Path) {
         for _ in 0..200 {
-            if socket.exists() {
+            if std::fs::symlink_metadata(socket)
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -333,6 +498,7 @@ mod tests {
     async fn serve_once(socket: &Path, handle: impl Fn(ControlOperation) -> ControlResult) {
         use muxe_protocol::control::ControlPolicy as Policy;
         let listener = UnixListener::bind(socket).unwrap();
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         let (mut stream, _) = listener.accept().await.unwrap();
         // The broker speaks first: its prelude identifies the peer role for
         // the coordinator's decoder before any frame flows.
@@ -400,9 +566,150 @@ mod tests {
         });
         wait_for_socket(&socket).await;
         let mut client = ControlClient::connect(&socket).await.unwrap();
-        let status = client.status().await.unwrap();
-        assert_eq!(status.lifecycle, LifecycleState::Running);
+        let verified = client.verified_status().await.unwrap();
+        assert_eq!(verified.status.lifecycle, LifecycleState::Running);
+        assert_eq!(verified.authority.process().get(), std::process::id());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_stream_status_rejects_socket_rebind_before_registry_use() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = temp.path().join("control.sock");
+        let server = tokio::spawn({
+            let socket = socket.clone();
+            async move {
+                let replacement = socket.clone();
+                serve_once(&socket, move |operation| {
+                    assert_eq!(operation, ControlOperation::Status);
+                    std::fs::remove_file(&replacement).unwrap();
+                    let rebound = UnixListener::bind(&replacement).unwrap();
+                    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    drop(rebound);
+                    ControlResult::Status(test_status())
+                })
+                .await;
+            }
+        });
+        wait_for_socket(&socket).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        assert!(matches!(
+            client.verified_status().await,
+            Err(ControlError::EndpointReplaced(path)) if path == socket
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_at_requires_exact_epoch_echo_from_peer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let handoff = HandoffId([3; 16]);
+        let epoch = muxe_protocol::UnitReadinessEpochId::from_bytes([4; 16]).unwrap();
+        let as_of = muxe_protocol::AsOfTick::from_millis(100).unwrap();
+        let socket = temp.path().join("legacy.sock");
+        let legacy = tokio::spawn({
+            let socket = socket.clone();
+            async move {
+                serve_once(&socket, |operation| {
+                    assert!(matches!(operation, ControlOperation::StatusAt { .. }));
+                    ControlResult::Status(test_status())
+                })
+                .await;
+            }
+        });
+        wait_for_socket(&socket).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        assert!(matches!(
+            client.status_at(handoff, epoch, as_of).await,
+            Err(ControlError::UnexpectedResult(_))
+        ));
+        legacy.await.unwrap();
+
+        let socket = temp.path().join("certified.sock");
+        let certified = tokio::spawn({
+            let socket = socket.clone();
+            async move {
+                serve_once(&socket, |operation| {
+                    assert!(matches!(
+                        operation,
+                        ControlOperation::StatusAt {
+                            handoff_id,
+                            epoch: received,
+                            as_of: received_tick,
+                        } if handoff_id == handoff && received == epoch && received_tick == as_of
+                    ));
+                    let mut status = test_status();
+                    status.phase = muxe_protocol::control::ActivationPhase::TargetGated;
+                    status.handoff_id = Some(handoff);
+                    status.ready = Some(muxe_protocol::TargetReadiness {
+                        registered_clients: Vec::new(),
+                        member_clients: 0,
+                        member_ids: Some(Vec::new()),
+                        proof_epoch: Some(epoch),
+                    });
+                    ControlResult::StatusAt(status)
+                })
+                .await;
+            }
+        });
+        wait_for_socket(&socket).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        assert_eq!(
+            client
+                .status_at(handoff, epoch, as_of)
+                .await
+                .unwrap()
+                .ready
+                .unwrap()
+                .proof_epoch,
+            Some(epoch)
+        );
+        certified.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_control_peer_hanging_before_broker_prelude_obeys_proof_deadline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let socket = temp.path().join("silent.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (accepted, entered) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            let _stream = stream;
+            std::future::pending::<()>().await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+        let result = tokio::time::timeout_at(deadline, async {
+            let mut client = ControlClient::connect(&socket).await?;
+            entered.await.unwrap();
+            client
+                .status_at(
+                    HandoffId([3; 16]),
+                    muxe_protocol::UnitReadinessEpochId::from_bytes([4; 16]).unwrap(),
+                    muxe_protocol::AsOfTick::from_millis(100).unwrap(),
+                )
+                .await
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "silent owned peer cannot extend the proof deadline"
+        );
+        peer.abort();
     }
 
     #[tokio::test]

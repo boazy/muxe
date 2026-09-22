@@ -39,7 +39,7 @@ use muxe_core::{
     NativeActionCandidate, OriginContext, PaneId, PortableAction, SourceSpan,
 };
 use muxe_protocol::{
-    CaptureLeaseId as CommonCaptureLeaseId, ExecutionId as CommonExecutionId,
+    AsOfTick, CaptureLeaseId as CommonCaptureLeaseId, ExecutionId as CommonExecutionId,
     UiSessionId as CommonUiSessionId,
 };
 use muxe_zellij_protocol::{
@@ -77,6 +77,7 @@ use crate::{
         PortableError, PortableMapping, creation_requires_post_dismissal, map_portable,
         map_post_dismissal_creation,
     },
+    readiness_gate::{ReadinessGate, ReadinessGateError, ReadinessGateGuard},
     registry::ZellijRegistry,
 };
 
@@ -89,6 +90,9 @@ const ORIGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long resume waits for fresh compatible registrations covering the
 /// authoritative membership before failing closed and staying suspended.
 const RESUME_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum wait for one readiness publication lock acquisition. Event-loop
+/// publications retry contention without dropping the observed transition.
+const READINESS_GATE_WAIT: Duration = Duration::from_secs(2);
 /// Event-loop sweep cadence for heartbeat-lease expiry: a quiet bridge is
 /// noticed within a few seconds past its 15s lease even when no caller
 /// touches the availability gates.
@@ -130,6 +134,8 @@ pub struct ZellijAdapterConfig {
     pub session_name: String,
     /// Zellij executable used to spawn pipe children in production.
     pub zellij_exe: PathBuf,
+    /// Explicit cache and canonical bridge-unit readiness publication gate.
+    pub readiness_gate: ReadinessGate,
 }
 
 impl ZellijAdapterConfig {
@@ -709,6 +715,8 @@ struct AdapterInner {
     publication_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
     #[cfg(test)]
     shutdown_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
+    #[cfg(test)]
+    readiness_gate_attempt: StdMutex<Option<Arc<Notify>>>,
     quiesce_wake: Notify,
     health_wake: Notify,
     shutdown: AtomicBool,
@@ -745,8 +753,9 @@ struct AdapterInner {
     membership: Arc<dyn MembershipSource>,
     /// Wakes resume while it awaits fresh post-suspend registrations.
     registry_notify: Notify,
-    /// Monotonic base for heartbeat-lease timestamps. Lease times are elapsed
-    /// milliseconds on this clock, never wall-clock time.
+    /// Paused-clock deterministic test origin; production uses OS-wide
+    /// `CLOCK_MONOTONIC` so target brokers compare the same as-of tick.
+    #[cfg(test)]
     started: tokio::time::Instant,
 }
 
@@ -831,6 +840,8 @@ impl ZellijAdapter {
                 publication_wait_hook: StdMutex::new(None),
                 #[cfg(test)]
                 shutdown_wait_hook: StdMutex::new(None),
+                #[cfg(test)]
+                readiness_gate_attempt: StdMutex::new(None),
                 quiesce_wake: Notify::new(),
                 health_wake: Notify::new(),
                 shutdown: AtomicBool::new(false),
@@ -842,6 +853,7 @@ impl ZellijAdapter {
                 success_snapshot: Mutex::new(None),
                 membership,
                 registry_notify: Notify::new(),
+                #[cfg(test)]
                 started: tokio::time::Instant::now(),
             }),
         };
@@ -1012,7 +1024,11 @@ impl ZellijAdapter {
                 "Zellij adapter is suspended; activation resume owns the subscription",
             ));
         }
-        let _transition = self.inner.registration_transition.lock().await;
+        let gate = self
+            .readiness_write_guard()
+            .await
+            .map_err(Self::readiness_gate_error)?;
+        let transition = self.inner.registration_transition.lock().await;
         self.invalidate_incarnation();
         *self.inner.pending_coverage.lock().await = None;
         *self.inner.success_snapshot.lock().await = None;
@@ -1022,6 +1038,8 @@ impl ZellijAdapter {
         )
         .await;
         self.inner.register_epoch.lock().await.clear();
+        drop(transition);
+        drop(gate);
         self.inner
             .event
             .respawn_with_payload(subscription_payload(generation)?)
@@ -1029,17 +1047,76 @@ impl ZellijAdapter {
             .map_err(|error| transport_error(&error))
     }
 
+    async fn readiness_write_guard(&self) -> Result<ReadinessGateGuard, ReadinessGateError> {
+        #[cfg(test)]
+        if let Some(notify) = self
+            .inner
+            .readiness_gate_attempt
+            .lock()
+            .expect("readiness gate hook is not poisoned")
+            .as_ref()
+        {
+            notify.notify_one();
+        }
+        self.inner
+            .config
+            .readiness_gate
+            .exclusive(READINESS_GATE_WAIT)
+            .await
+    }
+
+    async fn readiness_write_guard_retry(&self) -> Option<ReadinessGateGuard> {
+        loop {
+            match self.readiness_write_guard().await {
+                Ok(guard) => return Some(guard),
+                Err(ReadinessGateError::Contended(_)) => {
+                    // The coordinator holds a shared proof. Do not discard a
+                    // registration loss or channel transition while it owns
+                    // the broker-observed epoch.
+                }
+                Err(_) => {
+                    self.inner.quiescing.store(true, Ordering::Release);
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn readiness_gate_error(error: ReadinessGateError) -> AdapterError {
+        let diagnostic = error.to_string();
+        drop(error);
+        AdapterError::new(AdapterErrorKind::Unavailable, diagnostic)
+    }
+
+    async fn bounded_event_epoch(&self) -> Option<u64> {
+        timeout(Duration::from_secs(2), self.inner.event.install_epoch())
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Fresh compatible census for the readiness hook: client IDs holding a
     /// compatible record in the current evidence generation. Private; the
     /// typed `activation_readiness` hook is the only consumer surface.
     async fn fresh_census(&self) -> Vec<String> {
+        self.fresh_census_for(self.clock_millis()).await
+    }
+
+    async fn fresh_census_for(&self, as_of_millis: u64) -> Vec<String> {
         let registry = self.inner.registry.lock().await;
         let stamps = self.inner.register_epoch.lock().await;
         let epoch = self.inner.resume_epoch.load(Ordering::SeqCst);
         let mut census: Vec<String> = stamps
             .iter()
             .filter(|(client, stamped)| {
-                stamped.0 == epoch && registry.get(client).is_some_and(|record| record.compatible)
+                stamped.0 == epoch
+                    && registry.get(client).is_some_and(|record| {
+                        record.compatible
+                            && record.last_event_millis <= as_of_millis
+                            && as_of_millis - record.last_event_millis
+                                <= u64::try_from(crate::registry::HEARTBEAT_LEASE.as_millis())
+                                    .unwrap_or(u64::MAX)
+                    })
             })
             .map(|(client, _)| client.clone())
             .collect();
@@ -1047,14 +1124,77 @@ impl ZellijAdapter {
         census
     }
 
-    /// Milliseconds elapsed on the monotonic adapter clock, for lease times.
+    async fn readiness_snapshot_at(
+        &self,
+        as_of: Option<AsOfTick>,
+    ) -> Result<Option<ActivationReadiness>, AdapterError> {
+        // StatusAt is issued only while its coordinator holds the unit-wide
+        // shared gate. Reacquiring it here could queue behind a waiting writer
+        // and block the very proof that owns the read side.
+        let _read = if as_of.is_none() {
+            Some(
+                self.inner
+                    .config
+                    .readiness_gate
+                    .shared(READINESS_GATE_WAIT)
+                    .await
+                    .map_err(Self::readiness_gate_error)?,
+            )
+        } else {
+            None
+        };
+        if self.inner.suspended.load(Ordering::SeqCst)
+            || self.inner.quiescing.load(Ordering::Acquire)
+            || self.current_incarnation().is_err()
+        {
+            return Ok(None);
+        }
+        let current = self.clock_millis();
+        if self.inner.quiescing.load(Ordering::Acquire)
+            || as_of.is_some_and(|tick| tick.millis() > current)
+        {
+            return Ok(None);
+        }
+        let Some(snapshot) = self.inner.success_snapshot.lock().await.clone() else {
+            return Ok(None);
+        };
+        let Some(members) = canonical_member_set(snapshot) else {
+            return Ok(None);
+        };
+        let census = self
+            .fresh_census_for(as_of.map_or(current, AsOfTick::millis))
+            .await;
+        let registered = members
+            .iter()
+            .filter(|member| census.iter().any(|id| id == *member))
+            .cloned()
+            .collect();
+        Ok(Some(ActivationReadiness {
+            registered_clients: registered,
+            member_clients: members,
+        }))
+    }
+    /// OS-wide monotonic milliseconds in production; paused Tokio time in
+    /// unit tests. A clock failure makes readiness unavailable.
     fn clock_millis(&self) -> u64 {
-        self.inner
-            .started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX)
+        #[cfg(test)]
+        {
+            self.inner
+                .started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }
+        #[cfg(not(test))]
+        {
+            if let Ok(tick) = ReadinessGate::as_of_now() {
+                tick.millis()
+            } else {
+                self.inner.quiescing.store(true, Ordering::Release);
+                u64::MAX
+            }
+        }
     }
     async fn emit(&self, event: AdapterHealthEvent) {
         let event = match event {
@@ -1303,6 +1443,9 @@ impl ZellijAdapter {
                         .await;
                     }
                     PipeEventKind::Event(BridgeEvent::Heartbeat) => {
+                        let Some(_gate) = self.readiness_write_guard_retry().await else {
+                            return;
+                        };
                         let now = self.clock_millis();
                         let _ = self.inner.registry.lock().await.heartbeat(
                             &client_id,
@@ -1343,9 +1486,12 @@ impl ZellijAdapter {
             && identity.action_fingerprint == generated_action_fingerprint().0
             && identity.protocol_fingerprint == bridge_protocol_fingerprint().0
             && identity.muxe_version == env!("CARGO_PKG_VERSION");
+        let Some(gate) = self.readiness_write_guard_retry().await else {
+            return;
+        };
         let transition = self.inner.registration_transition.lock().await;
         if channel_generation != self.inner.generation.current()
-            || self.inner.event.install_epoch().await != Some(channel)
+            || self.bounded_event_epoch().await != Some(channel)
         {
             return;
         }
@@ -1381,6 +1527,7 @@ impl ZellijAdapter {
         // Wake a resume awaiting fresh post-suspend registrations.
         self.inner.registry_notify.notify_waiters();
         drop(transition);
+        drop(gate);
         if compatible {
             let continuity_was_current = self.current_incarnation().is_ok();
             if continuity_was_current {
@@ -2121,6 +2268,10 @@ impl ZellijAdapter {
         self.inner.request.respawn().await.is_ok()
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "channel-loss invalidation, request settlement, registration retirement and bounded respawn retain their required ordering"
+    )]
     async fn restart_whole_pipe(&self) {
         if self.inner.shutdown.load(Ordering::Relaxed)
             || self.inner.quiescing.load(Ordering::Acquire)
@@ -2128,6 +2279,9 @@ impl ZellijAdapter {
         {
             return;
         }
+        let Some(gate) = self.readiness_write_guard_retry().await else {
+            return;
+        };
         let _transition = self.inner.registration_transition.lock().await;
         self.invalidate_incarnation();
         *self.inner.pending_coverage.lock().await = None;
@@ -2181,6 +2335,7 @@ impl ZellijAdapter {
         }
         self.invalidate_all_registrations("Zellij event pipe failed before completion")
             .await;
+        drop(gate);
         self.inner.captures.lock().await.invalidate_all_clients();
         self.inner.pane_claims.lock().await.clear();
         self.inner.snapshots.lock().await.clear();
@@ -2273,11 +2428,15 @@ impl ZellijAdapter {
         pending: Option<&PendingCoverage>,
         resume: bool,
     ) -> Result<HostIdentity, AdapterError> {
+        let _gate = self
+            .readiness_write_guard()
+            .await
+            .map_err(Self::readiness_gate_error)?;
         let _transition = self.inner.registration_transition.lock().await;
         if self.inner.shutdown.load(Ordering::Acquire)
             || self.inner.quiescing.load(Ordering::Acquire)
             || self.inner.resume_epoch.load(Ordering::SeqCst) != resume_epoch
-            || self.inner.event.install_epoch().await != Some(channel)
+            || self.bounded_event_epoch().await != Some(channel)
             || (!resume && self.inner.suspended.load(Ordering::SeqCst))
         {
             return Err(AdapterError::new(
@@ -2334,7 +2493,7 @@ impl ZellijAdapter {
         if self.inner.shutdown.load(Ordering::Acquire)
             || self.inner.quiescing.load(Ordering::Acquire)
             || self.inner.resume_epoch.load(Ordering::SeqCst) != resume_epoch
-            || self.inner.event.install_epoch().await != Some(channel)
+            || self.bounded_event_epoch().await != Some(channel)
         {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
@@ -2363,6 +2522,17 @@ impl ZellijAdapter {
             return self.host_identity();
         }
 
+        self.publish_new_incarnation(owner, members, pending, resume)
+            .await
+    }
+
+    async fn publish_new_incarnation(
+        &self,
+        owner: CoverageOwner,
+        members: &[String],
+        pending: Option<&PendingCoverage>,
+        resume: bool,
+    ) -> Result<HostIdentity, AdapterError> {
         let incarnation = ZellijIncarnationId::mint()?;
         let identity = HostIdentity {
             kind: ApiHostKind::Zellij,
@@ -2620,6 +2790,9 @@ impl ZellijAdapter {
         // capture table without holding the guard, so lock order stays
         // transition-then-captures inside expiry and never inverts.
         {
+            let Some(_gate) = self.readiness_write_guard_retry().await else {
+                return;
+            };
             let _transition = self.inner.registration_transition.lock().await;
             let now = self.clock_millis();
             let expired = self.inner.registry.lock().await.expire_leases(now);
@@ -2678,15 +2851,23 @@ impl ZellijAdapter {
     /// reports `Unhealthy` while staying suspended. Every resume failure
     /// funnels here so no partial adapter can overlap the next attempt.
     async fn fail_resume(&self, message: &str) -> AdapterError {
+        let gate = match self.readiness_write_guard().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.inner.quiescing.store(true, Ordering::Release);
+                return Self::readiness_gate_error(error);
+            }
+        };
         let _transition = self.inner.registration_transition.lock().await;
         self.invalidate_incarnation();
         *self.inner.pending_coverage.lock().await = None;
-        self.inner.request.park().await;
-        self.inner.event.park().await;
         self.invalidate_all_registrations("Zellij activation resume failed before completion")
             .await;
         self.inner.register_epoch.lock().await.clear();
         *self.inner.success_snapshot.lock().await = None;
+        drop(gate);
+        self.inner.request.park().await;
+        self.inner.event.park().await;
         self.emit(AdapterHealthEvent::Unhealthy {
             modal_scope: None,
             error: AdapterError::new(AdapterErrorKind::Unavailable, message),
@@ -3904,6 +4085,10 @@ impl HostAdapter for ZellijAdapter {
     /// children are gone before any target connects. Idempotent: a second
     /// suspend while suspended succeeds without touching the transport.
     async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
+        let gate = self
+            .readiness_write_guard()
+            .await
+            .map_err(Self::readiness_gate_error)?;
         if self.inner.suspended.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -3959,6 +4144,7 @@ impl HostAdapter for ZellijAdapter {
         self.inner.captures.lock().await.invalidate_all_clients();
         self.inner.pane_claims.lock().await.clear();
         self.inner.snapshots.lock().await.clear();
+        drop(gate);
         return self.park_suspended_transport().await;
     }
 
@@ -3985,6 +4171,10 @@ impl HostAdapter for ZellijAdapter {
                 "Zellij adapter is not suspended for activation; refusing to fabricate a resumed subscription",
             ));
         }
+        let gate = self
+            .readiness_write_guard()
+            .await
+            .map_err(Self::readiness_gate_error)?;
         let transition = self.inner.registration_transition.lock().await;
         self.invalidate_incarnation();
         *self.inner.pending_coverage.lock().await = None;
@@ -3999,6 +4189,7 @@ impl HostAdapter for ZellijAdapter {
             .await;
         self.inner.register_epoch.lock().await.clear();
         let generation = self.inner.generation.advance()?;
+        drop(gate);
         let request_ok = self.inner.request.respawn().await.is_ok();
         let event_ok = match subscription_payload(generation) {
             Ok(payload) => self.inner.event.respawn_with_payload(payload).await.is_ok(),
@@ -4074,33 +4265,22 @@ impl HostAdapter for ZellijAdapter {
     /// empty sets after its adapter-local incarnation is minted. Only IDs
     /// leave this hook, never commands or payloads.
     async fn activation_readiness(&self) -> Result<Option<ActivationReadiness>, AdapterError> {
-        if self.inner.suspended.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        if self.current_incarnation().is_err() {
-            return Ok(None);
-        }
-        self.sweep_expired_clients().await;
-        let Some(snapshot) = self.inner.success_snapshot.lock().await.clone() else {
-            return Ok(None);
-        };
-        let Some(members) = canonical_member_set(snapshot) else {
-            return Ok(None);
-        };
-        let census = self.fresh_census().await;
-        let registered: Vec<String> = members
-            .iter()
-            .filter(|member| census.iter().any(|id| id == *member))
-            .cloned()
-            .collect();
-        Ok(Some(ActivationReadiness {
-            registered_clients: registered,
-            member_clients: members,
-        }))
+        self.readiness_snapshot_at(None).await
+    }
+
+    async fn activation_readiness_at(
+        &self,
+        as_of: AsOfTick,
+    ) -> Result<Option<ActivationReadiness>, AdapterError> {
+        self.readiness_snapshot_at(Some(as_of)).await
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
         {
+            let gate = self
+                .readiness_write_guard()
+                .await
+                .map_err(Self::readiness_gate_error)?;
             let _transition = self.inner.registration_transition.lock().await;
             if self.inner.shutdown.swap(true, Ordering::AcqRel) {
                 return Ok(());
@@ -4108,6 +4288,7 @@ impl HostAdapter for ZellijAdapter {
             self.invalidate_incarnation();
             *self.inner.pending_coverage.lock().await = None;
             *self.inner.success_snapshot.lock().await = None;
+            drop(gate);
             #[cfg(test)]
             {
                 let hook = self
@@ -4381,6 +4562,7 @@ mod tests {
             ZellijAdapterConfig {
                 session_name: "session-alpha".to_owned(),
                 zellij_exe: PathBuf::from("/nonexistent/zellij"),
+                readiness_gate: ReadinessGate::temporary(),
             },
             Arc::clone(request) as Arc<dyn PipeChannel>,
             Arc::clone(event) as Arc<dyn PipeChannel>,
@@ -4396,6 +4578,7 @@ mod tests {
             ZellijAdapterConfig {
                 session_name: "session-alpha".to_owned(),
                 zellij_exe: PathBuf::from("/nonexistent/zellij"),
+                readiness_gate: ReadinessGate::temporary(),
             },
             request,
             event,
@@ -6317,6 +6500,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_loss_publication_waits_for_shared_ready_proof() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter_with(&request, &event, ScriptedMembership::fresh(Vec::new()));
+        adapter.suspend_for_activation().await.unwrap();
+        let _ = next_event(&adapter).await;
+        resume_once(&adapter, &event, None).await.unwrap();
+        assert!(adapter.identity().await.is_ok());
+        let gate = adapter.inner.config.readiness_gate.clone();
+        let proof = gate.shared(Duration::from_secs(1)).await.unwrap();
+        let attempted = Arc::new(Notify::new());
+        *adapter.inner.readiness_gate_attempt.lock().unwrap() = Some(Arc::clone(&attempted));
+        let loss = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.restart_whole_pipe().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), attempted.notified())
+            .await
+            .expect("loss attempts the exclusive publication gate");
+        assert!(
+            !loss.is_finished(),
+            "channel loss cannot publish during Ready proof"
+        );
+        assert!(adapter.identity().await.is_ok());
+        drop(proof);
+        tokio::time::timeout(Duration::from_secs(5), loss)
+            .await
+            .expect("loss publishes after proof")
+            .unwrap();
+        assert!(adapter.identity().await.is_err());
+        assert!(adapter.activation_readiness().await.unwrap().is_none());
+        *adapter.inner.readiness_gate_attempt.lock().unwrap() = None;
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_publication_waits_for_shared_ready_proof() {
+        use crate::registry::HEARTBEAT_LEASE;
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter_with(
+            &request,
+            &event,
+            ScriptedMembership::fresh(vec!["client-1".to_owned()]),
+        );
+        adapter.suspend_for_activation().await.unwrap();
+        let _ = next_event(&adapter).await;
+        resume_once(&adapter, &event, Some(("client-1", [7; 16])))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let gate = adapter.inner.config.readiness_gate.clone();
+        let proof = gate.shared(Duration::from_secs(1)).await.unwrap();
+        let as_of = AsOfTick::from_millis(adapter.clock_millis().max(1)).unwrap();
+        assert_eq!(
+            adapter
+                .activation_readiness_at(as_of)
+                .await
+                .unwrap()
+                .unwrap()
+                .registered_clients,
+            vec!["client-1"]
+        );
+        let attempted = Arc::new(Notify::new());
+        *adapter.inner.readiness_gate_attempt.lock().unwrap() = Some(Arc::clone(&attempted));
+        tokio::time::advance(HEARTBEAT_LEASE + Duration::from_secs(1)).await;
+        let expiry = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.sweep_expired_clients().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), attempted.notified())
+            .await
+            .expect("expiry attempts the exclusive publication gate");
+        assert!(
+            adapter
+                .inner
+                .registry
+                .lock()
+                .await
+                .get("client-1")
+                .is_some()
+        );
+        assert!(
+            !expiry.is_finished(),
+            "expiry cannot publish during Ready proof"
+        );
+        assert!(
+            adapter.fresh_census().await.is_empty(),
+            "read-only readiness rejects expired evidence before publication"
+        );
+        assert_eq!(
+            adapter
+                .activation_readiness_at(as_of)
+                .await
+                .unwrap()
+                .unwrap()
+                .registered_clients,
+            vec!["client-1"],
+            "the broker-observed as-of epoch remains valid while current readiness ages out"
+        );
+        drop(proof);
+        tokio::time::timeout(Duration::from_secs(5), expiry)
+            .await
+            .expect("expiry publishes after proof")
+            .unwrap();
+        assert!(
+            adapter
+                .inner
+                .registry
+                .lock()
+                .await
+                .get("client-1")
+                .is_none()
+        );
+        *adapter.inner.readiness_gate_attempt.lock().unwrap() = None;
+        adapter.shutdown().await.unwrap();
+    }
+    #[tokio::test]
     async fn live_incarnation_rotates_and_rejects_pre_rotation_origin() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
@@ -6811,6 +7112,7 @@ mod tests {
             ZellijAdapterConfig {
                 session_name: String::new(),
                 zellij_exe: PathBuf::from("/nonexistent/zellij"),
+                readiness_gate: ReadinessGate::temporary(),
             },
             request as Arc<dyn PipeChannel>,
             event as Arc<dyn PipeChannel>,
@@ -7642,6 +7944,7 @@ done
             ZellijAdapterConfig {
                 session_name: "session-alpha".to_owned(),
                 zellij_exe: exe,
+                readiness_gate: ReadinessGate::temporary(),
             },
             Arc::clone(&request) as Arc<dyn crate::pipes::PipeChannel>,
             Arc::clone(&event) as Arc<dyn crate::pipes::PipeChannel>,

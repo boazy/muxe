@@ -77,14 +77,22 @@ where
     let units = select_units(&entries, inputs.scope, inputs.current.as_ref())?;
     let mut report = RetireReport::default();
     for unit in units {
-        report
-            .units
-            .push(retire_unit(inputs.control, &registry, &unit, inputs.logger).await?);
+        report.units.push(
+            retire_unit(
+                inputs.cache_dir,
+                inputs.control,
+                &registry,
+                &unit,
+                inputs.logger,
+            )
+            .await?,
+        );
     }
     Ok(report)
 }
 
 async fn retire_unit<C>(
+    cache_dir: &Path,
     control: &C,
     registry: &Registry,
     unit: &PlannedUnit,
@@ -94,6 +102,15 @@ where
     C: ControlPort,
 {
     let label = unit_label(unit);
+    let unit_guard = match unit {
+        PlannedUnit::Zellij {
+            bridge_identity, ..
+        } => Some(super::registry::BridgeUnitGuard::acquire(
+            cache_dir,
+            bridge_identity.clone(),
+        )?),
+        PlannedUnit::Herdr { .. } => None,
+    };
     let entries: Vec<&BrokerEntry> = match unit {
         PlannedUnit::Herdr { entry } => vec![entry],
         PlannedUnit::Zellij { entries, .. } => entries.iter().collect(),
@@ -106,7 +123,7 @@ where
         let outcome = match control.connect(&entry.socket).await {
             Ok(mut session) => session.retire().await.map(|_| ()),
             Err(error) if error.is_absent_endpoint() => {
-                registry.unregister_entry(entry)?;
+                registry.unregister_entry(entry, unit_guard.as_ref())?;
                 continue;
             }
             Err(error) => Err(error),
@@ -114,7 +131,7 @@ where
         match outcome {
             Ok(()) => {
                 retired_any = true;
-                registry.unregister_entry(entry)?;
+                registry.unregister_entry(entry, unit_guard.as_ref())?;
             }
             Err(error) => {
                 log(
@@ -156,6 +173,8 @@ mod tests {
     fn status() -> ActivationStatus {
         ActivationStatus {
             lifecycle: muxe_protocol::control::LifecycleState::Retired,
+            phase: muxe_protocol::control::ActivationPhase::Retired,
+            registration: None,
             live_server: LiveServerIdentity {
                 host: HostKind::Herdr,
                 discovery_key: "server".to_owned(),
@@ -170,7 +189,11 @@ mod tests {
             },
             target: None,
             handoff_id: None,
+            bridge_unit: None,
             ready: None,
+            prepare_handoff: Some(
+                muxe_protocol::control::PrepareHandoffProtocol::CoordinatorSuppliedV1,
+            ),
         }
     }
 
@@ -184,6 +207,7 @@ mod tests {
         async fn prepare(
             &mut self,
             _target: &CompatibilityRecord,
+            _handoff: &muxe_protocol::control::HandoffId,
         ) -> Result<ActivationStatus, ControlError> {
             Err(ControlError::Closed)
         }
@@ -250,6 +274,7 @@ mod tests {
         async fn prepare(
             &mut self,
             _target: &CompatibilityRecord,
+            _handoff: &muxe_protocol::control::HandoffId,
         ) -> Result<ActivationStatus, ControlError> {
             Err(self.failure.error())
         }
@@ -309,6 +334,7 @@ mod tests {
         async fn prepare(
             &mut self,
             _target: &CompatibilityRecord,
+            _handoff: &muxe_protocol::control::HandoffId,
         ) -> Result<ActivationStatus, ControlError> {
             Err(ControlError::Closed)
         }
@@ -356,6 +382,7 @@ mod tests {
         async fn prepare(
             &mut self,
             _target: &CompatibilityRecord,
+            _handoff: &muxe_protocol::control::HandoffId,
         ) -> Result<ActivationStatus, ControlError> {
             Ok(status())
         }

@@ -13,8 +13,8 @@ use data_encoding::HEXLOWER;
 use muxe_protocol::HostKind;
 use nix::{
     errno::Errno,
-    sys::signal::kill,
-    unistd::{Pid, Uid},
+    fcntl::{Flock, FlockArg},
+    unistd::Uid,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -22,6 +22,7 @@ use tokio::net::UnixListener;
 
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
+const STARTUP_LOCK_MARKER: &[u8] = b"muxe-startup-lock-v2\n";
 const MAX_SOCKET_PATH_BYTES: usize = 103;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,42 +115,158 @@ impl RuntimeEndpoint {
         }
     }
 
-    /// Acquires the short-lived owner-only lock that serializes broker startup attempts.
+    /// Acquires the persistent owner-only advisory lock that serializes broker startups.
+    ///
+    /// A fully initialized, already-locked inode is hard-linked into place
+    /// atomically. Old PID-file locks (including an empty file before its PID
+    /// write) are never adopted: they cannot prove exclusive ownership.
+    /// Neither this guard nor later callers unlink the published inode.
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` when the lock file cannot be created or locked.
+    /// Returns `RuntimeError` on contention or invalid path/ownership.
     pub fn acquire_startup_lock(&self) -> Result<StartupLock, RuntimeError> {
         self.ensure_owner_directory()?;
-        let create = || {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true).mode(OWNER_FILE_MODE);
-            let mut file = options
-                .open(&self.startup_lock)
-                .map_err(|source| RuntimeError::Io {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(&self.startup_lock)
+        {
+            Ok(file) => return self.lock_existing(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(RuntimeError::Io {
                     path: self.startup_lock.clone(),
                     source,
-                })?;
-            writeln!(file, "{}", std::process::id()).map_err(|source| RuntimeError::Io {
+                });
+            }
+        }
+        let mut staged = tempfile::Builder::new()
+            .prefix(".muxe-startup-")
+            .tempfile_in(&self.runtime_dir)
+            .map_err(|source| RuntimeError::Io {
+                path: self.runtime_dir.clone(),
+                source,
+            })?;
+        staged
+            .write_all(STARTUP_LOCK_MARKER)
+            .map_err(|source| RuntimeError::Io {
                 path: self.startup_lock.clone(),
                 source,
             })?;
-            Ok(StartupLock {
+        staged
+            .as_file()
+            .sync_all()
+            .map_err(|source| RuntimeError::Io {
                 path: self.startup_lock.clone(),
-                _file: file,
-            })
-        };
-
-        match create() {
-            Ok(lock) => Ok(lock),
-            Err(RuntimeError::Io { source, .. })
-                if source.kind() == io::ErrorKind::AlreadyExists =>
-            {
-                self.remove_stale_lock()?;
-                create()
+                source,
+            })?;
+        let file = staged
+            .as_file()
+            .try_clone()
+            .map_err(|source| RuntimeError::Io {
+                path: self.startup_lock.clone(),
+                source,
+            })?;
+        let locked =
+            Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, source)| {
+                RuntimeError::Io {
+                    path: self.startup_lock.clone(),
+                    source: source.into(),
+                }
+            })?;
+        match staged.persist_noclobber(&self.startup_lock) {
+            Ok(_) => {
+                self.validate_lock_identity(&locked)?;
+                Ok(StartupLock { _file: locked })
             }
-            Err(error) => Err(error),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                drop(locked);
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+                    .open(&self.startup_lock)
+                    .map_err(|source| RuntimeError::Io {
+                        path: self.startup_lock.clone(),
+                        source,
+                    })?;
+                self.lock_existing(file)
+            }
+            Err(error) => Err(RuntimeError::Io {
+                path: self.startup_lock.clone(),
+                source: error.error,
+            }),
         }
+    }
+
+    fn lock_existing(&self, mut file: File) -> Result<StartupLock, RuntimeError> {
+        self.validate_lock_identity(&file)?;
+        if file
+            .metadata()
+            .map_err(|source| RuntimeError::Io {
+                path: self.startup_lock.clone(),
+                source,
+            })?
+            .len()
+            != STARTUP_LOCK_MARKER.len() as u64
+        {
+            return Err(RuntimeError::LegacyStartupLock(self.startup_lock.clone()));
+        }
+        let mut marker = [0; STARTUP_LOCK_MARKER.len()];
+        file.read_exact(&mut marker)
+            .map_err(|source| RuntimeError::Io {
+                path: self.startup_lock.clone(),
+                source,
+            })?;
+        if marker != STARTUP_LOCK_MARKER {
+            return Err(RuntimeError::LegacyStartupLock(self.startup_lock.clone()));
+        }
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(locked) => {
+                self.validate_lock_identity(&locked)?;
+                Ok(StartupLock { _file: locked })
+            }
+            Err((_, error)) if error == Errno::EWOULDBLOCK => {
+                Err(RuntimeError::StartupInProgress(self.startup_lock.clone()))
+            }
+            Err((_, source)) => Err(RuntimeError::Io {
+                path: self.startup_lock.clone(),
+                source: source.into(),
+            }),
+        }
+    }
+
+    fn validate_lock_identity(&self, file: &File) -> Result<(), RuntimeError> {
+        let descriptor = file.metadata().map_err(|source| RuntimeError::Io {
+            path: self.startup_lock.clone(),
+            source,
+        })?;
+        let pathname =
+            fs::symlink_metadata(&self.startup_lock).map_err(|source| RuntimeError::Io {
+                path: self.startup_lock.clone(),
+                source,
+            })?;
+        if !descriptor.file_type().is_file()
+            || !pathname.file_type().is_file()
+            || descriptor.dev() != pathname.dev()
+            || descriptor.ino() != pathname.ino()
+        {
+            return Err(RuntimeError::ReplacedStartupLock(self.startup_lock.clone()));
+        }
+        validate_owner_file_metadata(&self.startup_lock, &descriptor)?;
+        validate_owner_file_metadata(&self.startup_lock, &pathname)?;
+        if descriptor.permissions().mode() & 0o777 != OWNER_FILE_MODE
+            || pathname.permissions().mode() & 0o777 != OWNER_FILE_MODE
+        {
+            return Err(RuntimeError::InsecurePermissions {
+                path: self.startup_lock.clone(),
+                mode: pathname.permissions().mode() & 0o777,
+                expected: OWNER_FILE_MODE,
+            });
+        }
+        Ok(())
     }
 
     /// Binds only after a startup lock holder has proved any existing socket is stale.
@@ -214,48 +331,11 @@ impl RuntimeEndpoint {
             }),
         }
     }
-
-    fn remove_stale_lock(&self) -> Result<(), RuntimeError> {
-        let metadata =
-            fs::symlink_metadata(&self.startup_lock).map_err(|source| RuntimeError::Io {
-                path: self.startup_lock.clone(),
-                source,
-            })?;
-        validate_owner_file_metadata(&self.startup_lock, &metadata)?;
-        let mut content = String::new();
-        File::open(&self.startup_lock)
-            .and_then(|mut file| file.read_to_string(&mut content))
-            .map_err(|source| RuntimeError::Io {
-                path: self.startup_lock.clone(),
-                source,
-            })?;
-        let pid = content
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| RuntimeError::InvalidLock(self.startup_lock.clone()))?;
-        match kill(Pid::from_raw(pid), None) {
-            Ok(()) | Err(Errno::EPERM) => Err(RuntimeError::StartupInProgress(pid)),
-            Err(Errno::ESRCH) => {
-                fs::remove_file(&self.startup_lock).map_err(|source| RuntimeError::Io {
-                    path: self.startup_lock.clone(),
-                    source,
-                })
-            }
-            Err(error) => Err(RuntimeError::ProcessProbe { pid, source: error }),
-        }
-    }
 }
 
 #[derive(Debug)]
 pub struct StartupLock {
-    path: PathBuf,
-    _file: File,
-}
-
-impl Drop for StartupLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    _file: Flock<File>,
 }
 
 /// Validates an owner-only directory without following symlinks.
@@ -352,12 +432,12 @@ pub enum RuntimeError {
     LiveSocket(PathBuf),
     #[error("endpoint is not a Unix socket: {0}")]
     UnexpectedEndpointFile(PathBuf),
-    #[error("startup lock contains an invalid PID: {0}")]
-    InvalidLock(PathBuf),
-    #[error("broker startup is already in progress for PID {0}")]
-    StartupInProgress(i32),
-    #[error("could not probe startup-lock PID {pid}: {source}")]
-    ProcessProbe { pid: i32, source: nix::Error },
+    #[error("legacy or incomplete startup lock cannot prove exclusive ownership: {0}")]
+    LegacyStartupLock(PathBuf),
+    #[error("startup lock pathname no longer names its opened inode: {0}")]
+    ReplacedStartupLock(PathBuf),
+    #[error("broker startup is already in progress at {0}")]
+    StartupInProgress(PathBuf),
 }
 
 #[cfg(test)]
@@ -423,5 +503,110 @@ mod tests {
             validate_owner_file(&directory),
             Err(RuntimeError::NotRegularFile(path)) if path == directory
         ));
+    }
+
+    #[test]
+    fn contender_opened_before_guard_release_claims_the_same_persistent_inode() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint =
+            RuntimeEndpoint::in_runtime_dir(temp.path(), HostKind::Herdr, "same").unwrap();
+        let first = endpoint.acquire_startup_lock().unwrap();
+        let original = fs::symlink_metadata(&endpoint.startup_lock).unwrap();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let contender = endpoint.clone();
+        let waiter = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+                .open(&contender.startup_lock)
+                .unwrap();
+            opened_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            contender.lock_existing(file).unwrap()
+        });
+        opened_rx.recv().unwrap();
+        assert!(matches!(
+            endpoint.acquire_startup_lock(),
+            Err(RuntimeError::StartupInProgress(_))
+        ));
+        drop(first);
+        resume_tx.send(()).unwrap();
+        let second = waiter.join().unwrap();
+        let current = fs::symlink_metadata(&endpoint.startup_lock).unwrap();
+        assert_eq!(
+            (original.dev(), original.ino()),
+            (current.dev(), current.ino())
+        );
+        assert!(matches!(
+            endpoint.acquire_startup_lock(),
+            Err(RuntimeError::StartupInProgress(_))
+        ));
+        drop(second);
+        let third = endpoint.acquire_startup_lock().unwrap();
+        assert_eq!(
+            original.ino(),
+            fs::symlink_metadata(&endpoint.startup_lock).unwrap().ino()
+        );
+        drop(third);
+    }
+
+    #[test]
+    fn unpublished_stage_and_legacy_empty_or_pid_files_never_claim_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint =
+            RuntimeEndpoint::in_runtime_dir(temp.path(), HostKind::Herdr, "staged").unwrap();
+        endpoint.ensure_owner_directory().unwrap();
+        let mut legacy = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(OWNER_FILE_MODE)
+            .open(&endpoint.startup_lock)
+            .unwrap();
+        assert!(matches!(
+            endpoint.acquire_startup_lock(),
+            Err(RuntimeError::LegacyStartupLock(_))
+        ));
+        writeln!(legacy, "{}", std::process::id()).unwrap();
+        assert!(matches!(
+            endpoint.acquire_startup_lock(),
+            Err(RuntimeError::LegacyStartupLock(_))
+        ));
+        drop(legacy);
+        fs::remove_file(&endpoint.startup_lock).unwrap();
+
+        let mut unpublished = tempfile::Builder::new()
+            .prefix(".muxe-startup-")
+            .tempfile_in(&endpoint.runtime_dir)
+            .unwrap();
+        unpublished.write_all(STARTUP_LOCK_MARKER).unwrap();
+        let staged = Flock::lock(
+            unpublished.as_file().try_clone().unwrap(),
+            FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+        assert!(
+            !endpoint.startup_lock.exists(),
+            "incomplete stage is not published"
+        );
+        let owner = endpoint.acquire_startup_lock().unwrap();
+        assert_eq!(
+            fs::read(&endpoint.startup_lock).unwrap(),
+            STARTUP_LOCK_MARKER
+        );
+        let error = unpublished
+            .persist_noclobber(&endpoint.startup_lock)
+            .unwrap_err();
+        assert_eq!(error.error.kind(), io::ErrorKind::AlreadyExists);
+        drop(staged);
+        assert!(matches!(
+            endpoint.acquire_startup_lock(),
+            Err(RuntimeError::StartupInProgress(_))
+        ));
+        drop(owner);
+        endpoint.acquire_startup_lock().unwrap();
     }
 }

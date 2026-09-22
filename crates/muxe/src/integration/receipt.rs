@@ -15,12 +15,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{BRIDGE_FILE_NAME, kdl};
-use crate::fsutil::{self, FsError};
-
-use crate::paths::ConfigPath;
+use crate::{
+    fsutil::{self, FsError},
+    paths::{BridgeIdentity, ConfigPath},
+};
 
 /// Current receipt schema version.
-pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const RECEIPT_SCHEMA_VERSION: u32 = 2;
 /// Receipt file name inside the integration directory.
 pub const RECEIPT_FILE_NAME: &str = "receipt.json";
 
@@ -113,10 +114,10 @@ pub enum Disposition {
 }
 
 /// The installed bridge record.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BridgeRecord {
-    /// Canonical stable bridge path.
-    pub canonical_path: PathBuf,
+    /// Descriptor-validated physical bridge authority.
+    pub bridge_identity: BridgeIdentity,
     /// Installed Muxe version.
     pub installed_version: String,
     /// SHA-256 digest of the installed bytes.
@@ -157,10 +158,54 @@ pub struct Receipt {
 
 impl Receipt {
     fn from_persisted(raw: RawReceipt, directory: &Path) -> Result<Self, String> {
+        let expected = BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))
+            .map_err(|error| format!("cannot validate bridge identity: {error}"))?;
+        let bridge_identity = match raw.schema_version {
+            1 => {
+                let legacy = raw
+                    .bridge
+                    .canonical_path
+                    .ok_or_else(|| "v1 receipt lacks bridge.canonical_path".to_owned())?;
+                if legacy.file_name() != Some(std::ffi::OsStr::new(BRIDGE_FILE_NAME)) {
+                    return Err(format!(
+                        "v1 bridge.canonical_path {} does not name the expected bridge leaf",
+                        legacy.display()
+                    ));
+                }
+                let legacy_parent = legacy.parent().ok_or_else(|| {
+                    format!(
+                        "v1 bridge.canonical_path {} has no integration directory",
+                        legacy.display()
+                    )
+                })?;
+                let legacy_identity = BridgeIdentity::resolve_existing(
+                    legacy_parent,
+                    std::ffi::OsStr::new(BRIDGE_FILE_NAME),
+                )
+                .map_err(|error| {
+                    format!(
+                        "cannot validate v1 bridge.canonical_path {}: {error}",
+                        legacy.display()
+                    )
+                })?;
+                if legacy_identity != expected {
+                    return Err(format!(
+                        "v1 bridge.canonical_path {} does not name the receipt-owned bridge",
+                        legacy.display()
+                    ));
+                }
+                expected
+            }
+            RECEIPT_SCHEMA_VERSION => raw
+                .bridge
+                .bridge_identity
+                .ok_or_else(|| "v2 receipt lacks bridge.bridge_identity".to_owned())?,
+            version => return Err(format!("unsupported receipt schema version {version}")),
+        };
         let receipt = Self {
-            schema_version: raw.schema_version,
+            schema_version: RECEIPT_SCHEMA_VERSION,
             bridge: BridgeRecord {
-                canonical_path: raw.bridge.canonical_path,
+                bridge_identity,
                 installed_version: raw.bridge.installed_version,
                 installed_digest: parse_digest(
                     "bridge.installed_digest",
@@ -198,12 +243,13 @@ impl Receipt {
     }
 
     fn validate(&self, directory: &Path) -> Result<(), String> {
-        let expected_bridge = directory.join(BRIDGE_FILE_NAME);
-        if self.bridge.canonical_path != expected_bridge {
+        let expected =
+            BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))
+                .map_err(|error| format!("cannot validate receipt bridge identity: {error}"))?;
+        if self.bridge.bridge_identity != expected {
             return Err(format!(
-                "bridge.canonical_path {} does not name the receipt-owned bridge {}",
-                self.bridge.canonical_path.display(),
-                expected_bridge.display()
+                "bridge identity {} does not match receipt-owned bridge {}",
+                self.bridge.bridge_identity, expected
             ));
         }
 
@@ -275,7 +321,10 @@ struct RawReceipt {
 
 #[derive(Deserialize)]
 struct RawBridgeRecord {
-    canonical_path: PathBuf,
+    #[serde(default)]
+    canonical_path: Option<PathBuf>,
+    #[serde(default)]
+    bridge_identity: Option<BridgeIdentity>,
     installed_version: String,
     installed_digest: String,
     previous_digest: Option<String>,
@@ -344,7 +393,7 @@ pub fn load(directory: &Path) -> Result<Option<Receipt>, ReceiptError> {
             path: path.clone(),
             source,
         })?;
-    if raw.schema_version != RECEIPT_SCHEMA_VERSION {
+    if !matches!(raw.schema_version, 1 | RECEIPT_SCHEMA_VERSION) {
         return Err(ReceiptError::UnsupportedVersion {
             path,
             version: raw.schema_version,
@@ -408,7 +457,11 @@ mod tests {
         Receipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             bridge: BridgeRecord {
-                canonical_path: directory.join(BRIDGE_FILE_NAME),
+                bridge_identity: BridgeIdentity::resolve(
+                    directory,
+                    std::ffi::OsStr::new(BRIDGE_FILE_NAME),
+                )
+                .unwrap(),
                 installed_version: "0.1.0".to_owned(),
                 installed_digest: Sha256Digest::parse("a".repeat(64)).unwrap(),
                 previous_digest: None,
@@ -449,6 +502,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load(temp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn v1_symlink_spelling_migrates_to_physical_bridge_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let physical_root = temp.path().join("physical");
+        std::fs::create_dir(&physical_root).unwrap();
+        std::fs::set_permissions(&physical_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let alias_root = temp.path().join("alias");
+        std::os::unix::fs::symlink(&physical_root, &alias_root).unwrap();
+        let physical_directory = physical_root.join("integrations/zellij");
+        let identity =
+            BridgeIdentity::resolve(&physical_directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))
+                .unwrap();
+        let stable = identity.stable_path(std::ffi::OsStr::new(BRIDGE_FILE_NAME));
+        std::fs::write(&stable, b"legacy bridge").unwrap();
+        let legacy_spelling = alias_root
+            .join("integrations/zellij")
+            .join(BRIDGE_FILE_NAME);
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "bridge": {
+                "canonical_path": legacy_spelling,
+                "installed_version": "0.1.0",
+                "installed_digest": fsutil::sha256_hex(b"legacy bridge"),
+                "previous_digest": null,
+                "bridge_compat": null
+            },
+            "configs": []
+        });
+        fsutil::write_atomic(
+            &physical_directory.join(RECEIPT_FILE_NAME),
+            &serde_json::to_vec(&raw).unwrap(),
+            "receipt",
+        )
+        .unwrap();
+
+        let loaded = load(&physical_directory)
+            .unwrap()
+            .expect("physical receipt authority loads");
+
+        assert_eq!(loaded.schema_version, RECEIPT_SCHEMA_VERSION);
+        assert_eq!(loaded.bridge.bridge_identity, identity);
     }
 
     #[test]

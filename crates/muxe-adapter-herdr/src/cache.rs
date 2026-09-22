@@ -772,11 +772,11 @@ mod tests {
             serde_json::json!("pane_id")
         );
 
-        let pair = vec![
+        let pair = [
             candidate("native.herdr.pane:resize", &["pane-id"]),
             candidate("native.herdr.server:reload-config", &["pane-id"]),
         ];
-        let swapped = vec![pair[1].clone(), pair[0].clone()];
+        let swapped = [pair[1].clone(), pair[0].clone()];
         let pair_refs = pair.iter().collect::<Vec<_>>();
         let swapped_refs = swapped.iter().collect::<Vec<_>>();
         assert_ne!(

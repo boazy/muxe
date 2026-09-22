@@ -20,14 +20,21 @@ pub mod journal;
 pub mod registry;
 pub mod retire;
 pub use activate::{
-    ActivateError, ActivateHooks, ActivateInputs, ActivateReport, ActivateStep, BrokerSpawner,
-    ControlPort, ControlSession, DetectedHost, HostReloader, LiveControl, LivePreflight, Preflight,
-    ProcessSpawner, RecoveryOutcome, SpawnMember, SpawnRequest, StagedBridge, TargetHandle,
-    UnitOutcome, ZellijCliReloader, activate, recover,
+    ActivateError, ActivateHooks, ActivateInputs, ActivateReport, ActivateStep,
+    BrokerRollbackOutcome, BrokerSpawner, ControlPort, ControlSession, DetectedHost, HostReloader,
+    LiveControl, LivePreflight, Preflight, ProcessSpawner, RecoveryOutcome, SpawnMember,
+    SpawnRequest, StagedBridge, TargetHandle, UnitOutcome, ZellijCliReloader, activate, recover,
 };
 pub use coldstart::{
     ColdstartError, ColdstartHost, ColdstartInputs, ColdstartOutcome, LiveBroker, ensure_broker,
 };
-pub use journal::{JournalState, MemberState, MemberTransition, UnitKind};
-pub use registry::{BrokerEntry, Liveness, Registry};
+pub use journal::{
+    ActivationId, ActivationMemberId, BridgeArtifactId, BridgeArtifactRole, BridgeArtifacts,
+    BridgeProgress, HerdrUnitId, MemberEndpoint, MemberLaunchAuthority, OldMemberProgress,
+    TargetMemberProgress, TransactionDirective, TransactionMember, TransactionPhase, UnitKind,
+};
+pub use registry::{
+    BridgeMemberId, BridgeUnitGuard, BrokerEntry, Liveness, MemberCensus, Registry,
+    TargetRegistrationCapability,
+};
 pub use retire::{RetireError, RetireInputs, RetireOutcome, RetireReport, retire};

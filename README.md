@@ -295,7 +295,7 @@ The uninstall command removes nodes created by Muxe, or restores the pre-install
 
 Before changing KDL, bridge, or the receipt, uninstall validates every selected KDL plan and the stable bridge and rollback copy against the receipt. It refuses while an interrupted install or the exact bridge-sharing activation unit has a journal, including a corrupt journal. Uninstall retains staging artifacts for the transaction that owns them. Bridge files are removed only when their recorded paths and digests match the receipt.
 
-`--zellij-config` selects receipt ownership only at its recorded absolute path. It cannot transfer authority to another path or symlink alias, and paths containing `..` are refused.
+Receipt ownership for `--zellij-config` uses its recorded absolute, normalized KDL path spelling. Muxe removes `.` components and refuses `..`; other spellings are not collapsed through symlinks. This identity differs from the canonical physical bridge-directory identity used to group Zellij brokers, so a symlink alias cannot inherit receipt authority.
 
 ## Herdr setup
 
@@ -344,7 +344,7 @@ If the menu does not open when pressing your hotkey:
 
 Upgrading Muxe separates updating installed binary files from activating running brokers.
 
-By default, `muxe activate` updates every live host registered for the current user and dismisses its active Muxe menus. Use `--host zellij` or `--host herdr` to restrict activation to a specific multiplexer kind, or `--host current` to target the host managing the current shell. (The valid `--host` options are `all`, `current`, `zellij`, and `herdr`, defaulting to `all`.) Inside Zellij, activation applies to every broker sharing that host's stable bridge path. A broker is the on-demand Muxe process associated with a live multiplexer session.
+By default, `muxe activate` updates every live host recorded in Muxe's current-user broker registry and dismisses its active menus. The `--host` options are `all` (the default), `current`, `zellij`, and `herdr`. Use `--host zellij` or `--host herdr` to select one multiplexer kind, or `--host current` to select the host managing the current shell. In Zellij, brokers with the same canonical stable bridge identity form one activation group. A broker is the on-demand Muxe process associated with a live multiplexer session.
 
 Upgrade the binary and activate running brokers:
 
@@ -362,12 +362,26 @@ muxe activate
 
 ### How activation works
 
-`muxe activate` preflights every selected unit before mutating any of them:
+`muxe activate` preflights every selected unit before mutation:
 
-- One Herdr broker is evaluated as one unit.
-- All live Zellij brokers sharing one stable bridge form one atomic group.
+- One Herdr broker is one unit.
+- All live Zellij brokers with the same canonical stable bridge identity form one atomic group.
 
-Units commit independently after preflight. The final command output reports every committed, unchanged, rolled-back, and failed unit. Run `muxe activate` explicitly from your shell before using the menu hotkey so that upgrade work completes outside the interactive menu path.
+Units commit independently after global preflight. The final output reports each unit as committed, unchanged, rolled back, or failed. Run `muxe activate` from your shell before using the menu hotkey.
+
+When a menu launch needs a broker, Muxe checks the unit's activation journal before probing the normal endpoint. It verifies `Status` and peer credentials on the same control connection, then rechecks the socket identity before consulting the registry. Muxe reuses, adopts, or relocates only the authenticated registration. Its token, process ID, and start time bind cleanup to that exact row; a legacy peer without a token may reuse only its unchanged row. A durable startup claim prevents concurrent launchers from starting competing children. Muxe removes a stale row only after a registry-locked recheck proves that the exact process is dead and the endpoint is absent or refused. Pending activation and ambiguous endpoints fail closed.
+
+Only a running ordinary or `TargetCommitted` broker with matching host identity may serve an attachment. A `TargetGated` broker and a legacy peer with an ambiguous handoff are not attachable.
+
+The `control-json-v1` protocol is additive: unknown fields are ignored and new status fields may be absent. Activation still requires the old broker to advertise `CoordinatorSuppliedV1`; a legacy broker without this Prepare capability is refused before drain or journal creation.
+
+New activation journals use schema v5. Schemas v3 and v4 remain readable for rollback before Ready. Earlier Ready journals lack exact target-incarnation proof and remain preserved instead of authorizing a commit. Corrupt or unsupported journals are also preserved for diagnosis.
+
+For Zellij, the coordinator holds the bridge-unit readiness gate while checking every target at one OS-wide monotonic as-of tick. The v5 Ready proof records the unit epoch ID separately from the tick, the exact member set, and each target's process-scoped registration identity. Herdr Ready records its exact target identity too. This is a broker-observed snapshot, not simultaneous physical host membership: `list-clients` is a snapshot, not a host-issued lease, and clients can attach or detach around it. Later heartbeat expiry does not change the earlier proof. An endpoint and handoff match alone do not establish the recorded target incarnation.
+
+After durable Ready, recovery commits only the original certified target. If that target is missing or replaced, Muxe preserves the journal and does not start a substitute; the old brokers remain stopped or drained as applicable.
+
+Before Ready, recovery persists the rollback decision, shuts down targets, restores the old bridge and receipt, reloads the old bridge in every recorded Zellij session, and then resumes the old brokers. It reports the original failure and each rollback diagnostic; an ambiguous barrier preserves its journal. Each activation attempt checks outstanding journals before a new transaction. If recovery reports an unresolved unit, leave its journal and transaction-owned artifacts unchanged for operator follow-up.
 
 ## Compatibility
 
@@ -399,6 +413,7 @@ Uninstall in this order so that the integration receipt remains available to cle
    ```sh
    muxe broker retire --host all
    ```
+
 2. While `muxe` remains installed, remove the Zellij bridge:
    ```sh
    muxe integration uninstall zellij
@@ -414,6 +429,8 @@ Uninstall in this order so that the integration receipt remains available to cle
    - `muxe purge` never modifies Zellij or Herdr keybindings.
 4. Remove the installed tool version or delete the versioned archive directory and symlink.
 5. Remove any Muxe keybindings from your Zellij or Herdr configuration files.
+
+`muxe broker retire` drains active menus and foreground work and removes the broker endpoint without starting a replacement. Detached generic command children remain under supervisor-only processes until reaped; retirement does not terminate those commands.
 
 ## Shell completions
 

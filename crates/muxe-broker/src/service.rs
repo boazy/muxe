@@ -1,5 +1,11 @@
 use std::{
-    collections::HashSet, fmt::Write as _, fs, future::Future, io, pin::Pin, sync::Arc,
+    collections::HashSet,
+    fmt::Write as _,
+    fs,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -9,14 +15,15 @@ use muxe_protocol::{
     ArchivedFrame, BrokerResponse, ClientRequest, ConnectionDecoder, ConnectionPolicy, DecodeError,
     PeerRole, PendingLaunchToken, Prelude, RequestId, SchemaFingerprint, UiSessionId, WireMessage,
     control::{
-        ActivationStatus, CompatibilityRecord, ControlDecoder, ControlMessage, ControlOperation,
-        ControlPolicy, ControlRequestId, ControlResponse, ControlResult, HandoffId, LifecycleState,
+        ActivationPhase, ActivationStatus, BridgeUnitId, BrokerRegistrationProof,
+        CompatibilityRecord, ControlDecoder, ControlMessage, ControlOperation, ControlPolicy,
+        ControlRequestId, ControlResponse, ControlResult, HandoffId, LifecycleState,
+        PrepareHandoffProtocol,
     },
     encode_frame,
 };
 use nix::unistd::Uid;
 use notify::{RecursiveMode, Watcher};
-use rand::{TryRngCore, rngs::OsRng};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use thiserror::Error;
@@ -36,11 +43,13 @@ use tokio::{
 pub enum ActivationBootstrap {
     Running {
         current: CompatibilityRecord,
+        bridge_unit: Option<BridgeUnitId>,
     },
     Target {
         current: CompatibilityRecord,
         handoff: HandoffId,
         live_server: muxe_protocol::LiveServerIdentity,
+        bridge_unit: Option<BridgeUnitId>,
     },
 }
 
@@ -48,6 +57,8 @@ pub enum ActivationBootstrap {
 struct ActivationController {
     current: CompatibilityRecord,
     expected_live_server: muxe_protocol::LiveServerIdentity,
+    bridge_unit: Option<BridgeUnitId>,
+    registration: Arc<OnceLock<BrokerRegistrationProof>>,
     state: Arc<Mutex<ActivationState>>,
     commands: Arc<Mutex<Option<mpsc::Sender<ServerCommand>>>>,
     // Serializes whole coordinator transitions (Prepare/Commit/Abort/Retire) so two
@@ -62,6 +73,16 @@ struct ActivationController {
     // Owner-side journal mapping for disconnect recovery. None until the executable
     // installs one after startup; without it an absent journal is assumed.
     recovery: Arc<Mutex<Option<Arc<dyn RecoveryJournal>>>>,
+    // Exact in-process Stop result. A retry may reuse proof but never sends a
+    // second Stop to the exited listener loop. Durable replay uses the journal
+    // receipt instead of this memory.
+    old_retirement: Arc<Mutex<Option<OldRetirementProof>>>,
+}
+
+#[derive(Clone)]
+struct OldRetirementProof {
+    handoff: HandoffId,
+    outcome: Result<(), String>,
 }
 
 /// Completion acknowledgement emitted only after the broker has completed its
@@ -70,7 +91,8 @@ struct ActivationController {
 pub enum RecoveryAck {
     Resumed,
     TargetRetired,
-    Committed,
+    OldCommitted,
+    TargetCommitted,
 }
 
 pub trait RecoveryPermit: Send + Sync {
@@ -98,6 +120,9 @@ pub enum RecoveryDecision {
     Committed {
         permit: Option<Arc<dyn RecoveryPermit>>,
     },
+    /// Terminal transaction authority was validated and cleanup converged.
+    /// The broker must perform no lifecycle transition or acknowledgement.
+    CleanupComplete,
 }
 
 #[cfg(test)]
@@ -142,7 +167,30 @@ pub trait RecoveryJournal: Send + Sync {
     fn recovery_decision<'a>(
         &'a self,
         handoff: &'a HandoffId,
+        local_status: &'a ActivationStatus,
     ) -> Pin<Box<dyn Future<Output = RecoveryDecision> + Send + 'a>>;
+    /// Read-only exact-incarnation check for a normal target Commit. Unlike
+    /// disconnect recovery, this must not acquire the coordinator's unit lock:
+    /// the coordinator holds it while sending Commit.
+    fn authorize_target_commit<'a>(
+        &'a self,
+        handoff: &'a HandoffId,
+        local_status: &'a ActivationStatus,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Read-only exact old-incarnation and durable `CommitIntent` preflight.
+    /// The coordinator can hold the unit lock while issuing normal Commit.
+    fn authorize_old_commit<'a>(
+        &'a self,
+        handoff: &'a HandoffId,
+        local_status: &'a ActivationStatus,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Persists exact post-stop old-broker proof before a wire or journal ACK.
+    /// Called only while the completed stop barrier's ticket is held.
+    fn publish_old_retirement<'a>(
+        &'a self,
+        handoff: &'a HandoffId,
+        local_status: &'a ActivationStatus,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +215,11 @@ enum ActivationState {
         handoff: HandoffId,
     },
     Retired,
+}
+enum PrepareAdmission {
+    Begin,
+    Idempotent,
+    Reject(String),
 }
 
 enum ServerCommand {
@@ -215,12 +268,16 @@ impl ActivationController {
         bootstrap: ActivationBootstrap,
     ) -> Result<Arc<Self>, ServerError> {
         let actual = broker.live_identity().await?;
-        let (current, expected_live_server, state) = match bootstrap {
-            ActivationBootstrap::Running { current } => (current, actual, ActivationState::Running),
+        let (current, expected_live_server, bridge_unit, state) = match bootstrap {
+            ActivationBootstrap::Running {
+                current,
+                bridge_unit,
+            } => (current, actual, bridge_unit, ActivationState::Running),
             ActivationBootstrap::Target {
                 current,
                 handoff,
                 live_server,
+                bridge_unit,
             } => {
                 if actual != live_server {
                     return Err(ServerError::Activation(format!(
@@ -230,6 +287,7 @@ impl ActivationController {
                 (
                     current,
                     live_server,
+                    bridge_unit,
                     ActivationState::TargetGated { handoff },
                 )
             }
@@ -237,11 +295,14 @@ impl ActivationController {
         Ok(Arc::new(Self {
             current,
             expected_live_server,
+            bridge_unit,
+            registration: Arc::new(OnceLock::new()),
             state: Arc::new(Mutex::new(state)),
             commands: Arc::new(Mutex::new(None)),
             transition: Arc::new(Mutex::new(())),
             connections: Arc::new(Mutex::new(0)),
             recovery: Arc::new(Mutex::new(None)),
+            old_retirement: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -262,6 +323,14 @@ impl ActivationController {
         )
     }
     async fn status(&self, broker: &Broker) -> Result<ActivationStatus, String> {
+        self.status_with(broker, None).await
+    }
+
+    async fn status_with(
+        &self,
+        broker: &Broker,
+        proof: Option<(muxe_protocol::AsOfTick, muxe_protocol::UnitReadinessEpochId)>,
+    ) -> Result<ActivationStatus, String> {
         let state = self.state.lock().await.clone();
         // A suspended adapter cannot answer host dispatch: suspend marks continuity
         // unhealthy, so `live_identity` fails exactly when the broker is Draining or
@@ -286,32 +355,70 @@ impl ActivationController {
                 actual
             }
         };
-        let (lifecycle, target, handoff_id, suspended) = match state {
-            ActivationState::Running => (LifecycleState::Running, None, None, false),
+        let (lifecycle, phase, target, handoff_id, suspended) = match state {
+            ActivationState::Running => (
+                LifecycleState::Running,
+                ActivationPhase::Ordinary,
+                None,
+                None,
+                false,
+            ),
             ActivationState::Draining {
                 target, handoff, ..
-            } => (LifecycleState::Draining, Some(*target), Some(handoff), true),
-            ActivationState::SupervisorOnly { handoff } => {
-                (LifecycleState::SupervisorOnly, None, Some(handoff), true)
-            }
-            ActivationState::TargetGated { handoff }
-            | ActivationState::TargetCommitted { handoff } => {
-                (LifecycleState::Running, None, Some(handoff), false)
-            }
-            ActivationState::Retired => (LifecycleState::Retired, None, None, false),
+            } => (
+                LifecycleState::Draining,
+                ActivationPhase::Draining,
+                Some(*target),
+                Some(handoff),
+                true,
+            ),
+            ActivationState::SupervisorOnly { handoff } => (
+                LifecycleState::SupervisorOnly,
+                ActivationPhase::SupervisorOnly,
+                None,
+                Some(handoff),
+                true,
+            ),
+            ActivationState::TargetGated { handoff } => (
+                LifecycleState::Running,
+                ActivationPhase::TargetGated,
+                None,
+                Some(handoff),
+                false,
+            ),
+            ActivationState::TargetCommitted { handoff } => (
+                LifecycleState::Running,
+                ActivationPhase::TargetCommitted,
+                None,
+                Some(handoff),
+                false,
+            ),
+            ActivationState::Retired => (
+                LifecycleState::Retired,
+                ActivationPhase::Retired,
+                None,
+                None,
+                false,
+            ),
         };
         Ok(ActivationStatus {
             lifecycle,
+            phase,
             live_server,
             current: self.current.clone(),
             target,
             handoff_id,
+            prepare_handoff: Some(PrepareHandoffProtocol::CoordinatorSuppliedV1),
+            registration: self.registration.get().copied(),
+            bridge_unit: self.bridge_unit,
             // Per-client bridge evidence comes from the live adapter only. Suspended
             // states serve None without touching host dispatch; a failed query also
             // serves None so status stays observable and the coordinator applies the
             // host-appropriate gate (Herdr gates on adapter health instead).
             ready: if suspended {
                 None
+            } else if let Some((as_of, epoch)) = proof {
+                broker.activation_readiness_at(as_of, epoch).await
             } else {
                 broker.activation_readiness().await
             },
@@ -371,42 +478,37 @@ impl ActivationController {
                 self.status_result(broker, ControlResult::Status).await,
                 false,
             ),
-            ControlOperation::Prepare { target } => self.handle_prepare(broker, *target).await,
-            ControlOperation::Commit { handoff_id } => {
-                let old = {
-                    let mut state = self.state.lock().await;
-                    match state.clone() {
-                        ActivationState::Draining { handoff, .. } if handoff == handoff_id => {
-                            *state = ActivationState::SupervisorOnly { handoff };
-                            true
-                        }
-                        ActivationState::SupervisorOnly { handoff } if handoff == handoff_id => {
-                            true
-                        }
-                        ActivationState::TargetGated { handoff } if handoff == handoff_id => {
-                            *state = ActivationState::TargetCommitted { handoff };
-                            false
-                        }
-                        ActivationState::TargetCommitted { handoff } if handoff == handoff_id => {
-                            false
-                        }
-                        _ => {
-                            return (
-                                ControlResult::Error {
-                                    diagnostic:
-                                        "commit handoff does not match the prepared activation"
-                                            .to_owned(),
-                                },
-                                false,
-                            );
-                        }
-                    }
-                };
+            ControlOperation::StatusAt {
+                handoff_id,
+                epoch,
+                as_of,
+            } => {
+                if !matches!(
+                    *self.state.lock().await,
+                    ActivationState::TargetGated { handoff } if handoff == handoff_id
+                ) || self.bridge_unit.is_none()
+                {
+                    return (
+                        ControlResult::Error {
+                            diagnostic:
+                                "as-of readiness requires the exact gated Zellij target handoff"
+                                    .to_owned(),
+                        },
+                        false,
+                    );
+                }
                 (
-                    self.status_result(broker, ControlResult::Committed).await,
-                    old,
+                    match self.status_with(broker, Some((as_of, epoch))).await {
+                        Ok(status) => ControlResult::StatusAt(status),
+                        Err(diagnostic) => ControlResult::Error { diagnostic },
+                    },
+                    false,
                 )
             }
+            ControlOperation::Prepare { target, handoff_id } => {
+                self.handle_prepare(broker, *target, handoff_id).await
+            }
+            ControlOperation::Commit { handoff_id } => self.handle_commit(broker, handoff_id).await,
             ControlOperation::Abort { handoff_id } => self.handle_abort(broker, handoff_id).await,
             ControlOperation::Retire => {
                 {
@@ -443,6 +545,227 @@ impl ActivationController {
         }
     }
 
+    async fn handle_commit(&self, broker: &Broker, handoff_id: HandoffId) -> (ControlResult, bool) {
+        let target_role = matches!(
+            *self.state.lock().await,
+            ActivationState::TargetGated { handoff }
+                | ActivationState::TargetCommitted { handoff }
+                if handoff == handoff_id
+        );
+        if target_role {
+            let status = match self.status(broker).await {
+                Ok(status) => status,
+                Err(diagnostic) => return (ControlResult::Error { diagnostic }, false),
+            };
+            let authorization = match self.recovery.lock().await.clone() {
+                Some(recovery) => recovery.authorize_target_commit(&handoff_id, &status).await,
+                None => Err("target Commit lacks owner journal authorization".to_owned()),
+            };
+            if let Err(diagnostic) = authorization {
+                return (ControlResult::Error { diagnostic }, false);
+            }
+        }
+        let state = self.state.lock().await.clone();
+        match state {
+            ActivationState::Draining { handoff, .. } if handoff == handoff_id => {
+                let status = match self.status(broker).await {
+                    Ok(status) => status,
+                    Err(diagnostic) => return (ControlResult::Error { diagnostic }, false),
+                };
+                let authorization = match self.recovery.lock().await.clone() {
+                    Some(recovery) => recovery.authorize_old_commit(&handoff_id, &status).await,
+                    None => Err("old Commit lacks owner journal authorization".to_owned()),
+                };
+                if let Err(diagnostic) = authorization {
+                    return (ControlResult::Error { diagnostic }, false);
+                }
+                (ControlResult::Committed(status), true)
+            }
+            ActivationState::SupervisorOnly { handoff } if handoff == handoff_id => {
+                let proof = self.old_retirement.lock().await.clone();
+                match proof {
+                    Some(OldRetirementProof {
+                        handoff: current,
+                        outcome: Ok(()),
+                    }) if current == handoff => (
+                        self.status_result(broker, ControlResult::Committed).await,
+                        true,
+                    ),
+                    Some(OldRetirementProof {
+                        handoff: current,
+                        outcome: Err(diagnostic),
+                    }) if current == handoff => (ControlResult::Error { diagnostic }, false),
+                    _ => (
+                        ControlResult::Error {
+                            diagnostic: "old retirement lacks a completed stop proof".to_owned(),
+                        },
+                        false,
+                    ),
+                }
+            }
+            ActivationState::TargetGated { handoff } if handoff == handoff_id => {
+                *self.state.lock().await = ActivationState::TargetCommitted { handoff };
+                (
+                    self.status_result(broker, ControlResult::Committed).await,
+                    false,
+                )
+            }
+            ActivationState::TargetCommitted { handoff } if handoff == handoff_id => (
+                self.status_result(broker, ControlResult::Committed).await,
+                false,
+            ),
+            _ => (
+                ControlResult::Error {
+                    diagnostic: "commit handoff does not match the prepared activation".to_owned(),
+                },
+                false,
+            ),
+        }
+    }
+
+    /// The sole old-role retirement barrier for RPC Commit and both recovery watches.
+    /// The transition mutex serializes entry, but the state mutex is never held over
+    /// adapter shutdown, monitor join, socket unlink, or receipt durability.
+    async fn retire_old(
+        &self,
+        broker: &Broker,
+        handoff: HandoffId,
+    ) -> Result<(Option<RetirementTicket>, Result<(), String>), String> {
+        let _transition = self.transition.lock().await;
+        let state = self.state.lock().await.clone();
+        if let ActivationState::SupervisorOnly { handoff: current } = state {
+            if current != handoff {
+                return Err("old retirement handoff differs from completed stop".to_owned());
+            }
+            let proof = self
+                .old_retirement
+                .lock()
+                .await
+                .clone()
+                .filter(|recorded| recorded.handoff == handoff)
+                .ok_or_else(|| "old retirement lacks completed stop proof".to_owned())?;
+            return Ok((None, proof.outcome));
+        }
+        if !matches!(
+            state,
+            ActivationState::Draining { handoff: current, .. } if current == handoff
+        ) {
+            return Err("old retirement requires the exact draining handoff".to_owned());
+        }
+        let status = self.status(broker).await?;
+        let ticket = self.stop_listener().await?;
+        // Stop is irreversible even if proof persistence fails. Never reopen this
+        // adapter or claim a second Stop on the now-exited run loop.
+        *self.state.lock().await = ActivationState::SupervisorOnly { handoff };
+        let proof = match self.recovery.lock().await.clone() {
+            Some(recovery) => recovery.publish_old_retirement(&handoff, &status).await,
+            None => Ok(()),
+        };
+        *self.old_retirement.lock().await = Some(OldRetirementProof {
+            handoff,
+            outcome: proof.clone(),
+        });
+        Ok((Some(ticket), proof))
+    }
+
+    async fn admit_prepare(
+        &self,
+        target: &CompatibilityRecord,
+        handoff: HandoffId,
+    ) -> PrepareAdmission {
+        let mut state = self.state.lock().await;
+        match &*state {
+            ActivationState::Draining {
+                target: current,
+                handoff: current_handoff,
+                ..
+            } if **current == *target && *current_handoff == handoff => {
+                PrepareAdmission::Idempotent
+            }
+            ActivationState::Draining { .. } => PrepareAdmission::Reject(
+                "prepare handoff does not match the active activation".to_owned(),
+            ),
+            ActivationState::Running | ActivationState::TargetCommitted { .. } => {
+                *state = ActivationState::Draining {
+                    target: Box::new(target.clone()),
+                    handoff,
+                    host_suspended: false,
+                };
+                PrepareAdmission::Begin
+            }
+            _ => PrepareAdmission::Reject(
+                "prepare is valid only for a running old broker".to_owned(),
+            ),
+        }
+    }
+
+    async fn handle_suspend_failure(
+        &self,
+        broker: &Broker,
+        target: &CompatibilityRecord,
+        handoff: HandoffId,
+        error: &BrokerError,
+    ) -> (ControlResult, bool) {
+        if matches!(
+            error,
+            BrokerError::Adapter(adapter) if adapter.kind == AdapterErrorKind::Unsupported
+        ) {
+            *self.state.lock().await = ActivationState::Running;
+            broker.reopen_dispatch().await;
+            return (
+                ControlResult::Error {
+                    diagnostic: format!("host adapter cannot suspend for activation: {error}"),
+                },
+                false,
+            );
+        }
+        let restore = broker.resume_host_after_abort().await;
+        let mut diagnostic = format!("could not suspend host subscription for activation: {error}");
+        match restore {
+            Ok(()) => {
+                *self.state.lock().await = ActivationState::Running;
+                broker.reopen_dispatch().await;
+            }
+            Err(restore) => {
+                *self.state.lock().await = ActivationState::Draining {
+                    target: Box::new(target.clone()),
+                    handoff,
+                    host_suspended: true,
+                };
+                let _ = write!(
+                    diagnostic,
+                    "; host restore also failed, adapter remains unhealthy: {restore}"
+                );
+            }
+        }
+        (ControlResult::Error { diagnostic }, false)
+    }
+
+    async fn handle_listener_drain_failure(
+        &self,
+        broker: &Broker,
+        target: &CompatibilityRecord,
+        handoff: HandoffId,
+        error: &str,
+    ) -> (ControlResult, bool) {
+        let restore = broker.resume_host_after_abort().await;
+        *self.state.lock().await = ActivationState::Draining {
+            target: Box::new(target.clone()),
+            handoff,
+            host_suspended: restore.is_ok(),
+        };
+        let mut diagnostic = format!(
+            "could not drain broker listener for activation: {error}; old endpoint remains drained"
+        );
+        if let Err(restore) = restore {
+            let _ = write!(
+                diagnostic,
+                "; host restore also failed, adapter remains unhealthy: {restore}"
+            );
+        }
+        (ControlResult::Error { diagnostic }, false)
+    }
+
     /// Runs the old-broker Prepare transition: UI drain, host suspend, listener
     /// release. Every failure restores a consistent state without ever claiming a
     /// healthy Running broker it has not re-verified.
@@ -450,33 +773,19 @@ impl ActivationController {
         &self,
         broker: &Broker,
         target: CompatibilityRecord,
+        handoff: HandoffId,
     ) -> (ControlResult, bool) {
-        let Some(handoff) = Self::fresh_handoff() else {
-            return (
-                ControlResult::Error {
-                    diagnostic: "could not generate a nonzero activation handoff ID".to_owned(),
-                },
-                false,
-            );
-        };
-        {
-            let mut state = self.state.lock().await;
-            if !matches!(
-                *state,
-                ActivationState::Running | ActivationState::TargetCommitted { .. }
-            ) {
+        match self.admit_prepare(&target, handoff).await {
+            PrepareAdmission::Idempotent => {
                 return (
-                    ControlResult::Error {
-                        diagnostic: "prepare is valid only for a running old broker".to_owned(),
-                    },
+                    self.status_result(broker, ControlResult::Prepared).await,
                     false,
                 );
             }
-            *state = ActivationState::Draining {
-                target: Box::new(target.clone()),
-                handoff,
-                host_suspended: false,
-            };
+            PrepareAdmission::Reject(diagnostic) => {
+                return (ControlResult::Error { diagnostic }, false);
+            }
+            PrepareAdmission::Begin => {}
         }
         if let Err(error) = broker.drain_for_activation().await {
             *self.state.lock().await = ActivationState::Running;
@@ -487,77 +796,16 @@ impl ActivationController {
                 false,
             );
         }
-        // Suspend only after UI drain and immediately before the endpoint
-        // release: the await proves the old host stream is closed before
-        // any target connects. Unsupported fails the group closed here.
         if let Err(error) = broker.suspend_host_for_activation().await {
-            // An explicit Unsupported leaves the adapter untouched and
-            // healthy; only a mid-suspend failure needs a restore attempt.
-            if matches!(
-                &error,
-                BrokerError::Adapter(adapter)
-                if adapter.kind == AdapterErrorKind::Unsupported
-            ) {
-                *self.state.lock().await = ActivationState::Running;
-                broker.reopen_dispatch().await;
-                return (
-                    ControlResult::Error {
-                        diagnostic: format!("host adapter cannot suspend for activation: {error}"),
-                    },
-                    false,
-                );
-            }
-            let restore = broker.resume_host_after_abort().await;
-            let mut diagnostic =
-                format!("could not suspend host subscription for activation: {error}");
-            match restore {
-                Ok(()) => {
-                    // Adapter healthy and listener never drained: Running again.
-                    *self.state.lock().await = ActivationState::Running;
-                    broker.reopen_dispatch().await;
-                }
-                Err(restore) => {
-                    // Fail closed: never claim a healthy Running broker with a
-                    // degraded adapter. Stay Draining so Status reveals the
-                    // handoff and a later Abort can retry the restore.
-                    *self.state.lock().await = ActivationState::Draining {
-                        target: Box::new(target.clone()),
-                        handoff,
-                        host_suspended: true,
-                    };
-                    let _ = write!(
-                        diagnostic,
-                        "; host restore also failed, adapter remains unhealthy: {restore}"
-                    );
-                }
-            }
-            return (ControlResult::Error { diagnostic }, false);
+            return self
+                .handle_suspend_failure(broker, &target, handoff, &error)
+                .await;
         }
         if let Err(error) = self.drain_listener().await {
-            // The listener is unlinked while the adapter is suspended. Restore the
-            // adapter, aggregate both outcomes, and stay Draining: Running is
-            // entered only after adapter and listener are both healthy again.
-            // Status reveals the handoff so the coordinator can Abort (retryable)
-            // once the host is restorable.
-            let restore = broker.resume_host_after_abort().await;
-            *self.state.lock().await = ActivationState::Draining {
-                target: Box::new(target.clone()),
-                handoff,
-                host_suspended: restore.is_ok(),
-            };
-            let mut diagnostic = format!(
-                "could not drain broker listener for activation: {error}; old endpoint remains drained"
-            );
-            if let Err(restore) = restore {
-                let _ = write!(
-                    diagnostic,
-                    "; host restore also failed, adapter remains unhealthy: {restore}"
-                );
-            }
-            return (ControlResult::Error { diagnostic }, false);
+            return self
+                .handle_listener_drain_failure(broker, &target, handoff, &error)
+                .await;
         }
-        // Suspend and listener drain both succeeded: record the suspension so a
-        // later Abort resumes the adapter before rebinding the listener.
         if let ActivationState::Draining { host_suspended, .. } = &mut *self.state.lock().await {
             *host_suspended = true;
         }
@@ -565,15 +813,6 @@ impl ActivationController {
             self.status_result(broker, ControlResult::Prepared).await,
             false,
         )
-    }
-
-    /// Mints one nonzero activation handoff ID.
-    fn fresh_handoff() -> Option<HandoffId> {
-        let mut bytes = [0; 16];
-        if OsRng.try_fill_bytes(&mut bytes).is_err() || bytes == [0; 16] {
-            return None;
-        }
-        Some(HandoffId(bytes))
     }
 
     /// Runs the old-broker Abort transition: host resume, listener rebind, and only
@@ -710,7 +949,8 @@ impl ActivationController {
         let watch = {
             let _transition = self.transition.lock().await;
             match self.state.lock().await.clone() {
-                ActivationState::Draining { handoff, .. } => Watch::Old { handoff },
+                ActivationState::Draining { handoff, .. }
+                | ActivationState::SupervisorOnly { handoff } => Watch::Old { handoff },
                 ActivationState::TargetGated { handoff } => Watch::Target { handoff },
                 _ => Watch::Nothing,
             }
@@ -720,22 +960,30 @@ impl ActivationController {
             Watch::Old { handoff } => (handoff, false),
             Watch::Target { handoff } => (handoff, true),
         };
-        let decision = self.recovery_decision(&handoff).await;
+        let decision = self.recovery_decision(&broker, &handoff).await;
         match decision {
             RecoveryDecision::Preserve { reason } => {
                 tracing::warn!(%reason, "activation recovery preserves owner decision");
                 return;
             }
-            RecoveryDecision::Committed { permit } => {
-                if let Some(permit) = permit {
-                    let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
-                }
+            RecoveryDecision::CleanupComplete | RecoveryDecision::Committed { permit: None } => {
+                return;
+            }
+            RecoveryDecision::Committed {
+                permit: Some(permit),
+            } if !is_target => {
+                self.finish_old_recovery(&broker, handoff, Some(permit))
+                    .await;
+                return;
+            }
+            RecoveryDecision::Committed {
+                permit: Some(permit),
+            } => {
+                Self::acknowledge_target_commit(permit, &handoff).await;
                 return;
             }
             RecoveryDecision::TargetOwns { permit, .. } if !is_target => {
-                if let Some(permit) = permit {
-                    let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
-                }
+                self.finish_old_recovery(&broker, handoff, permit).await;
                 return;
             }
             RecoveryDecision::TargetOwns { permit, .. } => {
@@ -746,7 +994,9 @@ impl ActivationController {
                 if gated {
                     *self.state.lock().await = ActivationState::TargetCommitted { handoff };
                     if let Some(permit) = permit {
-                        let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
+                        let _ = permit
+                            .acknowledge(&handoff, RecoveryAck::TargetCommitted)
+                            .await;
                     }
                     tracing::warn!("target completed its unit commit after coordinator disconnect");
                 }
@@ -805,6 +1055,42 @@ impl ActivationController {
         }
         self.run_recovery_watch(&broker, handoff, is_target).await;
     }
+    async fn acknowledge_target_commit(permit: Arc<dyn RecoveryPermit>, handoff: &HandoffId) {
+        if let Err(error) = permit
+            .acknowledge(handoff, RecoveryAck::TargetCommitted)
+            .await
+        {
+            tracing::warn!(%error, "target commit acknowledgement failed");
+        }
+    }
+
+    async fn finish_old_recovery(
+        &self,
+        broker: &Broker,
+        handoff: HandoffId,
+        permit: Option<Arc<dyn RecoveryPermit>>,
+    ) {
+        let (ticket, proof) = match self.retire_old(broker, handoff).await {
+            Ok(retirement) => retirement,
+            Err(error) => {
+                tracing::warn!(%error, "old broker recovery retirement barrier failed");
+                return;
+            }
+        };
+        if let Err(error) = proof {
+            tracing::warn!(%error, "old broker post-stop proof failed");
+            return;
+        }
+        if let Some(permit) = permit
+            && let Err(error) = permit
+                .acknowledge(&handoff, RecoveryAck::OldCommitted)
+                .await
+        {
+            tracing::warn!(%error, "old broker retirement acknowledgement failed");
+        }
+        drop(ticket);
+    }
+
     async fn run_recovery_watch(&self, broker: &Broker, handoff: HandoffId, is_target: bool) {
         let transition = self.transition.lock().await;
         if *self.connections.lock().await != 0 {
@@ -813,11 +1099,14 @@ impl ActivationController {
         drop(transition);
         // Re-read the journal at fire time without holding the transition lock:
         // owner-side probes and restoration may await control sockets.
-        let decision = self.recovery_decision(&handoff).await;
+        let decision = self.recovery_decision(broker, &handoff).await;
         let mut resume_permit: Option<Arc<dyn RecoveryPermit>> = None;
         match decision {
             RecoveryDecision::Preserve { reason } => {
                 tracing::warn!(%reason, "activation recovery preserves owner decision");
+                return;
+            }
+            RecoveryDecision::CleanupComplete | RecoveryDecision::Committed { permit: None } => {
                 return;
             }
             RecoveryDecision::TargetOwns { permit, .. } if is_target => {
@@ -828,16 +1117,26 @@ impl ActivationController {
                 if gated {
                     *self.state.lock().await = ActivationState::TargetCommitted { handoff };
                     if let Some(permit) = permit {
-                        let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
+                        Self::acknowledge_target_commit(permit, &handoff).await;
                     }
                 }
                 return;
             }
-            RecoveryDecision::Committed { permit }
-            | RecoveryDecision::TargetOwns { permit, .. } => {
-                if let Some(permit) = permit {
-                    let _ = permit.acknowledge(&handoff, RecoveryAck::Committed).await;
-                }
+            RecoveryDecision::Committed {
+                permit: Some(permit),
+            } if !is_target => {
+                self.finish_old_recovery(broker, handoff, Some(permit))
+                    .await;
+                return;
+            }
+            RecoveryDecision::Committed {
+                permit: Some(permit),
+            } => {
+                Self::acknowledge_target_commit(permit, &handoff).await;
+                return;
+            }
+            RecoveryDecision::TargetOwns { permit, .. } => {
+                self.finish_old_recovery(broker, handoff, permit).await;
                 return;
             }
             RecoveryDecision::NoJournal if is_target => {
@@ -928,10 +1227,14 @@ impl ActivationController {
         tracing::warn!("old broker restored its endpoint after coordinator disconnect");
     }
 
-    async fn recovery_decision(&self, handoff: &HandoffId) -> RecoveryDecision {
+    async fn recovery_decision(&self, broker: &Broker, handoff: &HandoffId) -> RecoveryDecision {
+        let local_status = match self.status(broker).await {
+            Ok(status) => status,
+            Err(reason) => return RecoveryDecision::Preserve { reason },
+        };
         let recovery = self.recovery.lock().await.clone();
         match recovery {
-            Some(recovery) => recovery.recovery_decision(handoff).await,
+            Some(recovery) => recovery.recovery_decision(handoff, &local_status).await,
             None => RecoveryDecision::Preserve {
                 reason: "owner recovery operation is not installed".to_owned(),
             },
@@ -1002,6 +1305,21 @@ impl BrokerServer {
             activation.set_recovery(recovery).await;
         }
         Self::start_inner(broker, endpoint, Some(activation), None).await
+    }
+
+    /// Binds this server's original registry token to every control status.
+    /// Must run after registration and before `run` accepts connections.
+    ///
+    /// # Errors
+    ///
+    /// Refuses duplicate attestation or a non-activation server.
+    pub fn attest_registration(&self, proof: BrokerRegistrationProof) -> Result<(), ServerError> {
+        self.activation
+            .as_ref()
+            .ok_or_else(|| ServerError::Activation("server lacks activation control".to_owned()))?
+            .registration
+            .set(proof)
+            .map_err(|_| ServerError::Activation("registration already attested".to_owned()))
     }
 
     /// Activation form of [`BrokerServer::start_with_lock`]: the executable
@@ -1184,33 +1502,38 @@ impl BrokerServer {
                             // Terminal dispatch outcomes remain observable through the health
                             // monitor until the adapter seals admission, joins every retained
                             // host task, and closes its completion queue.
-                            // Coordinator Stop owns its UI drain through the Retire
-                            // branch (`ActivationController::handle`); the shared
-                            // helper below must not drain again here.
+                            // Retire drains UI here through its control transition;
+                            // old Commit already drained UI at Prepare. Stop must
+                            // not repeat either transition.
                             drop(config_watch.take());
                             let outcome = match broker.shutdown_host_adapter().await {
                                 Ok(()) => {
-                                    if let Some(monitor) = health.take() {
-                                        let _ = monitor.await;
-                                    }
-                                    if listener.take().is_some() {
-                                        remove_owned_socket(
-                                            &endpoint,
-                                            socket_device,
-                                            socket_inode,
-                                        )
-                                        .map_err(|error| error.to_string())
-                                    } else {
-                                        Ok(())
-                                    }
+                                    let monitor_result = match health.take() {
+                                        Some(monitor) => monitor
+                                            .await
+                                            .map_err(|error| format!("host monitor join failed: {error}")),
+                                        None => Ok(()),
+                                    };
+                                    monitor_result.and_then(|()| {
+                                        if listener.take().is_some() {
+                                            remove_owned_socket(
+                                                &endpoint,
+                                                socket_device,
+                                                socket_inode,
+                                            )
+                                            .map_err(|error| error.to_string())
+                                        } else {
+                                            Ok(())
+                                        }
+                                    })
                                 }
                                 Err(error) => Err(error.to_string()),
                             };
                             match outcome {
                                 Ok(()) => {
+                                    supervisor_only = true;
                                     let (ticket, released) = RetirementTicket::pair();
                                     if complete.send(Ok(ticket)).is_ok() {
-                                        supervisor_only = true;
                                         let _ = released.await;
                                     }
                                     break Ok(());
@@ -1666,14 +1989,40 @@ async fn serve_activation_connection_inner(
             if !request_ids.insert(request.request_id) {
                 return Err(ServerError::DuplicateControlRequestId);
             }
-            let (result, stop_after_response) = activation.handle(&broker, request.operation).await;
+            let old_handoff = match &request.operation {
+                ControlOperation::Commit { handoff_id } => Some(*handoff_id),
+                _ => None,
+            };
+            let (mut result, stop_after_response) =
+                activation.handle(&broker, request.operation).await;
             let retirement_ticket = if stop_after_response {
-                Some(
-                    activation
-                        .stop_listener()
-                        .await
-                        .map_err(ServerError::Activation)?,
-                )
+                if let Some(handoff) = old_handoff {
+                    match activation.retire_old(&broker, handoff).await {
+                        Ok((ticket, Ok(()))) => {
+                            result = activation
+                                .status_result(&broker, ControlResult::Committed)
+                                .await;
+                            ticket
+                        }
+                        Ok((ticket, Err(diagnostic))) => {
+                            tracing::warn!(%diagnostic, "old broker post-stop proof failed");
+                            result = ControlResult::Error { diagnostic };
+                            ticket
+                        }
+                        Err(diagnostic) => {
+                            tracing::warn!(%diagnostic, "old broker retirement barrier failed");
+                            result = ControlResult::Error { diagnostic };
+                            None
+                        }
+                    }
+                } else {
+                    Some(
+                        activation
+                            .stop_listener()
+                            .await
+                            .map_err(ServerError::Activation)?,
+                    )
+                }
             } else {
                 None
             };
@@ -1681,10 +2030,14 @@ async fn serve_activation_connection_inner(
                 request_id: request.request_id,
                 result,
             };
-            // Keep the two-phase retirement ticket alive through the complete ACK
-            // write and flush. Dropping it permits the run loop to supervise and exit.
+            // Stop, proof durability, and owned unlink precede this ACK. The
+            // ticket keeps detached children supervised through the wire flush.
             write_control_response(&mut stream, &response).await?;
-            if stop_after_response {
+            if retirement_ticket.is_some()
+                || (stop_after_response
+                    && old_handoff.is_some()
+                    && matches!(response.result, ControlResult::Committed(_)))
+            {
                 drop(retirement_ticket);
                 return Ok(());
             }
@@ -2646,6 +2999,10 @@ mod tests {
             ))
         }
 
+        async fn suspend_for_activation(&self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
         async fn shutdown(&self) -> Result<(), AdapterError> {
             self.shutdown.store(true, Ordering::Relaxed);
             self.shutdown_wake.notify_waiters();
@@ -2662,6 +3019,10 @@ mod tests {
         readiness: std::sync::Mutex<Option<muxe_adapter_api::ActivationReadiness>>,
         shutdown: AtomicBool,
         shutdown_wake: tokio::sync::Notify,
+        block_shutdown: AtomicBool,
+        shutdown_error: AtomicBool,
+        shutdown_entered: tokio::sync::Notify,
+        shutdown_release: tokio::sync::Notify,
         queued_events: std::sync::Mutex<VecDeque<AdapterHealthEvent>>,
         observed_events: AtomicUsize,
     }
@@ -2892,8 +3253,20 @@ mod tests {
         }
 
         async fn shutdown(&self) -> Result<(), AdapterError> {
+            self.record("shutdown_begin");
+            self.shutdown_entered.notify_one();
+            if self.block_shutdown.load(Ordering::SeqCst) {
+                self.shutdown_release.notified().await;
+            }
+            if self.shutdown_error.load(Ordering::SeqCst) {
+                return Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "scripted old adapter shutdown failed",
+                ));
+            }
             self.shutdown.store(true, Ordering::Relaxed);
             self.shutdown_wake.notify_waiters();
+            self.record("shutdown_complete");
             Ok(())
         }
 
@@ -2918,6 +3291,12 @@ mod tests {
         }
     }
 
+    fn test_handoff() -> HandoffId {
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        let value = NEXT.fetch_add(1, Ordering::Relaxed);
+        HandoffId([u8::try_from(value % 255 + 1).expect("test handoff byte"); 16])
+    }
+
     fn ordering_broker(
         suspend_unsupported: bool,
         resume_fails: bool,
@@ -2938,6 +3317,10 @@ mod tests {
             readiness: std::sync::Mutex::new(None),
             shutdown: AtomicBool::new(false),
             shutdown_wake: tokio::sync::Notify::new(),
+            block_shutdown: AtomicBool::new(false),
+            shutdown_error: AtomicBool::new(false),
+            shutdown_entered: tokio::sync::Notify::new(),
+            shutdown_release: tokio::sync::Notify::new(),
             queued_events: std::sync::Mutex::new(VecDeque::new()),
             observed_events: AtomicUsize::new(0),
         });
@@ -3056,6 +3439,7 @@ mod tests {
                 endpoint.clone(),
                 ActivationBootstrap::Running {
                     current: test_record(),
+                    bridge_unit: None,
                 },
                 None,
             )
@@ -3189,6 +3573,7 @@ mod tests {
             &broker,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3311,6 +3696,7 @@ mod tests {
             &broker,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3322,6 +3708,7 @@ mod tests {
                 &broker,
                 ControlOperation::Prepare {
                     target: Box::new(test_record()),
+                    handoff_id: test_handoff(),
                 },
             )
             .await;
@@ -3337,6 +3724,45 @@ mod tests {
         let handoff = status
             .handoff_id
             .expect("prepare reports the fresh nonzero handoff");
+
+        let (retry, retry_stop) = controller
+            .handle(
+                &broker,
+                ControlOperation::Prepare {
+                    target: Box::new(test_record()),
+                    handoff_id: handoff,
+                },
+            )
+            .await;
+        assert!(!retry_stop);
+        assert!(
+            matches!(
+                retry,
+                ControlResult::Prepared(ActivationStatus {
+                    handoff_id: Some(reported),
+                    ..
+                }) if reported == handoff
+            ),
+            "an exact supplied Prepare retry is idempotent"
+        );
+        assert_eq!(
+            adapter.calls(),
+            vec!["suspend".to_owned(), "drain_listener".to_owned()],
+            "an idempotent retry does not drain twice"
+        );
+        let (conflict, _) = controller
+            .handle(
+                &broker,
+                ControlOperation::Prepare {
+                    target: Box::new(test_record()),
+                    handoff_id: test_handoff(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(conflict, ControlResult::Error { .. }),
+            "a different handoff cannot adopt the active drain"
+        );
 
         let (result, stop) = controller
             .handle(
@@ -3374,6 +3800,7 @@ mod tests {
             &broker,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3385,6 +3812,7 @@ mod tests {
                 &broker,
                 ControlOperation::Prepare {
                     target: Box::new(test_record()),
+                    handoff_id: test_handoff(),
                 },
             )
             .await;
@@ -3423,6 +3851,7 @@ mod tests {
             &broker,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3434,6 +3863,7 @@ mod tests {
                 &broker,
                 ControlOperation::Prepare {
                     target: Box::new(test_record()),
+                    handoff_id: test_handoff(),
                 },
             )
             .await;
@@ -3493,6 +3923,7 @@ mod tests {
         fn recovery_decision<'a>(
             &'a self,
             _handoff: &'a HandoffId,
+            _local_status: &'a ActivationStatus,
         ) -> Pin<Box<dyn Future<Output = RecoveryDecision> + Send + 'a>> {
             let view = *self.0.lock().expect("recovery script is readable");
             Box::pin(async move {
@@ -3516,6 +3947,49 @@ mod tests {
                     }
                 }
             })
+        }
+        fn authorize_target_commit<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+            _local_status: &'a ActivationStatus,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            let view = *self.0.lock().expect("recovery script is readable");
+            Box::pin(async move {
+                if matches!(view.journal, RecoveryJournalStatus::Present)
+                    && matches!(view.member, RecoveryMemberStatus::Ready)
+                    && view.target_live
+                {
+                    Ok(())
+                } else {
+                    Err("scripted target Commit lacks original Ready authority".to_owned())
+                }
+            })
+        }
+        fn authorize_old_commit<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+            local_status: &'a ActivationStatus,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            let view = *self.0.lock().expect("recovery script is readable");
+            Box::pin(async move {
+                if matches!(view.journal, RecoveryJournalStatus::Present)
+                    && matches!(view.member, RecoveryMemberStatus::Ready)
+                    && view.target_live
+                    && local_status.lifecycle == LifecycleState::Draining
+                {
+                    Ok(())
+                } else {
+                    Err("scripted old Commit lacks Ready authority".to_owned())
+                }
+            })
+        }
+
+        fn publish_old_retirement<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+            _local_status: &'a ActivationStatus,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -3544,6 +4018,7 @@ mod tests {
                 broker,
                 ControlOperation::Prepare {
                     target: Box::new(test_record()),
+                    handoff_id: test_handoff(),
                 },
             )
             .await;
@@ -3577,6 +4052,7 @@ mod tests {
             &broker,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3629,6 +4105,7 @@ mod tests {
             &broker,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3667,47 +4144,282 @@ mod tests {
         responder.abort();
     }
 
-    #[tokio::test]
-    async fn disconnect_stands_down_when_member_ready() {
-        let (broker, adapter, _directory) = ordering_broker(false, false);
-        let controller = ActivationController::start(
-            &broker,
-            ActivationBootstrap::Running {
-                current: test_record(),
-            },
-        )
-        .await
-        .expect("activation controller starts for a running broker");
-        controller
-            .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
-                RecoveryView {
-                    journal: RecoveryJournalStatus::Present,
-                    member: RecoveryMemberStatus::Ready,
-                    target_live: true,
-                    recover_after: Duration::ZERO,
-                },
-            ))))
-            .await;
-        let (_, responder) = prepared_old(&broker, &controller, &adapter.calls).await;
+    struct OldRetirementPermit {
+        adapter: Arc<OrderingAdapter>,
+        endpoint: RuntimeEndpoint,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        acknowledged: tokio::sync::Notify,
+        fail_ack: AtomicBool,
+    }
 
-        Arc::clone(&controller)
-            .control_disconnected(Arc::clone(&broker))
-            .await;
-        assert_eq!(
-            adapter.calls(),
-            vec!["suspend".to_owned(), "drain_listener".to_owned()],
-            "a Ready member owns the handoff; the old unit never resumes concurrently"
-        );
-        responder.abort();
+    impl RecoveryPermit for OldRetirementPermit {
+        fn acknowledge<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+            ack: RecoveryAck,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                assert_eq!(ack, RecoveryAck::OldCommitted);
+                assert!(self.adapter.shutdown.load(Ordering::SeqCst));
+                assert!(!self.endpoint.socket().exists());
+                if self.fail_ack.load(Ordering::SeqCst) {
+                    return Err("scripted journal ACK persistence failed".to_owned());
+                }
+                self.events.lock().expect("event trace").push("ack");
+                self.acknowledged.notify_one();
+                Ok(())
+            })
+        }
+    }
+
+    struct OldCommitRecovery {
+        permit: Arc<OldRetirementPermit>,
+        decisions: AtomicUsize,
+        delayed: bool,
+        fail_proof: AtomicBool,
+    }
+
+    impl RecoveryJournal for OldCommitRecovery {
+        fn recovery_decision<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+            _local_status: &'a ActivationStatus,
+        ) -> Pin<Box<dyn Future<Output = RecoveryDecision> + Send + 'a>> {
+            let first = self.decisions.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if self.delayed && first {
+                    RecoveryDecision::RestoreOld {
+                        recover_after: Duration::from_millis(1),
+                        permit: None,
+                    }
+                } else {
+                    RecoveryDecision::TargetOwns {
+                        recover_after: Duration::ZERO,
+                        permit: Some(self.permit.clone()),
+                    }
+                }
+            })
+        }
+
+        fn authorize_target_commit<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+            _local_status: &'a ActivationStatus,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Err("old broker cannot authorize target Commit".to_owned()) })
+        }
+
+        fn authorize_old_commit<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+            _local_status: &'a ActivationStatus,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Err("recovery-only fixture has no normal Commit permit".to_owned()) })
+        }
+
+        fn publish_old_retirement<'a>(
+            &'a self,
+            _handoff: &'a HandoffId,
+            _local_status: &'a ActivationStatus,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                assert!(self.permit.adapter.shutdown.load(Ordering::SeqCst));
+                assert!(!self.permit.endpoint.socket().exists());
+                if self.fail_proof.load(Ordering::SeqCst) {
+                    return Err("scripted retirement proof persistence failed".to_owned());
+                }
+                self.permit
+                    .events
+                    .lock()
+                    .expect("event trace")
+                    .push("proof");
+                Ok(())
+            })
+        }
     }
 
     #[tokio::test]
-    async fn disconnect_restores_when_ready_target_is_dead() {
+    async fn disconnected_old_stops_before_ack_in_both_recovery_watches() {
+        for delayed in [false, true] {
+            let (broker, adapter, _config) = ordering_broker(false, false);
+            adapter.block_shutdown.store(true, Ordering::SeqCst);
+            let runtime = tempfile::tempdir().expect("owned runtime");
+            let endpoint =
+                RuntimeEndpoint::in_runtime_dir(runtime.path(), HostKind::Herdr, "owned-fake-host")
+                    .expect("owned endpoint");
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let permit = Arc::new(OldRetirementPermit {
+                adapter: adapter.clone(),
+                endpoint: endpoint.clone(),
+                events: events.clone(),
+                acknowledged: tokio::sync::Notify::new(),
+                fail_ack: AtomicBool::new(false),
+            });
+            let recovery = Arc::new(OldCommitRecovery {
+                permit: permit.clone(),
+                decisions: AtomicUsize::new(0),
+                delayed,
+                fail_proof: AtomicBool::new(false),
+            });
+            let server = BrokerServer::start_activation(
+                broker.clone(),
+                endpoint.clone(),
+                ActivationBootstrap::Running {
+                    current: test_record(),
+                    bridge_unit: None,
+                },
+                Some(recovery.clone()),
+            )
+            .await
+            .expect("start old broker");
+            let controller = server.activation.clone().expect("controller");
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(server.run(shutdown_rx));
+            let mut control = ProductionControl::connect(endpoint.socket())
+                .await
+                .expect("connect coordinator");
+            let handoff = prepare_draining(&mut control, "prepare").await;
+            let (unauthorized, stop) = controller
+                .handle(
+                    &broker,
+                    ControlOperation::Commit {
+                        handoff_id: handoff,
+                    },
+                )
+                .await;
+            assert!(matches!(unauthorized, ControlResult::Error { .. }));
+            assert!(!stop, "an unauthorized old Commit cannot reach Stop");
+            assert!(
+                controller
+                    .retire_old(&broker, test_handoff())
+                    .await
+                    .is_err()
+            );
+            drop(control);
+            tokio::time::timeout(Duration::from_secs(5), adapter.shutdown_entered.notified())
+                .await
+                .expect("recovery reaches adapter shutdown");
+            assert!(!adapter.shutdown.load(Ordering::SeqCst));
+            assert!(events.lock().expect("event trace").is_empty());
+            assert!(!endpoint.socket().exists());
+            assert!(matches!(
+                *controller.state.lock().await,
+                ActivationState::Draining { handoff: current, .. } if current == handoff
+            ));
+            adapter.shutdown_release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), permit.acknowledged.notified())
+                .await
+                .expect("old retirement ACK follows stop");
+            assert_eq!(*events.lock().expect("event trace"), ["proof", "ack"]);
+            let (repeat_ticket, proof) = controller
+                .retire_old(&broker, handoff)
+                .await
+                .expect("exact repeated handoff reuses completed stop");
+            assert!(repeat_ticket.is_none());
+            assert!(proof.is_ok());
+            assert!(
+                controller
+                    .retire_old(&broker, test_handoff())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                adapter
+                    .calls()
+                    .iter()
+                    .filter(|call| call.as_str() == "shutdown_begin")
+                    .count(),
+                1,
+                "replay never sends Stop twice"
+            );
+            assert!(adapter.calls().iter().all(|call| call != "resume"));
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("old service exits after ACK")
+                .expect("service joins")
+                .expect("service succeeds");
+        }
+    }
+
+    #[tokio::test]
+    async fn old_recovery_never_acks_or_resumes_after_stop_or_persistence_failure() {
+        for failure in ["stop", "proof", "ack"] {
+            let (broker, adapter, _config) = ordering_broker(false, false);
+            adapter
+                .shutdown_error
+                .store(failure == "stop", Ordering::SeqCst);
+            let runtime = tempfile::tempdir().expect("owned runtime");
+            let endpoint =
+                RuntimeEndpoint::in_runtime_dir(runtime.path(), HostKind::Herdr, "owned-fake-host")
+                    .expect("owned endpoint");
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let permit = Arc::new(OldRetirementPermit {
+                adapter: adapter.clone(),
+                endpoint: endpoint.clone(),
+                events: events.clone(),
+                acknowledged: tokio::sync::Notify::new(),
+                fail_ack: AtomicBool::new(failure == "ack"),
+            });
+            let recovery = Arc::new(OldCommitRecovery {
+                permit,
+                decisions: AtomicUsize::new(0),
+                delayed: false,
+                fail_proof: AtomicBool::new(failure == "proof"),
+            });
+            let server = BrokerServer::start_activation(
+                broker.clone(),
+                endpoint.clone(),
+                ActivationBootstrap::Running {
+                    current: test_record(),
+                    bridge_unit: None,
+                },
+                Some(recovery),
+            )
+            .await
+            .expect("start old broker");
+            let controller = server.activation.clone().expect("controller");
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(server.run(shutdown_rx));
+            let mut control = ProductionControl::connect(endpoint.socket())
+                .await
+                .expect("connect coordinator");
+            let handoff = prepare_draining(&mut control, "prepare").await;
+            drop(control);
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("old service exits after failed barrier")
+                .expect("service joins")
+                .expect("service exits without rebind");
+            assert!(!endpoint.socket().exists());
+            assert!(adapter.calls().iter().all(|call| call != "resume"));
+            assert!(
+                events
+                    .lock()
+                    .expect("event trace")
+                    .iter()
+                    .all(|entry| *entry != "ack")
+            );
+            if failure == "stop" {
+                assert!(matches!(
+                    *controller.state.lock().await,
+                    ActivationState::Draining { handoff: current, .. } if current == handoff
+                ));
+            } else {
+                assert!(matches!(
+                    *controller.state.lock().await,
+                    ActivationState::SupervisorOnly { handoff: current } if current == handoff
+                ));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn disconnect_restores_when_pre_ready_target_is_dead() {
         let (broker, adapter, _directory) = ordering_broker(false, false);
         let controller = ActivationController::start(
             &broker,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3716,7 +4428,7 @@ mod tests {
             .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
                 RecoveryView {
                     journal: RecoveryJournalStatus::Present,
-                    member: RecoveryMemberStatus::Ready,
+                    member: RecoveryMemberStatus::Pending,
                     target_live: false,
                     recover_after: Duration::ZERO,
                 },
@@ -3724,8 +4436,7 @@ mod tests {
             .await;
         let (_, responder) = prepared_old(&broker, &controller, &adapter.calls).await;
 
-        // Durable Ready alone never strands the endpoint on a dead target: nobody
-        // else can serve, so the old unit restores exactly like the absent case.
+        // Before a durable Ready decision, a failed target can still roll back.
         Arc::clone(&controller)
             .control_disconnected(Arc::clone(&broker))
             .await;
@@ -3737,7 +4448,7 @@ mod tests {
                 "resume".to_owned(),
                 "resume_listener".to_owned(),
             ],
-            "a dead Ready target cannot own the handoff; the old unit restores"
+            "a pre-Ready dead target cannot own the handoff; old broker restores"
         );
         let (result, _) = controller.handle(&broker, ControlOperation::Status).await;
         let ControlResult::Status(status) = result else {
@@ -3746,15 +4457,14 @@ mod tests {
         assert_eq!(status.lifecycle, LifecycleState::Running);
         responder.abort();
     }
-    /// Mixed after-durable-Ready: targetA dead while targetB lives in one unit.
-    /// Both olds observe the same unit-incomplete view and restore; the live
-    /// target stands down first so no two adapters run concurrently.
+    /// Before durable Ready, a unit-incomplete target stands down before
+    /// either old broker restores its suspended adapter.
     #[tokio::test]
-    async fn disconnect_restores_both_olds_when_unit_has_one_dead_target() {
+    async fn disconnect_restores_both_olds_before_ready_when_target_is_dead() {
         fn incomplete() -> Arc<ScriptedRecovery> {
             Arc::new(ScriptedRecovery(std::sync::Mutex::new(RecoveryView {
                 journal: RecoveryJournalStatus::Present,
-                member: RecoveryMemberStatus::Ready,
+                member: RecoveryMemberStatus::Pending,
                 target_live: false,
                 recover_after: Duration::ZERO,
             })))
@@ -3764,6 +4474,7 @@ mod tests {
             &broker_a,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3775,6 +4486,7 @@ mod tests {
             &broker_b,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3792,6 +4504,7 @@ mod tests {
                     discovery_key: "owned-fake-host".to_owned(),
                     server_id: WireServerId::new("owned-fake-server"),
                 },
+                bridge_unit: None,
             },
         )
         .await
@@ -3847,6 +4560,7 @@ mod tests {
             &broker,
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
         )
         .await
@@ -3894,6 +4608,7 @@ mod tests {
                 current: test_record(),
                 handoff: HandoffId([7; 16]),
                 live_server,
+                bridge_unit: None,
             },
         )
         .await
@@ -4125,7 +4840,7 @@ mod tests {
     }
 
     impl ProductionStack {
-        async fn start() -> Option<Self> {
+        async fn start(authorize_commit: bool) -> Option<Self> {
             let Some(binary) = production_binary() else {
                 eprintln!("skipping: MUXE_HERDR_TEST_BINARY names no absolute Herdr binary");
                 return None;
@@ -4159,8 +4874,16 @@ mod tests {
                 endpoint.clone(),
                 ActivationBootstrap::Running {
                     current: test_record(),
+                    bridge_unit: None,
                 },
-                None,
+                authorize_commit.then(|| {
+                    Arc::new(ScriptedRecovery(std::sync::Mutex::new(RecoveryView {
+                        journal: RecoveryJournalStatus::Present,
+                        member: RecoveryMemberStatus::Ready,
+                        target_live: true,
+                        recover_after: Duration::ZERO,
+                    }))) as Arc<dyn RecoveryJournal>
+                }),
             )
             .await
             .expect("start production activation server");
@@ -4191,7 +4914,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires an owned live Herdr server via MUXE_HERDR_TEST_BINARY; never runs by default"]
     async fn production_herdr_prepare_status_abort_commit() {
-        let Some(mut stack) = ProductionStack::start().await else {
+        let Some(mut stack) = ProductionStack::start(true).await else {
             return;
         };
         let live_before = stack.live.clone();
@@ -4210,6 +4933,7 @@ mod tests {
             .control
             .round_trip(ControlOperation::Prepare {
                 target: Box::new(test_record()),
+                handoff_id: test_handoff(),
             })
             .await
             .expect("prepare round trip")
@@ -4241,6 +4965,7 @@ mod tests {
             .control
             .round_trip(ControlOperation::Prepare {
                 target: Box::new(test_record()),
+                handoff_id: test_handoff(),
             })
             .await
             .expect("second prepare round trip")
@@ -4277,13 +5002,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires an owned live Herdr server via MUXE_HERDR_TEST_BINARY; never runs by default"]
     async fn production_herdr_disconnect_restores_old_broker() {
-        let Some(mut stack) = ProductionStack::start().await else {
+        let Some(mut stack) = ProductionStack::start(false).await else {
             return;
         };
         let prepared = match stack
             .control
             .round_trip(ControlOperation::Prepare {
                 target: Box::new(test_record()),
+                handoff_id: test_handoff(),
             })
             .await
             .expect("prepare round trip")
@@ -4457,8 +5183,16 @@ mod tests {
             endpoint.clone(),
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
-            None,
+            Some(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
+                RecoveryView {
+                    journal: RecoveryJournalStatus::Present,
+                    member: RecoveryMemberStatus::Ready,
+                    target_live: true,
+                    recover_after: Duration::ZERO,
+                },
+            )))),
         )
         .await
         .expect("start recorded activation server");
@@ -4531,6 +5265,7 @@ mod tests {
         let prepared = match control
             .round_trip(ControlOperation::Prepare {
                 target: Box::new(test_record()),
+                handoff_id: test_handoff(),
             })
             .await
             .unwrap_or_else(|_| panic!("{what} round trip"))
@@ -4592,6 +5327,7 @@ mod tests {
                 current: test_record(),
                 handoff: HandoffId([7; 16]),
                 live_server,
+                bridge_unit: None,
             },
         )
         .await
@@ -4624,6 +5360,7 @@ mod tests {
                 registered_clients: Vec::new(),
                 member_clients: 0,
                 member_ids: Some(Vec::new()),
+                proof_epoch: None,
             }),
             "authoritative empty evidence is served verbatim, still UI-gated"
         );
@@ -4638,7 +5375,47 @@ mod tests {
             panic!("gated target reports status, got {result:?}");
         };
         assert_eq!(status.ready, None);
-        // Commit still works on the handoff; readiness never gates the broker path.
+        assert!(
+            controller
+                .retire_old(&broker, HandoffId([7; 16]))
+                .await
+                .is_err(),
+            "target role cannot use old retirement"
+        );
+        // A handoff alone is no longer a Commit permit. Missing owner proof
+        // leaves the target gated, even if it had reported a prior census.
+        let (result, stop) = controller
+            .handle(
+                &broker,
+                ControlOperation::Commit {
+                    handoff_id: HandoffId([7; 16]),
+                },
+            )
+            .await;
+        assert!(!stop);
+        assert!(matches!(result, ControlResult::Error { .. }));
+        assert!(!controller.allows_ui().await);
+        controller.set_recovery(absent_recovery()).await;
+        let (result, _) = controller
+            .handle(
+                &broker,
+                ControlOperation::Commit {
+                    handoff_id: HandoffId([7; 16]),
+                },
+            )
+            .await;
+        assert!(matches!(result, ControlResult::Error { .. }));
+        assert!(!controller.allows_ui().await);
+        controller
+            .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
+                RecoveryView {
+                    journal: RecoveryJournalStatus::Present,
+                    member: RecoveryMemberStatus::Ready,
+                    target_live: true,
+                    recover_after: Duration::ZERO,
+                },
+            ))))
+            .await;
         let (result, stop) = controller
             .handle(
                 &broker,
@@ -4648,13 +5425,19 @@ mod tests {
             )
             .await;
         assert!(!stop, "target commit never stops its own service");
+        assert!(matches!(result, ControlResult::Committed(_)));
+        assert!(controller.allows_ui().await);
+        let (again, _) = controller
+            .handle(
+                &broker,
+                ControlOperation::Commit {
+                    handoff_id: HandoffId([7; 16]),
+                },
+            )
+            .await;
         assert!(
-            matches!(result, ControlResult::Committed(_)),
-            "target commits on its handoff, got {result:?}"
-        );
-        assert!(
-            controller.allows_ui().await,
-            "commit opens UI for the target"
+            matches!(again, ControlResult::Committed(_)),
+            "the original may replay Commit"
         );
     }
 
@@ -4736,6 +5519,27 @@ mod tests {
     /// readiness, task completion, and liveness probes — no sleep assumptions.
     #[tokio::test]
     async fn retire_supervises_detached_child_until_reaped() {
+        assert_detached_child_supervision(RetirementScenario::Explicit).await;
+    }
+
+    #[tokio::test]
+    async fn recovered_old_supervises_detached_child_until_reaped() {
+        assert_detached_child_supervision(RetirementScenario::RecoveredOld).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_waiter_keeps_detached_child_supervised() {
+        assert_detached_child_supervision(RetirementScenario::CancelledStop).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum RetirementScenario {
+        Explicit,
+        RecoveredOld,
+        CancelledStop,
+    }
+
+    async fn assert_detached_child_supervision(scenario: RetirementScenario) {
         let staging = tempfile::tempdir().expect("owned child staging directory");
         let (script, startup, pidfile, exit_fifo) = stage_lingering_child(&staging);
 
@@ -4773,7 +5577,7 @@ menus:
             Some(adapter.as_ref()),
         )
         .expect("compile linger config");
-        let broker = Broker::from_compiled(adapter, &config_path, config);
+        let broker = Broker::from_compiled(adapter.clone(), &config_path, config);
 
         let runtime = tempfile::tempdir().expect("owned runtime directory");
         let endpoint =
@@ -4784,11 +5588,23 @@ menus:
             endpoint.clone(),
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
-            None,
+            matches!(scenario, RetirementScenario::RecoveredOld).then(|| {
+                Arc::new(ScriptedRecovery(std::sync::Mutex::new(RecoveryView {
+                    journal: RecoveryJournalStatus::Present,
+                    member: RecoveryMemberStatus::Ready,
+                    target_live: true,
+                    recover_after: Duration::ZERO,
+                }))) as Arc<dyn RecoveryJournal>
+            }),
         )
         .await
         .expect("start owned activation server");
+        let activation = broker_server
+            .activation
+            .clone()
+            .expect("activation controller");
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let run_task = tokio::spawn(broker_server.run(shutdown_rx));
 
@@ -4858,19 +5674,46 @@ menus:
             "child alive while running"
         );
 
-        // Coordinator connects and retires this broker.
-        let mut control = ProductionControl::connect(endpoint.socket())
-            .await
-            .expect("coordinator connects");
-        let retired = match control
-            .round_trip(ControlOperation::Retire)
-            .await
-            .expect("retire round trip")
-        {
-            ControlResult::Retired(status) => status,
-            result => panic!("retire must succeed, got {result:?}"),
-        };
-        assert_eq!(retired.lifecycle, LifecycleState::Retired);
+        // All three transitions reach the same terminal Stop barrier. The
+        // cancellation case closes its receiver *before* the run loop replies.
+        match scenario {
+            RetirementScenario::RecoveredOld => {
+                let mut control = ProductionControl::connect(endpoint.socket())
+                    .await
+                    .expect("coordinator connects");
+                prepare_draining(&mut control, "prepare").await;
+                drop(control);
+            }
+            RetirementScenario::Explicit => {
+                let mut control = ProductionControl::connect(endpoint.socket())
+                    .await
+                    .expect("coordinator connects");
+                let retired = match control
+                    .round_trip(ControlOperation::Retire)
+                    .await
+                    .expect("retire round trip")
+                {
+                    ControlResult::Retired(status) => status,
+                    result => panic!("retire must succeed, got {result:?}"),
+                };
+                assert_eq!(retired.lifecycle, LifecycleState::Retired);
+            }
+            RetirementScenario::CancelledStop => {
+                broker
+                    .drain_for_activation()
+                    .await
+                    .expect("drain UI before Stop");
+                let (complete, waiter) = oneshot::channel();
+                drop(waiter);
+                activation
+                    .command_sender()
+                    .await
+                    .expect("service installed commands")
+                    .send(ServerCommand::Stop { complete })
+                    .await
+                    .expect("deliver Stop with cancelled waiter");
+            }
+        }
 
         // The ready UI observes retirement before the connection closes: the drain
         // emits `BrokerRetiring` to every live session before tearing it down, and
@@ -4892,6 +5735,23 @@ menus:
         })
         .await
         .expect("retire unlinks the endpoint");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !adapter.shutdown.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovered old adapter completes shutdown");
+        assert!(
+            adapter.shutdown.load(Ordering::SeqCst),
+            "host adapter stops before detached-child supervision"
+        );
+        if matches!(scenario, RetirementScenario::CancelledStop) {
+            assert!(
+                activation.old_retirement.lock().await.is_none(),
+                "cancelled command has no Commit proof or acknowledgement"
+            );
+        }
 
         assert!(
             !run_task.is_finished(),
@@ -4991,6 +5851,7 @@ menus:
             endpoint.clone(),
             ActivationBootstrap::Running {
                 current: test_record(),
+                bridge_unit: None,
             },
             None,
         )
@@ -5090,7 +5951,7 @@ menus:
         // The ready UI observes retirement before the connection closes. The
         // terminal path broadcasts AdapterHealthChanged(false) before the
         // drain emits BrokerRetiring, so skip health events until retiring.
-        let _event = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match ui_client.next_event().await {
                     Ok(BrokerEvent::BrokerRetiring) => break,
