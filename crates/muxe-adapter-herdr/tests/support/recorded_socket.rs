@@ -2,6 +2,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -20,6 +21,27 @@ pub struct RecordedExchange {
     pub params: Value,
     pub response: RecordedResponse,
 }
+#[derive(Debug, Default)]
+pub struct ResponseBarrier {
+    entered: Notify,
+    release: Notify,
+}
+
+impl ResponseBarrier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn wait_until_blocked(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.entered.notified())
+            .await
+            .expect("recorded response reaches its barrier within two seconds");
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
 
 /// The scripted response for one exact request.
 ///
@@ -37,6 +59,17 @@ pub enum RecordedResponse {
     KeepOpen(Value),
     /// Accepts and records the request but never writes a response.
     Hang,
+    /// Records the request, then waits on an explicit barrier before replying.
+    Barrier {
+        barrier: Arc<ResponseBarrier>,
+        result: Value,
+    },
+    /// Records the request, then waits on an explicit barrier before rejecting it.
+    BarrierError {
+        barrier: Arc<ResponseBarrier>,
+        code: String,
+        message: String,
+    },
 }
 
 /// A sequential, TempDir-owned Unix-socket fixture for concrete Herdr transport tests.
@@ -174,6 +207,7 @@ async fn serve(
         let keep_open = matches!(&exchange.response, RecordedResponse::KeepOpen(_));
         let retained_generation = keep_open.then(|| *close_streams.borrow());
         let retained_event_receiver = keep_open.then(|| retained_events.subscribe());
+        let mut recorded = false;
         match exchange.response {
             RecordedResponse::Result(result) | RecordedResponse::KeepOpen(result) => {
                 let response = json!({ "id": id, "result": result });
@@ -191,6 +225,36 @@ async fn serve(
                     .await?;
                 reader.get_mut().flush().await?;
             }
+            RecordedResponse::Barrier { barrier, result } => {
+                requests.lock().await.push(request.clone());
+                requests_changed.notify_waiters();
+                recorded = true;
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+                let response = json!({ "id": id, "result": result });
+                reader
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await?;
+                reader.get_mut().flush().await?;
+            }
+            RecordedResponse::BarrierError {
+                barrier,
+                code,
+                message,
+            } => {
+                requests.lock().await.push(request.clone());
+                requests_changed.notify_waiters();
+                recorded = true;
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+                let response = json!({ "id": id, "error": { "code": code, "message": message } });
+                reader
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await?;
+                reader.get_mut().flush().await?;
+            }
             RecordedResponse::Close => {}
             RecordedResponse::Hang => {
                 requests.lock().await.push(request.clone());
@@ -198,8 +262,10 @@ async fn serve(
                 std::future::pending::<()>().await;
             }
         }
-        requests.lock().await.push(request);
-        requests_changed.notify_waiters();
+        if !recorded {
+            requests.lock().await.push(request);
+            requests_changed.notify_waiters();
+        }
         if let (Some(initial_generation), Some(mut event_receiver)) =
             (retained_generation, retained_event_receiver)
         {

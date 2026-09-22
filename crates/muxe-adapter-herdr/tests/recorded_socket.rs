@@ -3,16 +3,25 @@ mod support {
     pub mod recorded_socket;
 }
 
-use std::{fs, os::unix::fs::symlink, sync::Arc, time::Duration};
+use std::{
+    fs,
+    future::{Future, poll_fn},
+    os::unix::fs::symlink,
+    sync::Arc,
+    task::Poll,
+    time::Duration,
+};
 
 use muxe_adapter_api::{
     AdapterError, AdapterErrorKind, AdapterHealthEvent, DispatchCompletion, HostAdapter,
     HostCallerIdentity, OriginCaptureRequest, OriginHintSource, PendingPaneRegistration,
-    PostDismissalPortableDispatchRequest, ResolvedPortableAction, UiSessionId, UntrustedOriginHint,
+    PortableDispatchRequest, PostDismissalPortableDispatchRequest, ResolvedPortableAction,
+    UiSessionId, UntrustedOriginHint,
 };
 use muxe_adapter_herdr::{
     CommandPaneLaunch, CommandTabLaunch, FocusedPane, HerdrAdapter, HerdrResponse, HerdrRuntime,
-    UiSplitDirection, focused_pane, open_command_pane, open_command_tab,
+    PreparedUiPane, UiPaneLaunch, UiSplitDirection, focused_pane, move_prepared_ui_pane,
+    open_command_pane, open_command_tab,
 };
 use muxe_core::{
     ActionScalar, ActionValidator, ConfigValue, ConfigValueKind, CreateCommand, ExecutionId,
@@ -22,7 +31,7 @@ use muxe_core::{
 use serde_json::json;
 use support::{
     production_connect::ProductionConnectFixture,
-    recorded_socket::{RecordedExchange, RecordedResponse},
+    recorded_socket::{RecordedExchange, RecordedResponse, ResponseBarrier},
 };
 
 #[tokio::test]
@@ -509,9 +518,17 @@ async fn admitted_request_rejects_replacement_before_write_and_reports_one_lease
     tokio::time::timeout(Duration::from_secs(2), &mut request_waiting)
         .await
         .expect("request reaches its exact pre-connect guard");
+    adapter.set_request_connect_wait_hook(None);
+    let queued_pane = PaneId::new("pane-b");
+    let mut queued = Box::pin(adapter.modal_scope(&queued_pane));
+    poll_fn(|context| match queued.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("queued old-epoch request completed while the first was blocked"),
+    })
+    .await;
+    drop(queued);
     fs::remove_file(&endpoint).expect("replace the owned endpoint alias");
     symlink(second_host.socket(), &endpoint).expect("alias now selects the replacement host");
-    adapter.set_request_connect_wait_hook(None);
     hook.release.notify_one();
 
     let error = request
@@ -2014,6 +2031,508 @@ async fn launches_an_exact_command_from_the_live_focused_origin() {
     drop(runtime);
     drop(fixture);
 }
+#[tokio::test]
+async fn command_pane_transaction_excludes_an_already_accepted_unrelated_unary() {
+    let barrier = Arc::new(ResponseBarrier::new());
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.truncate(1);
+    script.push(RecordedExchange {
+        method: "layout.apply",
+        params: json!({
+            "focus": false,
+            "workspace_id": "workspace-1",
+            "root": {
+                "type": "pane",
+                "command": ["tool", "--literal"],
+                "cwd": "/captured/origin",
+                "env": {},
+            },
+        }),
+        response: RecordedResponse::Barrier {
+            barrier: Arc::clone(&barrier),
+            result: json!({
+                "type": "layout_apply",
+                "layout": {
+                    "workspace_id": "workspace-1",
+                    "tab_id": "temporary-tab",
+                    "zoomed": false,
+                    "focused_pane_id": "new-pane",
+                    "root": { "type": "pane", "pane_id": "new-pane" },
+                },
+            }),
+        },
+    });
+    script.push(RecordedExchange {
+        method: "pane.move",
+        params: json!({
+            "pane_id": "new-pane",
+            "focus": true,
+            "destination": {
+                "type": "tab",
+                "tab_id": "tab-1",
+                "target_pane_id": "pane-1",
+                "split": "down",
+                "ratio": 0.5,
+            },
+        }),
+        response: RecordedResponse::Result(json!({
+            "type": "pane_move",
+            "move_result": { "changed": true },
+        })),
+    });
+    script.push(RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "unrelated" }),
+        response: RecordedResponse::Result(json!({
+            "type": "pane_info",
+            "pane": {
+                "pane_id": "unrelated",
+                "tab_id": "tab-1",
+                "workspace_id": "workspace-1",
+            },
+        })),
+    });
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned composite-ordering fixture starts");
+    let runtime = Arc::new(
+        HerdrRuntime::connect(fixture.adapter_config())
+            .await
+            .expect("guarded runtime connects"),
+    );
+    let origin = FocusedPane {
+        workspace: WorkspaceId::new("workspace-1"),
+        tab: TabId::new("tab-1"),
+        pane: PaneId::new("pane-1"),
+        cwd: "/captured/origin".into(),
+        columns: 80,
+        rows: 24,
+    };
+    let launch = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            open_command_pane(
+                runtime.as_ref(),
+                CommandPaneLaunch {
+                    destination: origin.clone(),
+                    cwd: "/captured/origin".into(),
+                    origin,
+                    argv: vec!["tool".to_owned(), "--literal".to_owned()],
+                    direction: UiSplitDirection::Down,
+                    ratio: 0.5,
+                    focus: true,
+                },
+            )
+            .await
+        })
+    };
+    barrier.wait_until_blocked().await;
+
+    let unrelated = runtime.invoke_response("pane.get", json!({ "pane_id": "unrelated" }));
+    tokio::pin!(unrelated);
+    poll_fn(|context| match unrelated.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("unrelated unary completed while the composite was blocked"),
+    })
+    .await;
+    barrier.release();
+
+    launch
+        .await
+        .expect("command-pane task joins")
+        .expect("exclusive command-pane transaction completes");
+    unrelated
+        .await
+        .expect("accepted unrelated unary completes after the transaction");
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .into_iter()
+            .map(|request| request["method"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!("ping"),
+            json!("layout.apply"),
+            json!("pane.move"),
+            json!("pane.get"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn prepared_move_cleanup_failure_excludes_an_accepted_unrelated_unary() {
+    let barrier = Arc::new(ResponseBarrier::new());
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.truncate(1);
+    script.push(RecordedExchange {
+        method: "pane.move",
+        params: json!({
+            "pane_id": "ui-pane",
+            "focus": true,
+            "destination": {
+                "type": "tab",
+                "tab_id": "origin-tab",
+                "target_pane_id": "origin-pane",
+                "split": "down",
+                "ratio": 0.5,
+            },
+        }),
+        response: RecordedResponse::BarrierError {
+            barrier: Arc::clone(&barrier),
+            code: "move_failed".to_owned(),
+            message: "move rejected".to_owned(),
+        },
+    });
+    script.push(RecordedExchange {
+        method: "tab.close",
+        params: json!({ "tab_id": "temporary-tab" }),
+        response: RecordedResponse::Error {
+            code: "cleanup_failed".to_owned(),
+            message: "temporary tab remains".to_owned(),
+        },
+    });
+    script.push(RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "unrelated" }),
+        response: RecordedResponse::Result(json!({
+            "type": "pane_info",
+            "pane": {
+                "pane_id": "unrelated",
+                "tab_id": "origin-tab",
+                "workspace_id": "workspace-1",
+            },
+        })),
+    });
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned prepared-move rollback fixture starts");
+    let runtime = Arc::new(
+        HerdrRuntime::connect(fixture.adapter_config())
+            .await
+            .expect("guarded runtime connects"),
+    );
+    let moving = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            move_prepared_ui_pane(
+                runtime.as_ref(),
+                &UiPaneLaunch {
+                    origin_workspace: WorkspaceId::new("workspace-1"),
+                    origin_tab: TabId::new("origin-tab"),
+                    origin_pane: PaneId::new("origin-pane"),
+                    cwd: "/origin".into(),
+                    argv: Vec::new(),
+                    bootstrap_env: std::collections::BTreeMap::new(),
+                    direction: UiSplitDirection::Down,
+                    ratio: 0.5,
+                    focus: true,
+                },
+                PreparedUiPane {
+                    temporary_tab: TabId::new("temporary-tab"),
+                    ui_pane: PaneId::new("ui-pane"),
+                },
+            )
+            .await
+        })
+    };
+    barrier.wait_until_blocked().await;
+
+    let unrelated = runtime.invoke_response("pane.get", json!({ "pane_id": "unrelated" }));
+    tokio::pin!(unrelated);
+    poll_fn(|context| match unrelated.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("unrelated unary completed while prepared move was blocked"),
+    })
+    .await;
+    barrier.release();
+
+    let error = moving
+        .await
+        .expect("prepared move task joins")
+        .expect_err("move and rollback both fail");
+    assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
+    assert!(error.message.contains("move rejected"));
+    assert!(error.message.contains("temporary tab remains"));
+    unrelated
+        .await
+        .expect("unrelated unary runs after rollback finishes");
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .into_iter()
+            .map(|request| request["method"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!("ping"),
+            json!("pane.move"),
+            json!("tab.close"),
+            json!("pane.get"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn accepted_unary_survives_caller_cancellation_in_fifo_order() {
+    let barrier = Arc::new(ResponseBarrier::new());
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.truncate(1);
+    script.push(RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "first" }),
+        response: RecordedResponse::Barrier {
+            barrier: Arc::clone(&barrier),
+            result: json!({
+                "type": "pane_info",
+                "pane": {
+                    "pane_id": "first",
+                    "tab_id": "tab-1",
+                    "workspace_id": "workspace-1",
+                },
+            }),
+        },
+    });
+    script.push(RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "cancelled-caller" }),
+        response: RecordedResponse::Result(json!({
+            "type": "pane_info",
+            "pane": {
+                "pane_id": "cancelled-caller",
+                "tab_id": "tab-1",
+                "workspace_id": "workspace-1",
+            },
+        })),
+    });
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned cancellation-ordering fixture starts");
+    let runtime = Arc::new(
+        HerdrRuntime::connect(fixture.adapter_config())
+            .await
+            .expect("guarded runtime connects"),
+    );
+    let first = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            runtime
+                .invoke_response("pane.get", json!({ "pane_id": "first" }))
+                .await
+        })
+    };
+    barrier.wait_until_blocked().await;
+
+    let mut cancelled =
+        Box::pin(runtime.invoke_response("pane.get", json!({ "pane_id": "cancelled-caller" })));
+    poll_fn(|context| match cancelled.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("second unary completed while the first response was blocked"),
+    })
+    .await;
+    drop(cancelled);
+    barrier.release();
+
+    first
+        .await
+        .expect("first unary task joins")
+        .expect("first unary completes");
+    wait_for_lifecycle_requests(&fixture, 3, "cancelled caller's accepted unary").await;
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .into_iter()
+            .map(|request| request["params"]["pane_id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(null), json!("first"), json!("cancelled-caller")],
+        "caller cancellation after queue insertion cannot retract accepted work",
+    );
+}
+
+#[tokio::test]
+async fn schema_valid_long_wait_has_no_local_response_deadline() {
+    let barrier = Arc::new(ResponseBarrier::new());
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.truncate(1);
+    script.push(RecordedExchange {
+        method: "agent.wait",
+        params: json!({ "target": "agent-1", "timeout_ms": 300_000 }),
+        response: RecordedResponse::Barrier {
+            barrier: Arc::clone(&barrier),
+            result: json!({ "type": "agent_wait", "status": "completed" }),
+        },
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned long-wait fixture");
+    let runtime = Arc::new(
+        HerdrRuntime::connect(fixture.adapter_config())
+            .await
+            .expect("guarded runtime connects"),
+    );
+    let waiting = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        async move {
+            runtime
+                .invoke_response(
+                    "agent.wait",
+                    json!({ "target": "agent-1", "timeout_ms": 300_000 }),
+                )
+                .await
+        }
+    });
+    barrier.wait_until_blocked().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(301)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "a schema-valid long wait must remain owned until Herdr replies or the runtime retires"
+    );
+
+    barrier.release();
+    assert!(matches!(
+        waiting.await.expect("long-wait task joins").unwrap(),
+        HerdrResponse::Success(_)
+    ));
+}
+
+#[tokio::test]
+async fn explicit_response_timeout_remains_authoritative() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.truncate(1);
+    script.push(RecordedExchange {
+        method: "pane.get",
+        params: json!({ "pane_id": "hung" }),
+        response: RecordedResponse::Hang,
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned explicit-timeout fixture");
+    let runtime = HerdrRuntime::connect(fixture.adapter_config())
+        .await
+        .expect("guarded runtime connects");
+    tokio::time::pause();
+
+    let error = runtime
+        .invoke_response_with_timeout(
+            "pane.get",
+            json!({ "pane_id": "hung" }),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("explicit response deadline expires");
+    assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+    assert!(error.message.contains("request deadline"));
+    assert_eq!(fixture.requests().await.len(), 2);
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_a_hung_inflight_dispatch_without_server_release() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(ProductionConnectFixture::snapshot_exchange(
+        &lifecycle_snapshot(),
+    ));
+    script.push(RecordedExchange {
+        method: "pane.close",
+        params: json!({ "pane_id": "pane-1" }),
+        response: RecordedResponse::Hang,
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned hung-shutdown fixture");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures before dispatch");
+    let execution = ExecutionId(9_200_001);
+    adapter
+        .dispatch_portable(PortableDispatchRequest {
+            execution,
+            action: ResolvedPortableAction {
+                action: PortableAction::Pane(PaneAction::Close),
+            },
+            origin,
+        })
+        .await
+        .expect("hung dispatch is accepted");
+    wait_for_lifecycle_requests(&fixture, 4, "hung dispatch request").await;
+
+    tokio::time::timeout(Duration::from_secs(2), adapter.shutdown())
+        .await
+        .expect("shutdown interrupts a hung response read")
+        .expect("shutdown joins its retired queue owner");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+            execution: completed,
+            ..
+        }) if completed == execution
+    ));
+}
+
+#[tokio::test]
+async fn suspend_interrupts_a_hung_inflight_dispatch_without_server_release() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(ProductionConnectFixture::snapshot_exchange(
+        &lifecycle_snapshot(),
+    ));
+    script.push(RecordedExchange {
+        method: "pane.close",
+        params: json!({ "pane_id": "pane-1" }),
+        response: RecordedResponse::Hang,
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned hung-suspend fixture");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures before dispatch");
+    let execution = ExecutionId(9_200_002);
+    adapter
+        .dispatch_portable(PortableDispatchRequest {
+            execution,
+            action: ResolvedPortableAction {
+                action: PortableAction::Pane(PaneAction::Close),
+            },
+            origin,
+        })
+        .await
+        .expect("hung dispatch is accepted");
+    wait_for_lifecycle_requests(&fixture, 4, "hung dispatch request").await;
+
+    tokio::time::timeout(Duration::from_secs(2), adapter.suspend_for_activation())
+        .await
+        .expect("suspend interrupts a hung response read")
+        .expect("suspend joins its retired queue owner");
+    let mut saw_unknown = false;
+    let mut saw_unhealthy = false;
+    for _ in 0..2 {
+        match adapter.next_health_event().await.unwrap() {
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+                execution: completed,
+                ..
+            }) if completed == execution => saw_unknown = true,
+            AdapterHealthEvent::Unhealthy { .. } => saw_unhealthy = true,
+            _ => panic!("unexpected suspend terminal event"),
+        }
+    }
+    assert!(saw_unknown);
+    assert!(saw_unhealthy);
+    adapter
+        .shutdown()
+        .await
+        .expect("suspended adapter shuts down");
+}
 
 #[tokio::test]
 async fn launches_an_exact_command_as_a_labeled_unfocused_tab() {
@@ -2064,6 +2583,102 @@ async fn launches_an_exact_command_as_a_labeled_unfocused_tab() {
     assert_eq!(fixture.requests().await.len(), 2);
     drop(runtime);
     drop(fixture);
+}
+
+#[tokio::test]
+async fn shutdown_joins_queue_owner_and_settles_each_accepted_dispatch_once() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.push(ProductionConnectFixture::snapshot_exchange(
+        &lifecycle_snapshot(),
+    ));
+    script.push(RecordedExchange {
+        method: "pane.close",
+        params: json!({ "pane_id": "pane-1" }),
+        response: RecordedResponse::Hang,
+    });
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned shutdown-drain fixture");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter.next_health_event().await.unwrap(),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures before dispatch admission");
+    let first = ExecutionId(9_100_001);
+    let second = ExecutionId(9_100_002);
+    for execution in [first, second] {
+        adapter
+            .dispatch_portable(PortableDispatchRequest {
+                execution,
+                action: ResolvedPortableAction {
+                    action: PortableAction::Pane(PaneAction::Close),
+                },
+                origin: origin.clone(),
+            })
+            .await
+            .expect("dispatch is accepted into the bounded runtime queue");
+    }
+    wait_for_lifecycle_requests(&fixture, 4, "in-flight dispatch before shutdown").await;
+    tokio::time::timeout(Duration::from_secs(2), adapter.shutdown())
+        .await
+        .expect("shutdown settles accepted work within two seconds")
+        .expect("shutdown joins the send-queue owner");
+
+    let mut first_outcome_unknown = false;
+    let mut second_failed_not_sent = false;
+    for _ in 0..2 {
+        match adapter
+            .next_health_event()
+            .await
+            .expect("accepted dispatch has one deterministic terminal")
+        {
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+                execution,
+                ..
+            }) if execution == first => first_outcome_unknown = true,
+            AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Failed {
+                execution,
+                error,
+            }) if execution == second
+                && matches!(
+                    error.kind,
+                    AdapterErrorKind::Shutdown | AdapterErrorKind::Unavailable
+                ) =>
+            {
+                second_failed_not_sent = true;
+            }
+            _ => panic!("unexpected accepted-dispatch terminal"),
+        }
+    }
+    assert!(first_outcome_unknown);
+    assert!(second_failed_not_sent);
+    assert!(matches!(
+        adapter.next_health_event().await,
+        Err(AdapterError {
+            kind: AdapterErrorKind::Shutdown,
+            ..
+        })
+    ));
+    assert_eq!(
+        fixture
+            .requests()
+            .await
+            .into_iter()
+            .map(|request| request["method"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!("ping"),
+            json!("events.subscribe"),
+            json!("session.snapshot"),
+            json!("pane.close"),
+        ],
+        "shutdown lets the in-flight request settle and fails queued accepted work without a write",
+    );
 }
 
 /// One-consumer invariant: `next_health_event` is called only by the broker

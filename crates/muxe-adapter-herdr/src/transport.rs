@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
+    sync::watch,
 };
 
 use crate::generated::{MethodMetadata, MethodTransport};
@@ -70,6 +71,8 @@ pub enum SocketError {
     },
     #[error("Herdr endpoint at {socket} was replaced before the request was sent")]
     EndpointReplaced { socket: PathBuf },
+    #[error("Herdr runtime retired while the request was in flight")]
+    RuntimeRetired { delivery: DeliveryState },
     #[error("could not read Herdr response")]
     Read {
         delivery: DeliveryState,
@@ -103,6 +106,7 @@ impl SocketError {
             | Self::EarlyEof { delivery }
             | Self::ResponseTooLarge { delivery }
             | Self::Timeout { delivery }
+            | Self::RuntimeRetired { delivery }
             | Self::Read { delivery, .. }
             | Self::InvalidJson { delivery, .. }
             | Self::Protocol { delivery, .. } => *delivery,
@@ -239,6 +243,7 @@ impl HerdrSocketClient {
 
     /// Sends only when a fresh observed connection matches `expected`.
     /// A mismatch drops the still-unwritten stream and reports `NotSent`.
+    #[cfg(test)]
     pub(crate) async fn unary_on_expected_token(
         &self,
         metadata: &MethodMetadata,
@@ -255,24 +260,104 @@ impl HerdrSocketClient {
         Self::exchange(stream, request, ResponseDeadline::Unbounded).await
     }
 
-    /// Timeout variant of [`Self::unary_on_expected_token`]. The endpoint
-    /// comparison still precedes the first request byte; only the response wait
-    /// is bounded, so a timeout remains `MayHaveReachedHost`.
-    pub(crate) async fn unary_on_expected_token_with_timeout(
+    /// Sends one guarded request and waits for its response without imposing a
+    /// local deadline. Retirement interrupts connect, write, or response
+    /// processing and preserves exact delivery evidence.
+    pub(crate) async fn unary_on_expected_token_guarded<F>(
+        &self,
+        metadata: &MethodMetadata,
+        params: Value,
+        expected: &EndpointContinuityToken,
+        retirement: watch::Receiver<bool>,
+        on_replacement: F,
+    ) -> Result<HerdrResponse, SocketError>
+    where
+        F: Fn(),
+    {
+        self.unary_on_expected_token_guarded_deadline(
+            metadata,
+            params,
+            expected,
+            ResponseDeadline::Unbounded,
+            retirement,
+            on_replacement,
+        )
+        .await
+    }
+
+    /// Sends one guarded request with an explicit caller-provided response
+    /// deadline. Retirement remains independently cancellation-selectable.
+    pub(crate) async fn unary_on_expected_token_guarded_with_timeout<F>(
         &self,
         metadata: &MethodMetadata,
         params: Value,
         expected: &EndpointContinuityToken,
         timeout: Duration,
-    ) -> Result<HerdrResponse, SocketError> {
+        retirement: watch::Receiver<bool>,
+        on_replacement: F,
+    ) -> Result<HerdrResponse, SocketError>
+    where
+        F: Fn(),
+    {
+        self.unary_on_expected_token_guarded_deadline(
+            metadata,
+            params,
+            expected,
+            ResponseDeadline::Bounded(timeout),
+            retirement,
+            on_replacement,
+        )
+        .await
+    }
+
+    async fn unary_on_expected_token_guarded_deadline<F>(
+        &self,
+        metadata: &MethodMetadata,
+        params: Value,
+        expected: &EndpointContinuityToken,
+        deadline: ResponseDeadline,
+        mut retirement: watch::Receiver<bool>,
+        on_replacement: F,
+    ) -> Result<HerdrResponse, SocketError>
+    where
+        F: Fn(),
+    {
         let request = self.prepare_unary(metadata, &params)?;
-        let (stream, actual) = self.observed_connect().await?;
+        if *retirement.borrow() {
+            return Err(SocketError::RuntimeRetired {
+                delivery: DeliveryState::NotSent,
+            });
+        }
+        let observed = tokio::select! {
+            biased;
+            changed = retirement.changed() => {
+                let _ = changed;
+                return Err(SocketError::RuntimeRetired {
+                    delivery: DeliveryState::NotSent,
+                });
+            }
+            observed = self.observed_connect() => observed,
+        };
+        let (stream, actual) = match observed {
+            Ok(observed) => observed,
+            Err(error @ SocketError::EndpointReplaced { .. }) => {
+                on_replacement();
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         if expected.proven_replacement(&actual) {
+            on_replacement();
             return Err(SocketError::EndpointReplaced {
                 socket: self.socket.clone(),
             });
         }
-        Self::exchange(stream, request, ResponseDeadline::Bounded(timeout)).await
+        if *retirement.borrow() {
+            return Err(SocketError::RuntimeRetired {
+                delivery: DeliveryState::NotSent,
+            });
+        }
+        Self::exchange_guarded(stream, request, deadline, retirement).await
     }
 
     #[cfg(test)]
@@ -395,6 +480,58 @@ impl HerdrSocketClient {
         Ok(outcome)
     }
 
+    async fn exchange_guarded(
+        mut stream: UnixStream,
+        request: PreparedUnary,
+        deadline: ResponseDeadline,
+        mut retirement: watch::Receiver<bool>,
+    ) -> Result<HerdrResponse, SocketError> {
+        write_line_guarded(&mut stream, &request.line, &mut retirement).await?;
+        let response = async {
+            let mut reader = BufReader::new(stream);
+            let response_line = read_response_line(&mut reader).await?;
+            let response = serde_json::from_slice(&response_line).map_err(|source| {
+                SocketError::InvalidJson {
+                    delivery: DeliveryState::MayHaveReachedHost,
+                    source,
+                }
+            })?;
+            let outcome = parse_response(&response, &request.id)?;
+            reject_trailing_data(&mut reader).await?;
+            Ok(outcome)
+        };
+        match deadline {
+            ResponseDeadline::Unbounded => {
+                tokio::select! {
+                    biased;
+                    changed = retirement.changed() => {
+                        let _ = changed;
+                        Err(SocketError::RuntimeRetired {
+                            delivery: DeliveryState::MayHaveReachedHost,
+                        })
+                    }
+                    result = response => result,
+                }
+            }
+            ResponseDeadline::Bounded(timeout) => {
+                tokio::select! {
+                    biased;
+                    changed = retirement.changed() => {
+                        let _ = changed;
+                        Err(SocketError::RuntimeRetired {
+                            delivery: DeliveryState::MayHaveReachedHost,
+                        })
+                    }
+                    result = tokio::time::timeout(timeout, response) => {
+                        result.map_err(|_| SocketError::Timeout {
+                            delivery: DeliveryState::MayHaveReachedHost,
+                        })?
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     fn set_observed_connect_hook(&self, hook: Option<Arc<ObservedConnectHook>>) {
         *self
@@ -469,6 +606,57 @@ pub(crate) async fn write_line(stream: &mut UnixStream, line: &[u8]) -> Result<(
         delivery: DeliveryState::MayHaveReachedHost,
         source,
     })
+}
+
+async fn write_line_guarded(
+    stream: &mut UnixStream,
+    line: &[u8],
+    retirement: &mut watch::Receiver<bool>,
+) -> Result<(), SocketError> {
+    let mut sent = 0;
+    while sent < line.len() {
+        let write = tokio::select! {
+            biased;
+            changed = retirement.changed() => {
+                let _ = changed;
+                return Err(SocketError::RuntimeRetired {
+                    delivery: delivery_after(sent),
+                });
+            }
+            write = stream.write(&line[sent..]) => write,
+        };
+        match write {
+            Ok(0) => {
+                return Err(SocketError::Write {
+                    delivery: delivery_after(sent),
+                    source: io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "Herdr socket accepted zero bytes",
+                    ),
+                });
+            }
+            Ok(written) => sent += written,
+            Err(source) => {
+                return Err(SocketError::Write {
+                    delivery: delivery_after(sent),
+                    source,
+                });
+            }
+        }
+    }
+    tokio::select! {
+        biased;
+        changed = retirement.changed() => {
+            let _ = changed;
+            Err(SocketError::RuntimeRetired {
+                delivery: DeliveryState::MayHaveReachedHost,
+            })
+        }
+        result = stream.flush() => result.map_err(|source| SocketError::Write {
+            delivery: DeliveryState::MayHaveReachedHost,
+            source,
+        }),
+    }
 }
 
 /// Credentials the OS reports for the peer of one Herdr connection. They are advisory

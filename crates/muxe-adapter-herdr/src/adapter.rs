@@ -31,7 +31,10 @@ use crate::{
     HerdrAdapterConfig, HerdrCache, HerdrResponse, HerdrRuntime, SocketError, SubscriptionConfig,
     SubscriptionEvent, fields_to_json,
     generated::{BUNDLED_REQUEST_SCHEMA_SHA256, method_metadata},
-    runtime::{HerdrRequestAuthority, IncarnationEpoch, IncarnationLease},
+    runtime::{
+        ClassifiedInvokeError, GuardedHerdrInvoker, HerdrRequestAuthority, IncarnationEpoch,
+        IncarnationLease, OrderedReceiver, PreparedInvocation,
+    },
     validate_candidate,
 };
 
@@ -70,7 +73,7 @@ pub struct HerdrAdapter {
     dispatch_results_rx: Mutex<mpsc::UnboundedReceiver<DispatchTerminal>>,
     dispatch_wake: Notify,
     dispatch_tasks: StdMutex<DispatchTaskRegistry>,
-    pending_leases: StdMutex<HashMap<PendingPaneLeaseId, PendingPaneLeaseRecord>>,
+    pending_leases: Arc<StdMutex<HashMap<PendingPaneLeaseId, PendingPaneLeaseRecord>>>,
     post_dismissal: Mutex<HashMap<String, Vec<PostDismissalPortableDispatchRequest>>>,
     health_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
     reconnect_install_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
@@ -213,33 +216,20 @@ impl IncarnationAuthority {
         method: &str,
         params: Value,
     ) -> Result<HerdrResponse, (AdapterError, DeliveryState)> {
-        let metadata = self
+        let invocation = self
             .runtime
-            .checked_metadata(method, &params)
+            .prepare_invocation(method, params)
             .map_err(|error| (error, DeliveryState::NotSent))?;
-        if let Some(hook) = &self.request_connect_wait_hook {
-            hook.entered.notify_one();
-            hook.release.notified().await;
-        }
-        match self
-            .runtime
-            .invoke_response_on_lease(&self.lease, metadata, params)
+        let direct = self.clone();
+        self.runtime
+            .run_ordered(move |invoker| async move {
+                direct
+                    .transaction_authority(invoker)
+                    .invoke_prepared_with_delivery(invocation)
+                    .await
+            })
             .await
-        {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                let delivery = error.delivery();
-                let replaced = matches!(error, SocketError::EndpointReplaced { .. });
-                let error = socket_error(&error);
-                if replaced {
-                    let _ = self.continuity_loss_tx.send(ContinuityLoss {
-                        lease: self.lease.clone(),
-                        error: error.clone(),
-                    });
-                }
-                Err((error, delivery))
-            }
-        }
+            .map_err(|error| (error, DeliveryState::NotSent))?
     }
 
     async fn invoke_response(
@@ -257,6 +247,108 @@ impl IncarnationAuthority {
             HerdrResponse::Success(result) => Ok(result),
             HerdrResponse::Error { code, message } => Err(host_rejection(method, &code, &message)),
         }
+    }
+
+    async fn run_ordered<T, F, Fut>(&self, operation: F) -> Result<T, AdapterError>
+    where
+        T: Send + 'static,
+        F: FnOnce(IncarnationTransactionAuthority) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let authority = self.clone();
+        self.runtime
+            .run_ordered(move |invoker| operation(authority.transaction_authority(invoker)))
+            .await
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "ordered dispatch preserves the adapter's shared error type"
+    )]
+    fn try_run_ordered<T, F, Fut>(&self, operation: F) -> Result<OrderedReceiver<T>, AdapterError>
+    where
+        T: Send + 'static,
+        F: FnOnce(IncarnationTransactionAuthority) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let authority = self.clone();
+        self.runtime
+            .try_run_ordered(move |invoker| operation(authority.transaction_authority(invoker)))
+    }
+
+    fn transaction_authority(
+        &self,
+        invoker: GuardedHerdrInvoker,
+    ) -> IncarnationTransactionAuthority {
+        IncarnationTransactionAuthority {
+            invoker,
+            lease: self.lease.clone(),
+            continuity_loss_tx: self.continuity_loss_tx.clone(),
+            request_connect_wait_hook: self.request_connect_wait_hook.clone(),
+        }
+    }
+}
+
+struct IncarnationTransactionAuthority {
+    invoker: GuardedHerdrInvoker,
+    lease: IncarnationLease,
+    continuity_loss_tx: mpsc::UnboundedSender<ContinuityLoss>,
+    request_connect_wait_hook: Option<Arc<WaitHook>>,
+}
+
+impl IncarnationTransactionAuthority {
+    async fn invoke_prepared_with_delivery(
+        &self,
+        invocation: PreparedInvocation,
+    ) -> Result<HerdrResponse, (AdapterError, DeliveryState)> {
+        if let Some(hook) = &self.request_connect_wait_hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+        self.invoker
+            .invoke_prepared(&self.lease, invocation)
+            .await
+            .map_err(|error| self.classify(error))
+    }
+
+    async fn invoke_response_with_delivery(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<HerdrResponse, (AdapterError, DeliveryState)> {
+        let invocation = self
+            .invoker
+            .prepare(method, params)
+            .map_err(|error| (error, DeliveryState::NotSent))?;
+        self.invoke_prepared_with_delivery(invocation).await
+    }
+    async fn invoke_response(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<HerdrResponse, AdapterError> {
+        self.invoke_response_with_delivery(method, params)
+            .await
+            .map_err(|(error, _)| error)
+    }
+
+    fn classify(&self, error: ClassifiedInvokeError) -> (AdapterError, DeliveryState) {
+        if error.continuity_lost {
+            let _ = self.continuity_loss_tx.send(ContinuityLoss {
+                lease: self.lease.clone(),
+                error: error.error.clone(),
+            });
+        }
+        (error.error, error.delivery)
+    }
+}
+
+#[async_trait]
+impl HerdrRequestAuthority for IncarnationTransactionAuthority {
+    async fn request(&self, method: &str, params: Value) -> Result<HerdrResponse, AdapterError> {
+        self.invoke_response_with_delivery(method, params)
+            .await
+            .map_err(|(error, _)| error)
     }
 }
 
@@ -380,7 +472,7 @@ impl HerdrAdapter {
             suspend_release_wait_hook: StdMutex::new(None),
             host_lost_reserve_pending_hook: StdMutex::new(None),
             request_connect_wait_hook: StdMutex::new(None),
-            pending_leases: StdMutex::new(HashMap::new()),
+            pending_leases: Arc::new(StdMutex::new(HashMap::new())),
             resume_wake: Notify::new(),
             resume_slot: Mutex::new(None),
             resume_registry: StdMutex::new(ResumeRegistry {
@@ -439,7 +531,11 @@ impl HerdrAdapter {
         if self.shutdown.load(Ordering::Relaxed) || self.suspended.load(Ordering::SeqCst) {
             return false;
         }
-        incarnation.transition_to_lost(lease)
+        let transitioned = incarnation.transition_to_lost(lease);
+        if transitioned {
+            incarnation.runtime.retire_send_queue();
+        }
+        transitioned
     }
 
     fn reconnect_epoch(&self) -> Option<IncarnationEpoch> {
@@ -595,6 +691,7 @@ impl HerdrAdapter {
         });
         self.suspended.store(true, Ordering::SeqCst);
         incarnation.healthy = false;
+        incarnation.runtime.retire_send_queue();
         Ok((generation, requested))
     }
 
@@ -795,7 +892,7 @@ impl HerdrAdapter {
     fn admit_dispatch_task(
         &self,
         execution: muxe_core::ExecutionId,
-        spawn: impl FnOnce() -> JoinHandle<()>,
+        spawn: impl FnOnce() -> Result<JoinHandle<()>, AdapterError>,
     ) -> Result<(), AdapterError> {
         let mut registry = self
             .dispatch_tasks
@@ -813,9 +910,11 @@ impl HerdrAdapter {
                 "Herdr adapter already owns this dispatch execution",
             ));
         }
-        // Keep the admission lock through spawn and insertion. Shutdown cannot
-        // observe an unregistered task after its host future is allowed to run.
-        registry.tasks.insert(execution, spawn());
+        // Keep the admission lock through queue insertion and task registration.
+        // Queue insertion is dispatch acceptance; shutdown cannot observe an
+        // accepted request without also owning its completion waiter.
+        let task = spawn()?;
+        registry.tasks.insert(execution, task);
         Ok(())
     }
 
@@ -1024,27 +1123,22 @@ impl HerdrAdapter {
         execution: muxe_core::ExecutionId,
         invocation: Invocation,
     ) -> Result<DispatchAccepted, AdapterError> {
-        // The authority joins the origin validation, schema, and exact
-        // endpoint lease used by the background write.
-        authority
+        // The authority joins origin validation, one schema validation, and
+        // the exact endpoint lease used by the queue owner.
+        let method = invocation.method;
+        let prepared = authority
             .runtime
-            .checked_metadata(invocation.method, &invocation.params)?;
+            .prepare_invocation(method, invocation.params)?;
         let results = self.dispatch_results_tx.clone();
         self.admit_dispatch_task(execution, move || {
-            tokio::spawn(async move {
-                let completion = match authority
-                    .invoke_response_with_delivery(invocation.method, invocation.params)
-                    .await
-                {
+            let receiver = authority.try_run_ordered(move |direct| async move {
+                match direct.invoke_prepared_with_delivery(prepared).await {
                     Ok(HerdrResponse::Success(_)) => DispatchCompletion::Succeeded { execution },
                     Ok(HerdrResponse::Error { code, message }) => DispatchCompletion::Failed {
                         execution,
                         error: AdapterError::new(
                             AdapterErrorKind::DispatchFailed,
-                            format!(
-                                "Herdr {} rejected request with {code}: {message}",
-                                invocation.method
-                            ),
+                            format!("Herdr {method} rejected request with {code}: {message}"),
                         ),
                     },
                     Err((error, DeliveryState::MayHaveReachedHost)) => {
@@ -1053,12 +1147,17 @@ impl HerdrAdapter {
                     Err((error, DeliveryState::NotSent)) => {
                         DispatchCompletion::Failed { execution, error }
                     }
-                };
+                }
+            })?;
+            Ok(tokio::spawn(async move {
+                let completion = HerdrRuntime::await_ordered(receiver)
+                    .await
+                    .unwrap_or_else(|error| DispatchCompletion::Failed { execution, error });
                 let _ = results.send(DispatchTerminal {
                     execution,
                     completion,
                 });
-            })
+            }))
         })?;
         Ok(DispatchAccepted {
             correlation: ExecutionCorrelationId::new(format!(
@@ -1092,39 +1191,33 @@ impl HerdrAdapter {
                     "Herdr tab:swap requires the captured origin workspace",
                 )
             })?;
-        for method in ["tab.list", "tab.move"] {
-            if authority.runtime.schema().method(method).is_none() {
-                return Err(incompatible(format!(
-                    "active Herdr schema does not declare required method {method}"
-                )));
-            }
-            if method_metadata(method).is_none() {
-                return Err(incompatible(format!(
-                    "bundled Herdr metadata does not declare required method {method}"
-                )));
-            }
-        }
+        authority
+            .runtime
+            .validate_method_set(&["tab.list", "tab.move"])?;
         let results = self.dispatch_results_tx.clone();
         self.admit_dispatch_task(execution, move || {
-            tokio::spawn(async move {
-                let completion =
-                    match perform_tab_swap(&authority, &workspace, &source_tab, target_index).await
-                    {
-                        Ok(()) => DispatchCompletion::Succeeded { execution },
-                        Err(TabSwapError::Known(message)) => DispatchCompletion::Failed {
-                            execution,
-                            error: AdapterError::new(AdapterErrorKind::DispatchFailed, message),
-                        },
-                        Err(TabSwapError::Unknown(message)) => DispatchCompletion::OutcomeUnknown {
-                            execution,
-                            error: AdapterError::new(AdapterErrorKind::OutcomeUnknown, message),
-                        },
-                    };
+            let receiver = authority.try_run_ordered(move |direct| async move {
+                match perform_tab_swap(&direct, &workspace, &source_tab, target_index).await {
+                    Ok(()) => DispatchCompletion::Succeeded { execution },
+                    Err(TabSwapError::Known(message)) => DispatchCompletion::Failed {
+                        execution,
+                        error: AdapterError::new(AdapterErrorKind::DispatchFailed, message),
+                    },
+                    Err(TabSwapError::Unknown(message)) => DispatchCompletion::OutcomeUnknown {
+                        execution,
+                        error: AdapterError::new(AdapterErrorKind::OutcomeUnknown, message),
+                    },
+                }
+            })?;
+            Ok(tokio::spawn(async move {
+                let completion = HerdrRuntime::await_ordered(receiver)
+                    .await
+                    .unwrap_or_else(|error| DispatchCompletion::Failed { execution, error });
                 let _ = results.send(DispatchTerminal {
                     execution,
                     completion,
                 });
-            })
+            }))
         })?;
         Ok(DispatchAccepted {
             correlation: ExecutionCorrelationId::new(format!(
@@ -1183,24 +1276,31 @@ impl HerdrAdapter {
         origin: &muxe_core::OriginContext,
     ) -> Result<DispatchAccepted, AdapterError> {
         let authority = self.require_current_origin(origin)?;
+        if let Some(methods) = command_creation_methods(action) {
+            authority.runtime.validate_method_set(methods)?;
+        }
         let results = self.dispatch_results_tx.clone();
         let action = action.clone();
         let origin = origin.clone();
         self.admit_dispatch_task(execution, move || {
-            tokio::spawn(async move {
-                let completion = match perform_command_creation(&authority, &action, &origin).await
-                {
+            let receiver = authority.try_run_ordered(move |direct| async move {
+                match perform_command_creation(&direct, &action, &origin).await {
                     Ok(()) => DispatchCompletion::Succeeded { execution },
                     Err(error) if error.kind == AdapterErrorKind::OutcomeUnknown => {
                         DispatchCompletion::OutcomeUnknown { execution, error }
                     }
                     Err(error) => DispatchCompletion::Failed { execution, error },
-                };
+                }
+            })?;
+            Ok(tokio::spawn(async move {
+                let completion = HerdrRuntime::await_ordered(receiver)
+                    .await
+                    .unwrap_or_else(|error| DispatchCompletion::Failed { execution, error });
                 let _ = results.send(DispatchTerminal {
                     execution,
                     completion,
                 });
-            })
+            }))
         })?;
         Ok(self.post_dismissal_accepted(execution))
     }
@@ -1310,45 +1410,23 @@ impl HerdrAdapter {
             })
             .ok_or_else(pending_cleanup_lease_stale)
     }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
-    )]
-    fn claim_pending_close(
-        &self,
-        lease: &PendingPaneLeaseId,
-        record: &PendingPaneLeaseRecord,
-    ) -> Result<(), AdapterError> {
-        let mut leases = self
-            .pending_leases
-            .lock()
-            .expect("Herdr pending lease registry is not poisoned");
-        let Some(current) = leases.get_mut(lease) else {
-            return Err(pending_cleanup_lease_stale());
-        };
-        if current == record {
-            current.close_state = PendingPaneCloseState::CloseMayHaveApplied;
-            Ok(())
-        } else {
-            Err(pending_cleanup_outcome_unknown())
-        }
-    }
-
-    fn reopen_pending_close(&self, lease: &PendingPaneLeaseId, record: &PendingPaneLeaseRecord) {
-        let mut leases = self
-            .pending_leases
-            .lock()
-            .expect("Herdr pending lease registry is not poisoned");
-        if let Some(current) = leases.get_mut(lease)
-            && current
-                == &(PendingPaneLeaseRecord {
-                    close_state: PendingPaneCloseState::CloseMayHaveApplied,
-                    ..record.clone()
-                })
-        {
-            current.close_state = PendingPaneCloseState::Open;
-        }
+}
+fn reopen_pending_close_record(
+    leases: &StdMutex<HashMap<PendingPaneLeaseId, PendingPaneLeaseRecord>>,
+    lease: &PendingPaneLeaseId,
+    record: &PendingPaneLeaseRecord,
+) {
+    let mut leases = leases
+        .lock()
+        .expect("Herdr pending lease registry is not poisoned");
+    if let Some(current) = leases.get_mut(lease)
+        && current
+            == &(PendingPaneLeaseRecord {
+                close_state: PendingPaneCloseState::CloseMayHaveApplied,
+                ..record.clone()
+            })
+    {
+        current.close_state = PendingPaneCloseState::Open;
     }
 }
 
@@ -2065,79 +2143,91 @@ impl HostAdapter for HerdrAdapter {
         lease: PendingPaneLease,
     ) -> Result<(), AdapterError> {
         let authority = self.require_lifecycle()?;
+        authority
+            .runtime
+            .validate_method_set(&["pane.get", "pane.close"])?;
         let record = self.pending_close_record(&registration, &lease, &authority.lease)?;
-        let pane = match authority
-            .invoke_response("pane.get", json!({ "pane_id": record.pane.as_str() }))
-            .await?
-        {
-            HerdrResponse::Success(pane) => pane,
-            HerdrResponse::Error { code, .. } if pane_is_proven_absent(&code) => {
-                self.pending_leases
-                    .lock()
-                    .expect("Herdr pending lease registry is not poisoned")
-                    .remove(&lease.id);
-                return Ok(());
-            }
-            HerdrResponse::Error { code, message } => {
-                return Err(host_rejection("pane.get", &code, &message));
-            }
-        };
-        if record.close_state == PendingPaneCloseState::CloseMayHaveApplied {
-            return Err(pending_cleanup_outcome_unknown());
-        }
-        let object = crate::pane_info(&pane).ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::ContextUnavailable,
-                "Herdr pane.get returned an invalid pane_info response",
-            )
-        })?;
-        if object.get("pane_id").and_then(Value::as_str) != Some(record.pane.as_str()) {
-            return Err(AdapterError::new(
-                AdapterErrorKind::ContextUnavailable,
-                "pending Herdr pane identity changed",
-            ));
-        }
-        let authority = self.require_lifecycle()?;
-        if authority.lease != record.incarnation {
-            return Err(pending_cleanup_lease_stale());
-        }
-        // Re-check immediately before the state-changing send: a lifecycle
-        // transition that raced the pane.get probe must fail the exact lease
-        // before any close byte is written.
-        let authority = self.require_lifecycle()?;
-        if authority.lease != record.incarnation {
-            return Err(pending_cleanup_lease_stale());
-        }
-        self.claim_pending_close(&lease.id, &record)?;
-        match authority
-            .invoke_response_with_delivery("pane.close", json!({ "pane_id": record.pane.as_str() }))
-            .await
-        {
-            Ok(HerdrResponse::Success(_)) => {
-                self.pending_leases
-                    .lock()
-                    .expect("Herdr pending lease registry is not poisoned")
-                    .remove(&lease.id);
-                Ok(())
-            }
-            Ok(HerdrResponse::Error { code, .. }) if pane_is_proven_absent(&code) => {
-                self.pending_leases
-                    .lock()
-                    .expect("Herdr pending lease registry is not poisoned")
-                    .remove(&lease.id);
-                Ok(())
-            }
-            Ok(HerdrResponse::Error { code, message }) => {
-                self.reopen_pending_close(&lease.id, &record);
-                Err(host_rejection("pane.close", &code, &message))
-            }
-            Err((error, delivery)) => {
-                if delivery == DeliveryState::NotSent {
-                    self.reopen_pending_close(&lease.id, &record);
+        let pending_leases = Arc::clone(&self.pending_leases);
+        let lease_id = lease.id.clone();
+        authority
+            .run_ordered(move |direct| async move {
+                let pane = match direct
+                    .invoke_response("pane.get", json!({ "pane_id": record.pane.as_str() }))
+                    .await?
+                {
+                    HerdrResponse::Success(pane) => pane,
+                    HerdrResponse::Error { code, .. } if pane_is_proven_absent(&code) => {
+                        pending_leases
+                            .lock()
+                            .expect("Herdr pending lease registry is not poisoned")
+                            .remove(&lease_id);
+                        return Ok(());
+                    }
+                    HerdrResponse::Error { code, message } => {
+                        return Err(host_rejection("pane.get", &code, &message));
+                    }
+                };
+                if record.close_state == PendingPaneCloseState::CloseMayHaveApplied {
+                    return Err(pending_cleanup_outcome_unknown());
                 }
-                Err(error)
-            }
-        }
+                let object = crate::pane_info(&pane).ok_or_else(|| {
+                    AdapterError::new(
+                        AdapterErrorKind::ContextUnavailable,
+                        "Herdr pane.get returned an invalid pane_info response",
+                    )
+                })?;
+                if object.get("pane_id").and_then(Value::as_str) != Some(record.pane.as_str()) {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::ContextUnavailable,
+                        "pending Herdr pane identity changed",
+                    ));
+                }
+                {
+                    let mut leases = pending_leases
+                        .lock()
+                        .expect("Herdr pending lease registry is not poisoned");
+                    let Some(current) = leases.get_mut(&lease_id) else {
+                        return Err(pending_cleanup_lease_stale());
+                    };
+                    if current != &record {
+                        return Err(pending_cleanup_outcome_unknown());
+                    }
+                    current.close_state = PendingPaneCloseState::CloseMayHaveApplied;
+                }
+                let response = direct
+                    .invoke_response_with_delivery(
+                        "pane.close",
+                        json!({ "pane_id": record.pane.as_str() }),
+                    )
+                    .await;
+                match response {
+                    Ok(HerdrResponse::Success(_)) => {
+                        pending_leases
+                            .lock()
+                            .expect("Herdr pending lease registry is not poisoned")
+                            .remove(&lease_id);
+                        Ok(())
+                    }
+                    Ok(HerdrResponse::Error { code, .. }) if pane_is_proven_absent(&code) => {
+                        pending_leases
+                            .lock()
+                            .expect("Herdr pending lease registry is not poisoned")
+                            .remove(&lease_id);
+                        Ok(())
+                    }
+                    Ok(HerdrResponse::Error { code, message }) => {
+                        reopen_pending_close_record(&pending_leases, &lease_id, &record);
+                        Err(host_rejection("pane.close", &code, &message))
+                    }
+                    Err((error, delivery)) => {
+                        if delivery == DeliveryState::NotSent {
+                            reopen_pending_close_record(&pending_leases, &lease_id, &record);
+                        }
+                        Err(error)
+                    }
+                }
+            })
+            .await?
     }
 
     fn release_pending_pane(&self, lease: PendingPaneLease) {
@@ -2416,14 +2506,16 @@ impl HostAdapter for HerdrAdapter {
         // Lifecycle flags and incarnation health change under one write
         // authority. An install linearized before this point is invalidated;
         // one arriving after it must observe shutdown and reject publication.
-        {
+        let runtime = {
             let mut incarnation = self
                 .incarnation
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.shutdown.store(true, Ordering::Relaxed);
             incarnation.healthy = false;
-        }
+            incarnation.runtime.retire_send_queue();
+            Arc::clone(&incarnation.runtime)
+        };
         self.complete_suspend_shutdown();
         self.resume_wake.notify_waiters();
         self.close_resumes_and_wait().await;
@@ -2452,6 +2544,7 @@ impl HostAdapter for HerdrAdapter {
         if let Some(monitor) = self.monitor.lock().await.take() {
             let _ = monitor.await;
         }
+        let queue_result = runtime.shutdown_send_queue().await;
         for (_, task) in tasks {
             let _ = task.await;
             let mut registry = self
@@ -2465,7 +2558,7 @@ impl HostAdapter for HerdrAdapter {
             .expect("retained Herdr dispatch registry is not poisoned")
             .finalized = true;
         self.dispatch_wake.notify_waiters();
-        Ok(())
+        queue_result
     }
 }
 
@@ -2589,6 +2682,10 @@ async fn park_suspended_monitor(
     // released. A reconnect path may already have dropped it; that is the
     // same proof for the lease captured by the suspend attempt.
     drop(subscription.take());
+    if let Err(error) = adapter.runtime().shutdown_send_queue().await {
+        adapter.complete_suspend(generation, SuspendPhase::HostLost(error));
+        return false;
+    }
     let published = send_health_or_shutdown(
         adapter,
         AdapterHealthEvent::Unhealthy {
@@ -2664,6 +2761,7 @@ async fn monitor_subscription(
         }
         let lost_lease = loss.lease.clone();
         drop(subscription.take());
+        let queue_error = adapter.runtime().shutdown_send_queue().await.err();
         adapter
             .pending_leases
             .lock()
@@ -2676,7 +2774,7 @@ async fn monitor_subscription(
             &adapter,
             AdapterHealthEvent::Unhealthy {
                 modal_scope: None,
-                error: loss.error,
+                error: queue_error.unwrap_or(loss.error),
             },
         )
         .await
@@ -3303,7 +3401,7 @@ fn creation_requires_post_dismissal(action: &PortableAction) -> Result<bool, Ada
 }
 
 async fn perform_command_creation(
-    authority: &IncarnationAuthority,
+    authority: &IncarnationTransactionAuthority,
     action: &PortableAction,
     origin: &muxe_core::OriginContext,
 ) -> Result<(), AdapterError> {
@@ -3451,7 +3549,7 @@ enum TabSwapError {
 }
 
 async fn perform_tab_swap(
-    authority: &IncarnationAuthority,
+    authority: &IncarnationTransactionAuthority,
     workspace: &str,
     source_tab: &str,
     target_index: u64,
@@ -3514,7 +3612,7 @@ async fn perform_tab_swap(
 }
 
 async fn request_tab_swap(
-    authority: &IncarnationAuthority,
+    authority: &IncarnationTransactionAuthority,
     method: &str,
     params: Value,
     phase: &str,

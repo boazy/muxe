@@ -7,7 +7,10 @@ use muxe_adapter_api::{AdapterError, AdapterErrorKind};
 use muxe_core::{PaneId, TabId, WorkspaceId};
 use serde_json::{Map, Value, json};
 
-use crate::{HerdrResponse, HerdrRuntime, runtime::HerdrRequestAuthority};
+use crate::{
+    HerdrResponse, HerdrRuntime,
+    runtime::{HerdrRequestAuthority, IncarnationEpoch, RuntimeTransactionAuthority},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiSplitDirection {
@@ -289,7 +292,14 @@ pub async fn open_command_pane(
     runtime: &HerdrRuntime,
     launch: CommandPaneLaunch,
 ) -> Result<CommandPanePlacement, AdapterError> {
-    open_command_pane_with(runtime, launch).await
+    runtime.validate_method_set(&["layout.apply", "pane.move", "tab.close"])?;
+    let lease = runtime.lease(IncarnationEpoch::INITIAL);
+    runtime
+        .run_ordered(move |invoker| async move {
+            let authority = RuntimeTransactionAuthority::new(invoker, lease);
+            open_command_pane_with(&authority, launch).await
+        })
+        .await?
 }
 
 pub(crate) async fn open_command_pane_with(
@@ -389,7 +399,14 @@ pub async fn open_command_tab(
     runtime: &HerdrRuntime,
     launch: CommandTabLaunch,
 ) -> Result<(), AdapterError> {
-    open_command_tab_with(runtime, launch).await
+    runtime.validate_method_set(&["layout.apply"])?;
+    let lease = runtime.lease(IncarnationEpoch::INITIAL);
+    runtime
+        .run_ordered(move |invoker| async move {
+            let authority = RuntimeTransactionAuthority::new(invoker, lease);
+            open_command_tab_with(&authority, launch).await
+        })
+        .await?
 }
 
 pub(crate) async fn open_command_tab_with(
@@ -494,7 +511,15 @@ pub async fn move_prepared_ui_pane(
     launch: &UiPaneLaunch,
     prepared: PreparedUiPane,
 ) -> Result<UiPanePlacement, AdapterError> {
-    move_prepared_ui_pane_with(runtime, launch, prepared).await
+    runtime.validate_method_set(&["pane.move", "tab.close"])?;
+    let lease = runtime.lease(IncarnationEpoch::INITIAL);
+    let launch = launch.clone();
+    runtime
+        .run_ordered(move |invoker| async move {
+            let authority = RuntimeTransactionAuthority::new(invoker, lease);
+            move_prepared_ui_pane_with(&authority, &launch, prepared).await
+        })
+        .await?
 }
 
 pub(crate) async fn move_prepared_ui_pane_with(

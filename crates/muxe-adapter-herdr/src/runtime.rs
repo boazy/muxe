@@ -1,8 +1,14 @@
 use std::{
+    any::Any,
     fmt,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -12,6 +18,8 @@ use serde_json::{Map, Value};
 use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
+    sync::{Mutex, mpsc, oneshot, watch},
+    task::JoinHandle,
 };
 
 use crate::{
@@ -31,6 +39,389 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SCHEMA_BYTES: u64 = 8 * 1024 * 1024;
 /// Retained stderr bytes for failure diagnostics; the remainder is discarded.
 const MAX_DIAGNOSTIC_BYTES: u64 = 8 * 1024;
+/// Maximum number of accepted unary transactions waiting behind the active
+/// transaction for one exact Herdr runtime incarnation.
+const SEND_QUEUE_CAPACITY: usize = 64;
+
+type ErasedOutput = Box<dyn Any + Send + 'static>;
+type OrderedFuture = Pin<Box<dyn Future<Output = ErasedOutput> + Send + 'static>>;
+type OrderedRun = Box<dyn FnOnce(GuardedHerdrInvoker) -> OrderedFuture + Send + 'static>;
+type OrderedFinish = Box<dyn FnOnce(Result<ErasedOutput, QueueExecutionError>) + Send + 'static>;
+
+struct OrderedJob {
+    run: OrderedRun,
+    finish: OrderedFinish,
+}
+
+#[derive(Debug)]
+pub(crate) enum QueueExecutionError {
+    Panicked(String),
+    TypeMismatch,
+}
+
+impl QueueExecutionError {
+    fn into_adapter_error(self) -> AdapterError {
+        let message = match self {
+            Self::Panicked(message) => {
+                format!("Herdr ordered transaction panicked internally: {message}")
+            }
+            Self::TypeMismatch => {
+                "Herdr send-queue owner produced an invalid internal result type".to_owned()
+            }
+        };
+        AdapterError::new(AdapterErrorKind::Unavailable, message)
+    }
+}
+pub(crate) type OrderedReceiver<T> = oneshot::Receiver<Result<T, QueueExecutionError>>;
+
+pub(crate) struct PreparedInvocation {
+    metadata: &'static MethodMetadata,
+    params: Value,
+}
+
+struct QueueLifecycle {
+    admission_open: StdMutex<bool>,
+    retirement_tx: watch::Sender<bool>,
+}
+
+impl QueueLifecycle {
+    fn new() -> Arc<Self> {
+        let (retirement_tx, _) = watch::channel(false);
+        Arc::new(Self {
+            admission_open: StdMutex::new(true),
+            retirement_tx,
+        })
+    }
+
+    fn is_open(&self) -> bool {
+        *self
+            .admission_open
+            .lock()
+            .expect("Herdr send-queue admission lock is not poisoned")
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.retirement_tx.subscribe()
+    }
+
+    /// Returns true only for the transition that closes admission.
+    fn retire(&self) -> bool {
+        let mut open = self
+            .admission_open
+            .lock()
+            .expect("Herdr send-queue admission lock is not poisoned");
+        if !*open {
+            return false;
+        }
+        *open = false;
+        let _ = self.retirement_tx.send(true);
+        true
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GuardedHerdrInvoker {
+    client: Arc<HerdrSocketClient>,
+    schema: Arc<ApiSchema>,
+    expected: EndpointContinuityToken,
+    lifecycle: Arc<QueueLifecycle>,
+    replacement_reported: Arc<AtomicBool>,
+}
+
+pub(crate) struct ClassifiedInvokeError {
+    pub(crate) error: AdapterError,
+    pub(crate) delivery: DeliveryState,
+    pub(crate) continuity_lost: bool,
+}
+
+impl GuardedHerdrInvoker {
+    #[expect(
+        clippy::result_large_err,
+        reason = "prepared invocation preserves the adapter's shared error type"
+    )]
+    pub(crate) fn prepare(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<PreparedInvocation, AdapterError> {
+        let metadata = checked_metadata(&self.schema, method, &params)?;
+        Ok(PreparedInvocation { metadata, params })
+    }
+
+    pub(crate) async fn invoke_prepared(
+        &self,
+        lease: &IncarnationLease,
+        invocation: PreparedInvocation,
+    ) -> Result<HerdrResponse, ClassifiedInvokeError> {
+        self.invoke_prepared_deadline(lease, invocation, None).await
+    }
+
+    pub(crate) async fn invoke_prepared_with_timeout(
+        &self,
+        lease: &IncarnationLease,
+        invocation: PreparedInvocation,
+        timeout: Duration,
+    ) -> Result<HerdrResponse, ClassifiedInvokeError> {
+        self.invoke_prepared_deadline(lease, invocation, Some(timeout))
+            .await
+    }
+
+    async fn invoke_prepared_deadline(
+        &self,
+        lease: &IncarnationLease,
+        invocation: PreparedInvocation,
+        timeout: Option<Duration>,
+    ) -> Result<HerdrResponse, ClassifiedInvokeError> {
+        if !self.lifecycle.is_open() {
+            return Err(retired_before_send());
+        }
+        if self.expected.proven_replacement(&lease.expected) {
+            self.lifecycle.retire();
+            let continuity_lost = !self.replacement_reported.swap(true, Ordering::AcqRel);
+            return Err(ClassifiedInvokeError {
+                error: socket_error(&SocketError::EndpointReplaced {
+                    socket: self.client.socket().to_path_buf(),
+                }),
+                delivery: DeliveryState::NotSent,
+                continuity_lost,
+            });
+        }
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let retirement = lifecycle.subscribe();
+        let result = match timeout {
+            Some(timeout) => {
+                self.client
+                    .unary_on_expected_token_guarded_with_timeout(
+                        invocation.metadata,
+                        invocation.params,
+                        &lease.expected,
+                        timeout,
+                        retirement,
+                        move || {
+                            lifecycle.retire();
+                        },
+                    )
+                    .await
+            }
+            None => {
+                self.client
+                    .unary_on_expected_token_guarded(
+                        invocation.metadata,
+                        invocation.params,
+                        &lease.expected,
+                        retirement,
+                        move || {
+                            lifecycle.retire();
+                        },
+                    )
+                    .await
+            }
+        };
+        result.map_err(|error| {
+            let continuity_lost = matches!(error, SocketError::EndpointReplaced { .. })
+                && !self.replacement_reported.swap(true, Ordering::AcqRel);
+            ClassifiedInvokeError {
+                error: socket_error(&error),
+                delivery: error.delivery(),
+                continuity_lost,
+            }
+        })
+    }
+}
+
+fn retired_before_send() -> ClassifiedInvokeError {
+    ClassifiedInvokeError {
+        error: AdapterError::new(
+            AdapterErrorKind::Unavailable,
+            "Herdr runtime incarnation retired before the request was sent",
+        ),
+        delivery: DeliveryState::NotSent,
+        continuity_lost: false,
+    }
+}
+
+struct QueueCompletion {
+    finished: AtomicBool,
+    notify: tokio::sync::Notify,
+    owner_failure: StdMutex<Option<String>>,
+}
+
+struct OwnerCompletionGuard(Arc<QueueCompletion>);
+
+impl Drop for OwnerCompletionGuard {
+    fn drop(&mut self) {
+        self.0.finished.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
+}
+
+struct SendQueue {
+    tx: mpsc::Sender<OrderedJob>,
+    lifecycle: Arc<QueueLifecycle>,
+    owner: Mutex<Option<JoinHandle<()>>>,
+    completion: Arc<QueueCompletion>,
+}
+
+struct QueueReservation {
+    queue: Arc<SendQueue>,
+    permit: Option<mpsc::OwnedPermit<OrderedJob>>,
+}
+
+impl QueueReservation {
+    #[expect(
+        clippy::result_large_err,
+        reason = "queue admission uses the adapter's shared error type at its internal boundary"
+    )]
+    fn submit(mut self, job: OrderedJob) -> Result<(), AdapterError> {
+        let open = self
+            .queue
+            .lifecycle
+            .admission_open
+            .lock()
+            .expect("Herdr send-queue admission lock is not poisoned");
+        if !*open {
+            return Err(queue_closed());
+        }
+        self.permit
+            .take()
+            .expect("Herdr queue reservation is consumed once")
+            .send(job);
+        Ok(())
+    }
+}
+
+impl SendQueue {
+    fn start(invoker: GuardedHerdrInvoker, lifecycle: Arc<QueueLifecycle>) -> Arc<Self> {
+        let (tx, mut rx) = mpsc::channel::<OrderedJob>(SEND_QUEUE_CAPACITY);
+        let mut retirement = lifecycle.subscribe();
+        let completion = Arc::new(QueueCompletion {
+            finished: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+            owner_failure: StdMutex::new(None),
+        });
+        let worker_invoker = invoker;
+        let worker_completion = Arc::clone(&completion);
+        let owner = tokio::spawn(async move {
+            let _completion_guard = OwnerCompletionGuard(worker_completion);
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = retirement.changed() => {
+                        if changed.is_err() || *retirement.borrow() {
+                            rx.close();
+                            while let Some(job) = rx.recv().await {
+                                execute_ordered_job(job, worker_invoker.clone()).await;
+                            }
+                            break;
+                        }
+                    }
+                    job = rx.recv() => {
+                        let Some(job) = job else {
+                            break;
+                        };
+                        execute_ordered_job(job, worker_invoker.clone()).await;
+                    }
+                }
+            }
+        });
+        Arc::new(Self {
+            tx,
+            lifecycle,
+            owner: Mutex::new(Some(owner)),
+            completion,
+        })
+    }
+
+    async fn reserve(self: &Arc<Self>) -> Result<QueueReservation, AdapterError> {
+        let permit = self
+            .tx
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| queue_closed())?;
+        Ok(QueueReservation {
+            queue: Arc::clone(self),
+            permit: Some(permit),
+        })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "queue admission uses the adapter's shared error type at its internal boundary"
+    )]
+    fn try_reserve(self: &Arc<Self>) -> Result<QueueReservation, AdapterError> {
+        let permit = self
+            .tx
+            .clone()
+            .try_reserve_owned()
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "Herdr send queue is full; request was not accepted",
+                ),
+                mpsc::error::TrySendError::Closed(_) => queue_closed(),
+            })?;
+        Ok(QueueReservation {
+            queue: Arc::clone(self),
+            permit: Some(permit),
+        })
+    }
+
+    fn retire(&self) {
+        self.lifecycle.retire();
+    }
+
+    async fn join(&self) -> Result<(), AdapterError> {
+        self.retire();
+        let mut owner = self.owner.lock().await;
+        if let Some(handle) = owner.take()
+            && let Err(error) = handle.await
+        {
+            *self
+                .completion
+                .owner_failure
+                .lock()
+                .expect("Herdr queue completion lock is not poisoned") = Some(error.to_string());
+        }
+        drop(owner);
+        while !self.completion.finished.load(Ordering::Acquire) {
+            let finished = self.completion.notify.notified();
+            if self.completion.finished.load(Ordering::Acquire) {
+                break;
+            }
+            finished.await;
+        }
+        if let Some(error) = self
+            .completion
+            .owner_failure
+            .lock()
+            .expect("Herdr queue completion lock is not poisoned")
+            .clone()
+        {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                format!("Herdr send-queue owner failed: {error}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn execute_ordered_job(job: OrderedJob, invoker: GuardedHerdrInvoker) {
+    let OrderedJob { run, finish } = job;
+    let outcome = tokio::spawn(async move { run(invoker).await }).await;
+    match outcome {
+        Ok(output) => finish(Ok(output)),
+        Err(error) => finish(Err(QueueExecutionError::Panicked(error.to_string()))),
+    }
+}
+
+fn queue_closed() -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::Shutdown,
+        "Herdr runtime send queue is closed",
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HerdrAdapterConfig {
@@ -109,6 +500,7 @@ pub struct HerdrRuntime {
     identity: HostIdentity,
     expected: EndpointContinuityToken,
     server_version: HerdrServerVersion,
+    send_queue: Arc<SendQueue>,
 }
 impl HerdrRuntime {
     /// Acquires one runtime schema from the configured executable, verifies protocol compatibility,
@@ -126,14 +518,14 @@ impl HerdrRuntime {
 
         let client = Arc::new(HerdrSocketClient::new(config.socket_path.clone()));
         let (identity, expected, server_version) = establish_live_identity(&client).await?;
-        Ok(Self {
+        Ok(Self::from_parts(
             client,
             schema,
             schema_cache_hit,
             identity,
             expected,
             server_version,
-        })
+        ))
     }
 
     /// Establishes a retained event subscription guarded by this runtime's
@@ -164,14 +556,14 @@ impl HerdrRuntime {
             )
             .expect("bundled schema parses"),
         );
-        Ok(Self {
+        Ok(Self::from_parts(
             client,
             schema,
-            schema_cache_hit: false,
+            false,
             identity,
             expected,
             server_version,
-        })
+        ))
     }
 
     #[must_use]
@@ -220,38 +612,28 @@ impl HerdrRuntime {
         }
         self.client.connect_on_expected_token(&lease.expected).await
     }
-    pub(crate) async fn invoke_response_on_lease(
-        &self,
-        lease: &IncarnationLease,
-        metadata: &MethodMetadata,
-        params: Value,
-    ) -> Result<HerdrResponse, SocketError> {
-        if self.lease(lease.epoch()) != *lease {
-            return Err(SocketError::EndpointReplaced {
-                socket: self.client.socket().to_path_buf(),
-            });
-        }
-        self.client
-            .unary_on_expected_token(metadata, params, &lease.expected)
-            .await
-    }
-
-    /// Validates and sends one unary request only to this runtime's observed
-    /// endpoint incarnation.
+    /// Validates once, accepts, and executes one unary against this exact
+    /// runtime incarnation. Ordinary response processing waits for the
+    /// schema-valid host operation to complete while the runtime stays live;
+    /// retirement remains immediately cancellation-selectable.
     ///
     /// # Errors
     ///
     /// Returns [`AdapterError`] for schema/metadata incompatibility, a proved
-    /// endpoint replacement before write, transport failure, or invalid reply.
+    /// endpoint replacement before write, transport failure, retirement, or an
+    /// invalid reply.
     pub async fn invoke_response(
         &self,
         method: &str,
         params: Value,
     ) -> Result<HerdrResponse, AdapterError> {
-        let metadata = self.checked_metadata(method, &params)?;
-        self.invoke_response_on_lease(&self.lease(IncarnationEpoch::INITIAL), metadata, params)
-            .await
-            .map_err(|error| socket_error(&error))
+        let invocation = self.prepare_invocation(method, params)?;
+        let lease = self.lease(IncarnationEpoch::INITIAL);
+        self.run_ordered(
+            move |invoker| async move { invoker.invoke_prepared(&lease, invocation).await },
+        )
+        .await?
+        .map_err(|error| error.error)
     }
 
     /// Timeout variant of [`Self::invoke_response`]. The expected-incarnation
@@ -267,17 +649,15 @@ impl HerdrRuntime {
         params: Value,
         timeout: Duration,
     ) -> Result<HerdrResponse, AdapterError> {
-        let metadata = self.checked_metadata(method, &params)?;
+        let invocation = self.prepare_invocation(method, params)?;
         let lease = self.lease(IncarnationEpoch::INITIAL);
-        if self.lease(lease.epoch()) != lease {
-            return Err(socket_error(&SocketError::EndpointReplaced {
-                socket: self.client.socket().to_path_buf(),
-            }));
-        }
-        self.client
-            .unary_on_expected_token_with_timeout(metadata, params, &lease.expected, timeout)
-            .await
-            .map_err(|error| socket_error(&error))
+        self.run_ordered(move |invoker| async move {
+            invoker
+                .invoke_prepared_with_timeout(&lease, invocation, timeout)
+                .await
+        })
+        .await?
+        .map_err(|error| error.error)
     }
 
     /// Returns the success payload of a guarded unary request.
@@ -305,14 +685,165 @@ impl HerdrRuntime {
         method: &str,
         params: &Value,
     ) -> Result<&'static MethodMetadata, AdapterError> {
-        self.schema
-            .validate_method(method, params)
-            .map_err(|error| {
-                incompatible(format!("active Herdr schema rejects {method}: {error}"))
-            })?;
-        method_metadata(method).ok_or_else(|| {
-            incompatible(format!("bundled Herdr metadata does not declare {method}"))
-        })
+        checked_metadata(&self.schema, method, params)
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "method-set validation preserves the adapter's shared error type"
+    )]
+    pub(crate) fn validate_method_set(&self, methods: &[&str]) -> Result<(), AdapterError> {
+        for method in methods {
+            if self.schema.method(method).is_none() {
+                return Err(incompatible(format!(
+                    "active Herdr schema does not declare required method {method}"
+                )));
+            }
+            if method_metadata(method).is_none() {
+                return Err(incompatible(format!(
+                    "bundled Herdr metadata does not declare required method {method}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "prepared invocation preserves the adapter's shared error type"
+    )]
+    pub(crate) fn prepare_invocation(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<PreparedInvocation, AdapterError> {
+        let metadata = self.checked_metadata(method, &params)?;
+        Ok(PreparedInvocation { metadata, params })
+    }
+
+    pub(crate) async fn run_ordered<T, F, Fut>(&self, operation: F) -> Result<T, AdapterError>
+    where
+        T: Send + 'static,
+        F: FnOnce(GuardedHerdrInvoker) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let reservation = self.send_queue.reserve().await?;
+        let receiver = submit_ordered(reservation, operation)?;
+        Self::await_ordered(receiver).await
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "ordered invocation preserves the adapter's shared error type"
+    )]
+    pub(crate) fn try_run_ordered<T, F, Fut>(
+        &self,
+        operation: F,
+    ) -> Result<OrderedReceiver<T>, AdapterError>
+    where
+        T: Send + 'static,
+        F: FnOnce(GuardedHerdrInvoker) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        submit_ordered(self.send_queue.try_reserve()?, operation)
+    }
+    pub(crate) async fn await_ordered<T>(receiver: OrderedReceiver<T>) -> Result<T, AdapterError> {
+        receiver
+            .await
+            .map_err(|_| {
+                AdapterError::new(
+                    AdapterErrorKind::Shutdown,
+                    "Herdr send-queue owner stopped before completing accepted work",
+                )
+            })?
+            .map_err(QueueExecutionError::into_adapter_error)
+    }
+
+    pub(crate) fn retire_send_queue(&self) {
+        self.send_queue.retire();
+    }
+
+    pub(crate) async fn shutdown_send_queue(&self) -> Result<(), AdapterError> {
+        self.send_queue.join().await
+    }
+
+    fn from_parts(
+        client: Arc<HerdrSocketClient>,
+        schema: Arc<ApiSchema>,
+        schema_cache_hit: bool,
+        identity: HostIdentity,
+        expected: EndpointContinuityToken,
+        server_version: HerdrServerVersion,
+    ) -> Self {
+        let lifecycle = QueueLifecycle::new();
+        let invoker = GuardedHerdrInvoker {
+            client: Arc::clone(&client),
+            schema: Arc::clone(&schema),
+            expected: expected.clone(),
+            lifecycle: Arc::clone(&lifecycle),
+            replacement_reported: Arc::new(AtomicBool::new(false)),
+        };
+        Self {
+            client,
+            schema,
+            schema_cache_hit,
+            identity,
+            expected,
+            server_version,
+            send_queue: SendQueue::start(invoker, lifecycle),
+        }
+    }
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "ordered invocation preserves the adapter's shared error type"
+)]
+fn submit_ordered<T, F, Fut>(
+    reservation: QueueReservation,
+    operation: F,
+) -> Result<OrderedReceiver<T>, AdapterError>
+where
+    T: Send + 'static,
+    F: FnOnce(GuardedHerdrInvoker) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+{
+    let (result_tx, result_rx) = oneshot::channel();
+    let job = OrderedJob {
+        run: Box::new(move |invoker| {
+            Box::pin(async move { Box::new(operation(invoker).await) as ErasedOutput })
+        }),
+        finish: Box::new(move |outcome| {
+            let typed = outcome.and_then(|output| {
+                output
+                    .downcast::<T>()
+                    .map(|value| *value)
+                    .map_err(|_| QueueExecutionError::TypeMismatch)
+            });
+            let _ = result_tx.send(typed);
+        }),
+    };
+    reservation.submit(job)?;
+    Ok(result_rx)
+}
+
+pub(crate) struct RuntimeTransactionAuthority {
+    invoker: GuardedHerdrInvoker,
+    lease: IncarnationLease,
+}
+
+impl RuntimeTransactionAuthority {
+    pub(crate) fn new(invoker: GuardedHerdrInvoker, lease: IncarnationLease) -> Self {
+        Self { invoker, lease }
+    }
+}
+
+#[async_trait]
+impl HerdrRequestAuthority for RuntimeTransactionAuthority {
+    async fn request(&self, method: &str, params: Value) -> Result<HerdrResponse, AdapterError> {
+        let invocation = self.invoker.prepare(method, params)?;
+        self.invoker
+            .invoke_prepared(&self.lease, invocation)
+            .await
+            .map_err(|error| error.error)
     }
 }
 
@@ -567,6 +1098,22 @@ fn identity_from_ping_result(
     Ok((identity, version))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+)]
+fn checked_metadata(
+    schema: &ApiSchema,
+    method: &str,
+    params: &Value,
+) -> Result<&'static MethodMetadata, AdapterError> {
+    schema
+        .validate_method(method, params)
+        .map_err(|error| incompatible(format!("active Herdr schema rejects {method}: {error}")))?;
+    method_metadata(method)
+        .ok_or_else(|| incompatible(format!("bundled Herdr metadata does not declare {method}")))
+}
+
 fn socket_error(error: &SocketError) -> AdapterError {
     AdapterError::new(
         if error.delivery() == DeliveryState::MayHaveReachedHost {
@@ -680,14 +1227,14 @@ mod tests {
         let (identity, expected, server_version) =
             establish_live_identity(client.as_ref()).await.unwrap();
         server_a.await.unwrap();
-        let runtime = HerdrRuntime {
+        let runtime = HerdrRuntime::from_parts(
             client,
-            schema: test_schema(),
-            schema_cache_hit: false,
+            test_schema(),
+            false,
             identity,
             expected,
             server_version,
-        };
+        );
 
         std::fs::remove_file(&path).unwrap();
         let listener_b = UnixListener::bind(&path).unwrap();
@@ -703,11 +1250,191 @@ mod tests {
                 .message
                 .contains("replaced before the request was sent")
         );
+        let after = runtime
+            .invoke_response("ping", Value::Object(Map::new()))
+            .await
+            .expect_err("standalone runtime admission stays closed after replacement");
+        assert_eq!(after.kind, AdapterErrorKind::Shutdown);
         assert!(
             server_b.await.unwrap().is_empty(),
             "guarded runtime sends zero request bytes to the replacement"
         );
         drop(listener_a);
+    }
+
+    #[tokio::test]
+    async fn retirement_linearizes_against_reserved_and_future_admission() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("herdr.sock");
+        let listener = Arc::new(UnixListener::bind(&path).unwrap());
+        let server = tokio::spawn(answer_ping(Arc::clone(&listener)));
+        let client = Arc::new(HerdrSocketClient::new(path));
+        let (identity, expected, server_version) =
+            establish_live_identity(client.as_ref()).await.unwrap();
+        server.await.unwrap();
+        let runtime = HerdrRuntime::from_parts(
+            client,
+            test_schema(),
+            false,
+            identity,
+            expected,
+            server_version,
+        );
+
+        let accepted = runtime
+            .try_run_ordered(|_| async { 7_u8 })
+            .expect("work accepted before retirement");
+        let reserved = runtime
+            .send_queue
+            .try_reserve()
+            .expect("capacity reserved before retirement");
+        runtime.retire_send_queue();
+        let raced = submit_ordered(reserved, |_| async { 8_u8 })
+            .expect_err("a pre-retirement reservation cannot submit after retirement");
+        assert_eq!(raced.kind, AdapterErrorKind::Shutdown);
+        let after = runtime
+            .try_run_ordered(|_| async { 9_u8 })
+            .expect_err("future admission remains closed after retirement");
+        assert_eq!(after.kind, AdapterErrorKind::Shutdown);
+        assert_eq!(
+            HerdrRuntime::await_ordered(accepted).await.unwrap(),
+            7,
+            "accepted-before-retirement work remains owned"
+        );
+        tokio::time::timeout(Duration::from_secs(2), runtime.shutdown_send_queue())
+            .await
+            .expect("retired owner joins within two seconds")
+            .expect("retired owner exits normally");
+        drop(listener);
+    }
+    #[tokio::test]
+    async fn cancellation_while_internal_queue_is_full_never_accepts_work() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("herdr.sock");
+        let listener = Arc::new(UnixListener::bind(&path).unwrap());
+        let server = tokio::spawn(answer_ping(Arc::clone(&listener)));
+        let client = Arc::new(HerdrSocketClient::new(path));
+        let (identity, expected, server_version) =
+            establish_live_identity(client.as_ref()).await.unwrap();
+        server.await.unwrap();
+        let runtime = HerdrRuntime::from_parts(
+            client,
+            test_schema(),
+            false,
+            identity,
+            expected,
+            server_version,
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let active = runtime
+            .try_run_ordered({
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move |_| async move {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            })
+            .expect("active transaction is accepted");
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("queue owner starts the active transaction");
+
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut accepted = Vec::new();
+        loop {
+            let ran = Arc::clone(&ran);
+            match runtime.try_run_ordered(move |_| async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+            }) {
+                Ok(receiver) => accepted.push(receiver),
+                Err(error) => {
+                    assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+                    assert!(error.message.contains("queue is full"));
+                    break;
+                }
+            }
+        }
+        assert!(!accepted.is_empty(), "bounded queue accepts waiting work");
+
+        let cancelled_ran = Arc::new(AtomicBool::new(false));
+        let mut cancelled = Box::pin(runtime.run_ordered({
+            let cancelled_ran = Arc::clone(&cancelled_ran);
+            move |_| async move {
+                cancelled_ran.store(true, Ordering::SeqCst);
+            }
+        }));
+        std::future::poll_fn(|context| match cancelled.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(_) => {
+                panic!("full-queue work completed before capacity became available")
+            }
+        })
+        .await;
+        drop(cancelled);
+
+        let accepted_count = accepted.len();
+        release.notify_one();
+        HerdrRuntime::await_ordered(active)
+            .await
+            .expect("active transaction completes");
+        for receiver in accepted {
+            HerdrRuntime::await_ordered(receiver)
+                .await
+                .expect("accepted waiting transaction completes");
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), accepted_count);
+        assert!(
+            !cancelled_ran.load(Ordering::SeqCst),
+            "dropping a reserve waiter before admission sends no work to the owner"
+        );
+        runtime
+            .shutdown_send_queue()
+            .await
+            .expect("queue owner exits normally");
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn panicking_transaction_has_typed_terminal_and_owner_continues() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("herdr.sock");
+        let listener = Arc::new(UnixListener::bind(&path).unwrap());
+        let server = tokio::spawn(answer_ping(Arc::clone(&listener)));
+        let client = Arc::new(HerdrSocketClient::new(path));
+        let (identity, expected, server_version) =
+            establish_live_identity(client.as_ref()).await.unwrap();
+        server.await.unwrap();
+        let runtime = HerdrRuntime::from_parts(
+            client,
+            test_schema(),
+            false,
+            identity,
+            expected,
+            server_version,
+        );
+
+        let panicked: Result<(), AdapterError> = runtime
+            .run_ordered(|_| async {
+                panic!("deterministic queued transaction panic");
+            })
+            .await;
+        let error = panicked.expect_err("panicking work gets a typed terminal");
+        assert_eq!(error.kind, AdapterErrorKind::Unavailable);
+        assert!(error.message.contains("panicked internally"));
+        assert_eq!(
+            runtime
+                .run_ordered(|_| async { 42_u8 })
+                .await
+                .expect("owner continues after isolated transaction panic"),
+            42
+        );
+        tokio::time::timeout(Duration::from_secs(2), runtime.shutdown_send_queue())
+            .await
+            .expect("queue join returns within two seconds")
+            .expect("queue owner exits normally after transaction panic");
+        drop(listener);
     }
 
     /// The timeout path owns one concrete nonterminating schema child, kills it, and reaps it
