@@ -13,9 +13,11 @@ use async_trait::async_trait;
 use muxe_adapter_api::{
     AdapterCapabilities, AdapterError, AdapterErrorKind, AdapterHealthEvent, CaptureLease,
     CaptureReleaseReason, CaptureRequest, DispatchAccepted, DispatchCompletion,
-    ExecutionCorrelationId, HostAdapter, HostIdentity, KeyboardCapabilities, ModalScopeId,
-    NativeDispatchRequest, OriginCaptureRequest, PendingPaneLease, PendingPaneLeaseId,
-    PendingPaneRegistration, PortableDispatchRequest, PostDismissalPortableDispatchRequest,
+    ExecutionCorrelationId, HostAdapter, HostContinuityEpoch, HostIdentity, HostSchemaFingerprint,
+    KeyboardCapabilities, ModalScopeId, NativeCompatibilityIdentity, NativeCompatibilityOutcome,
+    NativeCompatibilitySnapshot, NativeCompatibilityValidator, NativeDispatchRequest,
+    OriginCaptureRequest, PendingPaneLease, PendingPaneLeaseId, PendingPaneRegistration,
+    PortableDispatchRequest, PostDismissalPortableDispatchRequest,
 };
 use muxe_core::{
     ActionScalar, ActionValidation, ActionValidator, ConfigDiagnostic, ConfigValueKind,
@@ -125,6 +127,25 @@ pub struct HerdrConfigValidator {
     schema: Arc<ApiSchema>,
 }
 
+#[derive(Clone, Debug)]
+struct HerdrNativeCompatibilityValidator {
+    schema: Arc<ApiSchema>,
+    cache: HerdrCache,
+}
+
+impl NativeCompatibilityValidator for HerdrNativeCompatibilityValidator {
+    fn validate_native(&self, candidate: &NativeActionCandidate) -> NativeCompatibilityOutcome {
+        match validate_native_batch_cached(&self.schema, &self.cache, &[candidate]) {
+            Ok(mut validations) => NativeCompatibilityOutcome::Compatible(
+                validations
+                    .pop()
+                    .expect("one candidate produces one compatibility validation"),
+            ),
+            Err(diagnostics) => NativeCompatibilityOutcome::Blocked(diagnostics),
+        }
+    }
+}
+
 impl HerdrConfigValidator {
     /// Loads the installed schema through the bounded owned-child path without
     /// probing or subscribing to a Herdr socket.
@@ -167,6 +188,7 @@ async fn wait_on_hook(hook: &StdMutex<Option<Arc<WaitHook>>>) {
 struct IncarnationState {
     runtime: Arc<HerdrRuntime>,
     epoch: IncarnationEpoch,
+    continuity: HostContinuityEpoch,
     healthy: bool,
 }
 impl IncarnationState {
@@ -177,6 +199,10 @@ impl IncarnationState {
         }
         self.healthy = false;
         self.epoch = self.epoch.next();
+        self.continuity = self
+            .continuity
+            .successor()
+            .expect("Herdr continuity epoch exhausted");
         true
     }
 
@@ -184,7 +210,8 @@ impl IncarnationState {
         &mut self,
         runtime: Arc<HerdrRuntime>,
         lease: &IncarnationLease,
-    ) -> Option<(HostIdentity, HostIdentity)> {
+        compatibility: NativeCompatibilitySnapshot,
+    ) -> Option<(HostIdentity, HostIdentity, NativeCompatibilitySnapshot)> {
         if self.healthy || self.epoch != lease.epoch() || runtime.lease(self.epoch) != *lease {
             return None;
         }
@@ -192,7 +219,7 @@ impl IncarnationState {
         let current = runtime.identity().clone();
         self.runtime = runtime;
         self.healthy = true;
-        Some((previous, current))
+        Some((previous, current, compatibility))
     }
 }
 
@@ -247,6 +274,21 @@ impl IncarnationAuthority {
             HerdrResponse::Success(result) => Ok(result),
             HerdrResponse::Error { code, message } => Err(host_rejection(method, &code, &message)),
         }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
+    fn verify_endpoint_file(&self) -> Result<(), AdapterError> {
+        self.runtime
+            .verify_endpoint_file(&self.lease)
+            .inspect_err(|error| {
+                let _ = self.continuity_loss_tx.send(ContinuityLoss {
+                    lease: self.lease.clone(),
+                    error: error.clone(),
+                });
+            })
     }
 
     async fn run_ordered<T, F, Fut>(&self, operation: F) -> Result<T, AdapterError>
@@ -448,6 +490,7 @@ impl HerdrAdapter {
             incarnation: RwLock::new(IncarnationState {
                 runtime,
                 epoch: IncarnationEpoch::INITIAL,
+                continuity: HostContinuityEpoch::initial(),
                 healthy: true,
             }),
             config,
@@ -568,10 +611,18 @@ impl HerdrAdapter {
         if self.shutdown.load(Ordering::Relaxed) || self.suspended.load(Ordering::SeqCst) {
             return IncarnationInstallOutcome::LifecycleChanged;
         }
-        let Some((previous, current)) = incarnation.install(runtime, lease) else {
+        let compatibility =
+            native_compatibility_snapshot(&runtime, incarnation.continuity, &self.cache);
+        let Some((previous, current, compatibility)) =
+            incarnation.install(runtime, lease, compatibility)
+        else {
             return IncarnationInstallOutcome::Retry;
         };
-        permit.send(AdapterHealthEvent::Reconnected { previous, current });
+        permit.send(AdapterHealthEvent::Reconnected {
+            previous,
+            current,
+            compatibility,
+        });
         IncarnationInstallOutcome::Installed
     }
 
@@ -1020,89 +1071,8 @@ impl HerdrAdapter {
         &self,
         candidates: &[&NativeActionCandidate],
     ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
         let runtime = self.runtime();
-        let structural = candidates
-            .iter()
-            .copied()
-            .map(crate::validation::structural_cache_key)
-            .collect::<Vec<_>>();
-        if structural.iter().any(Result::is_err) {
-            let mut diagnostics = Vec::new();
-            for (candidate, structural) in candidates.iter().zip(structural) {
-                if let Err(error) = structural {
-                    diagnostics.push(native_diagnostic(candidate, &error.to_string()));
-                    continue;
-                }
-                if let Err(error) = validate_candidate(runtime.schema(), candidate) {
-                    diagnostics.push(native_candidate_diagnostic(candidate, &error));
-                }
-            }
-            return Err(diagnostics);
-        }
-        let configured_requests_hash = match crate::validated_requests_hash(candidates) {
-            Ok(hash) => hash,
-            Err(error) => {
-                return Err(vec![native_diagnostic(candidates[0], &error.to_string())]);
-            }
-        };
-        let key = ComparisonKey {
-            bundled_schema_hash: BUNDLED_REQUEST_SCHEMA_SHA256.to_owned(),
-            runtime_schema_hash: runtime.schema().canonical_request_sha256().to_owned(),
-            configured_requests_hash,
-        };
-        if let Some(outcomes) = self.cache.comparison_lookup(&key)
-            && outcomes.len() == candidates.len()
-        {
-            let diagnostics = candidates
-                .iter()
-                .zip(outcomes)
-                .filter(|&(_, outcome)| !outcome)
-                .map(|(candidate, _)| {
-                    native_diagnostic(candidate, "cached Herdr compatibility rejection")
-                })
-                .collect::<Vec<_>>();
-            return if diagnostics.is_empty() {
-                Ok(vec![
-                    ActionValidation {
-                        execution: ExecutionCapabilities::ASYNCHRONOUS,
-                    };
-                    candidates.len()
-                ])
-            } else {
-                Err(diagnostics)
-            };
-        }
-
-        let mut outcomes = Vec::with_capacity(candidates.len());
-        let mut diagnostics = Vec::new();
-        for candidate in candidates {
-            match validate_candidate(runtime.schema(), candidate) {
-                Ok(_) => outcomes.push(true),
-                Err(error) => {
-                    outcomes.push(false);
-                    diagnostics.push(native_diagnostic(candidate, &error.error.to_string()));
-                }
-            }
-        }
-        if let Err(error) = self.cache.comparison_store(&key, &outcomes) {
-            diagnostics.push(native_diagnostic(
-                candidates[0],
-                &format!("could not update Herdr compatibility cache: {error}"),
-            ));
-        }
-        if diagnostics.is_empty() {
-            Ok(vec![
-                ActionValidation {
-                    execution: ExecutionCapabilities::ASYNCHRONOUS,
-                };
-                candidates.len()
-            ])
-        } else {
-            Err(diagnostics)
-        }
+        validate_native_batch_cached(runtime.schema(), &self.cache, candidates)
     }
 
     fn portable_compile_validation(
@@ -1123,6 +1093,7 @@ impl HerdrAdapter {
         execution: muxe_core::ExecutionId,
         invocation: Invocation,
     ) -> Result<DispatchAccepted, AdapterError> {
+        authority.verify_endpoint_file()?;
         // The authority joins origin validation, one schema validation, and
         // the exact endpoint lease used by the queue owner.
         let method = invocation.method;
@@ -1409,6 +1380,116 @@ impl HerdrAdapter {
                     && record.temporary_tab == registration.temporary_tab
             })
             .ok_or_else(pending_cleanup_lease_stale)
+    }
+}
+
+fn native_compatibility_snapshot(
+    runtime: &Arc<HerdrRuntime>,
+    continuity: HostContinuityEpoch,
+    cache: &HerdrCache,
+) -> NativeCompatibilitySnapshot {
+    let schema = Arc::clone(runtime.schema());
+    let fingerprint = HostSchemaFingerprint::parse(schema.canonical_request_sha256().to_owned())
+        .expect("Herdr canonical schema fingerprint is a SHA-256 digest");
+    NativeCompatibilitySnapshot::new(
+        NativeCompatibilityIdentity::new(continuity, fingerprint),
+        Arc::new(HerdrNativeCompatibilityValidator {
+            schema,
+            cache: cache.clone(),
+        }),
+    )
+}
+
+fn validate_native_batch_cached(
+    schema: &Arc<ApiSchema>,
+    cache: &HerdrCache,
+    candidates: &[&NativeActionCandidate],
+) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let structural = candidates
+        .iter()
+        .copied()
+        .map(crate::validation::structural_cache_key)
+        .collect::<Vec<_>>();
+    if structural.iter().any(Result::is_err) {
+        let mut diagnostics = Vec::new();
+        for (candidate, structural) in candidates.iter().zip(structural) {
+            if let Err(error) = structural {
+                diagnostics.push(native_diagnostic(candidate, &error.to_string()));
+                continue;
+            }
+            if let Err(error) = validate_candidate(schema, candidate) {
+                diagnostics.push(native_candidate_diagnostic(candidate, &error));
+            }
+        }
+        return Err(diagnostics);
+    }
+    let configured_requests_hash = match crate::validated_requests_hash(candidates) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return Err(vec![native_diagnostic(candidates[0], &error.to_string())]);
+        }
+    };
+    let key = ComparisonKey {
+        bundled_schema_hash: BUNDLED_REQUEST_SCHEMA_SHA256.to_owned(),
+        runtime_schema_hash: schema.canonical_request_sha256().to_owned(),
+        configured_requests_hash,
+    };
+    if let Some(outcomes) = cache.comparison_lookup(&key)
+        && outcomes.len() == candidates.len()
+    {
+        let mut diagnostics = Vec::new();
+        for (candidate, outcome) in candidates.iter().zip(&outcomes) {
+            if !outcome {
+                match validate_candidate(schema, candidate) {
+                    Ok(_) => diagnostics.push(native_diagnostic(
+                        candidate,
+                        "Herdr compatibility cache disagrees with the immutable runtime schema",
+                    )),
+                    Err(error) => diagnostics.push(native_candidate_diagnostic(candidate, &error)),
+                }
+            }
+        }
+        return if diagnostics.is_empty() {
+            Ok(vec![
+                ActionValidation {
+                    execution: ExecutionCapabilities::ASYNCHRONOUS,
+                };
+                candidates.len()
+            ])
+        } else {
+            Err(diagnostics)
+        };
+    }
+
+    let mut outcomes = Vec::with_capacity(candidates.len());
+    let mut diagnostics = Vec::new();
+    for candidate in candidates {
+        match validate_candidate(schema, candidate) {
+            Ok(_) => outcomes.push(true),
+            Err(error) => {
+                outcomes.push(false);
+                diagnostics.push(native_candidate_diagnostic(candidate, &error));
+            }
+        }
+    }
+    if let Err(error) = cache.comparison_store(&key, &outcomes) {
+        diagnostics.push(native_diagnostic(
+            candidates[0],
+            &format!("could not update Herdr compatibility cache: {error}"),
+        ));
+    }
+    if diagnostics.is_empty() {
+        Ok(vec![
+            ActionValidation {
+                execution: ExecutionCapabilities::ASYNCHRONOUS,
+            };
+            candidates.len()
+        ])
+    } else {
+        Err(diagnostics)
     }
 }
 fn reopen_pending_close_record(
@@ -2024,6 +2105,16 @@ impl HostAdapter for HerdrAdapter {
         Ok(self.identity())
     }
 
+    fn native_compatibility_snapshot(&self) -> Option<NativeCompatibilitySnapshot> {
+        let incarnation = self
+            .incarnation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        incarnation.healthy.then(|| {
+            native_compatibility_snapshot(&incarnation.runtime, incarnation.continuity, &self.cache)
+        })
+    }
+
     async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
         Ok(AdapterCapabilities {
             // Static compile-time caps only: these gate binding validation, not the
@@ -2400,15 +2491,20 @@ impl HostAdapter for HerdrAdapter {
         self.wait_for_suspend(generation).await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "activation resume keeps schema, subscription, runtime, compatibility snapshot, and health publication in one auditable transaction"
+    )]
     async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
         let _resume_guard = self.admit_resume()?;
-        let (prior_epoch, prior_lease) = {
+        let (prior_epoch, prior_continuity, prior_lease) = {
             let incarnation = self
                 .incarnation
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 incarnation.epoch,
+                incarnation.continuity,
                 incarnation.runtime.lease(incarnation.epoch),
             )
         };
@@ -2428,6 +2524,9 @@ impl HostAdapter for HerdrAdapter {
             ));
         }
         let fresh_epoch = prior_epoch.next();
+        let fresh_continuity = prior_continuity
+            .successor()
+            .expect("Herdr continuity epoch exhausted");
         // Fresh schema validation, live identity, and the successful guarded
         // subscription are assembled before any part becomes current. Both
         // futures are adapter-owned and dropped immediately when shutdown wins.
@@ -2487,14 +2586,21 @@ impl HostAdapter for HerdrAdapter {
             }
             let previous = incarnation.runtime.identity().clone();
             let current = refreshed.identity().clone();
+            let compatibility =
+                native_compatibility_snapshot(&refreshed, fresh_continuity, &self.cache);
             *slot = Some(subscription);
             incarnation.runtime = refreshed;
             incarnation.epoch = fresh_epoch;
+            incarnation.continuity = fresh_continuity;
             incarnation.healthy = true;
             suspend.current = None;
             suspend.terminal_loss = None;
             self.suspended.store(false, Ordering::SeqCst);
-            permit.send(AdapterHealthEvent::Reconnected { previous, current });
+            permit.send(AdapterHealthEvent::Reconnected {
+                previous,
+                current,
+                compatibility,
+            });
             self.suspend_changed.notify_waiters();
         }
         drop(slot);
@@ -4067,6 +4173,7 @@ mod tests {
         let mut state = IncarnationState {
             runtime: Arc::clone(&old_runtime),
             epoch: IncarnationEpoch::INITIAL,
+            continuity: HostContinuityEpoch::initial(),
             healthy: true,
         };
         let old_lease = old_runtime.lease(IncarnationEpoch::INITIAL);
@@ -4075,9 +4182,14 @@ mod tests {
         let (new_runtime, _new_listener) = test_incarnation_runtime(&temp, "new-herdr.sock").await;
         let new_epoch = IncarnationEpoch::INITIAL.next();
         let new_lease = new_runtime.lease(new_epoch);
+        let compatibility = native_compatibility_snapshot(
+            &new_runtime,
+            state.continuity,
+            &HerdrCache::new(temp.path()),
+        );
         assert!(
             state
-                .install(Arc::clone(&new_runtime), &new_lease)
+                .install(Arc::clone(&new_runtime), &new_lease, compatibility)
                 .is_some()
         );
 
@@ -4095,6 +4207,7 @@ mod tests {
         let mut state = IncarnationState {
             runtime,
             epoch: IncarnationEpoch::INITIAL,
+            continuity: HostContinuityEpoch::initial(),
             healthy: true,
         };
 

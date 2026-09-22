@@ -601,6 +601,25 @@ impl HerdrRuntime {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
+    )]
+    pub(crate) fn verify_endpoint_file(
+        &self,
+        lease: &IncarnationLease,
+    ) -> Result<(), AdapterError> {
+        if self.expected.proven_replacement(&lease.expected) {
+            return Err(socket_error(&SocketError::EndpointReplaced {
+                socket: self.client.socket().to_path_buf(),
+            }));
+        }
+        lease
+            .expected
+            .verify_socket_file(self.client.socket())
+            .map_err(|error| socket_error(&error))
+    }
+
     pub(crate) async fn connect_expected_subscription(
         &self,
         lease: &IncarnationLease,

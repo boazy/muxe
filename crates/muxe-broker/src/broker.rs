@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex, Weak,
@@ -17,21 +17,23 @@ use nix::{
 
 use muxe_adapter_api::{
     AdapterError, AdapterHealthEvent, CaptureLease, CaptureLossReason, CaptureReleaseReason,
-    CaptureRequest, DispatchCompletion, HostAdapter, HostCallerIdentity, OriginCaptureRequest,
-    OriginHintSource, PendingPaneRegistration, PortableDispatchRequest,
+    CaptureRequest, DispatchCompletion, HostAdapter, HostCallerIdentity,
+    NativeCompatibilityIdentity, NativeCompatibilityOutcome, NativeCompatibilitySnapshot,
+    OriginCaptureRequest, OriginHintSource, PendingPaneRegistration, PortableDispatchRequest,
     PostDismissalPortableDispatchRequest, ResolvedNativeAction, ResolvedPortableAction,
     UntrustedOriginHint,
 };
 use muxe_core::{
-    ActionSpec, CommandAction, CompiledConfig, CompiledGeneration, ConfigAction, ConfigDiagnostic,
-    ExecutionId as CoreExecutionId, ExecutionPolicy, MenuAction, PaneId, ResolvedAttachmentTheme,
-    SourceId, SourceSpan, TabId, ThemeSelection, TimeoutAction,
+    ActionSpec, BindingId as CoreBindingId, CommandAction, CompiledConfig, CompiledGeneration,
+    ConfigAction, ConfigDiagnostic, ExecutionId as CoreExecutionId, ExecutionPolicy, MenuAction,
+    PaneId, ResolvedAttachmentTheme, SourceId, SourceSpan, TabId, ThemeSelection, TimeoutAction,
 };
 use muxe_protocol::{
-    AbortUiLaunch, AttachUi, BrokerEvent, BrokerResponse, ClientRequest, DiagnosticCode, EventId,
-    ExecutionId, ExecutionOutcome, HostKind, HostPaneId, HostTabId, InvocationDisposition,
-    InvokeBinding, LiveServerIdentity, MenuControl, ModalScopeId, PendingLaunchToken,
-    ProtocolDiagnostic, RegisterPendingPane, UiMenuControl, UiSessionId, WireMessage,
+    AbortUiLaunch, AttachUi, BindingAvailability, BrokerEvent, BrokerResponse, ClientRequest,
+    DiagnosticCode, EventId, ExecutionId, ExecutionOutcome, HostKind, HostPaneId, HostTabId,
+    InvocationDisposition, InvokeBinding, LiveServerIdentity, MenuControl, ModalScopeId,
+    PendingLaunchToken, ProtocolDiagnostic, RegisterPendingPane, UiMenuControl, UiSessionId,
+    WireMessage,
 };
 use thiserror::Error;
 use tokio::{
@@ -50,6 +52,8 @@ pub struct Broker {
     config: ConfigStore,
     state: Arc<Mutex<BrokerState>>,
     sessions: Arc<Mutex<HashMap<UiSessionId, SessionRecord>>>,
+    compatibility: Arc<CompatibilityCoordinator>,
+    compatibility_rebuilds: Arc<CompatibilityRebuildSupervisor>,
     generic: Arc<GenericSupervisor>,
     cleanup: Arc<CleanupSupervisor>,
     execution_transitions: Arc<Notify>,
@@ -73,6 +77,8 @@ pub struct Broker {
     cleanup_enqueue_hook: StdMutex<Option<Arc<CleanupEnqueueHook>>>,
     #[cfg(test)]
     commit_ui_launch_hook: StdMutex<Option<Arc<WaitHook>>>,
+    #[cfg(test)]
+    compatibility_commit_hook: StdMutex<Option<Arc<WaitHook>>>,
 }
 
 #[cfg(test)]
@@ -80,6 +86,7 @@ pub struct Broker {
 pub struct WaitHook {
     pub entered: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+    pub completed: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -101,6 +108,385 @@ impl CleanupEnqueueHook {
         Self {
             entered: Notify::new(),
             release: Notify::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CompatibilityCoordinator {
+    publication: Mutex<()>,
+    state: Mutex<CompatibilityState>,
+}
+
+#[derive(Default)]
+struct CompatibilityState {
+    managed: bool,
+    retired: bool,
+    current: Option<NativeCompatibilitySnapshot>,
+    generations: BTreeMap<CompiledGeneration, GenerationCompatibility>,
+}
+
+#[derive(Clone)]
+struct GenerationCompatibility {
+    runtime: NativeCompatibilityIdentity,
+    bindings: BTreeMap<CoreBindingId, BindingCompatibility>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BindingCompatibility {
+    Pending,
+    Enabled,
+    Blocked(Vec<ConfigDiagnostic>),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompatibilityRebuildKey {
+    generation: CompiledGeneration,
+    runtime: NativeCompatibilityIdentity,
+}
+
+#[derive(Clone)]
+struct CompatibilityRebuildWork {
+    key: CompatibilityRebuildKey,
+    config: Arc<CompiledConfig>,
+    snapshot: NativeCompatibilitySnapshot,
+}
+
+#[derive(Default)]
+struct CompatibilityRebuildSupervisor {
+    state: StdMutex<CompatibilityRebuildSupervisorState>,
+}
+
+#[derive(Default)]
+struct CompatibilityRebuildSupervisorState {
+    closed: bool,
+    desired: BTreeMap<CompatibilityRebuildKey, CompatibilityRebuildWork>,
+    active: Option<CompatibilityRebuildKey>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompatibilityAdmissionError {
+    Closed,
+    Full,
+}
+
+const MAX_COMPATIBILITY_REBUILD_DESIRES: usize = 128;
+const COMPATIBILITY_REBUILD_PANIC_DIAGNOSTIC: &str =
+    "native compatibility validator worker terminated unexpectedly";
+
+const COMPATIBILITY_PENDING_DIAGNOSTIC: &str =
+    "native action compatibility validation is pending for the current host continuity epoch";
+
+fn compatibility_protocol_diagnostic(
+    compatibility: &BindingCompatibility,
+) -> Option<ProtocolDiagnostic> {
+    match compatibility {
+        BindingCompatibility::Enabled => None,
+        BindingCompatibility::Pending => Some(diagnostic(
+            DiagnosticCode::ActionBlocked,
+            COMPATIBILITY_PENDING_DIAGNOSTIC,
+        )),
+        BindingCompatibility::Blocked(diagnostics) => {
+            let message = if diagnostics.is_empty() {
+                "native action compatibility validation failed without a diagnostic".to_owned()
+            } else {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            Some(diagnostic(DiagnosticCode::ActionBlocked, &message))
+        }
+    }
+}
+
+fn compatibility_availability(
+    compatibility: &BindingCompatibility,
+) -> (BindingAvailability, Option<ProtocolDiagnostic>) {
+    match compatibility {
+        BindingCompatibility::Enabled => (BindingAvailability::Enabled, None),
+        BindingCompatibility::Pending | BindingCompatibility::Blocked(_) => (
+            BindingAvailability::Blocked,
+            compatibility_protocol_diagnostic(compatibility),
+        ),
+    }
+}
+
+impl CompatibilityCoordinator {
+    fn new(snapshot: Option<NativeCompatibilitySnapshot>, config: &CompiledConfig) -> Self {
+        let mut state = CompatibilityState::default();
+        if let Some(snapshot) = snapshot {
+            state.managed = true;
+            state.generations.insert(
+                config.generation,
+                validate_generation_compatibility(config, &snapshot),
+            );
+            state.current = Some(snapshot);
+        }
+        Self {
+            publication: Mutex::new(()),
+            state: Mutex::new(state),
+        }
+    }
+}
+
+impl CompatibilityRebuildSupervisor {
+    fn enqueue(
+        self: &Arc<Self>,
+        broker: Weak<Broker>,
+        work: CompatibilityRebuildWork,
+    ) -> Result<(), CompatibilityAdmissionError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("compatibility rebuild supervisor is not poisoned");
+        if state.closed {
+            return Err(CompatibilityAdmissionError::Closed);
+        }
+        state.desired.retain(|key, _| {
+            key.generation != work.key.generation || key.runtime == work.key.runtime
+        });
+        if state.active.as_ref() == Some(&work.key) {
+            return Ok(());
+        }
+        if state.desired.len() >= MAX_COMPATIBILITY_REBUILD_DESIRES
+            && !state.desired.contains_key(&work.key)
+        {
+            return Err(CompatibilityAdmissionError::Full);
+        }
+        state.desired.insert(work.key.clone(), work);
+        if state.task.is_none() {
+            let supervisor = Arc::clone(self);
+            state.task = Some(tokio::spawn(async move {
+                run_compatibility_rebuild_supervisor(supervisor, broker).await;
+            }));
+        }
+        Ok(())
+    }
+
+    fn clear_desired(&self) {
+        self.state
+            .lock()
+            .expect("compatibility rebuild supervisor is not poisoned")
+            .desired
+            .clear();
+    }
+
+    fn retain_generations(&self, active: &BTreeSet<CompiledGeneration>) {
+        self.state
+            .lock()
+            .expect("compatibility rebuild supervisor is not poisoned")
+            .desired
+            .retain(|key, _| active.contains(&key.generation));
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("compatibility rebuild supervisor is not poisoned");
+        state.closed = true;
+        state.desired.clear();
+    }
+
+    async fn close_and_join(&self) {
+        let task = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("compatibility rebuild supervisor is not poisoned");
+            state.closed = true;
+            state.desired.clear();
+            state.task.take()
+        };
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .expect("compatibility rebuild supervisor is not poisoned");
+        (usize::from(state.active.is_some()), state.desired.len())
+    }
+}
+
+async fn run_compatibility_rebuild_supervisor(
+    supervisor: Arc<CompatibilityRebuildSupervisor>,
+    broker: Weak<Broker>,
+) {
+    loop {
+        let work = {
+            let mut state = supervisor
+                .state
+                .lock()
+                .expect("compatibility rebuild supervisor is not poisoned");
+            if state.closed {
+                state.active = None;
+                state.task = None;
+                return;
+            }
+            let Some((key, work)) = state.desired.pop_first() else {
+                state.active = None;
+                state.task = None;
+                return;
+            };
+            state.active = Some(key);
+            work
+        };
+        let rebuilt_snapshot = work.snapshot.clone();
+        let rebuilt_config = Arc::clone(&work.config);
+        let rebuilt = tokio::task::spawn_blocking(move || {
+            validate_generation_compatibility(&rebuilt_config, &rebuilt_snapshot)
+        })
+        .await;
+        let Some(broker) = broker.upgrade() else {
+            let mut state = supervisor
+                .state
+                .lock()
+                .expect("compatibility rebuild supervisor is not poisoned");
+            state.active = None;
+            state.desired.clear();
+            state.task = None;
+            return;
+        };
+        #[cfg(test)]
+        let hook = broker
+            .compatibility_commit_hook
+            .lock()
+            .expect("compatibility commit hook is not poisoned")
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = &hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+        let closed = supervisor
+            .state
+            .lock()
+            .expect("compatibility rebuild supervisor is not poisoned")
+            .closed;
+        if !closed {
+            let rebuilt = rebuilt.unwrap_or_else(|error| {
+                failed_generation_compatibility(
+                    &work.config,
+                    &work.snapshot,
+                    &format!("{COMPATIBILITY_REBUILD_PANIC_DIAGNOSTIC}: {error}"),
+                )
+            });
+            broker
+                .commit_generation_compatibility(work.config, work.snapshot, rebuilt)
+                .await;
+        }
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook.completed.notify_one();
+        }
+        let mut state = supervisor
+            .state
+            .lock()
+            .expect("compatibility rebuild supervisor is not poisoned");
+        state.active = None;
+    }
+}
+
+fn pending_generation_compatibility(
+    config: &CompiledConfig,
+    runtime: NativeCompatibilityIdentity,
+) -> GenerationCompatibility {
+    let bindings = config
+        .menus
+        .iter()
+        .flat_map(|menu| &menu.bindings)
+        .filter_map(|binding| {
+            matches!(binding.action, ActionSpec::Native(_))
+                .then_some((binding.id, BindingCompatibility::Pending))
+        })
+        .collect();
+    GenerationCompatibility { runtime, bindings }
+}
+
+fn validate_generation_compatibility(
+    config: &CompiledConfig,
+    snapshot: &NativeCompatibilitySnapshot,
+) -> GenerationCompatibility {
+    let bindings = config
+        .menus
+        .iter()
+        .flat_map(|menu| &menu.bindings)
+        .filter_map(|binding| {
+            let ActionSpec::Native(candidate) = &binding.action else {
+                return None;
+            };
+            let compatibility = match snapshot.validate_native(candidate) {
+                NativeCompatibilityOutcome::Compatible(_) => BindingCompatibility::Enabled,
+                NativeCompatibilityOutcome::Blocked(diagnostics) => {
+                    BindingCompatibility::Blocked(diagnostics)
+                }
+            };
+            Some((binding.id, compatibility))
+        })
+        .collect();
+    GenerationCompatibility {
+        runtime: snapshot.identity().clone(),
+        bindings,
+    }
+}
+
+fn failed_generation_compatibility(
+    config: &CompiledConfig,
+    snapshot: &NativeCompatibilitySnapshot,
+    message: &str,
+) -> GenerationCompatibility {
+    let bindings = config
+        .menus
+        .iter()
+        .flat_map(|menu| &menu.bindings)
+        .filter_map(|binding| {
+            let ActionSpec::Native(candidate) = &binding.action else {
+                return None;
+            };
+            Some((
+                binding.id,
+                BindingCompatibility::Blocked(vec![ConfigDiagnostic::error(
+                    muxe_core::DiagnosticCode::NativeActionRejected,
+                    message,
+                    candidate.type_span.clone(),
+                )]),
+            ))
+        })
+        .collect();
+    GenerationCompatibility {
+        runtime: snapshot.identity().clone(),
+        bindings,
+    }
+}
+
+fn compatibility_generation_deltas(
+    generation: CompiledGeneration,
+    previous: Option<&GenerationCompatibility>,
+    next: &GenerationCompatibility,
+) -> Vec<(CompiledGeneration, CoreBindingId, BindingCompatibility)> {
+    next.bindings
+        .iter()
+        .filter_map(|(binding, compatibility)| {
+            (previous.and_then(|generation| generation.bindings.get(binding))
+                != Some(compatibility))
+            .then_some((generation, *binding, compatibility.clone()))
+        })
+        .collect()
+}
+
+fn compatibility_admission_diagnostic(error: CompatibilityAdmissionError) -> &'static str {
+    match error {
+        CompatibilityAdmissionError::Closed => "native compatibility rebuild admission is closed",
+        CompatibilityAdmissionError::Full => {
+            "native compatibility rebuild queue reached its bounded capacity"
         }
     }
 }
@@ -721,12 +1107,18 @@ impl Broker {
         config_path: impl Into<std::path::PathBuf>,
         config: CompiledConfig,
     ) -> Arc<Self> {
+        let compatibility = Arc::new(CompatibilityCoordinator::new(
+            adapter.native_compatibility_snapshot(),
+            &config,
+        ));
         let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded_channel();
         Arc::new_cyclic(|self_weak| Self {
             adapter,
             config: ConfigStore::from_compiled(config_path, config),
             state: Arc::new(Mutex::new(BrokerState::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            compatibility,
+            compatibility_rebuilds: Arc::new(CompatibilityRebuildSupervisor::default()),
             generic: Arc::new(GenericSupervisor::default()),
             cleanup: Arc::new(CleanupSupervisor::default()),
             execution_transitions: Arc::new(Notify::new()),
@@ -743,6 +1135,8 @@ impl Broker {
             cleanup_enqueue_hook: StdMutex::new(None),
             #[cfg(test)]
             commit_ui_launch_hook: StdMutex::new(None),
+            #[cfg(test)]
+            compatibility_commit_hook: StdMutex::new(None),
         })
     }
 
@@ -757,12 +1151,19 @@ impl Broker {
         config_path: impl Into<std::path::PathBuf>,
     ) -> Result<Arc<Self>, ConfigError> {
         let config = ConfigStore::load(config_path, adapter.as_ref()).await?;
+        let initial = config.snapshot().await.config;
+        let compatibility = Arc::new(CompatibilityCoordinator::new(
+            adapter.native_compatibility_snapshot(),
+            &initial,
+        ));
         let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded_channel();
         Ok(Arc::new_cyclic(|self_weak| Self {
             adapter,
             config,
             state: Arc::new(Mutex::new(BrokerState::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            compatibility,
+            compatibility_rebuilds: Arc::new(CompatibilityRebuildSupervisor::default()),
             generic: Arc::new(GenericSupervisor::default()),
             execution_transitions: Arc::new(Notify::new()),
             cleanup: Arc::new(CleanupSupervisor::default()),
@@ -779,6 +1180,8 @@ impl Broker {
             cleanup_enqueue_hook: StdMutex::new(None),
             #[cfg(test)]
             commit_ui_launch_hook: StdMutex::new(None),
+            #[cfg(test)]
+            compatibility_commit_hook: StdMutex::new(None),
         }))
     }
 
@@ -810,6 +1213,13 @@ impl Broker {
             .commit_ui_launch_hook
             .lock()
             .expect("commit UI launch hook is not poisoned") = hook;
+    }
+    #[cfg(test)]
+    pub(crate) fn set_compatibility_commit_hook(&self, hook: Option<Arc<WaitHook>>) {
+        *self
+            .compatibility_commit_hook
+            .lock()
+            .expect("compatibility commit hook is not poisoned") = hook;
     }
 
     /// Closes every menu-owned pending pane and releases every UI capture before an activation
@@ -1236,6 +1646,7 @@ impl Broker {
     ///
     /// Returns the adapter shutdown error.
     pub async fn shutdown_host_adapter(&self) -> Result<(), BrokerError> {
+        self.compatibility_rebuilds.close_and_join().await;
         self.adapter.shutdown().await.map_err(BrokerError::from)
     }
     /// Keeps the previous immutable generation active if parsing, compilation, or active-host
@@ -1245,10 +1656,290 @@ impl Broker {
     /// Returns `BrokerError::Configuration` when parsing, compilation, or active-host
     /// validation fails; the previous generation stays active.
     pub async fn reload(&self) -> Result<CompiledGeneration, BrokerError> {
-        self.config
+        let generation = self
+            .config
             .reload(self.adapter.as_ref())
             .await
-            .map_err(|error| BrokerError::Configuration(Box::new(error)))
+            .map_err(|error| BrokerError::Configuration(Box::new(error)))?;
+        let config = self.config.snapshot().await.config;
+        let _publication = self.compatibility.publication.lock().await;
+        let active = self.active_generations().await;
+        let active_ids = active.keys().copied().collect::<BTreeSet<_>>();
+        self.compatibility_rebuilds.retain_generations(&active_ids);
+        let deltas = {
+            let mut state = self.compatibility.state.lock().await;
+            state
+                .generations
+                .retain(|generation, _| active_ids.contains(generation));
+            if !state.managed || state.retired {
+                Vec::new()
+            } else if let Some(snapshot) = state.current.clone() {
+                let pending =
+                    pending_generation_compatibility(&config, snapshot.identity().clone());
+                let previous = state.generations.insert(generation, pending);
+                match self.enqueue_compatibility_rebuild(Arc::clone(&config), snapshot.clone()) {
+                    Ok(()) => Vec::new(),
+                    Err(error) => {
+                        let failed = failed_generation_compatibility(
+                            &config,
+                            &snapshot,
+                            compatibility_admission_diagnostic(error),
+                        );
+                        let pending = state.generations.insert(generation, failed.clone());
+                        compatibility_generation_deltas(
+                            generation,
+                            pending.as_ref().or(previous.as_ref()),
+                            &failed,
+                        )
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        };
+        self.publish_compatibility_deltas(&deltas).await;
+        Ok(generation)
+    }
+
+    async fn active_generations(&self) -> BTreeMap<CompiledGeneration, Arc<CompiledConfig>> {
+        let current = self.config.snapshot().await.config;
+        let pinned = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .map(|record| Arc::clone(&record.config))
+            .collect::<Vec<_>>();
+        let mut generations = BTreeMap::new();
+        generations.insert(current.generation, current);
+        for config in pinned {
+            generations.entry(config.generation).or_insert(config);
+        }
+        generations
+    }
+
+    async fn prune_inactive_compatibility_under_publication(&self) {
+        let active = self.active_generations().await;
+        let active_ids = active.keys().copied().collect::<BTreeSet<_>>();
+        self.compatibility_rebuilds.retain_generations(&active_ids);
+        self.compatibility
+            .state
+            .lock()
+            .await
+            .generations
+            .retain(|generation, _| active_ids.contains(generation));
+    }
+
+    async fn install_compatibility_snapshot(&self, snapshot: NativeCompatibilitySnapshot) -> bool {
+        let _publication = self.compatibility.publication.lock().await;
+        if self.host_loss_armed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let active = self.active_generations().await;
+        let active_ids = active.keys().copied().collect::<BTreeSet<_>>();
+        self.compatibility_rebuilds.retain_generations(&active_ids);
+        let deltas = {
+            let mut state = self.compatibility.state.lock().await;
+            if state.retired {
+                return false;
+            }
+            state.managed = true;
+            state.current = Some(snapshot.clone());
+            state
+                .generations
+                .retain(|generation, _| active_ids.contains(generation));
+            let mut deltas = Vec::new();
+            for (generation, config) in &active {
+                let pending = pending_generation_compatibility(config, snapshot.identity().clone());
+                let previous = state.generations.insert(*generation, pending.clone());
+                deltas.extend(compatibility_generation_deltas(
+                    *generation,
+                    previous.as_ref(),
+                    &pending,
+                ));
+                if let Err(error) =
+                    self.enqueue_compatibility_rebuild(Arc::clone(config), snapshot.clone())
+                {
+                    let failed = failed_generation_compatibility(
+                        config,
+                        &snapshot,
+                        compatibility_admission_diagnostic(error),
+                    );
+                    let previous = state.generations.insert(*generation, failed.clone());
+                    deltas.extend(compatibility_generation_deltas(
+                        *generation,
+                        previous.as_ref(),
+                        &failed,
+                    ));
+                }
+            }
+            deltas
+        };
+        self.publish_compatibility_deltas(&deltas).await;
+        self.broadcast_health(true, None).await;
+        true
+    }
+
+    async fn mark_compatibility_pending(&self) {
+        let _publication = self.compatibility.publication.lock().await;
+        let active = self.active_generations().await;
+        let active_ids = active.keys().copied().collect::<BTreeSet<_>>();
+        self.compatibility_rebuilds.clear_desired();
+        let deltas = {
+            let mut state = self.compatibility.state.lock().await;
+            let Some(snapshot) = state.current.clone() else {
+                return;
+            };
+            if !state.managed || state.retired {
+                return;
+            }
+            state
+                .generations
+                .retain(|generation, _| active_ids.contains(generation));
+            let mut deltas = Vec::new();
+            for (generation, config) in &active {
+                let pending = pending_generation_compatibility(config, snapshot.identity().clone());
+                let previous = state.generations.insert(*generation, pending.clone());
+                for (binding, compatibility) in &pending.bindings {
+                    if previous
+                        .as_ref()
+                        .and_then(|generation| generation.bindings.get(binding))
+                        != Some(compatibility)
+                    {
+                        deltas.push((*generation, *binding, compatibility.clone()));
+                    }
+                }
+            }
+            state.current = None;
+            deltas
+        };
+        self.publish_compatibility_deltas(&deltas).await;
+    }
+
+    fn enqueue_compatibility_rebuild(
+        &self,
+        config: Arc<CompiledConfig>,
+        snapshot: NativeCompatibilitySnapshot,
+    ) -> Result<(), CompatibilityAdmissionError> {
+        self.compatibility_rebuilds.enqueue(
+            self.self_weak.clone(),
+            CompatibilityRebuildWork {
+                key: CompatibilityRebuildKey {
+                    generation: config.generation,
+                    runtime: snapshot.identity().clone(),
+                },
+                config,
+                snapshot,
+            },
+        )
+    }
+    async fn commit_generation_compatibility(
+        &self,
+        config: Arc<CompiledConfig>,
+        snapshot: NativeCompatibilitySnapshot,
+        rebuilt: GenerationCompatibility,
+    ) {
+        let _publication = self.compatibility.publication.lock().await;
+        if self.host_loss_armed.load(Ordering::SeqCst) {
+            return;
+        }
+        let active = self.active_generations().await;
+        let active_ids = active.keys().copied().collect::<BTreeSet<_>>();
+        self.compatibility_rebuilds.retain_generations(&active_ids);
+        if !active_ids.contains(&config.generation) {
+            self.compatibility
+                .state
+                .lock()
+                .await
+                .generations
+                .remove(&config.generation);
+            return;
+        }
+        let deltas = {
+            let mut state = self.compatibility.state.lock().await;
+            state
+                .generations
+                .retain(|generation, _| active_ids.contains(generation));
+            let valid = state.managed
+                && !state.retired
+                && state
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.identity() == snapshot.identity())
+                && state
+                    .generations
+                    .get(&config.generation)
+                    .is_some_and(|pending| pending.runtime == *snapshot.identity());
+            if valid {
+                let previous = state
+                    .generations
+                    .insert(config.generation, rebuilt.clone())
+                    .expect("active compatibility generation exists");
+                rebuilt
+                    .bindings
+                    .iter()
+                    .filter_map(|(binding, compatibility)| {
+                        (previous.bindings.get(binding) != Some(compatibility)).then_some((
+                            config.generation,
+                            *binding,
+                            compatibility.clone(),
+                        ))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        self.publish_compatibility_deltas(&deltas).await;
+    }
+
+    async fn publish_compatibility_deltas(
+        &self,
+        deltas: &[(CompiledGeneration, CoreBindingId, BindingCompatibility)],
+    ) {
+        if deltas.is_empty() {
+            return;
+        }
+        let mut sessions = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(session, record)| {
+                (
+                    session.clone(),
+                    record.config.generation,
+                    record.events.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        for (generation, binding, compatibility) in deltas {
+            let (availability, diagnostic) = compatibility_availability(compatibility);
+            for (session, pinned, events) in &sessions {
+                if pinned != generation {
+                    continue;
+                }
+                note_send_outcome(
+                    &events.try_send(WireMessage::Event {
+                        event_id: self.new_event_id(),
+                        event: BrokerEvent::BindingAvailabilityChanged {
+                            session: session.clone(),
+                            generation: generation.0,
+                            binding: muxe_protocol::BindingId {
+                                generation: binding.generation().0,
+                                ordinal: binding.ordinal(),
+                            },
+                            availability,
+                            diagnostic: diagnostic.clone(),
+                        },
+                    }),
+                    &self.self_weak,
+                    session,
+                    "BindingAvailabilityChanged",
+                );
+            }
+        }
     }
 
     /// Captures the live host identity for endpoint and activation decisions.
@@ -1510,14 +2201,17 @@ impl Broker {
     /// Stop join, and later duplicates are dropped idempotently.
     pub(crate) async fn handle_health_event(&self, event: AdapterHealthEvent) -> bool {
         match event {
-            AdapterHealthEvent::Healthy { .. }
-            | AdapterHealthEvent::CaptureReady { .. }
-            | AdapterHealthEvent::Reconnected { .. } => {
+            AdapterHealthEvent::Healthy { .. } | AdapterHealthEvent::CaptureReady { .. } => {
                 self.broadcast_health(true, None).await;
+                false
+            }
+            AdapterHealthEvent::Reconnected { compatibility, .. } => {
+                let _ = self.install_compatibility_snapshot(compatibility).await;
                 false
             }
             AdapterHealthEvent::Unhealthy { modal_scope, error } => match modal_scope {
                 None => {
+                    self.mark_compatibility_pending().await;
                     self.broadcast_health(false, Some(error)).await;
                     false
                 }
@@ -1572,8 +2266,18 @@ impl Broker {
     /// re-broadcast unhealthiness. Returns true so the monitor exits and never
     /// blocks the Stop join.
     async fn retire_on_host_loss(&self, error: AdapterError) -> bool {
+        let duplicate = {
+            let _publication = self.compatibility.publication.lock().await;
+            let duplicate = self.host_loss_armed.swap(true, Ordering::SeqCst);
+            self.compatibility_rebuilds.close();
+            let mut state = self.compatibility.state.lock().await;
+            state.retired = true;
+            state.current = None;
+            state.generations.clear();
+            duplicate
+        };
         self.broadcast_health(false, Some(error.clone())).await;
-        if self.host_loss_armed.swap(true, Ordering::SeqCst) {
+        if duplicate {
             return true;
         }
         self.fail_host_executions(&error).await;
@@ -2152,7 +2856,54 @@ impl Broker {
             readiness,
             events,
         };
-        self.sessions.lock().await.insert(session.clone(), record);
+        {
+            let _publication = self.compatibility.publication.lock().await;
+            self.sessions.lock().await.insert(session.clone(), record);
+            let deltas = {
+                let mut compatibility = self.compatibility.state.lock().await;
+                let snapshot = compatibility.current.clone();
+                if compatibility.managed
+                    && !compatibility.retired
+                    && let Some(snapshot) = snapshot
+                    && compatibility
+                        .generations
+                        .get(&config.generation)
+                        .is_none_or(|generation| generation.runtime != *snapshot.identity())
+                {
+                    let pending =
+                        pending_generation_compatibility(&config, snapshot.identity().clone());
+                    let previous = compatibility
+                        .generations
+                        .insert(config.generation, pending.clone());
+                    let mut deltas = compatibility_generation_deltas(
+                        config.generation,
+                        previous.as_ref(),
+                        &pending,
+                    );
+                    if let Err(error) =
+                        self.enqueue_compatibility_rebuild(Arc::clone(&config), snapshot.clone())
+                    {
+                        let failed = failed_generation_compatibility(
+                            &config,
+                            &snapshot,
+                            compatibility_admission_diagnostic(error),
+                        );
+                        let previous = compatibility
+                            .generations
+                            .insert(config.generation, failed.clone());
+                        deltas.extend(compatibility_generation_deltas(
+                            config.generation,
+                            previous.as_ref(),
+                            &failed,
+                        ));
+                    }
+                    deltas
+                } else {
+                    Vec::new()
+                }
+            };
+            self.publish_compatibility_deltas(&deltas).await;
+        }
 
         let (ready, finalization_error): (bool, Option<BrokerError>) = {
             let mut state = self.state.lock().await;
@@ -2211,7 +2962,11 @@ impl Broker {
             }
         };
         if let Some(error) = finalization_error {
-            self.sessions.lock().await.remove(&session);
+            {
+                let _publication = self.compatibility.publication.lock().await;
+                self.sessions.lock().await.remove(&session);
+                self.prune_inactive_compatibility_under_publication().await;
+            }
             if let Some(registration) = registration {
                 self.enqueue_pending_pane_close(&session, registration, Some(error.to_string()))
                     .await;
@@ -2453,26 +3208,105 @@ impl Broker {
         }
     }
 
+    async fn compatibility_attachment_view(
+        &self,
+        config: &CompiledConfig,
+    ) -> BTreeMap<CoreBindingId, wire::BindingAvailabilityView> {
+        let state = self.compatibility.state.lock().await;
+        if !state.managed {
+            return BTreeMap::new();
+        }
+        let current = state
+            .current
+            .as_ref()
+            .map(NativeCompatibilitySnapshot::identity);
+        config
+            .menus
+            .iter()
+            .flat_map(|menu| &menu.bindings)
+            .filter_map(|binding| {
+                if !matches!(binding.action, ActionSpec::Native(_)) {
+                    return None;
+                }
+                let compatibility = if state.retired {
+                    BindingCompatibility::Pending
+                } else {
+                    state
+                        .generations
+                        .get(&config.generation)
+                        .filter(|generation| {
+                            current.is_some_and(|current| generation.runtime == *current)
+                        })
+                        .and_then(|generation| generation.bindings.get(&binding.id))
+                        .cloned()
+                        .unwrap_or(BindingCompatibility::Pending)
+                };
+                Some((
+                    binding.id,
+                    wire::BindingAvailabilityView {
+                        blocked: compatibility != BindingCompatibility::Enabled,
+                        diagnostic: compatibility_protocol_diagnostic(&compatibility),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn native_compatibility_diagnostic(
+        &self,
+        generation: CompiledGeneration,
+        binding: CoreBindingId,
+    ) -> Option<ProtocolDiagnostic> {
+        let state = self.compatibility.state.lock().await;
+        if !state.managed {
+            return None;
+        }
+        let compatibility = if state.retired {
+            BindingCompatibility::Pending
+        } else {
+            let current = state
+                .current
+                .as_ref()
+                .map(NativeCompatibilitySnapshot::identity);
+            state
+                .generations
+                .get(&generation)
+                .filter(|generation| current.is_some_and(|current| generation.runtime == *current))
+                .and_then(|generation| generation.bindings.get(&binding))
+                .cloned()
+                .unwrap_or(BindingCompatibility::Pending)
+        };
+        compatibility_protocol_diagnostic(&compatibility)
+    }
+
     async fn attached_response(
         &self,
         session: &UiSessionId,
     ) -> Result<BrokerResponse, BrokerError> {
-        let sessions = self.sessions.lock().await;
-        let record = sessions
-            .get(session)
-            .ok_or_else(|| BrokerError::UnknownSession(session.clone()))?;
-        let view = record
-            .config
-            .attachment_view_resolved(&record.root, &record.resolved_theme)
+        let _publication = self.compatibility.publication.lock().await;
+        let (config, root, resolved_theme) = {
+            let sessions = self.sessions.lock().await;
+            let record = sessions
+                .get(session)
+                .ok_or_else(|| BrokerError::UnknownSession(session.clone()))?;
+            (
+                Arc::clone(&record.config),
+                record.root.clone(),
+                record.resolved_theme.clone(),
+            )
+        };
+        let view = config
+            .attachment_view_resolved(&root, &resolved_theme)
             .map_err(|error| match error {
                 muxe_core::AttachmentViewError::MissingMenu(root) => {
                     BrokerError::UnknownMenu(core_menu_id_to_wire(&root))
                 }
                 muxe_core::AttachmentViewError::Theme(error) => theme_selection_broker_error(error),
             })?;
+        let availability = self.compatibility_attachment_view(&config).await;
         Ok(BrokerResponse::UiAttached {
             session: session.clone(),
-            snapshot: wire::attachment(&view),
+            snapshot: wire::attachment(&view, &availability),
         })
     }
 
@@ -2662,6 +3496,13 @@ impl Broker {
             )
             .cloned()
             .ok_or(BrokerError::StaleGeneration)?;
+        if matches!(binding.action, ActionSpec::Native(_))
+            && let Some(diagnostic) = self
+                .native_compatibility_diagnostic(config.generation, binding.id)
+                .await
+        {
+            return Err(BrokerError::NativeCompatibility(diagnostic.message));
+        }
         Ok((origin, binding))
     }
 
@@ -3023,7 +3864,12 @@ impl Broker {
         session: &UiSessionId,
         reason: CaptureReleaseReason,
     ) -> Result<(), BrokerError> {
-        let record = self.sessions.lock().await.remove(session);
+        let record = {
+            let _publication = self.compatibility.publication.lock().await;
+            let record = self.sessions.lock().await.remove(session);
+            self.prune_inactive_compatibility_under_publication().await;
+            record
+        };
         // Provenance enqueue is atomic with the ownership unlink: the
         // capture and gated-registration cleanup entries are inserted under
         // the same state lock that removes them, so cancellation between the
@@ -3999,7 +4845,9 @@ mod tests {
     use async_trait::async_trait;
     use muxe_adapter_api::{
         AdapterCapabilities, AdapterHealthEvent, CaptureLeaseId, DispatchAccepted,
-        ExecutionCorrelationId, HostIdentity, KeyboardCapabilities, ModalScopeId,
+        ExecutionCorrelationId, HostContinuityEpoch, HostIdentity, HostSchemaFingerprint,
+        KeyboardCapabilities, ModalScopeId, NativeCompatibilityIdentity,
+        NativeCompatibilityOutcome, NativeCompatibilitySnapshot, NativeCompatibilityValidator,
         NativeDispatchRequest,
     };
     use muxe_core::{
@@ -6655,7 +7503,7 @@ menus:
         assert_eq!(view.menu.root, root);
         // Core -> wire preserves the variant; the owned view validates
         // (whitespace names are in the wire domain, matching core).
-        let wire_view = wire::attachment(&view);
+        let wire_view = wire::attachment(&view, &BTreeMap::new());
         muxe_protocol::Validate::validate(&wire_view)
             .expect("compiled whitespace view passes wire validation");
         // Wire -> core round-trips both identities losslessly by variant.
@@ -9046,6 +9894,8 @@ colors:
             config: store,
             state: Arc::new(Mutex::new(BrokerState::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            compatibility: Arc::new(CompatibilityCoordinator::default()),
+            compatibility_rebuilds: Arc::new(CompatibilityRebuildSupervisor::default()),
             generic: Arc::new(GenericSupervisor::default()),
             cleanup: Arc::new(CleanupSupervisor::default()),
             execution_transitions: Arc::new(Notify::new()),
@@ -9060,6 +9910,7 @@ colors:
             self_weak: Weak::new(),
             cleanup_enqueue_hook: StdMutex::new(None),
             commit_ui_launch_hook: StdMutex::new(None),
+            compatibility_commit_hook: StdMutex::new(None),
         });
         (adapter, broker, directory)
     }
@@ -9445,6 +10296,1274 @@ menus:
         assert_eq!(snap_new.theme.scheme.title, "Scheme Two");
         assert_eq!(snap_new.menu.generation, 2);
     }
+
+    #[derive(Debug)]
+    struct FixedCompatibilityValidator {
+        blocked: BTreeMap<String, String>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl NativeCompatibilityValidator for FixedCompatibilityValidator {
+        fn validate_native(
+            &self,
+            candidate: &muxe_core::NativeActionCandidate,
+        ) -> NativeCompatibilityOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(message) = self.blocked.get(&candidate.type_name) {
+                NativeCompatibilityOutcome::Blocked(vec![ConfigDiagnostic::error(
+                    muxe_core::DiagnosticCode::NativeActionRejected,
+                    message,
+                    candidate.type_span.clone(),
+                )])
+            } else {
+                NativeCompatibilityOutcome::Compatible(ActionValidation {
+                    execution: muxe_core::ExecutionCapabilities::ASYNCHRONOUS,
+                })
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingCompatibilityValidator;
+
+    impl NativeCompatibilityValidator for PanickingCompatibilityValidator {
+        fn validate_native(
+            &self,
+            _candidate: &muxe_core::NativeActionCandidate,
+        ) -> NativeCompatibilityOutcome {
+            panic!("intentional compatibility validator panic")
+        }
+    }
+
+    fn panicking_compatibility_snapshot(
+        continuity: HostContinuityEpoch,
+    ) -> NativeCompatibilitySnapshot {
+        NativeCompatibilitySnapshot::new(
+            NativeCompatibilityIdentity::new(
+                continuity,
+                HostSchemaFingerprint::parse("d".repeat(64))
+                    .expect("test fingerprint is hexadecimal"),
+            ),
+            Arc::new(PanickingCompatibilityValidator),
+        )
+    }
+
+    fn compatibility_snapshot(
+        continuity: HostContinuityEpoch,
+        fingerprint: char,
+        blocked: &[(&str, &str)],
+        calls: Arc<AtomicUsize>,
+    ) -> NativeCompatibilitySnapshot {
+        let schema = HostSchemaFingerprint::parse(fingerprint.to_string().repeat(64))
+            .expect("test fingerprint is hexadecimal");
+        NativeCompatibilitySnapshot::new(
+            NativeCompatibilityIdentity::new(continuity, schema),
+            Arc::new(FixedCompatibilityValidator {
+                blocked: blocked
+                    .iter()
+                    .map(|(action, message)| ((*action).to_owned(), (*message).to_owned()))
+                    .collect(),
+                calls,
+            }),
+        )
+    }
+
+    fn compatibility_identity(server: &str) -> HostIdentity {
+        HostIdentity {
+            kind: muxe_adapter_api::HostKind::Herdr,
+            discovery_key: muxe_adapter_api::HostDiscoveryKey::parse("compatibility-test")
+                .expect("valid discovery key"),
+            live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(server.to_owned())
+                .expect("valid live server identity"),
+        }
+    }
+
+    fn native_compatibility_fixture() -> (Arc<CountingAdapter>, Arc<Broker>) {
+        let adapter = counting_adapter(false);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<compatibility-regression>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      a:
+        label: agents
+        action: native.herdr.agent:list
+      w:
+        label: workspaces
+        action: native.herdr.workspace:list
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("native compatibility fixture compiles");
+        let broker = Broker::from_compiled(
+            adapter.clone(),
+            PathBuf::from("<compatibility-regression>"),
+            config,
+        );
+        (adapter, broker)
+    }
+
+    async fn attach_native_fixture(
+        broker: &Arc<Broker>,
+        pane: &str,
+    ) -> (
+        UiSessionId,
+        muxe_protocol::UiAttachmentWire,
+        mpsc::Receiver<WireMessage>,
+    ) {
+        let (events, receiver) = mpsc::channel(32);
+        let response = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new(pane),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events,
+            )
+            .await
+            .expect("native UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, snapshot }) = response
+        else {
+            panic!("native fixture attachment is immediate")
+        };
+        (session, snapshot, receiver)
+    }
+
+    fn attached_binding<'a>(
+        snapshot: &'a muxe_protocol::UiAttachmentWire,
+        label: &str,
+    ) -> &'a muxe_protocol::BindingViewWire {
+        snapshot
+            .menu
+            .menus
+            .iter()
+            .flat_map(|menu| &menu.bindings)
+            .find(|binding| binding.label.as_deref() == Some(label))
+            .expect("fixture binding is attached")
+    }
+
+    #[tokio::test]
+    async fn compatibility_rebuild_blocks_pending_and_preserves_exact_diagnostic() {
+        let (adapter, broker) = native_compatibility_fixture();
+        let (session, initial, mut events) = attach_native_fixture(&broker, "pane-initial").await;
+        let agents_id = attached_binding(&initial, "agents").id;
+        let workspaces_id = attached_binding(&initial, "workspaces").id;
+        assert!(!attached_binding(&initial, "agents").state.blocked);
+
+        let hook = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook)));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let epoch_a = HostContinuityEpoch::initial();
+        let epoch_b = epoch_a.successor().expect("next epoch");
+        let snapshot_b = compatibility_snapshot(
+            epoch_b,
+            'b',
+            &[(
+                "native.herdr.agent:list",
+                "schema B requires the removed agent selector",
+            )],
+            Arc::clone(&calls_b),
+        );
+        assert!(
+            !broker
+                .handle_health_event(AdapterHealthEvent::Reconnected {
+                    previous: compatibility_identity("server-a"),
+                    current: compatibility_identity("server-b"),
+                    compatibility: snapshot_b,
+                })
+                .await
+        );
+        hook.entered.notified().await;
+
+        let (_pending_session, pending, _pending_events) =
+            attach_native_fixture(&broker, "pane-pending").await;
+        let pending_agent = attached_binding(&pending, "agents");
+        assert!(pending_agent.state.blocked);
+        assert_eq!(
+            pending_agent
+                .diagnostic
+                .as_ref()
+                .expect("pending diagnostic")
+                .message,
+            COMPATIBILITY_PENDING_DIAGNOSTIC
+        );
+        let Err(blocked) = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session,
+                    generation: initial.menu.generation,
+                    binding: pending_agent.id,
+                }),
+                mpsc::channel(1).0,
+            )
+            .await
+        else {
+            panic!("pending native invocation must fail closed")
+        };
+        assert!(matches!(
+            &blocked,
+            BrokerError::NativeCompatibility(message)
+                if message == COMPATIBILITY_PENDING_DIAGNOSTIC
+        ));
+        assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
+
+        broker.set_compatibility_commit_hook(None);
+        hook.release.notify_one();
+        hook.completed.notified().await;
+        let published = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(published.len(), 5);
+        assert!(matches!(
+            &published[0],
+            WireMessage::Event {
+                event: BrokerEvent::BindingAvailabilityChanged {
+                    binding,
+                    availability: BindingAvailability::Blocked,
+                    diagnostic: Some(diagnostic),
+                    ..
+                },
+                ..
+            } if *binding == agents_id
+                && diagnostic.message == COMPATIBILITY_PENDING_DIAGNOSTIC
+        ));
+        assert!(matches!(
+            &published[1],
+            WireMessage::Event {
+                event: BrokerEvent::BindingAvailabilityChanged {
+                    binding,
+                    availability: BindingAvailability::Blocked,
+                    diagnostic: Some(diagnostic),
+                    ..
+                },
+                ..
+            } if *binding == workspaces_id
+                && diagnostic.message == COMPATIBILITY_PENDING_DIAGNOSTIC
+        ));
+        assert!(matches!(
+            &published[2],
+            WireMessage::Event {
+                event: BrokerEvent::AdapterHealthChanged {
+                    healthy: true,
+                    diagnostic: None,
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &published[3],
+            WireMessage::Event {
+                event: BrokerEvent::BindingAvailabilityChanged {
+                    binding,
+                    availability: BindingAvailability::Blocked,
+                    diagnostic: Some(diagnostic),
+                    ..
+                },
+                ..
+            } if *binding == agents_id
+                && diagnostic.message == "schema B requires the removed agent selector"
+        ));
+        assert!(matches!(
+            &published[4],
+            WireMessage::Event {
+                event: BrokerEvent::BindingAvailabilityChanged {
+                    binding,
+                    availability: BindingAvailability::Enabled,
+                    diagnostic: None,
+                    ..
+                },
+                ..
+            } if *binding == workspaces_id
+        ));
+
+        let (_blocked_session, blocked_snapshot, _blocked_events) =
+            attach_native_fixture(&broker, "pane-blocked").await;
+        let blocked_agent = attached_binding(&blocked_snapshot, "agents");
+        assert!(blocked_agent.state.blocked);
+        assert_eq!(
+            blocked_agent
+                .diagnostic
+                .as_ref()
+                .expect("blocked diagnostic")
+                .message,
+            "schema B requires the removed agent selector"
+        );
+        assert!(
+            !attached_binding(&blocked_snapshot, "workspaces")
+                .state
+                .blocked
+        );
+
+        let hook = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook)));
+        let epoch_c = epoch_b.successor().expect("restored epoch");
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let snapshot_a = compatibility_snapshot(epoch_c, 'a', &[], Arc::clone(&calls_a));
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-b"),
+                current: compatibility_identity("server-c"),
+                compatibility: snapshot_a,
+            })
+            .await;
+        hook.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        hook.release.notify_one();
+        hook.completed.notified().await;
+        let (_restored_session, restored, _restored_events) =
+            attach_native_fixture(&broker, "pane-restored").await;
+        assert!(!attached_binding(&restored, "agents").state.blocked);
+        assert!(!attached_binding(&restored, "workspaces").state.blocked);
+    }
+
+    #[tokio::test]
+    async fn compatibility_validator_panic_fails_closed_instead_of_staying_pending() {
+        let (_adapter, broker) = native_compatibility_fixture();
+        let (_session, _initial, _events) = attach_native_fixture(&broker, "pane-panic").await;
+        let hook = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook)));
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-before-panic"),
+                current: compatibility_identity("server-panic"),
+                compatibility: panicking_compatibility_snapshot(HostContinuityEpoch::initial()),
+            })
+            .await;
+        hook.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        hook.release.notify_one();
+        hook.completed.notified().await;
+
+        let (_blocked_session, blocked, _blocked_events) =
+            attach_native_fixture(&broker, "pane-after-panic").await;
+        for label in ["agents", "workspaces"] {
+            let binding = attached_binding(&blocked, label);
+            assert!(binding.state.blocked);
+            let message = &binding
+                .diagnostic
+                .as_ref()
+                .expect("panic diagnostic")
+                .message;
+            assert!(message.starts_with(COMPATIBILITY_REBUILD_PANIC_DIAGNOSTIC));
+            assert_ne!(message, COMPATIBILITY_PENDING_DIAGNOSTIC);
+        }
+        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
+    }
+    #[tokio::test]
+    async fn compatibility_newer_epoch_wins_and_host_loss_cancels_paused_publication() {
+        let (_adapter, broker) = native_compatibility_fixture();
+        let (_session, _initial, mut events) = attach_native_fixture(&broker, "pane-race").await;
+        let epoch_a = HostContinuityEpoch::initial();
+        let epoch_b = epoch_a.successor().expect("newer epoch");
+
+        let hook_a = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_a)));
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-0"),
+                current: compatibility_identity("server-a"),
+                compatibility: compatibility_snapshot(
+                    epoch_a,
+                    'a',
+                    &[("native.herdr.agent:list", "stale A rejection")],
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            })
+            .await;
+        hook_a.entered.notified().await;
+
+        let hook_b = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_b)));
+        let snapshot_b = compatibility_snapshot(
+            epoch_b,
+            'b',
+            &[("native.herdr.workspace:list", "current B rejection")],
+            Arc::new(AtomicUsize::new(0)),
+        );
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-a"),
+                current: compatibility_identity("server-b"),
+                compatibility: snapshot_b.clone(),
+            })
+            .await;
+        hook_a.release.notify_one();
+        hook_a.completed.notified().await;
+        hook_b.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        hook_b.release.notify_one();
+        hook_b.completed.notified().await;
+
+        {
+            let state = broker.compatibility.state.lock().await;
+            assert_eq!(
+                state
+                    .current
+                    .as_ref()
+                    .map(NativeCompatibilitySnapshot::identity),
+                Some(snapshot_b.identity())
+            );
+            let generation = state
+                .generations
+                .get(&CompiledGeneration(1))
+                .expect("active generation compatibility");
+            assert_eq!(generation.runtime, *snapshot_b.identity());
+            let diagnostics = generation
+                .bindings
+                .values()
+                .filter_map(compatibility_protocol_diagnostic)
+                .map(|diagnostic| diagnostic.message)
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics, vec!["current B rejection"]);
+        }
+
+        let hook_loss = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_loss)));
+        let epoch_c = epoch_b.successor().expect("terminal epoch");
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-b"),
+                current: compatibility_identity("server-c"),
+                compatibility: compatibility_snapshot(
+                    epoch_c,
+                    'c',
+                    &[],
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            })
+            .await;
+        hook_loss.entered.notified().await;
+        assert!(
+            broker
+                .handle_health_event(AdapterHealthEvent::HostLost {
+                    identity: compatibility_identity("server-c"),
+                    error: AdapterError::new(
+                        muxe_adapter_api::AdapterErrorKind::Unavailable,
+                        "terminal recorded host loss",
+                    ),
+                })
+                .await
+        );
+        broker.set_compatibility_commit_hook(None);
+        hook_loss.release.notify_one();
+        hook_loss.completed.notified().await;
+
+        let mut terminal_seen = false;
+        while let Ok(message) = events.try_recv() {
+            let WireMessage::Event { event, .. } = message else {
+                continue;
+            };
+            if terminal_seen {
+                assert!(
+                    !matches!(
+                        event,
+                        BrokerEvent::BindingAvailabilityChanged { .. }
+                            | BrokerEvent::AdapterHealthChanged { healthy: true, .. }
+                    ),
+                    "no compatibility or healthy publication follows HostLost"
+                );
+            }
+            if matches!(
+                event,
+                BrokerEvent::AdapterHealthChanged { healthy: false, .. }
+            ) {
+                terminal_seen = true;
+            }
+        }
+        assert!(terminal_seen, "HostLost publishes terminal unhealthiness");
+        let state = broker.compatibility.state.lock().await;
+        assert!(state.retired);
+        assert!(state.current.is_none());
+    }
+
+    #[tokio::test]
+    async fn compatibility_reload_stays_pending_until_same_schema_newer_epoch() {
+        let directory = tempfile::TempDir::new().expect("temp config directory");
+        let path = directory.path().join("config.yml");
+        std::fs::write(
+            &path,
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      a:
+        label: agents
+        action: native.herdr.agent:list
+      w:
+        label: workspaces
+        action: native.herdr.workspace:list
+",
+        )
+        .expect("initial config");
+        let adapter = counting_adapter(false);
+        let broker = Broker::load(adapter, &path)
+            .await
+            .expect("initial broker config");
+        let epoch_a = HostContinuityEpoch::initial();
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let hook_initial = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_initial)));
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-0"),
+                current: compatibility_identity("server-a"),
+                compatibility: compatibility_snapshot(epoch_a, 'a', &[], Arc::clone(&calls_a)),
+            })
+            .await;
+        hook_initial.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        hook_initial.release.notify_one();
+        hook_initial.completed.notified().await;
+        broker
+            .handle_health_event(AdapterHealthEvent::Unhealthy {
+                modal_scope: None,
+                error: AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "recorded continuity loss before reload",
+                ),
+            })
+            .await;
+
+        std::fs::write(
+            &path,
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      a:
+        label: agents
+        action: native.herdr.agent:list
+      w:
+        label: workspaces
+        action: native.herdr.workspace:list
+      s:
+        label: server
+        action: native.herdr.server:agent-manifests
+",
+        )
+        .expect("reloaded config");
+        assert_eq!(
+            broker.reload().await.expect("reload publishes generation"),
+            CompiledGeneration(2)
+        );
+        let (_pending_session, pending, _events) =
+            attach_native_fixture(&broker, "pane-reload-pending").await;
+        for label in ["agents", "workspaces", "server"] {
+            let binding = attached_binding(&pending, label);
+            assert!(binding.state.blocked);
+            assert_eq!(
+                binding
+                    .diagnostic
+                    .as_ref()
+                    .expect("pending compatibility diagnostic")
+                    .message,
+                COMPATIBILITY_PENDING_DIAGNOSTIC
+            );
+        }
+
+        let epoch_b = epoch_a.successor().expect("newer continuity epoch");
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let snapshot_b = compatibility_snapshot(epoch_b, 'a', &[], Arc::clone(&calls_b));
+        let hook_reconnect = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_reconnect)));
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-a"),
+                current: compatibility_identity("server-b"),
+                compatibility: snapshot_b.clone(),
+            })
+            .await;
+        hook_reconnect.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        hook_reconnect.release.notify_one();
+        hook_reconnect.completed.notified().await;
+
+        let state = broker.compatibility.state.lock().await;
+        let generation = state
+            .generations
+            .get(&CompiledGeneration(2))
+            .expect("reloaded generation remains active");
+        assert_eq!(generation.runtime, *snapshot_b.identity());
+        assert_eq!(generation.bindings.len(), 3);
+        assert!(
+            generation
+                .bindings
+                .values()
+                .all(|compatibility| *compatibility == BindingCompatibility::Enabled)
+        );
+    }
+
+    fn recorded_pane_exchange(pane: &'static str) -> crate::recorded_socket::RecordedExchange {
+        crate::recorded_socket::RecordedExchange {
+            method: "pane.get",
+            params: serde_json::json!({ "pane_id": pane }),
+            response: crate::recorded_socket::RecordedResponse::Result(serde_json::json!({
+                "type": "pane_info",
+                "pane": {
+                    "pane_id": pane,
+                    "tab_id": "tab-1",
+                    "workspace_id": "workspace-1",
+                },
+            })),
+        }
+    }
+
+    fn recorded_origin_snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "workspaces": [{ "workspace_id": "workspace-1" }],
+            "tabs": [{
+                "tab_id": "tab-1",
+                "workspace_id": "workspace-1",
+                "number": 0,
+            }],
+            "panes": [
+                {
+                    "pane_id": "pane-origin",
+                    "tab_id": "tab-1",
+                    "workspace_id": "workspace-1",
+                    "cwd": "/saved/origin",
+                },
+                {
+                    "pane_id": "pane-ui",
+                    "tab_id": "tab-1",
+                    "workspace_id": "workspace-1",
+                    "cwd": "/ui/caller",
+                },
+            ],
+        })
+    }
+
+    #[tokio::test]
+    async fn recorded_herdr_broker_rejects_runtime_replacement_before_request_bytes() {
+        let mut first_script =
+            crate::production_connect::ProductionConnectFixture::initial_handshake();
+        first_script.push(recorded_pane_exchange("pane-ui"));
+        first_script.push(
+            crate::production_connect::ProductionConnectFixture::snapshot_exchange(
+                &recorded_origin_snapshot(),
+            ),
+        );
+        let first_host =
+            crate::production_connect::ProductionConnectFixture::start_scripted(first_script)
+                .expect("first recorded Herdr runtime starts");
+        let replacement =
+            crate::production_connect::ProductionConnectFixture::start_scripted(vec![
+                crate::production_connect::ProductionConnectFixture::ping_exchange(),
+            ])
+            .expect("replacement recorded Herdr runtime starts");
+        let endpoint_directory = tempfile::tempdir().expect("owned endpoint alias directory");
+        let endpoint = endpoint_directory.path().join("herdr.sock");
+        std::os::unix::fs::symlink(first_host.socket(), &endpoint)
+            .expect("endpoint initially selects runtime A");
+        let adapter = muxe_adapter_herdr::HerdrAdapter::connect(
+            first_host.adapter_config_at(endpoint.clone()),
+        )
+        .await
+        .expect("production Herdr adapter connects to runtime A");
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<recorded-herdr-broker-dispatch>"),
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      a:
+        label: agents
+        action: native.herdr.agent:list
+",
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("recorded native config compiles");
+        let broker = Broker::from_compiled(
+            adapter.clone(),
+            PathBuf::from("<recorded-herdr-broker-dispatch>"),
+            config,
+        );
+        let (events, _events_rx) = mpsc::channel(16);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-ui"),
+                    pending_launch: None,
+                    origin: Some(muxe_protocol::UiOriginBootstrap {
+                        workspace: muxe_protocol::WorkspaceId::new("workspace-1"),
+                        tab: HostTabId::new("tab-1"),
+                        pane: HostPaneId::new("pane-origin"),
+                        cwd: Some("/saved/origin".to_owned()),
+                    }),
+                    caller_identity: Some(muxe_protocol::UiCallerIdentityWire {
+                        workspace: muxe_protocol::WorkspaceId::new("workspace-1"),
+                        tab: HostTabId::new("tab-1"),
+                        pane: HostPaneId::new("pane-ui"),
+                        cwd: "/ui/caller".to_owned(),
+                    }),
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("recorded UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, snapshot }) = attached
+        else {
+            panic!("recorded UI attachment is immediate")
+        };
+        let binding = attached_binding(&snapshot, "agents");
+        assert!(
+            !binding.state.blocked,
+            "native binding is Enabled for runtime A"
+        );
+
+        let binding = binding.id;
+        std::fs::remove_file(&endpoint).expect("remove runtime A endpoint alias");
+        std::os::unix::fs::symlink(replacement.socket(), &endpoint)
+            .expect("endpoint now selects runtime B");
+        let result = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session,
+                    generation: snapshot.menu.generation,
+                    binding,
+                }),
+                events,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "runtime replacement returns no InvocationAccepted response"
+        );
+        assert!(
+            replacement.requests().await.is_empty(),
+            "runtime B receives zero request bytes and no replay"
+        );
+        broker
+            .shutdown_host_adapter()
+            .await
+            .expect("recorded adapter shuts down");
+    }
+
+    async fn attach_recorded_herdr_fixture(
+        broker: &Arc<Broker>,
+    ) -> (
+        UiSessionId,
+        muxe_protocol::UiAttachmentWire,
+        mpsc::Receiver<WireMessage>,
+    ) {
+        let (events, receiver) = mpsc::channel(64);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("pane-ui"),
+                    pending_launch: None,
+                    origin: Some(muxe_protocol::UiOriginBootstrap {
+                        workspace: muxe_protocol::WorkspaceId::new("workspace-1"),
+                        tab: HostTabId::new("tab-1"),
+                        pane: HostPaneId::new("pane-origin"),
+                        cwd: Some("/saved/origin".to_owned()),
+                    }),
+                    caller_identity: Some(muxe_protocol::UiCallerIdentityWire {
+                        workspace: muxe_protocol::WorkspaceId::new("workspace-1"),
+                        tab: HostTabId::new("tab-1"),
+                        pane: HostPaneId::new("pane-ui"),
+                        cwd: "/ui/caller".to_owned(),
+                    }),
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events,
+            )
+            .await
+            .expect("recorded Herdr UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, snapshot }) = attached
+        else {
+            panic!("recorded Herdr UI attachment is immediate")
+        };
+        (session, snapshot, receiver)
+    }
+
+    fn recorded_compatibility_config() -> &'static str {
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      w:
+        label: workspaces
+        action: native.herdr.workspace:list
+"
+    }
+
+    async fn wait_for_health_event(events: &mut mpsc::Receiver<WireMessage>, healthy: bool) {
+        loop {
+            let message = events.recv().await.expect("broker health event");
+            if matches!(
+                message,
+                WireMessage::Event {
+                    event: BrokerEvent::AdapterHealthChanged {
+                        healthy: actual,
+                        ..
+                    },
+                    ..
+                } if actual == healthy
+            ) {
+                return;
+            }
+        }
+    }
+
+    fn schema_without_workspace_list() -> serde_json::Value {
+        let mut schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/herdr/herdr-api.schema.json"
+        ))
+        .expect("bundled schema A");
+        schema["schemas"]["request"]["oneOf"]
+            .as_array_mut()
+            .expect("request alternatives")
+            .retain(|method| {
+                method["properties"]["method"]["const"].as_str() != Some("workspace.list")
+            });
+        schema
+    }
+
+    #[tokio::test]
+    async fn recorded_herdr_reconnect_publishes_only_latest_compatibility() {
+        let mut script = crate::production_connect::ProductionConnectFixture::initial_handshake();
+        script.push(recorded_pane_exchange("pane-ui"));
+        script.push(
+            crate::production_connect::ProductionConnectFixture::snapshot_exchange(
+                &recorded_origin_snapshot(),
+            ),
+        );
+        script.extend(crate::production_connect::ProductionConnectFixture::initial_handshake());
+        let fixture = crate::production_connect::ProductionConnectFixture::start_scripted(script)
+            .expect("recorded schema reconnect fixture starts");
+        let adapter = muxe_adapter_herdr::HerdrAdapter::connect(fixture.adapter_config())
+            .await
+            .expect("recorded schema A connects");
+        let config_directory = tempfile::tempdir().expect("owned broker config directory");
+        let config_path = config_directory.path().join("config.yml");
+        std::fs::write(&config_path, recorded_compatibility_config())
+            .expect("write recorded broker config");
+        let broker = Broker::load(adapter.clone(), &config_path)
+            .await
+            .expect("recorded broker config loads");
+        let runtime_a = {
+            let state = broker.compatibility.state.lock().await;
+            let initial = state
+                .generations
+                .get(&CompiledGeneration(1))
+                .expect("runtime A validates generation N");
+            assert!(
+                initial
+                    .bindings
+                    .values()
+                    .all(|compatibility| { *compatibility == BindingCompatibility::Enabled })
+            );
+            state
+                .current
+                .as_ref()
+                .expect("runtime A compatibility")
+                .identity()
+                .clone()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(Arc::clone(&broker).monitor(shutdown_rx));
+
+        let hook_a = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_a)));
+        assert_eq!(
+            broker.reload().await.expect("generation N+1 reloads"),
+            CompiledGeneration(2)
+        );
+        hook_a.entered.notified().await;
+        let (_session, pending, mut events) = attach_recorded_herdr_fixture(&broker).await;
+        assert!(attached_binding(&pending, "workspaces").state.blocked);
+
+        let hook_b = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_b)));
+        fixture
+            .replace_schema(&schema_without_workspace_list())
+            .expect("install real schema B");
+        fixture.lose_retained_subscriptions();
+        wait_for_health_event(&mut events, false).await;
+        wait_for_health_event(&mut events, true).await;
+        while events.try_recv().is_ok() {}
+        let runtime_b = broker
+            .compatibility
+            .state
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .expect("runtime B compatibility from the real event stream")
+            .identity()
+            .clone();
+        assert_ne!(
+            runtime_a.schema(),
+            runtime_b.schema(),
+            "the recorded reconnect installs schema B, not only a newer continuity epoch"
+        );
+        assert_ne!(runtime_a, runtime_b);
+
+        hook_a.release.notify_one();
+        hook_a.completed.notified().await;
+        hook_b.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        hook_b.release.notify_one();
+        hook_b.completed.notified().await;
+
+        let published = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            published.iter().any(|message| matches!(
+                message,
+                WireMessage::Event {
+                    event: BrokerEvent::BindingAvailabilityChanged {
+                        availability: BindingAvailability::Blocked,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "runtime B publishes its blocked workspace compatibility"
+        );
+        assert!(
+            published.iter().all(|message| !matches!(
+                message,
+                WireMessage::Event {
+                    event: BrokerEvent::BindingAvailabilityChanged {
+                        availability: BindingAvailability::Enabled,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "paused runtime A never publishes after runtime B is installed"
+        );
+        let state = broker.compatibility.state.lock().await;
+        let generation = state
+            .generations
+            .get(&CompiledGeneration(2))
+            .expect("generation N+1 remains active");
+        assert_eq!(generation.runtime, runtime_b);
+        assert!(
+            generation
+                .bindings
+                .values()
+                .any(|compatibility| { matches!(compatibility, BindingCompatibility::Blocked(_)) }),
+            "schema B compatibility state: {:?}",
+            generation.bindings
+        );
+        assert!(
+            generation
+                .bindings
+                .values()
+                .all(|compatibility| { !matches!(compatibility, BindingCompatibility::Pending) })
+        );
+        drop(state);
+
+        let _ = shutdown_tx.send(true);
+        monitor.await.expect("broker monitor joins");
+        broker
+            .shutdown_host_adapter()
+            .await
+            .expect("recorded adapter shuts down");
+    }
+
+    #[tokio::test]
+    async fn recorded_herdr_host_loss_discards_paused_compatibility_publication() {
+        let mut script = crate::production_connect::ProductionConnectFixture::initial_handshake();
+        script.push(recorded_pane_exchange("pane-ui"));
+        script.push(
+            crate::production_connect::ProductionConnectFixture::snapshot_exchange(
+                &recorded_origin_snapshot(),
+            ),
+        );
+        let fixture = crate::production_connect::ProductionConnectFixture::start_scripted(script)
+            .expect("recorded terminal-loss fixture starts");
+        let adapter = muxe_adapter_herdr::HerdrAdapter::connect(fixture.adapter_config())
+            .await
+            .expect("recorded runtime connects");
+        let config_directory = tempfile::tempdir().expect("owned broker config directory");
+        let config_path = config_directory.path().join("config.yml");
+        std::fs::write(&config_path, recorded_compatibility_config())
+            .expect("write recorded broker config");
+        let broker = Broker::load(adapter, &config_path)
+            .await
+            .expect("recorded broker config loads");
+        let (_session, _initial, mut events) = attach_recorded_herdr_fixture(&broker).await;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(Arc::clone(&broker).monitor(shutdown_rx));
+        wait_for_health_event(&mut events, true).await;
+
+        let hook = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook)));
+        broker.reload().await.expect("compatibility rebuild starts");
+        hook.entered.notified().await;
+        fixture.lose_retained_subscriptions();
+        wait_for_health_event(&mut events, false).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        monitor
+            .await
+            .expect("real HostLost stops the broker monitor");
+        assert!(broker.compatibility.state.lock().await.retired);
+        while events.try_recv().is_ok() {}
+
+        broker.set_compatibility_commit_hook(None);
+        hook.release.notify_one();
+        hook.completed.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            events.try_recv().is_err(),
+            "no healthy or compatibility delta is published after HostLost"
+        );
+        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
+        broker
+            .shutdown_host_adapter()
+            .await
+            .expect("terminally lost adapter shuts down");
+    }
+    #[tokio::test]
+    async fn compatibility_reconnect_burst_coalesces_to_latest_runtime() {
+        let (_adapter, broker) = native_compatibility_fixture();
+        let (_session, _initial, _events) =
+            attach_native_fixture(&broker, "pane-reconnect-burst").await;
+        let epoch_a = HostContinuityEpoch::initial();
+        let epoch_b = epoch_a.successor().expect("second epoch");
+        let epoch_c = epoch_b.successor().expect("third epoch");
+        let epoch_d = epoch_c.successor().expect("fourth epoch");
+        let hook_a = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_a)));
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-0"),
+                current: compatibility_identity("server-a"),
+                compatibility: compatibility_snapshot(
+                    epoch_a,
+                    'a',
+                    &[],
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            })
+            .await;
+        hook_a.entered.notified().await;
+
+        let hook_latest = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_latest)));
+        let snapshot_d = compatibility_snapshot(
+            epoch_d,
+            'd',
+            &[("native.herdr.workspace:list", "latest runtime rejection")],
+            Arc::new(AtomicUsize::new(0)),
+        );
+        for (previous, current, snapshot) in [
+            (
+                "server-a",
+                "server-b",
+                compatibility_snapshot(epoch_b, 'b', &[], Arc::new(AtomicUsize::new(0))),
+            ),
+            (
+                "server-b",
+                "server-c",
+                compatibility_snapshot(epoch_c, 'c', &[], Arc::new(AtomicUsize::new(0))),
+            ),
+            ("server-c", "server-d", snapshot_d.clone()),
+        ] {
+            broker
+                .handle_health_event(AdapterHealthEvent::Reconnected {
+                    previous: compatibility_identity(previous),
+                    current: compatibility_identity(current),
+                    compatibility: snapshot,
+                })
+                .await;
+        }
+        assert_eq!(
+            broker.compatibility_rebuilds.counts(),
+            (1, 1),
+            "a reconnect burst retains one active rebuild and one coalesced latest desire"
+        );
+
+        hook_a.release.notify_one();
+        hook_a.completed.notified().await;
+        hook_latest.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        hook_latest.release.notify_one();
+        hook_latest.completed.notified().await;
+
+        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
+        let state = broker.compatibility.state.lock().await;
+        assert_eq!(
+            state
+                .current
+                .as_ref()
+                .map(NativeCompatibilitySnapshot::identity),
+            Some(snapshot_d.identity())
+        );
+        let generation = state
+            .generations
+            .get(&CompiledGeneration(1))
+            .expect("active generation has latest compatibility");
+        assert_eq!(generation.runtime, *snapshot_d.identity());
+        assert!(generation.bindings.values().any(|compatibility| {
+            matches!(
+                compatibility,
+                BindingCompatibility::Blocked(diagnostics)
+                    if diagnostics.iter().any(|diagnostic| {
+                        diagnostic.message == "latest runtime rejection"
+                    })
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn compatibility_reload_and_detach_prune_obsolete_desires() {
+        let directory = tempfile::TempDir::new().expect("temp config directory");
+        let path = directory.path().join("config.yml");
+        std::fs::write(
+            &path,
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      a:
+        label: agents
+        action: native.herdr.agent:list
+      w:
+        label: workspaces
+        action: native.herdr.workspace:list
+",
+        )
+        .expect("initial config");
+        let adapter = counting_adapter(false);
+        let broker = Broker::load(adapter, &path)
+            .await
+            .expect("initial broker config");
+        let initial_hook = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&initial_hook)));
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-0"),
+                current: compatibility_identity("server-a"),
+                compatibility: compatibility_snapshot(
+                    HostContinuityEpoch::initial(),
+                    'a',
+                    &[],
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            })
+            .await;
+        initial_hook.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        initial_hook.release.notify_one();
+        initial_hook.completed.notified().await;
+        let (pinned_session, _initial, _events) =
+            attach_native_fixture(&broker, "pane-pinned-generation").await;
+
+        let first_hook = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&first_hook)));
+        assert_eq!(
+            broker.reload().await.expect("first reload"),
+            CompiledGeneration(2)
+        );
+        first_hook.entered.notified().await;
+        for expected in 3..=18 {
+            assert_eq!(
+                broker.reload().await.expect("burst reload"),
+                CompiledGeneration(expected)
+            );
+            assert!(
+                broker.compatibility_rebuilds.counts().1 <= 1,
+                "obsolete reload desires are pruned eagerly"
+            );
+            assert!(
+                broker.compatibility.state.lock().await.generations.len() <= 2,
+                "only the pinned and current generations remain compatible"
+            );
+        }
+        assert_eq!(broker.compatibility_rebuilds.counts(), (1, 1));
+
+        broker
+            .detach(&pinned_session, CaptureReleaseReason::UiDismissed)
+            .await
+            .expect("detach pinned generation");
+        assert_eq!(
+            broker.compatibility.state.lock().await.generations.len(),
+            1,
+            "detaching the last pinned session prunes its compatibility state"
+        );
+
+        let latest_hook = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&latest_hook)));
+        first_hook.release.notify_one();
+        first_hook.completed.notified().await;
+        latest_hook.entered.notified().await;
+        broker.set_compatibility_commit_hook(None);
+        latest_hook.release.notify_one();
+        latest_hook.completed.notified().await;
+        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
+        let state = broker.compatibility.state.lock().await;
+        assert_eq!(
+            state.generations.keys().copied().collect::<Vec<_>>(),
+            vec![CompiledGeneration(18)]
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_shutdown_joins_active_rebuild_worker() {
+        let (_adapter, broker) = native_compatibility_fixture();
+        let (_session, _initial, _events) =
+            attach_native_fixture(&broker, "pane-shutdown-worker").await;
+        let hook = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook)));
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity("server-0"),
+                current: compatibility_identity("server-a"),
+                compatibility: compatibility_snapshot(
+                    HostContinuityEpoch::initial(),
+                    'a',
+                    &[],
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            })
+            .await;
+        hook.entered.notified().await;
+
+        let shutdown_broker = Arc::clone(&broker);
+        let shutdown = tokio::spawn(async move { shutdown_broker.shutdown_host_adapter().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown waits for the broker-owned compatibility worker"
+        );
+        broker.set_compatibility_commit_hook(None);
+        hook.release.notify_one();
+        hook.completed.notified().await;
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("adapter shuts down");
+        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
+    }
 }
 
 #[derive(Debug, Error)]
@@ -9482,6 +11601,8 @@ pub enum BrokerError {
     LocalMenuAction,
     #[error("adapter acknowledged a different execution identity")]
     MismatchedExecution,
+    #[error("{0}")]
+    NativeCompatibility(String),
     #[error("native action could not resolve against its immutable origin")]
     ContextUnavailable,
     #[error(

@@ -157,6 +157,21 @@ impl EndpointContinuityToken {
         self != other
     }
 
+    pub(crate) fn verify_socket_file(&self, socket: &Path) -> Result<(), SocketError> {
+        let actual =
+            SocketFileIdentity::capture(socket).map_err(|source| SocketError::Endpoint {
+                socket: socket.to_path_buf(),
+                source,
+            })?;
+        if self.socket_file == actual {
+            Ok(())
+        } else {
+            Err(SocketError::EndpointReplaced {
+                socket: socket.to_path_buf(),
+            })
+        }
+    }
+
     #[must_use]
     pub(crate) fn live_server_id(&self, protocol: u64, version: &str) -> String {
         live_server_id(

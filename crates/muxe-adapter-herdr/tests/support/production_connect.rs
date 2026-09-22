@@ -21,6 +21,7 @@ use super::recorded_socket::{RecordedExchange, RecordedResponse, RecordedUnixSer
 pub struct ProductionConnectFixture {
     _schema_temp: TempDir,
     schema_binary: PathBuf,
+    schema_json: PathBuf,
     cache_dir: PathBuf,
     server: RecordedUnixServer,
 }
@@ -64,6 +65,7 @@ impl ProductionConnectFixture {
         Ok(Self {
             _schema_temp: schema_temp,
             schema_binary,
+            schema_json,
             cache_dir,
             server,
         })
@@ -123,6 +125,13 @@ impl ProductionConnectFixture {
             herdr_binary: self.schema_binary.clone(),
             cache_dir: self.cache_dir.clone(),
         }
+    }
+
+    /// Atomically replaces the schema returned by the owned fake binary.
+    pub fn replace_schema(&self, schema: &Value) -> io::Result<()> {
+        let replacement = self.schema_json.with_extension("next");
+        std::fs::write(&replacement, schema.to_string())?;
+        std::fs::rename(replacement, &self.schema_json)
     }
 
     pub fn socket(&self) -> &Path {

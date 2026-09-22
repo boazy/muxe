@@ -14,9 +14,9 @@ use std::{
 
 use muxe_adapter_api::{
     AdapterError, AdapterErrorKind, AdapterHealthEvent, DispatchCompletion, HostAdapter,
-    HostCallerIdentity, OriginCaptureRequest, OriginHintSource, PendingPaneRegistration,
-    PortableDispatchRequest, PostDismissalPortableDispatchRequest, ResolvedPortableAction,
-    UiSessionId, UntrustedOriginHint,
+    HostCallerIdentity, NativeCompatibilityOutcome, OriginCaptureRequest, OriginHintSource,
+    PendingPaneRegistration, PortableDispatchRequest, PostDismissalPortableDispatchRequest,
+    ResolvedPortableAction, UiSessionId, UntrustedOriginHint,
 };
 use muxe_adapter_herdr::{
     CommandPaneLaunch, CommandTabLaunch, FocusedPane, HerdrAdapter, HerdrResponse, HerdrRuntime,
@@ -1279,6 +1279,120 @@ async fn reconnects_the_production_adapter_only_after_retained_subscription_loss
     drop(fixture);
 }
 
+#[tokio::test]
+async fn reconnect_snapshot_tracks_schema_a_to_b_to_a_with_exact_cached_diagnostics() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.extend(ProductionConnectFixture::initial_handshake());
+    script.extend(ProductionConnectFixture::initial_handshake());
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned schema-drift reconnect fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("initial schema A connects");
+    assert!(matches!(
+        adapter.next_health_event().await.expect("initial health"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    let initial = adapter
+        .native_compatibility_snapshot()
+        .expect("initial compatibility snapshot");
+    let candidate = |type_name: &str, source: &str| NativeActionCandidate {
+        type_name: type_name.to_owned(),
+        type_span: SourceSpan::new(SourceId::new(source), 10, 20),
+        fields: Vec::new(),
+    };
+    let agents = candidate("native.herdr.agent:list", "agents");
+    let workspaces = candidate("native.herdr.workspace:list", "workspaces");
+    assert!(matches!(
+        initial.validate_native(&agents),
+        NativeCompatibilityOutcome::Compatible(_)
+    ));
+    assert!(matches!(
+        initial.validate_native(&workspaces),
+        NativeCompatibilityOutcome::Compatible(_)
+    ));
+
+    let schema_a: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/herdr/herdr-api.schema.json"
+    ))
+    .expect("bundled schema A");
+    let mut schema_b = schema_a.clone();
+    schema_b["schemas"]["request"]["oneOf"]
+        .as_array_mut()
+        .expect("request alternatives")
+        .retain(|method| {
+            method["properties"]["method"]["const"].as_str() != Some("workspace.list")
+        });
+    fixture
+        .replace_schema(&schema_b)
+        .expect("atomically install schema B");
+    fixture.lose_retained_subscriptions();
+    assert!(matches!(
+        adapter.next_health_event().await.expect("schema A loss"),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    let AdapterHealthEvent::Reconnected {
+        compatibility: schema_b_snapshot,
+        ..
+    } = adapter
+        .next_health_event()
+        .await
+        .expect("schema B reconnect")
+    else {
+        panic!("expected schema B Reconnected event")
+    };
+    assert!(schema_b_snapshot.identity().continuity() > initial.identity().continuity());
+    assert_ne!(
+        schema_b_snapshot.identity().schema(),
+        initial.identity().schema()
+    );
+    assert!(matches!(
+        schema_b_snapshot.validate_native(&agents),
+        NativeCompatibilityOutcome::Compatible(_)
+    ));
+    let first_blocked = match schema_b_snapshot.validate_native(&workspaces) {
+        NativeCompatibilityOutcome::Blocked(diagnostics) => diagnostics,
+        NativeCompatibilityOutcome::Compatible(_) => panic!("schema B removed workspace.list"),
+    };
+    let cached_blocked = match schema_b_snapshot.validate_native(&workspaces) {
+        NativeCompatibilityOutcome::Blocked(diagnostics) => diagnostics,
+        NativeCompatibilityOutcome::Compatible(_) => {
+            panic!("cached schema B result cannot enable workspace.list")
+        }
+    };
+    assert_eq!(
+        cached_blocked, first_blocked,
+        "cached negative reconstructs the exact source-aware diagnostic"
+    );
+    assert!(
+        !first_blocked[0]
+            .message
+            .contains("cached Herdr compatibility rejection")
+    );
+
+    fixture
+        .replace_schema(&schema_a)
+        .expect("atomically restore schema A");
+    fixture.lose_retained_subscriptions();
+    assert!(matches!(
+        adapter.next_health_event().await.expect("schema B loss"),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    let AdapterHealthEvent::Reconnected {
+        compatibility: restored,
+        ..
+    } = adapter.next_health_event().await.expect("schema A restore")
+    else {
+        panic!("expected restored schema A Reconnected event")
+    };
+    assert!(restored.identity().continuity() > schema_b_snapshot.identity().continuity());
+    assert_eq!(restored.identity().schema(), initial.identity().schema());
+    assert!(matches!(
+        restored.validate_native(&workspaces),
+        NativeCompatibilityOutcome::Compatible(_)
+    ));
+    adapter.shutdown().await.expect("adapter shutdown");
+}
 #[tokio::test]
 async fn reconnect_install_cannot_revive_a_completed_suspend_invalidation() {
     let mut script = ProductionConnectFixture::initial_handshake();

@@ -872,6 +872,9 @@ async fn recorded_herdr_reconnect_reestablishes_subscription_with_recorded_messa
         .identity()
         .await
         .expect("identity before continuity loss");
+    let before_compatibility = adapter
+        .native_compatibility_snapshot()
+        .expect("healthy Herdr runtime exposes compatibility");
     let connected = tokio::time::timeout(Duration::from_secs(10), adapter.next_health_event())
         .await
         .expect("connect reports promptly")
@@ -896,10 +899,24 @@ async fn recorded_herdr_reconnect_reestablishes_subscription_with_recorded_messa
         .await
         .expect("the monitor reconnects through recorded messages")
         .expect("reconnect is a valid event");
-    let AdapterHealthEvent::Reconnected { previous, current } = reconnected else {
+    let AdapterHealthEvent::Reconnected {
+        previous,
+        current,
+        compatibility,
+    } = reconnected
+    else {
         panic!("expected a Reconnected event after the recorded reconnect")
     };
     assert_eq!(previous, before);
+    assert!(
+        compatibility.identity().continuity() > before_compatibility.identity().continuity(),
+        "same-schema reconnect still advances the typed continuity epoch"
+    );
+    assert_eq!(
+        compatibility.identity().schema(),
+        before_compatibility.identity().schema(),
+        "same recorded schema keeps the pure schema fingerprint"
+    );
     // Endpoint peer credentials are diagnostic only and may legitimately
     // differ after a reconnect; continuity rests on the fresh subscription
     // plus the epoch, never on equal endpoint observations.

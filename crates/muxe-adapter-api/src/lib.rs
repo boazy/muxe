@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use muxe_core::{
-    ActionValidator, CompiledGeneration, ConfigDiagnostic, ContextResolutionError,
-    ExecutionCapabilities, ExecutionId, NativeActionCandidate, OriginContext, PaneId,
-    PortableAction, PortableActionResolutionError, TabId, WorkspaceId,
+    ActionValidation, ActionValidator, BindingId, CompiledGeneration, ConfigDiagnostic,
+    ContextResolutionError, ExecutionCapabilities, ExecutionId, NativeActionCandidate,
+    OriginContext, PaneId, PortableAction, PortableActionResolutionError, TabId, WorkspaceId,
 };
 
 macro_rules! opaque_id {
@@ -144,6 +144,145 @@ pub struct HostIdentity {
     pub kind: HostKind,
     pub discovery_key: HostDiscoveryKey,
     pub live_server_id: LiveServerIncarnationId,
+}
+
+/// Monotonic continuity identity for one installed host runtime.
+///
+/// The ordinal is intentionally opaque: callers can only create the initial
+/// epoch or advance an existing epoch, so unrelated numeric values cannot be
+/// substituted for continuity evidence.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HostContinuityEpoch(u64);
+
+impl HostContinuityEpoch {
+    pub const INITIAL: Self = Self(1);
+
+    #[must_use]
+    pub const fn initial() -> Self {
+        Self::INITIAL
+    }
+
+    #[must_use]
+    pub const fn successor(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
+/// Rejected host-schema fingerprint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostSchemaFingerprintError;
+
+impl fmt::Display for HostSchemaFingerprintError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("host schema fingerprint must be a 64-character hexadecimal digest")
+    }
+}
+
+impl std::error::Error for HostSchemaFingerprintError {}
+
+/// Content identity of the immutable native-request schema used by a runtime.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HostSchemaFingerprint(Arc<str>);
+
+impl HostSchemaFingerprint {
+    /// Parses the canonical lowercase or uppercase SHA-256 hexadecimal form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostSchemaFingerprintError`] for any non-digest value.
+    pub fn parse(value: impl Into<Arc<str>>) -> Result<Self, HostSchemaFingerprintError> {
+        let value = value.into();
+        if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Ok(Self(value))
+        } else {
+            Err(HostSchemaFingerprintError)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Exact host runtime against which native candidates are validated.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NativeCompatibilityIdentity {
+    continuity: HostContinuityEpoch,
+    schema: HostSchemaFingerprint,
+}
+
+impl NativeCompatibilityIdentity {
+    #[must_use]
+    pub const fn new(continuity: HostContinuityEpoch, schema: HostSchemaFingerprint) -> Self {
+        Self { continuity, schema }
+    }
+
+    #[must_use]
+    pub const fn continuity(&self) -> HostContinuityEpoch {
+        self.continuity
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> &HostSchemaFingerprint {
+        &self.schema
+    }
+}
+
+/// Result of validating one retained native candidate against an immutable runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeCompatibilityOutcome {
+    Compatible(ActionValidation),
+    /// One or more complete source-aware diagnostics. Implementations must not
+    /// return an empty vector.
+    Blocked(Vec<ConfigDiagnostic>),
+}
+
+/// Immutable native-candidate validator captured from one installed runtime.
+pub trait NativeCompatibilityValidator: Send + Sync {
+    fn validate_native(&self, candidate: &NativeActionCandidate) -> NativeCompatibilityOutcome;
+}
+
+/// Cloneable compatibility capability bound to one continuity epoch and schema.
+#[derive(Clone)]
+pub struct NativeCompatibilitySnapshot {
+    identity: NativeCompatibilityIdentity,
+    validator: Arc<dyn NativeCompatibilityValidator>,
+}
+
+impl NativeCompatibilitySnapshot {
+    #[must_use]
+    pub fn new(
+        identity: NativeCompatibilityIdentity,
+        validator: Arc<dyn NativeCompatibilityValidator>,
+    ) -> Self {
+        Self {
+            identity,
+            validator,
+        }
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &NativeCompatibilityIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub fn validate_native(&self, candidate: &NativeActionCandidate) -> NativeCompatibilityOutcome {
+        self.validator.validate_native(candidate)
+    }
+}
+
+impl fmt::Debug for NativeCompatibilitySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeCompatibilitySnapshot")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
 }
 
 #[expect(
@@ -366,6 +505,7 @@ pub enum AdapterHealthEvent {
     Reconnected {
         previous: HostIdentity,
         current: HostIdentity,
+        compatibility: NativeCompatibilitySnapshot,
     },
     /// Terminal host loss: the adapter exhausted its bounded grace and will not recover;
     /// the broker must retire it.
@@ -451,6 +591,13 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
     async fn identity(&self) -> Result<HostIdentity, AdapterError>;
 
     async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError>;
+
+    /// Returns the immutable native-compatibility capability for the exact
+    /// currently installed runtime. Adapters without schema-drifting native
+    /// actions leave compatibility unmanaged.
+    fn native_compatibility_snapshot(&self) -> Option<NativeCompatibilitySnapshot> {
+        None
+    }
 
     /// Returns a host-defined scope used to enforce v1's one-ready-UI modal rule.
     async fn modal_scope(&self, ui_pane: &PaneId) -> Result<ModalScopeId, AdapterError>;
@@ -553,8 +700,8 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BindingCompatibilityKey {
     pub generation: CompiledGeneration,
-    pub binding_ordinal: u64,
-    pub active_host_schema_fingerprint: String,
+    pub binding: BindingId,
+    pub runtime: NativeCompatibilityIdentity,
 }
 
 #[cfg(test)]

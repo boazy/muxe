@@ -14,6 +14,21 @@ pub mod service;
 pub mod spawn;
 mod wire;
 
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "broker reconnect proofs share the adapter's complete production-connect fixture"
+)]
+#[path = "../../muxe-adapter-herdr/tests/support/production_connect.rs"]
+pub(crate) mod production_connect;
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "broker reconnect proofs share the adapter's complete recorded socket fixture"
+)]
+#[path = "../../muxe-adapter-herdr/tests/support/recorded_socket.rs"]
+pub(crate) mod recorded_socket;
+
 pub use broker::{Broker, BrokerDiagnostic, BrokerError, PendingAttachment, RequestResult};
 pub use client::{BrokerClient, ClientError};
 pub use config::{ConfigError, ConfigSnapshot, ConfigStore, load_effective_config};

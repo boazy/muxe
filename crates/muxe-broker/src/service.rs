@@ -1983,6 +1983,7 @@ fn error_diagnostic(error: &BrokerError) -> muxe_protocol::ProtocolDiagnostic {
             BrokerError::ActivationInProgress => {
                 muxe_protocol::DiagnosticCode::ActivationInProgress
             }
+            BrokerError::NativeCompatibility(_) => muxe_protocol::DiagnosticCode::ActionBlocked,
             _ => muxe_protocol::DiagnosticCode::InvalidRequest,
         },
         message,

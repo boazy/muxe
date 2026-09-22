@@ -1,22 +1,31 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use muxe_core::{
-    AfterAction as CoreAfterAction, BindingConditions, ConditionIr, KeyboardProfile,
-    LocalMenuAction, MenuControl as CoreMenuControl, MenuId as CoreMenuId, MenuView, MenuViewMenu,
-    ThemeSection, UiAttachmentView, ViewBindingSettings,
+    AfterAction as CoreAfterAction, BindingConditions, BindingId as CoreBindingId, ConditionIr,
+    KeyboardProfile, LocalMenuAction, MenuControl as CoreMenuControl, MenuId as CoreMenuId,
+    MenuView, MenuViewMenu, ThemeSection, UiAttachmentView, ViewBindingSettings,
 };
 use muxe_protocol::{
     AfterAction, BindingConditionsWire, BindingId, BindingSettingsWire, BindingStateWire,
     BindingViewWire, ColorSchemeWire, CompiledThemeWire, ConditionIrWire, ExecutionMode,
     ExecutionPolicyWire, KeyCapabilitiesWire, KeyboardProfileWire, LayoutPaddingWire,
     LayoutSettingsWire, LocalMenuActionWire, MenuControl, MenuControlAction, MenuId,
-    MenuViewMenuWire, MenuViewWire, NamedStringWire, NamedStyleWire, StyleWire, ThemeSectionWire,
-    TimeoutAction, UiAttachmentWire,
+    MenuViewMenuWire, MenuViewWire, NamedStringWire, NamedStyleWire, ProtocolDiagnostic, StyleWire,
+    ThemeSectionWire, TimeoutAction, UiAttachmentWire,
 };
 
-pub fn attachment(view: &UiAttachmentView) -> UiAttachmentWire {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindingAvailabilityView {
+    pub blocked: bool,
+    pub diagnostic: Option<ProtocolDiagnostic>,
+}
+
+pub fn attachment(
+    view: &UiAttachmentView,
+    availability: &BTreeMap<CoreBindingId, BindingAvailabilityView>,
+) -> UiAttachmentWire {
     UiAttachmentWire {
-        menu: menu_view(&view.menu),
+        menu: menu_view(&view.menu, availability),
         keyboard: keyboard(&view.keyboard),
         inactivity_timeout_millis: view.inactivity_timeout.map(duration_millis),
         theme: theme(&view.theme),
@@ -30,15 +39,25 @@ fn core_menu_id(value: &CoreMenuId) -> MenuId {
     }
 }
 
-fn menu_view(view: &MenuView) -> MenuViewWire {
+fn menu_view(
+    view: &MenuView,
+    availability: &BTreeMap<CoreBindingId, BindingAvailabilityView>,
+) -> MenuViewWire {
     MenuViewWire {
         generation: view.generation.0,
         root: core_menu_id(&view.root),
-        menus: view.menus.iter().map(menu).collect(),
+        menus: view
+            .menus
+            .iter()
+            .map(|menu_view| menu(menu_view, availability))
+            .collect(),
     }
 }
 
-fn menu(menu: &MenuViewMenu) -> MenuViewMenuWire {
+fn menu(
+    menu: &MenuViewMenu,
+    availability: &BTreeMap<CoreBindingId, BindingAvailabilityView>,
+) -> MenuViewMenuWire {
     MenuViewMenuWire {
         id: core_menu_id(&menu.id),
         title: menu.title.clone(),
@@ -56,24 +75,27 @@ fn menu(menu: &MenuViewMenu) -> MenuViewMenuWire {
         bindings: menu
             .bindings
             .iter()
-            .map(|binding| BindingViewWire {
-                id: BindingId {
-                    generation: binding.id.generation().0,
-                    ordinal: binding.id.ordinal(),
-                },
-                key: binding.key.to_string(),
-                label: binding.label.clone(),
-                hidden: binding.hidden,
-                state: BindingStateWire {
-                    included: binding.state.included,
-                    enabled: binding.state.enabled,
-                    shown: binding.state.shown,
-                    blocked: binding.state.blocked,
-                },
-                settings: settings(&binding.settings),
-                conditions: conditions(&binding.conditions),
-                local_menu_action: binding.local_menu_action.as_ref().map(local_action),
-                diagnostic: None,
+            .map(|binding| {
+                let compatibility = availability.get(&binding.id);
+                BindingViewWire {
+                    id: BindingId {
+                        generation: binding.id.generation().0,
+                        ordinal: binding.id.ordinal(),
+                    },
+                    key: binding.key.to_string(),
+                    label: binding.label.clone(),
+                    hidden: binding.hidden,
+                    state: BindingStateWire {
+                        included: binding.state.included,
+                        enabled: binding.state.enabled,
+                        shown: binding.state.shown,
+                        blocked: compatibility.is_some_and(|state| state.blocked),
+                    },
+                    settings: settings(&binding.settings),
+                    conditions: conditions(&binding.conditions),
+                    local_menu_action: binding.local_menu_action.as_ref().map(local_action),
+                    diagnostic: compatibility.and_then(|state| state.diagnostic.clone()),
+                }
             })
             .collect(),
     }
