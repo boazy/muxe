@@ -137,8 +137,14 @@ impl ProductionConnectFixture {
         drop(stream);
         Ok(HostIdentity {
             kind: HostKind::Herdr,
-            discovery_key: self.server.socket().display().to_string(),
-            live_server_id: endpoint.live_server_id(BUNDLED_PROTOCOL, "0.8.2"),
+            discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                self.server.socket().display().to_string(),
+            )
+            .expect("validated host discovery key"),
+            live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                endpoint.live_server_id(BUNDLED_PROTOCOL, "0.8.2"),
+            )
+            .expect("validated live server incarnation"),
         })
     }
 

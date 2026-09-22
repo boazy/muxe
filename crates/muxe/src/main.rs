@@ -614,7 +614,7 @@ async fn ensure_herdr_broker(
 ) -> Result<PathBuf> {
     let record = muxe::compatibility::embedded_record()
         .wrap_err("could not load the embedded compatibility record")?;
-    let discovery = runtime.identity().discovery_key.clone();
+    let discovery = runtime.identity().discovery_key.as_str().to_owned();
     let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Herdr, &discovery)
         .wrap_err("could not derive the normal Herdr broker endpoint")?;
     let executable = env::current_exe().wrap_err("could not locate the running muxe executable")?;
@@ -665,7 +665,7 @@ async fn ensure_zellij_broker(
     config_file: &Path,
     session: &str,
     zellij_exe: &Path,
-) -> Result<PathBuf> {
+) -> Result<muxe::lifecycle::LiveBroker> {
     let record = muxe::compatibility::embedded_record()
         .wrap_err("could not load the embedded compatibility record")?;
     let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Zellij, session)
@@ -694,7 +694,7 @@ async fn ensure_zellij_broker(
         .await
         .map_err(|error| color_eyre::eyre::eyre!("could not ensure the Zellij broker: {error}"))?
     {
-        muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.socket),
+        muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live),
         muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
             let current = Some(detect_current_host(cache_dir)?);
             run_activation(HostScope::Current, current).await?;
@@ -703,7 +703,7 @@ async fn ensure_zellij_broker(
                 .map_err(|error| {
                     color_eyre::eyre::eyre!("could not re-verify the Zellij broker: {error}")
                 })? {
-                muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.socket),
+                muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live),
                 muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
                     bail!("activation did not converge the Zellij broker record")
                 }
@@ -2223,7 +2223,7 @@ async fn launcher_client(
     // is activated) before the exactly-one selection below. A wrong identity
     // fails closed here, never with a second broker.
     ensure_herdr_broker(cache_dir, config_file, runtime).await?;
-    let discovery = runtime.identity().discovery_key.clone();
+    let discovery = runtime.identity().discovery_key.as_str().to_owned();
     let registry = muxe::lifecycle::Registry::open(cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
     let mut matches = registry
@@ -2246,8 +2246,8 @@ async fn launcher_client(
         env!("CARGO_PKG_VERSION"),
         muxe_protocol::LiveServerIdentity {
             host: muxe_protocol::HostKind::Herdr,
-            discovery_key: identity.discovery_key.clone(),
-            server_id: muxe_protocol::ServerId::new(identity.live_server_id.clone()),
+            discovery_key: identity.discovery_key.as_str().to_owned(),
+            server_id: muxe_protocol::ServerId::new(identity.live_server_id.as_str()),
         },
     )
     .await
@@ -2419,7 +2419,7 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
     // so attach below never races initial readiness. A stale record
     // activates the invoking bridge group; a wrong identity fails closed
     // without a second broker.
-    let socket = ensure_zellij_broker(
+    let live = ensure_zellij_broker(
         &paths.cache_dir,
         &paths.config_file(),
         &session,
@@ -2427,14 +2427,10 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
     )
     .await?;
     let mut client = muxe_broker::BrokerClient::connect(
-        &socket,
+        &live.entry.socket,
         muxe_protocol::PeerRole::Ui,
         env!("CARGO_PKG_VERSION"),
-        muxe_protocol::LiveServerIdentity {
-            host: muxe_protocol::HostKind::Zellij,
-            discovery_key: session.clone(),
-            server_id: muxe_protocol::ServerId::new(format!("zellij-session:{session}")),
-        },
+        live.status.live_server,
     )
     .await
     .wrap_err("could not establish the Zellij UI broker connection")?;
@@ -2815,8 +2811,8 @@ async fn run_herdr_ui(menu: UiMenuCommand) -> Result<()> {
     let socket = ensure_herdr_broker(&paths.cache_dir, &paths.config_file(), &runtime).await?;
     let live_server = LiveServerIdentity {
         host: ProtocolHostKind::Herdr,
-        discovery_key: runtime.identity().discovery_key.clone(),
-        server_id: muxe_protocol::ServerId::new(runtime.identity().live_server_id.clone()),
+        discovery_key: runtime.identity().discovery_key.as_str().to_owned(),
+        server_id: muxe_protocol::ServerId::new(runtime.identity().live_server_id.as_str()),
     };
     let mut client = BrokerClient::connect(
         &socket,
@@ -3683,8 +3679,15 @@ mod mixed_recovery_production_tests {
         async fn identity(&self) -> Result<HostIdentity, AdapterError> {
             Ok(HostIdentity {
                 kind: muxe_adapter_api::HostKind::Zellij,
-                discovery_key: self.discovery_key.clone(),
-                live_server_id: format!("server-{}", self.discovery_key),
+                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                    self.discovery_key.clone(),
+                )
+                .expect("validated host discovery key"),
+                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(format!(
+                    "server-{}",
+                    self.discovery_key
+                ))
+                .expect("validated live server incarnation"),
             })
         }
 

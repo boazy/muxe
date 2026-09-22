@@ -30,7 +30,9 @@ use muxe_adapter_api::{
     PortableDispatchRequest,
 };
 use muxe_adapter_herdr::HerdrAdapter;
-use muxe_adapter_zellij::{PipeChannel, PipeTransportError, ZellijAdapter, ZellijAdapterConfig};
+use muxe_adapter_zellij::{
+    MembershipSource, PipeChannel, PipeTransportError, ZellijAdapter, ZellijAdapterConfig,
+};
 use muxe_core::{
     ActionValidation, ActionValidator, ConfigDiagnostic, DiagnosticCode, ExecutionCapabilities,
     ExecutionId, NativeActionCandidate, OriginContext, OriginHostKind, OriginInvocationSource,
@@ -198,8 +200,14 @@ impl HostAdapter for RecordedContractAdapter {
     async fn identity(&self) -> Result<HostIdentity, AdapterError> {
         Ok(HostIdentity {
             kind: HostKind::Herdr,
-            discovery_key: "recorded-contract".to_owned(),
-            live_server_id: "recorded-server".to_owned(),
+            discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                "recorded-contract".to_owned(),
+            )
+            .expect("validated host discovery key"),
+            live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                "recorded-server".to_owned(),
+            )
+            .expect("validated live server incarnation"),
         })
     }
 
@@ -356,6 +364,21 @@ fn origin() -> OriginContext {
         link_handler_id: None,
     }
 }
+async fn current_origin(adapter: &ZellijAdapter) -> OriginContext {
+    let identity = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(identity) = adapter.identity().await {
+                return identity;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("compatible coverage publishes a live identity");
+    let mut origin = origin();
+    origin.server_id = ServerId::new(identity.live_server_id.as_str());
+    origin
+}
 
 fn candidate(type_name: &str) -> NativeActionCandidate {
     NativeActionCandidate {
@@ -448,14 +471,6 @@ async fn drive_shared_contract(adapter: &dyn HostAdapter, expectations: &Contrac
         .await
         .expect("the shared contract reports a live identity");
     assert_eq!(identity.kind, expectations.kind);
-    assert!(
-        !identity.discovery_key.is_empty(),
-        "the shared contract reports a discovery key"
-    );
-    assert!(
-        !identity.live_server_id.is_empty(),
-        "the shared contract reports a live server id"
-    );
     assert_eq!(
         adapter
             .capabilities()
@@ -637,17 +652,46 @@ async fn recorded_herdr_production_connect_reports_raw_identity_and_messages() {
     adapter.shutdown().await.expect("Herdr shutdown");
 }
 
-async fn self_attested_registration_is_contained() {
-    let request = RecordedPipeChannel::new();
-    let event = RecordedPipeChannel::new();
-    let contained = ZellijAdapter::new(
+struct SingleClientMembership;
+
+#[async_trait]
+impl MembershipSource for SingleClientMembership {
+    async fn snapshot_members(&self) -> Result<Vec<String>, AdapterError> {
+        Ok(vec!["client-1".to_owned()])
+    }
+}
+
+fn recorded_zellij_adapter(
+    request: &Arc<RecordedPipeChannel>,
+    event: &Arc<RecordedPipeChannel>,
+) -> ZellijAdapter {
+    ZellijAdapter::new_with_membership(
         ZellijAdapterConfig {
             session_name: "session-alpha".to_owned(),
             zellij_exe: PathBuf::from("/nonexistent/zellij"),
         },
-        Arc::clone(&request) as Arc<dyn PipeChannel>,
-        Arc::clone(&event) as Arc<dyn PipeChannel>,
+        Arc::clone(request) as Arc<dyn PipeChannel>,
+        Arc::clone(event) as Arc<dyn PipeChannel>,
+        Arc::new(SingleClientMembership),
+    )
+}
+
+async fn self_attested_registration_is_contained() {
+    let request = RecordedPipeChannel::new();
+    let event = RecordedPipeChannel::new();
+    let contained = recorded_zellij_adapter(&request, &event);
+    event.push_line(
+        encode_event_line(&register_event([7; 16], bridge_build_id()))
+            .expect("compatible registration encodes"),
     );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while contained.identity().await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("compatible continuity is covered");
+    let current_origin = current_origin(&contained).await;
     event.push_line(
         encode_event_line(&register_event(
             [9; 16],
@@ -655,6 +699,18 @@ async fn self_attested_registration_is_contained() {
         ))
         .expect("registration encodes"),
     );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                contained.next_health_event().await,
+                Ok(AdapterHealthEvent::Unhealthy { .. })
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("incompatible registration is observed");
     let rejection = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let result = contained
@@ -663,7 +719,7 @@ async fn self_attested_registration_is_contained() {
                     action: muxe_adapter_api::ResolvedNativeAction {
                         candidate: candidate("native.zellij.command:close-focus"),
                     },
-                    origin: origin(),
+                    origin: current_origin.clone(),
                 })
                 .await;
             if let Err(error) = result
@@ -688,6 +744,7 @@ async fn await_registration_accepted(
     adapter: &ZellijAdapter,
     execution: ExecutionId,
 ) -> DispatchAccepted {
+    let origin = current_origin(adapter).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match adapter
@@ -696,7 +753,7 @@ async fn await_registration_accepted(
                     action: muxe_adapter_api::ResolvedNativeAction {
                         candidate: candidate("native.zellij.command:close-focus"),
                     },
-                    origin: origin(),
+                    origin: origin.clone(),
                 })
                 .await
             {
@@ -715,14 +772,7 @@ async fn await_registration_accepted(
 async fn recorded_zellij_bridge_contract_targets_registration_and_contains_self_attestation() {
     let request = RecordedPipeChannel::new();
     let event = RecordedPipeChannel::new();
-    let adapter = ZellijAdapter::new(
-        ZellijAdapterConfig {
-            session_name: "session-alpha".to_owned(),
-            zellij_exe: PathBuf::from("/nonexistent/zellij"),
-        },
-        Arc::clone(&request) as Arc<dyn PipeChannel>,
-        Arc::clone(&event) as Arc<dyn PipeChannel>,
-    );
+    let adapter = recorded_zellij_adapter(&request, &event);
     assert!(
         !adapter
             .capabilities()

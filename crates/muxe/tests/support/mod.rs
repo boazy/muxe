@@ -710,12 +710,7 @@ async fn wait_for_herdr_handshake(socket: &Path) -> io::Result<String> {
         if socket.exists() {
             let client = muxe_adapter_herdr::HerdrSocketClient::new(socket);
             if let Ok(identity) = muxe_adapter_herdr::probe_live_identity(&client).await {
-                if identity.discovery_key.is_empty() || identity.live_server_id.is_empty() {
-                    // Socket answers but the server is not fully up yet.
-                } else {
-                    return Ok(identity.discovery_key);
-                }
-                // Socket file exists before the server accepts; keep polling.
+                return Ok(identity.discovery_key.as_str().to_owned());
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1589,7 +1584,7 @@ impl ContinuityGuard {
                     self.socket.display()
                 ))
             })?;
-        if identity.discovery_key != self.expected {
+        if identity.discovery_key.as_str() != self.expected {
             return Err(io::Error::other(format!(
                 "continuity witness '{}': live identity changed mid-run",
                 self.tag

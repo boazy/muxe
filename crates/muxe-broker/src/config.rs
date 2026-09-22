@@ -498,8 +498,14 @@ mod tests {
         async fn identity(&self) -> Result<HostIdentity, AdapterError> {
             Ok(HostIdentity {
                 kind: AdapterHostKind::Herdr,
-                discovery_key: "config-test-host".to_owned(),
-                live_server_id: "config-test-server".to_owned(),
+                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                    "config-test-host".to_owned(),
+                )
+                .expect("validated host discovery key"),
+                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                    "config-test-server".to_owned(),
+                )
+                .expect("validated live server incarnation"),
             })
         }
 

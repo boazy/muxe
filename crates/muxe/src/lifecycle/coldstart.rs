@@ -1347,8 +1347,10 @@ mod tests {
         ) -> Result<muxe_adapter_api::HostIdentity, muxe_adapter_api::AdapterError> {
             Ok(muxe_adapter_api::HostIdentity {
                 kind: muxe_adapter_api::HostKind::Zellij,
-                discovery_key: "session-test".to_owned(),
-                live_server_id: "server-test".to_owned(),
+                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse("session-test")
+                    .expect("valid test discovery key"),
+                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse("server-test")
+                    .expect("valid test incarnation"),
             })
         }
         async fn capabilities(

@@ -7,6 +7,7 @@
 //! dispatch targets, and missing values stay missing so the broker can report
 //! `context_unavailable` before dispatch.
 
+use muxe_adapter_api::{HostDiscoveryKey, LiveServerIncarnationId};
 use std::path::PathBuf;
 
 use muxe_core::{
@@ -34,8 +35,8 @@ pub enum OriginError {
 
 /// Builds the immutable attach-time origin from a validated bridge snapshot.
 ///
-/// `server_name` is the live session name the broker was configured with; a
-/// snapshot for a different session fails rather than cross-wiring dispatch.
+/// `discovery` is the typed live session key the broker was configured with;
+/// a snapshot for a different session fails rather than cross-wiring dispatch.
 /// `ui_pane` is the attaching Muxe UI's own pane. It is verified against the
 /// snapshot but never stored as the action origin: pane-scoped actions resolve
 /// from the verified bridge PRIOR (pre-menu) pane, so the UI pane can never
@@ -50,7 +51,8 @@ pub enum OriginError {
 /// absolute.
 pub fn build_origin_context(
     snapshot: &ZellijOrigin,
-    server_name: &str,
+    discovery: &HostDiscoveryKey,
+    live: &LiveServerIncarnationId,
     ui_pane: &str,
     session_id: Option<&str>,
     tab_id: Option<&str>,
@@ -81,7 +83,7 @@ pub fn build_origin_context(
         Some(pane) => Some(PaneId::new(pane)),
     };
     if let Some(session) = &snapshot.session_name
-        && session != server_name
+        && session != discovery.as_str()
     {
         return Err(OriginError::InvalidId {
             field: "session",
@@ -102,7 +104,7 @@ pub fn build_origin_context(
         .transpose()?;
     Ok(OriginContext {
         host_kind: OriginHostKind::Zellij,
-        server_id: ServerId::new(server_name),
+        server_id: ServerId::new(live.as_str()),
         client_id: Some(ClientId::new(snapshot.client_id.clone())),
         session_id: session_id
             .or(snapshot.session_name.as_deref())
@@ -155,15 +157,30 @@ mod tests {
             prior_pane_is_plugin: Some(false),
         }
     }
+    fn discovery(value: &str) -> HostDiscoveryKey {
+        HostDiscoveryKey::parse(value).expect("test discovery key is nonempty")
+    }
+
+    fn incarnation(value: &str) -> LiveServerIncarnationId {
+        LiveServerIncarnationId::parse(value).expect("test live incarnation is nonempty")
+    }
 
     #[test]
     fn snapshot_builds_immutable_origin() {
         // Production-shaped capture: no caller-supplied tab/session values.
         // Every asserted identity comes from the bridge frame itself.
-        let origin = build_origin_context(&snapshot(), "alpha", "plugin-9", None, None, None)
-            .expect("valid snapshot builds");
+        let origin = build_origin_context(
+            &snapshot(),
+            &discovery("alpha"),
+            &incarnation("incarnation-alpha"),
+            "plugin-9",
+            None,
+            None,
+            None,
+        )
+        .expect("valid snapshot builds");
         assert_eq!(origin.host_kind, OriginHostKind::Zellij);
-        assert_eq!(origin.server_id.as_str(), "alpha");
+        assert_eq!(origin.server_id.as_str(), "incarnation-alpha");
         // The action origin is the bridge PRIOR pane, never the Muxe UI pane:
         // pane-scoped dispatch must not close or write into the menu itself.
         assert_eq!(
@@ -188,7 +205,8 @@ mod tests {
     fn caller_tab_override_wins_over_snapshot() {
         let origin = build_origin_context(
             &snapshot(),
-            "alpha",
+            &discovery("alpha"),
+            &incarnation("incarnation-alpha"),
             "plugin-9",
             None,
             Some("tab-9"),
@@ -204,8 +222,16 @@ mod tests {
 
     #[test]
     fn cross_session_snapshot_fails() {
-        let error = build_origin_context(&snapshot(), "beta", "plugin-9", None, None, None)
-            .expect_err("different session fails");
+        let error = build_origin_context(
+            &snapshot(),
+            &discovery("beta"),
+            &incarnation("incarnation-alpha"),
+            "plugin-9",
+            None,
+            None,
+            None,
+        )
+        .expect_err("different session fails");
         assert!(matches!(
             error,
             OriginError::InvalidId {
@@ -220,7 +246,15 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.prior_pane_cwd = Some("relative/path".to_owned());
         assert!(matches!(
-            build_origin_context(&snapshot, "alpha", "plugin-9", None, None, None),
+            build_origin_context(
+                &snapshot,
+                &discovery("alpha"),
+                &incarnation("incarnation-alpha"),
+                "plugin-9",
+                None,
+                None,
+                None,
+            ),
             Err(OriginError::RelativeCwd)
         ));
     }
@@ -233,8 +267,16 @@ mod tests {
         snapshot.active_tab_index = None;
         snapshot.active_tab_id = None;
         snapshot.prior_pane_is_plugin = None;
-        let origin =
-            build_origin_context(&snapshot, "alpha", "plugin-9", None, None, None).expect("builds");
+        let origin = build_origin_context(
+            &snapshot,
+            &discovery("alpha"),
+            &incarnation("incarnation-alpha"),
+            "plugin-9",
+            None,
+            None,
+            None,
+        )
+        .expect("builds");
         assert_eq!(origin.pane_cwd, None);
         assert_eq!(origin.session_id, None);
         assert_eq!(origin.tab_index, None);
@@ -249,8 +291,16 @@ mod tests {
 
     #[test]
     fn ui_pane_mismatch_fails() {
-        let error = build_origin_context(&snapshot(), "alpha", "plugin-8", None, None, None)
-            .expect_err("foreign UI pane fails");
+        let error = build_origin_context(
+            &snapshot(),
+            &discovery("alpha"),
+            &incarnation("incarnation-alpha"),
+            "plugin-8",
+            None,
+            None,
+            None,
+        )
+        .expect_err("foreign UI pane fails");
         assert!(matches!(
             error,
             OriginError::InvalidId {
@@ -264,8 +314,16 @@ mod tests {
     fn empty_prior_pane_fails() {
         let mut snapshot = snapshot();
         snapshot.prior_pane_id = Some(String::new());
-        let error = build_origin_context(&snapshot, "alpha", "plugin-9", None, None, None)
-            .expect_err("empty prior fails");
+        let error = build_origin_context(
+            &snapshot,
+            &discovery("alpha"),
+            &incarnation("incarnation-alpha"),
+            "plugin-9",
+            None,
+            None,
+            None,
+        )
+        .expect_err("empty prior fails");
         assert!(matches!(
             error,
             OriginError::InvalidId {
@@ -279,8 +337,16 @@ mod tests {
     fn missing_prior_pane_stays_missing() {
         let mut snapshot = snapshot();
         snapshot.prior_pane_id = None;
-        let origin =
-            build_origin_context(&snapshot, "alpha", "plugin-9", None, None, None).expect("builds");
+        let origin = build_origin_context(
+            &snapshot,
+            &discovery("alpha"),
+            &incarnation("incarnation-alpha"),
+            "plugin-9",
+            None,
+            None,
+            None,
+        )
+        .expect("builds");
         assert_eq!(origin.pane_id, None);
     }
 }

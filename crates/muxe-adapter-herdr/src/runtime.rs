@@ -364,8 +364,12 @@ fn identity_from_ping_result(
     // process identifiers; consumers must not use it as a continuity token.
     Ok(HostIdentity {
         kind: HostKind::Herdr,
-        discovery_key,
-        live_server_id: endpoint.live_server_id(protocol, version),
+        discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(discovery_key)
+            .expect("validated Herdr discovery key"),
+        live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+            endpoint.live_server_id(protocol, version),
+        )
+        .expect("validated Herdr endpoint incarnation"),
     })
 }
 
@@ -407,9 +411,9 @@ mod tests {
         let identity = identity_from_ping_result("/owned/socket".to_owned(), &endpoint, &pong())
             .expect("protocol 20 pong has type, version, and protocol");
 
-        assert_eq!(identity.discovery_key, "/owned/socket");
+        assert_eq!(identity.discovery_key.as_str(), "/owned/socket");
         assert_eq!(
-            identity.live_server_id,
+            identity.live_server_id.as_str(),
             endpoint.live_server_id(BUNDLED_PROTOCOL, "0.8.2")
         );
     }

@@ -462,6 +462,7 @@ impl Preflight for LivePreflight<'_> {
                 let identity = self.herdr_runtime(discovery_key).await?.identity().clone();
                 let version = identity
                     .live_server_id
+                    .as_str()
                     .split("/ver:")
                     .nth(1)
                     .and_then(|tail| tail.split('/').next())

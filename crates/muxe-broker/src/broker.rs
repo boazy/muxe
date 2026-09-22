@@ -1199,8 +1199,8 @@ impl Broker {
                 muxe_adapter_api::HostKind::Zellij => HostKind::Zellij,
                 muxe_adapter_api::HostKind::Herdr => HostKind::Herdr,
             },
-            discovery_key: identity.discovery_key,
-            server_id: muxe_protocol::ServerId::new(identity.live_server_id),
+            discovery_key: identity.discovery_key.as_str().to_owned(),
+            server_id: muxe_protocol::ServerId::new(identity.live_server_id.as_str()),
         })
     }
 
@@ -4129,8 +4129,12 @@ menus:
         async fn identity(&self) -> Result<HostIdentity, AdapterError> {
             Ok(HostIdentity {
                 kind: muxe_adapter_api::HostKind::Herdr,
-                discovery_key: "test".to_owned(),
-                live_server_id: "server".to_owned(),
+                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse("test".to_owned())
+                    .expect("validated host discovery key"),
+                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                    "server".to_owned(),
+                )
+                .expect("validated live server incarnation"),
             })
         }
 
@@ -4340,8 +4344,12 @@ menus:
         async fn identity(&self) -> Result<HostIdentity, AdapterError> {
             Ok(HostIdentity {
                 kind: muxe_adapter_api::HostKind::Herdr,
-                discovery_key: "test".to_owned(),
-                live_server_id: "server".to_owned(),
+                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse("test".to_owned())
+                    .expect("validated host discovery key"),
+                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                    "server".to_owned(),
+                )
+                .expect("validated live server incarnation"),
             })
         }
 
@@ -4601,8 +4609,12 @@ menus:
             .handle_health_event(AdapterHealthEvent::HostLost {
                 identity: HostIdentity {
                     kind: muxe_adapter_api::HostKind::Herdr,
-                    discovery_key: "test".to_owned(),
-                    live_server_id: "server".to_owned(),
+                    discovery_key: muxe_adapter_api::HostDiscoveryKey::parse("test".to_owned())
+                        .expect("validated host discovery key"),
+                    live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                        "server".to_owned(),
+                    )
+                    .expect("validated live server incarnation"),
                 },
                 error: AdapterError::new(
                     muxe_adapter_api::AdapterErrorKind::Unavailable,
@@ -4628,8 +4640,12 @@ menus:
             .handle_health_event(AdapterHealthEvent::HostLost {
                 identity: HostIdentity {
                     kind: muxe_adapter_api::HostKind::Herdr,
-                    discovery_key: "test".to_owned(),
-                    live_server_id: "server".to_owned(),
+                    discovery_key: muxe_adapter_api::HostDiscoveryKey::parse("test".to_owned())
+                        .expect("validated host discovery key"),
+                    live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                        "server".to_owned(),
+                    )
+                    .expect("validated live server incarnation"),
                 },
                 error: AdapterError::new(
                     muxe_adapter_api::AdapterErrorKind::Unavailable,
@@ -4716,8 +4732,12 @@ menus:
             .handle_health_event(AdapterHealthEvent::HostLost {
                 identity: HostIdentity {
                     kind: muxe_adapter_api::HostKind::Herdr,
-                    discovery_key: "test".to_owned(),
-                    live_server_id: "server".to_owned(),
+                    discovery_key: muxe_adapter_api::HostDiscoveryKey::parse("test".to_owned())
+                        .expect("validated host discovery key"),
+                    live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                        "server".to_owned(),
+                    )
+                    .expect("validated live server incarnation"),
                 },
                 error: AdapterError::new(
                     muxe_adapter_api::AdapterErrorKind::Unavailable,

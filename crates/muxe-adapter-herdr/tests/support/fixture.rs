@@ -278,7 +278,7 @@ impl OwnedHerdrFixture {
             }
             match timeout(remaining, probe_live_identity(&client)).await {
                 Ok(Ok(identity)) => {
-                    if identity.discovery_key != self.socket.display().to_string() {
+                    if identity.discovery_key.as_str() != self.socket.display().to_string() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "Herdr readiness identity is not bound to the fixture socket",

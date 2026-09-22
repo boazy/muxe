@@ -3346,14 +3346,20 @@ mod tests {
     fn a_new_local_epoch_blocks_an_origin_with_the_same_observed_server() {
         let identity = HostIdentity {
             kind: muxe_adapter_api::HostKind::Herdr,
-            discovery_key: "/owned/herdr.sock".to_owned(),
-            live_server_id: "observed-server".to_owned(),
+            discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                "/owned/herdr.sock".to_owned(),
+            )
+            .expect("validated host discovery key"),
+            live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                "observed-server".to_owned(),
+            )
+            .expect("validated live server incarnation"),
         };
         let mut captured = origin();
         captured.server_id = ServerId::new(origin_epoch_token(&identity, 1));
 
         assert!(!origin_is_current(&captured, &identity, 2));
-        assert_eq!(identity.live_server_id, "observed-server");
+        assert_eq!(identity.live_server_id.as_str(), "observed-server");
     }
 
     #[test]

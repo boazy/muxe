@@ -1246,7 +1246,10 @@ mod tests {
                 prior_pane_cwd: None,
                 prior_pane_is_plugin: Some(false),
             },
-            "session-alpha",
+            &muxe_adapter_api::HostDiscoveryKey::parse("session-alpha")
+                .expect("test discovery key"),
+            &muxe_adapter_api::LiveServerIncarnationId::parse("incarnation-alpha")
+                .expect("test incarnation"),
             "plugin-9",
             None,
             None,
@@ -1570,7 +1573,10 @@ mod tests {
                 prior_pane_cwd: None,
                 prior_pane_is_plugin: Some(false),
             },
-            "session-alpha",
+            &muxe_adapter_api::HostDiscoveryKey::parse("session-alpha")
+                .expect("test discovery key"),
+            &muxe_adapter_api::LiveServerIncarnationId::parse("incarnation-alpha")
+                .expect("test incarnation"),
             "plugin-9",
             None,
             None,

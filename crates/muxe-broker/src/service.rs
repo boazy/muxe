@@ -2105,7 +2105,7 @@ pub enum ServerError {
 }
 #[cfg(test)]
 mod tests {
-    use crate::{BrokerClient, broker::WaitHook};
+    use crate::{BrokerClient, ClientError, broker::WaitHook};
     use std::{
         collections::VecDeque,
         sync::{
@@ -2512,8 +2512,14 @@ mod tests {
         async fn identity(&self) -> Result<HostIdentity, AdapterError> {
             Ok(HostIdentity {
                 kind: muxe_adapter_api::HostKind::Herdr,
-                discovery_key: "owned-fake-host".to_owned(),
-                live_server_id: "owned-fake-server".to_owned(),
+                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                    "owned-fake-host".to_owned(),
+                )
+                .expect("validated host discovery key"),
+                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                    "owned-fake-server".to_owned(),
+                )
+                .expect("validated live server incarnation"),
             })
         }
 
@@ -2718,8 +2724,14 @@ mod tests {
         async fn identity(&self) -> Result<HostIdentity, AdapterError> {
             Ok(HostIdentity {
                 kind: muxe_adapter_api::HostKind::Herdr,
-                discovery_key: "owned-fake-host".to_owned(),
-                live_server_id: "owned-fake-server".to_owned(),
+                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                    "owned-fake-host".to_owned(),
+                )
+                .expect("validated host discovery key"),
+                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                    "owned-fake-server".to_owned(),
+                )
+                .expect("validated live server incarnation"),
             })
         }
 
@@ -3168,16 +3180,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_unix_server_accepts_and_detaches_a_fake_host_ui() {
+    async fn unix_server_rejects_retired_identity_and_accepts_status_identity() {
         let (directory, _runtime, broker, endpoint, shutdown_tx, server_task) =
             running_unix_server().await;
         let config_path = directory.path().join("config.yml");
-        let live_server = broker.live_identity().await.expect("fake host identity");
-        let client_identity = LiveServerIdentity {
-            host: HostKind::Herdr,
-            discovery_key: "owned-fake-host".to_owned(),
-            server_id: WireServerId::new(live_server.server_id.as_str()),
+        let controller = ActivationController::start(
+            &broker,
+            ActivationBootstrap::Running {
+                current: test_record(),
+            },
+        )
+        .await
+        .expect("running controller captures broker identity");
+        let (result, _) = controller.handle(&broker, ControlOperation::Status).await;
+        let ControlResult::Status(status) = result else {
+            panic!("running broker reports status, got {result:?}");
         };
+        let client_identity = status.live_server;
+        let retired_incarnation = LiveServerIdentity {
+            host: HostKind::Herdr,
+            discovery_key: client_identity.discovery_key.clone(),
+            server_id: WireServerId::new("retired-incarnation"),
+        };
+        let rejected = match BrokerClient::connect(
+            endpoint.socket(),
+            PeerRole::Ui,
+            "owned-stale-ui",
+            retired_incarnation,
+        )
+        .await
+        {
+            Ok(_) => panic!("same discovery key with a retired incarnation must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            rejected,
+            ClientError::ConnectionClosed | ClientError::IdentityMismatch
+        ));
         let mut client = BrokerClient::connect(
             endpoint.socket(),
             PeerRole::Ui,
@@ -5031,8 +5070,14 @@ menus:
             .handle_health_event(AdapterHealthEvent::HostLost {
                 identity: HostIdentity {
                     kind: muxe_adapter_api::HostKind::Herdr,
-                    discovery_key: "owned-fake-host".to_owned(),
-                    live_server_id: "owned-fake-server".to_owned(),
+                    discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                        "owned-fake-host".to_owned(),
+                    )
+                    .expect("validated host discovery key"),
+                    live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                        "owned-fake-server".to_owned(),
+                    )
+                    .expect("validated live server incarnation"),
                 },
                 error: AdapterError::new(
                     AdapterErrorKind::Unavailable,

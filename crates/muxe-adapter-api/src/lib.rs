@@ -60,13 +60,90 @@ pub enum HostKind {
     Zellij,
     Herdr,
 }
+/// Rejected host-identity component.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostIdentityError {
+    field: &'static str,
+}
+
+impl fmt::Display for HostIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} must not be empty", self.field)
+    }
+}
+
+impl std::error::Error for HostIdentityError {}
+
+macro_rules! host_identity_id {
+    ($name:ident, $description:literal, $field:literal) => {
+        #[doc = $description]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(Arc<str>);
+
+        impl $name {
+            /// Validates and wraps an identity component.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`HostIdentityError`] when `value` is empty.
+            pub fn parse(value: impl Into<Arc<str>>) -> Result<Self, HostIdentityError> {
+                let value = value.into();
+                if value.is_empty() {
+                    return Err(HostIdentityError { field: $field });
+                }
+                Ok(Self(value))
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = HostIdentityError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::parse(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = HostIdentityError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::parse(value)
+            }
+        }
+    };
+}
+
+host_identity_id!(
+    HostDiscoveryKey,
+    "Stable key used to discover one configured host.",
+    "host discovery key"
+);
+host_identity_id!(
+    LiveServerIncarnationId,
+    "Opaque identity of one live continuity incarnation.",
+    "live server incarnation"
+);
 
 /// Identity of the exact live host server, not merely its discovery key.
+///
+/// The discovery key may survive a server replacement; only the incarnation
+/// identifies the continuity currently safe for captured origins and clients.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostIdentity {
     pub kind: HostKind,
-    pub discovery_key: String,
-    pub live_server_id: String,
+    pub discovery_key: HostDiscoveryKey,
+    pub live_server_id: LiveServerIncarnationId,
 }
 
 #[expect(
@@ -478,4 +555,27 @@ pub struct BindingCompatibilityKey {
     pub generation: CompiledGeneration,
     pub binding_ordinal: u64,
     pub active_host_schema_fingerprint: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostDiscoveryKey, LiveServerIncarnationId};
+
+    #[test]
+    fn host_identity_components_reject_empty_values() {
+        assert!(HostDiscoveryKey::parse("").is_err());
+        assert!(LiveServerIncarnationId::parse("").is_err());
+        assert_eq!(
+            HostDiscoveryKey::parse("session-alpha")
+                .expect("nonempty discovery key")
+                .as_str(),
+            "session-alpha"
+        );
+        assert_eq!(
+            LiveServerIncarnationId::parse("zellij/continuity:01ABC")
+                .expect("nonempty incarnation")
+                .as_str(),
+            "zellij/continuity:01ABC"
+        );
+    }
 }
