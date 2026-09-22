@@ -85,6 +85,20 @@ impl ConditionProgram {
         muxe_condition::evaluate(&self.ir, pages)
     }
 }
+/// Evaluates already-lowered condition IR through the shared evaluator.
+///
+/// This is used by archive bridges that retain only the condition trees needed for hot-path
+/// decisions instead of copying an entire menu graph.
+///
+/// # Errors
+///
+/// Returns an error when evaluation cannot produce a Boolean result.
+pub fn evaluate_condition_ir(
+    ir: &ConditionIr,
+    pages: PagesContext,
+) -> Result<bool, ConditionEvaluationError> {
+    muxe_condition::evaluate(ir, pages)
+}
 /// Lowers one accepted CEL AST into the shared IR. Every rejected construct names the construct
 /// and the source fragment; CEL parse errors themselves surface from `Program::compile` above.
 fn lower_expression(expression: &IdedExpr) -> Result<ConditionIr, String> {

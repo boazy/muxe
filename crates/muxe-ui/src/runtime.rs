@@ -1,16 +1,16 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use muxe_core::{
-    AfterAction, CanonicalKey, EventKind, ExecutionId as CoreExecutionId, InlineMenuId,
-    KeyCapabilities, KeyboardProfile, MenuControl as CoreMenuControl, MenuId as CoreMenuId,
-    MenuName, MenuSession, MenuSessionEvent, MenuSessionInput, MenuSessionOutput, MenuSessionState,
-    SessionInstant,
+    AfterAction, CanonicalKey, ConditionIr, EventKind, ExecutionId as CoreExecutionId,
+    InlineMenuId, KeyCapabilities, KeyboardProfile, MenuControl as CoreMenuControl,
+    MenuId as CoreMenuId, MenuName, MenuSession, MenuSessionEvent, MenuSessionInput,
+    MenuSessionOutput, MenuSessionState, PagesContext, SessionInstant, evaluate_condition_ir,
 };
 use muxe_protocol::{
-    ArchivedKeyboardProfileWire, ArchivedLocalMenuActionWire, ArchivedMenuControl, ArchivedMenuId,
-    ArchivedMenuViewMenuWire, BindingAvailability, BindingId, BrokerEvent,
-    ConditionEvaluationErrorWire, ExecutionId as WireExecutionId, ExecutionOutcome, MenuControl,
-    PagesContextWire, ProtocolDiagnostic, evaluate_archived_binding_state,
+    ArchivedConditionIrWire, ArchivedKeyboardProfileWire, ArchivedLocalMenuActionWire,
+    ArchivedMenuControl, ArchivedMenuId, ArchivedMenuViewMenuWire, BindingAvailability, BindingId,
+    BrokerEvent, ConditionEvaluationErrorWire, ExecutionId as WireExecutionId, ExecutionOutcome,
+    MenuControl, PagesContextWire, ProtocolDiagnostic, evaluate_archived_binding_state,
 };
 use ratatui::{layout::Rect, style::Style as RatatuiStyle};
 use thiserror::Error;
@@ -266,19 +266,57 @@ struct PendingExecution {
     after_action: AfterAction,
 }
 
+#[derive(Clone, Copy)]
 struct BindingPolicy {
     after_action: AfterAction,
+}
+
+struct RoutingMetadata {
+    generation: u64,
+    menus: Vec<RoutingMenu>,
+    menu_indices: HashMap<CoreMenuId, usize>,
+    binding_policies: HashMap<BindingId, BindingPolicy>,
+}
+
+struct RoutingMenu {
+    bindings: Vec<RoutingBinding>,
+}
+
+struct RoutingBinding {
+    id: BindingId,
+    key: CanonicalKey,
+    repeat: bool,
+    blocked: bool,
+    conditions: RoutingConditions,
+    action: Option<RoutingAction>,
+    diagnostic: Option<String>,
+}
+
+struct RoutingConditions {
+    include: Option<ConditionIr>,
+    enable: Option<ConditionIr>,
+    show: Option<ConditionIr>,
+}
+
+enum RoutingAction {
+    Open(CoreMenuId),
+    Control(MenuControl),
+    PagePrevious,
+    PageNext,
 }
 
 /// UI-local state around a checked archived attachment.
 ///
 /// The frame remains the source of every menu, binding, layout, condition, and local action.
 /// This type compiles only the attachment's template environment and produces transient rendered
-/// cells for the current terminal size; it never deserializes or mirrors the menu graph.
+/// cells for the current terminal size. Routing retains only compact hot-path metadata; it never
+/// deserializes or mirrors the menu graph.
 pub struct UiRuntime {
     snapshot: ArchivedUiSnapshot,
     renderer: TemplateRenderer,
     keyboard_profile: KeyboardProfile,
+    session_id: String,
+    routing: RoutingMetadata,
     menu_session: MenuSession,
     current_page: usize,
     last_page_count: usize,
@@ -310,25 +348,33 @@ impl UiRuntime {
         frame: muxe_protocol::ArchivedFrame,
         now: SessionInstant,
     ) -> Result<Self, UiError> {
-        let snapshot = ArchivedUiSnapshot::new(frame)?;
-        let renderer = snapshot
-            .with_attachment(|attachment| TemplateRenderer::from_archived(&attachment.theme))??;
-        let keyboard_profile = snapshot.with_attachment(keyboard_profile_from_attachment)?;
-        let (root, timeout) = snapshot.with_attachment(|attachment| {
-            (
-                archived_to_core_menu_id(&attachment.menu.root),
-                attachment
+        let (snapshot, initialized) =
+            ArchivedUiSnapshot::with_new_attachment(frame, |session_id, attachment| {
+                let renderer = TemplateRenderer::from_archived(&attachment.theme)?;
+                let keyboard_profile = keyboard_profile_from_attachment(attachment);
+                let root = archived_to_core_menu_id(&attachment.menu.root)
+                    .ok_or(UiError::InvalidMenuIdentity)?;
+                let timeout = attachment
                     .inactivity_timeout_millis
                     .as_ref()
-                    .map(|timeout| Duration::from_millis(timeout.to_native())),
-            )
-        })?;
-        let root = root.ok_or(UiError::InvalidMenuIdentity)?;
-        snapshot.with_attachment(validate_binding_keys)??;
+                    .map(|timeout| Duration::from_millis(timeout.to_native()));
+                let routing = routing_metadata(attachment)?;
+                Ok::<_, UiError>((
+                    session_id.to_owned(),
+                    renderer,
+                    keyboard_profile,
+                    root,
+                    timeout,
+                    routing,
+                ))
+            })?;
+        let (session_id, renderer, keyboard_profile, root, timeout, routing) = initialized?;
         Ok(Self {
             snapshot,
             renderer,
             keyboard_profile,
+            session_id,
+            routing,
             menu_session: MenuSession::new(root, timeout, now),
             current_page: 0,
             last_page_count: 1,
@@ -340,14 +386,10 @@ impl UiRuntime {
         })
     }
 
-    /// Returns the checked broker session ID associated with this runtime.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`UiError`] when the retained frame fails to decode or is not a UI attachment
-    /// response.
-    pub fn session_id(&self) -> Result<&str, UiError> {
-        Ok(self.snapshot.session_id()?)
+    /// Returns the broker session ID captured during attachment initialization.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Returns the parser profile exactly supplied by the attached broker snapshot.
@@ -467,22 +509,25 @@ impl UiRuntime {
         input: &crate::ConvertedKeyEvent,
     ) -> Result<Selection, UiError> {
         let current_menu = self.current_menu_id()?;
-        self.snapshot.with_attachment(|attachment| {
-            let menu = attachment
-                .menu
-                .menus
-                .iter()
-                .find(|menu| archived_targets_core(&menu.id, &current_menu))
-                .ok_or(UiError::MissingRoot)?;
-            select_binding(
-                menu,
-                &self.keyboard_profile,
-                input,
-                self.current_page,
-                self.last_page_count,
-                &self.availability,
-            )
-        })?
+        let menu_index = self
+            .routing
+            .menu_indices
+            .get(&current_menu)
+            .copied()
+            .ok_or(UiError::MissingRoot)?;
+        let menu = self
+            .routing
+            .menus
+            .get(menu_index)
+            .ok_or(UiError::MissingRoot)?;
+        select_binding(
+            menu,
+            &self.keyboard_profile,
+            input,
+            self.current_page,
+            self.last_page_count,
+            &self.availability,
+        )
     }
 
     /// Moves the pager one page, reporting whether the visible page changed.
@@ -606,8 +651,7 @@ impl UiRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`UiError`] when the attached session ID or attachment cannot be read, or when a
-    /// binding condition fails to evaluate.
+    /// Returns [`UiError`] when a binding condition fails to evaluate.
     pub fn handle_broker_event(
         &mut self,
         event: &BrokerEvent,
@@ -619,7 +663,7 @@ impl UiRuntime {
                 execution,
                 outcome,
                 diagnostic,
-            } if session.as_str() == self.session_id()? => {
+            } if session.as_str() == self.session_id => {
                 Ok(self.on_execution_completed(execution, *outcome, diagnostic.as_ref(), at))
             }
             BrokerEvent::BindingAvailabilityChanged {
@@ -628,19 +672,9 @@ impl UiRuntime {
                 binding,
                 availability,
                 diagnostic,
-            } if session.as_str() == self.session_id()? => {
-                let known = self.snapshot.with_attachment(|attachment| {
-                    attachment.menu.generation.to_native() == *generation
-                        && attachment
-                            .menu
-                            .menus
-                            .iter()
-                            .flat_map(|menu| menu.bindings.iter())
-                            .any(|candidate| {
-                                candidate.id.generation.to_native() == binding.generation
-                                    && candidate.id.ordinal.to_native() == binding.ordinal
-                            })
-                })?;
+            } if session.as_str() == self.session_id => {
+                let known = self.routing.generation == *generation
+                    && self.routing.binding_policies.contains_key(binding);
                 if !known {
                     return Ok(UiCommand::Ignored);
                 }
@@ -778,22 +812,14 @@ impl UiRuntime {
             self.last_page_count = 1;
         }
         // First pass: lay out against the pre-existing status so a healthy
-        // menu renders byte-identical to before. When that pass newly degrades
-        // a component, the centralized error status was absent at layout time,
-        // so a second pass re-lays out with the row reserved; degradation is
-        // monotonic, so one re-run converges instead of oscillating. Compare
-        // against the pre-existing status rather than the rendered line: the
-        // first pass always paints the error it detects.
+        // menu renders byte-identical to before. A newly degraded component causes the
+        // single archive borrow below to rerun layout with the status row reserved.
         let status_visible = self.status.is_some();
-        let (mut prepared, page, degraded) = self.prepare_with_status_row(area, false)?;
-        if !degraded.is_empty() && !status_visible {
-            (prepared, _, _) = self.prepare_with_status_row(area, true)?;
-        }
+        let (prepared, page, _degraded) = self.prepare_with_status_row(area, status_visible)?;
         self.current_page = page;
         self.last_page_count = prepared.plan.page_count.max(1);
         Ok(prepared)
     }
-
     /// Renders one frame with explicit control over the reserved status row.
     /// Degraded components set the centralized error status through
     /// [`Self::flag_degraded_component`] and the status line is rendered in
@@ -807,7 +833,7 @@ impl UiRuntime {
         let stack = self.menu_session.stack();
         let current_page = self.current_page;
         let last_page_count = self.last_page_count;
-        let reserve_status = status_reserved || self.status.is_some();
+        let status_visible = self.status.is_some();
         let (prepared, page, degraded) = self.snapshot.with_attachment(|attachment| {
             let menu = attachment
                 .menu
@@ -829,76 +855,26 @@ impl UiRuntime {
             // Width ownership stays here: reserve the title and delimiter, then trim leading
             // crumbs before SurfaceFrame reaches the terminal. Terminal/widget only render the
             // spans they receive, so right-edge clipping cannot discard the current-menu tail.
-            let breadcrumb_width = available_breadcrumb_width(area.width, &title);
-            let grid = grid_rect(area, padding, reserve_status);
-            let max_title_width = menu.layout.max_item_title_length.to_native() as usize;
-            let mut count = last_page_count.max(1);
-            let mut page = current_page.min(count.saturating_sub(1));
-            let attempts = menu.bindings.len().saturating_mul(2).saturating_add(2);
-
-            for _ in 0..attempts {
-                let pages = PagesContextWire {
-                    current: page.saturating_add(1) as u64,
-                    count: count as u64,
-                };
-                let (cells, degraded_cells) = render_visible_cells(
-                    &self.renderer,
-                    menu,
-                    pages,
-                    max_title_width,
-                    &self.availability,
-                )?;
-                let layout_cells = cells
-                    .iter()
-                    .map(|rendered| Cell {
-                        text: &rendered.plain,
-                    })
-                    .collect::<Vec<_>>();
-                let plan = arrange_cells(
-                    &layout_cells,
-                    grid,
-                    menu.layout.padding.between_rows.to_native(),
-                    menu.layout.padding.between_columns.to_native(),
-                );
-                let next_count = plan.page_count.max(1);
-                let next_page = page.min(next_count.saturating_sub(1));
-                if next_count == count && next_page == page {
-                    let (breadcrumbs, degraded_crumbs) = render_breadcrumbs_or_fallback(
-                        &self.renderer,
-                        attachment,
-                        stack,
-                        breadcrumb_width,
-                    );
-                    let (pager_text, degraded_pager) = render_pager_or_fallback(
-                        &self.renderer,
-                        menu,
-                        &plan,
-                        page,
-                        grid.width as usize,
-                    );
-                    let mut degraded: Vec<DegradedComponent> = degraded_cells;
-                    degraded.extend(degraded_crumbs);
-                    degraded.extend(degraded_pager);
-                    return Ok((
-                        PreparedMenu {
-                            title,
-                            title_style: self.renderer.title_style(),
-                            breadcrumbs,
-                            padding,
-                            plan,
-                            cells,
-                            page,
-                            pager: pager_text,
-                            status: None,
-                        },
-                        page,
-                        degraded,
-                    ));
-                }
-                count = next_count;
-                page = next_page;
+            let pass = RenderMenuPass {
+                renderer: &self.renderer,
+                attachment,
+                menu,
+                stack,
+                availability: &self.availability,
+                area,
+                padding,
+                title: &title,
+                breadcrumb_width: available_breadcrumb_width(area.width, &title),
+                max_title_width: menu.layout.max_item_title_length.to_native() as usize,
+                current_page,
+                last_page_count,
+            };
+            let first = render_menu_pass(pass, status_reserved)?;
+            if !first.2.is_empty() && !status_visible {
+                render_menu_pass(pass, true)
+            } else {
+                Ok(first)
             }
-            Err(UiError::UnstablePageConditions)
         })??;
         let mut prepared = prepared;
         for (component, error) in &degraded {
@@ -907,11 +883,6 @@ impl UiRuntime {
         prepared.status = self.render_current_status();
         Ok((prepared, page, degraded))
     }
-
-    /// Renders the current centralized status through the status template in
-    /// the same `prepare` that set it, so the detecting frame paints its own
-    /// error line. A failing status template degrades to the plain message
-    /// text rather than aborting the otherwise fully rendered menu.
     fn render_current_status(&mut self) -> Option<RenderedText> {
         let (level, message) = self
             .status
@@ -937,24 +908,14 @@ impl UiRuntime {
     }
 
     fn binding_policy(&self, binding: &BindingId) -> Result<BindingPolicy, UiError> {
-        self.snapshot.with_attachment(|attachment| {
-            attachment
-                .menu
-                .menus
-                .iter()
-                .flat_map(|menu| menu.bindings.iter())
-                .find(|candidate| {
-                    candidate.id.generation.to_native() == binding.generation
-                        && candidate.id.ordinal.to_native() == binding.ordinal
-                })
-                .map(|binding| BindingPolicy {
-                    after_action: archived_after_action(&binding.settings.after_action),
-                })
-                .ok_or(UiError::MissingBinding {
-                    generation: binding.generation,
-                    ordinal: binding.ordinal,
-                })
-        })?
+        self.routing
+            .binding_policies
+            .get(binding)
+            .copied()
+            .ok_or(UiError::MissingBinding {
+                generation: binding.generation,
+                ordinal: binding.ordinal,
+            })
     }
 
     fn menu_output(&mut self, output: Option<&MenuSessionOutput>) -> UiCommand {
@@ -1121,6 +1082,95 @@ fn render_visible_cells(
     Ok((cells, degraded))
 }
 
+#[derive(Clone, Copy)]
+struct RenderMenuPass<'a> {
+    renderer: &'a TemplateRenderer,
+    attachment: &'a muxe_protocol::ArchivedUiAttachmentWire,
+    menu: &'a ArchivedMenuViewMenuWire,
+    stack: &'a [CoreMenuId],
+    availability: &'a [BindingAvailabilityOverlay],
+    area: Rect,
+    padding: SurfacePadding,
+    title: &'a str,
+    breadcrumb_width: usize,
+    max_title_width: usize,
+    current_page: usize,
+    last_page_count: usize,
+}
+
+fn render_menu_pass(
+    pass: RenderMenuPass<'_>,
+    reserve_status: bool,
+) -> Result<(PreparedMenu, usize, Vec<DegradedComponent>), UiError> {
+    let RenderMenuPass {
+        renderer,
+        attachment,
+        menu,
+        stack,
+        availability,
+        area,
+        padding,
+        title,
+        breadcrumb_width,
+        max_title_width,
+        current_page,
+        last_page_count,
+    } = pass;
+    let grid = grid_rect(area, padding, reserve_status);
+    let mut count = last_page_count.max(1);
+    let mut page = current_page.min(count.saturating_sub(1));
+    let attempts = menu.bindings.len().saturating_mul(2).saturating_add(2);
+    for _ in 0..attempts {
+        let pages = PagesContextWire {
+            current: page.saturating_add(1) as u64,
+            count: count as u64,
+        };
+        let (cells, degraded_cells) =
+            render_visible_cells(renderer, menu, pages, max_title_width, availability)?;
+        let layout_cells = cells
+            .iter()
+            .map(|rendered| Cell {
+                text: &rendered.plain,
+            })
+            .collect::<Vec<_>>();
+        let plan = arrange_cells(
+            &layout_cells,
+            grid,
+            menu.layout.padding.between_rows.to_native(),
+            menu.layout.padding.between_columns.to_native(),
+        );
+        let next_count = plan.page_count.max(1);
+        let next_page = page.min(next_count.saturating_sub(1));
+        if next_count == count && next_page == page {
+            let (breadcrumbs, degraded_crumbs) =
+                render_breadcrumbs_or_fallback(renderer, attachment, stack, breadcrumb_width);
+            let (pager_text, degraded_pager) =
+                render_pager_or_fallback(renderer, menu, &plan, page, grid.width as usize);
+            let mut degraded: Vec<DegradedComponent> = degraded_cells;
+            degraded.extend(degraded_crumbs);
+            degraded.extend(degraded_pager);
+            return Ok((
+                PreparedMenu {
+                    title: title.to_owned(),
+                    title_style: renderer.title_style(),
+                    breadcrumbs,
+                    padding,
+                    plan,
+                    cells,
+                    page,
+                    pager: pager_text,
+                    status: None,
+                },
+                page,
+                degraded,
+            ));
+        }
+        count = next_count;
+        page = next_page;
+    }
+    Err(UiError::UnstablePageConditions)
+}
+
 /// Renders breadcrumbs, degrading to the plain crumb titles when the
 /// load-valid template fails evaluation. The runtime owns the available width:
 /// it re-renders a suffix with an ellipsis before handing spans to the terminal.
@@ -1276,23 +1326,179 @@ enum Selection {
     Binding(BindingId),
 }
 
-fn validate_binding_keys(
+fn routing_metadata(
     attachment: &muxe_protocol::ArchivedUiAttachmentWire,
-) -> Result<(), UiError> {
-    for binding in attachment
-        .menu
-        .menus
-        .iter()
-        .flat_map(|menu| menu.bindings.iter())
-    {
-        CanonicalKey::parse(binding.key.as_str())
-            .map_err(|_| UiError::InvalidBindingKey(binding.key.as_str().to_owned()))?;
+) -> Result<RoutingMetadata, UiError> {
+    let mut menus = Vec::with_capacity(attachment.menu.menus.len());
+    let mut menu_indices = HashMap::with_capacity(attachment.menu.menus.len());
+    let mut binding_policies = HashMap::new();
+    for menu in attachment.menu.menus.iter() {
+        let menu_id = archived_to_core_menu_id(&menu.id).ok_or(UiError::InvalidMenuIdentity)?;
+        let mut bindings = Vec::with_capacity(menu.bindings.len());
+        for binding in menu.bindings.iter() {
+            let binding_id = BindingId {
+                generation: binding.id.generation.to_native(),
+                ordinal: binding.id.ordinal.to_native(),
+            };
+            let key = CanonicalKey::parse(binding.key.as_str())
+                .map_err(|_| UiError::InvalidBindingKey(binding.key.as_str().to_owned()))?;
+            let action = match binding.local_menu_action.as_ref() {
+                Some(ArchivedLocalMenuActionWire::Open { target }) => Some(RoutingAction::Open(
+                    archived_to_core_menu_id(target).ok_or(UiError::InvalidMenuIdentity)?,
+                )),
+                Some(ArchivedLocalMenuActionWire::Control(ArchivedMenuControl::Quit)) => {
+                    Some(RoutingAction::Control(MenuControl::Quit))
+                }
+                Some(ArchivedLocalMenuActionWire::Control(ArchivedMenuControl::Return)) => {
+                    Some(RoutingAction::Control(MenuControl::Return))
+                }
+                Some(ArchivedLocalMenuActionWire::PagePrevious) => {
+                    Some(RoutingAction::PagePrevious)
+                }
+                Some(ArchivedLocalMenuActionWire::PageNext) => Some(RoutingAction::PageNext),
+                None => None,
+            };
+            let route = RoutingBinding {
+                id: binding_id,
+                key,
+                repeat: binding
+                    .settings
+                    .repeat
+                    .as_ref()
+                    .is_some_and(|repeat| *repeat),
+                blocked: binding.state.blocked,
+                conditions: RoutingConditions {
+                    include: binding.conditions.include.as_ref().map(compact_condition),
+                    enable: binding.conditions.enable.as_ref().map(compact_condition),
+                    show: binding.conditions.show.as_ref().map(compact_condition),
+                },
+                action,
+                diagnostic: binding
+                    .diagnostic
+                    .as_ref()
+                    .map(|diagnostic| diagnostic.message.as_str().to_owned()),
+            };
+            binding_policies.entry(binding_id).or_insert(BindingPolicy {
+                after_action: archived_after_action(&binding.settings.after_action),
+            });
+            bindings.push(route);
+        }
+        let index = menus.len();
+        menu_indices.insert(menu_id, index);
+        menus.push(RoutingMenu { bindings });
     }
-    Ok(())
+    Ok(RoutingMetadata {
+        generation: attachment.menu.generation.to_native(),
+        menus,
+        menu_indices,
+        binding_policies,
+    })
+}
+
+fn compact_condition(condition: &ArchivedConditionIrWire) -> ConditionIr {
+    use ArchivedConditionIrWire as Ir;
+    match condition {
+        Ir::Bool(value) => ConditionIr::Bool(*value),
+        Ir::Integer(value) => ConditionIr::Integer(value.to_native()),
+        Ir::PagesCount => ConditionIr::PagesCount,
+        Ir::PagesCurrent => ConditionIr::PagesCurrent,
+        Ir::Not(value) => ConditionIr::Not(Box::new(compact_condition(value.get()))),
+        Ir::And(left, right) => ConditionIr::And(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Or(left, right) => ConditionIr::Or(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Equal(left, right) => ConditionIr::Equal(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::NotEqual(left, right) => ConditionIr::NotEqual(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Less(left, right) => ConditionIr::Less(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::LessEqual(left, right) => ConditionIr::LessEqual(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Greater(left, right) => ConditionIr::Greater(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::GreaterEqual(left, right) => ConditionIr::GreaterEqual(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Add(left, right) => ConditionIr::Add(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Subtract(left, right) => ConditionIr::Subtract(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Multiply(left, right) => ConditionIr::Multiply(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Divide(left, right) => ConditionIr::Divide(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Modulo(left, right) => ConditionIr::Modulo(
+            Box::new(compact_condition(left.get())),
+            Box::new(compact_condition(right.get())),
+        ),
+        Ir::Negate(value) => ConditionIr::Negate(Box::new(compact_condition(value.get()))),
+        Ir::Conditional(condition, when_true, when_false) => ConditionIr::Conditional(
+            Box::new(compact_condition(condition.get())),
+            Box::new(compact_condition(when_true.get())),
+            Box::new(compact_condition(when_false.get())),
+        ),
+    }
+}
+
+fn evaluate_routing_state(
+    binding: &RoutingBinding,
+    pages: PagesContextWire,
+) -> Result<(bool, bool), ConditionEvaluationErrorWire> {
+    let pages = PagesContext {
+        count: pages.count,
+        current: pages.current,
+    };
+    let included = binding
+        .conditions
+        .include
+        .as_ref()
+        .map_or(Ok(true), |condition| {
+            evaluate_condition_ir(condition, pages)
+        })?;
+    let enabled = binding
+        .conditions
+        .enable
+        .as_ref()
+        .map_or(Ok(true), |condition| {
+            evaluate_condition_ir(condition, pages)
+        })?;
+    // The archived selector evaluates `show` for validation but does not gate execution on it.
+    let _shown = binding
+        .conditions
+        .show
+        .as_ref()
+        .map_or(Ok(true), |condition| {
+            evaluate_condition_ir(condition, pages)
+        })?;
+    Ok((included, enabled))
 }
 
 fn select_binding(
-    menu: &ArchivedMenuViewMenuWire,
+    menu: &RoutingMenu,
     profile: &KeyboardProfile,
     input: &crate::ConvertedKeyEvent,
     page: usize,
@@ -1303,62 +1509,38 @@ fn select_binding(
         current: page.saturating_add(1) as u64,
         count: page_count.max(1) as u64,
     };
-    for binding in menu.bindings.iter() {
-        if input.event.kind == EventKind::Repeat
-            && !binding
-                .settings
-                .repeat
-                .as_ref()
-                .is_some_and(|repeat| *repeat)
-        {
+    for binding in &menu.bindings {
+        if input.event.kind == EventKind::Repeat && !binding.repeat {
             continue;
         }
-        let key = CanonicalKey::parse(binding.key.as_str())
-            .map_err(|_| UiError::InvalidBindingKey(binding.key.as_str().to_owned()))?;
-        if !profile.matches_binding(&key, &input.event) {
+        if !profile.matches_binding(&binding.key, &input.event) {
             continue;
         }
-        let state = evaluate_archived_binding_state(binding, pages)?;
-        if !state.included {
+        let (included, enabled) = evaluate_routing_state(binding, pages)?;
+        if !included {
             continue;
         }
-        let binding_id = BindingId {
-            generation: binding.id.generation.to_native(),
-            ordinal: binding.id.ordinal.to_native(),
-        };
         let availability = availability
             .iter()
-            .find(|current| current.binding == binding_id);
-        let blocked = availability.map_or(state.blocked, |current| {
+            .find(|current| current.binding == binding.id);
+        let blocked = availability.map_or(binding.blocked, |current| {
             current.availability == BindingAvailability::Blocked
         });
-        if !state.enabled || blocked {
+        if !enabled || blocked {
             return Ok(Selection::Unavailable(
                 availability
                     .and_then(|current| current.diagnostic.as_deref())
-                    .or_else(|| {
-                        binding
-                            .diagnostic
-                            .as_ref()
-                            .map(|diagnostic| diagnostic.message.as_str())
-                    })
+                    .or(binding.diagnostic.as_deref())
                     .unwrap_or("Binding is unavailable")
                     .to_owned(),
             ));
         }
-        return Ok(match binding.local_menu_action.as_ref() {
-            Some(ArchivedLocalMenuActionWire::Open { target }) => Selection::Open(
-                archived_to_core_menu_id(target).ok_or(UiError::InvalidMenuIdentity)?,
-            ),
-            Some(ArchivedLocalMenuActionWire::Control(ArchivedMenuControl::Quit)) => {
-                Selection::Control(MenuControl::Quit)
-            }
-            Some(ArchivedLocalMenuActionWire::Control(ArchivedMenuControl::Return)) => {
-                Selection::Control(MenuControl::Return)
-            }
-            Some(ArchivedLocalMenuActionWire::PagePrevious) => Selection::PagePrevious,
-            Some(ArchivedLocalMenuActionWire::PageNext) => Selection::PageNext,
-            None => Selection::Binding(binding_id),
+        return Ok(match binding.action.as_ref() {
+            Some(RoutingAction::Open(target)) => Selection::Open(target.clone()),
+            Some(RoutingAction::Control(control)) => Selection::Control(*control),
+            Some(RoutingAction::PagePrevious) => Selection::PagePrevious,
+            Some(RoutingAction::PageNext) => Selection::PageNext,
+            None => Selection::Binding(binding.id),
         });
     }
     Ok(Selection::Ignored)
@@ -1869,6 +2051,32 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn show_condition_error_is_preserved_on_key_selection() {
+        let mut failing =
+            binding_with_policy(1, "x", AfterAction::Stay, ExecutionMode::Await, None);
+        failing.conditions.show = Some(muxe_protocol::ConditionIrWire::Greater(
+            Box::new(muxe_protocol::ConditionIrWire::Divide(
+                Box::new(muxe_protocol::ConditionIrWire::Integer(1)),
+                Box::new(muxe_protocol::ConditionIrWire::Integer(0)),
+            )),
+            Box::new(muxe_protocol::ConditionIrWire::Integer(0)),
+        ));
+        let mut runtime = UiRuntime::attach(profiled_attachment(
+            KeyboardProfileWire::Vt100 {
+                escape_timeout_millis: 25,
+            },
+            vec![failing],
+        ))
+        .expect("attachment attaches");
+
+        assert!(matches!(
+            runtime.handle_input(&press('x')),
+            Err(UiError::Condition(
+                ConditionEvaluationErrorWire::DivisionByZero
+            ))
+        ));
+    }
     fn at(milliseconds: u64) -> SessionInstant {
         SessionInstant(Duration::from_millis(milliseconds))
     }
@@ -2879,7 +3087,7 @@ pub(crate) mod tests {
     fn checked_broker_archive_drives_templates_conditions_navigation_and_invocation() {
         let mut runtime = UiRuntime::attach(archived_attachment()).expect("archive attaches");
 
-        assert_eq!(runtime.session_id().expect("session is borrowed"), "ui");
+        assert_eq!(runtime.session_id(), "ui");
         assert_eq!(
             runtime.keyboard_profile().expect("profile is archived"),
             KeyboardProfile::Kitty(KeyCapabilities {
@@ -2929,6 +3137,46 @@ pub(crate) mod tests {
                 .title,
             "Root"
         );
+    }
+
+    #[test]
+    fn routing_hot_path_reuses_one_checked_attachment_validation() {
+        let mut runtime = UiRuntime::attach(archived_attachment()).expect("archive attaches");
+        assert_eq!(runtime.snapshot.validation_count(), 1);
+
+        for tick in 1..=4 {
+            assert!(matches!(
+                runtime.handle_input_at(&press('a'), at(tick)),
+                Ok(UiCommand::Invoke { .. })
+            ));
+        }
+        let binding = BindingId {
+            generation: 7,
+            ordinal: 1,
+        };
+        let execution = muxe_protocol::ExecutionId([11; 16]);
+        let _ = runtime
+            .invocation_accepted(binding, execution, InvocationDisposition::Detached, at(5))
+            .expect("binding policy comes from compact routing metadata");
+        let availability = BrokerEvent::BindingAvailabilityChanged {
+            session: UiSessionId::new("ui"),
+            generation: 7,
+            binding,
+            availability: BindingAvailability::Enabled,
+            diagnostic: None,
+        };
+        runtime
+            .handle_broker_event(&availability, at(6))
+            .expect("known binding event is accepted");
+        assert_eq!(runtime.snapshot.validation_count(), 1);
+        runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("first prepare traverses the checked attachment");
+        assert_eq!(runtime.snapshot.validation_count(), 2);
+        runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("second prepare traverses the checked attachment once");
+        assert_eq!(runtime.snapshot.validation_count(), 3);
     }
     #[test]
     fn prepared_breadcrumb_preserves_current_menu_under_tight_width() {

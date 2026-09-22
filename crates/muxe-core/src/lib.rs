@@ -25,7 +25,9 @@ pub use action::{
     PaneAction, PortableAction, PortableActionKind, PortableActionResolutionError,
     PortableActionSchema, SessionAction, TabAction,
 };
-pub use condition::{ConditionEvaluationError, ConditionIr, ConditionProgram, PagesContext};
+pub use condition::{
+    ConditionEvaluationError, ConditionIr, ConditionProgram, PagesContext, evaluate_condition_ir,
+};
 pub use config::{
     ActionValidation, ActionValidator, CompileInput, CompiledConfig, Compiler, ConfigDocument,
     ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError, HostSettings,

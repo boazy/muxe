@@ -117,7 +117,7 @@ fn frame_bytes(message: &WireMessage) -> Vec<u8> {
     bytes
 }
 
-fn checked_benchmark_frame() -> muxe_protocol::ArchivedFrame {
+fn checked_benchmark_frame(offscreen_menus: usize) -> muxe_protocol::ArchivedFrame {
     let bindings = MENU_BINDINGS
         .iter()
         .enumerate()
@@ -129,26 +129,44 @@ fn checked_benchmark_frame() -> muxe_protocol::ArchivedFrame {
             )
         })
         .collect();
+    let root = MenuViewMenuWire {
+        id: MenuId::named("root"),
+        title: Some("Benchmark menu".into()),
+        layout: LayoutSettingsWire {
+            padding: LayoutPaddingWire {
+                left: 1,
+                right: 1,
+                top: 0,
+                bottom: 0,
+                between_rows: 0,
+                between_columns: 3,
+            },
+            max_item_title_length: 24,
+        },
+        bindings,
+    };
+    let mut menus = vec![root];
+    menus.extend((0..offscreen_menus).map(|index| MenuViewMenuWire {
+        id: MenuId::named(format!("offscreen-{index}")),
+        title: None,
+        layout: LayoutSettingsWire {
+            padding: LayoutPaddingWire {
+                left: 0,
+                right: 0,
+                top: 0,
+                bottom: 0,
+                between_rows: 0,
+                between_columns: 0,
+            },
+            max_item_title_length: 1,
+        },
+        bindings: Vec::new(),
+    }));
     let attachment = UiAttachmentWire {
         menu: MenuViewWire {
             generation: 7,
             root: MenuId::named("root"),
-            menus: vec![MenuViewMenuWire {
-                id: MenuId::named("root"),
-                title: Some("Benchmark menu".into()),
-                layout: LayoutSettingsWire {
-                    padding: LayoutPaddingWire {
-                        left: 1,
-                        right: 1,
-                        top: 0,
-                        bottom: 0,
-                        between_rows: 0,
-                        between_columns: 3,
-                    },
-                    max_item_title_length: 24,
-                },
-                bindings,
-            }],
+            menus,
         },
         keyboard: KeyboardProfileWire::Vt100 {
             escape_timeout_millis: 25,
@@ -210,7 +228,7 @@ fn key_a() -> muxe_ui::ConvertedInput {
 #[divan::bench]
 fn attach_and_prepare_menu(bencher: divan::Bencher<'_, '_>) {
     bencher
-        .with_inputs(checked_benchmark_frame)
+        .with_inputs(|| checked_benchmark_frame(0))
         .bench_values(|frame| {
             let mut runtime = UiRuntime::attach(frame).expect("checked attachment attaches");
             black_box(
@@ -221,19 +239,19 @@ fn attach_and_prepare_menu(bencher: divan::Bencher<'_, '_>) {
         });
 }
 
-fn prepared_binding_input() -> (UiRuntime, muxe_ui::ConvertedInput) {
-    let mut runtime =
-        UiRuntime::attach(checked_benchmark_frame()).expect("checked attachment attaches");
+fn prepared_binding_input(offscreen_menus: usize) -> (UiRuntime, muxe_ui::ConvertedInput) {
+    let mut runtime = UiRuntime::attach(checked_benchmark_frame(offscreen_menus))
+        .expect("checked attachment attaches");
     runtime
         .prepare(Rect::new(0, 0, 80, 24))
         .expect("finite menu prepares");
     (runtime, key_a())
 }
 
-#[divan::bench]
-fn match_menu_binding(bencher: divan::Bencher<'_, '_>) {
+#[divan::bench(args = [0usize, 1000usize])]
+fn match_menu_binding(bencher: divan::Bencher<'_, '_>, offscreen_menus: usize) {
     bencher
-        .with_inputs(prepared_binding_input)
+        .with_inputs(|| prepared_binding_input(offscreen_menus))
         .bench_refs(|(runtime, key)| {
             black_box(
                 runtime
