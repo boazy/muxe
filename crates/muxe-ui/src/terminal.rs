@@ -331,9 +331,17 @@ pub struct SurfaceFrame<'a> {
 pub struct TerminalSurface<W: Write> {
     output: Option<W>,
     terminal: Option<Terminal<AreaBackend<W>>>,
-    entered_alternate_screen: bool,
+    screen: TerminalScreenState,
     raw_mode: bool,
     kitty_restore_needed: bool,
+    disable_raw_mode: fn() -> io::Result<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalScreenState {
+    Plain,
+    Alternate,
+    CursorHidden,
 }
 
 /// A [`Backend`] adapter over [`CrosstermBackend`] that reports the caller-supplied render area.
@@ -447,23 +455,51 @@ impl<W: Write> TerminalSurface<W> {
     ///
     /// Returns the underlying terminal error when raw mode cannot be enabled, or when the
     /// alternate screen, cursor-hide, or flush writes fail.
-    pub fn enter(mut output: W) -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
-        if let Err(error) = output
-            .queue(EnterAlternateScreen)
-            .and_then(|output| output.queue(Hide))
-            .and_then(std::io::Write::flush)
-        {
-            let _ = terminal::disable_raw_mode();
-            return Err(error);
-        }
-        Ok(Self {
+    pub fn enter(output: W) -> io::Result<Self> {
+        Self::enter_with_raw_mode(
+            output,
+            terminal::enable_raw_mode,
+            terminal::disable_raw_mode,
+        )
+    }
+
+    fn enter_with_raw_mode(
+        output: W,
+        enable_raw_mode: fn() -> io::Result<()>,
+        disable_raw_mode: fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        // Construct the surface before the first terminal mutation. If any later entry step
+        // fails, this same stateful guard owns every transition that completed and restores it.
+        let mut surface = Self {
             output: Some(output),
             terminal: None,
-            entered_alternate_screen: true,
-            raw_mode: true,
+            screen: TerminalScreenState::Plain,
+            raw_mode: false,
             kitty_restore_needed: false,
-        })
+            disable_raw_mode,
+        };
+        enable_raw_mode()?;
+        surface.raw_mode = true;
+
+        let entry = surface.enter_terminal();
+        if let Err(error) = entry {
+            // Preserve the entry error for the caller. The guard still attempts every inverse;
+            // its flags make those attempts exactly once even when one inverse also fails.
+            let _ = surface.restore_inner();
+            return Err(error);
+        }
+        Ok(surface)
+    }
+
+    fn enter_terminal(&mut self) -> io::Result<()> {
+        self.writer_mut().queue(EnterAlternateScreen)?;
+        self.screen = TerminalScreenState::Alternate;
+        self.writer_mut().flush()?;
+
+        self.writer_mut().queue(Hide)?;
+        self.screen = TerminalScreenState::CursorHidden;
+        self.writer_mut().flush()?;
+        Ok(())
     }
 
     /// Builds the writer-only surface used by tests: no raw mode, no alternate screen, no
@@ -480,9 +516,10 @@ impl<W: Write> TerminalSurface<W> {
         Ok(Self {
             output: None,
             terminal: Some(terminal),
-            entered_alternate_screen: false,
+            screen: TerminalScreenState::Plain,
             raw_mode: false,
             kitty_restore_needed: false,
+            disable_raw_mode: terminal::disable_raw_mode,
         })
     }
 
@@ -513,10 +550,12 @@ impl<W: Write> TerminalSurface<W> {
         capabilities: KeyCapabilities,
     ) -> io::Result<KittyNegotiation> {
         let negotiation = KittyNegotiation::new(capabilities);
+        {
+            let writer = self.writer_mut();
+            write!(writer, "\x1b[>{}u\x1b[?u", negotiation.expected_flags())?;
+        }
         self.kitty_restore_needed = true;
-        let writer = self.writer_mut();
-        write!(writer, "\x1b[>{}u\x1b[?u", negotiation.expected_flags())?;
-        writer.flush()?;
+        self.writer_mut().flush()?;
         Ok(negotiation)
     }
 
@@ -597,12 +636,21 @@ impl<W: Write> TerminalSurface<W> {
                 first_error = Some(error);
             }
         }
-        if self.entered_alternate_screen {
-            self.entered_alternate_screen = false;
+        if self.screen == TerminalScreenState::CursorHidden {
+            self.screen = TerminalScreenState::Alternate;
             if let Err(error) = self
                 .writer_mut()
                 .queue(Show)
-                .and_then(|output| output.queue(LeaveAlternateScreen))
+                .and_then(std::io::Write::flush)
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        if self.screen == TerminalScreenState::Alternate {
+            self.screen = TerminalScreenState::Plain;
+            if let Err(error) = self
+                .writer_mut()
+                .queue(LeaveAlternateScreen)
                 .and_then(std::io::Write::flush)
             {
                 first_error.get_or_insert(error);
@@ -610,7 +658,7 @@ impl<W: Write> TerminalSurface<W> {
         }
         if self.raw_mode {
             self.raw_mode = false;
-            if let Err(error) = terminal::disable_raw_mode() {
+            if let Err(error) = (self.disable_raw_mode)() {
                 first_error.get_or_insert(error);
             }
         }
@@ -689,19 +737,39 @@ impl<W: Write> Drop for TerminalSurface<W> {
 
 #[cfg(test)]
 mod tests {
+    use muxe_core::{KeyIdentity, NamedKey, compiled_default_theme};
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
-        sync::Mutex,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
-
-    use muxe_core::{KeyIdentity, NamedKey, compiled_default_theme};
 
     use super::*;
     use crate::TemplateRenderer;
 
     static BYTE_CAPTURE: Mutex<()> = Mutex::new(());
+    static RAW_DISABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_enable_raw_mode() -> std::io::Result<()> {
+        if RAW_DISABLE_CALLS.load(Ordering::SeqCst) == usize::MAX {
+            Err(std::io::Error::other("unreachable test hook"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn test_disable_raw_mode() -> std::io::Result<()> {
+        let calls = RAW_DISABLE_CALLS.fetch_add(1, Ordering::SeqCst);
+        if calls == usize::MAX {
+            Err(std::io::Error::other("unreachable test hook"))
+        } else {
+            Ok(())
+        }
+    }
 
     struct AnsiColorGateRestore(bool);
 
@@ -952,6 +1020,60 @@ mod tests {
             Ok(())
         }
     }
+    #[derive(Debug)]
+    struct FailOnceWriter {
+        bytes: Rc<RefCell<Vec<u8>>>,
+        write_counter: Rc<Cell<usize>>,
+        fail_at: usize,
+        failed: bool,
+    }
+
+    impl std::io::Write for FailOnceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let write_number = self.write_counter.get();
+            self.write_counter.set(write_number + 1);
+            if write_number == self.fail_at && !self.failed {
+                self.failed = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "one-shot entry failure",
+                ));
+            }
+            self.bytes.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[derive(Debug)]
+    struct FlushFailWriter {
+        bytes: Rc<RefCell<Vec<u8>>>,
+        flush_counter: Rc<Cell<usize>>,
+        fail_at: usize,
+        failed: bool,
+    }
+
+    impl std::io::Write for FlushFailWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let flush_number = self.flush_counter.get();
+            self.flush_counter.set(flush_number + 1);
+            if flush_number == self.fail_at && !self.failed {
+                self.failed = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "one-shot flush failure",
+                ));
+            }
+            Ok(())
+        }
+    }
 
     fn single_cell_plan(width: u16) -> GridPlan {
         GridPlan {
@@ -1007,6 +1129,176 @@ mod tests {
             }
         }
         visible
+    }
+
+    #[test]
+    fn entry_failure_restores_each_completed_transition_once() {
+        let _byte_capture = BYTE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        RAW_DISABLE_CALLS.store(0, Ordering::SeqCst);
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let write_counter = Rc::new(Cell::new(0));
+        let writer = FailOnceWriter {
+            bytes: Rc::clone(&bytes),
+            write_counter,
+            fail_at: 1,
+            failed: false,
+        };
+        let result = TerminalSurface::enter_with_raw_mode(
+            writer,
+            test_enable_raw_mode,
+            test_disable_raw_mode,
+        );
+        let Err(error) = result else {
+            panic!("Hide write must fail during entry");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+
+        let emitted = bytes.borrow();
+        assert!(
+            emitted
+                .windows(b"\x1b[?1049h".len())
+                .any(|window| window == b"\x1b[?1049h"),
+            "alternate-screen entry must complete before the injected failure: {emitted:?}"
+        );
+        assert_eq!(
+            emitted
+                .windows(b"\x1b[?1049l".len())
+                .filter(|window| *window == b"\x1b[?1049l")
+                .count(),
+            1,
+            "completed alternate-screen entry must be inverted exactly once: {emitted:?}"
+        );
+        assert!(
+            !emitted
+                .windows(b"\x1b[?25h".len())
+                .any(|window| window == b"\x1b[?25h"),
+            "cursor hide never completed, so Show must not be claimed or emitted: {emitted:?}"
+        );
+        assert_eq!(
+            RAW_DISABLE_CALLS.load(Ordering::SeqCst),
+            1,
+            "raw mode cleanup must run after entry failure"
+        );
+    }
+
+    #[test]
+    fn entry_flush_failure_restores_transitions_written_before_flush() {
+        let _byte_capture = BYTE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        RAW_DISABLE_CALLS.store(0, Ordering::SeqCst);
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let flush_counter = Rc::new(Cell::new(0));
+        let writer = FlushFailWriter {
+            bytes: Rc::clone(&bytes),
+            flush_counter,
+            fail_at: 1,
+            failed: false,
+        };
+        let result = TerminalSurface::enter_with_raw_mode(
+            writer,
+            test_enable_raw_mode,
+            test_disable_raw_mode,
+        );
+        let Err(error) = result else {
+            panic!("Hide flush must fail during entry");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+
+        let emitted = bytes.borrow();
+        for command in [
+            &b"\x1b[?1049h"[..],
+            &b"\x1b[?25l"[..],
+            &b"\x1b[?25h"[..],
+            &b"\x1b[?1049l"[..],
+        ] {
+            assert!(
+                emitted
+                    .windows(command.len())
+                    .any(|window| window == command),
+                "entry and cleanup command {command:?} must be emitted: {emitted:?}"
+            );
+        }
+        assert_eq!(
+            RAW_DISABLE_CALLS.load(Ordering::SeqCst),
+            1,
+            "raw mode cleanup must run after flush failure"
+        );
+    }
+
+    #[test]
+    fn kitty_write_and_flush_failures_track_reset_boundary() {
+        let _byte_capture = BYTE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let capabilities = KeyCapabilities {
+            event_types: true,
+            alternate_keys: true,
+            all_keys_as_escape_codes: false,
+        };
+
+        // A failed command write never completes the Kitty transition, so restoration must not
+        // emit a reset. The old guard armed itself before this write and emitted a spurious reset.
+        let write_failure_bytes = Rc::new(RefCell::new(Vec::new()));
+        let write_failure_writer = FailOnceWriter {
+            bytes: Rc::clone(&write_failure_bytes),
+            write_counter: Rc::new(Cell::new(0)),
+            fail_at: 0,
+            failed: false,
+        };
+        let mut write_failure_surface =
+            TerminalSurface::for_test(write_failure_writer, Rect::new(0, 0, 4, 2))
+                .expect("test surface");
+        let result = write_failure_surface.begin_kitty_negotiation(capabilities);
+        let Err(error) = result else {
+            panic!("Kitty negotiation write must fail");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        write_failure_surface
+            .restore_inner()
+            .expect("unentered Kitty mode needs no reset");
+        let emitted = write_failure_bytes.borrow();
+        assert_eq!(
+            emitted
+                .windows(b"\x1b[<u".len())
+                .filter(|window| *window == b"\x1b[<u")
+                .count(),
+            0,
+            "a failed Kitty push write must not arm reset: {emitted:?}"
+        );
+        drop(emitted);
+
+        // A successful command write followed by a flush failure has completed the transition;
+        // restoration must emit exactly one reset.
+        let flush_failure_bytes = Rc::new(RefCell::new(Vec::new()));
+        let flush_failure_writer = FlushFailWriter {
+            bytes: Rc::clone(&flush_failure_bytes),
+            flush_counter: Rc::new(Cell::new(0)),
+            fail_at: 0,
+            failed: false,
+        };
+        let mut flush_failure_surface =
+            TerminalSurface::for_test(flush_failure_writer, Rect::new(0, 0, 4, 2))
+                .expect("test surface");
+        let result = flush_failure_surface.begin_kitty_negotiation(capabilities);
+        let Err(error) = result else {
+            panic!("Kitty negotiation flush must fail");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        flush_failure_surface
+            .restore_inner()
+            .expect("Kitty reset remains restorable after flush failure");
+        let emitted = flush_failure_bytes.borrow();
+        assert_eq!(
+            emitted
+                .windows(b"\x1b[<u".len())
+                .filter(|window| *window == b"\x1b[<u")
+                .count(),
+            1,
+            "a written Kitty push must reset exactly once: {emitted:?}"
+        );
     }
 
     #[test]
@@ -1490,7 +1782,7 @@ mod tests {
         let writer = ToggleFailWriter::new(Rc::clone(&bytes), Rc::clone(&failing));
         let mut surface = TerminalSurface::for_test(writer, area).expect("test surface");
         surface.kitty_restore_needed = true;
-        surface.entered_alternate_screen = true;
+        surface.screen = TerminalScreenState::CursorHidden;
         let breadcrumb = empty_breadcrumb();
         let plan = single_cell_plan(area.width);
         let first = styled_cell("abcd", ratatui::style::Style::default());
@@ -1557,9 +1849,10 @@ mod tests {
         let mut surface = TerminalSurface {
             output: Some(writer),
             terminal: None,
-            entered_alternate_screen: true,
+            screen: TerminalScreenState::CursorHidden,
             raw_mode: false,
             kitty_restore_needed: true,
+            disable_raw_mode: terminal::disable_raw_mode,
         };
         let breadcrumb = empty_breadcrumb();
         let plan = single_cell_plan(area.width);
@@ -1696,7 +1989,7 @@ mod tests {
         let output = Vec::new();
         let mut surface = TerminalSurface::for_test(output, area).expect("test surface");
         surface.kitty_restore_needed = true;
-        surface.entered_alternate_screen = true;
+        surface.screen = TerminalScreenState::CursorHidden;
         surface.restore_inner().expect("restore succeeds");
         let bytes = surface
             .terminal

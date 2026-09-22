@@ -11,7 +11,7 @@ use crossterm::terminal;
 use muxe_core::KeyboardProfile;
 use muxe_protocol::{
     BindingId, BrokerEvent, BrokerResponse, InvocationDisposition as WireInvocationDisposition,
-    MenuControl,
+    MenuControl, ProtocolDiagnostic,
 };
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
@@ -75,8 +75,6 @@ pub enum UiExit {
     Interrupted,
     /// The broker announced retirement.
     BrokerRetiring,
-    /// The broker sent a session-fatal diagnostic.
-    BrokerFatal,
 }
 
 /// Failure while driving the attached native terminal UI.
@@ -90,6 +88,14 @@ pub enum UiRunError {
     Kitty(#[from] KittyNegotiationError),
     #[error("broker UI connection failed: {0}")]
     Control(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("broker sent fatal diagnostic ({diagnostic:?})")]
+    BrokerFatal { diagnostic: ProtocolDiagnostic },
+    #[error("UI run failed: {primary}; terminal restoration failed: {restoration}")]
+    RunAndRestore {
+        #[source]
+        primary: Box<Self>,
+        restoration: Box<Self>,
+    },
     #[error("broker detach did not complete before terminal restoration")]
     DetachTimedOut,
 }
@@ -418,11 +424,31 @@ where
     let mut session = UiSession::attach(frame)?;
     let mut surface = TerminalSurface::enter(io::stdout())?;
     let result = run_loop(&mut session, &mut surface, control, &mut signals).await;
-    let restored = surface.restore();
+    finish_run(result, surface.restore())
+}
+
+fn finish_run(
+    result: Result<UiExit, UiRunError>,
+    restored: io::Result<()>,
+) -> Result<UiExit, UiRunError> {
     match (result, restored) {
         (Ok(exit), Ok(())) => Ok(exit),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(UiRunError::Io(error)),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(restoration)) => Err(UiRunError::Io(restoration)),
+        (Err(primary), Err(restoration)) => Err(UiRunError::RunAndRestore {
+            primary: Box::new(primary),
+            restoration: Box::new(UiRunError::Io(restoration)),
+        }),
+    }
+}
+
+fn broker_event_exit(event: &BrokerEvent) -> Result<Option<UiExit>, UiRunError> {
+    match event {
+        BrokerEvent::BrokerRetiring => Ok(Some(UiExit::BrokerRetiring)),
+        BrokerEvent::Fatal(diagnostic) => Err(UiRunError::BrokerFatal {
+            diagnostic: diagnostic.clone(),
+        }),
+        _ => Ok(None),
     }
 }
 
@@ -522,12 +548,7 @@ where
             }
             event = control.next_event() => {
                 let event = event.map_err(|error| UiRunError::Control(Box::new(error)))?;
-                let exit = match event {
-                    BrokerEvent::BrokerRetiring => Some(UiExit::BrokerRetiring),
-                    BrokerEvent::Fatal(_) => Some(UiExit::BrokerFatal),
-                    _ => None,
-                };
-                if let Some(exit) = exit {
+                if let Some(exit) = broker_event_exit(&event)? {
                     return Ok(exit);
                 }
                 let command = session.handle_broker_event(&event)?;
@@ -648,10 +669,12 @@ fn terminal_area() -> io::Result<Rect> {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
     use muxe_core::KeyCapabilities;
     use muxe_protocol::{
-        AfterAction, ExecutionId, ExecutionMode, KeyCapabilitiesWire, KeyboardProfileWire,
-        LocalMenuActionWire, MenuControl,
+        AfterAction, DiagnosticCode, ExecutionId, ExecutionMode, KeyCapabilitiesWire,
+        KeyboardProfileWire, LocalMenuActionWire, MenuControl, ProtocolDiagnostic,
     };
 
     use super::*;
@@ -851,5 +874,57 @@ mod tests {
             arbitrate_with_paused_clock(Duration::ZERO, Duration::from_millis(40)).await;
         assert_eq!(after_decision, Some(EscapeArrival::AtOrAfterDeadline));
         assert_eq!(after_commands, at_commands);
+    }
+    #[test]
+    fn loop_and_restore_errors_preserve_primary_then_cleanup() {
+        let error = finish_run(
+            Err(UiRunError::Io(io::Error::other("loop failed"))),
+            Err(io::Error::other("restore failed")),
+        )
+        .expect_err("both failures must remain an error");
+
+        let UiRunError::RunAndRestore {
+            primary,
+            restoration,
+        } = &error
+        else {
+            panic!("expected structured primary and restoration errors: {error:?}");
+        };
+        assert_eq!(primary.to_string(), "loop failed");
+        assert_eq!(restoration.to_string(), "restore failed");
+        assert_eq!(
+            error.to_string(),
+            "UI run failed: loop failed; terminal restoration failed: restore failed"
+        );
+        assert_eq!(
+            error.source().expect("primary is the source").to_string(),
+            "loop failed"
+        );
+    }
+
+    #[test]
+    fn fatal_broker_event_preserves_diagnostic_as_a_run_error() {
+        let diagnostic = ProtocolDiagnostic {
+            code: DiagnosticCode::HostUnavailable,
+            message: "host vanished".into(),
+        };
+        let error = broker_event_exit(&BrokerEvent::Fatal(diagnostic.clone()))
+            .expect_err("fatal broker diagnostics must not become successful exits");
+
+        let UiRunError::BrokerFatal {
+            diagnostic: received,
+        } = &error
+        else {
+            panic!("expected structured fatal diagnostic: {error:?}");
+        };
+        assert_eq!(received, &diagnostic);
+        assert_eq!(
+            error.to_string(),
+            "broker sent fatal diagnostic (ProtocolDiagnostic { code: HostUnavailable, message: \"host vanished\" })"
+        );
+        assert!(
+            error.source().is_none(),
+            "wire diagnostics are the terminal error source"
+        );
     }
 }
