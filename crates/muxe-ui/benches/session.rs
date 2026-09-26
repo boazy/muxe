@@ -132,6 +132,7 @@ fn checked_benchmark_frame(offscreen_menus: usize) -> muxe_protocol::ArchivedFra
     let root = MenuViewMenuWire {
         id: MenuId::named("root"),
         title: Some("Benchmark menu".into()),
+        inactivity_timeout_millis: None,
         layout: LayoutSettingsWire {
             padding: LayoutPaddingWire {
                 left: 1,
@@ -149,6 +150,7 @@ fn checked_benchmark_frame(offscreen_menus: usize) -> muxe_protocol::ArchivedFra
     menus.extend((0..offscreen_menus).map(|index| MenuViewMenuWire {
         id: MenuId::named(format!("offscreen-{index}")),
         title: None,
+        inactivity_timeout_millis: None,
         layout: LayoutSettingsWire {
             padding: LayoutPaddingWire {
                 left: 0,
@@ -171,7 +173,6 @@ fn checked_benchmark_frame(offscreen_menus: usize) -> muxe_protocol::ArchivedFra
         keyboard: KeyboardProfileWire::Vt100 {
             escape_timeout_millis: 25,
         },
-        inactivity_timeout_millis: None,
         theme: default_theme_wire(),
     };
     let mut decoder = ConnectionDecoder::new(ConnectionPolicy::client(

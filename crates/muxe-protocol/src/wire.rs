@@ -877,6 +877,8 @@ pub struct MenuViewMenuWire {
     /// `None` is semantically distinct from an empty title: selectors and the UI do not fall
     /// back to the menu ID for an absent title.
     pub title: Option<String>,
+    /// `None` disables inactivity; zero remains an immediate deadline.
+    pub inactivity_timeout_millis: Option<u64>,
     pub layout: LayoutSettingsWire,
     pub bindings: Vec<BindingViewWire>,
 }
@@ -1098,7 +1100,6 @@ impl Validate for CompiledThemeWire {
 pub struct UiAttachmentWire {
     pub menu: MenuViewWire,
     pub keyboard: KeyboardProfileWire,
-    pub inactivity_timeout_millis: Option<u64>,
     pub theme: CompiledThemeWire,
 }
 
@@ -2448,6 +2449,7 @@ mod tests {
                 menus: vec![MenuViewMenuWire {
                     id: MenuId::named("root"),
                     title: None,
+                    inactivity_timeout_millis: None,
                     layout: layout(),
                     bindings: Vec::new(),
                 }],
@@ -2455,7 +2457,6 @@ mod tests {
             keyboard: KeyboardProfileWire::Vt100 {
                 escape_timeout_millis: 25,
             },
-            inactivity_timeout_millis: None,
             theme: CompiledThemeWire {
                 common: ThemeSectionWire {
                     styles: Vec::new(),
@@ -2740,6 +2741,7 @@ mod tests {
                 MenuViewMenuWire {
                     id: MenuId::named(format!("menu-{index}")),
                     title: None,
+                    inactivity_timeout_millis: None,
                     layout: layout(),
                     bindings: vec![binding(7, index, action)],
                 }
@@ -2775,6 +2777,7 @@ mod tests {
             menus: vec![MenuViewMenuWire {
                 id: MenuId::named("root"),
                 title: Some("Root".into()),
+                inactivity_timeout_millis: None,
                 layout: layout(),
                 bindings: vec![binding(
                     7,
@@ -2804,6 +2807,7 @@ mod tests {
                 MenuViewMenuWire {
                     id: MenuId::named("my menu"),
                     title: None,
+                    inactivity_timeout_millis: None,
                     layout: layout(),
                     bindings: vec![binding(
                         7,
@@ -2816,6 +2820,7 @@ mod tests {
                 MenuViewMenuWire {
                     id: MenuId::inline("my menu", 0),
                     title: None,
+                    inactivity_timeout_millis: None,
                     layout: layout(),
                     bindings: Vec::new(),
                 },
@@ -2851,6 +2856,7 @@ mod tests {
                 MenuViewMenuWire {
                     id: MenuId::named("main"),
                     title: None,
+                    inactivity_timeout_millis: None,
                     layout: layout(),
                     bindings: vec![binding(
                         7,
@@ -2863,12 +2869,14 @@ mod tests {
                 MenuViewMenuWire {
                     id: MenuId::inline("main", 0),
                     title: None,
+                    inactivity_timeout_millis: None,
                     layout: layout(),
                     bindings: Vec::new(),
                 },
                 MenuViewMenuWire {
                     id: MenuId::named("main#0"),
                     title: None,
+                    inactivity_timeout_millis: None,
                     layout: layout(),
                     bindings: Vec::new(),
                 },
@@ -2883,6 +2891,7 @@ mod tests {
         let menu = || MenuViewMenuWire {
             id: MenuId::named("main"),
             title: None,
+            inactivity_timeout_millis: None,
             layout: layout(),
             bindings: Vec::new(),
         };
@@ -2895,6 +2904,7 @@ mod tests {
         let inline = || MenuViewMenuWire {
             id: MenuId::inline("main", 0),
             title: None,
+            inactivity_timeout_millis: None,
             layout: layout(),
             bindings: Vec::new(),
         };
@@ -2904,6 +2914,42 @@ mod tests {
             menus: vec![inline(), inline()],
         };
         assert_eq!(inline_view.validate(), Err(SemanticError::DuplicateMenu));
+    }
+
+    #[test]
+    fn archived_menu_timeout_distinguishes_off_zero_and_finite() {
+        let mut snapshot = attachment();
+        let mut zero = snapshot.menu.menus[0].clone();
+        zero.id = MenuId::named("immediate");
+        zero.inactivity_timeout_millis = Some(0);
+        let mut finite = zero.clone();
+        finite.id = MenuId::named("finite");
+        finite.inactivity_timeout_millis = Some(250);
+        snapshot.menu.menus.extend([zero, finite]);
+        snapshot
+            .validate()
+            .expect("all three timeout values validate");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot).unwrap();
+        let archived =
+            rkyv::access::<ArchivedUiAttachmentWire, rkyv::rancor::Error>(&bytes).unwrap();
+        assert!(archived.menu.menus[0].inactivity_timeout_millis.is_none());
+        assert_eq!(
+            archived.menu.menus[1]
+                .inactivity_timeout_millis
+                .as_ref()
+                .map(|value| value.to_native()),
+            Some(0)
+        );
+        assert_eq!(
+            archived.menu.menus[2]
+                .inactivity_timeout_millis
+                .as_ref()
+                .map(|value| value.to_native()),
+            Some(250)
+        );
+        let restored: UiAttachmentWire =
+            rkyv::deserialize::<UiAttachmentWire, rkyv::rancor::Error>(archived).unwrap();
+        assert_eq!(restored, snapshot);
     }
 
     #[test]

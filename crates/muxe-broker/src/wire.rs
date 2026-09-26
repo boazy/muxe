@@ -27,7 +27,6 @@ pub fn attachment(
     UiAttachmentWire {
         menu: menu_view(&view.menu, availability),
         keyboard: keyboard(&view.keyboard),
-        inactivity_timeout_millis: view.inactivity_timeout.map(duration_millis),
         theme: theme(&view.theme),
     }
 }
@@ -61,6 +60,7 @@ fn menu(
     MenuViewMenuWire {
         id: core_menu_id(&menu.id),
         title: menu.title.clone(),
+        inactivity_timeout_millis: menu.inactivity_timeout.map(duration_millis),
         layout: LayoutSettingsWire {
             padding: LayoutPaddingWire {
                 left: menu.layout.padding.left,

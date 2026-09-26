@@ -134,7 +134,6 @@ pub(crate) fn compile_effective(
         EffectiveSettings::default(),
         SettingsScope::Global,
     )?;
-    let inactivity_timeout = global_settings.timeout;
     let reload = global_settings.reload;
     let host = global_settings.host;
     let theme_catalog = compile_theme_catalog(&theme_assets);
@@ -233,7 +232,6 @@ pub(crate) fn compile_effective(
     Ok(CompiledConfig {
         generation,
         keyboard,
-        inactivity_timeout,
         reload,
         host,
         theme_selection,
@@ -434,8 +432,17 @@ fn compile_settings(
     let allowed = match scope {
         SettingsScope::Global => &["timeout", "after_action", "execution", "reload", "host"][..],
         SettingsScope::Menu => &["timeout", "after_action", "execution"][..],
-        SettingsScope::Binding => &["timeout", "after_action", "execution", "repeat"][..],
+        SettingsScope::Binding => &["after_action", "execution", "repeat"][..],
     };
+    if scope == SettingsScope::Binding
+        && let Some(timeout) = value.field("timeout")
+    {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            "`settings.timeout` is not valid at binding scope; use `settings.execution.timeout` for action execution",
+            timeout.name_span.clone(),
+        )]);
+    }
     validate_fields(value, allowed)?;
     if let Some(timeout) = value.field("timeout") {
         base.timeout = parse_duration_value(&timeout.value, true)?;

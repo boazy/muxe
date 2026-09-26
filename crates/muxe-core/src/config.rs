@@ -505,7 +505,6 @@ pub struct ActionValidation {
 pub struct CompiledConfig {
     pub generation: CompiledGeneration,
     pub keyboard: KeyboardProfile,
-    pub inactivity_timeout: Option<Duration>,
     pub reload: ReloadSettings,
     pub host: HostSettings,
     pub theme_selection: ThemeSelection,
@@ -611,7 +610,6 @@ impl CompiledConfig {
         Ok(UiAttachmentView {
             menu,
             keyboard: self.keyboard.clone(),
-            inactivity_timeout: self.inactivity_timeout,
             theme_selection: resolved.selection.clone(),
             theme: Arc::clone(&resolved.theme),
         })

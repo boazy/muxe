@@ -722,6 +722,63 @@ mod tests {
             Some("Newer")
         );
     }
+    #[tokio::test]
+    async fn reload_does_not_change_an_existing_attachment_menu_timeout() {
+        let directory = tempfile::tempdir().expect("isolated configuration");
+        let path = directory.path().join("config.yml");
+        fs::write(
+            &path,
+            "version: 1\nsettings: { timeout: 5ms }\nmenus:\n  main:\n    bindings:\n      q: { label: quit, action: menu:quit }\n  child:\n    settings: { timeout: off }\n    bindings:\n      q: { label: quit, action: menu:quit }\n",
+        ).unwrap();
+        let adapter = ReloadAdapter::new();
+        let store = ConfigStore::load(&path, &adapter).await.unwrap();
+        let original = store.snapshot().await.config;
+        fs::write(
+            &path,
+            "version: 1\nsettings: { timeout: off }\nmenus:\n  main:\n    bindings:\n      q: { label: quit, action: menu:quit }\n  child:\n    settings: { timeout: 10ms }\n    bindings:\n      q: { label: quit, action: menu:quit }\n",
+        ).unwrap();
+        assert_eq!(store.reload(&adapter).await.unwrap(), CompiledGeneration(2));
+        let current = store.snapshot().await.config;
+        let main = muxe_core::MenuId::named(muxe_core::MenuName::parse("main").unwrap());
+        let old = original
+            .attachment_view(&main, &original.theme_selection)
+            .unwrap();
+        let new = current
+            .attachment_view(&main, &current.theme_selection)
+            .unwrap();
+        let old = crate::wire::attachment(&old, &BTreeMap::new());
+        let new = crate::wire::attachment(&new, &BTreeMap::new());
+        let child = muxe_protocol::MenuId::named("child");
+        assert_eq!(old.menu.generation, 1);
+        assert_eq!(new.menu.generation, 2);
+        assert_eq!(
+            old.menu
+                .menus
+                .iter()
+                .find(|menu| menu.id == child)
+                .unwrap()
+                .inactivity_timeout_millis,
+            None
+        );
+        assert_eq!(
+            new.menu
+                .menus
+                .iter()
+                .find(|menu| menu.id == child)
+                .unwrap()
+                .inactivity_timeout_millis,
+            Some(10)
+        );
+        assert_eq!(
+            old.menu
+                .menus
+                .iter()
+                .find(|menu| menu.id == muxe_protocol::MenuId::named("main"))
+                .unwrap()
+                .inactivity_timeout_millis,
+            Some(5)
+        );
+    }
 }
 
 struct AdapterValidator<'a>(&'a dyn HostAdapter);

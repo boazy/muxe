@@ -1919,3 +1919,89 @@ fn duplicate_named_menu_is_rejected_with_both_spans_not_first_wins() {
     let rendered = format!("{:?}", diagnostics[0]);
     assert!(rendered.contains("main"), "{rendered}");
 }
+
+#[test]
+fn binding_inactivity_is_rejected_but_execution_timeout_remains_inherited() {
+    let valid = r"
+version: 1
+settings:
+  timeout: off
+  execution: { timeout: 3s }
+menus:
+  main:
+    settings:
+      timeout: 2s
+    bindings:
+      a:
+        label: action
+        action: command:execute program=printf
+        settings:
+          execution: { timeout: 5s }
+";
+    let compiled = compile(valid, None, KeyCapabilities::default()).expect("valid scopes");
+    assert_eq!(
+        compiled.menu(&id("main")).unwrap().inactivity_timeout,
+        Some(std::time::Duration::from_secs(2))
+    );
+    let policy = &compiled
+        .menu(&id("main"))
+        .unwrap()
+        .bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "a")
+        .unwrap()
+        .settings
+        .execution;
+    assert_eq!(policy.timeout, Some(std::time::Duration::from_secs(5)));
+    let invalid = valid.replace("execution: { timeout: 5s }", "timeout: off");
+    let diagnostics = compile(&invalid, None, KeyCapabilities::default()).unwrap_err();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|item| item.message.contains("binding scope"))
+        .expect("specific scope diagnostic");
+    assert_eq!(diagnostic.code, DiagnosticCode::InvalidValue);
+    assert!(diagnostic.message.contains("settings.execution.timeout"));
+}
+
+#[test]
+fn global_off_and_menu_finite_inherit_across_named_and_inline_menus() {
+    let compiled = compile(
+        r"
+version: 1
+settings: { timeout: off }
+menus:
+  root:
+    bindings:
+      a:
+        label: open
+        action:
+          type: menu:open
+          submenu:
+            settings: { timeout: 0ms }
+            bindings:
+              q: { label: quit, action: menu:quit }
+  finite:
+    settings: { timeout: 250ms }
+    bindings:
+      q: { label: quit, action: menu:quit }
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect("nested scopes compile");
+    assert_eq!(compiled.menu(&id("root")).unwrap().inactivity_timeout, None);
+    assert_eq!(
+        compiled.menu(&id("finite")).unwrap().inactivity_timeout,
+        Some(std::time::Duration::from_millis(250))
+    );
+    let view = compiled
+        .attachment_view(&id("root"), &compiled.theme_selection)
+        .unwrap();
+    assert!(
+        view.menu
+            .menus
+            .iter()
+            .any(|menu| menu.id.inline_id().is_some()
+                && menu.inactivity_timeout == Some(std::time::Duration::ZERO))
+    );
+}

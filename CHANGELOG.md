@@ -2,6 +2,7 @@
 
 ### 🐛 Bug Fixes
 
+- *(ui)* Honor menu-scoped inactivity timeouts and reject binding-scoped inactivity settings
 - *(zellij)* Bind uninstall configuration ownership to the recorded path
 - *(zellij)* Preserve receipt-owned configuration provenance across reinstalls
 - *(broker)* Propagate retirement and registry cleanup failures

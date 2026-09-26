@@ -51,7 +51,6 @@ pub enum MenuSessionEvent {
         at: SessionInstant,
         execution: ExecutionId,
     },
-    /// Broker accepted a detached action. Its configured post-action policy takes effect now.
     DetachedAccepted {
         at: SessionInstant,
         execution: ExecutionId,
@@ -70,8 +69,12 @@ pub enum MenuSessionEvent {
         execution: ExecutionId,
         control: MenuControl,
     },
-    /// Broker resolved a `menu:open` action and supplied its target menu.
-    OpenSubmenu { at: SessionInstant, menu: MenuId },
+    /// The destination menu supplies the policy as soon as it becomes visible.
+    OpenSubmenu {
+        at: SessionInstant,
+        menu: MenuId,
+        timeout: Option<Duration>,
+    },
     /// Explicit clock advance; the caller supplies this rather than the state machine reading time.
     Tick { at: SessionInstant },
 }
@@ -89,13 +92,25 @@ pub enum MenuSessionOutput {
     ReturnedTo(MenuId),
     Dismissed,
 }
+/// One caller-stack level and its pinned inactivity policy.
+#[derive(Clone, Debug)]
+pub struct MenuFrame {
+    menu: MenuId,
+    timeout: Option<Duration>,
+}
+
+impl MenuFrame {
+    #[must_use]
+    pub fn menu(&self) -> &MenuId {
+        &self.menu
+    }
+}
 
 /// Pure caller-stack, inactivity, and pending-action state. It deliberately has no terminal,
 /// host, IPC, clock, or action-payload dependency.
 #[derive(Clone, Debug)]
 pub struct MenuSession {
-    stack: Vec<MenuId>,
-    timeout: Option<Duration>,
+    stack: Vec<MenuFrame>,
     deadline: Option<SessionInstant>,
     paused_remaining: Option<Duration>,
     state: MenuSessionState,
@@ -106,8 +121,10 @@ impl MenuSession {
     pub fn new(root: MenuId, timeout: Option<Duration>, now: SessionInstant) -> Self {
         let deadline = timeout.and_then(|duration| now.checked_add(duration));
         Self {
-            stack: vec![root],
-            timeout,
+            stack: vec![MenuFrame {
+                menu: root,
+                timeout,
+            }],
             deadline,
             paused_remaining: None,
             state: MenuSessionState::Active,
@@ -121,11 +138,11 @@ impl MenuSession {
 
     #[must_use]
     pub fn current_menu(&self) -> Option<&MenuId> {
-        self.stack.last()
+        self.stack.last().map(MenuFrame::menu)
     }
 
     #[must_use]
-    pub fn stack(&self) -> &[MenuId] {
+    pub fn stack(&self) -> &[MenuFrame] {
         &self.stack
     }
 
@@ -139,11 +156,11 @@ impl MenuSession {
             MenuSessionEvent::Key { at, input } => self.key(at, input),
             MenuSessionEvent::ActionPending { at, execution } => self.action_pending(at, execution),
             MenuSessionEvent::DetachedAccepted {
-                at: _,
+                at,
                 execution: _,
                 after_action,
             } => matches!(self.state, MenuSessionState::Active)
-                .then(|| self.apply_after_action(after_action))
+                .then(|| self.apply_after_action(after_action, at))
                 .flatten(),
             MenuSessionEvent::ActionCompleted {
                 at,
@@ -156,7 +173,9 @@ impl MenuSession {
                 execution,
                 control,
             } => self.pending_control_completed(at, execution, control),
-            MenuSessionEvent::OpenSubmenu { at, menu } => self.open_submenu(at, menu),
+            MenuSessionEvent::OpenSubmenu { at, menu, timeout } => {
+                self.open_submenu(at, menu, timeout)
+            }
             MenuSessionEvent::Tick { at } => self.tick(at),
         }
     }
@@ -188,7 +207,7 @@ impl MenuSession {
                         Some(MenuSessionOutput::InvokeBinding(binding))
                     }
                     MenuSessionInput::Unknown => Some(MenuSessionOutput::UnknownKeySwallowed),
-                    MenuSessionInput::Control(control) => Some(self.apply_control(control)),
+                    MenuSessionInput::Control(control) => Some(self.apply_control(control, at)),
                 }
             }
         }
@@ -237,8 +256,12 @@ impl MenuSession {
         }
         self.state = MenuSessionState::Active;
         if success {
-            self.resume_deadline(at);
-            self.apply_after_action(after_action)
+            if after_action == AfterAction::Stay {
+                self.resume_deadline(at);
+            } else {
+                self.paused_remaining = None;
+            }
+            self.apply_after_action(after_action, at)
         } else {
             // Dispatch failure keeps this level visible and resets inactivity like a received key.
             self.paused_remaining = None;
@@ -263,17 +286,25 @@ impl MenuSession {
         if current != execution || requested != control {
             return None;
         }
-        self.resume_deadline(at);
+        self.paused_remaining = None;
         self.state = MenuSessionState::Active;
-        Some(self.apply_control(control))
+        Some(self.apply_control(control, at))
     }
 
-    fn open_submenu(&mut self, at: SessionInstant, menu: MenuId) -> Option<MenuSessionOutput> {
+    fn open_submenu(
+        &mut self,
+        at: SessionInstant,
+        menu: MenuId,
+        timeout: Option<Duration>,
+    ) -> Option<MenuSessionOutput> {
         if !matches!(self.state, MenuSessionState::Active) {
             return None;
         }
+        self.stack.push(MenuFrame {
+            menu: menu.clone(),
+            timeout,
+        });
         self.reset_deadline(at);
-        self.stack.push(menu.clone());
         Some(MenuSessionOutput::NavigatedTo(menu))
     }
 
@@ -287,24 +318,30 @@ impl MenuSession {
         }
     }
 
-    fn apply_after_action(&mut self, after_action: AfterAction) -> Option<MenuSessionOutput> {
+    fn apply_after_action(
+        &mut self,
+        after_action: AfterAction,
+        at: SessionInstant,
+    ) -> Option<MenuSessionOutput> {
         match after_action {
             AfterAction::Quit => Some(self.dismiss()),
-            AfterAction::Return => Some(self.apply_control(MenuControl::Return)),
+            AfterAction::Return => Some(self.apply_control(MenuControl::Return, at)),
             AfterAction::Stay => None,
         }
     }
 
-    fn apply_control(&mut self, control: MenuControl) -> MenuSessionOutput {
+    fn apply_control(&mut self, control: MenuControl, at: SessionInstant) -> MenuSessionOutput {
         match control {
             MenuControl::Quit => self.dismiss(),
             MenuControl::Return if self.stack.len() == 1 => self.dismiss(),
             MenuControl::Return => {
                 self.stack.pop();
+                self.reset_deadline(at);
                 MenuSessionOutput::ReturnedTo(
                     self.stack
                         .last()
                         .expect("non-root return retains caller")
+                        .menu
                         .clone(),
                 )
             }
@@ -319,11 +356,15 @@ impl MenuSession {
     }
 
     fn reset_deadline(&mut self, at: SessionInstant) {
-        self.deadline = self.timeout.and_then(|duration| at.checked_add(duration));
+        self.deadline = self
+            .stack
+            .last()
+            .and_then(|frame| frame.timeout)
+            .and_then(|duration| at.checked_add(duration));
     }
 
     fn reset_paused_timeout(&mut self) {
-        self.paused_remaining = self.timeout;
+        self.paused_remaining = self.stack.last().and_then(|frame| frame.timeout);
     }
 
     fn resume_deadline(&mut self, at: SessionInstant) {
@@ -372,7 +413,8 @@ mod tests {
         assert!(matches!(
             session.handle(MenuSessionEvent::OpenSubmenu {
                 at: at(1),
-                menu: MenuId::named(expect_name("child"))
+                menu: MenuId::named(expect_name("child")),
+                timeout: None,
             }),
             Some(MenuSessionOutput::NavigatedTo(_))
         ));
@@ -469,5 +511,154 @@ mod tests {
             }),
             Some(MenuSessionOutput::Dismissed)
         );
+    }
+    #[test]
+    fn navigation_installs_destination_policy_and_fresh_parent_interval() {
+        let root = MenuId::named(expect_name("root"));
+        let child = MenuId::named(expect_name("child"));
+        let mut session = MenuSession::new(root.clone(), Some(Duration::from_millis(10)), at(0));
+        assert_eq!(
+            session.handle(MenuSessionEvent::OpenSubmenu {
+                at: at(9),
+                menu: child.clone(),
+                timeout: None,
+            }),
+            Some(MenuSessionOutput::NavigatedTo(child))
+        );
+        assert_eq!(session.deadline(), None);
+        assert_eq!(session.handle(MenuSessionEvent::Tick { at: at(100) }), None);
+        assert_eq!(
+            session.handle(MenuSessionEvent::Key {
+                at: at(101),
+                input: MenuSessionInput::Control(MenuControl::Return),
+            }),
+            Some(MenuSessionOutput::ReturnedTo(root))
+        );
+        assert_eq!(session.deadline(), Some(at(111)));
+        assert_eq!(session.handle(MenuSessionEvent::Tick { at: at(110) }), None);
+        assert_eq!(
+            session.handle(MenuSessionEvent::Tick { at: at(111) }),
+            Some(MenuSessionOutput::Dismissed)
+        );
+    }
+
+    #[test]
+    fn off_root_finite_child_and_awaited_return_restore_visible_policy() {
+        let root = MenuId::named(expect_name("root"));
+        let child = MenuId::named(expect_name("child"));
+        let mut session = MenuSession::new(root.clone(), None, at(0));
+        session.handle(MenuSessionEvent::OpenSubmenu {
+            at: at(3),
+            menu: child,
+            timeout: Some(Duration::from_millis(5)),
+        });
+        assert_eq!(session.deadline(), Some(at(8)));
+        session.handle(MenuSessionEvent::ActionPending {
+            at: at(4),
+            execution: ExecutionId(5),
+        });
+        assert_eq!(session.deadline(), None);
+        assert_eq!(session.handle(MenuSessionEvent::Tick { at: at(100) }), None);
+        session.handle(MenuSessionEvent::Key {
+            at: at(101),
+            input: MenuSessionInput::Unknown,
+        });
+        session.handle(MenuSessionEvent::ActionCompleted {
+            at: at(102),
+            execution: ExecutionId(5),
+            success: true,
+            after_action: AfterAction::Stay,
+        });
+        assert_eq!(session.deadline(), Some(at(107)));
+        session.handle(MenuSessionEvent::ActionPending {
+            at: at(103),
+            execution: ExecutionId(6),
+        });
+        assert_eq!(
+            session.handle(MenuSessionEvent::ActionCompleted {
+                at: at(110),
+                execution: ExecutionId(6),
+                success: true,
+                after_action: AfterAction::Return,
+            }),
+            Some(MenuSessionOutput::ReturnedTo(root))
+        );
+        assert_eq!(session.deadline(), None);
+    }
+
+    #[test]
+    fn failed_await_rearms_full_visible_interval() {
+        let mut session = MenuSession::new(
+            MenuId::named(expect_name("root")),
+            Some(Duration::from_millis(10)),
+            at(0),
+        );
+        session.handle(MenuSessionEvent::ActionPending {
+            at: at(4),
+            execution: ExecutionId(7),
+        });
+        session.handle(MenuSessionEvent::ActionCompleted {
+            at: at(100),
+            execution: ExecutionId(7),
+            success: false,
+            after_action: AfterAction::Return,
+        });
+        assert_eq!(session.deadline(), Some(at(110)));
+    }
+    #[test]
+    fn pending_return_ack_installs_parent_interval_after_completion_race() {
+        let root = MenuId::named(expect_name("root"));
+        let mut session = MenuSession::new(root.clone(), Some(Duration::from_millis(10)), at(0));
+        session.handle(MenuSessionEvent::OpenSubmenu {
+            at: at(1),
+            menu: MenuId::named(expect_name("child")),
+            timeout: None,
+        });
+        session.handle(MenuSessionEvent::ActionPending {
+            at: at(2),
+            execution: ExecutionId(8),
+        });
+        assert_eq!(
+            session.handle(MenuSessionEvent::Key {
+                at: at(3),
+                input: MenuSessionInput::Control(MenuControl::Return),
+            }),
+            Some(MenuSessionOutput::RequestPendingControl {
+                execution: ExecutionId(8),
+                control: MenuControl::Return,
+            })
+        );
+        assert_eq!(
+            session.handle(MenuSessionEvent::ActionCompleted {
+                at: at(4),
+                execution: ExecutionId(8),
+                success: true,
+                after_action: AfterAction::Stay,
+            }),
+            None
+        );
+        assert_eq!(session.deadline(), None);
+        assert_eq!(
+            session.handle(MenuSessionEvent::PendingControlCompleted {
+                at: at(25),
+                execution: ExecutionId(8),
+                control: MenuControl::Return,
+            }),
+            Some(MenuSessionOutput::ReturnedTo(root))
+        );
+        assert_eq!(session.deadline(), Some(at(35)));
+    }
+    #[test]
+    fn zero_duration_is_immediately_due_and_distinct_from_off() {
+        let root = MenuId::named(expect_name("root"));
+        let mut immediate = MenuSession::new(root.clone(), Some(Duration::ZERO), at(7));
+        assert_eq!(immediate.deadline(), Some(at(7)));
+        assert_eq!(
+            immediate.handle(MenuSessionEvent::Tick { at: at(7) }),
+            Some(MenuSessionOutput::Dismissed)
+        );
+        let mut off = MenuSession::new(root, None, at(7));
+        assert_eq!(off.deadline(), None);
+        assert_eq!(off.handle(MenuSessionEvent::Tick { at: at(7) }), None);
     }
 }

@@ -57,7 +57,7 @@ pub use menu::{
     ViewBindingSettings, ViewBindingState, binding_index, menu_view,
 };
 pub use session::{
-    ExecutionId, MenuSession, MenuSessionEvent, MenuSessionInput, MenuSessionOutput,
+    ExecutionId, MenuFrame, MenuSession, MenuSessionEvent, MenuSessionInput, MenuSessionOutput,
     MenuSessionState, SessionInstant,
 };
 pub use theme::{

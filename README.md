@@ -12,7 +12,7 @@ Muxe supports **Zellij** (version 0.46.0) and **Herdr** (version 0.8.2) as both 
 - **Nested menus**: Pressing a key can execute an action, open an inline submenu, or open another named menu as a submenu.
 - **Built-in navigation**: By default, `Esc` dismisses the active menu stack; `Backspace` returns to the parent menu (or exits if at a root menu); and `Left`/`Right` or `Page Up`/`Page Down` navigate pages in multi-page menus.
 - **Safe key handling**: Any unknown key delivered to Muxe is swallowed: it is not forwarded to the underlying pane, does not alter the menu stack, and resets the inactivity timer. On Zellij, configured Locked-mode host bindings execute before Muxe receives the key and are reserved to the host.
-- **Inactivity timeout**: If you do not press a key, the menu closes automatically after 10 seconds by default. The timer pauses while Muxe awaits an action.
+- **Inactivity timeout**: The visible menu closes after 10 seconds without a key by default. Set `settings.timeout` globally or on a menu to change its interval; `off` disables it. The timer pauses while Muxe awaits an action.
 - **Action completion**: Executing an action closes the menu by default. If an awaited action fails, Muxe remains in the active menu and displays the error. Post-action behavior is configurable per binding, per menu, or globally via `settings.after_action`.
 
 ## Quick start
@@ -144,6 +144,16 @@ Muxe reads its configuration from `$CONFIG_DIR`:
 Muxe recursively merges the active host override file into `config.yml`. Override files inherit `version: 1` and cannot change it.
 
 Automatic configuration watching is enabled by default. A valid reload applies immediately to newly opened menus, while open menus retain their pinned configuration generation. If an edit produces invalid YAML or unsupported actions, Muxe logs the error and keeps the last valid configuration active.
+
+### Inactivity timeout
+
+Set `settings.timeout` globally or in a menu to a duration in milliseconds (`250ms`), seconds (`10s`), or minutes (`2m`). The default is `10s`. Use `off` to disable inactivity dismissal. A menu inherits the global setting unless it specifies its own value; a finite menu value re-enables a global `off`.
+
+Opening a submenu starts its full interval. Returning starts the caller menu's full interval. Each received key resets the visible menu's timer, including an unknown or unavailable key. Protocol responses and malformed terminal input do not reset it.
+
+The timer pauses while Muxe awaits an action. Keys received while pending reset its paused interval. A successful action that stays in the menu resumes the remaining interval; a failed action starts a full interval. Open menus keep their timeout policies from the pinned configuration generation across reloads.
+
+Binding-level `settings.timeout` is invalid. Use `settings.execution.timeout` on a binding to limit action execution; it does not control menu inactivity.
 
 See [`REFERENCE.md`](REFERENCE.md) for the complete inventory of portable actions, native actions, parameter schemas, and canonical key syntax.
 

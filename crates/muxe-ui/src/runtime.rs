@@ -279,6 +279,7 @@ struct RoutingMetadata {
 }
 
 struct RoutingMenu {
+    inactivity_timeout: Option<Duration>,
     bindings: Vec<RoutingBinding>,
 }
 
@@ -354,11 +355,13 @@ impl UiRuntime {
                 let keyboard_profile = keyboard_profile_from_attachment(attachment);
                 let root = archived_to_core_menu_id(&attachment.menu.root)
                     .ok_or(UiError::InvalidMenuIdentity)?;
-                let timeout = attachment
-                    .inactivity_timeout_millis
-                    .as_ref()
-                    .map(|timeout| Duration::from_millis(timeout.to_native()));
                 let routing = routing_metadata(attachment)?;
+                let timeout = routing
+                    .menu_indices
+                    .get(&root)
+                    .and_then(|index| routing.menus.get(*index))
+                    .ok_or(UiError::MissingRoot)?
+                    .inactivity_timeout;
                 Ok::<_, UiError>((
                     session_id.to_owned(),
                     renderer,
@@ -454,9 +457,18 @@ impl UiRuntime {
                 Ok(self.menu_output(output.as_ref()))
             }
             Selection::Open(target) if active => {
-                let output = self
-                    .menu_session
-                    .handle(MenuSessionEvent::OpenSubmenu { at, menu: target });
+                let timeout = self
+                    .routing
+                    .menu_indices
+                    .get(&target)
+                    .and_then(|index| self.routing.menus.get(*index))
+                    .ok_or(UiError::MissingRoot)?
+                    .inactivity_timeout;
+                let output = self.menu_session.handle(MenuSessionEvent::OpenSubmenu {
+                    at,
+                    menu: target,
+                    timeout,
+                });
                 Ok(self.menu_output(output.as_ref()))
             }
             Selection::Control(control) => {
@@ -1087,7 +1099,7 @@ struct RenderMenuPass<'a> {
     renderer: &'a TemplateRenderer,
     attachment: &'a muxe_protocol::ArchivedUiAttachmentWire,
     menu: &'a ArchivedMenuViewMenuWire,
-    stack: &'a [CoreMenuId],
+    stack: &'a [muxe_core::MenuFrame],
     availability: &'a [BindingAvailabilityOverlay],
     area: Rect,
     padding: SurfacePadding,
@@ -1177,17 +1189,17 @@ fn render_menu_pass(
 fn render_breadcrumbs_or_fallback(
     renderer: &TemplateRenderer,
     attachment: &muxe_protocol::ArchivedUiAttachmentWire,
-    stack: &[CoreMenuId],
+    stack: &[muxe_core::MenuFrame],
     available_width: usize,
 ) -> (RenderedText, Option<DegradedComponent>) {
     let crumbs = stack
         .iter()
-        .filter_map(|id| {
+        .filter_map(|frame| {
             attachment
                 .menu
                 .menus
                 .iter()
-                .find(|menu| archived_targets_core(&menu.id, id))
+                .find(|menu| archived_targets_core(&menu.id, frame.menu()))
         })
         .filter_map(|menu| {
             menu.title
@@ -1385,7 +1397,13 @@ fn routing_metadata(
         }
         let index = menus.len();
         menu_indices.insert(menu_id, index);
-        menus.push(RoutingMenu { bindings });
+        menus.push(RoutingMenu {
+            inactivity_timeout: menu
+                .inactivity_timeout_millis
+                .as_ref()
+                .map(|value| Duration::from_millis(value.to_native())),
+            bindings,
+        });
     }
     Ok(RoutingMetadata {
         generation: attachment.menu.generation.to_native(),
@@ -1694,7 +1712,10 @@ pub(crate) mod tests {
         bytes
     }
 
-    fn archived_attachment() -> muxe_protocol::ArchivedFrame {
+    fn scoped_attachment(
+        root_timeout: Option<u64>,
+        child_timeout: Option<u64>,
+    ) -> muxe_protocol::ArchivedFrame {
         let attachment = UiAttachmentWire {
             menu: MenuViewWire {
                 generation: 7,
@@ -1703,6 +1724,7 @@ pub(crate) mod tests {
                     MenuViewMenuWire {
                         id: MenuId::named("root"),
                         title: Some("Root".into()),
+                        inactivity_timeout_millis: root_timeout,
                         layout: layout(),
                         bindings: vec![
                             binding(1, "a", "Open", BindingConditionsWire::default(), None),
@@ -1730,6 +1752,7 @@ pub(crate) mod tests {
                     MenuViewMenuWire {
                         id: MenuId::named("child"),
                         title: Some("Child".into()),
+                        inactivity_timeout_millis: child_timeout,
                         layout: layout(),
                         bindings: vec![binding(
                             4,
@@ -1748,10 +1771,13 @@ pub(crate) mod tests {
                 alternate_keys: true,
                 all_keys_as_escape_codes: false,
             }),
-            inactivity_timeout_millis: None,
             theme: default_theme_wire(),
         };
         archive_attachment(attachment)
+    }
+
+    fn archived_attachment() -> muxe_protocol::ArchivedFrame {
+        scoped_attachment(None, None)
     }
 
     fn archive_attachment(attachment: UiAttachmentWire) -> muxe_protocol::ArchivedFrame {
@@ -1812,6 +1838,7 @@ pub(crate) mod tests {
                 menus: vec![MenuViewMenuWire {
                     id: MenuId::named("root"),
                     title: Some("Root".into()),
+                    inactivity_timeout_millis: None,
                     layout: layout(),
                     bindings,
                 }],
@@ -1821,7 +1848,6 @@ pub(crate) mod tests {
                 alternate_keys: true,
                 all_keys_as_escape_codes: false,
             }),
-            inactivity_timeout_millis: None,
             theme,
         })
     }
@@ -1862,12 +1888,12 @@ pub(crate) mod tests {
                 menus: vec![MenuViewMenuWire {
                     id: MenuId::named("root"),
                     title: Some("Root".into()),
+                    inactivity_timeout_millis,
                     layout: layout(),
                     bindings,
                 }],
             },
             keyboard,
-            inactivity_timeout_millis,
             theme: default_theme_wire(),
         })
     }
@@ -2170,6 +2196,102 @@ pub(crate) mod tests {
             UiCommand::Ignored
         );
         assert_eq!(protocol_runtime.tick(at(10)), UiCommand::Detach);
+    }
+    #[test]
+    fn archived_navigation_and_unsupported_input_use_visible_menu_policy() {
+        let mut runtime = UiRuntime::attach_at(scoped_attachment(Some(10), None), at(0))
+            .expect("checked attachment");
+        assert_eq!(runtime.inactivity_deadline(), Some(at(10)));
+        assert_eq!(
+            runtime.handle_input_at(&press('n'), at(9)).unwrap(),
+            UiCommand::Redraw
+        );
+        assert_eq!(runtime.inactivity_deadline(), None);
+        assert_eq!(
+            runtime
+                .handle_input_at(&parsed_input(b"\x1b[>1u"), at(20))
+                .unwrap(),
+            UiCommand::Ignored
+        );
+        assert_eq!(runtime.tick(at(100)), UiCommand::Ignored);
+        assert_eq!(
+            runtime.handle_input_at(&press('r'), at(101)).unwrap(),
+            UiCommand::Redraw
+        );
+        assert_eq!(runtime.inactivity_deadline(), Some(at(111)));
+        assert_eq!(runtime.tick(at(111)), UiCommand::Detach);
+    }
+
+    #[test]
+    fn archived_old_and_new_policies_remain_independent() {
+        let mut old = UiRuntime::attach_at(scoped_attachment(None, Some(2)), at(0)).unwrap();
+        let mut new = UiRuntime::attach_at(scoped_attachment(Some(4), None), at(0)).unwrap();
+        assert_eq!(old.inactivity_deadline(), None);
+        assert_eq!(new.inactivity_deadline(), Some(at(4)));
+        assert_eq!(
+            old.handle_input_at(&press('n'), at(1)).unwrap(),
+            UiCommand::Redraw
+        );
+        assert_eq!(
+            new.handle_input_at(&press('n'), at(1)).unwrap(),
+            UiCommand::Redraw
+        );
+        assert_eq!(old.inactivity_deadline(), Some(at(3)));
+        assert_eq!(new.inactivity_deadline(), None);
+        assert_eq!(old.tick(at(3)), UiCommand::Detach);
+        assert_eq!(new.tick(at(3)), UiCommand::Ignored);
+    }
+
+    #[test]
+    fn blocked_unknown_and_release_keys_reset_finite_child_timeout() {
+        let mut runtime = UiRuntime::attach_at(scoped_attachment(None, Some(5)), at(0)).unwrap();
+        assert_eq!(
+            runtime.handle_input_at(&press('n'), at(1)).unwrap(),
+            UiCommand::Redraw
+        );
+        assert_eq!(runtime.inactivity_deadline(), Some(at(6)));
+        assert_eq!(
+            runtime
+                .handle_input_at(&parsed_input(b"\x1b[>1u"), at(5))
+                .unwrap(),
+            UiCommand::Ignored
+        );
+        assert_eq!(runtime.inactivity_deadline(), Some(at(10)));
+        runtime
+            .handle_broker_event(
+                &BrokerEvent::BindingAvailabilityChanged {
+                    session: UiSessionId::new("ui"),
+                    generation: 7,
+                    binding: BindingId {
+                        generation: 7,
+                        ordinal: 4,
+                    },
+                    availability: BindingAvailability::Blocked,
+                    diagnostic: Some(ProtocolDiagnostic {
+                        code: muxe_protocol::DiagnosticCode::ActionBlocked,
+                        message: "unavailable".to_owned(),
+                    }),
+                },
+                at(6),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.handle_input_at(&press('r'), at(9)).unwrap(),
+            UiCommand::Redraw
+        );
+        assert_eq!(runtime.inactivity_deadline(), Some(at(14)));
+        let mut release = press('r');
+        if let ConvertedInput::Key(key) = &mut release {
+            key.event.kind = EventKind::Release;
+            key.raw.kind = RawEventKind::Release;
+        }
+        assert_eq!(
+            runtime.handle_input_at(&release, at(13)).unwrap(),
+            UiCommand::Ignored
+        );
+        assert_eq!(runtime.inactivity_deadline(), Some(at(18)));
+        assert_eq!(runtime.tick(at(14)), UiCommand::Ignored);
+        assert_eq!(runtime.tick(at(18)), UiCommand::Detach);
     }
 
     #[test]
@@ -3014,6 +3136,7 @@ pub(crate) mod tests {
                     MenuViewMenuWire {
                         id: MenuId::named("root"),
                         title: Some("Root".into()),
+                        inactivity_timeout_millis: None,
                         layout: layout(),
                         bindings: vec![binding(
                             1,
@@ -3028,6 +3151,7 @@ pub(crate) mod tests {
                     MenuViewMenuWire {
                         id: MenuId::inline("root", 0),
                         title: Some("Inline".into()),
+                        inactivity_timeout_millis: None,
                         layout: layout(),
                         bindings: vec![binding(
                             2,
@@ -3042,6 +3166,7 @@ pub(crate) mod tests {
                     MenuViewMenuWire {
                         id: MenuId::named("root#0"),
                         title: Some("Namesake".into()),
+                        inactivity_timeout_millis: None,
                         layout: layout(),
                         bindings: Vec::new(),
                     },
@@ -3052,7 +3177,6 @@ pub(crate) mod tests {
                 alternate_keys: true,
                 all_keys_as_escape_codes: false,
             }),
-            inactivity_timeout_millis: None,
             theme: default_theme_wire(),
         };
         let mut runtime =

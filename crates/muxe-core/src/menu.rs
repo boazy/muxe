@@ -373,6 +373,8 @@ pub struct MenuViewMenu {
     pub id: MenuId,
     pub title: Option<String>,
     pub layout: LayoutSettings,
+    /// Effective inactivity policy for this menu after global and menu overrides.
+    pub inactivity_timeout: Option<Duration>,
     pub bindings: Vec<BindingView>,
 }
 
@@ -411,7 +413,6 @@ impl MenuView {
 pub struct UiAttachmentView {
     pub menu: MenuView,
     pub keyboard: KeyboardProfile,
-    pub inactivity_timeout: Option<Duration>,
     pub theme_selection: ThemeSelection,
     pub theme: Arc<CompiledTheme>,
 }
@@ -422,6 +423,7 @@ impl CompiledMenu {
             id: self.id.clone(),
             title: self.title.clone(),
             layout: self.layout,
+            inactivity_timeout: self.inactivity_timeout,
             bindings: self.bindings.iter().map(CompiledBinding::view).collect(),
         }
     }
