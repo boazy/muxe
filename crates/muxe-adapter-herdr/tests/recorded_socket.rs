@@ -141,6 +141,57 @@ async fn wait_for_lifecycle_requests(
         panic!("timed out waiting for {stage}; received {methods:?}");
     }
 }
+async fn assert_request_methods(fixture: &ProductionConnectFixture, expected: &[&str]) {
+    let methods = fixture
+        .requests()
+        .await
+        .into_iter()
+        .map(|request| request["method"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods,
+        expected
+            .iter()
+            .map(|method| json!(method))
+            .collect::<Vec<_>>()
+    );
+}
+fn assert_rejected_after_shutdown<T: std::fmt::Debug>(
+    result: &Result<T, AdapterError>,
+    operation: &str,
+) {
+    assert!(
+        matches!(
+            result,
+            Err(error) if error.kind == AdapterErrorKind::Shutdown
+                || error.kind == AdapterErrorKind::Unavailable
+        ),
+        "{operation} fails closed after shutdown, got {result:?}"
+    );
+}
+fn assert_workspace_compatibility_cached(
+    snapshot: &muxe_adapter_api::NativeCompatibilitySnapshot,
+    candidate: &NativeActionCandidate,
+) {
+    let first = match snapshot.validate_native(candidate) {
+        NativeCompatibilityOutcome::Blocked(diagnostics) => diagnostics,
+        NativeCompatibilityOutcome::Compatible(_) => panic!("schema B removed workspace.list"),
+    };
+    assert!(
+        first.iter().any(|diagnostic| diagnostic
+            .labels
+            .iter()
+            .any(|label| label.span == candidate.type_span)),
+        "blocked compatibility retains the candidate source span"
+    );
+    let cached = match snapshot.validate_native(candidate) {
+        NativeCompatibilityOutcome::Blocked(diagnostics) => diagnostics,
+        NativeCompatibilityOutcome::Compatible(_) => {
+            panic!("cached schema B result cannot enable workspace.list")
+        }
+    };
+    assert_eq!(cached, first);
+}
 
 fn pending_pane_registration() -> PendingPaneRegistration {
     PendingPaneRegistration {
@@ -1350,25 +1401,7 @@ async fn reconnect_snapshot_tracks_schema_a_to_b_to_a_with_exact_cached_diagnost
         schema_b_snapshot.validate_native(&agents),
         NativeCompatibilityOutcome::Compatible(_)
     ));
-    let first_blocked = match schema_b_snapshot.validate_native(&workspaces) {
-        NativeCompatibilityOutcome::Blocked(diagnostics) => diagnostics,
-        NativeCompatibilityOutcome::Compatible(_) => panic!("schema B removed workspace.list"),
-    };
-    let cached_blocked = match schema_b_snapshot.validate_native(&workspaces) {
-        NativeCompatibilityOutcome::Blocked(diagnostics) => diagnostics,
-        NativeCompatibilityOutcome::Compatible(_) => {
-            panic!("cached schema B result cannot enable workspace.list")
-        }
-    };
-    assert_eq!(
-        cached_blocked, first_blocked,
-        "cached negative reconstructs the exact source-aware diagnostic"
-    );
-    assert!(
-        !first_blocked[0]
-            .message
-            .contains("cached Herdr compatibility rejection")
-    );
+    assert_workspace_compatibility_cached(&schema_b_snapshot, &workspaces);
 
     fixture
         .replace_schema(&schema_a)
@@ -2145,9 +2178,7 @@ async fn launches_an_exact_command_from_the_live_focused_origin() {
     drop(runtime);
     drop(fixture);
 }
-#[tokio::test]
-async fn command_pane_transaction_excludes_an_already_accepted_unrelated_unary() {
-    let barrier = Arc::new(ResponseBarrier::new());
+fn command_pane_ordering_script(barrier: &Arc<ResponseBarrier>) -> Vec<RecordedExchange> {
     let mut script = ProductionConnectFixture::initial_handshake();
     script.truncate(1);
     script.push(RecordedExchange {
@@ -2163,7 +2194,7 @@ async fn command_pane_transaction_excludes_an_already_accepted_unrelated_unary()
             },
         }),
         response: RecordedResponse::Barrier {
-            barrier: Arc::clone(&barrier),
+            barrier: Arc::clone(barrier),
             result: json!({
                 "type": "layout_apply",
                 "layout": {
@@ -2206,6 +2237,14 @@ async fn command_pane_transaction_excludes_an_already_accepted_unrelated_unary()
             },
         })),
     });
+    script
+}
+
+#[tokio::test]
+async fn command_pane_transaction_excludes_an_already_accepted_unrelated_unary() {
+    let barrier = Arc::new(ResponseBarrier::new());
+    let script = command_pane_ordering_script(&barrier);
+
     let fixture = ProductionConnectFixture::start_scripted(script)
         .expect("owned composite-ordering fixture starts");
     let runtime = Arc::new(
@@ -2257,20 +2296,7 @@ async fn command_pane_transaction_excludes_an_already_accepted_unrelated_unary()
     unrelated
         .await
         .expect("accepted unrelated unary completes after the transaction");
-    assert_eq!(
-        fixture
-            .requests()
-            .await
-            .into_iter()
-            .map(|request| request["method"].clone())
-            .collect::<Vec<_>>(),
-        vec![
-            json!("ping"),
-            json!("layout.apply"),
-            json!("pane.move"),
-            json!("pane.get"),
-        ],
-    );
+    assert_request_methods(&fixture, &["ping", "layout.apply", "pane.move", "pane.get"]).await;
 }
 
 #[tokio::test]
@@ -2369,20 +2395,7 @@ async fn prepared_move_cleanup_failure_excludes_an_accepted_unrelated_unary() {
     unrelated
         .await
         .expect("unrelated unary runs after rollback finishes");
-    assert_eq!(
-        fixture
-            .requests()
-            .await
-            .into_iter()
-            .map(|request| request["method"].clone())
-            .collect::<Vec<_>>(),
-        vec![
-            json!("ping"),
-            json!("pane.move"),
-            json!("tab.close"),
-            json!("pane.get"),
-        ],
-    );
+    assert_request_methods(&fixture, &["ping", "pane.move", "tab.close", "pane.get"]).await;
 }
 
 #[tokio::test]
@@ -2909,45 +2922,17 @@ async fn shutdown_leaves_no_host_bound_operation_reaching_the_recorded_server() 
     );
 
     let modal = adapter.modal_scope(&PaneId::new("pane-1")).await;
-    assert!(
-        matches!(
-            &modal,
-            Err(error) if error.kind == AdapterErrorKind::Shutdown
-                || error.kind == AdapterErrorKind::Unavailable
-        ),
-        "modal_scope fails closed after shutdown, got {modal:?}"
-    );
+    assert_rejected_after_shutdown(&modal, "modal_scope");
     let capture = adapter.capture_origin(lifecycle_capture_request()).await;
-    assert!(
-        matches!(
-            &capture,
-            Err(error) if error.kind == AdapterErrorKind::Shutdown
-                || error.kind == AdapterErrorKind::Unavailable
-        ),
-        "capture_origin fails closed after shutdown, got {capture:?}"
-    );
+    assert_rejected_after_shutdown(&capture, "capture_origin");
     let register = adapter
         .register_pending_pane(pending_pane_registration())
         .await;
-    assert!(
-        matches!(
-            &register,
-            Err(error) if error.kind == AdapterErrorKind::Shutdown
-                || error.kind == AdapterErrorKind::Unavailable
-        ),
-        "register_pending_pane fails closed after shutdown, got {register:?}"
-    );
+    assert_rejected_after_shutdown(&register, "register_pending_pane");
     let close = adapter
         .close_pending_pane(pending_pane_registration(), lease)
         .await;
-    assert!(
-        matches!(
-            &close,
-            Err(error) if error.kind == AdapterErrorKind::Shutdown
-                || error.kind == AdapterErrorKind::Unavailable
-        ),
-        "close_pending_pane fails closed after shutdown, got {close:?}"
-    );
+    assert_rejected_after_shutdown(&close, "close_pending_pane");
     let post_dismissal = adapter
         .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
             execution: ExecutionId(7_310_001),
@@ -2963,25 +2948,11 @@ async fn shutdown_leaves_no_host_bound_operation_reaching_the_recorded_server() 
             ui_pane: PaneId::new("pane-2"),
         })
         .await;
-    assert!(
-        matches!(
-            &post_dismissal,
-            Err(error) if error.kind == AdapterErrorKind::Shutdown
-                || error.kind == AdapterErrorKind::Unavailable
-        ),
-        "post-dismissal dispatch fails closed after shutdown, got {post_dismissal:?}"
-    );
+    assert_rejected_after_shutdown(&post_dismissal, "post-dismissal dispatch");
     // `identity` stays gated by continuity (not ungated): with continuity
     // invalidated it must fail closed rather than return the retained value.
     let identity = adapter.identity().await;
-    assert!(
-        matches!(
-            &identity,
-            Err(error) if error.kind == AdapterErrorKind::Shutdown
-                || error.kind == AdapterErrorKind::Unavailable
-        ),
-        "identity fails closed after shutdown, got {identity:?}"
-    );
+    assert_rejected_after_shutdown(&identity, "identity");
     // `capabilities` is local-only: it may succeed, but must send no bytes.
     let _ = adapter.capabilities().await;
     tokio::time::sleep(Duration::from_millis(200)).await;

@@ -4909,6 +4909,34 @@ mod mixed_recovery_production_tests {
             .expect("UI closes after accepted dispatch");
     }
 
+    async fn assert_native_diagnostic_written(
+        cache: &tempfile::TempDir,
+        broker: Arc<muxe_broker::Broker>,
+        consumer: super::DiagnosticConsumer,
+    ) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let health = tokio::spawn(Arc::clone(&broker).monitor(shutdown_rx));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cache.path().join("logs/muxe.jsonl").exists() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual broker failure reaches the native diagnostic consumer");
+        let _ = shutdown_tx.send(true);
+        health.await.expect("broker health monitor stops");
+        consumer.stop_and_join().await;
+
+        let record = fs::read_to_string(cache.path().join("logs/muxe.jsonl"))
+            .expect("native diagnostic record");
+        assert!(record.contains("detached execution failed"));
+        assert!(record.contains("Failed: ActionBlocked"));
+        assert!(!record.contains("secret-sentinel"));
+    }
+
     #[tokio::test]
     async fn detached_broker_failure_after_ui_close_reaches_native_json_log() {
         let cache = tempfile::tempdir().expect("owned cache directory");
@@ -4957,26 +4985,6 @@ mod mixed_recovery_production_tests {
             },
         )
         .await;
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let health = tokio::spawn(Arc::clone(&broker).monitor(shutdown_rx));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if cache.path().join("logs/muxe.jsonl").exists() {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("actual broker failure reaches the native diagnostic consumer");
-        let _ = shutdown_tx.send(true);
-        health.await.expect("broker health monitor stops");
-        consumer.stop_and_join().await;
-
-        let record = fs::read_to_string(cache.path().join("logs/muxe.jsonl"))
-            .expect("native diagnostic record");
-        assert!(record.contains("detached execution failed"));
-        assert!(record.contains("Failed: ActionBlocked"));
-        assert!(!record.contains("secret-sentinel"));
+        assert_native_diagnostic_written(&cache, broker, consumer).await;
     }
 }

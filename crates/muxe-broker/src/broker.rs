@@ -305,15 +305,6 @@ impl CompatibilityRebuildSupervisor {
             let _ = task.await;
         }
     }
-
-    #[cfg(test)]
-    fn counts(&self) -> (usize, usize) {
-        let state = self
-            .state
-            .lock()
-            .expect("compatibility rebuild supervisor is not poisoned");
-        (usize::from(state.active.is_some()), state.desired.len())
-    }
 }
 
 async fn run_compatibility_rebuild_supervisor(
@@ -845,8 +836,7 @@ struct ExecutionRecord {
     awaiting: bool,
     cancellable: bool,
     on_menu_control: muxe_core::MenuControlAction,
-    timeout: Option<Duration>,
-    on_timeout: TimeoutAction,
+    deadline: Option<(Duration, TimeoutAction)>,
     owner: ExecutionOwner,
     phase: ExecutionPhase,
     /// Focus-sensitive host work remains attached to this exact owner while the
@@ -854,7 +844,6 @@ struct ExecutionRecord {
     deferred: Option<PostDismissalPortableDispatchRequest>,
     pending_control: Option<MenuControl>,
     termination_requested: bool,
-    deadline_scheduled: bool,
 }
 
 #[derive(Default)]
@@ -1400,7 +1389,7 @@ impl Broker {
     /// The supervisor-only linger after activation stop uses this to exit only
     /// after every remaining child is reaped.
     #[must_use]
-    pub(crate) async fn has_supervised_children(&self) -> bool {
+    pub(crate) fn has_supervised_children(&self) -> bool {
         !self
             .generic
             .processes
@@ -1445,11 +1434,9 @@ impl Broker {
                 awaiting,
                 cancellable: owner == ExecutionOwner::GenericProcess,
                 on_menu_control: policy.on_menu_control,
-                timeout: policy.timeout,
-                on_timeout: policy.on_timeout,
+                deadline: policy.timeout.map(|timeout| (timeout, policy.on_timeout)),
                 owner,
                 phase: ExecutionPhase::Reserved,
-                deadline_scheduled: false,
                 deferred,
                 pending_control: None,
                 termination_requested: false,
@@ -1466,13 +1453,11 @@ impl Broker {
     async fn release_reservation(&self, core: CoreExecutionId) {
         let released = {
             let mut state = self.state.lock().await;
-            if !state
+            if state
                 .executions
                 .get(&core)
                 .is_some_and(|record| record.phase == ExecutionPhase::Reserved)
             {
-                false
-            } else {
                 let record = state
                     .executions
                     .remove(&core)
@@ -1483,6 +1468,8 @@ impl Broker {
                     state.awaiting.remove(&session);
                 }
                 true
+            } else {
+                false
             }
         };
         if released {
@@ -1511,10 +1498,7 @@ impl Broker {
             };
             record.phase = phase;
             record.cancellable = cancellable;
-            let deadline = (!record.deadline_scheduled)
-                .then(|| record.timeout.map(|timeout| (timeout, record.on_timeout)))
-                .flatten();
-            record.deadline_scheduled |= deadline.is_some();
+            let deadline = record.deadline.take();
             (state.activation_sealed, deadline)
         };
         self.execution_transitions.notify_waiters();
@@ -1558,7 +1542,7 @@ impl Broker {
                 .expect("generic supervisor registry is not poisoned")
                 .contains_key(&core)
             {
-                self.cancel_generic(core).await
+                self.cancel_generic(core)
             } else {
                 Ok(())
             }
@@ -1567,7 +1551,7 @@ impl Broker {
                 ExecutionOwner::Adapter => {
                     self.adapter.cancel(core).await.map_err(BrokerError::from)
                 }
-                ExecutionOwner::GenericProcess => self.cancel_generic(core).await,
+                ExecutionOwner::GenericProcess => self.cancel_generic(core),
             }
         };
         if result.is_err() {
@@ -3753,7 +3737,7 @@ impl Broker {
         Ok(())
     }
 
-    async fn cancel_generic(&self, execution: CoreExecutionId) -> Result<(), BrokerError> {
+    fn cancel_generic(&self, execution: CoreExecutionId) -> Result<(), BrokerError> {
         let cancellation = self
             .generic
             .processes
@@ -4935,6 +4919,154 @@ mod tests {
             fail_cancellation: AtomicBool::new(false),
         })
     }
+    const COUNTING_AWAIT_FOCUS_YAML: &str = r"
+version: 1
+menus:
+  main:
+    bindings:
+      f:
+        label: focus tab
+        action: tab:focus index=1
+        settings:
+          execution:
+            mode: await
+";
+    const COUNTING_RELOAD_YAML: &str = r"
+version: 1
+menus:
+  main:
+    bindings:
+      x:
+        label: no-op
+        action: config:reload
+";
+
+    fn counting_config(
+        adapter: &Arc<CountingAdapter>,
+        source: &str,
+        yaml: &str,
+    ) -> muxe_core::CompiledConfig {
+        muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new(source),
+            yaml,
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        )
+        .expect("counting test configuration compiles")
+    }
+
+    fn counting_broker(
+        adapter: &Arc<CountingAdapter>,
+        source: &str,
+        yaml: &str,
+    ) -> (Arc<Broker>, tempfile::TempDir) {
+        let config = counting_config(adapter, source, yaml);
+        let directory = tempfile::tempdir().expect("counting test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        (broker, directory)
+    }
+
+    fn counting_focus_broker(
+        adapter: &Arc<CountingAdapter>,
+        source: &str,
+        yaml: &str,
+    ) -> (Arc<Broker>, muxe_core::BindingId, tempfile::TempDir) {
+        let config = counting_config(adapter, source, yaml);
+        let root = named("main");
+        let binding = config
+            .attachment_view(&root, &config.theme_selection)
+            .ok()
+            .and_then(|view| {
+                view.menu
+                    .menu(&root)
+                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
+            })
+            .expect("counting focus binding is visible");
+        let directory = tempfile::tempdir().expect("counting focus test directory");
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        (broker, binding, directory)
+    }
+
+    async fn attach_slow_ui_with_full_queue(
+        broker: &Broker,
+        pane: &str,
+        event_id: muxe_protocol::EventId,
+    ) -> (
+        UiSessionId,
+        mpsc::Sender<WireMessage>,
+        mpsc::Receiver<WireMessage>,
+    ) {
+        let (session, events, events_rx) = attach_ready_with_capacity(broker, pane, 1).await;
+        events
+            .try_send(WireMessage::Event {
+                event_id,
+                event: BrokerEvent::AdapterHealthChanged {
+                    healthy: true,
+                    diagnostic: None,
+                },
+            })
+            .expect("test fills the slow UI event queue");
+        (session, events, events_rx)
+    }
+
+    async fn invoke_awaited_binding(
+        broker: &Broker,
+        session: &UiSessionId,
+        binding: &muxe_core::BindingId,
+        events: mpsc::Sender<WireMessage>,
+    ) -> muxe_protocol::ExecutionId {
+        let accepted = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation: 1,
+                    binding: BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events,
+            )
+            .await
+            .expect("awaited invocation is accepted");
+        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+            execution,
+            disposition: InvocationDisposition::Awaited,
+        }) = accepted
+        else {
+            panic!("invocation remains awaited");
+        };
+        execution
+    }
+
+    fn spawn_awaited_binding(
+        broker: Arc<Broker>,
+        session: UiSessionId,
+        binding: &muxe_core::BindingId,
+    ) -> tokio::task::JoinHandle<Result<RequestResult, BrokerError>> {
+        let binding = BindingId {
+            generation: binding.generation().0,
+            ordinal: binding.ordinal(),
+        };
+        tokio::spawn(async move {
+            broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::InvokeBinding(InvokeBinding {
+                        session,
+                        generation: 1,
+                        binding,
+                    }),
+                    mpsc::channel(1).0,
+                )
+                .await
+        })
+    }
+
     async fn dispatch_detached_adapter_execution(
         cancellable: bool,
     ) -> (Arc<CountingAdapter>, Arc<Broker>, CoreExecutionId) {
@@ -5617,61 +5749,13 @@ menus:
         // Awaiting adapter execution observes Failed/HostUnavailable terminal
         // delivery; unrelated generic supervision is untouched.
         let adapter = counting_adapter(false);
-        let config = muxe_core::compile_yaml(
-            CompiledGeneration(1),
-            SourceId::new("<host loss awaiting regression>"),
-            r"
-version: 1
-menus:
-  main:
-    bindings:
-      f:
-        label: focus tab
-        action: tab:focus index=1
-        settings:
-          execution:
-            mode: await
-",
-            KeyCapabilities::default(),
-            Some(adapter.as_ref()),
-        )
-        .expect("await adapter configuration compiles");
-        let root = named("main");
-        let binding = config
-            .attachment_view(&root, &config.theme_selection)
-            .ok()
-            .and_then(|view| {
-                view.menu
-                    .menu(&root)
-                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
-            })
-            .expect("test binding is visible");
-        let directory = tempfile::tempdir().expect("owned host-loss directory");
-        let broker = Broker::from_compiled(adapter, directory.path().join("config.yml"), config);
+        let (broker, binding, _directory) = counting_focus_broker(
+            &adapter,
+            "<host loss awaiting regression>",
+            COUNTING_AWAIT_FOCUS_YAML,
+        );
         let (session, mut events_rx) = attach_ready(&broker, "host-loss-await").await;
-        let (events, _) = mpsc::channel(1);
-        let accepted = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::InvokeBinding(InvokeBinding {
-                    session: session.clone(),
-                    generation: 1,
-                    binding: BindingId {
-                        generation: binding.generation().0,
-                        ordinal: binding.ordinal(),
-                    },
-                }),
-                events,
-            )
-            .await
-            .expect("await adapter dispatch is accepted");
-        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-            execution: wire,
-            disposition: InvocationDisposition::Awaited,
-        }) = accepted
-        else {
-            panic!("expected an awaited acceptance");
-        };
+        let wire = invoke_awaited_binding(&broker, &session, &binding, mpsc::channel(1).0).await;
         broker
             .handle_health_event(AdapterHealthEvent::HostLost {
                 identity: HostIdentity {
@@ -5877,60 +5961,17 @@ menus:
     async fn activation_seal_during_reserved_dispatch_reaps_owner_and_reopens() {
         let adapter = counting_adapter(true);
         adapter.block_dispatch.store(true, Ordering::SeqCst);
-        let config = muxe_core::compile_yaml(
-            CompiledGeneration(1),
-            SourceId::new("<reserved activation seal regression>"),
-            r"
-version: 1
-menus:
-  main:
-    bindings:
-      f:
-        label: focus tab
-        action: tab:focus index=1
-        settings:
-          execution:
-            mode: await
-",
-            KeyCapabilities::default(),
-            Some(adapter.as_ref()),
-        )
-        .expect("test configuration compiles");
-        let root = named("main");
-        let binding = config
-            .attachment_view(&root, &config.theme_selection)
-            .ok()
-            .and_then(|view| {
-                view.menu
-                    .menu(&root)
-                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
-            })
-            .expect("test binding is visible");
-        let directory = tempfile::tempdir().expect("test directory");
-        let broker =
-            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (broker, binding, _directory) = counting_focus_broker(
+            &adapter,
+            "<reserved activation seal regression>",
+            COUNTING_AWAIT_FOCUS_YAML,
+        );
         let (session, _events_rx) = attach_ready(&broker, "reserved-seal").await;
-        let request = ClientRequest::InvokeBinding(InvokeBinding {
-            session: session.clone(),
-            generation: 1,
-            binding: BindingId {
-                generation: binding.generation().0,
-                ordinal: binding.ordinal(),
-            },
-        });
-        let invoking = tokio::spawn({
-            let broker = Arc::clone(&broker);
-            async move {
-                broker
-                    .handle(PeerRole::Ui, request, mpsc::channel(1).0)
-                    .await
-            }
-        });
+        let invoking = spawn_awaited_binding(Arc::clone(&broker), session.clone(), &binding);
         let entered = adapter.dispatch_entered.notified();
         tokio::pin!(entered);
         entered.as_mut().enable();
         entered.await;
-
         let draining = tokio::spawn({
             let broker = Arc::clone(&broker);
             async move { broker.drain_for_activation().await }
@@ -5967,18 +6008,15 @@ menus:
             .await
             .expect("activation drain task joins")
             .expect("sealed owner reaches a terminal completion");
-        assert!(
-            broker.state.lock().await.activation_sealed,
-            "successful drain remains sealed until the coordinator reopens it"
-        );
 
+        assert_new_ui_attach_is_sealed(&broker).await;
         broker.reopen_dispatch().await;
-        let (fresh_session, _events_rx) = attach_ready(&broker, "reserved-seal-fresh").await;
+        let (probe_session, _events_rx) = attach_ready(&broker, "reserved-seal-probe").await;
         let accepted = broker
             .handle(
                 PeerRole::Ui,
                 ClientRequest::InvokeBinding(InvokeBinding {
-                    session: fresh_session,
+                    session: probe_session,
                     generation: 1,
                     binding: BindingId {
                         generation: binding.generation().0,
@@ -5989,8 +6027,10 @@ menus:
             )
             .await;
         assert!(matches!(
-            accepted.expect("reopened broker accepts a fresh dispatch"),
-            RequestResult::Immediate(BrokerResponse::InvocationAccepted { .. })
+            accepted,
+            Ok(RequestResult::Immediate(
+                BrokerResponse::InvocationAccepted { .. }
+            ))
         ));
         assert_eq!(
             adapter.portable_dispatches.load(Ordering::SeqCst),
@@ -6004,15 +6044,9 @@ menus:
             .await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn execution_deadlines_detach_or_cancel_once_and_ignore_late_old_completion() {
-        for (on_timeout, expected_outcome, expected_cancellations) in [
-            ("cancel", ExecutionOutcome::TimedOut, 1),
-            ("detach", ExecutionOutcome::Detached, 0),
-        ] {
-            let adapter = counting_adapter(true);
-            let yaml = format!(
-                r"
+    fn counting_deadline_yaml(on_timeout: &str) -> String {
+        format!(
+            r"
 version: 1
 menus:
   main:
@@ -6027,51 +6061,22 @@ menus:
             on-timeout: {on_timeout}
             on-menu-control: cancel
 "
-            );
-            let config = muxe_core::compile_yaml(
-                CompiledGeneration(1),
-                SourceId::new("<execution deadline regression>"),
-                yaml.as_str(),
-                KeyCapabilities::default(),
-                Some(adapter.as_ref()),
-            )
-            .expect("deadline configuration compiles");
-            let root = named("main");
-            let binding = config
-                .attachment_view(&root, &config.theme_selection)
-                .ok()
-                .and_then(|view| {
-                    view.menu
-                        .menu(&root)
-                        .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
-                })
-                .expect("deadline binding is visible");
-            let directory = tempfile::tempdir().expect("deadline test directory");
-            let broker =
-                Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
-            let (session, mut events_rx) = attach_ready(&broker, "deadline").await;
-            let invoke = |session: UiSessionId| {
-                ClientRequest::InvokeBinding(InvokeBinding {
-                    session,
-                    generation: 1,
-                    binding: BindingId {
-                        generation: binding.generation().0,
-                        ordinal: binding.ordinal(),
-                    },
-                })
-            };
-            let accepted = broker
-                .handle(PeerRole::Ui, invoke(session.clone()), mpsc::channel(1).0)
-                .await
-                .expect("deadline invocation is accepted");
-            let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-                execution: first_execution,
-                disposition: InvocationDisposition::Awaited,
-            }) = accepted
-            else {
-                panic!("deadline invocation remains awaited");
-            };
+        )
+    }
 
+    #[tokio::test(start_paused = true)]
+    async fn execution_deadlines_detach_or_cancel_once_and_ignore_late_old_completion() {
+        for (on_timeout, expected_outcome, expected_cancellations) in [
+            ("cancel", ExecutionOutcome::TimedOut, 1),
+            ("detach", ExecutionOutcome::Detached, 0),
+        ] {
+            let adapter = counting_adapter(true);
+            let yaml = counting_deadline_yaml(on_timeout);
+            let (broker, binding, _directory) =
+                counting_focus_broker(&adapter, "<execution deadline regression>", &yaml);
+            let (session, mut events_rx) = attach_ready(&broker, "deadline").await;
+            let first_execution =
+                invoke_awaited_binding(&broker, &session, &binding, mpsc::channel(1).0).await;
             tokio::time::advance(Duration::from_millis(10)).await;
             for _ in 0..3 {
                 tokio::task::yield_now().await;
@@ -6097,17 +6102,8 @@ menus:
                 "timeout policy requests exactly its configured host cancellation"
             );
 
-            let accepted = broker
-                .handle(PeerRole::Ui, invoke(session), mpsc::channel(1).0)
-                .await
-                .expect("the timed-out UI can start a newer execution");
-            let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-                execution: second_execution,
-                disposition: InvocationDisposition::Awaited,
-            }) = accepted
-            else {
-                panic!("new execution remains awaited");
-            };
+            let second_execution =
+                invoke_awaited_binding(&broker, &session, &binding, mpsc::channel(1).0).await;
             assert_ne!(
                 first_execution, second_execution,
                 "late completion identities must not be reused"
@@ -6118,13 +6114,6 @@ menus:
                     execution: CoreExecutionId(1),
                 })
                 .await;
-            {
-                let state = broker.state.lock().await;
-                assert!(
-                    state.executions.contains_key(&CoreExecutionId(2)),
-                    "late completion of the timed-out owner leaves the newer owner intact"
-                );
-            }
             broker
                 .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
                     execution: CoreExecutionId(2),
@@ -6138,7 +6127,9 @@ menus:
                         ..
                     },
                 ..
-            }) = events_rx.recv().await
+            }) = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+                .await
+                .expect("new owner completion arrives bounded")
             else {
                 panic!("new execution emits its own completion event");
             };
@@ -6146,262 +6137,106 @@ menus:
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn full_ui_event_queue_does_not_delay_timeout_cancellation_or_owner_release() {
+    struct FullQueueTimeoutFixture {
+        adapter: Arc<CountingAdapter>,
+        broker: Arc<Broker>,
+        binding: muxe_core::BindingId,
+        session: UiSessionId,
+        events_rx: mpsc::Receiver<WireMessage>,
+        _directory: tempfile::TempDir,
+    }
+
+    async fn full_queue_timeout_fixture() -> FullQueueTimeoutFixture {
         let adapter = counting_adapter(true);
-        let config = muxe_core::compile_yaml(
-            CompiledGeneration(1),
-            SourceId::new("<full timeout event queue regression>"),
-            r"
-version: 1
-menus:
-  main:
-    bindings:
-      f:
-        label: focus tab
-        action: tab:focus index=1
-        settings:
-          execution:
-            mode: await
-            timeout: 10ms
-            on-timeout: cancel
-            on-menu-control: cancel
-",
-            KeyCapabilities::default(),
-            Some(adapter.as_ref()),
-        )
-        .expect("full-queue timeout configuration compiles");
-        let root = named("main");
-        let binding = config
-            .attachment_view(&root, &config.theme_selection)
-            .ok()
-            .and_then(|view| {
-                view.menu
-                    .menu(&root)
-                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
-            })
-            .expect("full-queue binding is visible");
-        let directory = tempfile::tempdir().expect("full-queue test directory");
-        let broker =
-            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
-        let (events, mut events_rx) = mpsc::channel(1);
-        let attached = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::named("main"),
-                    pane: HostPaneId::new("full-queue"),
-                    pending_launch: None,
-                    origin: None,
-                    caller_identity: None,
-                    theme: None,
-                    color_scheme: None,
-                }),
-                events.clone(),
-            )
-            .await
-            .expect("full-queue UI attaches");
-        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
-            panic!("expected full-queue attachment");
-        };
-        events
-            .try_send(WireMessage::Event {
-                event_id: EventId([9; 16]),
-                event: BrokerEvent::AdapterHealthChanged {
-                    healthy: true,
-                    diagnostic: None,
-                },
-            })
-            .expect("test fills the bounded UI event queue");
-        let accepted = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::InvokeBinding(InvokeBinding {
-                    session: session.clone(),
-                    generation: 1,
-                    binding: BindingId {
-                        generation: binding.generation().0,
-                        ordinal: binding.ordinal(),
-                    },
-                }),
-                events.clone(),
-            )
-            .await
-            .expect("full-queue invocation is accepted");
-        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-            execution: _first_execution,
-            disposition: InvocationDisposition::Awaited,
-        }) = accepted
-        else {
-            panic!("full-queue invocation remains awaited");
-        };
-        for _ in 0..3 {
+        let yaml = counting_deadline_yaml("cancel");
+        let (broker, binding, directory) =
+            counting_focus_broker(&adapter, "<full timeout event queue regression>", &yaml);
+        let (session, events, events_rx) =
+            attach_slow_ui_with_full_queue(&broker, "full-queue", EventId([9; 16])).await;
+        let _execution = invoke_awaited_binding(&broker, &session, &binding, events.clone()).await;
+        drop(events);
+        FullQueueTimeoutFixture {
+            adapter,
+            broker,
+            binding,
+            session,
+            events_rx,
+            _directory: directory,
+        }
+    }
+
+    async fn timeout_detaches_full_queue_consumer(fixture: &mut FullQueueTimeoutFixture) {
+        for _ in 0..20 {
+            if fixture.adapter.cancellations.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
         }
-        tokio::time::advance(Duration::from_millis(10)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        // The blocked timeout delivery is now non-blocking: the owner-side
-        // stop still crosses the adapter, but the full queue is an explicit
-        // slow-consumer failure, so the session is torn down on its own task
-        // instead of receiving the timed-out completion after the drain.
         assert_eq!(
-            adapter.cancellations.load(Ordering::SeqCst),
+            fixture.adapter.cancellations.load(Ordering::SeqCst),
             1,
             "timeout cancellation crosses the adapter while UI delivery is blocked"
         );
-        {
-            let state = broker.state.lock().await;
-            let record = state
-                .executions
-                .get(&CoreExecutionId(1))
-                .expect("timed-out owner remains until its late terminal");
-            assert!(matches!(record.owner, ExecutionOwner::Adapter));
-            assert!(record.termination_requested);
-            assert!(!record.awaiting);
-        }
-        // The pre-filled event is the only item the dead queue ever held; its
-        // drain proves the teardown ran, because a slow-consumer detach leaves
-        // a disconnected queue while the test still holds the only receiver.
         let Some(WireMessage::Event {
             event: BrokerEvent::AdapterHealthChanged { .. },
             ..
-        }) = events_rx.recv().await
+        }) = fixture.events_rx.recv().await
         else {
             panic!("expected initial health event");
         };
-        // Paused clock: poll with yields (no timers) until the spawned
-        // teardown detaches the session.
-        for _ in 0..1000 {
-            if !broker.sessions.lock().await.contains_key(&session) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let closed = tokio::time::timeout(Duration::from_secs(1), fixture.events_rx.recv())
+            .await
+            .expect("slow-consumer teardown closes its event channel");
         assert!(
-            !broker.sessions.lock().await.contains_key(&session),
-            "slow-consumer teardown detaches the full session"
+            closed.is_none(),
+            "torn-down session receives no more events"
         );
-        assert!(
-            broker
-                .state
-                .lock()
-                .await
-                .executions
-                .get(&CoreExecutionId(1))
-                .is_none_or(|record| record.session.is_none()),
-            "torn-down session owns no in-flight execution UI"
-        );
-        // The detached session can no longer admit work: detach is effectively
-        // once per session and the record is gone, so the slot is not reused.
-        let stale = broker
+        let stale = fixture
+            .broker
             .handle(
                 PeerRole::Ui,
                 ClientRequest::InvokeBinding(InvokeBinding {
-                    session: session.clone(),
+                    session: fixture.session.clone(),
                     generation: 1,
                     binding: BindingId {
-                        generation: binding.generation().0,
-                        ordinal: binding.ordinal(),
+                        generation: fixture.binding.generation().0,
+                        ordinal: fixture.binding.ordinal(),
                     },
                 }),
-                events.clone(),
+                mpsc::channel(1).0,
             )
             .await;
         assert!(
             matches!(stale, Err(BrokerError::UnknownSession(_))),
             "detached slow consumer admits no further invocations"
         );
-        // The teardown ends the session capture exactly once through the
-        // supervised cleanup path.
         for _ in 0..1000 {
-            if adapter.ended_captures.load(Ordering::SeqCst) == 1 {
+            if fixture.adapter.ended_captures.load(Ordering::SeqCst) == 1 {
                 break;
             }
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            adapter.ended_captures.load(Ordering::SeqCst),
+            fixture.adapter.ended_captures.load(Ordering::SeqCst),
             1,
             "slow-consumer teardown ends the session capture exactly once"
         );
-        // The timed-out session is gone, so the newer owner lives in a second
-        // session: the released owner slot must still admit fresh work.
-        let (second_events, mut second_rx) = mpsc::channel(8);
-        let attached = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::named("main"),
-                    pane: HostPaneId::new("full-queue-second"),
-                    pending_launch: None,
-                    origin: None,
-                    caller_identity: None,
-                    theme: None,
-                    color_scheme: None,
-                }),
-                second_events.clone(),
-            )
-            .await
-            .expect("second UI attaches after the slow consumer is gone");
-        let RequestResult::Immediate(BrokerResponse::UiAttached {
-            session: second_session,
-            ..
-        }) = attached
-        else {
-            panic!("expected second attachment");
-        };
-        let accepted = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::InvokeBinding(InvokeBinding {
-                    session: second_session.clone(),
-                    generation: 1,
-                    binding: BindingId {
-                        generation: binding.generation().0,
-                        ordinal: binding.ordinal(),
-                    },
-                }),
-                second_events.clone(),
-            )
-            .await
-            .expect("released owner slot admits a newer owner");
-        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-            execution: second_execution,
-            disposition: InvocationDisposition::Awaited,
-        }) = accepted
-        else {
-            panic!("new owner remains awaited");
-        };
-        // A late completion for the torn-down owner cannot remove the newer
-        // owner: the terminal arrived after the old session's removal.
-        broker
+    }
+
+    async fn replacement_owner_survives_late_completion(fixture: &mut FullQueueTimeoutFixture) {
+        let (session, events, mut events_rx) =
+            attach_ready_with_capacity(&fixture.broker, "full-queue-second", 8).await;
+        let execution =
+            invoke_awaited_binding(&fixture.broker, &session, &fixture.binding, events).await;
+        fixture
+            .broker
             .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
                 execution: CoreExecutionId(1),
             })
             .await;
-        assert!(
-            broker
-                .state
-                .lock()
-                .await
-                .executions
-                .contains_key(&CoreExecutionId(2)),
-            "late completion cannot remove the newer owner"
-        );
-        assert!(
-            !broker
-                .state
-                .lock()
-                .await
-                .executions
-                .contains_key(&CoreExecutionId(1)),
-            "late completion of the torn-down owner leaves no execution behind"
-        );
-        // The healthy second session still receives its own terminal through
-        // the same delivery path that dropped the slow consumer.
-        broker
+        fixture
+            .broker
             .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
                 execution: CoreExecutionId(2),
             })
@@ -6409,159 +6244,51 @@ menus:
         let Some(WireMessage::Event {
             event:
                 BrokerEvent::ExecutionCompleted {
-                    execution: succeeded_execution,
+                    execution: succeeded,
                     outcome: ExecutionOutcome::Succeeded,
                     ..
                 },
             ..
-        }) = second_rx.recv().await
+        }) = events_rx.try_recv().ok()
         else {
-            panic!("expected second execution succeeded completion");
+            panic!("healthy second session receives its own completion");
         };
-        assert_eq!(succeeded_execution, second_execution);
+        assert_eq!(succeeded, execution);
         assert!(
-            events_rx.try_recv().is_err(),
+            fixture.events_rx.try_recv().is_err(),
             "slow-consumer teardown delivers no timed-out completion"
         );
         assert_eq!(
-            adapter.ended_captures.load(Ordering::SeqCst),
+            fixture.adapter.ended_captures.load(Ordering::SeqCst),
             1,
             "no second teardown ends another capture"
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn full_ui_event_queue_does_not_delay_timeout_cancellation_or_owner_release() {
+        let mut fixture = full_queue_timeout_fixture().await;
+        timeout_detaches_full_queue_consumer(&mut fixture).await;
+        replacement_owner_survives_late_completion(&mut fixture).await;
+    }
+
     #[tokio::test]
     async fn slow_ui_does_not_block_unrelated_session_completion() {
         let adapter = counting_adapter(true);
-        let config = muxe_core::compile_yaml(
-            CompiledGeneration(1),
-            SourceId::new("<slow consumer isolation regression>"),
-            r"
-version: 1
-menus:
-  main:
-    bindings:
-      f:
-        label: focus tab
-        action: tab:focus index=1
-        settings:
-          execution:
-            mode: await
-",
-            KeyCapabilities::default(),
-            Some(adapter.as_ref()),
-        )
-        .expect("isolation configuration compiles");
-        let root = named("main");
-        let binding = config
-            .attachment_view(&root, &config.theme_selection)
-            .ok()
-            .and_then(|view| {
-                view.menu
-                    .menu(&root)
-                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
-            })
-            .expect("isolation binding is visible");
-        let directory = tempfile::tempdir().expect("isolation test directory");
-        let broker =
-            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
-        let invoke = |session: UiSessionId| {
-            ClientRequest::InvokeBinding(InvokeBinding {
-                session,
-                generation: 1,
-                binding: BindingId {
-                    generation: binding.generation().0,
-                    ordinal: binding.ordinal(),
-                },
-            })
-        };
-        // The slow session's outbox (capacity 1) is filled and never drained.
-        let (slow_events, _slow_rx) = mpsc::channel::<WireMessage>(1);
-        let attached = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::named("main"),
-                    pane: HostPaneId::new("slow-ui"),
-                    pending_launch: None,
-                    origin: None,
-                    caller_identity: None,
-                    theme: None,
-                    color_scheme: None,
-                }),
-                slow_events.clone(),
-            )
-            .await
-            .expect("slow UI attaches");
-        let RequestResult::Immediate(BrokerResponse::UiAttached {
-            session: slow_session,
-            ..
-        }) = attached
-        else {
-            panic!("expected slow attachment");
-        };
-        slow_events
-            .try_send(WireMessage::Event {
-                event_id: EventId([7; 16]),
-                event: BrokerEvent::AdapterHealthChanged {
-                    healthy: true,
-                    diagnostic: None,
-                },
-            })
-            .expect("test fills the slow UI queue");
-        // A healthy session shares the same adapter monitor.
-        let (fast_events, mut fast_rx) = mpsc::channel::<WireMessage>(8);
-        let attached = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::named("main"),
-                    pane: HostPaneId::new("fast-ui"),
-                    pending_launch: None,
-                    origin: None,
-                    caller_identity: None,
-                    theme: None,
-                    color_scheme: None,
-                }),
-                fast_events.clone(),
-            )
-            .await
-            .expect("healthy UI attaches");
-        let RequestResult::Immediate(BrokerResponse::UiAttached {
-            session: fast_session,
-            ..
-        }) = attached
-        else {
-            panic!("expected healthy attachment");
-        };
-        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-            execution: slow_execution,
-            disposition: InvocationDisposition::Awaited,
-        }) = broker
-            .handle(
-                PeerRole::Ui,
-                invoke(slow_session.clone()),
-                slow_events.clone(),
-            )
-            .await
-            .expect("slow invocation is accepted")
-        else {
-            panic!("slow invocation remains awaited");
-        };
-        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-            execution: fast_execution,
-            disposition: InvocationDisposition::Awaited,
-        }) = broker
-            .handle(
-                PeerRole::Ui,
-                invoke(fast_session.clone()),
-                fast_events.clone(),
-            )
-            .await
-            .expect("healthy invocation is accepted")
-        else {
-            panic!("healthy invocation remains awaited");
-        };
+        let (broker, binding, _directory) = counting_focus_broker(
+            &adapter,
+            "<slow consumer isolation regression>",
+            COUNTING_AWAIT_FOCUS_YAML,
+        );
+        let (slow_session, slow_events, mut slow_rx) =
+            attach_slow_ui_with_full_queue(&broker, "slow-ui", EventId([7; 16])).await;
+        let (fast_session, fast_events, mut fast_rx) =
+            attach_ready_with_capacity(&broker, "fast-ui", 8).await;
+        let slow_execution =
+            invoke_awaited_binding(&broker, &slow_session, &binding, slow_events.clone()).await;
+        let fast_execution =
+            invoke_awaited_binding(&broker, &fast_session, &binding, fast_events.clone()).await;
+        drop(slow_events);
         assert_ne!(slow_execution, fast_execution);
         // One unhealthy broadcast must not wedge the healthy session: the slow
         // queue is torn down while every other session still gets its event.
@@ -6581,18 +6308,20 @@ menus:
             !fast_healthy,
             "healthy session observes the unhealthy broadcast"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if !broker.sessions.lock().await.contains_key(&slow_session) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("slow consumer is torn down exactly once");
-        // The other session's execution still completes through the same
-        // monitor that just dropped the slow consumer.
+        let Some(WireMessage::Event {
+            event: BrokerEvent::AdapterHealthChanged { healthy: true, .. },
+            ..
+        }) = slow_rx.recv().await
+        else {
+            panic!("slow session receives its queued health event");
+        };
+        let closed = tokio::time::timeout(Duration::from_secs(1), slow_rx.recv())
+            .await
+            .expect("slow session closes after failed event delivery");
+        assert!(
+            closed.is_none(),
+            "slow session outbox closes after teardown"
+        );
         broker
             .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
                 execution: CoreExecutionId(2),
@@ -6616,98 +6345,20 @@ menus:
     #[tokio::test]
     async fn slow_ui_completion_teardown_runs_once_and_delivers_nothing_further() {
         let adapter = counting_adapter(true);
-        let config = muxe_core::compile_yaml(
-            CompiledGeneration(1),
-            SourceId::new("<slow consumer teardown regression>"),
-            r"
-version: 1
-menus:
-  main:
-    bindings:
-      f:
-        label: focus tab
-        action: tab:focus index=1
-        settings:
-          execution:
-            mode: await
-",
-            KeyCapabilities::default(),
-            Some(adapter.as_ref()),
-        )
-        .expect("teardown configuration compiles");
-        let root = named("main");
-        let binding = config
-            .attachment_view(&root, &config.theme_selection)
-            .ok()
-            .and_then(|view| {
-                view.menu
-                    .menu(&root)
-                    .and_then(|menu| menu.bindings.first().map(|binding| binding.id))
-            })
-            .expect("teardown binding is visible");
-        let directory = tempfile::tempdir().expect("teardown test directory");
-        let broker =
-            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
-        let (events, mut events_rx) = mpsc::channel::<WireMessage>(1);
-        let attached = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::named("main"),
-                    pane: HostPaneId::new("slow-teardown"),
-                    pending_launch: None,
-                    origin: None,
-                    caller_identity: None,
-                    theme: None,
-                    color_scheme: None,
-                }),
-                events.clone(),
-            )
-            .await
-            .expect("slow UI attaches");
-        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
-            panic!("expected slow attachment");
-        };
-        events
-            .try_send(WireMessage::Event {
-                event_id: EventId([7; 16]),
-                event: BrokerEvent::AdapterHealthChanged {
-                    healthy: true,
-                    diagnostic: None,
-                },
-            })
-            .expect("test fills the slow UI queue");
-        let accepted = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::InvokeBinding(InvokeBinding {
-                    session: session.clone(),
-                    generation: 1,
-                    binding: BindingId {
-                        generation: binding.generation().0,
-                        ordinal: binding.ordinal(),
-                    },
-                }),
-                events.clone(),
-            )
-            .await
-            .expect("slow invocation is accepted");
-        let RequestResult::Immediate(BrokerResponse::InvocationAccepted {
-            disposition: InvocationDisposition::Awaited,
-            ..
-        }) = accepted
-        else {
-            panic!("slow invocation remains awaited");
-        };
-        // The full queue is a slow-consumer failure: delivering this terminal
-        // must tear the session down instead of queueing behind the filler.
+        let (broker, binding, _directory) = counting_focus_broker(
+            &adapter,
+            "<slow consumer teardown regression>",
+            COUNTING_AWAIT_FOCUS_YAML,
+        );
+        let (session, events, mut events_rx) =
+            attach_slow_ui_with_full_queue(&broker, "slow-teardown", EventId([7; 16])).await;
+        let _execution = invoke_awaited_binding(&broker, &session, &binding, events.clone()).await;
+        drop(events);
         broker
             .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
                 execution: CoreExecutionId(1),
             })
             .await;
-        // The filler is the only event the dead queue ever held; draining it
-        // proves the teardown ran while this test still holds the receiver.
         let Some(WireMessage::Event {
             event: BrokerEvent::AdapterHealthChanged { .. },
             ..
@@ -6715,21 +6366,12 @@ menus:
         else {
             panic!("expected filler health event");
         };
+        let closed = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("slow consumer outbox closes");
+        assert!(closed.is_none(), "teardown drops the slow session sender");
         tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if !broker.sessions.lock().await.contains_key(&session) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("slow consumer is detached");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if adapter.ended_captures.load(Ordering::SeqCst) == 1 {
-                    return;
-                }
+            while adapter.ended_captures.load(Ordering::SeqCst) != 1 {
                 tokio::task::yield_now().await;
             }
         })
@@ -6740,17 +6382,11 @@ menus:
             1,
             "slow-consumer teardown ends the session capture exactly once"
         );
-        // No further events are attempted for the torn-down session: a second
-        // terminal for the same execution finds no owner and no UI to notify.
         broker
             .dispatch_completed(muxe_adapter_api::DispatchCompletion::Succeeded {
                 execution: CoreExecutionId(1),
             })
             .await;
-        assert!(
-            !broker.sessions.lock().await.contains_key(&session),
-            "repeat delivery attempts no second teardown"
-        );
         assert!(
             events_rx.try_recv().is_err(),
             "torn-down session receives no completion"
@@ -6760,69 +6396,21 @@ menus:
             1,
             "repeat delivery attempts no second capture end"
         );
-        assert!(
-            !broker
-                .state
-                .lock()
-                .await
-                .executions
-                .contains_key(&CoreExecutionId(1)),
-            "terminal removes the torn-down execution exactly once"
-        );
     }
 
     #[tokio::test]
     async fn slow_ui_generic_reaper_still_leaves_supervision() {
         let adapter = counting_adapter(false);
-        let config = muxe_core::compile_yaml(
-            CompiledGeneration(1),
-            SourceId::new("<slow generic reaper regression>"),
-            r"
-version: 1
-menus:
-  main:
-    bindings:
-      x:
-        label: no-op
-        action: config:reload
-",
-            KeyCapabilities::default(),
-            Some(adapter.as_ref()),
-        )
-        .expect("reaper configuration compiles");
-        let directory = tempfile::tempdir().expect("owned command cwd");
-        let broker = Broker::from_compiled(adapter, directory.path().join("config.yml"), config);
+        let (broker, directory) = counting_broker(
+            &adapter,
+            "<slow generic reaper regression>",
+            COUNTING_RELOAD_YAML,
+        );
         // Awed execution whose queue (capacity 1) is filled before the child
         // exits: the reaper's terminal delivery must not block on it.
-        let (events, _events_rx) = mpsc::channel::<WireMessage>(1);
-        let attached = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::named("main"),
-                    pane: HostPaneId::new("slow-generic"),
-                    pending_launch: None,
-                    origin: None,
-                    caller_identity: None,
-                    theme: None,
-                    color_scheme: None,
-                }),
-                events.clone(),
-            )
-            .await
-            .expect("slow UI attaches");
-        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
-            panic!("expected slow attachment");
-        };
-        events
-            .try_send(WireMessage::Event {
-                event_id: EventId([7; 16]),
-                event: BrokerEvent::AdapterHealthChanged {
-                    healthy: true,
-                    diagnostic: None,
-                },
-            })
-            .expect("test fills the slow UI queue");
+        let (session, events, mut events_rx) =
+            attach_slow_ui_with_full_queue(&broker, "slow-generic", EventId([7; 16])).await;
+        drop(events);
         let wire = ExecutionId([3; 16]);
         let core = CoreExecutionId(3);
         broker
@@ -6845,7 +6433,7 @@ menus:
         origin.pane_cwd = Some(directory.path().to_path_buf());
         broker
             .execute_command(CommandLaunch {
-                session: session.clone(),
+                session,
                 wire,
                 core,
                 command: CommandAction {
@@ -6868,32 +6456,29 @@ menus:
             .await
             .expect("slow generic child starts");
         assert!(
-            broker.has_supervised_children().await,
+            broker.has_supervised_children(),
             "slow generic child is supervised while it runs"
         );
         // The reaper must finish even though the UI never reads: the child
-        // leaves supervision (so the activation linger cannot wait on it) and
-        // the wedged session is torn down instead of blocking the reaper.
+        // leaves supervision and the blocked event channel closes on teardown.
         tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if !broker.has_supervised_children().await {
-                    return;
-                }
+            while broker.has_supervised_children() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("slow-UI reaper leaves supervision");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if !broker.sessions.lock().await.contains_key(&session) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("slow consumer is detached by its reaper");
+        let Some(WireMessage::Event {
+            event: BrokerEvent::AdapterHealthChanged { .. },
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("slow generic UI receives its queued health event");
+        };
+        let closed = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("slow generic UI outbox closes after reaper delivery");
+        assert!(closed.is_none(), "reaper tears down the blocked UI session");
     }
 
     #[tokio::test]
@@ -8798,6 +8383,65 @@ menus:
         .await
         .expect("completed cleanup task is removed from the supervisor registry");
     }
+
+    async fn attach_ready(
+        broker: &Broker,
+        pane: &str,
+    ) -> (UiSessionId, mpsc::Receiver<WireMessage>) {
+        let (session, _events, events_rx) = attach_ready_with_capacity(broker, pane, 8).await;
+        (session, events_rx)
+    }
+    async fn assert_new_ui_attach_is_sealed(broker: &Broker) {
+        let result = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("reserved-seal-probe"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                mpsc::channel(1).0,
+            )
+            .await;
+        assert!(matches!(result, Err(BrokerError::ActivationInProgress)));
+    }
+
+    async fn attach_ready_with_capacity(
+        broker: &Broker,
+        pane: &str,
+        capacity: usize,
+    ) -> (
+        UiSessionId,
+        mpsc::Sender<WireMessage>,
+        mpsc::Receiver<WireMessage>,
+    ) {
+        let (events, events_rx) = mpsc::channel(capacity);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new(pane),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("expected immediate attachment");
+        };
+        (session, events, events_rx)
+    }
+
     async fn prepare_pending_scope(
         broker: &Broker,
     ) -> (PendingLaunchToken, PendingAttachment, UiSessionId) {
@@ -8942,33 +8586,6 @@ menus:
         })
         .await
         .expect("supervised capture cleanup completes");
-    }
-
-    async fn attach_ready(
-        broker: &Broker,
-        pane: &str,
-    ) -> (UiSessionId, mpsc::Receiver<WireMessage>) {
-        let (events, events_rx) = mpsc::channel(8);
-        let attached = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::named("main"),
-                    pane: HostPaneId::new(pane),
-                    pending_launch: None,
-                    origin: None,
-                    caller_identity: None,
-                    theme: None,
-                    color_scheme: None,
-                }),
-                events,
-            )
-            .await
-            .expect("UI attaches");
-        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
-            panic!("expected immediate attachment");
-        };
-        (session, events_rx)
     }
 
     async fn assert_expired_isolated(
@@ -9345,7 +8962,7 @@ menus:
         .expect("write owned generic-process script");
         let adapter = counting_adapter(false);
         let yaml = format!(
-            r#"
+            r"
 version: 1
 menus:
   main:
@@ -9362,7 +8979,7 @@ menus:
           execution:
             mode: await
             on-menu-control: detach
-"#,
+",
             script = script.to_string_lossy(),
             cwd = directory.path().to_string_lossy(),
         );
@@ -9454,7 +9071,7 @@ menus:
             "drain detaches the UI session"
         );
         assert!(
-            broker.has_supervised_children().await,
+            broker.has_supervised_children(),
             "an awaited generic command configured to detach survives the drain supervised"
         );
         assert!(
@@ -9487,7 +9104,7 @@ menus:
             std::io::Write::write_all(&mut trigger, b"exit\n").expect("write exit trigger");
         }
         tokio::time::timeout(Duration::from_secs(10), async {
-            while broker.has_supervised_children().await {
+            while broker.has_supervised_children() {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
@@ -9664,7 +9281,7 @@ menus:
         );
         // The Cancel-policy child is stopped through the dismissal transition and reaped.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while broker.has_supervised_children().await
+            while broker.has_supervised_children()
                 || !broker.state.lock().await.executions.is_empty()
             {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -9761,15 +9378,11 @@ while :; do sleep 1; done
         .expect("TERM-resistant descendant receives group SIGKILL and is reaped");
     }
 
-    async fn theme_override_test_fixture()
-    -> (Arc<ScopedTestAdapter>, Arc<Broker>, tempfile::TempDir) {
-        let directory = tempfile::tempdir().expect("owned configuration directory");
-        let config_dir = directory.path();
+    fn write_theme_fixture_catalog(config_dir: &std::path::Path) {
         std::fs::create_dir_all(config_dir.join("themes")).unwrap();
-        std::fs::create_dir_all(config_dir.join("color-schemes")).unwrap();
         std::fs::write(
             config_dir.join("config.yml"),
-            r#"
+            r"
 version: 1
 theme: theme-one
 color-scheme: scheme-one
@@ -9782,7 +9395,7 @@ menus:
       r:
         label: reload
         action: config:reload
-"#,
+",
         )
         .unwrap();
         std::fs::write(
@@ -9840,6 +9453,10 @@ menu:
 "#,
         )
         .unwrap();
+    }
+
+    fn write_theme_fixture_color_schemes(config_dir: &std::path::Path) {
+        std::fs::create_dir_all(config_dir.join("color-schemes")).unwrap();
         std::fs::write(
             config_dir.join("color-schemes/scheme-one.yml"),
             r##"
@@ -9867,6 +9484,14 @@ colors:
 "##,
         )
         .unwrap();
+    }
+
+    async fn theme_override_test_fixture()
+    -> (Arc<ScopedTestAdapter>, Arc<Broker>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("owned configuration directory");
+        let config_dir = directory.path();
+        write_theme_fixture_catalog(config_dir);
+        write_theme_fixture_color_schemes(config_dir);
         let adapter = Arc::new(ScopedTestAdapter {
             dispatches: AtomicUsize::new(0),
             modal_scope_calls: AtomicUsize::new(0),
@@ -10104,9 +9729,8 @@ colors:
                 events,
             )
             .await;
-        let err = match res {
-            Err(err) => err,
-            Ok(_) => panic!("unknown theme must be rejected"),
+        let Err(err) = res else {
+            panic!("unknown theme must be rejected");
         };
         assert!(matches!(err, BrokerError::Configuration(_)));
         // Assert no sessions leaked
@@ -10155,16 +9779,23 @@ colors:
                 events,
             )
             .await;
-        let error = match result {
-            Err(BrokerError::Configuration(error)) => error,
-            Err(_) => panic!("mixed pair should return a configuration diagnostic"),
-            Ok(_) => panic!("mixed pair must fail"),
+        let Err(BrokerError::Configuration(error)) = result else {
+            panic!("mixed theme/color-scheme pair is rejected");
         };
-        assert!(error.to_string().contains("theme-invalid-pair"));
+        let ConfigError::Diagnostics(diagnostics) = error.as_ref() else {
+            panic!("mixed theme/color-scheme failure carries source diagnostics");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, muxe_core::DiagnosticCode::InvalidTheme);
         assert!(
-            error
-                .to_string()
-                .contains("unknown palette or semantic color")
+            diagnostics[0].labels.iter().any(|label| {
+                label
+                    .span
+                    .source
+                    .as_str()
+                    .ends_with("themes/theme-invalid-pair.yml")
+            }),
+            "diagnostic labels the selected theme involved in the incompatible pair"
         );
         assert_eq!(adapter.modal_scope_calls.load(Ordering::SeqCst), 0);
         assert_eq!(adapter.capture_calls.load(Ordering::SeqCst), 0);
@@ -10254,7 +9885,7 @@ colors:
         // Rewrite config.yml to change default theme
         std::fs::write(
             dir.path().join("config.yml"),
-            r#"
+            r"
 version: 1
 theme: theme-two
 color-scheme: scheme-two
@@ -10264,7 +9895,7 @@ menus:
       q:
         label: quit
         action: menu:quit
-"#,
+",
         )
         .unwrap();
 
@@ -10394,6 +10025,27 @@ menus:
                 .expect("valid live server identity"),
         }
     }
+    async fn reconnect_with_snapshot(
+        broker: &Broker,
+        previous: &str,
+        current: &str,
+        epoch: HostContinuityEpoch,
+        fingerprint: char,
+        blocked: &[(&str, &str)],
+    ) {
+        broker
+            .handle_health_event(AdapterHealthEvent::Reconnected {
+                previous: compatibility_identity(previous),
+                current: compatibility_identity(current),
+                compatibility: compatibility_snapshot(
+                    epoch,
+                    fingerprint,
+                    blocked,
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+            })
+            .await;
+    }
 
     fn native_compatibility_fixture() -> (Arc<CountingAdapter>, Arc<Broker>) {
         let adapter = counting_adapter(false);
@@ -10422,6 +10074,36 @@ menus:
             config,
         );
         (adapter, broker)
+    }
+    async fn native_compatibility_reload_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<CountingAdapter>,
+        Arc<Broker>,
+    ) {
+        let directory = tempfile::tempdir().expect("owned compatibility config directory");
+        let path = directory.path().join("config.yml");
+        std::fs::write(
+            &path,
+            r"
+version: 1
+menus:
+  main:
+    bindings:
+      a:
+        label: agents
+        action: native.herdr.agent:list
+      w:
+        label: workspaces
+        action: native.herdr.workspace:list
+",
+        )
+        .expect("write compatibility config");
+        let adapter = counting_adapter(false);
+        let broker = Broker::load(adapter.clone(), &path)
+            .await
+            .expect("load compatibility broker");
+        (directory, path, adapter, broker)
     }
 
     async fn attach_native_fixture(
@@ -10468,9 +10150,116 @@ menus:
             .find(|binding| binding.label.as_deref() == Some(label))
             .expect("fixture binding is attached")
     }
+    fn attached_action_block_diagnostic<'a>(
+        snapshot: &'a muxe_protocol::UiAttachmentWire,
+        label: &str,
+    ) -> &'a ProtocolDiagnostic {
+        let binding = attached_binding(snapshot, label);
+        assert!(binding.state.blocked);
+        let diagnostic = binding
+            .diagnostic
+            .as_ref()
+            .expect("blocked native action retains a diagnostic");
+        assert_eq!(diagnostic.code, DiagnosticCode::ActionBlocked);
+        diagnostic
+    }
+
+    async fn assert_native_invocation_matches_diagnostic(
+        broker: &Broker,
+        session: &UiSessionId,
+        generation: u64,
+        binding: BindingId,
+        diagnostic: &ProtocolDiagnostic,
+    ) {
+        let result = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: session.clone(),
+                    generation,
+                    binding,
+                }),
+                mpsc::channel(1).0,
+            )
+            .await;
+        let Err(BrokerError::NativeCompatibility(message)) = result else {
+            panic!("native invocation returns its current compatibility rejection");
+        };
+        assert_eq!(message, diagnostic.message);
+    }
+    async fn assert_detached_session_rejects_invocation(
+        broker: &Broker,
+        session: UiSessionId,
+        generation: u64,
+        binding: BindingId,
+    ) {
+        let result = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session,
+                    generation,
+                    binding,
+                }),
+                mpsc::channel(1).0,
+            )
+            .await;
+        assert!(matches!(result, Err(BrokerError::UnknownSession(_))));
+    }
+
+    fn assert_pending_then_schema_b_events(
+        events: &[WireMessage],
+        agents: BindingId,
+        workspaces: BindingId,
+    ) {
+        assert_eq!(
+            events.len(),
+            5,
+            "pending and replacement outcomes publish once"
+        );
+        for (index, expected_binding) in [(0, agents), (1, workspaces), (3, agents)] {
+            assert!(matches!(
+                &events[index],
+                WireMessage::Event {
+                    event: BrokerEvent::BindingAvailabilityChanged {
+                        binding,
+                        availability: BindingAvailability::Blocked,
+                        diagnostic: Some(ProtocolDiagnostic {
+                            code: DiagnosticCode::ActionBlocked,
+                            ..
+                        }),
+                        ..
+                    },
+                    ..
+                } if *binding == expected_binding
+            ));
+        }
+        assert!(matches!(
+            &events[2],
+            WireMessage::Event {
+                event: BrokerEvent::AdapterHealthChanged {
+                    healthy: true,
+                    diagnostic: None,
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &events[4],
+            WireMessage::Event {
+                event: BrokerEvent::BindingAvailabilityChanged {
+                    binding,
+                    availability: BindingAvailability::Enabled,
+                    diagnostic: None,
+                    ..
+                },
+                ..
+            } if *binding == workspaces
+        ));
+    }
 
     #[tokio::test]
-    async fn compatibility_rebuild_blocks_pending_and_preserves_exact_diagnostic() {
+    async fn compatibility_rebuild_blocks_pending_and_publishes_latest_state() {
         let (adapter, broker) = native_compatibility_fixture();
         let (session, initial, mut events) = attach_native_fixture(&broker, "pane-initial").await;
         let agents_id = attached_binding(&initial, "agents").id;
@@ -10505,120 +10294,42 @@ menus:
         let (_pending_session, pending, _pending_events) =
             attach_native_fixture(&broker, "pane-pending").await;
         let pending_agent = attached_binding(&pending, "agents");
-        assert!(pending_agent.state.blocked);
-        assert_eq!(
-            pending_agent
-                .diagnostic
-                .as_ref()
-                .expect("pending diagnostic")
-                .message,
-            COMPATIBILITY_PENDING_DIAGNOSTIC
-        );
-        let Err(blocked) = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::InvokeBinding(InvokeBinding {
-                    session,
-                    generation: initial.menu.generation,
-                    binding: pending_agent.id,
-                }),
-                mpsc::channel(1).0,
-            )
-            .await
-        else {
-            panic!("pending native invocation must fail closed")
-        };
-        assert!(matches!(
-            &blocked,
-            BrokerError::NativeCompatibility(message)
-                if message == COMPATIBILITY_PENDING_DIAGNOSTIC
-        ));
+        let pending_diagnostic = attached_action_block_diagnostic(&pending, "agents");
+        assert_native_invocation_matches_diagnostic(
+            &broker,
+            &session,
+            initial.menu.generation,
+            pending_agent.id,
+            pending_diagnostic,
+        )
+        .await;
         assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
 
         broker.set_compatibility_commit_hook(None);
         hook.release.notify_one();
         hook.completed.notified().await;
         let published = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
-        assert_eq!(published.len(), 5);
-        assert!(matches!(
-            &published[0],
-            WireMessage::Event {
-                event: BrokerEvent::BindingAvailabilityChanged {
-                    binding,
-                    availability: BindingAvailability::Blocked,
-                    diagnostic: Some(diagnostic),
-                    ..
-                },
-                ..
-            } if *binding == agents_id
-                && diagnostic.message == COMPATIBILITY_PENDING_DIAGNOSTIC
-        ));
-        assert!(matches!(
-            &published[1],
-            WireMessage::Event {
-                event: BrokerEvent::BindingAvailabilityChanged {
-                    binding,
-                    availability: BindingAvailability::Blocked,
-                    diagnostic: Some(diagnostic),
-                    ..
-                },
-                ..
-            } if *binding == workspaces_id
-                && diagnostic.message == COMPATIBILITY_PENDING_DIAGNOSTIC
-        ));
-        assert!(matches!(
-            &published[2],
-            WireMessage::Event {
-                event: BrokerEvent::AdapterHealthChanged {
-                    healthy: true,
-                    diagnostic: None,
-                },
-                ..
-            }
-        ));
-        assert!(matches!(
-            &published[3],
-            WireMessage::Event {
-                event: BrokerEvent::BindingAvailabilityChanged {
-                    binding,
-                    availability: BindingAvailability::Blocked,
-                    diagnostic: Some(diagnostic),
-                    ..
-                },
-                ..
-            } if *binding == agents_id
-                && diagnostic.message == "schema B requires the removed agent selector"
-        ));
-        assert!(matches!(
-            &published[4],
-            WireMessage::Event {
-                event: BrokerEvent::BindingAvailabilityChanged {
-                    binding,
-                    availability: BindingAvailability::Enabled,
-                    diagnostic: None,
-                    ..
-                },
-                ..
-            } if *binding == workspaces_id
-        ));
+        assert_pending_then_schema_b_events(&published, agents_id, workspaces_id);
 
-        let (_blocked_session, blocked_snapshot, _blocked_events) =
+        let (blocked_session, blocked_snapshot, _blocked_events) =
             attach_native_fixture(&broker, "pane-blocked").await;
         let blocked_agent = attached_binding(&blocked_snapshot, "agents");
-        assert!(blocked_agent.state.blocked);
-        assert_eq!(
-            blocked_agent
-                .diagnostic
-                .as_ref()
-                .expect("blocked diagnostic")
-                .message,
-            "schema B requires the removed agent selector"
-        );
+        let blocked_diagnostic = attached_action_block_diagnostic(&blocked_snapshot, "agents");
+        assert_ne!(blocked_diagnostic.message, pending_diagnostic.message);
         assert!(
             !attached_binding(&blocked_snapshot, "workspaces")
                 .state
                 .blocked
         );
+        assert_native_invocation_matches_diagnostic(
+            &broker,
+            &blocked_session,
+            blocked_snapshot.menu.generation,
+            blocked_agent.id,
+            blocked_diagnostic,
+        )
+        .await;
+        assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
 
         let hook = Arc::new(WaitHook::new());
         broker.set_compatibility_commit_hook(Some(Arc::clone(&hook)));
@@ -10644,8 +10355,7 @@ menus:
 
     #[tokio::test]
     async fn compatibility_validator_panic_fails_closed_instead_of_staying_pending() {
-        let (_adapter, broker) = native_compatibility_fixture();
-        let (_session, _initial, _events) = attach_native_fixture(&broker, "pane-panic").await;
+        let (adapter, broker) = native_compatibility_fixture();
         let hook = Arc::new(WaitHook::new());
         broker.set_compatibility_commit_hook(Some(Arc::clone(&hook)));
         broker
@@ -10656,29 +10366,91 @@ menus:
             })
             .await;
         hook.entered.notified().await;
+
+        let (_pending_session, pending, _pending_events) =
+            attach_native_fixture(&broker, "pane-panic-pending").await;
+        let pending_agents = attached_action_block_diagnostic(&pending, "agents");
+        let pending_workspaces = attached_action_block_diagnostic(&pending, "workspaces");
+
         broker.set_compatibility_commit_hook(None);
         hook.release.notify_one();
         hook.completed.notified().await;
 
-        let (_blocked_session, blocked, _blocked_events) =
+        let (session, blocked, _blocked_events) =
             attach_native_fixture(&broker, "pane-after-panic").await;
-        for label in ["agents", "workspaces"] {
+        for (label, pending_diagnostic) in [
+            ("agents", pending_agents),
+            ("workspaces", pending_workspaces),
+        ] {
+            let diagnostic = attached_action_block_diagnostic(&blocked, label);
+            assert_ne!(diagnostic.message, pending_diagnostic.message);
             let binding = attached_binding(&blocked, label);
-            assert!(binding.state.blocked);
-            let message = &binding
-                .diagnostic
-                .as_ref()
-                .expect("panic diagnostic")
-                .message;
-            assert!(message.starts_with(COMPATIBILITY_REBUILD_PANIC_DIAGNOSTIC));
-            assert_ne!(message, COMPATIBILITY_PENDING_DIAGNOSTIC);
+            assert_native_invocation_matches_diagnostic(
+                &broker,
+                &session,
+                blocked.menu.generation,
+                binding.id,
+                diagnostic,
+            )
+            .await;
         }
-        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
+        assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
     }
+    fn latest_binding_availability(
+        events: &[WireMessage],
+        binding_id: BindingId,
+    ) -> Option<(BindingAvailability, Option<DiagnosticCode>)> {
+        events.iter().rev().find_map(|message| match message {
+            WireMessage::Event {
+                event:
+                    BrokerEvent::BindingAvailabilityChanged {
+                        binding,
+                        availability,
+                        diagnostic,
+                        ..
+                    },
+                ..
+            } if *binding == binding_id => Some((
+                *availability,
+                diagnostic.as_ref().map(|diagnostic| diagnostic.code),
+            )),
+            _ => None,
+        })
+    }
+
+    fn assert_schema_b_availability(
+        events: &[WireMessage],
+        agents: BindingId,
+        workspaces: BindingId,
+    ) {
+        assert_eq!(
+            latest_binding_availability(events, agents),
+            Some((BindingAvailability::Enabled, None))
+        );
+        assert_eq!(
+            latest_binding_availability(events, workspaces),
+            Some((
+                BindingAvailability::Blocked,
+                Some(DiagnosticCode::ActionBlocked)
+            ))
+        );
+    }
+
+    fn assert_schema_a_availability(events: &[WireMessage], bindings: [BindingId; 2]) {
+        for binding in bindings {
+            assert_eq!(
+                latest_binding_availability(events, binding),
+                Some((BindingAvailability::Enabled, None))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn compatibility_newer_epoch_wins_and_host_loss_cancels_paused_publication() {
         let (_adapter, broker) = native_compatibility_fixture();
-        let (_session, _initial, mut events) = attach_native_fixture(&broker, "pane-race").await;
+        let (_session, initial, mut events) = attach_native_fixture(&broker, "pane-race").await;
+        let agents_id = attached_binding(&initial, "agents").id;
+        let workspaces_id = attached_binding(&initial, "workspaces").id;
         let epoch_a = HostContinuityEpoch::initial();
         let epoch_b = epoch_a.successor().expect("newer epoch");
 
@@ -10719,29 +10491,8 @@ menus:
         broker.set_compatibility_commit_hook(None);
         hook_b.release.notify_one();
         hook_b.completed.notified().await;
-
-        {
-            let state = broker.compatibility.state.lock().await;
-            assert_eq!(
-                state
-                    .current
-                    .as_ref()
-                    .map(NativeCompatibilitySnapshot::identity),
-                Some(snapshot_b.identity())
-            );
-            let generation = state
-                .generations
-                .get(&CompiledGeneration(1))
-                .expect("active generation compatibility");
-            assert_eq!(generation.runtime, *snapshot_b.identity());
-            let diagnostics = generation
-                .bindings
-                .values()
-                .filter_map(compatibility_protocol_diagnostic)
-                .map(|diagnostic| diagnostic.message)
-                .collect::<Vec<_>>();
-            assert_eq!(diagnostics, vec!["current B rejection"]);
-        }
+        let published = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_schema_b_availability(&published, agents_id, workspaces_id);
 
         let hook_loss = Arc::new(WaitHook::new());
         broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_loss)));
@@ -10797,9 +10548,208 @@ menus:
             }
         }
         assert!(terminal_seen, "HostLost publishes terminal unhealthiness");
-        let state = broker.compatibility.state.lock().await;
-        assert!(state.retired);
-        assert!(state.current.is_none());
+    }
+
+    #[tokio::test]
+    async fn compatibility_reconnect_burst_publishes_only_the_latest_runtime() {
+        let (_adapter, broker) = native_compatibility_fixture();
+        let (_session, initial, mut events) = attach_native_fixture(&broker, "pane-burst").await;
+        let bindings = [
+            attached_binding(&initial, "agents").id,
+            attached_binding(&initial, "workspaces").id,
+        ];
+        let epoch_a = HostContinuityEpoch::initial();
+        let epoch_b = epoch_a.successor().expect("epoch B");
+        let epoch_c = epoch_b.successor().expect("epoch C");
+        let epoch_d = epoch_c.successor().expect("epoch D");
+
+        let hook_a = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_a)));
+        reconnect_with_snapshot(
+            &broker,
+            "server-0",
+            "server-a",
+            epoch_a,
+            'a',
+            &[("native.herdr.agent:list", "A compatibility state")],
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), hook_a.entered.notified())
+            .await
+            .expect("runtime A rebuild reaches its barrier");
+
+        let hook_d = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_d)));
+        reconnect_with_snapshot(
+            &broker,
+            "server-a",
+            "server-b",
+            epoch_b,
+            'b',
+            &[("native.herdr.workspace:list", "B compatibility state")],
+        )
+        .await;
+        reconnect_with_snapshot(
+            &broker,
+            "server-b",
+            "server-c",
+            epoch_c,
+            'c',
+            &[
+                ("native.herdr.agent:list", "C compatibility state"),
+                ("native.herdr.workspace:list", "C compatibility state"),
+            ],
+        )
+        .await;
+        reconnect_with_snapshot(&broker, "server-c", "server-d", epoch_d, 'd', &[]).await;
+        let (_pending_session, pending, _pending_events) =
+            attach_native_fixture(&broker, "pane-burst-pending").await;
+        assert!(attached_binding(&pending, "agents").state.blocked);
+        assert!(attached_binding(&pending, "workspaces").state.blocked);
+
+        hook_a.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook_a.completed.notified())
+            .await
+            .expect("superseded runtime A completes");
+        tokio::time::timeout(Duration::from_secs(1), hook_d.entered.notified())
+            .await
+            .expect("latest runtime rebuild reaches its barrier");
+        broker.set_compatibility_commit_hook(None);
+        hook_d.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook_d.completed.notified())
+            .await
+            .expect("latest runtime compatibility completes within the bound");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let published = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_schema_a_availability(&published, bindings);
+        let (session, latest, _latest_events) =
+            attach_native_fixture(&broker, "pane-burst-latest").await;
+        let agent = attached_binding(&latest, "agents");
+        assert!(!agent.state.blocked);
+        assert!(!attached_binding(&latest, "workspaces").state.blocked);
+        let result = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session,
+                    generation: latest.menu.generation,
+                    binding: agent.id,
+                }),
+                mpsc::channel(1).0,
+            )
+            .await
+            .expect("latest runtime permits its compatible action");
+        assert!(matches!(
+            result,
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn compatibility_reload_burst_keeps_pinned_generation_until_detach() {
+        let (_directory, _path, _adapter, broker) = native_compatibility_reload_fixture().await;
+        let (pinned_session, pinned, _pinned_events) =
+            attach_native_fixture(&broker, "pane-pinned-generation").await;
+        let pinned_agent = attached_binding(&pinned, "agents");
+        let hook_initial = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_initial)));
+        reconnect_with_snapshot(
+            &broker,
+            "server-0",
+            "server-a",
+            HostContinuityEpoch::initial(),
+            'a',
+            &[],
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), hook_initial.entered.notified())
+            .await
+            .expect("initial generation rebuild reaches its barrier");
+
+        let mut generation = pinned.menu.generation;
+        for _ in 0..16 {
+            generation = broker.reload().await.expect("reload advances generation").0;
+        }
+        assert_eq!(generation, 17);
+        let (latest_session, latest, mut latest_events) =
+            attach_native_fixture(&broker, "pane-latest-generation").await;
+        assert_eq!(latest.menu.generation, generation);
+        assert!(attached_binding(&latest, "agents").state.blocked);
+        assert!(matches!(
+            broker
+                .handle(
+                    PeerRole::Ui,
+                    ClientRequest::InvokeBinding(InvokeBinding {
+                        session: pinned_session.clone(),
+                        generation: pinned.menu.generation,
+                        binding: pinned_agent.id,
+                    }),
+                    mpsc::channel(1).0,
+                )
+                .await,
+            Err(BrokerError::NativeCompatibility(_))
+        ));
+
+        broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::DetachUi(muxe_protocol::DetachUi {
+                    session: pinned_session.clone(),
+                }),
+                mpsc::channel(1).0,
+            )
+            .await
+            .expect("pinned session detaches");
+        assert_detached_session_rejects_invocation(
+            &broker,
+            pinned_session,
+            pinned.menu.generation,
+            pinned_agent.id,
+        )
+        .await;
+
+        let hook_latest = Arc::new(WaitHook::new());
+        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_latest)));
+        hook_initial.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook_initial.completed.notified())
+            .await
+            .expect("detached generation work completes");
+        tokio::time::timeout(Duration::from_secs(1), hook_latest.entered.notified())
+            .await
+            .expect("latest generation rebuild completes within the bound");
+        broker.set_compatibility_commit_hook(None);
+        hook_latest.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook_latest.completed.notified())
+            .await
+            .expect("latest generation compatibility publishes within the bound");
+
+        assert_schema_a_availability(
+            &std::iter::from_fn(|| latest_events.try_recv().ok()).collect::<Vec<_>>(),
+            [
+                attached_binding(&latest, "agents").id,
+                attached_binding(&latest, "workspaces").id,
+            ],
+        );
+        let agent = attached_binding(&latest, "agents");
+        let result = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(InvokeBinding {
+                    session: latest_session,
+                    generation: latest.menu.generation,
+                    binding: agent.id,
+                }),
+                mpsc::channel(1).0,
+            )
+            .await
+            .expect("latest pinned UI can invoke its compatible action");
+        assert!(matches!(
+            result,
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted { .. })
+        ));
     }
 
     #[tokio::test]
@@ -10879,14 +10829,7 @@ menus:
         for label in ["agents", "workspaces", "server"] {
             let binding = attached_binding(&pending, label);
             assert!(binding.state.blocked);
-            assert_eq!(
-                binding
-                    .diagnostic
-                    .as_ref()
-                    .expect("pending compatibility diagnostic")
-                    .message,
-                COMPATIBILITY_PENDING_DIAGNOSTIC
-            );
+            assert!(binding.diagnostic.is_some());
         }
 
         let epoch_b = epoch_a.successor().expect("newer continuity epoch");
@@ -10898,7 +10841,7 @@ menus:
             .handle_health_event(AdapterHealthEvent::Reconnected {
                 previous: compatibility_identity("server-a"),
                 current: compatibility_identity("server-b"),
-                compatibility: snapshot_b.clone(),
+                compatibility: snapshot_b,
             })
             .await;
         hook_reconnect.entered.notified().await;
@@ -10906,19 +10849,11 @@ menus:
         hook_reconnect.release.notify_one();
         hook_reconnect.completed.notified().await;
 
-        let state = broker.compatibility.state.lock().await;
-        let generation = state
-            .generations
-            .get(&CompiledGeneration(2))
-            .expect("reloaded generation remains active");
-        assert_eq!(generation.runtime, *snapshot_b.identity());
-        assert_eq!(generation.bindings.len(), 3);
-        assert!(
-            generation
-                .bindings
-                .values()
-                .all(|compatibility| *compatibility == BindingCompatibility::Enabled)
-        );
+        let (_session, reconnected, _events) =
+            attach_native_fixture(&broker, "pane-reconnected").await;
+        for label in ["agents", "workspaces", "server"] {
+            assert!(!attached_binding(&reconnected, label).state.blocked);
+        }
     }
 
     fn recorded_pane_exchange(pane: &'static str) -> crate::recorded_socket::RecordedExchange {
@@ -11009,44 +10944,14 @@ menus:
             PathBuf::from("<recorded-herdr-broker-dispatch>"),
             config,
         );
-        let (events, _events_rx) = mpsc::channel(16);
-        let attached = broker
-            .handle(
-                PeerRole::Ui,
-                ClientRequest::AttachUi(AttachUi {
-                    root: muxe_protocol::MenuId::named("main"),
-                    pane: HostPaneId::new("pane-ui"),
-                    pending_launch: None,
-                    origin: Some(muxe_protocol::UiOriginBootstrap {
-                        workspace: muxe_protocol::WorkspaceId::new("workspace-1"),
-                        tab: HostTabId::new("tab-1"),
-                        pane: HostPaneId::new("pane-origin"),
-                        cwd: Some("/saved/origin".to_owned()),
-                    }),
-                    caller_identity: Some(muxe_protocol::UiCallerIdentityWire {
-                        workspace: muxe_protocol::WorkspaceId::new("workspace-1"),
-                        tab: HostTabId::new("tab-1"),
-                        pane: HostPaneId::new("pane-ui"),
-                        cwd: "/ui/caller".to_owned(),
-                    }),
-                    theme: None,
-                    color_scheme: None,
-                }),
-                events.clone(),
-            )
-            .await
-            .expect("recorded UI attaches");
-        let RequestResult::Immediate(BrokerResponse::UiAttached { session, snapshot }) = attached
-        else {
-            panic!("recorded UI attachment is immediate")
-        };
+        let (session, snapshot, _events_rx) = attach_recorded_herdr_fixture(&broker).await;
         let binding = attached_binding(&snapshot, "agents");
         assert!(
             !binding.state.blocked,
             "native binding is Enabled for runtime A"
         );
-
         let binding = binding.id;
+
         std::fs::remove_file(&endpoint).expect("remove runtime A endpoint alias");
         std::os::unix::fs::symlink(replacement.socket(), &endpoint)
             .expect("endpoint now selects runtime B");
@@ -11058,7 +10963,7 @@ menus:
                     generation: snapshot.menu.generation,
                     binding,
                 }),
-                events,
+                mpsc::channel(1).0,
             )
             .await;
         assert!(
@@ -11160,6 +11065,31 @@ menus:
         schema
     }
 
+    fn assert_workspace_schema_b_events(events: &[WireMessage], workspace: BindingId) {
+        assert!(events.iter().any(|message| matches!(
+            message,
+            WireMessage::Event {
+                event: BrokerEvent::BindingAvailabilityChanged {
+                    binding,
+                    availability: BindingAvailability::Blocked,
+                    diagnostic: Some(_),
+                    ..
+                },
+                ..
+            } if *binding == workspace
+        )));
+        assert!(!events.iter().any(|message| matches!(
+            message,
+            WireMessage::Event {
+                event: BrokerEvent::BindingAvailabilityChanged {
+                    availability: BindingAvailability::Enabled,
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
     #[tokio::test]
     async fn recorded_herdr_reconnect_publishes_only_latest_compatibility() {
         let mut script = crate::production_connect::ProductionConnectFixture::initial_handshake();
@@ -11182,25 +11112,6 @@ menus:
         let broker = Broker::load(adapter.clone(), &config_path)
             .await
             .expect("recorded broker config loads");
-        let runtime_a = {
-            let state = broker.compatibility.state.lock().await;
-            let initial = state
-                .generations
-                .get(&CompiledGeneration(1))
-                .expect("runtime A validates generation N");
-            assert!(
-                initial
-                    .bindings
-                    .values()
-                    .all(|compatibility| { *compatibility == BindingCompatibility::Enabled })
-            );
-            state
-                .current
-                .as_ref()
-                .expect("runtime A compatibility")
-                .identity()
-                .clone()
-        };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let monitor = tokio::spawn(Arc::clone(&broker).monitor(shutdown_rx));
 
@@ -11212,6 +11123,7 @@ menus:
         );
         hook_a.entered.notified().await;
         let (_session, pending, mut events) = attach_recorded_herdr_fixture(&broker).await;
+        let workspace_id = attached_binding(&pending, "workspaces").id;
         assert!(attached_binding(&pending, "workspaces").state.blocked);
 
         let hook_b = Arc::new(WaitHook::new());
@@ -11223,22 +11135,6 @@ menus:
         wait_for_health_event(&mut events, false).await;
         wait_for_health_event(&mut events, true).await;
         while events.try_recv().is_ok() {}
-        let runtime_b = broker
-            .compatibility
-            .state
-            .lock()
-            .await
-            .current
-            .as_ref()
-            .expect("runtime B compatibility from the real event stream")
-            .identity()
-            .clone();
-        assert_ne!(
-            runtime_a.schema(),
-            runtime_b.schema(),
-            "the recorded reconnect installs schema B, not only a newer continuity epoch"
-        );
-        assert_ne!(runtime_a, runtime_b);
 
         hook_a.release.notify_one();
         hook_a.completed.notified().await;
@@ -11248,53 +11144,7 @@ menus:
         hook_b.completed.notified().await;
 
         let published = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            published.iter().any(|message| matches!(
-                message,
-                WireMessage::Event {
-                    event: BrokerEvent::BindingAvailabilityChanged {
-                        availability: BindingAvailability::Blocked,
-                        ..
-                    },
-                    ..
-                }
-            )),
-            "runtime B publishes its blocked workspace compatibility"
-        );
-        assert!(
-            published.iter().all(|message| !matches!(
-                message,
-                WireMessage::Event {
-                    event: BrokerEvent::BindingAvailabilityChanged {
-                        availability: BindingAvailability::Enabled,
-                        ..
-                    },
-                    ..
-                }
-            )),
-            "paused runtime A never publishes after runtime B is installed"
-        );
-        let state = broker.compatibility.state.lock().await;
-        let generation = state
-            .generations
-            .get(&CompiledGeneration(2))
-            .expect("generation N+1 remains active");
-        assert_eq!(generation.runtime, runtime_b);
-        assert!(
-            generation
-                .bindings
-                .values()
-                .any(|compatibility| { matches!(compatibility, BindingCompatibility::Blocked(_)) }),
-            "schema B compatibility state: {:?}",
-            generation.bindings
-        );
-        assert!(
-            generation
-                .bindings
-                .values()
-                .all(|compatibility| { !matches!(compatibility, BindingCompatibility::Pending) })
-        );
-        drop(state);
+        assert_workspace_schema_b_events(&published, workspace_id);
 
         let _ = shutdown_tx.send(true);
         monitor.await.expect("broker monitor joins");
@@ -11341,7 +11191,6 @@ menus:
         monitor
             .await
             .expect("real HostLost stops the broker monitor");
-        assert!(broker.compatibility.state.lock().await.retired);
         while events.try_recv().is_ok() {}
 
         broker.set_compatibility_commit_hook(None);
@@ -11352,196 +11201,10 @@ menus:
             events.try_recv().is_err(),
             "no healthy or compatibility delta is published after HostLost"
         );
-        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
         broker
             .shutdown_host_adapter()
             .await
             .expect("terminally lost adapter shuts down");
-    }
-    #[tokio::test]
-    async fn compatibility_reconnect_burst_coalesces_to_latest_runtime() {
-        let (_adapter, broker) = native_compatibility_fixture();
-        let (_session, _initial, _events) =
-            attach_native_fixture(&broker, "pane-reconnect-burst").await;
-        let epoch_a = HostContinuityEpoch::initial();
-        let epoch_b = epoch_a.successor().expect("second epoch");
-        let epoch_c = epoch_b.successor().expect("third epoch");
-        let epoch_d = epoch_c.successor().expect("fourth epoch");
-        let hook_a = Arc::new(WaitHook::new());
-        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_a)));
-        broker
-            .handle_health_event(AdapterHealthEvent::Reconnected {
-                previous: compatibility_identity("server-0"),
-                current: compatibility_identity("server-a"),
-                compatibility: compatibility_snapshot(
-                    epoch_a,
-                    'a',
-                    &[],
-                    Arc::new(AtomicUsize::new(0)),
-                ),
-            })
-            .await;
-        hook_a.entered.notified().await;
-
-        let hook_latest = Arc::new(WaitHook::new());
-        broker.set_compatibility_commit_hook(Some(Arc::clone(&hook_latest)));
-        let snapshot_d = compatibility_snapshot(
-            epoch_d,
-            'd',
-            &[("native.herdr.workspace:list", "latest runtime rejection")],
-            Arc::new(AtomicUsize::new(0)),
-        );
-        for (previous, current, snapshot) in [
-            (
-                "server-a",
-                "server-b",
-                compatibility_snapshot(epoch_b, 'b', &[], Arc::new(AtomicUsize::new(0))),
-            ),
-            (
-                "server-b",
-                "server-c",
-                compatibility_snapshot(epoch_c, 'c', &[], Arc::new(AtomicUsize::new(0))),
-            ),
-            ("server-c", "server-d", snapshot_d.clone()),
-        ] {
-            broker
-                .handle_health_event(AdapterHealthEvent::Reconnected {
-                    previous: compatibility_identity(previous),
-                    current: compatibility_identity(current),
-                    compatibility: snapshot,
-                })
-                .await;
-        }
-        assert_eq!(
-            broker.compatibility_rebuilds.counts(),
-            (1, 1),
-            "a reconnect burst retains one active rebuild and one coalesced latest desire"
-        );
-
-        hook_a.release.notify_one();
-        hook_a.completed.notified().await;
-        hook_latest.entered.notified().await;
-        broker.set_compatibility_commit_hook(None);
-        hook_latest.release.notify_one();
-        hook_latest.completed.notified().await;
-
-        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
-        let state = broker.compatibility.state.lock().await;
-        assert_eq!(
-            state
-                .current
-                .as_ref()
-                .map(NativeCompatibilitySnapshot::identity),
-            Some(snapshot_d.identity())
-        );
-        let generation = state
-            .generations
-            .get(&CompiledGeneration(1))
-            .expect("active generation has latest compatibility");
-        assert_eq!(generation.runtime, *snapshot_d.identity());
-        assert!(generation.bindings.values().any(|compatibility| {
-            matches!(
-                compatibility,
-                BindingCompatibility::Blocked(diagnostics)
-                    if diagnostics.iter().any(|diagnostic| {
-                        diagnostic.message == "latest runtime rejection"
-                    })
-            )
-        }));
-    }
-
-    #[tokio::test]
-    async fn compatibility_reload_and_detach_prune_obsolete_desires() {
-        let directory = tempfile::TempDir::new().expect("temp config directory");
-        let path = directory.path().join("config.yml");
-        std::fs::write(
-            &path,
-            r"
-version: 1
-menus:
-  main:
-    bindings:
-      a:
-        label: agents
-        action: native.herdr.agent:list
-      w:
-        label: workspaces
-        action: native.herdr.workspace:list
-",
-        )
-        .expect("initial config");
-        let adapter = counting_adapter(false);
-        let broker = Broker::load(adapter, &path)
-            .await
-            .expect("initial broker config");
-        let initial_hook = Arc::new(WaitHook::new());
-        broker.set_compatibility_commit_hook(Some(Arc::clone(&initial_hook)));
-        broker
-            .handle_health_event(AdapterHealthEvent::Reconnected {
-                previous: compatibility_identity("server-0"),
-                current: compatibility_identity("server-a"),
-                compatibility: compatibility_snapshot(
-                    HostContinuityEpoch::initial(),
-                    'a',
-                    &[],
-                    Arc::new(AtomicUsize::new(0)),
-                ),
-            })
-            .await;
-        initial_hook.entered.notified().await;
-        broker.set_compatibility_commit_hook(None);
-        initial_hook.release.notify_one();
-        initial_hook.completed.notified().await;
-        let (pinned_session, _initial, _events) =
-            attach_native_fixture(&broker, "pane-pinned-generation").await;
-
-        let first_hook = Arc::new(WaitHook::new());
-        broker.set_compatibility_commit_hook(Some(Arc::clone(&first_hook)));
-        assert_eq!(
-            broker.reload().await.expect("first reload"),
-            CompiledGeneration(2)
-        );
-        first_hook.entered.notified().await;
-        for expected in 3..=18 {
-            assert_eq!(
-                broker.reload().await.expect("burst reload"),
-                CompiledGeneration(expected)
-            );
-            assert!(
-                broker.compatibility_rebuilds.counts().1 <= 1,
-                "obsolete reload desires are pruned eagerly"
-            );
-            assert!(
-                broker.compatibility.state.lock().await.generations.len() <= 2,
-                "only the pinned and current generations remain compatible"
-            );
-        }
-        assert_eq!(broker.compatibility_rebuilds.counts(), (1, 1));
-
-        broker
-            .detach(&pinned_session, CaptureReleaseReason::UiDismissed)
-            .await
-            .expect("detach pinned generation");
-        assert_eq!(
-            broker.compatibility.state.lock().await.generations.len(),
-            1,
-            "detaching the last pinned session prunes its compatibility state"
-        );
-
-        let latest_hook = Arc::new(WaitHook::new());
-        broker.set_compatibility_commit_hook(Some(Arc::clone(&latest_hook)));
-        first_hook.release.notify_one();
-        first_hook.completed.notified().await;
-        latest_hook.entered.notified().await;
-        broker.set_compatibility_commit_hook(None);
-        latest_hook.release.notify_one();
-        latest_hook.completed.notified().await;
-        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
-        let state = broker.compatibility.state.lock().await;
-        assert_eq!(
-            state.generations.keys().copied().collect::<Vec<_>>(),
-            vec![CompiledGeneration(18)]
-        );
     }
 
     #[tokio::test]
@@ -11579,7 +11242,6 @@ menus:
             .await
             .expect("shutdown task joins")
             .expect("adapter shuts down");
-        assert_eq!(broker.compatibility_rebuilds.counts(), (0, 0));
     }
 }
 

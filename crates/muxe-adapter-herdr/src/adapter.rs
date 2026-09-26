@@ -1310,7 +1310,7 @@ impl HerdrAdapter {
         }
         let queued = self.post_dismissal.lock().await.remove(&pane);
         if let Some(queued) = queued {
-            self.start_post_dismissals(queued).await;
+            self.start_post_dismissals(queued);
         }
         Ok(self.post_dismissal_accepted(execution))
     }
@@ -1324,11 +1324,11 @@ impl HerdrAdapter {
         };
         let queued = self.post_dismissal.lock().await.remove(pane);
         if let Some(queued) = queued {
-            self.start_post_dismissals(queued).await;
+            self.start_post_dismissals(queued);
         }
     }
 
-    async fn start_post_dismissals(&self, queued: Vec<PostDismissalPortableDispatchRequest>) {
+    fn start_post_dismissals(&self, queued: Vec<PostDismissalPortableDispatchRequest>) {
         for request in queued {
             let execution = request.execution;
             if let Err(error) = self.start_post_dismissal(&request) {

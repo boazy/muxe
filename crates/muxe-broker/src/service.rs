@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{Broker, BrokerError, RequestResult, RuntimeEndpoint, RuntimeError, StartupLock};
+use crate::{
+    Broker, BrokerError, PendingAttachment, RequestResult, RuntimeEndpoint, RuntimeError,
+    StartupLock,
+};
 use muxe_adapter_api::AdapterErrorKind;
 use muxe_protocol::{
     ArchivedFrame, BrokerResponse, ClientRequest, ConnectionDecoder, ConnectionPolicy, DecodeError,
@@ -1628,7 +1631,7 @@ async fn retire_for_host_loss(
 async fn await_supervised_drain(broker: &Arc<Broker>, shutdown: &mut watch::Receiver<bool>) {
     // DES commit path: the old broker exits only after its remaining detached
     // children are reaped. Shutdown still interrupts the wait.
-    while broker.has_supervised_children().await {
+    while broker.has_supervised_children() {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -2106,6 +2109,98 @@ async fn process_frames(
     Ok(())
 }
 
+fn serve_pending_attachment(
+    broker: &Arc<Broker>,
+    outbox: &mpsc::Sender<WireMessage>,
+    resources: &mut ConnectionResources,
+    tracking: &ClientRequest,
+    request_id: RequestId,
+    pending: Box<PendingAttachment>,
+) -> Result<(), ServerError> {
+    let pending_token = pending.token();
+    let attachment = resources
+        .record_pending_attachment(tracking, pending.session().clone())
+        .map_err(|_| ServerError::UnexpectedMessage)?;
+    let outbox = outbox.clone();
+    let broker = Arc::clone(broker);
+    #[cfg(test)]
+    let publication_hook = resources.publication_hook.clone();
+    resources.waiter = Some(tokio::spawn(async move {
+        // Centralize the pending-result transition on the shared
+        // attachment phase: the waiter owns Pending→Attached/Closed,
+        // disconnect owns *→Closed, and both are atomic under the
+        // attachment mutex. A commit that publishes the session before
+        // disconnect runs still converges through `disconnect_gated`,
+        // which classifies pending-vs-attached under the broker lock.
+        let response = (*pending).wait().await;
+        // A gated waiter always answers its connection: success
+        // publishes UiAttached, while any other readiness outcome
+        // (abort, expiry, detach) still delivers its Error frame so
+        // the connection never hangs in `request_frame`. Only the
+        // success path transitions Pending->Attached and confirms
+        // the gated attachment; disconnect wins by taking the phase
+        // first, in which case this waiter owns nothing and sends
+        // nothing.
+        let (published_session, send_response) = {
+            let mut attachment = attachment
+                .lock()
+                .expect("connection attachment is not poisoned");
+            // Only the waiter that still observes Pending transitions
+            // the phase. When disconnect already took Closed, this
+            // waiter owns nothing and must not enqueue a stale
+            // UiAttached for a session it no longer owns.
+            if let UiAttachment::Pending { session, .. } = &*attachment {
+                let session = session.clone();
+                if let BrokerResponse::UiAttached { .. } = &response {
+                    *attachment = UiAttachment::Attached {
+                        session: session.clone(),
+                    };
+                    (Some(session), true)
+                } else {
+                    *attachment = UiAttachment::Closed;
+                    (None, true)
+                }
+            } else {
+                (None, false)
+            }
+        };
+        if !send_response {
+            return;
+        }
+        if let Some(session) = published_session {
+            #[cfg(test)]
+            if let Some(hook) = publication_hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+            }
+            if outbox
+                .send(WireMessage::Response {
+                    request_id,
+                    response,
+                })
+                .await
+                .is_ok()
+            {
+                broker
+                    .confirm_gated_attachment(pending_token, &session)
+                    .await;
+            }
+        } else if outbox
+            .send(WireMessage::Response {
+                request_id,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            // The connection is gone; the phase is already Closed and
+            // the gated token's cleanup already ran when readiness
+            // failed, so there is nothing left to confirm.
+        }
+    }));
+    Ok(())
+}
+
 /// Serves one validated client request frame: handshake gate, attachment gate,
 /// ownership check, broker dispatch, and the immediate or pending response.
 async fn serve_request_frame(
@@ -2170,87 +2265,7 @@ async fn serve_request_frame(
             }
         }
         Ok(RequestResult::WaitForAttachment(pending)) => {
-            let pending_token = pending.token();
-            let attachment = resources
-                .record_pending_attachment(&tracking, pending.session().clone())
-                .map_err(|_| ServerError::UnexpectedMessage)?;
-            let outbox = outbox.clone();
-            let broker = Arc::clone(broker);
-            #[cfg(test)]
-            let publication_hook = resources.publication_hook.clone();
-            resources.waiter = Some(tokio::spawn(async move {
-                // Centralize the pending-result transition on the shared
-                // attachment phase: the waiter owns Pending→Attached/Closed,
-                // disconnect owns *→Closed, and both are atomic under the
-                // attachment mutex. A commit that publishes the session before
-                // disconnect runs still converges through `disconnect_gated`,
-                // which classifies pending-vs-attached under the broker lock.
-                let response = (*pending).wait().await;
-                // A gated waiter always answers its connection: success
-                // publishes UiAttached, while any other readiness outcome
-                // (abort, expiry, detach) still delivers its Error frame so
-                // the connection never hangs in `request_frame`. Only the
-                // success path transitions Pending->Attached and confirms
-                // the gated attachment; disconnect wins by taking the phase
-                // first, in which case this waiter owns nothing and sends
-                // nothing.
-                let (published_session, send_response) = {
-                    let mut attachment = attachment
-                        .lock()
-                        .expect("connection attachment is not poisoned");
-                    // Only the waiter that still observes Pending transitions
-                    // the phase. When disconnect already took Closed, this
-                    // waiter owns nothing and must not enqueue a stale
-                    // UiAttached for a session it no longer owns.
-                    if let UiAttachment::Pending { session, .. } = &*attachment {
-                        let session = session.clone();
-                        if let BrokerResponse::UiAttached { .. } = &response {
-                            *attachment = UiAttachment::Attached {
-                                session: session.clone(),
-                            };
-                            (Some(session), true)
-                        } else {
-                            *attachment = UiAttachment::Closed;
-                            (None, true)
-                        }
-                    } else {
-                        (None, false)
-                    }
-                };
-                if !send_response {
-                    return;
-                }
-                if let Some(session) = published_session {
-                    #[cfg(test)]
-                    if let Some(hook) = publication_hook {
-                        hook.entered.notify_one();
-                        hook.release.notified().await;
-                    }
-                    if outbox
-                        .send(WireMessage::Response {
-                            request_id,
-                            response,
-                        })
-                        .await
-                        .is_ok()
-                    {
-                        broker
-                            .confirm_gated_attachment(pending_token, &session)
-                            .await;
-                    }
-                } else if outbox
-                    .send(WireMessage::Response {
-                        request_id,
-                        response,
-                    })
-                    .await
-                    .is_err()
-                {
-                    // The connection is gone; the phase is already Closed and
-                    // the gated token's cleanup already ran when readiness
-                    // failed, so there is nothing left to confirm.
-                }
-            }));
+            serve_pending_attachment(broker, outbox, resources, &tracking, request_id, pending)?;
         }
 
         Err(error) => {
@@ -3564,50 +3579,35 @@ mod tests {
         .expect("recursive watcher publishes a new immutable generation");
     }
 
-    #[tokio::test]
-    async fn unix_server_rejects_retired_identity_and_accepts_status_identity() {
-        let (directory, _runtime, broker, endpoint, shutdown_tx, server_task) =
-            running_unix_server().await;
-        let config_path = directory.path().join("config.yml");
-        let controller = ActivationController::start(
-            &broker,
-            ActivationBootstrap::Running {
-                current: test_record(),
-                bridge_unit: None,
-            },
-        )
-        .await
-        .expect("running controller captures broker identity");
-        let (result, _) = controller.handle(&broker, ControlOperation::Status).await;
-        let ControlResult::Status(status) = result else {
-            panic!("running broker reports status, got {result:?}");
-        };
-        let client_identity = status.live_server;
-        let retired_incarnation = LiveServerIdentity {
-            host: HostKind::Herdr,
-            discovery_key: client_identity.discovery_key.clone(),
+    async fn assert_retired_incarnation_rejected(
+        endpoint: &RuntimeEndpoint,
+        current: &LiveServerIdentity,
+    ) {
+        let retired = LiveServerIdentity {
+            host: current.host,
+            discovery_key: current.discovery_key.clone(),
             server_id: WireServerId::new("retired-incarnation"),
         };
-        let rejected = match BrokerClient::connect(
-            endpoint.socket(),
-            PeerRole::Ui,
-            "owned-stale-ui",
-            retired_incarnation,
-        )
-        .await
-        {
-            Ok(_) => panic!("same discovery key with a retired incarnation must be rejected"),
-            Err(error) => error,
+        let Err(error) =
+            BrokerClient::connect(endpoint.socket(), PeerRole::Ui, "owned-stale-ui", retired).await
+        else {
+            panic!("same discovery key with a retired incarnation must be rejected");
         };
         assert!(matches!(
-            rejected,
+            error,
             ClientError::ConnectionClosed | ClientError::IdentityMismatch
         ));
+    }
+
+    async fn attach_ui_and_reject_cross_session_detach(
+        endpoint: &RuntimeEndpoint,
+        identity: LiveServerIdentity,
+    ) -> (BrokerClient, UiSessionId) {
         let mut client = BrokerClient::connect(
             endpoint.socket(),
             PeerRole::Ui,
             "owned-smoke-ui",
-            client_identity.clone(),
+            identity.clone(),
         )
         .await
         .expect("connect over the owned broker socket");
@@ -3630,7 +3630,7 @@ mod tests {
             endpoint.socket(),
             PeerRole::Ui,
             "owned-intruder-ui",
-            client_identity.clone(),
+            identity,
         )
         .await
         .expect("connect second owned UI peer");
@@ -3654,6 +3654,31 @@ mod tests {
             BrokerResponse::Acknowledged
         ));
         drop(intruder);
+        (client, session)
+    }
+
+    #[tokio::test]
+    async fn unix_server_rejects_retired_identity_and_accepts_status_identity() {
+        let (directory, _runtime, broker, endpoint, shutdown_tx, server_task) =
+            running_unix_server().await;
+        let config_path = directory.path().join("config.yml");
+        let controller = ActivationController::start(
+            &broker,
+            ActivationBootstrap::Running {
+                current: test_record(),
+                bridge_unit: None,
+            },
+        )
+        .await
+        .expect("running controller captures broker identity");
+        let (result, _) = controller.handle(&broker, ControlOperation::Status).await;
+        let ControlResult::Status(status) = result else {
+            panic!("running broker reports status, got {result:?}");
+        };
+        let client_identity = status.live_server;
+        assert_retired_incarnation_rejected(&endpoint, &client_identity).await;
+        let (mut client, session) =
+            attach_ui_and_reject_cross_session_detach(&endpoint, client_identity).await;
 
         malformed_peer_is_closed(&endpoint).await;
         assert!(matches!(
@@ -5135,6 +5160,32 @@ mod tests {
         })
     }
 
+    async fn assert_recorded_prepared_status(
+        control: &mut ProductionControl,
+        live_before: &LiveServerIdentity,
+        live_streams: &Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let prepared = match control
+            .round_trip(ControlOperation::Status)
+            .await
+            .expect("status round trip")
+        {
+            ControlResult::Status(status) => status,
+            result => panic!("status must report, got {result:?}"),
+        };
+        assert_eq!(
+            &prepared.live_server, live_before,
+            "suspended adapter still reports the retained identity"
+        );
+        await_stream_count(
+            live_streams,
+            0,
+            Duration::from_secs(5),
+            "suspend releases the retained stream before any target connects",
+        )
+        .await;
+    }
+
     /// Recorded-host production round trip: a real Herdr adapter against a scripted
     /// socket plus schema child, a real broker listener, and real control framing
     /// prove Prepare/Status/Abort/Commit with retained identity through suspend.
@@ -5202,25 +5253,7 @@ mod tests {
             .await
             .expect("coordinator connects");
         let handoff = prepare_draining(&mut control, "prepare").await;
-        let prepared = match control
-            .round_trip(ControlOperation::Status)
-            .await
-            .expect("status round trip")
-        {
-            ControlResult::Status(status) => status,
-            result => panic!("status must report, got {result:?}"),
-        };
-        assert_eq!(
-            prepared.live_server, live_before,
-            "suspended adapter still reports the retained identity"
-        );
-        await_stream_count(
-            &live_streams,
-            0,
-            Duration::from_secs(5),
-            "suspend releases the retained stream before any target connects",
-        )
-        .await;
+        assert_recorded_prepared_status(&mut control, &live_before, &live_streams).await;
         abort_and_assert_running(&mut control, handoff).await;
         await_stream_count(
             &live_streams,
@@ -5308,6 +5341,68 @@ mod tests {
         .expect(what);
     }
 
+    async fn assert_target_commit_authority(
+        controller: &Arc<ActivationController>,
+        broker: &Arc<Broker>,
+    ) {
+        // A handoff without owner proof cannot authorize target Commit.
+        let (result, stop) = controller
+            .handle(
+                broker,
+                ControlOperation::Commit {
+                    handoff_id: HandoffId([7; 16]),
+                },
+            )
+            .await;
+        assert!(!stop);
+        assert!(matches!(result, ControlResult::Error { .. }));
+        assert!(!controller.allows_ui().await);
+        controller.set_recovery(absent_recovery()).await;
+        let (result, _) = controller
+            .handle(
+                broker,
+                ControlOperation::Commit {
+                    handoff_id: HandoffId([7; 16]),
+                },
+            )
+            .await;
+        assert!(matches!(result, ControlResult::Error { .. }));
+        assert!(!controller.allows_ui().await);
+        controller
+            .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
+                RecoveryView {
+                    journal: RecoveryJournalStatus::Present,
+                    member: RecoveryMemberStatus::Ready,
+                    target_live: true,
+                    recover_after: Duration::ZERO,
+                },
+            ))))
+            .await;
+        let (result, stop) = controller
+            .handle(
+                broker,
+                ControlOperation::Commit {
+                    handoff_id: HandoffId([7; 16]),
+                },
+            )
+            .await;
+        assert!(!stop, "target commit never stops its own service");
+        assert!(matches!(result, ControlResult::Committed(_)));
+        assert!(controller.allows_ui().await);
+        let (again, _) = controller
+            .handle(
+                broker,
+                ControlOperation::Commit {
+                    handoff_id: HandoffId([7; 16]),
+                },
+            )
+            .await;
+        assert!(
+            matches!(again, ControlResult::Committed(_)),
+            "the original may replay Commit"
+        );
+    }
+
     /// A fresh gated target reports no readiness until its adapter completes a
     /// real census round: the broker exposes gated control (status works, UI
     /// refused) without waiting for evidence, serves evidence verbatim once the
@@ -5382,63 +5477,7 @@ mod tests {
                 .is_err(),
             "target role cannot use old retirement"
         );
-        // A handoff alone is no longer a Commit permit. Missing owner proof
-        // leaves the target gated, even if it had reported a prior census.
-        let (result, stop) = controller
-            .handle(
-                &broker,
-                ControlOperation::Commit {
-                    handoff_id: HandoffId([7; 16]),
-                },
-            )
-            .await;
-        assert!(!stop);
-        assert!(matches!(result, ControlResult::Error { .. }));
-        assert!(!controller.allows_ui().await);
-        controller.set_recovery(absent_recovery()).await;
-        let (result, _) = controller
-            .handle(
-                &broker,
-                ControlOperation::Commit {
-                    handoff_id: HandoffId([7; 16]),
-                },
-            )
-            .await;
-        assert!(matches!(result, ControlResult::Error { .. }));
-        assert!(!controller.allows_ui().await);
-        controller
-            .set_recovery(Arc::new(ScriptedRecovery(std::sync::Mutex::new(
-                RecoveryView {
-                    journal: RecoveryJournalStatus::Present,
-                    member: RecoveryMemberStatus::Ready,
-                    target_live: true,
-                    recover_after: Duration::ZERO,
-                },
-            ))))
-            .await;
-        let (result, stop) = controller
-            .handle(
-                &broker,
-                ControlOperation::Commit {
-                    handoff_id: HandoffId([7; 16]),
-                },
-            )
-            .await;
-        assert!(!stop, "target commit never stops its own service");
-        assert!(matches!(result, ControlResult::Committed(_)));
-        assert!(controller.allows_ui().await);
-        let (again, _) = controller
-            .handle(
-                &broker,
-                ControlOperation::Commit {
-                    handoff_id: HandoffId([7; 16]),
-                },
-            )
-            .await;
-        assert!(
-            matches!(again, ControlResult::Committed(_)),
-            "the original may replay Commit"
-        );
+        assert_target_commit_authority(&controller, &broker).await;
     }
 
     /// Stages a lingering `/bin/sh` child (pid file + FIFO announcement) and returns
@@ -5513,25 +5552,6 @@ mod tests {
             .expect("supervisor barrier task joins");
     }
 
-    /// Retire lifetime smoke over a production server: a real detached generic
-    /// child keeps running; the service stays supervisor-only until the
-    /// child exits and is reaped, then terminates. Barriers throughout: FIFO
-    /// readiness, task completion, and liveness probes — no sleep assumptions.
-    #[tokio::test]
-    async fn retire_supervises_detached_child_until_reaped() {
-        assert_detached_child_supervision(RetirementScenario::Explicit).await;
-    }
-
-    #[tokio::test]
-    async fn recovered_old_supervises_detached_child_until_reaped() {
-        assert_detached_child_supervision(RetirementScenario::RecoveredOld).await;
-    }
-
-    #[tokio::test]
-    async fn cancelled_stop_waiter_keeps_detached_child_supervised() {
-        assert_detached_child_supervision(RetirementScenario::CancelledStop).await;
-    }
-
     #[derive(Clone, Copy)]
     enum RetirementScenario {
         Explicit,
@@ -5539,14 +5559,34 @@ mod tests {
         CancelledStop,
     }
 
-    async fn assert_detached_child_supervision(scenario: RetirementScenario) {
-        let staging = tempfile::tempdir().expect("owned child staging directory");
-        let (script, startup, pidfile, exit_fifo) = stage_lingering_child(&staging);
+    struct LingerService {
+        broker: Arc<Broker>,
+        adapter: Arc<SmokeAdapter>,
+        activation: Arc<ActivationController>,
+        endpoint: RuntimeEndpoint,
+        run_task: JoinHandle<Result<(), ServerError>>,
+        _config_directory: tempfile::TempDir,
+        _runtime_directory: tempfile::TempDir,
+        _shutdown_tx: tokio::sync::watch::Sender<bool>,
+    }
 
-        let directory = tempfile::tempdir().expect("owned activation runtime directory");
-        let config_path = directory.path().join("config.yml");
+    struct SupervisedChildFixture {
+        service: LingerService,
+        ui_client: BrokerClient,
+        child: nix::unistd::Pid,
+        exit_fifo: std::path::PathBuf,
+        _staging: tempfile::TempDir,
+    }
+
+    async fn start_linger_service(
+        staging: &tempfile::TempDir,
+        script: &std::path::Path,
+        scenario: RetirementScenario,
+    ) -> LingerService {
+        let config_directory = tempfile::tempdir().expect("owned activation runtime directory");
+        let config_path = config_directory.path().join("config.yml");
         let yaml = format!(
-            r#"
+            r"
 version: 1
 menus:
   main:
@@ -5562,12 +5602,11 @@ menus:
         settings:
           execution:
             mode: detach
-"#,
+",
             script = script.to_string_lossy(),
             cwd = staging.path().to_string_lossy(),
         );
         std::fs::write(&config_path, &yaml).expect("write linger config");
-
         let adapter = Arc::new(SmokeAdapter::new());
         let config = muxe_core::compile_yaml(
             CompiledGeneration(1),
@@ -5578,11 +5617,13 @@ menus:
         )
         .expect("compile linger config");
         let broker = Broker::from_compiled(adapter.clone(), &config_path, config);
-
-        let runtime = tempfile::tempdir().expect("owned runtime directory");
-        let endpoint =
-            RuntimeEndpoint::in_runtime_dir(runtime.path(), HostKind::Herdr, "owned-fake-host")
-                .expect("derive owned endpoint");
+        let runtime_directory = tempfile::tempdir().expect("owned runtime directory");
+        let endpoint = RuntimeEndpoint::in_runtime_dir(
+            runtime_directory.path(),
+            HostKind::Herdr,
+            "owned-fake-host",
+        )
+        .expect("derive owned endpoint");
         let broker_server = BrokerServer::start_activation(
             Arc::clone(&broker),
             endpoint.clone(),
@@ -5605,17 +5646,34 @@ menus:
             .activation
             .clone()
             .expect("activation controller");
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let run_task = tokio::spawn(broker_server.run(shutdown_rx));
+        LingerService {
+            broker,
+            adapter,
+            activation,
+            endpoint,
+            run_task,
+            _config_directory: config_directory,
+            _runtime_directory: runtime_directory,
+            _shutdown_tx: shutdown_tx,
+        }
+    }
 
-        let live_server = broker.live_identity().await.expect("host identity");
+    async fn start_supervised_child_fixture(
+        scenario: RetirementScenario,
+    ) -> SupervisedChildFixture {
+        let staging = tempfile::tempdir().expect("owned child staging directory");
+        let (script, startup, pidfile, exit_fifo) = stage_lingering_child(&staging);
+        let service = start_linger_service(&staging, &script, scenario).await;
+        let live_server = service.broker.live_identity().await.expect("host identity");
         let client_identity = LiveServerIdentity {
             host: HostKind::Herdr,
             discovery_key: "owned-fake-host".to_owned(),
             server_id: WireServerId::new(live_server.server_id.as_str()),
         };
         let mut ui_client = BrokerClient::connect(
-            endpoint.socket(),
+            service.endpoint.socket(),
             PeerRole::Ui,
             "owned-retire-ui",
             client_identity,
@@ -5641,12 +5699,12 @@ menus:
             .menu
             .menus
             .iter()
-            .find(|m| m.id == muxe_protocol::MenuId::named("main"))
-            .and_then(|m| m.bindings.first())
+            .find(|menu| menu.id == muxe_protocol::MenuId::named("main"))
+            .and_then(|menu| menu.bindings.first())
             .expect("linger binding visible");
         let invoked = ui_client
             .request(ClientRequest::InvokeBinding(muxe_protocol::InvokeBinding {
-                session: session.clone(),
+                session,
                 generation: 1,
                 binding: binding.id,
             }))
@@ -5659,33 +5717,86 @@ menus:
                 ..
             }
         ));
-
-        // Barrier: the child wrote its announcement; it is now running.
         let started = startup.await.expect("child signals start");
         assert_eq!(&started, b"started");
-        let pid: i32 = std::fs::read_to_string(&pidfile)
+        let child_pid: i32 = std::fs::read_to_string(&pidfile)
             .expect("child publishes its pid")
             .trim()
             .parse()
             .expect("pid parses");
-        let child = nix::unistd::Pid::from_raw(pid);
+        let child = nix::unistd::Pid::from_raw(child_pid);
         assert!(
             nix::sys::signal::kill(child, None).is_ok(),
             "child alive while running"
         );
+        SupervisedChildFixture {
+            service,
+            ui_client,
+            child,
+            exit_fifo,
+            _staging: staging,
+        }
+    }
 
-        // All three transitions reach the same terminal Stop barrier. The
-        // cancellation case closes its receiver *before* the run loop replies.
+    async fn assert_supervised_child_exits_after_release(fixture: &mut SupervisedChildFixture) {
+        assert!(
+            !fixture.service.run_task.is_finished(),
+            "the service stays supervisor-only while the child runs"
+        );
+        assert!(fixture.service.broker.has_supervised_children());
+        assert!(nix::sys::signal::kill(fixture.child, None).is_ok());
+        {
+            let mut trigger = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fixture.exit_fifo)
+                .expect("open exit trigger fifo");
+            std::io::Write::write_all(&mut trigger, b"exit\n").expect("write exit trigger");
+        }
+        tokio::time::timeout(Duration::from_secs(10), &mut fixture.service.run_task)
+            .await
+            .expect("service terminates after child exits and is reaped")
+            .expect("service joins")
+            .expect("service has no error");
+        assert_eq!(
+            nix::sys::signal::kill(fixture.child, None),
+            Err(nix::errno::Errno::ESRCH),
+            "child process is reaped and no longer exists"
+        );
+        assert!(!fixture.service.broker.has_supervised_children());
+    }
+
+    /// Retire lifetime smoke over a production server: a real detached generic
+    /// child keeps running; the service stays supervisor-only until the
+    /// child exits and is reaped, then terminates. Barriers throughout: FIFO
+    /// readiness, task completion, and liveness probes — no sleep assumptions.
+    #[tokio::test]
+    async fn retire_supervises_detached_child_until_reaped() {
+        assert_detached_child_supervision(RetirementScenario::Explicit).await;
+    }
+
+    #[tokio::test]
+    async fn recovered_old_supervises_detached_child_until_reaped() {
+        assert_detached_child_supervision(RetirementScenario::RecoveredOld).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_waiter_keeps_detached_child_supervised() {
+        assert_detached_child_supervision(RetirementScenario::CancelledStop).await;
+    }
+
+    async fn assert_detached_child_supervision(scenario: RetirementScenario) {
+        let mut fixture = start_supervised_child_fixture(scenario).await;
         match scenario {
             RetirementScenario::RecoveredOld => {
-                let mut control = ProductionControl::connect(endpoint.socket())
+                let mut control = ProductionControl::connect(fixture.service.endpoint.socket())
                     .await
                     .expect("coordinator connects");
                 prepare_draining(&mut control, "prepare").await;
                 drop(control);
             }
             RetirementScenario::Explicit => {
-                let mut control = ProductionControl::connect(endpoint.socket())
+                let mut control = ProductionControl::connect(fixture.service.endpoint.socket())
                     .await
                     .expect("coordinator connects");
                 let retired = match control
@@ -5699,13 +5810,17 @@ menus:
                 assert_eq!(retired.lifecycle, LifecycleState::Retired);
             }
             RetirementScenario::CancelledStop => {
-                broker
+                fixture
+                    .service
+                    .broker
                     .drain_for_activation()
                     .await
                     .expect("drain UI before Stop");
                 let (complete, waiter) = oneshot::channel();
                 drop(waiter);
-                activation
+                fixture
+                    .service
+                    .activation
                     .command_sender()
                     .await
                     .expect("service installed commands")
@@ -5714,11 +5829,7 @@ menus:
                     .expect("deliver Stop with cancelled waiter");
             }
         }
-
-        // The ready UI observes retirement before the connection closes: the drain
-        // emits `BrokerRetiring` to every live session before tearing it down, and
-        // the connection close remains the backstop if the outbox is full.
-        let event = tokio::time::timeout(Duration::from_secs(5), ui_client.next_event())
+        let event = tokio::time::timeout(Duration::from_secs(5), fixture.ui_client.next_event())
             .await
             .expect("retire emits a UI event within bound")
             .expect("ready UI receives the retirement event");
@@ -5726,209 +5837,52 @@ menus:
             matches!(event, BrokerEvent::BrokerRetiring),
             "the ready UI observes BrokerRetiring before the connection closes"
         );
-
-        // The endpoint is unlinked while the child keeps running under GenericSupervisor.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while endpoint.socket().exists() {
+            while fixture.service.endpoint.socket().exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("retire unlinks the endpoint");
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !adapter.shutdown.load(Ordering::SeqCst) {
+            while !fixture.service.adapter.shutdown.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("recovered old adapter completes shutdown");
         assert!(
-            adapter.shutdown.load(Ordering::SeqCst),
+            fixture.service.adapter.shutdown.load(Ordering::SeqCst),
             "host adapter stops before detached-child supervision"
         );
         if matches!(scenario, RetirementScenario::CancelledStop) {
             assert!(
-                activation.old_retirement.lock().await.is_none(),
+                fixture
+                    .service
+                    .activation
+                    .old_retirement
+                    .lock()
+                    .await
+                    .is_none(),
                 "cancelled command has no Commit proof or acknowledgement"
             );
         }
-
-        assert!(
-            !run_task.is_finished(),
-            "the service stays supervisor-only while the child runs"
-        );
-        assert!(
-            broker.has_supervised_children().await,
-            "GenericSupervisor retains the detached child across activation drain"
-        );
-        assert!(
-            nix::sys::signal::kill(child, None).is_ok(),
-            "child alive while supervised"
-        );
-
-        // Trigger the child's bounded natural exit (no SIGTERM or SIGKILL, no global cleanup).
-        {
-            let mut trigger = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&exit_fifo)
-                .expect("open exit trigger fifo");
-            std::io::Write::write_all(&mut trigger, b"exit\n").expect("write exit trigger");
-        }
-
-        // The run lifetime ends only now: completion proves the supervisor reaped the naturally exited child.
-        tokio::time::timeout(Duration::from_secs(10), run_task)
-            .await
-            .expect("service terminates after child naturally exits and is reaped")
-            .expect("service joins")
-            .expect("service has no error");
-
-        // Verify the child process was cleanly reaped (no zombie).
-        assert_eq!(
-            nix::sys::signal::kill(child, None),
-            Err(nix::errno::Errno::ESRCH),
-            "child process is reaped and no longer exists"
-        );
-        assert!(
-            !broker.has_supervised_children().await,
-            "no supervised children remain"
-        );
+        assert_supervised_child_exits_after_release(&mut fixture).await;
     }
 
     /// H08 acceptance (service layer, owned fixtures only): a queued terminal
-    /// HostLost drives the exact Stop teardown — config watch dropped (probes
+    /// `HostLost` drives the exact Stop teardown — config watch dropped (probes
     /// stop), owned endpoint unlinked, awaiting host execution failed with
-    /// HostUnavailable — while the detached generic child stays supervised.
+    /// `HostUnavailable` — while the detached generic child stays supervised.
     /// Cloned from `retire_supervises_detached_child_until_reaped`; the only
     /// difference is the retirement trigger (health signal, not Retire RPC).
     #[tokio::test]
     async fn host_loss_retires_owned_endpoint_and_keeps_generic_supervision() {
-        let staging = tempfile::tempdir().expect("owned child staging directory");
-        let (script, startup, pidfile, exit_fifo) = stage_lingering_child(&staging);
-
-        let directory = tempfile::tempdir().expect("owned activation runtime directory");
-        let config_path = directory.path().join("config.yml");
-        let yaml = format!(
-            r#"
-version: 1
-menus:
-  main:
-    bindings:
-      l:
-        label: linger
-        action:
-          type: command:execute
-          program: /bin/sh
-          args:
-            - {script:?}
-          cwd: {cwd:?}
-        settings:
-          execution:
-            mode: detach
-"#,
-            script = script.to_string_lossy(),
-            cwd = staging.path().to_string_lossy(),
-        );
-        std::fs::write(&config_path, &yaml).expect("write linger config");
-
-        let adapter = Arc::new(SmokeAdapter::new());
-        let config = muxe_core::compile_yaml(
-            CompiledGeneration(1),
-            SourceId::new("<owned activation linger>"),
-            yaml,
-            KeyCapabilities::default(),
-            Some(adapter.as_ref()),
-        )
-        .expect("compile linger config");
-        let broker = Broker::from_compiled(adapter, &config_path, config);
-
-        let runtime = tempfile::tempdir().expect("owned runtime directory");
-        let endpoint =
-            RuntimeEndpoint::in_runtime_dir(runtime.path(), HostKind::Herdr, "owned-fake-host")
-                .expect("derive owned endpoint");
-        let broker_server = BrokerServer::start_activation(
-            Arc::clone(&broker),
-            endpoint.clone(),
-            ActivationBootstrap::Running {
-                current: test_record(),
-                bridge_unit: None,
-            },
-            None,
-        )
-        .await
-        .expect("start owned activation server");
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let run_task = tokio::spawn(broker_server.run(shutdown_rx));
-
-        let live_server = broker.live_identity().await.expect("host identity");
-        let client_identity = LiveServerIdentity {
-            host: HostKind::Herdr,
-            discovery_key: "owned-fake-host".to_owned(),
-            server_id: WireServerId::new(live_server.server_id.as_str()),
-        };
-        let mut ui_client = BrokerClient::connect(
-            endpoint.socket(),
-            PeerRole::Ui,
-            "owned-retire-ui",
-            client_identity,
-        )
-        .await
-        .expect("connect UI client");
-        let attached = ui_client
-            .request(ClientRequest::AttachUi(AttachUi {
-                root: muxe_protocol::MenuId::named("main"),
-                pane: HostPaneId::new("owned-ui-pane"),
-                pending_launch: None,
-                origin: None,
-                caller_identity: None,
-                theme: None,
-                color_scheme: None,
-            }))
-            .await
-            .expect("attach UI");
-        let BrokerResponse::UiAttached { session, snapshot } = attached else {
-            panic!("expected UI attached");
-        };
-        let binding = snapshot
-            .menu
-            .menus
-            .iter()
-            .find(|m| m.id == muxe_protocol::MenuId::named("main"))
-            .and_then(|m| m.bindings.first())
-            .expect("linger binding visible");
-        let invoked = ui_client
-            .request(ClientRequest::InvokeBinding(muxe_protocol::InvokeBinding {
-                session: session.clone(),
-                generation: 1,
-                binding: binding.id,
-            }))
-            .await
-            .expect("invoke linger binding");
-        assert!(matches!(
-            invoked,
-            BrokerResponse::InvocationAccepted {
-                disposition: InvocationDisposition::Detached,
-                ..
-            }
-        ));
-
-        // Barrier: the child wrote its announcement; it is now running.
-        let started = startup.await.expect("child signals start");
-        assert_eq!(&started, b"started");
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("child publishes its pid")
-            .trim()
-            .parse()
-            .expect("pid parses");
-        let child = nix::unistd::Pid::from_raw(pid);
-        assert!(
-            nix::sys::signal::kill(child, None).is_ok(),
-            "child alive while running"
-        );
-
-        // Terminal host loss — no coordinator, no Retire RPC: the monitor
-        // signal alone must retire this broker.
-        broker
+        // Host loss, without a coordinator or Retire RPC, must drive Stop.
+        let mut fixture = start_supervised_child_fixture(RetirementScenario::Explicit).await;
+        fixture
+            .service
+            .broker
             .handle_health_event(AdapterHealthEvent::HostLost {
                 identity: HostIdentity {
                     kind: muxe_adapter_api::HostKind::Herdr,
@@ -5948,69 +5902,25 @@ menus:
             })
             .await;
 
-        // The ready UI observes retirement before the connection closes. The
-        // terminal path broadcasts AdapterHealthChanged(false) before the
-        // drain emits BrokerRetiring, so skip health events until retiring.
+        // Health events may precede the terminal BrokerRetiring notification.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match ui_client.next_event().await {
-                    Ok(BrokerEvent::BrokerRetiring) => break,
-                    Ok(_) => continue,
+                match fixture.ui_client.next_event().await {
+                    Ok(BrokerEvent::BrokerRetiring) => return,
+                    Ok(_) => {}
                     Err(error) => panic!("ready UI receives the retirement event: {error}"),
                 }
             }
         })
         .await
         .expect("host loss emits a UI event within bound");
-
-        // The endpoint is unlinked while the child keeps running under GenericSupervisor.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while endpoint.socket().exists() {
+            while fixture.service.endpoint.socket().exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("host loss unlinks the endpoint");
-
-        assert!(
-            !run_task.is_finished(),
-            "the service stays supervisor-only while the child runs"
-        );
-        assert!(
-            broker.has_supervised_children().await,
-            "GenericSupervisor retains the detached child across host-loss retirement"
-        );
-        assert!(
-            nix::sys::signal::kill(child, None).is_ok(),
-            "child alive while supervised"
-        );
-
-        // Trigger the child's bounded natural exit (no SIGTERM or SIGKILL, no global cleanup).
-        {
-            let mut trigger = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&exit_fifo)
-                .expect("open exit trigger fifo");
-            std::io::Write::write_all(&mut trigger, b"exit\n").expect("write exit trigger");
-        }
-
-        // The run lifetime ends only now: completion proves the supervisor reaped the naturally exited child.
-        tokio::time::timeout(Duration::from_secs(10), run_task)
-            .await
-            .expect("service terminates after child naturally exits and is reaped")
-            .expect("service joins")
-            .expect("service has no error");
-
-        // Verify the child process was cleanly reaped (no zombie).
-        assert_eq!(
-            nix::sys::signal::kill(child, None),
-            Err(nix::errno::Errno::ESRCH),
-            "child process is reaped and no longer exists"
-        );
-        assert!(
-            !broker.has_supervised_children().await,
-            "no supervised children remain"
-        );
+        assert_supervised_child_exits_after_release(&mut fixture).await;
     }
 }

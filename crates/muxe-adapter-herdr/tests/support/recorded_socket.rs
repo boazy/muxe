@@ -167,6 +167,95 @@ impl Drop for RecordedUnixServer {
     }
 }
 
+async fn receive_recorded_request(
+    reader: &mut BufReader<tokio::net::UnixStream>,
+    exchange: &RecordedExchange,
+) -> io::Result<Value> {
+    let mut line = Vec::new();
+    let read = reader.read_until(b'\n', &mut line).await?;
+    if read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "recorded Herdr client closed before its request",
+        ));
+    }
+    let request: Value = serde_json::from_slice(&line).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("recorded Herdr request was not JSON: {error}"),
+        )
+    })?;
+    validate_request(&request, exchange)?;
+    Ok(request)
+}
+
+async fn respond_to_recorded_exchange(
+    reader: &mut BufReader<tokio::net::UnixStream>,
+    response_kind: RecordedResponse,
+    id: &str,
+    request: &Value,
+    requests: &Mutex<Vec<Value>>,
+    requests_changed: &Notify,
+) -> io::Result<bool> {
+    match response_kind {
+        RecordedResponse::Result(result) | RecordedResponse::KeepOpen(result) => {
+            let response = json!({ "id": id, "result": result });
+            reader
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await?;
+            reader.get_mut().flush().await?;
+            Ok(false)
+        }
+        RecordedResponse::Error { code, message } => {
+            let response = json!({ "id": id, "error": { "code": code, "message": message } });
+            reader
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await?;
+            reader.get_mut().flush().await?;
+            Ok(false)
+        }
+        RecordedResponse::Barrier { barrier, result } => {
+            requests.lock().await.push(request.clone());
+            requests_changed.notify_waiters();
+            barrier.entered.notify_one();
+            barrier.release.notified().await;
+            let response = json!({ "id": id, "result": result });
+            reader
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await?;
+            reader.get_mut().flush().await?;
+            Ok(true)
+        }
+        RecordedResponse::BarrierError {
+            barrier,
+            code,
+            message,
+        } => {
+            requests.lock().await.push(request.clone());
+            requests_changed.notify_waiters();
+            barrier.entered.notify_one();
+            barrier.release.notified().await;
+            let response = json!({ "id": id, "error": { "code": code, "message": message } });
+            reader
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await?;
+            reader.get_mut().flush().await?;
+            Ok(true)
+        }
+        RecordedResponse::Close => Ok(false),
+        RecordedResponse::Hang => {
+            requests.lock().await.push(request.clone());
+            requests_changed.notify_waiters();
+            std::future::pending::<()>().await;
+            Ok(true)
+        }
+    }
+}
+
 async fn serve(
     listener: UnixListener,
     exchanges: Vec<RecordedExchange>,
@@ -179,21 +268,7 @@ async fn serve(
     for exchange in exchanges {
         let (stream, _) = listener.accept().await?;
         let mut reader = BufReader::new(stream);
-        let mut line = Vec::new();
-        let read = reader.read_until(b'\n', &mut line).await?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "recorded Herdr client closed before its request",
-            ));
-        }
-        let request: Value = serde_json::from_slice(&line).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("recorded Herdr request was not JSON: {error}"),
-            )
-        })?;
-        validate_request(&request, &exchange)?;
+        let request = receive_recorded_request(&mut reader, &exchange).await?;
         let id = request
             .get("id")
             .and_then(Value::as_str)
@@ -207,61 +282,15 @@ async fn serve(
         let keep_open = matches!(&exchange.response, RecordedResponse::KeepOpen(_));
         let retained_generation = keep_open.then(|| *close_streams.borrow());
         let retained_event_receiver = keep_open.then(|| retained_events.subscribe());
-        let mut recorded = false;
-        match exchange.response {
-            RecordedResponse::Result(result) | RecordedResponse::KeepOpen(result) => {
-                let response = json!({ "id": id, "result": result });
-                reader
-                    .get_mut()
-                    .write_all(format!("{response}\n").as_bytes())
-                    .await?;
-                reader.get_mut().flush().await?;
-            }
-            RecordedResponse::Error { code, message } => {
-                let response = json!({ "id": id, "error": { "code": code, "message": message } });
-                reader
-                    .get_mut()
-                    .write_all(format!("{response}\n").as_bytes())
-                    .await?;
-                reader.get_mut().flush().await?;
-            }
-            RecordedResponse::Barrier { barrier, result } => {
-                requests.lock().await.push(request.clone());
-                requests_changed.notify_waiters();
-                recorded = true;
-                barrier.entered.notify_one();
-                barrier.release.notified().await;
-                let response = json!({ "id": id, "result": result });
-                reader
-                    .get_mut()
-                    .write_all(format!("{response}\n").as_bytes())
-                    .await?;
-                reader.get_mut().flush().await?;
-            }
-            RecordedResponse::BarrierError {
-                barrier,
-                code,
-                message,
-            } => {
-                requests.lock().await.push(request.clone());
-                requests_changed.notify_waiters();
-                recorded = true;
-                barrier.entered.notify_one();
-                barrier.release.notified().await;
-                let response = json!({ "id": id, "error": { "code": code, "message": message } });
-                reader
-                    .get_mut()
-                    .write_all(format!("{response}\n").as_bytes())
-                    .await?;
-                reader.get_mut().flush().await?;
-            }
-            RecordedResponse::Close => {}
-            RecordedResponse::Hang => {
-                requests.lock().await.push(request.clone());
-                requests_changed.notify_waiters();
-                std::future::pending::<()>().await;
-            }
-        }
+        let recorded = respond_to_recorded_exchange(
+            &mut reader,
+            exchange.response,
+            id,
+            &request,
+            &requests,
+            &requests_changed,
+        )
+        .await?;
         if !recorded {
             requests.lock().await.push(request);
             requests_changed.notify_waiters();
