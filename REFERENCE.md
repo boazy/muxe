@@ -612,6 +612,8 @@ Some named keys need optional Kitty keyboard features. The table shows which fea
 
 Using `alternate:` or `base:` requires alternate-key reporting. Setting `repeat` to either `true` or `false` requires key-event reporting. Lock modifiers on printable characters require all-keys-as-escape-codes mode.
 
+On Herdr 0.8.2, Muxe rejects configurations enabling optional Kitty event types, alternate keys, or all-keys-as-escape-codes, as well as bindings that require them. The pinned encoder forwards only some event types and alternate identities; enhanced-key delivery through a live pane has not been verified. Herdr's default keyboard profile remains VT100.
+
 | Named key | Without explicit `repeat` | With explicit `repeat` |
 |---|---|---|
 | `esc` | none | event types |

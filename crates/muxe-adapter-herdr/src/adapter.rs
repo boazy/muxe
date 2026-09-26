@@ -2117,13 +2117,14 @@ impl HostAdapter for HerdrAdapter {
 
     async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
         Ok(AdapterCapabilities {
-            // Static compile-time caps only: these gate binding validation, not the
-            // runtime pty negotiation the UI performs directly. All false is
-            // fail-closed (kitty enhancements rejected at compile, vt100 default
-            // works; kitty_baseline is currently unread). DESIGN lists Herdr
-            // defaults event-types/alternate as true, but flipping them requires a
-            // live 0.8.2 forwarding proof through a real pane — do not change
-            // without it.
+            // Compile-time validation caps, not the UI's PTY negotiation;
+            // kitty_baseline is not a compiler gate. In pinned Herdr 0.8.2,
+            // unmodified Enter/Tab/Backspace and function-key repeats retain
+            // legacy press bytes and their releases are omitted. Ordinary
+            // shifted text bypasses alternate-key CSI-u, no base-layout
+            // identity is encoded, and navigation can use keypad CSI-u codes.
+            // These are source findings, not a live enhanced-key pane proof.
+            // Keep optional capabilities fail-closed and VT100 as the default.
             keyboard: KeyboardCapabilities {
                 kitty_baseline: false,
                 kitty_event_types: false,
