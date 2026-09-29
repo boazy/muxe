@@ -312,7 +312,7 @@ pub struct ChildDiagnostics {
 pub struct OwnedChild {
     tag: String,
     child: Option<Child>,
-    _stdin: Option<ChildStdin>,
+    stdin: Option<ChildStdin>,
     stdout: Option<JoinHandle<Vec<u8>>>,
     stderr: Option<JoinHandle<Vec<u8>>>,
 }
@@ -332,7 +332,7 @@ impl OwnedChild {
         Ok(Self {
             tag: tag.to_owned(),
             child: Some(child),
-            _stdin: None,
+            stdin: None,
             stdout,
             stderr,
         })
@@ -353,10 +353,22 @@ impl OwnedChild {
         Ok(Self {
             tag: tag.to_owned(),
             child: Some(child),
-            _stdin: stdin,
+            stdin,
             stdout,
             stderr,
         })
+    }
+    /// Sends input through this owned interactive PTY client's retained stdin.
+    /// Ordinary CLI children have no writer and fail instead of selecting a
+    /// terminal outside the test-owned session.
+    pub async fn send_input(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::other("owned child has no interactive stdin"))?;
+        stdin.write_all(bytes).await?;
+        stdin.flush().await
     }
 
     /// Whether the child handle is still retained.
@@ -917,6 +929,10 @@ impl OwnedZellijHost {
         let mut command = Command::new(helper);
         command.arg("--socket").arg(&socket);
         self.apply_host_scoped_env(&mut command, scoped_root);
+        // The production CLI sets this before it starts the server. This
+        // fixture enters start_server_impl directly, so seed the same
+        // session identity for Run panes spawned by the owned server.
+        command.env("ZELLIJ_SESSION_NAME", session);
         command.current_dir(&self.workdir);
         command
     }
@@ -955,7 +971,9 @@ impl OwnedZellijHost {
             .arg("--cols")
             .arg(BOOTSTRAP_COLS.to_string());
         self.apply_host_scoped_env(&mut command, scoped_root);
-        command.env("TERM", "xterm-256color");
+        command
+            .env("TERM", "xterm-256color")
+            .env("ZELLIJ_SESSION_NAME", session);
         command.current_dir(&self.workdir);
         command
     }
@@ -1409,7 +1427,8 @@ impl OwnedZellijHost {
         self.apply_host_env(&mut command);
         command.env("TERM", "xterm-256color");
         command.current_dir(&self.workdir);
-        let mut child = OwnedChild::spawn(&format!("{tag}-pty-client"), &mut command)?;
+        let mut child =
+            OwnedChild::spawn_with_open_stdin(&format!("{tag}-pty-client"), &mut command)?;
         tokio::time::sleep(Duration::from_secs(2)).await;
         if child.try_wait()?.is_some() {
             let diagnostics = child.terminate_and_reap().await?;
@@ -2154,7 +2173,7 @@ pub trait ActivateCommandEnvironment {
     fn apply_owned_scoped_env(&self, command: &mut Command, scoped_root: &Path);
 }
 
-/// Applies only the Muxe-owned TempDir environment for a host-free runner.
+/// Applies only the Muxe-owned `TempDir` environment for a host-free runner.
 pub struct ScopedOnlyActivateEnvironment;
 
 impl ActivateCommandEnvironment for ScopedOnlyActivateEnvironment {
@@ -2572,6 +2591,31 @@ mod scoped_spawn_tests {
         child.terminate_and_reap().await.expect("reap PTY fake");
     }
 
+    async fn assert_scoped_child(tag: &str, command: &mut Command, marker: &Path) {
+        let mut child =
+            OwnedChild::spawn(&format!("scope-{tag}"), command).expect("spawn muxe fake");
+        // Wait for the real child to validate its environment and exit
+        // naturally; immediate reaping could mistake it for a SIGTERM exit.
+        wait_for_marker(marker);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().expect("poll scoped child").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{tag} scoped child never exited after its marker"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let diagnostics = child.terminate_and_reap().await.expect("reap muxe fake");
+        let exit_status = diagnostics.exit_status;
+        assert!(
+            exit_status.is_some_and(|status| status.success()),
+            "{tag} scoped child failed (status {exit_status:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            diagnostics.stdout_tail.lossy(),
+            diagnostics.stderr_tail.lossy(),
+        );
+        assert!(marker.is_file(), "{tag} scoped child left no owned marker");
+    }
+
     #[tokio::test]
     async fn muxe_spawns_scope_real_children() {
         let case = case_dir("muxe");
@@ -2661,31 +2705,13 @@ mod scoped_spawn_tests {
             ("herdr", &mut herdr_command, &marker_herdr),
             ("zellij", &mut zellij_command, &marker_zellij),
             ("activate", &mut zellij_activate_command, &marker_activate),
-            ("activate-scoped", &mut scoped_activate_command, &marker_activate_scoped),
+            (
+                "activate-scoped",
+                &mut scoped_activate_command,
+                &marker_activate_scoped,
+            ),
         ] {
-            let mut child =
-                OwnedChild::spawn(&format!("scope-{tag}"), command).expect("spawn muxe fake");
-            // The marker proves the body ran; then poll for natural
-            // exit. Reaping immediately would race a fast-exiting
-            // child with SIGTERM and misreport cooperation as failure.
-            wait_for_marker(marker);
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while child.try_wait().expect("poll scoped child").is_none() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{tag} scoped child never exited after its marker"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            let diagnostics = child.terminate_and_reap().await.expect("reap muxe fake");
-            let exit_status = diagnostics.exit_status;
-            assert!(
-                exit_status.is_some_and(|status| status.success()),
-                "{tag} scoped child failed (status {exit_status:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                diagnostics.stdout_tail.lossy(),
-                diagnostics.stderr_tail.lossy(),
-            );
-            assert!(marker.is_file(), "{tag} scoped child left no owned marker");
+            assert_scoped_child(tag, command, marker).await;
         }
     }
 

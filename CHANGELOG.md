@@ -5,7 +5,8 @@
 - *(broker)* Require the selected host's registry authority for cold-start adoption, reuse, stale removal, and retirement; reject foreign persisted rows before mutation
 - *(activation)* Spawn targets from the typed journal unit instead of a registry label or socket filename
 - *(activation)* Keep bridge preflight, reload, and Ready proof under the selected host policy; accept unchanged bridge membership regardless of registry insertion order
-- *(zellij)* Complete fresh membership coverage before ordinary broker startup; keep activation targets gated until their reserved identity is covered
+- *(zellij)* Reuse a receipt-backed loaded bridge on ordinary coldstart, reload only an absent bridge before spawn, refresh pane-origin census after host pane transitions, and defer activation target subscriptions until durable replacement reload
+- *(zellij)* Keep spawned brokers outside the launching pane's process group; document mode-specific root bindings that publish an observed prior mode before the first UI capture
 - *(cli)* Create and validate the cache root owner-only before audit logging; refuse unsafe existing directories
 - *(ui)* Honor menu-scoped inactivity timeouts and reject binding-scoped inactivity settings
 - *(broker)* Reconcile authenticated cold-start endpoints before spawning, preserving live registration ownership and refusing ambiguous recovery

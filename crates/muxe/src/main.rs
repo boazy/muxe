@@ -1176,24 +1176,33 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
             "could not claim the Zellij broker endpoint: {error}"
         ));
     }
-    // inherent input API directly, while the broker shares the same Arc as a
-    // trait object after load.
-    let adapter = std::sync::Arc::new(
-        muxe_adapter_zellij::ZellijAdapter::connect(muxe_adapter_zellij::ZellijAdapterConfig {
-            session_name: command.session.clone(),
-            zellij_exe: command.zellij_exe.clone(),
-            readiness_gate: muxe_adapter_zellij::ReadinessGate::new(
-                command.cache_dir.clone(),
-                bridge_identity.unit(),
-            ),
-        })
-        .await
-        .wrap_err("could not connect the pinned Zellij session for broker startup")?,
-    );
-    // Ordinary brokers must prove a fresh census before configuration asks
-    // for a live identity. Targets cannot do so until the coordinator swaps
-    // the bridge: reserve a gated identity now and prove it after binding.
+    // Ordinary brokers subscribe immediately. A target binds TargetGated
+    // control with dormant pipes, then subscribes only after its exact
+    // journal records the replacement bridge reloaded in every session.
     let is_target = command.handoff.is_some();
+    let adapter_config = muxe_adapter_zellij::ZellijAdapterConfig {
+        session_name: command.session.clone(),
+        zellij_exe: command.zellij_exe.clone(),
+        readiness_gate: muxe_adapter_zellij::ReadinessGate::new(
+            command.cache_dir.clone(),
+            bridge_identity.unit(),
+        ),
+    };
+    let (adapter, deferred_pipes) = if is_target {
+        let (adapter, pipes) = muxe_adapter_zellij::ZellijAdapter::connect_deferred(adapter_config)
+            .wrap_err("could not reserve dormant Zellij target pipes")?;
+        (std::sync::Arc::new(adapter), Some(pipes))
+    } else {
+        (
+            std::sync::Arc::new(
+                muxe_adapter_zellij::ZellijAdapter::connect(adapter_config)
+                    .await
+                    .wrap_err("could not connect the pinned Zellij session for broker startup")?,
+            ),
+            None,
+        )
+    };
+    // The adapter reserves a gated identity without any bridge registration.
     let reserved = if is_target {
         let identity = adapter
             .reserve_startup_identity()
@@ -1244,8 +1253,9 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         );
     }
     let current = muxe::compatibility::embedded_record()?.handoff;
+    let expected_target = is_target.then(|| current.clone());
     // A half pair bails in the bootstrap match below.
-    let (bootstrap, target_registration, registration_handoff) = match (
+    let (bootstrap, target_registration, registration_handoff, target_wait) = match (
         command.handoff,
         command.activation_journal,
     ) {
@@ -1254,6 +1264,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 current,
                 bridge_unit: Some(bridge_identity.unit()),
             },
+            None,
             None,
             None,
         ),
@@ -1286,6 +1297,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 },
                 Some(capability),
                 Some(handoff),
+                Some((journal_path, journal.activation_id)),
             )
         }
         _ => bail!("broker target startup requires both --handoff and --activation-journal"),
@@ -1335,11 +1347,12 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     // The endpoint was claimed before adapter construction and the guard is
     // consumed here: bind reuses the held lock instead of re-acquiring, so no
     // gap admits a second child between construction and bind.
+    let recovery_port: Arc<dyn muxe_broker::RecoveryJournal> = recovery.clone();
     let server = match muxe_broker::BrokerServer::start_activation_with_lock(
         Arc::clone(&broker),
         endpoint,
         bootstrap,
-        Some(recovery),
+        Some(recovery_port),
         pre_lock,
     )
     .await
@@ -1410,17 +1423,38 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     );
     drop(unit_guard.take());
     if is_target {
-        // The endpoint is already bound and serving TargetGated status with
-        // ready=None, so the coordinator observes the target before the
-        // bridge swap. Census attempts run concurrently with serving; each
-        // failed attempt replaces only the event subscription while the
-        // outer deadline bounds even a hanging call. Expiry requests
-        // shutdown, awaits the owned service (whose run epilogue unlinks the
-        // endpoint), unregisters the owned entry, and propagates the failure.
+        // TargetGated control is bound before the swap, but neither pipe
+        // subscribes to the predecessor bridge. The exact durable reload
+        // barrier opens both children; only that subscription can prove Ready.
+        // The same deadline bounds journal wait, child launch, and census.
+        let (journal_path, activation_id) =
+            target_wait.expect("validated target owns an activation journal");
+        let handoff = registration_handoff.expect("validated target owns a handoff");
+        let deferred_pipes = deferred_pipes.expect("validated target has dormant pipes");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
         let covered = async {
+            wait_for_target_bridge_reload(
+                TargetBridgeWait {
+                    journal_path: &journal_path,
+                    activation_id,
+                    bridge_identity: &bridge_identity,
+                    member: &recovery.discovery_key,
+                    endpoint: &command.socket,
+                    handoff,
+                    target: expected_target.as_ref().expect("validated target record"),
+                },
+                deadline,
+            )
+            .await?;
+            tokio::time::timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                deferred_pipes.start(),
+            )
+            .await
+            .map_err(|_| color_eyre::eyre::eyre!("Zellij target pipe startup exceeded its deadline"))?
+            .wrap_err("could not start Zellij target pipes after bridge reload")?;
             establish_initial_round_until(&adapter, deadline, &logger).await?;
             let identity = broker
                 .live_identity()
@@ -1497,6 +1531,52 @@ fn cleanup_zellij_registration(
     let guard = muxe::lifecycle::BridgeUnitGuard::acquire_blocking(cache_dir, identity.clone())?;
     registry.unregister_zellij(&guard, registration)?;
     Ok(())
+}
+
+/// Exact durable authority that permits one gated target to subscribe after
+/// the bridge replacement was reloaded in every recorded session.
+struct TargetBridgeWait<'a> {
+    journal_path: &'a Path,
+    activation_id: muxe::lifecycle::ActivationId,
+    bridge_identity: &'a muxe::paths::BridgeIdentity,
+    member: &'a muxe::lifecycle::ActivationMemberId,
+    endpoint: &'a Path,
+    handoff: muxe_protocol::HandoffId,
+    target: &'a muxe_protocol::control::CompatibilityRecord,
+}
+
+async fn wait_for_target_bridge_reload(
+    expected: TargetBridgeWait<'_>,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    loop {
+        let journal = muxe::lifecycle::journal::read_journal(expected.journal_path)
+            .wrap_err("could not inspect gated target's activation journal")?;
+        if journal.activation_id != expected.activation_id
+            || journal.unit
+                != (muxe::lifecycle::UnitKind::Zellij {
+                    bridge_unit: expected.bridge_identity.unit(),
+                })
+            || journal.bridge_identity.as_ref() != Some(expected.bridge_identity)
+            || journal.target_record != *expected.target
+            || journal.directive() != muxe::lifecycle::TransactionDirective::Activate
+            || !journal
+                .recovery_member(expected.member, expected.handoff)
+                .is_ok_and(|member| member.endpoint().as_path() == expected.endpoint)
+        {
+            bail!("gated Zellij target lost its exact journal authority before bridge reload");
+        }
+        if journal.bridge().is_some_and(|bridge| {
+            bridge.progress == muxe::lifecycle::BridgeProgress::TargetReloaded
+        }) {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("gated Zellij target waited past its deadline for durable bridge reload");
+        }
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
+    }
 }
 
 /// Retries the inherent initial census round until success or the outer
@@ -2236,7 +2316,15 @@ async fn open_pane(open: &PaneOpen) -> Result<()> {
         }
     };
     match host {
-        HostSelector::Zellij => zellij_open_pane(&logger, open),
+        HostSelector::Zellij => {
+            Box::pin(zellij_open_pane(
+                &logger,
+                &paths.cache_dir,
+                &paths.config_file(),
+                open,
+            ))
+            .await
+        }
         HostSelector::Herdr => {
             Box::pin(herdr_open_pane(
                 &logger,
@@ -2611,12 +2699,30 @@ fn bootstrap_env(
 /// Opens a pane through the pinned Zellij CLI: `zellij --session <name> run`.
 /// Placement maps onto Run flags; semantics the CLI cannot express fail
 /// closed instead of silently degrading.
-fn zellij_open_pane(logger: &muxe::logging::Logger, open: &PaneOpen) -> Result<()> {
+async fn zellij_open_pane(
+    logger: &muxe::logging::Logger,
+    cache_dir: &Path,
+    config_file: &Path,
+    open: &PaneOpen,
+) -> Result<()> {
     let session = required_environment("ZELLIJ_SESSION_NAME")?;
     let program = muxe_adapter_zellij::resolve_zellij_exe().map_err(|error| {
         color_eyre::eyre::eyre!("could not resolve the pinned Zellij executable: {error}")
     })?;
     let argv = zellij_run_argv(&session, open)?;
+    if muxe_adapter_api::launch::is_ui_argv(&open.argv) {
+        // The selected Zellij UI launcher ensures a fresh bridge subscription
+        // while the invoking pane still owns focus. The UI child reuses that
+        // broker; reloading only after the UI pane is focused would erase the
+        // confirmed non-UI origin. Generic command panes never coldstart here.
+        Box::pin(ensure_zellij_broker(
+            cache_dir,
+            config_file,
+            &session,
+            &program,
+        ))
+        .await?;
+    }
     let output = std::process::Command::new(&program)
         .args(&argv)
         .output()
@@ -2741,11 +2847,10 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
     let zellij_exe = muxe_adapter_zellij::resolve_zellij_exe().map_err(|error| {
         color_eyre::eyre::eyre!("could not resolve the pinned Zellij executable: {error}")
     })?;
-    // Coldstart first: a brokerless session starts one ordinary broker,
-    // reloads the stable bridge, and awaits the fresh compatible round here,
-    // so attach below never races initial readiness. A stale record
-    // activates the invoking bridge group; a wrong identity fails closed
-    // without a second broker.
+    // Coldstart reuses a receipt-owned loaded bridge (or loads an absent
+    // one) before awaiting a fresh compatible round, so attach never races
+    // initial readiness. A stale record activates the invoking bridge group;
+    // a wrong identity fails closed without a second broker.
     let live = Box::pin(ensure_zellij_broker(
         &paths.cache_dir,
         &paths.config_file(),
@@ -3935,6 +4040,65 @@ mod tests {
         journal
     }
 
+    #[tokio::test]
+    async fn gated_target_wait_rejects_replaced_and_rollback_journals_and_expires() {
+        use muxe::lifecycle::journal::{
+            BridgeProgress, OldMemberProgress, TargetMemberProgress, write_journal,
+        };
+        use std::{os::unix::fs::PermissionsExt, time::Duration};
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = temp.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = muxe::paths::BridgeIdentity::resolve(
+            &temp.path().join("integration"),
+            std::ffi::OsStr::new(muxe::integration::BRIDGE_FILE_NAME),
+        )
+        .unwrap();
+        let endpoint = temp.path().join("member.sock");
+        let handoff = muxe_protocol::control::HandoffId([42; 16]);
+        let old = zellij_test_entry(&identity, endpoint.clone(), None, 1);
+        let mut journal = zellij_test_journal(&identity, old, handoff);
+        journal.enter_activating();
+        journal.members_mut()[0].old = OldMemberProgress::Drained;
+        journal.members_mut()[0].target = TargetMemberProgress::Gated;
+        journal.bridge_mut().unwrap().progress = BridgeProgress::ArtifactsReady;
+        let original_record = journal.target_record.clone();
+        let activation_id = journal.activation_id;
+        let member = muxe::lifecycle::ActivationMemberId::new("session-a".to_owned()).unwrap();
+        let path = write_journal(&cache, &journal).unwrap();
+        let expected = || TargetBridgeWait {
+            journal_path: &path,
+            activation_id,
+            bridge_identity: &identity,
+            member: &member,
+            endpoint: &endpoint,
+            handoff,
+            target: &original_record,
+        };
+        let wait = |duration| {
+            wait_for_target_bridge_reload(expected(), std::time::Instant::now() + duration)
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), wait(Duration::from_millis(20)))
+                .await
+                .expect("journal wait must stop at its deadline")
+                .is_err()
+        );
+
+        journal.target_record.target_triple = "replacement".to_owned();
+        journal.bridge_mut().unwrap().progress = BridgeProgress::TargetReloaded;
+        write_journal(&cache, &journal).unwrap();
+        assert!(wait(Duration::from_secs(1)).await.is_err());
+
+        journal.target_record = original_record.clone();
+        journal.enter_rollback("activation abandoned".to_owned());
+        write_journal(&cache, &journal).unwrap();
+        assert!(wait(Duration::from_secs(1)).await.is_err());
+    }
+
     #[test]
     fn single_target_cleanup_waits_for_journal_owner_then_removes_exact_row() {
         use std::{os::unix::fs::PermissionsExt, sync::mpsc, time::Duration};
@@ -4570,7 +4734,7 @@ mod consumer_tests {
             unit: &unit,
             authority: muxe::lifecycle::MemberLaunchAuthority {
                 member: muxe::lifecycle::ActivationMemberId::new("/herdr.sock".to_owned()).unwrap(),
-                endpoint: muxe::lifecycle::MemberEndpoint::new(socket.clone()).unwrap(),
+                endpoint: muxe::lifecycle::MemberEndpoint::new(socket).unwrap(),
                 handoff_id: muxe_protocol::HandoffId([0xab; 16]),
             },
             observed_host: ProtocolHostKind::Zellij,
@@ -4596,7 +4760,6 @@ mod consumer_tests {
             Err(muxe::lifecycle::ActivateError::Spawn(_))
         ));
     }
-
 }
 #[cfg(test)]
 mod mixed_recovery_production_tests {

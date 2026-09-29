@@ -47,8 +47,8 @@ use super::{
     control::{ControlError, VerifiedControlStatus},
     journal::{self, UnitKind, UnitLockAttempt},
     registry::{
-        BridgeMemberId, BridgeUnitGuard, BrokerEntry, HerdrUnitGuard, Registry,
-        RegistryAuthority, RegistryError,
+        BridgeMemberId, BridgeUnitGuard, BrokerEntry, HerdrUnitGuard, Registry, RegistryAuthority,
+        RegistryError,
     },
 };
 use crate::{fsutil, integration, paths::BridgeIdentity};
@@ -131,8 +131,8 @@ pub enum ColdstartError {
     /// Child process mechanics failed.
     #[error("could not start the broker child: {0}")]
     Spawn(String),
-    /// Stable bridge reload failed after spawning a Zellij broker.
-    #[error("could not reload the stable bridge: {0}")]
+    /// Stable bridge presence inspection or reload failed before spawning a Zellij broker.
+    #[error("could not prepare the stable bridge: {0}")]
     Reload(String),
     /// A live broker answers for a different host identity: never start a
     /// second broker over it.
@@ -172,7 +172,7 @@ trait ColdstartPolicy {
 
 trait ColdstartBridge {
     fn canonical_identity(&self, config_file: &Path) -> Result<BridgeIdentity, ColdstartError>;
-    fn reload(
+    fn ensure_loaded(
         &self,
         identity: &BridgeIdentity,
         reloader: &dyn HostReloader,
@@ -283,8 +283,8 @@ impl ColdstartPolicy for ZellijColdstart<'_> {
         _unit: &UnitKind,
         bridge: Option<&BridgeIdentity>,
     ) -> Result<Option<Self::Guard>, ColdstartError> {
-        let identity = bridge
-            .ok_or_else(|| ColdstartError::Startup("missing canonical bridge".to_owned()))?;
+        let identity =
+            bridge.ok_or_else(|| ColdstartError::Startup("missing canonical bridge".to_owned()))?;
         BridgeUnitGuard::try_acquire(cache_dir, identity.clone()).map_err(ColdstartError::Registry)
     }
 
@@ -316,7 +316,7 @@ impl ColdstartBridge for ZellijColdstart<'_> {
             .map_err(|error| ColdstartError::Startup(error.to_string()))
     }
 
-    fn reload(
+    fn ensure_loaded(
         &self,
         identity: &BridgeIdentity,
         reloader: &dyn HostReloader,
@@ -324,6 +324,12 @@ impl ColdstartBridge for ZellijColdstart<'_> {
         let bridge_url = integration::kdl::bridge_url(
             &identity.stable_path(std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME)),
         );
+        if reloader
+            .bridge_loaded(self.session.as_str(), &bridge_url)
+            .map_err(|error| ColdstartError::Reload(error.to_string()))?
+        {
+            return Ok(());
+        }
         reloader
             .reload_bridge(self.session.as_str(), &bridge_url)
             .map_err(|error| ColdstartError::Reload(error.to_string()))
@@ -442,7 +448,6 @@ fn clear_spawn_intent(path: &Path) -> Result<(), ColdstartError> {
         .map(|_| ())
         .map_err(|error| ColdstartError::EndpointConflict(error.to_string()))
 }
-
 
 /// Ensures one live broker for the expected host identity, cold-starting an
 /// ordinary broker when none answers.
@@ -615,7 +620,9 @@ where
                 &verified,
                 inputs,
                 host,
-                ownership.as_ref().expect("coldstart unit ownership is held"),
+                ownership
+                    .as_ref()
+                    .expect("coldstart unit ownership is held"),
                 bridge.as_ref(),
             ) {
                 Ok(entry) => entry,
@@ -671,11 +678,27 @@ where
             &entries,
             inputs,
             host,
-            ownership.as_ref().expect("coldstart unit ownership is held"),
+            ownership
+                .as_ref()
+                .expect("coldstart unit ownership is held"),
             bridge.as_ref(),
         )?;
         prior_socket = Some(observed);
         let request = host.spawn_request(inputs).map_err(ColdstartError::Spawn)?;
+        // Inspect the active bridge under the unit and startup guards before
+        // spawning. Reuse an already loaded bridge with its focus history;
+        // reload an absent bridge before the child subscribes.
+        if let Some(policy) = host.bridge() {
+            let identity = bridge.as_ref().ok_or_else(|| {
+                ColdstartError::Startup(
+                    "Zellij coldstart lost its canonical bridge identity".to_owned(),
+                )
+            })?;
+            let reloader = inputs.reloader.ok_or_else(|| {
+                ColdstartError::Reload("no Zellij bridge reloader for coldstart".to_owned())
+            })?;
+            policy.ensure_loaded(identity, reloader)?;
+        }
         let mut intent = ColdstartSpawnIntent {
             schema_version: 1,
             attempt,
@@ -706,23 +729,6 @@ where
         // The child needs the shared unit guard for registration. Do not hold
         // it while waiting for readiness; the durable PID intent bridges the gap.
         drop(ownership.take());
-        if let Some(policy) = host.bridge() {
-            let reload = (|| {
-                let identity = bridge.as_ref().ok_or_else(|| {
-                    ColdstartError::Startup(
-                        "Zellij coldstart lost its canonical bridge identity".to_owned(),
-                    )
-                })?;
-                let reloader = inputs.reloader.ok_or_else(|| {
-                    ColdstartError::Reload("no Zellij bridge reloader for coldstart".to_owned())
-                })?;
-                policy.reload(identity, reloader)
-            })();
-            if let Err(error) = reload {
-                stop_spawned(inputs.spawner, spawned.take());
-                return Err(error);
-            }
-        }
         wait_before_retry(inputs.spawner, &mut spawned, deadline, inputs.poll_interval).await?;
     }
 }
@@ -883,12 +889,9 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
         .map(|_| BridgeMemberId::new(discovery.to_owned()))
         .transpose()?;
     if verified.status.registration.is_none() {
-        let mut matching = entries
-            .iter()
-            .filter(|known| {
-                known.parsed_host_kind().ok() == Some(host_kind)
-                    && known.discovery_key == discovery
-            });
+        let mut matching = entries.iter().filter(|known| {
+            known.parsed_host_kind().ok() == Some(host_kind) && known.discovery_key == discovery
+        });
         let Some(known) = matching.next().filter(|_| matching.next().is_none()) else {
             return Err(ColdstartError::EndpointConflict(
                 "legacy peer lacks registration authority for adoption or relocation".to_owned(),
@@ -939,7 +942,6 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
         })
         .map_err(ColdstartError::Registry)
 }
-
 
 fn ensure_no_activation_journal(cache_dir: &Path, unit: &UnitKind) -> Result<(), ColdstartError> {
     let path = journal::activation_dir(cache_dir).join(unit.journal_name());
@@ -1148,7 +1150,6 @@ fn recorded_process_is_dead(server_pid: u32) -> Result<bool, ColdstartError> {
     }
 }
 
-
 /// Parent directory of an absolute config file, fail closed.
 fn parent_of(config_file: &Path) -> Result<&Path, ColdstartError> {
     config_file.parent().ok_or_else(|| {
@@ -1207,6 +1208,23 @@ mod tests {
     impl HostReloader for OkReloader {
         fn reload_bridge(&self, _session: &str, _bridge_url: &str) -> Result<(), ActivateError> {
             Ok(())
+        }
+        fn bridge_loaded(&self, _session: &str, _bridge_url: &str) -> Result<bool, ActivateError> {
+            Ok(false)
+        }
+    }
+    struct RejectBridgePresence;
+
+    impl HostReloader for RejectBridgePresence {
+        fn reload_bridge(&self, _session: &str, _bridge_url: &str) -> Result<(), ActivateError> {
+            panic!("failed presence inspection must never issue a reload");
+        }
+
+        fn bridge_loaded(&self, session: &str, _bridge_url: &str) -> Result<bool, ActivateError> {
+            Err(ActivateError::Reload {
+                session: session.to_owned(),
+                detail: "host plugin inventory unavailable".to_owned(),
+            })
         }
     }
 
@@ -1473,151 +1491,163 @@ mod tests {
         }
     }
 
-/// Each fixture has one immutable host identity and owns its registry APIs.
-trait FixtureHost: Copy {
-    fn owned_discovery(self) -> HostDiscoveryKey;
-    fn stale_discovery(self) -> HostDiscoveryKey;
-    fn protocol_kind(self) -> HostKind;
-    fn adapter_kind(self) -> muxe_adapter_api::HostKind;
-    fn bridge_identity(self, root: &Path) -> Option<BridgeIdentity>;
-    fn input_host(self, root: &Path, discovery: &HostDiscoveryKey) -> ColdstartHost;
-    fn unit_kind(self, discovery: &HostDiscoveryKey, bridge: Option<&BridgeIdentity>) -> UnitKind;
-    fn register(
-        self,
-        registry: &Registry,
-        cache: &Path,
-        bridge: Option<&BridgeIdentity>,
-        entry: BrokerEntry,
-    ) -> crate::lifecycle::registry::Registration;
-    fn unregister(
-        self,
-        registry: &Registry,
-        cache: &Path,
-        bridge: Option<&BridgeIdentity>,
-        registration: &crate::lifecycle::registry::Registration,
-    ) -> bool;
-}
+    /// Each fixture has one immutable host identity and owns its registry APIs.
+    trait FixtureHost: Copy {
+        fn owned_discovery(self) -> HostDiscoveryKey;
+        fn stale_discovery(self) -> HostDiscoveryKey;
+        fn protocol_kind(self) -> HostKind;
+        fn adapter_kind(self) -> muxe_adapter_api::HostKind;
+        fn bridge_identity(self, root: &Path) -> Option<BridgeIdentity>;
+        fn input_host(self, root: &Path, discovery: &HostDiscoveryKey) -> ColdstartHost;
+        fn unit_kind(
+            self,
+            discovery: &HostDiscoveryKey,
+            bridge: Option<&BridgeIdentity>,
+        ) -> UnitKind;
+        fn register(
+            self,
+            registry: &Registry,
+            cache: &Path,
+            bridge: Option<&BridgeIdentity>,
+            entry: BrokerEntry,
+        ) -> crate::lifecycle::registry::Registration;
+        fn unregister(
+            self,
+            registry: &Registry,
+            cache: &Path,
+            bridge: Option<&BridgeIdentity>,
+            registration: &crate::lifecycle::registry::Registration,
+        ) -> bool;
+    }
 
-#[derive(Clone, Copy)]
-struct HerdrFixtureHost;
+    #[derive(Clone, Copy)]
+    struct HerdrFixtureHost;
 
-impl FixtureHost for HerdrFixtureHost {
-    fn owned_discovery(self) -> HostDiscoveryKey {
-        HostDiscoveryKey::parse("herdr-owned").unwrap()
-    }
-    fn stale_discovery(self) -> HostDiscoveryKey {
-        HostDiscoveryKey::parse("herdr-stale").unwrap()
-    }
-    fn protocol_kind(self) -> HostKind {
-        HostKind::Herdr
-    }
-    fn adapter_kind(self) -> muxe_adapter_api::HostKind {
-        muxe_adapter_api::HostKind::Herdr
-    }
-    fn bridge_identity(self, _root: &Path) -> Option<BridgeIdentity> {
-        None
-    }
-    fn input_host(self, root: &Path, discovery: &HostDiscoveryKey) -> ColdstartHost {
-        ColdstartHost::Herdr {
-            discovery_key: discovery.clone(),
-            live_server_id: ServerId::new("server-test"),
-            herdr_binary: PathBuf::from("/bin/false"),
-            herdr_socket: root.join("herdr.sock"),
+    impl FixtureHost for HerdrFixtureHost {
+        fn owned_discovery(self) -> HostDiscoveryKey {
+            HostDiscoveryKey::parse("herdr-owned").unwrap()
+        }
+        fn stale_discovery(self) -> HostDiscoveryKey {
+            HostDiscoveryKey::parse("herdr-stale").unwrap()
+        }
+        fn protocol_kind(self) -> HostKind {
+            HostKind::Herdr
+        }
+        fn adapter_kind(self) -> muxe_adapter_api::HostKind {
+            muxe_adapter_api::HostKind::Herdr
+        }
+        fn bridge_identity(self, _root: &Path) -> Option<BridgeIdentity> {
+            None
+        }
+        fn input_host(self, root: &Path, discovery: &HostDiscoveryKey) -> ColdstartHost {
+            ColdstartHost::Herdr {
+                discovery_key: discovery.clone(),
+                live_server_id: ServerId::new("server-test"),
+                herdr_binary: PathBuf::from("/bin/false"),
+                herdr_socket: root.join("herdr.sock"),
+            }
+        }
+        fn unit_kind(
+            self,
+            discovery: &HostDiscoveryKey,
+            _bridge: Option<&BridgeIdentity>,
+        ) -> UnitKind {
+            UnitKind::Herdr {
+                host_hash: journal::unit_hash(discovery.as_str()),
+            }
+        }
+        fn register(
+            self,
+            registry: &Registry,
+            _cache: &Path,
+            _bridge: Option<&BridgeIdentity>,
+            entry: BrokerEntry,
+        ) -> crate::lifecycle::registry::Registration {
+            registry.register_herdr(entry).unwrap()
+        }
+        fn unregister(
+            self,
+            registry: &Registry,
+            _cache: &Path,
+            _bridge: Option<&BridgeIdentity>,
+            registration: &crate::lifecycle::registry::Registration,
+        ) -> bool {
+            registry.unregister_herdr(registration).unwrap()
         }
     }
-    fn unit_kind(self, discovery: &HostDiscoveryKey, _bridge: Option<&BridgeIdentity>) -> UnitKind {
-        UnitKind::Herdr {
-            host_hash: journal::unit_hash(discovery.as_str()),
-        }
-    }
-    fn register(
-        self,
-        registry: &Registry,
-        _cache: &Path,
-        _bridge: Option<&BridgeIdentity>,
-        entry: BrokerEntry,
-    ) -> crate::lifecycle::registry::Registration {
-        registry.register_herdr(entry).unwrap()
-    }
-    fn unregister(
-        self,
-        registry: &Registry,
-        _cache: &Path,
-        _bridge: Option<&BridgeIdentity>,
-        registration: &crate::lifecycle::registry::Registration,
-    ) -> bool {
-        registry.unregister_herdr(registration).unwrap()
-    }
-}
 
-#[derive(Clone, Copy)]
-struct ZellijFixtureHost;
+    #[derive(Clone, Copy)]
+    struct ZellijFixtureHost;
 
-impl FixtureHost for ZellijFixtureHost {
-    fn owned_discovery(self) -> HostDiscoveryKey {
-        HostDiscoveryKey::parse("session-test").unwrap()
-    }
-    fn stale_discovery(self) -> HostDiscoveryKey {
-        HostDiscoveryKey::parse("session-test").unwrap()
-    }
-    fn protocol_kind(self) -> HostKind {
-        HostKind::Zellij
-    }
-    fn adapter_kind(self) -> muxe_adapter_api::HostKind {
-        muxe_adapter_api::HostKind::Zellij
-    }
-    fn bridge_identity(self, root: &Path) -> Option<BridgeIdentity> {
-        Some(integration::bridge_identity(root).unwrap())
-    }
-    fn input_host(self, _root: &Path, discovery: &HostDiscoveryKey) -> ColdstartHost {
-        ColdstartHost::Zellij {
-            session: discovery.clone(),
-            zellij_exe: PathBuf::from("/bin/false"),
+    impl FixtureHost for ZellijFixtureHost {
+        fn owned_discovery(self) -> HostDiscoveryKey {
+            HostDiscoveryKey::parse("session-test").unwrap()
+        }
+        fn stale_discovery(self) -> HostDiscoveryKey {
+            HostDiscoveryKey::parse("session-test").unwrap()
+        }
+        fn protocol_kind(self) -> HostKind {
+            HostKind::Zellij
+        }
+        fn adapter_kind(self) -> muxe_adapter_api::HostKind {
+            muxe_adapter_api::HostKind::Zellij
+        }
+        fn bridge_identity(self, root: &Path) -> Option<BridgeIdentity> {
+            Some(integration::bridge_identity(root).unwrap())
+        }
+        fn input_host(self, _root: &Path, discovery: &HostDiscoveryKey) -> ColdstartHost {
+            ColdstartHost::Zellij {
+                session: discovery.clone(),
+                zellij_exe: PathBuf::from("/bin/false"),
+            }
+        }
+        fn unit_kind(
+            self,
+            _discovery: &HostDiscoveryKey,
+            bridge: Option<&BridgeIdentity>,
+        ) -> UnitKind {
+            UnitKind::Zellij {
+                bridge_unit: bridge.expect("fixed Zellij fixture has bridge").unit(),
+            }
+        }
+        fn register(
+            self,
+            registry: &Registry,
+            cache: &Path,
+            bridge: Option<&BridgeIdentity>,
+            entry: BrokerEntry,
+        ) -> crate::lifecycle::registry::Registration {
+            let identity = bridge.expect("fixed Zellij fixture has bridge");
+            let guard = BridgeUnitGuard::acquire(cache, identity.clone()).unwrap();
+            let Some(handoff) = entry.handoff_id else {
+                return registry.register_zellij(&guard, entry).unwrap();
+            };
+            let mut old = entry.clone();
+            old.handoff_id = None;
+            old.registration_id =
+                Some(muxe_protocol::control::BrokerRegistrationId::generate().unwrap());
+            registry.register_zellij(&guard, old).unwrap();
+            let capability = super::super::registry::TargetRegistrationCapability::new(
+                identity.clone(),
+                entry.bridge_member.clone().expect("fixed bridge member"),
+                entry.socket.clone(),
+                entry.discovery_key.clone(),
+                handoff,
+            );
+            registry.register_zellij_target(&capability, entry).unwrap()
+        }
+        fn unregister(
+            self,
+            registry: &Registry,
+            cache: &Path,
+            bridge: Option<&BridgeIdentity>,
+            registration: &crate::lifecycle::registry::Registration,
+        ) -> bool {
+            let identity = bridge.expect("fixed Zellij fixture has bridge");
+            let guard = BridgeUnitGuard::acquire(cache, identity.clone()).unwrap();
+            registry.unregister_zellij(&guard, registration).unwrap()
         }
     }
-    fn unit_kind(self, _discovery: &HostDiscoveryKey, bridge: Option<&BridgeIdentity>) -> UnitKind {
-        UnitKind::Zellij {
-            bridge_unit: bridge.expect("fixed Zellij fixture has bridge").unit(),
-        }
-    }
-    fn register(
-        self,
-        registry: &Registry,
-        cache: &Path,
-        bridge: Option<&BridgeIdentity>,
-        entry: BrokerEntry,
-    ) -> crate::lifecycle::registry::Registration {
-        let identity = bridge.expect("fixed Zellij fixture has bridge");
-        let guard = BridgeUnitGuard::acquire(cache, identity.clone()).unwrap();
-        let Some(handoff) = entry.handoff_id else {
-            return registry.register_zellij(&guard, entry).unwrap();
-        };
-        let mut old = entry.clone();
-        old.handoff_id = None;
-        old.registration_id =
-            Some(muxe_protocol::control::BrokerRegistrationId::generate().unwrap());
-        registry.register_zellij(&guard, old).unwrap();
-        let capability = super::super::registry::TargetRegistrationCapability::new(
-            identity.clone(),
-            entry.bridge_member.clone().expect("fixed bridge member"),
-            entry.socket.clone(),
-            entry.discovery_key.clone(),
-            handoff,
-        );
-        registry.register_zellij_target(&capability, entry).unwrap()
-    }
-    fn unregister(
-        self,
-        registry: &Registry,
-        cache: &Path,
-        bridge: Option<&BridgeIdentity>,
-        registration: &crate::lifecycle::registry::Registration,
-    ) -> bool {
-        let identity = bridge.expect("fixed Zellij fixture has bridge");
-        let guard = BridgeUnitGuard::acquire(cache, identity.clone()).unwrap();
-        registry.unregister_zellij(&guard, registration).unwrap()
-    }
-}
 
     struct OwnedBrokerFixture<H: FixtureHost> {
         root: tempfile::TempDir,
@@ -1948,7 +1978,11 @@ impl FixtureHost for ZellijFixtureHost {
         let before = fixture.registry.entries().unwrap();
         let guard =
             BridgeUnitGuard::acquire(fixture.root.path(), fixture.bridge.clone().unwrap()).unwrap();
-        let ColdstartHost::Zellij { session, zellij_exe } = &inputs.host else {
+        let ColdstartHost::Zellij {
+            session,
+            zellij_exe,
+        } = &inputs.host
+        else {
             panic!("fixed Zellij fixture must carry a Zellij input");
         };
         let host = ZellijColdstart {
@@ -2039,9 +2073,12 @@ impl FixtureHost for ZellijFixtureHost {
             let config = root.path().join("config.yml");
             std::fs::write(&config, "version: 1\nmenus: {}\n").unwrap();
             let discovery = host.stale_discovery();
-            let endpoint =
-                RuntimeEndpoint::in_runtime_dir(root.path(), host.protocol_kind(), discovery.as_str())
-                    .unwrap();
+            let endpoint = RuntimeEndpoint::in_runtime_dir(
+                root.path(),
+                host.protocol_kind(),
+                discovery.as_str(),
+            )
+            .unwrap();
             endpoint.ensure_owner_directory().unwrap();
             let bridge = host.bridge_identity(root.path());
             let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
@@ -2142,12 +2179,45 @@ impl FixtureHost for ZellijFixtureHost {
                 );
                 assert!(fixture.registry.entries().unwrap().is_empty());
                 assert_eq!(spawner.0.load(Ordering::SeqCst), 1);
+                assert!(
+                    !spawn_intent_path(fixture.root.path(), &fixture.endpoint).exists(),
+                    "failed child spawn must clear its exact durable intent"
+                );
             } else {
                 assert!(outcome.is_err(), "{scenario} cannot mutate or spawn");
                 assert_eq!(fixture.registry.entries().unwrap(), before);
                 assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn failed_bridge_presence_preserves_no_child_or_spawn_intent() {
+        let fixture = StaleFixture::new(ZellijFixtureHost);
+        let spawner = RejectSpawn::default();
+        let reloader = RejectBridgePresence;
+        let inputs = ColdstartInputs {
+            cache_dir: fixture.root.path(),
+            config_file: &fixture.config,
+            executable: Path::new("/bin/false"),
+            endpoint: fixture.endpoint.clone(),
+            host: fixture
+                .host
+                .input_host(fixture.root.path(), &fixture.discovery),
+            current_record: test_record("9.9.9"),
+            spawner: &spawner,
+            control: &LiveControl,
+            reloader: Some(&reloader),
+            readiness_deadline: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(5),
+        };
+        assert!(matches!(
+            ensure_broker(&inputs).await,
+            Err(ColdstartError::Reload(_))
+        ));
+        assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
+        assert!(!spawn_intent_path(fixture.root.path(), &fixture.endpoint).exists());
+        assert!(!fixture.endpoint.socket().exists());
     }
 
     #[tokio::test]
@@ -2166,51 +2236,43 @@ impl FixtureHost for ZellijFixtureHost {
             drop(listener);
             let observed = observe_stale_endpoint(socket).unwrap();
             let entries = fixture.registry.entries().unwrap();
-            let result =
-                fixture
-                    .registry
-                    .remove_exact_stale(
-                        &super::super::registry::HerdrRegistryAuthority,
-                        &entries,
-                        &fixture.recorded,
-                        || {
-                        if race == "pid-reuse" {
-                            assert!(
-                                !recorded_process_is_dead(std::process::id()).unwrap(),
-                                "a reused/live PID never grants removal"
-                            );
-                            return Err(RegistryError::Conflict("PID reused".to_owned()));
-                        }
-                        if race == "symlink" {
-                            std::fs::remove_file(socket).unwrap();
-                            let target = fixture.root.path().join("foreign");
-                            std::fs::write(&target, b"unowned").unwrap();
-                            std::os::unix::fs::symlink(target, socket).unwrap();
-                        } else {
-                            // Keep the displaced inode alive: unlinking it lets some
-                            // filesystems recycle its number for the replacement.
-                            std::fs::rename(
-                                socket,
-                                fixture.root.path().join("displaced-stale-socket"),
-                            )
+            let result = fixture.registry.remove_exact_stale(
+                &super::super::registry::HerdrRegistryAuthority,
+                &entries,
+                &fixture.recorded,
+                || {
+                    if race == "pid-reuse" {
+                        assert!(
+                            !recorded_process_is_dead(std::process::id()).unwrap(),
+                            "a reused/live PID never grants removal"
+                        );
+                        return Err(RegistryError::Conflict("PID reused".to_owned()));
+                    }
+                    if race == "symlink" {
+                        std::fs::remove_file(socket).unwrap();
+                        let target = fixture.root.path().join("foreign");
+                        std::fs::write(&target, b"unowned").unwrap();
+                        std::os::unix::fs::symlink(target, socket).unwrap();
+                    } else {
+                        // Keep the displaced inode alive: unlinking it lets some
+                        // filesystems recycle its number for the replacement.
+                        std::fs::rename(socket, fixture.root.path().join("displaced-stale-socket"))
                             .unwrap();
-                            let rebound = UnixListener::bind(socket).unwrap();
-                            std::fs::set_permissions(
-                                socket,
-                                std::fs::Permissions::from_mode(0o600),
-                            )
+                        let rebound = UnixListener::bind(socket).unwrap();
+                        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
                             .unwrap();
-                            drop(rebound);
-                        }
-                        let current = observe_stale_endpoint(socket)
-                            .map_err(|error| RegistryError::Conflict(error.to_string()))?;
-                        if current != observed {
-                            return Err(RegistryError::Conflict(
-                                "socket identity changed".to_owned(),
-                            ));
-                        }
-                        Ok(())
-                    });
+                        drop(rebound);
+                    }
+                    let current = observe_stale_endpoint(socket)
+                        .map_err(|error| RegistryError::Conflict(error.to_string()))?;
+                    if current != observed {
+                        return Err(RegistryError::Conflict(
+                            "socket identity changed".to_owned(),
+                        ));
+                    }
+                    Ok(())
+                },
+            );
             assert!(result.is_err(), "{race} must fail inside the registry lock");
             assert_eq!(fixture.registry.entries().unwrap(), entries);
         }
@@ -2224,60 +2286,59 @@ impl FixtureHost for ZellijFixtureHost {
         let spawner = RejectSpawn::default();
         let inputs = fixture.inputs(&spawner);
         let unit = host.unit_kind(&fixture.discovery, fixture.bridge.as_ref());
-            let path = journal::activation_dir(fixture.root.path()).join(unit.journal_name());
-            fsutil::write_atomic(&path, b"pending", "owned-journal").unwrap();
-            assert!(matches!(
-                ensure_broker(&inputs).await,
-                Err(ColdstartError::Startup(message)) if message.contains("activation recovery")
-            ));
-            assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
-            fsutil::remove_file_durable(&path, "clear owned journal").unwrap();
-            assert!(matches!(
-                ensure_broker(&inputs).await,
-                Err(ColdstartError::EndpointConflict(_))
-            ));
-            assert_eq!(fixture.registry.entries().unwrap().len(), 1);
-            let mut control =
-                super::super::control::ControlClient::connect(fixture.endpoint.socket())
-                    .await
-                    .unwrap();
-            let gated = control.status().await.unwrap();
-            assert_eq!(gated.phase, ActivationPhase::TargetGated);
-            let mut ui = muxe_broker::BrokerClient::connect(
-                fixture.endpoint.socket(),
-                PeerRole::Ui,
-                "owned-gate-ui",
-                gated.live_server.clone(),
-            )
+        let path = journal::activation_dir(fixture.root.path()).join(unit.journal_name());
+        fsutil::write_atomic(&path, b"pending", "owned-journal").unwrap();
+        assert!(matches!(
+            ensure_broker(&inputs).await,
+            Err(ColdstartError::Startup(message)) if message.contains("activation recovery")
+        ));
+        assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
+        fsutil::remove_file_durable(&path, "clear owned journal").unwrap();
+        assert!(matches!(
+            ensure_broker(&inputs).await,
+            Err(ColdstartError::EndpointConflict(_))
+        ));
+        assert_eq!(fixture.registry.entries().unwrap().len(), 1);
+        let mut control = super::super::control::ControlClient::connect(fixture.endpoint.socket())
             .await
             .unwrap();
-            let attach = ClientRequest::AttachUi(AttachUi {
-                root: MenuId::named("main"),
-                pane: HostPaneId::new("owned-pane"),
-                pending_launch: None,
-                origin: None,
-                caller_identity: None,
-                theme: None,
-                color_scheme: None,
-            });
-            assert!(matches!(
-                ui.request(attach.clone()).await.unwrap(),
-                BrokerResponse::Error(_)
-            ));
-            let committed = control.commit(HandoffId([7; 16])).await.unwrap();
-            assert_eq!(committed.phase, ActivationPhase::TargetCommitted);
-            let ColdstartOutcome::Ready(ready) = ensure_broker(&inputs).await.unwrap() else {
-                panic!("committed target must be attachable after journal clear");
-            };
-            assert_eq!(ready.status.phase, ActivationPhase::TargetCommitted);
-            assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
-            assert!(matches!(
-                ui.request(attach).await.unwrap(),
-                BrokerResponse::UiAttached { .. }
-            ));
-            drop(ui);
-            drop(control);
-            fixture.stop().await;
+        let gated = control.status().await.unwrap();
+        assert_eq!(gated.phase, ActivationPhase::TargetGated);
+        let mut ui = muxe_broker::BrokerClient::connect(
+            fixture.endpoint.socket(),
+            PeerRole::Ui,
+            "owned-gate-ui",
+            gated.live_server.clone(),
+        )
+        .await
+        .unwrap();
+        let attach = ClientRequest::AttachUi(AttachUi {
+            root: MenuId::named("main"),
+            pane: HostPaneId::new("owned-pane"),
+            pending_launch: None,
+            origin: None,
+            caller_identity: None,
+            theme: None,
+            color_scheme: None,
+        });
+        assert!(matches!(
+            ui.request(attach.clone()).await.unwrap(),
+            BrokerResponse::Error(_)
+        ));
+        let committed = control.commit(HandoffId([7; 16])).await.unwrap();
+        assert_eq!(committed.phase, ActivationPhase::TargetCommitted);
+        let ColdstartOutcome::Ready(ready) = ensure_broker(&inputs).await.unwrap() else {
+            panic!("committed target must be attachable after journal clear");
+        };
+        assert_eq!(ready.status.phase, ActivationPhase::TargetCommitted);
+        assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            ui.request(attach).await.unwrap(),
+            BrokerResponse::UiAttached { .. }
+        ));
+        drop(ui);
+        drop(control);
+        fixture.stop().await;
     }
 
     #[tokio::test]

@@ -198,20 +198,34 @@ impl SubprocessChannel {
         pipe_name: String,
         initial_payload: Option<String>,
     ) -> Result<Arc<Self>, PipeTransportError> {
-        let channel = Arc::new(Self {
+        let channel = Self::dormant(zellij_exe, session, pipe_name, initial_payload);
+        channel.respawn_inner(None).await?;
+        Ok(channel)
+    }
+
+    /// Holds exact child argv without starting a pipe. `next_line` waits for
+    /// the first explicit `respawn`, so a target can bind its gated endpoint
+    /// before a journal-authorized bridge reload without subscribing to the
+    /// predecessor plugin.
+    #[must_use]
+    pub fn dormant(
+        zellij_exe: PathBuf,
+        session: String,
+        pipe_name: String,
+        initial_payload: Option<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             state: Mutex::new(None),
             lifecycle: Mutex::new(()),
             state_notify: Notify::new(),
-            replacing: AtomicBool::new(false),
+            replacing: AtomicBool::new(true),
             epochs: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             zellij_exe,
             session,
             pipe_name,
             initial_payload: Mutex::new(initial_payload),
-        });
-        channel.respawn_inner(None).await?;
-        Ok(channel)
+        })
     }
 
     /// Kills and reaps the old child, then starts its replacement.
@@ -955,6 +969,32 @@ exec sleep 60
             channel.next_line().await,
             Err(PipeTransportError::Closed)
         ));
+        channel.close().await;
+    }
+
+    #[tokio::test]
+    async fn dormant_target_pipe_waits_for_reloaded_bridge_before_first_child() {
+        let (_dir, exe) = write_fake_zellij(ECHO_SCRIPT);
+        let channel = SubprocessChannel::dormant(
+            exe,
+            "target-session".to_owned(),
+            "muxe-event-target-session".to_owned(),
+            None,
+        );
+        assert_eq!(channel.install_epoch().await, None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), channel.next_line())
+                .await
+                .is_err(),
+            "a gated target must not receive predecessor-bridge events"
+        );
+        channel
+            .respawn()
+            .await
+            .expect("authorized reload starts first child");
+        assert_eq!(channel.install_epoch().await, Some(1));
+        channel.send_line("fresh\n".to_owned()).await.unwrap();
+        assert_eq!(channel.next_line().await.unwrap(), "got:fresh");
         channel.close().await;
     }
 

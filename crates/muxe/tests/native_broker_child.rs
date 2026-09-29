@@ -457,8 +457,13 @@ async fn assert_coldstart_owned_child(scenario: &str) {
     )
     .unwrap();
     let registry = muxe::lifecycle::Registry::open(&cache).unwrap();
-    let stale_id =
-        register_stale_owner(scenario, &endpoint, &registry, discovery.as_str(), &current_server);
+    let stale_id = register_stale_owner(
+        scenario,
+        &endpoint,
+        &registry,
+        discovery.as_str(),
+        &current_server,
+    );
     let spawner = ScopedColdstartSpawner::new(root.path());
     let executable = Path::new(env!("CARGO_BIN_EXE_muxe"));
     let inputs = ColdstartInputs {

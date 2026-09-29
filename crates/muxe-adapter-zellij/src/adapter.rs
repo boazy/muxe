@@ -72,7 +72,7 @@ use crate::{
     capture::CaptureTable,
     origin::{OriginError, build_origin_context},
     parse::candidate_to_raw,
-    pipes::{PipeChannel, PipeTransportError, RELEASE_TIMEOUT, channel_names},
+    pipes::{PipeChannel, PipeTransportError, RELEASE_TIMEOUT, SubprocessChannel, channel_names},
     portable::{
         PortableError, PortableMapping, creation_requires_post_dismissal, map_portable,
         map_post_dismissal_creation,
@@ -769,6 +769,33 @@ pub struct ZellijAdapter {
     inner: Arc<AdapterInner>,
 }
 
+/// Exact dormant pipe children for one gated activation target. Only the
+/// journal-authorized owner starts them after the replacement bridge reload.
+pub struct DeferredPipes {
+    request: Arc<SubprocessChannel>,
+    event: Arc<SubprocessChannel>,
+}
+
+impl DeferredPipes {
+    /// Starts both retained children once, after the owner's reload barrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns the child spawn failure; a partially started request child is
+    /// parked before returning so no adapter retains half a live transport.
+    pub async fn start(self) -> Result<(), AdapterError> {
+        self.request
+            .respawn()
+            .await
+            .map_err(|error| transport_error(&error))?;
+        if let Err(error) = self.event.respawn().await {
+            self.request.park().await;
+            return Err(transport_error(&error));
+        }
+        Ok(())
+    }
+}
+
 impl ZellijAdapter {
     /// Builds the adapter over injected channels and starts the event loop.
     ///
@@ -882,7 +909,6 @@ impl ZellijAdapter {
     /// child cannot be spawned. No host state is modified beyond spawning the
     /// two CLI children.
     pub async fn connect(config: ZellijAdapterConfig) -> Result<Self, AdapterError> {
-        use crate::pipes::SubprocessChannel;
         config.validate()?;
         let (request_name, event_name) = channel_names(&config.session_name);
         let request = SubprocessChannel::launch(
@@ -903,6 +929,41 @@ impl ZellijAdapter {
         .await
         .map_err(|error| transport_error(&error))?;
         Ok(Self::new(config, request, event))
+    }
+
+    /// Constructs a gated target without subscribing either pipe to the
+    /// predecessor bridge. The event loop waits on the dormant child until
+    /// the owner proves the durable replacement-reload barrier and starts
+    /// [`DeferredPipes`]; reserved identity and `TargetGated` control remain
+    /// available before then.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid static configuration or subscription payload.
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the fixed public adapter error returned across this module"
+    )]
+    pub fn connect_deferred(
+        config: ZellijAdapterConfig,
+    ) -> Result<(Self, DeferredPipes), AdapterError> {
+        config.validate()?;
+        let (request_name, event_name) = channel_names(&config.session_name);
+        let subscribe = subscription_payload(ChannelGeneration::INITIAL)?;
+        let request = SubprocessChannel::dormant(
+            config.zellij_exe.clone(),
+            config.session_name.clone(),
+            request_name,
+            None,
+        );
+        let event = SubprocessChannel::dormant(
+            config.zellij_exe.clone(),
+            config.session_name.clone(),
+            event_name,
+            Some(subscribe),
+        );
+        let adapter = Self::new(config, request.clone(), event.clone());
+        Ok((adapter, DeferredPipes { request, event }))
     }
 
     /// Injection point for the contract suite: the request channel under test.
@@ -4676,6 +4737,61 @@ mod tests {
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         (dir, exe)
+    }
+
+    #[tokio::test]
+    async fn gated_target_reserves_identity_without_predecessor_pipe_coverage() {
+        let script = r#"#!/bin/sh
+if [ "$1" != "--session" ] || [ "$3" != "pipe" ] || [ "$4" != "--name" ]; then
+  exit 3
+fi
+printf '%s\n' "$5" >> "$(dirname "$0")/started"
+while IFS= read -r line; do :; done
+"#;
+        let (root, executable) = write_fake_exe(script);
+        let marker = root.path().join("started");
+        let (adapter, deferred) = ZellijAdapter::connect_deferred(ZellijAdapterConfig {
+            session_name: "session-alpha".to_owned(),
+            zellij_exe: executable,
+            readiness_gate: ReadinessGate::temporary(),
+        })
+        .expect("gated target reserves its dormant transport");
+        adapter
+            .reserve_startup_identity()
+            .expect("identity precedes coverage");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !marker.exists(),
+            "predecessor plugin must receive no target pipe"
+        );
+        assert_eq!(adapter.request_channel().install_epoch().await, None);
+        assert_eq!(adapter.event_channel().install_epoch().await, None);
+        assert!(adapter.activation_readiness().await.unwrap().is_none());
+        deferred
+            .start()
+            .await
+            .expect("owner opened the fresh bridge");
+        assert_eq!(adapter.request_channel().install_epoch().await, Some(1));
+        assert_eq!(adapter.event_channel().install_epoch().await, Some(1));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(names) = std::fs::read_to_string(&marker)
+                && names.lines().count() == 2
+            {
+                assert!(names.contains("muxe-request-session-alpha"));
+                assert!(names.contains("muxe-event-session-alpha"));
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owned pipe children never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        adapter
+            .shutdown()
+            .await
+            .expect("owned pipe children are reaped");
     }
 
     async fn poll_outbound(channel: &ScriptedChannel) -> String {

@@ -240,14 +240,32 @@ When Zellij loads the bridge plugin, it displays a host-owned permission prompt.
 
 Zellij keybindings run `muxe ui menu {root}` directly using the native `Run` action. The integration command targets `--zellij-config <path>` if provided, then `$ZELLIJ_CONFIG_DIR/config.kdl`, then `$XDG_CONFIG_HOME/zellij/config.kdl` (falling back to `~/.config/zellij/config.kdl`). For manual root keybindings, add this binding to whichever configuration file your running Zellij instance loads.
 
-Merge the `shared_among "normal" "locked"` block into your existing `keybinds` section, choosing an unused hotkey. While Locked mode is active, that key is reserved to Zellij.
+Merge the `normal` and `locked` blocks into your existing `keybinds` section, choosing an unused hotkey. Each binding issues `SwitchToMode` for its own active mode before `Run`, so the bridge observes that mode rather than guessing a prior mode. The modal menu restores the observed mode after dismissal. While Locked mode is active, this key is reserved to Zellij.
+
+Replace an older `shared_among "normal" "locked"` Run-only binding rather than keeping both versions of `Alt m`. The pinned host does not guarantee an initial `ModeUpdate` to an autoloaded bridge; without the same-mode action, the first menu may fail closed while waiting to capture Locked mode.
 
 To open Muxe as a borderless floating pane across the bottom (recommended), add this binding:
 
 ```kdl
 keybinds {
-    shared_among "normal" "locked" {
+    normal {
         bind "Alt m" {
+            SwitchToMode "Normal"
+            Run "muxe" "ui" "menu" "main" {
+                floating true
+                x "0"
+                y "70%"
+                width "100%"
+                height "30%"
+                borderless true
+                close_on_exit true
+                start_suspended false
+            }
+        }
+    }
+    locked {
+        bind "Alt m" {
+            SwitchToMode "Locked"
             Run "muxe" "ui" "menu" "main" {
                 floating true
                 x "0"
@@ -268,8 +286,19 @@ keybinds {
 To open Muxe as a tiled pane split downward instead (using Zellij's initial split sizing), use this binding:
 ```kdl
 keybinds {
-    shared_among "normal" "locked" {
+    normal {
         bind "Alt m" {
+            SwitchToMode "Normal"
+            Run "muxe" "ui" "menu" "main" {
+                direction "Down"
+                close_on_exit true
+                start_suspended false
+            }
+        }
+    }
+    locked {
+        bind "Alt m" {
+            SwitchToMode "Locked"
             Run "muxe" "ui" "menu" "main" {
                 direction "Down"
                 close_on_exit true
@@ -378,6 +407,10 @@ The `control-json-v1` protocol is additive: unknown fields are ignored and new s
 New activation journals use schema v5. Schemas v3 and v4 remain readable for rollback before Ready. Earlier Ready journals lack exact target-incarnation proof and remain preserved instead of authorizing a commit. Corrupt or unsupported journals are also preserved for diagnosis.
 
 For Zellij, the coordinator holds the bridge-unit readiness gate while checking every target at one OS-wide monotonic as-of tick. The v5 Ready proof records the unit epoch ID separately from the tick, the exact member set, and each target's process-scoped registration identity. Herdr Ready records its exact target identity too. This is a broker-observed snapshot, not simultaneous physical host membership: `list-clients` is a snapshot, not a host-issued lease, and clients can attach or detach around it. Later heartbeat expiry does not change the earlier proof. An endpoint and handoff match alone do not establish the recorded target incarnation.
+
+For a Zellij activation, the target broker binds its gated control endpoint without opening bridge pipes. After the coordinator durably records that the replacement bridge reloaded in every selected session, the target opens its request and event pipes and establishes a fresh client census. A journal with different authority or a rollback decision rejects the wait; a predecessor bridge subscription cannot authorize Ready.
+
+On ordinary menu coldstart, Muxe keeps an already loaded, receipt-backed bridge so its observed prior pane survives; if the bridge is absent, Muxe loads the stable bridge before spawning the broker. Zellij reports the loaded plugin's alias rather than its in-memory URL: Muxe checks the receipt, current KDL mapping, and installed bytes, then requires a fresh compatible bridge registration. A loaded incompatible plugin fails closed; the config mapping alone does not attest its running code.
 
 After durable Ready, recovery commits only the original certified target. If that target is missing or replaced, Muxe preserves the journal and does not start a substitute; the old brokers remain stopped or drained as applicable.
 

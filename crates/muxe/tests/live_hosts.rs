@@ -83,8 +83,8 @@ use support::{
     assert_no_preserved_journals, await_activate, await_session_ready, await_target_ready,
     drive_activate, emit_owned_host_log_tails, init_shared_dirs, input_path,
     install_zellij_integration, installed_version, installed_wasm_digest, poll_until,
-    read_broker_record, retire_broker, short_tempdir, spawn_activate, spawn_herdr_client,
-    spawn_serve_herdr, spawn_serve_zellij, validate_installation,
+    read_broker_record, retire_broker, run_cli_bounded, short_tempdir, spawn_activate,
+    spawn_herdr_client, spawn_serve_herdr, spawn_serve_zellij, validate_installation,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -265,7 +265,8 @@ fn combine_body_and_cleanup(body: io::Result<()>, cleanup: io::Result<()>) -> io
 /// client count.
 #[expect(
     clippy::too_many_arguments,
-    reason = "rig builder threads every explicit typed input (case label, init plus install binaries, five pinned binaries/dirs, session table) with absolute paths and no command hook; bundling would hide the typed-input surface the live gate documents"
+    clippy::too_many_lines,
+    reason = "one owned host rig keeps explicit binaries, optional scoped binding, startup, and reverse-order teardown together"
 )]
 async fn bring_hosts(
     case: &str,
@@ -277,6 +278,7 @@ async fn bring_hosts(
     bootstrap: &Path,
     seeder: &Path,
     sessions: &[(&str, usize)],
+    ui_hotkey: Option<&Path>,
 ) -> io::Result<Rig> {
     let root = short_tempdir(&format!("muxe-live-{case}-"))?;
     let scoped_root = root.path().join("scoped");
@@ -297,6 +299,71 @@ async fn bring_hosts(
     // preflight finds receipt-owned bytes. `install_bin` selects the
     // pre-state generation (old for upgrade rehearsal, target for smoke).
     install_zellij_integration(case, install_bin, &host, &scoped_root).await?;
+    if let Some(binary) = ui_hotkey {
+        use std::io::Write as _;
+        let path = binary
+            .to_str()
+            .ok_or_else(|| io::Error::other("owned UI binary path is not UTF-8"))?;
+        let program = serde_json::to_string(path).map_err(io::Error::other)?;
+        let normal_marker =
+            serde_json::to_string(&scoped_root.join("normal-mode.marker").to_string_lossy())
+                .map_err(io::Error::other)?;
+        let locked_marker =
+            serde_json::to_string(&scoped_root.join("locked-mode.marker").to_string_lossy())
+                .map_err(io::Error::other)?;
+        let binding = format!(
+            r#"
+keybinds {{
+    normal {{
+        bind "Alt m" {{
+            SwitchToMode "Normal"
+            Run {program} "ui" "menu" "main" {{
+                floating true
+                x "0"
+                y "70%"
+                width "100%"
+                height "30%"
+                borderless true
+                close_on_exit true
+                start_suspended false
+            }}
+        }}
+        bind "Alt x" {{
+            Run "/usr/bin/touch" {normal_marker} {{
+                close_on_exit true
+                start_suspended false
+            }}
+        }}
+    }}
+    locked {{
+        bind "Alt m" {{
+            SwitchToMode "Locked"
+            Run {program} "ui" "menu" "main" {{
+                floating true
+                x "0"
+                y "70%"
+                width "100%"
+                height "30%"
+                borderless true
+                close_on_exit true
+                start_suspended false
+            }}
+        }}
+        bind "Alt x" {{
+            Run "/usr/bin/touch" {locked_marker} {{
+                close_on_exit true
+                start_suspended false
+            }}
+        }}
+    }}
+}}
+"#
+        );
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(host.config_file())?;
+        config.write_all(binding.as_bytes())?;
+    }
     // Scoped permission grant for the managed bridge location: the exact
     // stable path the coordinator will load (bare path, matching the
     // pinned `Display for RunPluginLocation::File`), seeded with the
@@ -750,6 +817,7 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
         &bootstrap,
         &seeder,
         &[("duo", 2)],
+        None,
     )
     .await?;
     let result = async {
@@ -1434,6 +1502,7 @@ async fn run_target_only_smoke() -> io::Result<()> {
         &bootstrap,
         &seeder,
         &[("smoke", 1)],
+        None,
     )
     .await?;
     let result = async {
@@ -1448,14 +1517,13 @@ async fn run_target_only_smoke() -> io::Result<()> {
         .await?;
         // Pre-transfer sanity: the old broker serves its installed version.
         assert_broker_serving(&herdr_endpoint, "smoke", &target_version).await?;
-        let report =
-            drive_activate(
-                &target_bin,
-                &rig.scoped_root,
-                rig.activate_environment(),
-                "smoke",
-            )
-            .await?;
+        let report = drive_activate(
+            &target_bin,
+            &rig.scoped_root,
+            rig.activate_environment(),
+            "smoke",
+        )
+        .await?;
         eprintln!("[smoke] activate report:\n{report}");
         let live = assert_broker_serving(&herdr_endpoint, "smoke", &target_version).await?;
         if live != rig.discovery {
@@ -1512,13 +1580,7 @@ async fn transfer_to(
     sessions: &[&str],
     case: &str,
 ) -> io::Result<()> {
-    let report = drive_activate(
-        to_bin,
-        &rig.scoped_root,
-        rig.activate_environment(),
-        case,
-    )
-    .await?;
+    let report = drive_activate(to_bin, &rig.scoped_root, rig.activate_environment(), case).await?;
     eprintln!("[matrix] {case} activate report:\n{report}");
     assert_serving_record(herdr_endpoint, case, expected_herdr, &rig.discovery).await?;
     for (endpoint, expected, session) in zellij_endpoints
@@ -1579,6 +1641,7 @@ async fn run_upgrade_and_rollback() -> io::Result<()> {
         &bootstrap,
         &seeder,
         &[("matrix-alpha", 2), ("matrix-beta", 1)],
+        None,
     )
     .await?;
     let result = async {
@@ -1686,6 +1749,7 @@ async fn run_final_session_reload_failure() -> io::Result<()> {
         &bootstrap,
         &seeder,
         &[("fault-alpha", 1), ("fault-beta", 1)],
+        None,
     )
     .await?;
     let result = async {
@@ -1909,6 +1973,566 @@ async fn final_session_reload_failure() {
         panic!("final-session reload failure case failed: {error}");
     }
 }
+/// A previously loaded same-source bridge may cover the target briefly even
+/// when the target subscribed to its predecessor. The post-commit lease
+/// witness must still see the exact retained client after old retirement.
+async fn prove_zellij_coverage_survives_lease(
+    endpoint: &Path,
+    host: &OwnedZellijHost,
+    session: &str,
+) -> io::Result<()> {
+    let mut control = muxe::lifecycle::control::ControlClient::connect(endpoint)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let initial = control
+        .status()
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    drop(control);
+    if initial.handoff_id.is_none() {
+        return Err(io::Error::other("target has no committed handoff"));
+    }
+    await_session_ready(
+        endpoint,
+        "same-source-initial",
+        &initial.current,
+        session,
+        host,
+        session,
+        READY_TIMEOUT,
+    )
+    .await?;
+    tokio::time::sleep(muxe_adapter_zellij::HEARTBEAT_LEASE + std::time::Duration::from_secs(8))
+        .await;
+    let mut control = muxe::lifecycle::control::ControlClient::connect(endpoint)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let current = control
+        .status()
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let snapshot = host.list_clients(session).await?;
+    let ready = current
+        .ready
+        .as_ref()
+        .ok_or_else(|| io::Error::other("target lost readiness after heartbeat lease"))?;
+    if current.lifecycle != muxe_protocol::control::LifecycleState::Running
+        || current.handoff_id != initial.handoff_id
+        || current.live_server != initial.live_server
+        || current.current != initial.current
+        || snapshot.len() != 1
+        || ready.member_clients != 1
+        || ready.member_ids.as_ref() != Some(&snapshot)
+        || ready.registered_clients != snapshot
+    {
+        return Err(io::Error::other(format!(
+            "target lost exact one-client coverage after lease: snapshot={snapshot:?}, status={current:?}"
+        )));
+    }
+    Ok(())
+}
+
+async fn run_same_source_bridge_replacement() -> io::Result<()> {
+    let old_bin = validate_installation(&input_path("MUXE_OLD_INSTALLATION")).await;
+    let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
+    let old_digest = installed_wasm_digest(&old_bin)
+        .await?
+        .ok_or_else(|| io::Error::other("old same-source installation lacks a packaged bridge"))?;
+    let target_digest = installed_wasm_digest(&target_bin).await?.ok_or_else(|| {
+        io::Error::other("target same-source installation lacks a packaged bridge")
+    })?;
+    if old_digest == target_digest
+        || installed_version(&old_bin).await? != installed_version(&target_bin).await?
+    {
+        return Err(io::Error::other(
+            "same-source probe requires one version with distinct producer WASM bytes",
+        ));
+    }
+    let herdr_binary = input_path("MUXE_HERDR_BINARY");
+    let zellij_binary = input_path("MUXE_ZELLIJ_BINARY");
+    let foreground = input_path("MUXE_ZELLIJ_FOREGROUND_BINARY");
+    let bootstrap = input_path("MUXE_ZELLIJ_BOOTSTRAP_BINARY");
+    let seeder = input_path("MUXE_ZELLIJ_PERMISSION_SEEDER");
+    let mut rig = bring_hosts(
+        "same-source",
+        &target_bin,
+        &old_bin,
+        &herdr_binary,
+        &zellij_binary,
+        &foreground,
+        &bootstrap,
+        &seeder,
+        &[("same-source", 1)],
+        None,
+    )
+    .await?;
+    let result = async {
+        let (herdr_endpoint, zellij_endpoints) = serve_old_brokers(
+            &mut rig,
+            &old_bin,
+            &herdr_binary,
+            &zellij_binary,
+            "same-source-old",
+            &["same-source"],
+        )
+        .await?;
+        if stable_digest(&rig.config_file)? != old_digest {
+            return Err(io::Error::other("old bridge does not match its receipt"));
+        }
+        assert_no_preserved_journals(&rig.cache_dir, "same-source-before")?;
+        drive_activate(
+            &target_bin,
+            &rig.scoped_root,
+            rig.activate_environment(),
+            "same-source",
+        )
+        .await?;
+        if stable_digest(&rig.config_file)? != target_digest {
+            return Err(io::Error::other("target bridge bytes were not installed"));
+        }
+        assert_no_preserved_journals(&rig.cache_dir, "same-source-after")?;
+        let version = installed_version(&target_bin).await?;
+        assert_broker_serving(&herdr_endpoint, "same-source-herdr", &version).await?;
+        let endpoint = zellij_endpoints
+            .first()
+            .ok_or_else(|| io::Error::other("same-source host has no broker endpoint"))?;
+        assert_broker_serving(endpoint, "same-source-zellij", &version).await?;
+        let host = rig
+            .zellij
+            .as_ref()
+            .ok_or_else(|| io::Error::other("owned Zellij host disappeared"))?;
+        prove_zellij_coverage_survives_lease(endpoint, host, "same-source").await
+    }
+    .await;
+    rig.finish("same-source", result).await
+}
+
+#[tokio::test]
+#[ignore = "live same-source debug/release installations and explicit host approval required"]
+async fn same_source_bridge_replacement_retains_live_client_past_lease() {
+    require_live_approval();
+    if let Err(error) = run_same_source_bridge_replacement().await {
+        panic!("same-source bridge replacement smoke failed: {error}");
+    }
+}
+
+async fn ordinary_zellij_client_coverage(
+    endpoint: &Path,
+    host: &OwnedZellijHost,
+    session: &str,
+    expected: &CompatibilityRecord,
+) -> Result<(), String> {
+    let census = host
+        .list_clients(session)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut control = muxe::lifecycle::control::ControlClient::connect(endpoint)
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = control.status().await.map_err(|error| error.to_string())?;
+    let covered = status.ready.as_ref().is_some_and(|ready| {
+        ready.member_clients == 1
+            && ready.member_ids.as_ref() == Some(&census)
+            && ready.registered_clients == census
+    });
+    if status.handoff_id.is_none()
+        && status.lifecycle == muxe_protocol::control::LifecycleState::Running
+        && status.current == *expected
+        && status.live_server.discovery_key == session
+        && census.len() == 1
+        && covered
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "ordinary menu coldstart lost exact client coverage: status={status:?}, census={census:?}"
+        ))
+    }
+}
+
+async fn assert_live_zellij_menu_pane(
+    host: &OwnedZellijHost,
+    zellij_binary: &Path,
+    scoped_root: &Path,
+    workdir: &Path,
+    session: &str,
+    target_bin: &Path,
+) -> io::Result<()> {
+    let mut command = tokio::process::Command::new(zellij_binary);
+    command.args([
+        "--session",
+        session,
+        "action",
+        "list-panes",
+        "--all",
+        "--json",
+    ]);
+    host.apply_host_scoped_env(&mut command, scoped_root);
+    command.current_dir(workdir);
+    let output = run_cli_bounded("menu-live-pane", &mut command).await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "cannot inspect menu panes: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let panes: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+    let target = target_bin
+        .to_str()
+        .ok_or_else(|| io::Error::other("target installation is not UTF-8"))?;
+    let mut menus = panes.iter().filter(|pane| {
+        pane.get("terminal_command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| command.contains(target) && command.contains(" ui menu main"))
+    });
+    let menu = menus.next().ok_or_else(|| {
+        io::Error::other(format!(
+            "no live UI command pane: {}",
+            String::from_utf8_lossy(&output.stdout)
+        ))
+    })?;
+    if menus.next().is_some()
+        || menu.get("is_plugin").and_then(serde_json::Value::as_bool) != Some(false)
+        || menu.get("is_focused").and_then(serde_json::Value::as_bool) != Some(true)
+        || menu.get("exited").and_then(serde_json::Value::as_bool) != Some(false)
+        || menu.get("is_held").and_then(serde_json::Value::as_bool) != Some(false)
+    {
+        return Err(io::Error::other(format!(
+            "UI pane exited, lost focus, or is ambiguous: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )));
+    }
+    let id = menu
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| io::Error::other("UI pane lacks numeric host ID"))?;
+    let pane = muxe_protocol::HostPaneId::new(format!("terminal_{id}"));
+    let mut inventory = tokio::process::Command::new(zellij_binary);
+    inventory.args(["--session", session, "action", "list-clients"]);
+    host.apply_host_scoped_env(&mut inventory, scoped_root);
+    inventory.current_dir(workdir);
+    let clients = run_cli_bounded("menu-live-client", &mut inventory).await?;
+    let text = String::from_utf8_lossy(&clients.stdout);
+    let mut rows = text.lines().skip(1);
+    if !clients.status.success()
+        || rows.next().and_then(|row| row.split_whitespace().nth(1)) != Some(pane.as_str())
+        || rows.next().is_some()
+    {
+        return Err(io::Error::other(format!(
+            "UI pane is not owned by the sole live client: {text}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum OwnedMenuMode {
+    Normal,
+    Locked,
+}
+
+impl OwnedMenuMode {
+    const fn case(self) -> &'static str {
+        match self {
+            Self::Normal => "mn",
+            Self::Locked => "ml",
+        }
+    }
+
+    fn markers(self, root: &Path) -> (PathBuf, PathBuf) {
+        let normal = root.join("normal-mode.marker");
+        let locked = root.join("locked-mode.marker");
+        match self {
+            Self::Normal => (normal, locked),
+            Self::Locked => (locked, normal),
+        }
+    }
+}
+
+/// A public menu on a fresh session must coldstart one broker without a
+/// manually pre-served endpoint, and retain client coverage beyond the lease.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ignored live scenario brackets one fresh Rig and its full public hotkey, lease, dismissal, mode-restoration and teardown proof"
+)]
+async fn run_zellij_menu_coldstart(mode: OwnedMenuMode) -> io::Result<()> {
+    let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
+    let herdr_binary = input_path("MUXE_HERDR_BINARY");
+    let zellij_binary = input_path("MUXE_ZELLIJ_BINARY");
+    let foreground = input_path("MUXE_ZELLIJ_FOREGROUND_BINARY");
+    let bootstrap = input_path("MUXE_ZELLIJ_BOOTSTRAP_BINARY");
+    let seeder = input_path("MUXE_ZELLIJ_PERMISSION_SEEDER");
+    let session = "cold";
+    let mut rig = bring_hosts(
+        mode.case(),
+        &target_bin,
+        &target_bin,
+        &herdr_binary,
+        &zellij_binary,
+        &foreground,
+        &bootstrap,
+        &seeder,
+        &[(session, 1)],
+        Some(&target_bin),
+    )
+    .await?;
+    {
+        use std::io::Write as _;
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rig.config_file)?;
+        config.write_all(b"settings: { timeout: off }\n")?;
+    }
+    let endpoint = muxe_broker::RuntimeEndpoint::in_runtime_dir(
+        rig.scoped_root.join("runtime"),
+        muxe_protocol::HostKind::Zellij,
+        session,
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?
+    .socket()
+    .to_path_buf();
+    let result = async {
+        if endpoint.exists() {
+            return Err(io::Error::other(
+                "fresh menu host unexpectedly has a broker",
+            ));
+        }
+        let host = rig
+            .zellij
+            .as_ref()
+            .ok_or_else(|| io::Error::other("owned host is gone"))?;
+        let mut inventory = tokio::process::Command::new(&zellij_binary);
+        inventory.args(["--session", session, "action", "list-clients"]);
+        host.apply_host_scoped_env(&mut inventory, &rig.scoped_root);
+        inventory.current_dir(&rig.workdir);
+        let observed = run_cli_bounded("menu-origin-inventory", &mut inventory).await?;
+        eprintln!(
+            "[cold] attached client inventory before menu input: status={:?}, {}",
+            observed.status,
+            String::from_utf8_lossy(&observed.stdout)
+        );
+        if String::from_utf8_lossy(&observed.stdout).contains("zellij:about") {
+            // The pinned first-client bootstrap opens the host-owned About
+            // overlay. Its own Esc binding closes it; only a subsequently
+            // observed terminal pane may act as the public menu origin.
+            rig.pty_clients
+                .first_mut()
+                .ok_or_else(|| io::Error::other("owned interactive client is gone"))?
+                .send_input(b"\x1b")
+                .await?;
+        }
+        let origin = poll_until(
+            "attached shell pane after host overlay",
+            std::time::Duration::from_secs(5),
+            || async {
+                let mut inventory = tokio::process::Command::new(&zellij_binary);
+                inventory.args(["--session", session, "action", "list-clients"]);
+                host.apply_host_scoped_env(&mut inventory, &rig.scoped_root);
+                inventory.current_dir(&rig.workdir);
+                let output = run_cli_bounded("menu-shell-inventory", &mut inventory)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let text = String::from_utf8_lossy(&output.stdout);
+                let mut rows = text.lines().skip(1);
+                let row = rows
+                    .next()
+                    .ok_or_else(|| format!("no attached client: {text}"))?;
+                let pane = row.split_whitespace().nth(1).unwrap_or("");
+                if !output.status.success()
+                    || rows.next().is_some()
+                    || !pane.starts_with("terminal_")
+                {
+                    return Err(format!("client has no unique focused shell pane: {text}"));
+                }
+                Ok(text.into_owned())
+            },
+        )
+        .await?;
+        eprintln!("[cold] real menu origin: {origin}");
+        // Let the bridge see another host census with focus on the actual
+        // terminal. The just-dismissed About pane is not a valid menu origin.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if matches!(mode, OwnedMenuMode::Locked) {
+            // The real client enters Locked through the pinned Ctrl-g binding.
+            rig.pty_clients
+                .first_mut()
+                .ok_or_else(|| io::Error::other("owned interactive client is gone"))?
+                .send_input(b"\x07")
+                .await?;
+        }
+        // The real attached client triggers the documented native Run
+        // keybinding. This is not an external CLI pretending to own a client.
+        rig.pty_clients
+            .first_mut()
+            .ok_or_else(|| io::Error::other("owned interactive client is gone"))?
+            .send_input(b"\x1bm")
+            .await?;
+        if let Err(error) = poll_until(
+            "menu-created ordinary Zellij endpoint",
+            std::time::Duration::from_secs(15),
+            || {
+                let bound = endpoint.exists();
+                async move {
+                    if bound {
+                        Ok(())
+                    } else {
+                        Err("no broker endpoint yet".to_owned())
+                    }
+                }
+            },
+        )
+        .await
+        {
+            let mut dump = tokio::process::Command::new(&zellij_binary);
+            dump.args([
+                "--session",
+                session,
+                "action",
+                "dump-screen",
+                "--pane-id",
+                "terminal_1",
+            ]);
+            host.apply_host_scoped_env(&mut dump, &rig.scoped_root);
+            dump.current_dir(&rig.workdir);
+            let output = run_cli_bounded("menu-ui-screen", &mut dump).await?;
+            return Err(io::Error::other(format!(
+                "{error}; UI pane screen: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )));
+        }
+        assert_broker_serving(&endpoint, session, &installed_version(&target_bin).await?).await?;
+        let record = muxe::compatibility::embedded_record().map_err(io::Error::other)?;
+        poll_until("ordinary menu initial coverage", READY_TIMEOUT, || {
+            ordinary_zellij_client_coverage(&endpoint, host, session, &record.handoff)
+        })
+        .await?;
+        poll_until("attached public menu pane", READY_TIMEOUT, || async {
+            assert_live_zellij_menu_pane(
+                host,
+                &zellij_binary,
+                &rig.scoped_root,
+                &rig.workdir,
+                session,
+                &target_bin,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await?;
+        tokio::time::sleep(
+            muxe_adapter_zellij::HEARTBEAT_LEASE + std::time::Duration::from_secs(8),
+        )
+        .await;
+        ordinary_zellij_client_coverage(&endpoint, host, session, &record.handoff)
+            .await
+            .map_err(io::Error::other)?;
+        assert_live_zellij_menu_pane(
+            host,
+            &zellij_binary,
+            &rig.scoped_root,
+            &rig.workdir,
+            session,
+            &target_bin,
+        )
+        .await?;
+        // Dismiss through the real client, then prove the ordinary broker
+        // survives the UI pane process and still serves its exact record.
+        rig.pty_clients
+            .first_mut()
+            .ok_or_else(|| io::Error::other("owned interactive client is gone"))?
+            .send_input(b"\x1b")
+            .await?;
+        poll_until(
+            "owned menu dismissal",
+            std::time::Duration::from_secs(8),
+            || async {
+                let mut panes = tokio::process::Command::new(&zellij_binary);
+                panes.args([
+                    "--session",
+                    session,
+                    "action",
+                    "list-panes",
+                    "--all",
+                    "--json",
+                ]);
+                host.apply_host_scoped_env(&mut panes, &rig.scoped_root);
+                panes.current_dir(&rig.workdir);
+                let output = run_cli_bounded("menu-dismissed-panes", &mut panes)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let panes: Vec<serde_json::Value> =
+                    serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+                if panes.iter().any(|pane| {
+                    pane.get("terminal_command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|command| command.contains(" ui menu main"))
+                        && pane.get("exited").and_then(serde_json::Value::as_bool) == Some(false)
+                }) {
+                    Err("the menu UI process still owns its pane".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await?;
+        assert_broker_serving(&endpoint, session, &installed_version(&target_bin).await?).await?;
+        // Closing the UI pane precedes the broker's async EndCapture host
+        // action; let that action settle before probing the restored mode.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        rig.pty_clients
+            .first_mut()
+            .ok_or_else(|| io::Error::other("owned interactive client is gone"))?
+            .send_input(b"\x1bx")
+            .await?;
+        let (expected_marker, foreign_marker) = mode.markers(&rig.scoped_root);
+        poll_until(
+            "restored host input mode",
+            std::time::Duration::from_secs(5),
+            || {
+                let expected = expected_marker.exists();
+                let foreign = foreign_marker.exists();
+                async move {
+                    if expected && !foreign {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "expected marker={expected}, foreign marker={foreign}"
+                        ))
+                    }
+                }
+            },
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    let retire = if endpoint.exists() {
+        retire_broker(&endpoint, session).await
+    } else {
+        Ok(())
+    };
+    rig.finish(session, combine_body_and_cleanup(result, retire))
+        .await
+}
+
+#[tokio::test]
+#[ignore = "live pinned hosts, staged installation, and explicit host approval required"]
+async fn zellij_public_menu_coldstart_retains_live_client_past_lease() {
+    require_live_approval();
+    if let Err(error) = run_zellij_menu_coldstart(OwnedMenuMode::Normal).await {
+        panic!("fresh Zellij menu coldstart failed: {error}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live pinned hosts, staged installation, and explicit host approval required"]
+async fn zellij_locked_menu_coldstart_restores_locked_mode() {
+    require_live_approval();
+    if let Err(error) = run_zellij_menu_coldstart(OwnedMenuMode::Locked).await {
+        panic!("fresh Locked-mode Zellij menu coldstart failed: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

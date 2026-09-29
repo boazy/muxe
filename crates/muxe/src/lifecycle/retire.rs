@@ -105,10 +105,9 @@ where
 {
     let label = unit_label(unit);
     let unit_guard = unit.retirement_guard(cache_dir)?;
-    let authority: &dyn RegistryAuthority = unit_guard.as_ref().map_or(
-        &HERDR_AUTHORITY,
-        |guard| guard as &dyn RegistryAuthority,
-    );
+    let authority: &dyn RegistryAuthority = unit_guard
+        .as_ref()
+        .map_or(&HERDR_AUTHORITY, |guard| guard as &dyn RegistryAuthority);
     let entries: Vec<&BrokerEntry> = match unit {
         PlannedUnit::Herdr { entry } => vec![entry],
         PlannedUnit::Zellij { entries, .. } => entries.iter().collect(),

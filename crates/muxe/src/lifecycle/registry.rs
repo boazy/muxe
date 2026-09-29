@@ -1036,7 +1036,12 @@ mod tests {
         let observed = registry.entries().unwrap();
         assert_eq!(
             registry
-                .reconcile_live(&HerdrRegistryAuthority, &observed, candidate.clone(), || Ok(()))
+                .reconcile_live(
+                    &HerdrRegistryAuthority,
+                    &observed,
+                    candidate.clone(),
+                    || Ok(())
+                )
                 .unwrap(),
             candidate
         );
@@ -1049,7 +1054,12 @@ mod tests {
         registry.register(candidate.clone()).unwrap();
         assert!(
             registry
-                .reconcile_live(&HerdrRegistryAuthority, &stale_snapshot, candidate.clone(), || Ok(()))
+                .reconcile_live(
+                    &HerdrRegistryAuthority,
+                    &stale_snapshot,
+                    candidate.clone(),
+                    || Ok(())
+                )
                 .is_err()
         );
         assert_eq!(registry.entries().unwrap(), vec![candidate.clone()]);
@@ -1170,7 +1180,12 @@ mod tests {
         .unwrap();
         let guard = BridgeUnitGuard::acquire(temp.path(), identity.clone()).unwrap();
         let herdr = entry(temp.path().join("herdr.sock"));
-        let zellij = zellij_entry(&identity, "session-a", temp.path().join("zellij.sock"), None);
+        let zellij = zellij_entry(
+            &identity,
+            "session-a",
+            temp.path().join("zellij.sock"),
+            None,
+        );
         assert!(matches!(
             registry.reconcile_live(&HerdrRegistryAuthority, &[], zellij, || {
                 panic!("foreign row must fail before endpoint revalidation")

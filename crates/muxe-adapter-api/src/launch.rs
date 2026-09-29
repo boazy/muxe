@@ -1,6 +1,6 @@
 //! Host-independent command shapes used by native launch composition.
 
-use std::path::Path;
+use std::{ffi::OsStr, path::Path};
 
 /// Reports whether an argv vector begins with Muxe's canonical UI command,
 /// `muxe ui menu`.
@@ -10,15 +10,15 @@ use std::path::Path;
 /// arguments are intentionally left to the selected launch path to validate.
 /// This recognizes command shape only; it does not authorize a launch.
 #[must_use]
-pub fn is_ui_argv(argv: &[String]) -> bool {
+pub fn is_ui_argv<T: AsRef<OsStr>>(argv: &[T]) -> bool {
     let [program, first, second, ..] = argv else {
         return false;
     };
-    Path::new(program)
+    Path::new(program.as_ref())
         .file_name()
         .is_some_and(|name| name == "muxe")
-        && first == "ui"
-        && second == "menu"
+        && first.as_ref() == OsStr::new("ui")
+        && second.as_ref() == OsStr::new("menu")
 }
 
 #[cfg(test)]
@@ -33,7 +33,12 @@ mod tests {
     fn recognizes_only_the_canonical_ui_argv_prefix() {
         assert!(is_ui_argv(&argv(&["muxe", "ui", "menu"])));
         assert!(is_ui_argv(&argv(&["muxe", "ui", "menu", "main"])));
-        assert!(is_ui_argv(&argv(&["/opt/mise/shims/muxe", "ui", "menu", "main"])));
+        assert!(is_ui_argv(&argv(&[
+            "/opt/mise/shims/muxe",
+            "ui",
+            "menu",
+            "main"
+        ])));
         assert!(is_ui_argv(&argv(&["./muxe", "ui", "menu", "main"])));
 
         for args in [

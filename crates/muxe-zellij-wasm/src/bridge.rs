@@ -491,6 +491,16 @@ impl Bridge {
                         }
                         let proven_muxe_ui = is_muxe_running_command(&client.running_command);
                         self.origin.observe(focused, proven_muxe_ui);
+                    } else if self.active.is_none()
+                        && self.pending.is_none()
+                        && self.restoring_mode.is_none()
+                        && self.origin.candidate == Some(focused)
+                        && !is_muxe_running_command(&client.running_command)
+                    {
+                        // A second independent host census while focus stays
+                        // on the same non-UI candidate confirms it. The
+                        // first census alone cannot distinguish a new menu.
+                        self.origin.confirm(focused);
                     }
                     self.focused_pane = Some(focused);
                     break;
@@ -573,24 +583,52 @@ impl Bridge {
     }
 
     fn on_pane_update(&mut self, manifest: &PaneManifest, effects: &mut dyn HostEffects) {
+        let mut focused_hint = None;
+        let mut prior_present = false;
+        let mut confirmed_present = false;
+        let active_tab = self.inventory.active_tab_with_id().0;
         let mut panes = BTreeMap::new();
         for (tab, infos) in &manifest.panes {
             panes.insert(
                 *tab,
                 infos
                     .iter()
-                    .map(|info| PaneGeometry {
-                        id: info.id,
-                        is_plugin: info.is_plugin,
-                        x: info.pane_x,
-                        y: info.pane_y,
-                        columns: info.pane_columns,
-                        rows: info.pane_rows,
+                    .map(|info| {
+                        let pane = PaneGeometry {
+                            id: info.id,
+                            is_plugin: info.is_plugin,
+                            x: info.pane_x,
+                            y: info.pane_y,
+                            columns: info.pane_columns,
+                            rows: info.pane_rows,
+                        };
+                        let id = host_pane_id(pane);
+                        prior_present |= self.focused_pane == Some(id);
+                        confirmed_present |= self.origin.confirmed == Some(id);
+                        if info.is_focused && active_tab == Some(*tab) {
+                            focused_hint = Some(id);
+                        }
+                        pane
                     })
                     .collect(),
             );
         }
         self.inventory.set_manifest(panes);
+        // PaneUpdate is a hint that focus or inventory changed, never an
+        // authority for per-client origin. Ask the host for its client-scoped
+        // census after a focus transition or the prior pane's removal, before
+        // another UI launch can replace that non-UI history. Do not update
+        // origin while a menu owns capture.
+        if self.permission_gate == PermissionGate::Granted
+            && self.active.is_none()
+            && self.pending.is_none()
+            && self.restoring_mode.is_none()
+            && (self.focused_pane.is_some_and(|_| !prior_present)
+                || self.origin.confirmed.is_some_and(|_| !confirmed_present)
+                || focused_hint.is_some_and(|pane| self.focused_pane != Some(pane)))
+        {
+            effects.list_clients();
+        }
         self.try_post_dismissals(effects);
     }
     /// Binds the pending claim pane to a capture lease. The claim and capture
@@ -2890,6 +2928,58 @@ mod tests {
             }
             _ => panic!("expected snapshot, got decline"),
         }
+    }
+
+    /// A startup plugin can be the previously confirmed focus. Its close is
+    /// a manifest transition, not a new client attach; ask the host for the
+    /// same client's shell focus before the first UI takes focus.
+    #[test]
+    fn closed_startup_plugin_reobserves_shell_before_first_ui_claim() {
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Plugin(3))),
+            &mut host,
+        );
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(0))),
+            &mut host,
+        );
+        let before = host.lists;
+        let mut shell = pane_info(0, 0, 0, 80, 20);
+        shell.is_focused = true;
+        bridge.update(Event::PaneUpdate(manifest([(0, vec![shell])])), &mut host);
+        assert_eq!(
+            host.lists,
+            before + 1,
+            "closed prior requests an exact client census"
+        );
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(0))),
+            &mut host,
+        );
+        bridge.update(
+            Event::ListClients(clients_for_command(
+                5,
+                PaneId::Terminal(1),
+                "muxe ui menu main",
+            )),
+            &mut host,
+        );
+        bridge.pipe(
+            request_msg(BridgeRequest::RequestOrigin {
+                ui_session: session("first-ui"),
+                request: ZellijOriginRequest {
+                    ui_pane: "terminal_1".to_owned(),
+                },
+            }),
+            &mut host,
+        );
+        let (_, event) = host.last_event();
+        let PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. }) = event else {
+            panic!("first UI must claim an origin snapshot");
+        };
+        assert_eq!(origin.prior_pane_id.as_deref(), Some("terminal_0"));
+        assert_eq!(origin.ui_pane_id, "terminal_1");
     }
 
     /// H10 exact sequence: `ListClients(origin)`, `ListClients(new UI)`,
