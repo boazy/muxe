@@ -10,6 +10,20 @@
   user host.
 - Preserve diagnostics on failure.
 
+## Host polymorphism
+
+- Host-independent production and test code must not branch on a concrete muxer
+  name or kind to select behavior. No `is_zellij` flags, host-name comparisons,
+  or host-kind `if`/`match` ladders in shared broker, lifecycle, configuration,
+  or test logic. Put host-specific behavior behind required trait methods
+  implemented by each concrete adapter or fixed-identity test adapter. A new
+  muxer should not require edits to shared control flow.
+- A composition boundary may inspect an explicit CLI argument or detected host
+  once to select and construct the concrete adapter or validator. Wire-format
+  conversion may exhaustively map a closed protocol enum when the protocol
+  requires it. Do not pass a host tag downstream to reselect behavior.
+  Branching on host-independent lifecycle states or capabilities is allowed.
+
 ## VCS
 
 - Use `jj` with frequent path-scoped checkpoints. One coordinator owns shared
