@@ -102,15 +102,7 @@ where
     C: ControlPort,
 {
     let label = unit_label(unit);
-    let unit_guard = match unit {
-        PlannedUnit::Zellij {
-            bridge_identity, ..
-        } => Some(super::registry::BridgeUnitGuard::acquire(
-            cache_dir,
-            bridge_identity.clone(),
-        )?),
-        PlannedUnit::Herdr { .. } => None,
-    };
+    let unit_guard = unit.retirement_guard(cache_dir)?;
     let entries: Vec<&BrokerEntry> = match unit {
         PlannedUnit::Herdr { entry } => vec![entry],
         PlannedUnit::Zellij { entries, .. } => entries.iter().collect(),

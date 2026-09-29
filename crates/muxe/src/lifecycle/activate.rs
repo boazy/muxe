@@ -590,15 +590,23 @@ impl HostReloader for ZellijCliReloader {
     }
 }
 
-/// Preflight checks owned by configuration and host-adapter modules.
+/// A selected, fixed-identity host owns its live version and action probes.
 #[expect(
     async_fn_in_trait,
-    reason = "coordinator traits use static dispatch with one implementation per process; no Send bound is required"
+    reason = "the selected host and production preflight use static dispatch"
+)]
+pub trait HostPreflight {
+    async fn validate_live_host(&self, live: &LivePreflight<'_>) -> Result<(), String>;
+}
+
+/// Global configuration check plus the selected host's concrete admission probe.
+#[expect(
+    async_fn_in_trait,
+    reason = "coordinator traits use static dispatch with one implementation per process"
 )]
 pub trait Preflight {
     async fn validate_config(&self) -> Result<(), String>;
-    async fn revalidate_herdr_actions(&self, discovery_key: &str) -> Result<(), String>;
-    async fn check_host_version(&self, host_kind: &str, discovery_key: &str) -> Result<(), String>;
+    async fn validate_host<H: HostPreflight>(&self, host: &H) -> Result<(), String>;
 }
 /// Production preflight: fail-fast configuration and host checks before any
 /// unit mutates.
@@ -694,64 +702,23 @@ impl LivePreflight<'_> {
             let _ = logger.append(&event);
         }
     }
-}
-impl Preflight for LivePreflight<'_> {
-    async fn validate_config(&self) -> Result<(), String> {
-        self.compile_config().map(|_| ())
+
+    fn version_policy(&self) -> Result<muxe_core::HostVersionCheck, String> {
+        self.compile_config()
+            .map_err(|error| format!("cannot read version policy: {error}"))
+            .map(|config| config.host.version_check)
     }
 
-    async fn revalidate_herdr_actions(&self, discovery_key: &str) -> Result<(), String> {
-        self.herdr_runtime(discovery_key).await.map(|_| ())
-    }
-
-    async fn check_host_version(&self, host_kind: &str, discovery_key: &str) -> Result<(), String> {
-        let policy = self
-            .compile_config()
-            .map_err(|error| format!("cannot read version policy: {error}"))?
-            .host
-            .version_check;
-        let (minimum, latest, live) = match host_kind {
-            "herdr" => {
-                let identity = self.herdr_runtime(discovery_key).await?.identity().clone();
-                let version = identity
-                    .live_server_id
-                    .as_str()
-                    .split("/ver:")
-                    .nth(1)
-                    .and_then(|tail| tail.split('/').next())
-                    .ok_or_else(|| {
-                        format!("Herdr host {discovery_key} reports an unrecognized identity shape")
-                    })?;
-                (
-                    crate::compatibility::HERDR_MINIMUM,
-                    crate::compatibility::HERDR_LATEST_VERIFIED,
-                    version.to_owned(),
-                )
-            }
-            "zellij" => {
-                let program = self.zellij_exe.as_ref().ok_or_else(|| {
-                    "no Zellij executable is installed; cannot probe Zellij hosts".to_owned()
-                })?;
-                let output = std::process::Command::new(program)
-                    .arg("--version")
-                    .output()
-                    .map_err(|error| format!("cannot probe the Zellij executable: {error}"))?;
-                if !output.status.success() {
-                    return Err("the Zellij executable refuses its version probe".to_owned());
-                }
-                let text = String::from_utf8_lossy(&output.stdout);
-                let version = text.split_whitespace().nth(1).ok_or_else(|| {
-                    "the Zellij executable reports an unrecognized version line".to_owned()
-                })?;
-                (
-                    crate::compatibility::ZELLIJ_MINIMUM,
-                    crate::compatibility::ZELLIJ_LATEST_VERIFIED,
-                    version.to_owned(),
-                )
-            }
-            other => return Err(format!("unknown host kind {other}")),
-        };
-        let live_numbers = Self::version_numbers(&live).ok_or_else(|| {
+    fn check_version(
+        &self,
+        host: &str,
+        discovery_key: &str,
+        live: &str,
+        minimum: &str,
+        latest: &str,
+        policy: muxe_core::HostVersionCheck,
+    ) -> Result<(), String> {
+        let live_numbers = Self::version_numbers(live).ok_or_else(|| {
             format!("host {discovery_key} reports an unparsable version {live:?}")
         })?;
         let minimum_numbers = Self::version_numbers(minimum).expect("embedded minimum is semver");
@@ -769,11 +736,20 @@ impl Preflight for LivePreflight<'_> {
                 format!("host {discovery_key} runs {live}, newer than latest verified {latest}");
             match policy {
                 muxe_core::HostVersionCheck::Strict => return Err(message),
-                muxe_core::HostVersionCheck::Min => self.warn(host_kind, message),
+                muxe_core::HostVersionCheck::Min => self.warn(host, message),
                 muxe_core::HostVersionCheck::Off => {}
             }
         }
         Ok(())
+    }
+}
+impl Preflight for LivePreflight<'_> {
+    async fn validate_config(&self) -> Result<(), String> {
+        self.compile_config().map(|_| ())
+    }
+
+    async fn validate_host<H: HostPreflight>(&self, host: &H) -> Result<(), String> {
+        host.validate_live_host(self).await
     }
 }
 
@@ -802,6 +778,564 @@ impl PlannedUnit {
                 bridge_unit: bridge_identity.unit(),
             },
         }
+    }
+
+    pub(super) fn retirement_guard(
+        &self,
+        cache_dir: &Path,
+    ) -> Result<Option<super::registry::BridgeUnitGuard>, RegistryError> {
+        match self {
+            Self::Herdr { .. } => Ok(None),
+            Self::Zellij {
+                bridge_identity,
+                entries,
+                census,
+            } => ZellijActivation {
+                identity: bridge_identity,
+                entries,
+                census,
+            }
+            .retirement_guard(cache_dir)
+            .map(Some),
+        }
+    }
+}
+
+/// Host policy is selected from the planned unit at the composition boundary.
+/// The transaction interpreter only sees this contract and durable capabilities.
+trait ActivationHost: HostPreflight {
+    type ReadinessGuard;
+    type ProofSnapshot: Send + 'static;
+
+    fn entries(&self) -> &[BrokerEntry];
+    fn bridge(&self) -> Option<&dyn BridgeActivation>;
+    async fn preflight<P: Preflight>(
+        &self,
+        preflight: &P,
+        config_dir: &Path,
+    ) -> Result<(), String>;
+    fn attests_host(&self, status: &ActivationStatus) -> bool;
+    async fn readiness_guard(
+        &self,
+        cache_dir: &Path,
+        deadline: Instant,
+    ) -> Result<Self::ReadinessGuard, ActivateError>;
+    fn readiness_proof(
+        &self,
+        guard: &Self::ReadinessGuard,
+    ) -> Result<Option<(UnitReadinessEpochId, AsOfTick)>, ActivateError>;
+    fn proof_snapshot(&self) -> Self::ProofSnapshot;
+    fn prove_ready_authority(
+        snapshot: Self::ProofSnapshot,
+        config_dir: &Path,
+        cache_dir: &Path,
+        journal: &ActivationJournal,
+        prepared: &[PreparedAuthority],
+    ) -> Result<Vec<BrokerEntry>, ActivateError>;
+}
+
+/// Bridge transaction operations exist only for a unit with bridge authority.
+/// Durable `journal.bridge()` progress remains the recovery interpreter's input.
+trait BridgeActivation {
+    fn preflight_global(
+        &self,
+        config_dir: &Path,
+        staged_bridge: Option<&StagedBridge>,
+        preparation: &mut GlobalPreflight,
+    ) -> Result<(), String>;
+    fn revalidate_locked(&self, cache_dir: &Path) -> Result<(), String>;
+    fn unchanged_bridge(&self, preparation: &GlobalPreflight) -> bool;
+    fn target_coverage(&self, status: &ActivationStatus, target: &CompatibilityRecord) -> bool;
+    fn retirement_guard(
+        &self,
+        cache_dir: &Path,
+    ) -> Result<super::registry::BridgeUnitGuard, RegistryError>;
+    fn bind_authority(
+        &self,
+        journal: &mut ActivationJournal,
+        preparation: &GlobalPreflight,
+        target: &CompatibilityRecord,
+    ) -> Result<(), ActivateError>;
+    fn install_and_reload(
+        &self,
+        cache_dir: &Path,
+        journal: &mut ActivationJournal,
+        prepared: &[PreparedAuthority],
+        reloader: &dyn HostReloader,
+        hooks: &ActivateHooks,
+    ) -> Result<(), ActivateError>;
+}
+
+struct HerdrActivation<'a>(&'a BrokerEntry);
+
+struct ZellijActivation<'a> {
+    identity: &'a BridgeIdentity,
+    entries: &'a [BrokerEntry],
+    census: &'a MemberCensus,
+}
+
+impl HostPreflight for HerdrActivation<'_> {
+    async fn validate_live_host(&self, live: &LivePreflight<'_>) -> Result<(), String> {
+        let discovery_key = &self.0.discovery_key;
+        let policy = live.version_policy()?;
+        let runtime = live.herdr_runtime(discovery_key).await?;
+        let version = runtime
+            .identity()
+            .live_server_id
+            .as_str()
+            .split("/ver:")
+            .nth(1)
+            .and_then(|tail| tail.split('/').next())
+            .ok_or_else(|| {
+                format!("Herdr host {discovery_key} reports an unrecognized identity shape")
+            })?;
+        live.check_version(
+            "herdr",
+            discovery_key,
+            version,
+            crate::compatibility::HERDR_MINIMUM,
+            crate::compatibility::HERDR_LATEST_VERIFIED,
+            policy,
+        )
+    }
+}
+
+impl HostPreflight for ZellijActivation<'_> {
+    async fn validate_live_host(&self, live: &LivePreflight<'_>) -> Result<(), String> {
+        for entry in self.entries {
+            let policy = live.version_policy()?;
+            let program = live.zellij_exe.as_ref().ok_or_else(|| {
+                "no Zellij executable is installed; cannot probe Zellij hosts".to_owned()
+            })?;
+            let output = std::process::Command::new(program)
+                .arg("--version")
+                .output()
+                .map_err(|error| format!("cannot probe the Zellij executable: {error}"))?;
+            if !output.status.success() {
+                return Err("the Zellij executable refuses its version probe".to_owned());
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let version = text.split_whitespace().nth(1).ok_or_else(|| {
+                "the Zellij executable reports an unrecognized version line".to_owned()
+            })?;
+            live.check_version(
+                "zellij",
+                &entry.discovery_key,
+                version,
+                crate::compatibility::ZELLIJ_MINIMUM,
+                crate::compatibility::ZELLIJ_LATEST_VERIFIED,
+                policy,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl ActivationHost for HerdrActivation<'_> {
+    type ReadinessGuard = ();
+    type ProofSnapshot = ();
+
+    fn entries(&self) -> &[BrokerEntry] {
+        std::slice::from_ref(self.0)
+    }
+
+    fn bridge(&self) -> Option<&dyn BridgeActivation> {
+        None
+    }
+
+    async fn preflight<P: Preflight>(
+        &self,
+        preflight: &P,
+        _config_dir: &Path,
+    ) -> Result<(), String> {
+        preflight.validate_host(self).await
+    }
+
+    fn attests_host(&self, status: &ActivationStatus) -> bool {
+        status.live_server.host == muxe_protocol::wire::HostKind::Herdr
+    }
+
+    async fn readiness_guard(
+        &self,
+        _cache_dir: &Path,
+        _deadline: Instant,
+    ) -> Result<Self::ReadinessGuard, ActivateError> {
+        Ok(())
+    }
+
+    fn readiness_proof(
+        &self,
+        _guard: &Self::ReadinessGuard,
+    ) -> Result<Option<(UnitReadinessEpochId, AsOfTick)>, ActivateError> {
+        Ok(None)
+    }
+
+    fn proof_snapshot(&self) -> Self::ProofSnapshot {}
+
+    fn prove_ready_authority(
+        (): Self::ProofSnapshot,
+        _config_dir: &Path,
+        cache_dir: &Path,
+        _journal: &ActivationJournal,
+        _prepared: &[PreparedAuthority],
+    ) -> Result<Vec<BrokerEntry>, ActivateError> {
+        Ok(Registry::open(cache_dir)?.entries()?)
+    }
+}
+
+impl ActivationHost for ZellijActivation<'_> {
+    type ReadinessGuard = muxe_adapter_zellij::ReadinessGateGuard;
+    type ProofSnapshot = (BridgeIdentity, Vec<BrokerEntry>, MemberCensus);
+
+    fn entries(&self) -> &[BrokerEntry] {
+        self.entries
+    }
+
+    fn bridge(&self) -> Option<&dyn BridgeActivation> {
+        Some(self)
+    }
+
+    async fn preflight<P: Preflight>(
+        &self,
+        preflight: &P,
+        config_dir: &Path,
+    ) -> Result<(), String> {
+        let expected = integration::bridge_identity(config_dir)
+            .map_err(|error| format!("cannot resolve canonical bridge authority: {error}"))?;
+        if *self.identity != expected {
+            return Err(format!(
+                "Zellij unit uses unmanaged bridge identity {}",
+                self.identity
+            ));
+        }
+        preflight.validate_host(self).await
+    }
+
+    fn attests_host(&self, status: &ActivationStatus) -> bool {
+        status.live_server.host == muxe_protocol::wire::HostKind::Zellij
+    }
+
+    async fn readiness_guard(
+        &self,
+        cache_dir: &Path,
+        deadline: Instant,
+    ) -> Result<Self::ReadinessGuard, ActivateError> {
+        muxe_adapter_zellij::ReadinessGate::new(cache_dir.to_path_buf(), self.identity.unit())
+            .shared(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(2)),
+            )
+            .await
+            .map_err(|error| ActivateError::UnitFailed {
+                reason: format!(
+                    "cannot hold broker-observed readiness while sealing as-of proof: {error}"
+                ),
+            })
+    }
+
+    fn readiness_proof(
+        &self,
+        _guard: &Self::ReadinessGuard,
+    ) -> Result<Option<(UnitReadinessEpochId, AsOfTick)>, ActivateError> {
+        let mut bytes = [0_u8; 16];
+        getrandom::getrandom(&mut bytes).map_err(|error| ActivateError::UnitFailed {
+            reason: format!("cannot mint unit readiness epoch: {error}"),
+        })?;
+        let epoch = UnitReadinessEpochId::from_bytes(bytes).map_err(|error| {
+            ActivateError::UnitFailed {
+                reason: format!("invalid unit readiness epoch: {error}"),
+            }
+        })?;
+        let as_of = muxe_adapter_zellij::ReadinessGate::as_of_now().map_err(|error| {
+            ActivateError::UnitFailed {
+                reason: format!("cannot capture common monotonic readiness tick: {error}"),
+            }
+        })?;
+        Ok(Some((epoch, as_of)))
+    }
+
+    fn proof_snapshot(&self) -> Self::ProofSnapshot {
+        (self.identity.clone(), self.entries.to_vec(), self.census.clone())
+    }
+
+    fn prove_ready_authority(
+        (identity, entries, census): Self::ProofSnapshot,
+        config_dir: &Path,
+        cache_dir: &Path,
+        journal: &ActivationJournal,
+        prepared: &[PreparedAuthority],
+    ) -> Result<Vec<BrokerEntry>, ActivateError> {
+        prove_ready_bridge(config_dir, cache_dir, &identity, &entries, &census, journal, prepared)?;
+        let rows = Registry::open(cache_dir)?.entries()?;
+        if rows
+            .iter()
+            .filter(|row| {
+                row.host_kind == "zellij" && row.bridge_identity.as_ref() == Some(&identity)
+            })
+            .count()
+            != prepared.len()
+        {
+            return Err(ActivateError::UnitFailed {
+                reason: "final Ready proof has incomplete target registry membership".to_owned(),
+            });
+        }
+        Ok(rows)
+    }
+}
+
+impl BridgeActivation for ZellijActivation<'_> {
+    fn revalidate_locked(&self, cache_dir: &Path) -> Result<(), String> {
+        let live = Registry::open(cache_dir)
+            .map_err(|error| error.to_string())?
+            .probe()
+            .map_err(|error| error.to_string())?
+            .live;
+        let mut current_entries = live
+            .into_iter()
+            .filter(|entry| {
+                entry.host_kind == "zellij"
+                    && entry.bridge_identity.as_ref() == Some(self.identity)
+            })
+            .collect::<Vec<_>>();
+        current_entries.sort_by(|left, right| left.bridge_member.cmp(&right.bridge_member));
+        let current_census = MemberCensus::from_entries(self.identity, &current_entries)
+            .map_err(|error| error.to_string())?;
+        if &current_census != self.census || current_entries != self.entries {
+            return Err(
+                "Zellij bridge membership changed after preflight; activation aborted before journal or drain"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn unchanged_bridge(&self, preparation: &GlobalPreflight) -> bool {
+        matches!(
+            (&preparation.expected_current, &preparation.verified_bridge),
+            (Some(current), Some(target)) if current == &target.packaged_digest
+        )
+    }
+
+    fn target_coverage(&self, status: &ActivationStatus, target: &CompatibilityRecord) -> bool {
+        target
+            .zellij
+            .as_ref()
+            .and_then(|zellij| zellij.bridge_build_id)
+            .is_some_and(|build_id| !build_id.is_zero())
+            && status.ready.as_ref().is_some_and(zellij_census_covered)
+    }
+
+    fn retirement_guard(
+        &self,
+        cache_dir: &Path,
+    ) -> Result<super::registry::BridgeUnitGuard, RegistryError> {
+        super::registry::BridgeUnitGuard::acquire(cache_dir, self.identity.clone())
+    }
+
+    fn preflight_global(
+        &self,
+        config_dir: &Path,
+        staged_bridge: Option<&StagedBridge>,
+        preparation: &mut GlobalPreflight,
+    ) -> Result<(), String> {
+        let staged = staged_bridge.ok_or_else(|| {
+            "a Zellij unit is selected but no staged replacement bridge was provided".to_owned()
+        })?;
+        let verification = compatibility::verify_packaged_asset(&staged.bytes).map_err(|error| {
+            format!("staged bridge rejected by native package identity: {error}")
+        })?;
+        let identity = integration::bridge_identity(config_dir)
+            .map_err(|error| format!("cannot resolve canonical bridge authority: {error}"))?;
+        let stable = identity.stable_path(std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME));
+        let receipt = integration::receipt::load(identity.directory())
+            .map_err(|error| format!("cannot read integration receipt: {error}"))?
+            .ok_or_else(|| {
+                "activation requires an existing receipt-owned Zellij bridge; install it first"
+                    .to_owned()
+            })?;
+        if receipt.bridge.bridge_identity != identity {
+            return Err(format!(
+                "integration receipt bridge identity {} does not match {}",
+                receipt.bridge.bridge_identity, identity
+            ));
+        }
+        integration::bridge::check_previous(
+            &stable,
+            receipt
+                .bridge
+                .previous_digest
+                .as_ref()
+                .map(integration::receipt::Sha256Digest::as_str),
+        )
+        .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
+        let (eligibility, _) = integration::bridge::check_destination(
+            &stable,
+            Some(receipt.bridge.installed_digest.as_str()),
+        )
+        .map_err(|error| format!("bridge preflight failed: {error}"))?;
+        let expected_current = match eligibility {
+            integration::bridge::Eligibility::Absent => {
+                return Err(
+                    "receipt-owned stable Zellij bridge is absent; refusing activation".to_owned(),
+                );
+            }
+            integration::bridge::Eligibility::EligibleReplace { current_digest } => {
+                Some(current_digest)
+            }
+        };
+        if expected_current.is_some() {
+            fsutil::read_owner_file(&stable)
+                .map_err(|error| format!("bridge destination is not owner-only: {error}"))?;
+        }
+        preparation.verified_bridge = Some(verification);
+        preparation.expected_current = expected_current;
+        preparation.bridge_receipt = Some(receipt.bridge);
+        Ok(())
+    }
+
+    fn bind_authority(
+        &self,
+        journal: &mut ActivationJournal,
+        preparation: &GlobalPreflight,
+        target: &CompatibilityRecord,
+    ) -> Result<(), ActivateError> {
+        let verification =
+            preparation
+                .verified_bridge
+                .as_ref()
+                .ok_or_else(|| ActivateError::UnitFailed {
+                    reason: "Zellij bridge package was not verified".to_owned(),
+                })?;
+        let receipt =
+            preparation
+                .bridge_receipt
+                .clone()
+                .ok_or_else(|| ActivateError::UnitFailed {
+                    reason: "Zellij receipt authority is absent".to_owned(),
+                })?;
+        let old_digest = integration::receipt::Sha256Digest::parse(
+            preparation
+                .expected_current
+                .clone()
+                .ok_or_else(|| ActivateError::UnitFailed {
+                    reason: "receipt-owned stable bridge is absent".to_owned(),
+                })?,
+        )
+        .map_err(|error| ActivateError::UnitFailed {
+            reason: format!("old bridge digest is invalid: {error}"),
+        })?;
+        let target_digest =
+            integration::receipt::Sha256Digest::parse(verification.packaged_digest.clone())
+                .map_err(|error| ActivateError::UnitFailed {
+                    reason: format!("target bridge digest is invalid: {error}"),
+                })?;
+        let receipt_target = integration::receipt::BridgeRecord {
+            bridge_identity: self.identity.clone(),
+            installed_version: target.muxe_version.clone(),
+            installed_digest: target_digest.clone(),
+            previous_digest: Some(old_digest.clone()),
+            bridge_compat: target.zellij.clone(),
+        };
+        let mut receipt_rollback = receipt.clone();
+        receipt_rollback.previous_digest = Some(target_digest.clone());
+        journal.bind_zellij_authority(
+            self.identity.clone(),
+            self.census.clone(),
+            BridgeArtifacts {
+                old: BridgeArtifactId::new(journal.activation_id, BridgeArtifactRole::Old),
+                target: BridgeArtifactId::new(journal.activation_id, BridgeArtifactRole::Target),
+                old_digest,
+                target_digest,
+                receipt_preimage: receipt,
+                receipt_target,
+                receipt_rollback,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn install_and_reload(
+        &self,
+        cache_dir: &Path,
+        journal: &mut ActivationJournal,
+        prepared: &[PreparedAuthority],
+        reloader: &dyn HostReloader,
+        hooks: &ActivateHooks,
+    ) -> Result<(), ActivateError> {
+        revalidate_transaction_membership(
+            cache_dir,
+            self.identity,
+            self.census,
+            self.entries,
+            prepared,
+        )
+        .map_err(|reason| ActivateError::UnitFailed { reason })?;
+        let stable = self
+            .identity
+            .stable_path(std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME));
+        let artifacts = journal
+            .bridge()
+            .expect("validated Zellij journal has artifacts")
+            .artifacts
+            .clone();
+        journal
+            .bridge_mut()
+            .expect("validated Zellij journal has artifacts")
+            .progress = BridgeProgress::TargetInstallIntent;
+        journal::write_journal(cache_dir, journal)?;
+        integration::bridge::install_artifact(
+            self.identity,
+            artifacts.target,
+            &artifacts.target_digest,
+            &stable,
+            &[&artifacts.old_digest, &artifacts.target_digest],
+            false,
+        )?;
+        journal
+            .bridge_mut()
+            .expect("validated Zellij journal has artifacts")
+            .progress = BridgeProgress::TargetInstalled;
+        journal::write_journal(cache_dir, journal)?;
+        hooks.check(ActivateStep::BridgeSwapped)?;
+        let url = integration::kdl::bridge_url(&stable);
+        journal
+            .bridge_mut()
+            .expect("validated Zellij journal has bridge")
+            .progress = BridgeProgress::TargetReloading {
+            active: None,
+            completed: Vec::new(),
+        };
+        journal::write_journal(cache_dir, journal)?;
+        for member in journal.members().to_vec() {
+            if let BridgeProgress::TargetReloading { active, .. } = &mut journal
+                .bridge_mut()
+                .expect("validated Zellij journal has bridge")
+                .progress
+            {
+                *active = Some(member.id.clone());
+            }
+            journal::write_journal(cache_dir, journal)?;
+            reloader.reload_bridge(member.member().as_str(), &url)?;
+            if let BridgeProgress::TargetReloading { active, completed } = &mut journal
+                .bridge_mut()
+                .expect("validated Zellij journal has bridge")
+                .progress
+            {
+                *active = None;
+                if !completed.contains(&member.id) {
+                    completed.push(member.id);
+                }
+            }
+            journal::write_journal(cache_dir, journal)?;
+        }
+        journal
+            .bridge_mut()
+            .expect("validated Zellij journal has bridge")
+            .progress = BridgeProgress::TargetReloaded;
+        journal::write_journal(cache_dir, journal)?;
+        hooks.check(ActivateStep::ReloadIssued)?;
+        Ok(())
     }
 }
 
@@ -1034,101 +1568,50 @@ async fn global_preflight<C, S, R, P>(
 where
     P: Preflight,
 {
-    let zellij_selected = units
-        .iter()
-        .any(|unit| matches!(unit, PlannedUnit::Zellij { .. }));
     let mut preparation = GlobalPreflight {
         verified_bridge: None,
         expected_current: None,
         bridge_receipt: None,
     };
-    if zellij_selected {
-        let staged = inputs.staged_bridge.as_ref().ok_or_else(|| {
-            "a Zellij unit is selected but no staged replacement bridge was provided".to_owned()
-        })?;
-        let verification =
-            compatibility::verify_packaged_asset(&staged.bytes).map_err(|error| {
-                format!("staged bridge rejected by native package identity: {error}")
-            })?;
-        let identity = integration::bridge_identity(inputs.config_dir)
-            .map_err(|error| format!("cannot resolve canonical bridge authority: {error}"))?;
-        let stable = identity.stable_path(std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME));
-        let directory = identity.directory();
-        let receipt = integration::receipt::load(directory)
-            .map_err(|error| format!("cannot read integration receipt: {error}"))?
-            .ok_or_else(|| {
-                "activation requires an existing receipt-owned Zellij bridge; install it first"
-                    .to_owned()
-            })?;
-        if receipt.bridge.bridge_identity != identity {
-            return Err(format!(
-                "integration receipt bridge identity {} does not match {}",
-                receipt.bridge.bridge_identity, identity
-            ));
-        }
-        let receipt_digest = Some(receipt.bridge.installed_digest.as_str());
-        integration::bridge::check_previous(
-            &stable,
-            receipt
-                .bridge
-                .previous_digest
-                .as_ref()
-                .map(integration::receipt::Sha256Digest::as_str),
-        )
-        .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
-        let (eligibility, _) = integration::bridge::check_destination(&stable, receipt_digest)
-            .map_err(|error| format!("bridge preflight failed: {error}"))?;
-        let expected_current = match eligibility {
-            integration::bridge::Eligibility::Absent => {
-                return Err(
-                    "receipt-owned stable Zellij bridge is absent; refusing activation".to_owned(),
-                );
-            }
-            integration::bridge::Eligibility::EligibleReplace { current_digest } => {
-                Some(current_digest)
-            }
-        };
-        if expected_current.is_some() {
-            fsutil::read_owner_file(&stable)
-                .map_err(|error| format!("bridge destination is not owner-only: {error}"))?;
-        }
-        preparation.verified_bridge = Some(verification);
-        preparation.expected_current = expected_current;
-        preparation.bridge_receipt = Some(receipt.bridge);
+    // Select the concrete bridge validator once before any unit mutates.
+    if let Some(bridge) = units.iter().find_map(|unit| match unit {
+        PlannedUnit::Herdr { .. } => None,
+        PlannedUnit::Zellij {
+            bridge_identity,
+            entries,
+            census,
+        } => Some(ZellijActivation {
+            identity: bridge_identity,
+            entries,
+            census,
+        }),
+    }) {
+        bridge.preflight_global(
+            inputs.config_dir,
+            inputs.staged_bridge.as_ref(),
+            &mut preparation,
+        )?;
     }
     inputs.preflight.validate_config().await?;
     for unit in units {
         match unit {
             PlannedUnit::Herdr { entry } => {
-                inputs
-                    .preflight
-                    .check_host_version("herdr", &entry.discovery_key)
-                    .await?;
-                inputs
-                    .preflight
-                    .revalidate_herdr_actions(&entry.discovery_key)
+                HerdrActivation(entry)
+                    .preflight(inputs.preflight, inputs.config_dir)
                     .await?;
             }
             PlannedUnit::Zellij {
                 bridge_identity,
                 entries,
-                ..
+                census,
             } => {
-                let expected =
-                    integration::bridge_identity(inputs.config_dir).map_err(|error| {
-                        format!("cannot resolve canonical bridge authority: {error}")
-                    })?;
-                if *bridge_identity != expected {
-                    return Err(format!(
-                        "Zellij unit uses unmanaged bridge identity {bridge_identity}"
-                    ));
+                ZellijActivation {
+                    identity: bridge_identity,
+                    entries,
+                    census,
                 }
-                for entry in entries {
-                    inputs
-                        .preflight
-                        .check_host_version("zellij", &entry.discovery_key)
-                        .await?;
-                }
+                .preflight(inputs.preflight, inputs.config_dir)
+                .await?;
             }
         }
     }
@@ -1148,6 +1631,43 @@ where
     R: HostReloader,
     P: Preflight,
 {
+    match unit {
+        PlannedUnit::Herdr { entry } => {
+            activate_unit_for(inputs, unit, &HerdrActivation(entry), preparation).await
+        }
+        PlannedUnit::Zellij {
+            bridge_identity,
+            entries,
+            census,
+        } => {
+            activate_unit_for(
+                inputs,
+                unit,
+                &ZellijActivation {
+                    identity: bridge_identity,
+                    entries,
+                    census,
+                },
+                preparation,
+            )
+            .await
+        }
+    }
+}
+
+async fn activate_unit_for<C, S, R, P, H>(
+    inputs: &ActivateInputs<'_, C, S, R, P>,
+    unit: &PlannedUnit,
+    host: &H,
+    preparation: &mut GlobalPreflight,
+) -> UnitOutcome
+where
+    C: ControlPort,
+    S: BrokerSpawner,
+    R: HostReloader,
+    P: Preflight,
+    H: ActivationHost,
+{
     let label = unit_label(unit);
     let _unit_lock = match journal::acquire_unit_lock(inputs.cache_dir, &unit.unit_kind()) {
         Ok(lock) => lock,
@@ -1158,16 +1678,15 @@ where
             };
         }
     };
-    let locked_unit = match revalidate_locked_unit(inputs.cache_dir, unit) {
-        Ok(unit) => unit,
-        Err(reason) => {
-            return UnitOutcome::Failed {
-                unit: label,
-                reason,
-            };
-        }
-    };
-    match activate_unit_inner_prepared(inputs, &locked_unit, preparation).await {
+    if let Some(bridge) = host.bridge()
+        && let Err(reason) = bridge.revalidate_locked(inputs.cache_dir)
+    {
+        return UnitOutcome::Failed {
+            unit: label,
+            reason,
+        };
+    }
+    match activate_unit_inner_prepared(inputs, unit, host, preparation).await {
         Ok(outcome) => outcome,
         Err(ActivateError::FaultInjected { step }) => UnitOutcome::Failed {
             unit: label,
@@ -1189,57 +1708,13 @@ pub(crate) fn unit_label(unit: &PlannedUnit) -> String {
     }
 }
 
-fn revalidate_locked_unit(cache_dir: &Path, planned: &PlannedUnit) -> Result<PlannedUnit, String> {
-    let PlannedUnit::Zellij {
-        bridge_identity,
-        entries,
-        census,
-    } = planned
-    else {
-        return Ok(planned.clone());
-    };
-    let live = Registry::open(cache_dir)
-        .map_err(|error| error.to_string())?
-        .probe()
-        .map_err(|error| error.to_string())?
-        .live;
-    let current_entries = live
-        .into_iter()
-        .filter(|entry| {
-            entry.host_kind == "zellij" && entry.bridge_identity.as_ref() == Some(bridge_identity)
-        })
-        .collect::<Vec<_>>();
-    let current =
-        zellij_unit(bridge_identity.clone(), current_entries).map_err(|error| error.to_string())?;
-    let PlannedUnit::Zellij {
-        entries: current_entries,
-        census: current_census,
-        ..
-    } = &current
-    else {
-        unreachable!("zellij_unit always returns Zellij");
-    };
-    if current_census != census || current_entries != entries {
-        return Err(
-            "Zellij bridge membership changed after preflight; activation aborted before journal or drain"
-                .to_owned(),
-        );
-    }
-    Ok(current)
-}
 fn revalidate_transaction_membership(
     cache_dir: &Path,
-    unit: &PlannedUnit,
-    authorized_target: impl Fn(&BrokerEntry) -> bool,
+    bridge_identity: &BridgeIdentity,
+    census: &MemberCensus,
+    old_entries: &[BrokerEntry],
+    prepared: &[PreparedAuthority],
 ) -> Result<(), String> {
-    let PlannedUnit::Zellij {
-        bridge_identity,
-        census,
-        entries: old_entries,
-    } = unit
-    else {
-        return Ok(());
-    };
     let registry_entries = Registry::open(cache_dir)
         .map_err(|error| error.to_string())?
         .entries()
@@ -1258,8 +1733,13 @@ fn revalidate_transaction_membership(
         if old_entries.contains(current) {
             continue;
         }
-        let authorized =
-            current.bridge_identity.as_ref() == Some(bridge_identity) && authorized_target(current);
+        let authorized = current.bridge_identity.as_ref() == Some(bridge_identity)
+            && prepared.iter().any(|member| {
+                current.bridge_member == member.entry.bridge_member
+                    && current.discovery_key == member.entry.discovery_key
+                    && current.socket == member.entry.socket
+                    && current.handoff_id == Some(member.handoff)
+            });
         if !authorized {
             return Err("registry contains a non-journal-authorized bridge incarnation".to_owned());
         }
@@ -1307,9 +1787,10 @@ where
     clippy::too_many_lines,
     reason = "the normal actor executes the single durable transaction interpreter and persists every intent/result boundary"
 )]
-async fn activate_unit_inner_prepared<C, S, R, P>(
+async fn activate_unit_inner_prepared<C, S, R, P, H>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     unit: &PlannedUnit,
+    host: &H,
     preparation: &mut GlobalPreflight,
 ) -> Result<UnitOutcome, ActivateError>
 where
@@ -1317,18 +1798,16 @@ where
     S: BrokerSpawner,
     R: HostReloader,
     P: Preflight,
+    H: ActivationHost,
 {
     let label = unit_label(unit);
-    let entries: Vec<BrokerEntry> = match unit {
-        PlannedUnit::Herdr { entry } => vec![entry.clone()],
-        PlannedUnit::Zellij { entries, .. } => entries.clone(),
-    };
+    let entries = host.entries();
 
     // Observe exact old records before constructing the complete journal. No
     // Prepare can occur until every handoff and member intent is durable.
     let mut observed = Vec::with_capacity(entries.len());
     let mut all_current = true;
-    for entry in &entries {
+    for entry in entries {
         let mut session = inputs
             .control
             .connect(&entry.socket)
@@ -1357,15 +1836,7 @@ where
         all_current &= status.current == inputs.target;
         observed.push((entry.clone(), status.current));
     }
-    let bridge_current = all_current
-        && match unit {
-            PlannedUnit::Herdr { .. } => true,
-            PlannedUnit::Zellij { .. } => matches!(
-                (&preparation.expected_current, &preparation.verified_bridge),
-                (Some(current), Some(target)) if current == &target.packaged_digest
-            ),
-        };
-    if all_current && bridge_current {
+    if all_current && host.bridge().is_none_or(|bridge| bridge.unchanged_bridge(preparation)) {
         return Ok(UnitOutcome::Unchanged { unit: label });
     }
 
@@ -1388,66 +1859,9 @@ where
         inputs.target.clone(),
         members,
     )?;
-    journal.old_registry.clone_from(&entries);
-
-    if let PlannedUnit::Zellij {
-        bridge_identity,
-        census,
-        ..
-    } = unit
-    {
-        let verification =
-            preparation
-                .verified_bridge
-                .as_ref()
-                .ok_or_else(|| ActivateError::UnitFailed {
-                    reason: "Zellij bridge package was not verified".to_owned(),
-                })?;
-        let receipt =
-            preparation
-                .bridge_receipt
-                .clone()
-                .ok_or_else(|| ActivateError::UnitFailed {
-                    reason: "Zellij receipt authority is absent".to_owned(),
-                })?;
-        let old_digest = integration::receipt::Sha256Digest::parse(
-            preparation
-                .expected_current
-                .clone()
-                .ok_or_else(|| ActivateError::UnitFailed {
-                    reason: "receipt-owned stable bridge is absent".to_owned(),
-                })?,
-        )
-        .map_err(|error| ActivateError::UnitFailed {
-            reason: format!("old bridge digest is invalid: {error}"),
-        })?;
-        let target_digest =
-            integration::receipt::Sha256Digest::parse(verification.packaged_digest.clone())
-                .map_err(|error| ActivateError::UnitFailed {
-                    reason: format!("target bridge digest is invalid: {error}"),
-                })?;
-        let receipt_target = integration::receipt::BridgeRecord {
-            bridge_identity: bridge_identity.clone(),
-            installed_version: inputs.target.muxe_version.clone(),
-            installed_digest: target_digest.clone(),
-            previous_digest: Some(old_digest.clone()),
-            bridge_compat: inputs.target.zellij.clone(),
-        };
-        let mut receipt_rollback = receipt.clone();
-        receipt_rollback.previous_digest = Some(target_digest.clone());
-        journal.bind_zellij_authority(
-            bridge_identity.clone(),
-            census.clone(),
-            BridgeArtifacts {
-                old: BridgeArtifactId::new(activation_id, BridgeArtifactRole::Old),
-                target: BridgeArtifactId::new(activation_id, BridgeArtifactRole::Target),
-                old_digest,
-                target_digest,
-                receipt_preimage: receipt,
-                receipt_target,
-                receipt_rollback,
-            },
-        )?;
+    journal.old_registry.extend_from_slice(entries);
+    if let Some(bridge) = host.bridge() {
+        bridge.bind_authority(&mut journal, preparation, &inputs.target)?;
     }
     let journal_path = journal::write_journal(inputs.cache_dir, &journal)?;
     // Private artifacts are created only after their exact typed identities,
@@ -1504,7 +1918,7 @@ where
     }
 
     let mut prepared = Vec::with_capacity(entries.len());
-    for entry in &entries {
+    for entry in entries {
         let member_index = journal
             .members()
             .iter()
@@ -1680,86 +2094,23 @@ where
             }
         }
     }
+    let authorities = prepared
+        .iter()
+        .map(|member| PreparedAuthority {
+            entry: member.entry.clone(),
+            handoff: member.handoff,
+        })
+        .collect::<Vec<_>>();
     let pre_ready = async {
         inputs.hooks.check(ActivateStep::TargetSpawned)?;
-        if let PlannedUnit::Zellij {
-            bridge_identity, ..
-        } = unit
-        {
-            revalidate_transaction_membership(inputs.cache_dir, unit, |current| {
-                prepared.iter().any(|member| {
-                    current.bridge_member == member.entry.bridge_member
-                        && current.discovery_key == member.entry.discovery_key
-                        && current.socket == member.entry.socket
-                        && current.handoff_id == Some(member.handoff)
-                })
-            })
-            .map_err(|reason| ActivateError::UnitFailed { reason })?;
-            let stable =
-                bridge_identity.stable_path(std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME));
-            let artifacts = journal
-                .bridge()
-                .expect("validated Zellij journal has artifacts")
-                .artifacts
-                .clone();
-            journal
-                .bridge_mut()
-                .expect("validated Zellij journal has artifacts")
-                .progress = BridgeProgress::TargetInstallIntent;
-            journal::write_journal(inputs.cache_dir, &journal)?;
-            integration::bridge::install_artifact(
-                bridge_identity,
-                artifacts.target,
-                &artifacts.target_digest,
-                &stable,
-                &[&artifacts.old_digest, &artifacts.target_digest],
-                false,
+        if let Some(bridge) = host.bridge() {
+            bridge.install_and_reload(
+                inputs.cache_dir,
+                &mut journal,
+                &authorities,
+                inputs.reloader,
+                &inputs.hooks,
             )?;
-            journal
-                .bridge_mut()
-                .expect("validated Zellij journal has artifacts")
-                .progress = BridgeProgress::TargetInstalled;
-            journal::write_journal(inputs.cache_dir, &journal)?;
-            inputs.hooks.check(ActivateStep::BridgeSwapped)?;
-            let url = integration::kdl::bridge_url(&stable);
-            journal
-                .bridge_mut()
-                .expect("validated Zellij journal has bridge")
-                .progress = BridgeProgress::TargetReloading {
-                active: None,
-                completed: Vec::new(),
-            };
-            journal::write_journal(inputs.cache_dir, &journal)?;
-            for member in journal.members().to_vec() {
-                if let BridgeProgress::TargetReloading { active, .. } = &mut journal
-                    .bridge_mut()
-                    .expect("validated Zellij journal has bridge")
-                    .progress
-                {
-                    *active = Some(member.id.clone());
-                }
-                journal::write_journal(inputs.cache_dir, &journal)?;
-                inputs
-                    .reloader
-                    .reload_bridge(member.member().as_str(), &url)?;
-                if let BridgeProgress::TargetReloading { active, completed } = &mut journal
-                    .bridge_mut()
-                    .expect("validated Zellij journal has bridge")
-                    .progress
-                {
-                    *active = None;
-                    if !completed.contains(&member.id) {
-                        completed.push(member.id);
-                    }
-                }
-                journal::write_journal(inputs.cache_dir, &journal)?;
-            }
-            journal
-                .bridge_mut()
-                .expect("validated Zellij journal has bridge")
-                .progress = BridgeProgress::TargetReloaded;
-            journal::write_journal(inputs.cache_dir, &journal)?;
-            inputs.hooks.check(ActivateStep::ReloadIssued)?;
         }
 
         let deadline = Instant::now() + inputs.readiness_deadline;
@@ -1769,6 +2120,7 @@ where
                 &member.entry,
                 &member.handoff,
                 &inputs.target,
+                host,
                 deadline,
                 inputs.poll_interval,
             )
@@ -1799,67 +2151,34 @@ where
         return Ok(rollback_outcome(label, reason, &diagnostics));
     }
     let proof_deadline = Instant::now() + inputs.readiness_deadline;
-    let readiness_guard = if let PlannedUnit::Zellij {
-        bridge_identity, ..
-    } = unit
-    {
-        match muxe_adapter_zellij::ReadinessGate::new(
-            inputs.cache_dir.to_path_buf(),
-            bridge_identity.unit(),
-        )
-        .shared(
-            proof_deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(2)),
-        )
+    let readiness_guard = match host
+        .readiness_guard(inputs.cache_dir, proof_deadline)
         .await
-        {
-            Ok(guard) => Some(guard),
-            Err(error) => {
-                let reason = format!(
-                    "cannot hold broker-observed readiness while sealing as-of proof: {error}"
-                );
-                let diagnostics = rollback_transaction(
-                    inputs,
-                    unit,
-                    &mut journal,
-                    &journal_path,
-                    prepared,
-                    targets,
-                    reason.clone(),
-                )
-                .await;
-                return Ok(rollback_outcome(label, reason, &diagnostics));
-            }
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            let reason = error.to_string();
+            let diagnostics = rollback_transaction(
+                inputs,
+                unit,
+                &mut journal,
+                &journal_path,
+                prepared,
+                targets,
+                reason.clone(),
+            )
+            .await;
+            return Ok(rollback_outcome(label, reason, &diagnostics));
         }
-    } else {
-        None
     };
     let proof_result = async {
-        let epoch = if readiness_guard.is_some() {
-            let mut bytes = [0_u8; 16];
-            getrandom::getrandom(&mut bytes).map_err(|error| ActivateError::UnitFailed {
-                reason: format!("cannot mint unit readiness epoch: {error}"),
-            })?;
-            let epoch = UnitReadinessEpochId::from_bytes(bytes).map_err(|error| {
-                ActivateError::UnitFailed {
-                    reason: format!("invalid unit readiness epoch: {error}"),
-                }
-            })?;
-            let as_of = muxe_adapter_zellij::ReadinessGate::as_of_now().map_err(|error| {
-                ActivateError::UnitFailed {
-                    reason: format!("cannot capture common monotonic readiness tick: {error}"),
-                }
-            })?;
-            Some((epoch, as_of))
-        } else {
-            None
-        };
+        let epoch = host.readiness_proof(&readiness_guard)?;
         let incarnations = prove_ready_unit(
             inputs,
-            unit,
+            host,
             &journal,
             &prepared,
+            &authorities,
             &mut targets,
             epoch,
             proof_deadline,
@@ -1994,7 +2313,7 @@ where
     }
 
     publish_commit_artifacts(inputs.cache_dir, &mut journal)?;
-    if matches!(unit, PlannedUnit::Zellij { .. }) {
+    if host.bridge().is_some() {
         inputs.hooks.check(ActivateStep::ReceiptUpdated)?;
     }
 
@@ -2143,36 +2462,21 @@ pub fn status_attests_journal(status: &ActivationStatus, journal: &ActivationJou
 /// compatible registration, so a partially or spuriously registered target
 /// can never commit. Herdr keeps its subscription/health gate and never
 /// requires this census.
-fn target_ready(
+fn target_ready<H: ActivationHost>(
     status: &ActivationStatus,
     member: &BrokerEntry,
     expected_handoff: &HandoffId,
     target: &CompatibilityRecord,
+    host: &H,
 ) -> bool {
-    if status.current != *target
-        || status.handoff_id != Some(*expected_handoff)
-        || status.live_server.discovery_key != member.discovery_key
-        || status.live_server.host
-            != if member.host_kind == "zellij" {
-                muxe_protocol::wire::HostKind::Zellij
-            } else {
-                muxe_protocol::wire::HostKind::Herdr
-            }
-        || status.target.is_some()
-        || !status_attests_entry(status, member)
-        || status.lifecycle != LifecycleState::Running
-    {
-        return false;
-    }
-    if member.host_kind == "zellij" {
-        let expected_build_id = target
-            .zellij
-            .as_ref()
-            .and_then(|zellij| zellij.bridge_build_id);
-        return expected_build_id.is_some_and(|build_id| !build_id.is_zero())
-            && status.ready.as_ref().is_some_and(zellij_census_covered);
-    }
-    true
+    status.current == *target
+        && status.handoff_id == Some(*expected_handoff)
+        && status.live_server.discovery_key == member.discovery_key
+        && host.attests_host(status)
+        && status.target.is_none()
+        && status_attests_entry(status, member)
+        && status.lifecycle == LifecycleState::Running
+        && host.bridge().is_none_or(|bridge| bridge.target_coverage(status, target))
 }
 
 /// Checks one snapshot round of Zellij commit-gate evidence: the registered
@@ -2205,21 +2509,23 @@ fn zellij_census_covered(ready: &TargetReadiness) -> bool {
     registered == members
 }
 
-async fn wait_ready<C>(
+async fn wait_ready<C, H>(
     control: &C,
     member: &BrokerEntry,
     expected_handoff: &HandoffId,
     target: &CompatibilityRecord,
+    host: &H,
     deadline: Instant,
     poll_interval: Duration,
 ) -> Result<(), ActivateError>
 where
     C: ControlPort,
+    H: ActivationHost,
 {
     loop {
         if let Ok(mut session) = control.connect(&member.socket).await
             && let Ok(status) = session.status().await
-            && target_ready(&status, member, expected_handoff, target)
+            && target_ready(&status, member, expected_handoff, target, host)
         {
             return Ok(());
         }
@@ -2236,11 +2542,12 @@ where
 /// member in a different round; only this fresh pass authorizes the durable
 /// Ready transition. Bridge bytes and receipt prove installed artifacts, not
 /// which WASM a host has loaded; the live per-client snapshot is separate.
-async fn prove_ready_unit<C, S, R, P>(
+async fn prove_ready_unit<C, S, R, P, H>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
-    unit: &PlannedUnit,
+    host: &H,
     journal: &ActivationJournal,
     prepared: &[PreparedMember<C>],
+    authorities: &[PreparedAuthority],
     targets: &mut [OwnedTarget],
     proof: Option<(UnitReadinessEpochId, AsOfTick)>,
     deadline: Instant,
@@ -2250,6 +2557,7 @@ where
     S: BrokerSpawner,
     R: HostReloader,
     P: Preflight,
+    H: ActivationHost,
 {
     journal.validate()?;
     if journal.directive() != TransactionDirective::Activate
@@ -2265,44 +2573,19 @@ where
     }
     let config_dir = inputs.config_dir.to_path_buf();
     let cache_dir = inputs.cache_dir.to_path_buf();
-    let unit_snapshot = unit.clone();
+    let proof_snapshot = host.proof_snapshot();
     let journal_snapshot = journal.clone();
-    let authorities = prepared
-        .iter()
-        .map(|member| PreparedAuthority {
-            entry: member.entry.clone(),
-            handoff: member.handoff,
-        })
-        .collect::<Vec<_>>();
+    let authorities = authorities.to_vec();
     let rows = tokio::time::timeout_at(
         deadline.into(),
         tokio::task::spawn_blocking(move || {
-            prove_ready_bridge(
+            H::prove_ready_authority(
+                proof_snapshot,
                 &config_dir,
                 &cache_dir,
-                &unit_snapshot,
                 &journal_snapshot,
                 &authorities,
-            )?;
-            let rows = Registry::open(&cache_dir)?.entries()?;
-            if let PlannedUnit::Zellij {
-                bridge_identity, ..
-            } = &unit_snapshot
-                && rows
-                    .iter()
-                    .filter(|row| {
-                        row.host_kind == "zellij"
-                            && row.bridge_identity.as_ref() == Some(bridge_identity)
-                    })
-                    .count()
-                    != authorities.len()
-            {
-                return Err(ActivateError::UnitFailed {
-                    reason: "final Ready proof has incomplete target registry membership"
-                        .to_owned(),
-                });
-            }
-            Ok::<Vec<BrokerEntry>, ActivateError>(rows)
+            )
         }),
     )
     .await
@@ -2317,6 +2600,7 @@ where
         incarnations.push(
             prove_ready_member(
                 inputs.control,
+                host,
                 journal,
                 prepared_member,
                 targets,
@@ -2333,18 +2617,12 @@ where
 fn prove_ready_bridge(
     config_dir: &Path,
     cache_dir: &Path,
-    unit: &PlannedUnit,
+    bridge_identity: &BridgeIdentity,
+    old_entries: &[BrokerEntry],
+    census: &MemberCensus,
     journal: &ActivationJournal,
     prepared: &[PreparedAuthority],
 ) -> Result<(), ActivateError> {
-    let PlannedUnit::Zellij {
-        bridge_identity,
-        census,
-        ..
-    } = unit
-    else {
-        return Ok(());
-    };
     if journal.bridge_identity.as_ref() != Some(bridge_identity)
         || journal.member_census.as_ref() != Some(census)
         || journal
@@ -2355,14 +2633,13 @@ fn prove_ready_bridge(
             reason: "final Ready proof lacks exact reloaded bridge authority".to_owned(),
         });
     }
-    revalidate_transaction_membership(cache_dir, unit, |current| {
-        prepared.iter().any(|member| {
-            current.bridge_member == member.entry.bridge_member
-                && current.discovery_key == member.entry.discovery_key
-                && current.socket == member.entry.socket
-                && current.handoff_id == Some(member.handoff)
-        })
-    })
+    revalidate_transaction_membership(
+        cache_dir,
+        bridge_identity,
+        census,
+        old_entries,
+        prepared,
+    )
     .map_err(|reason| ActivateError::UnitFailed { reason })?;
     if integration::bridge_identity(config_dir)? != *bridge_identity {
         return Err(ActivateError::UnitFailed {
@@ -2408,8 +2685,9 @@ fn prove_ready_bridge(
     Ok(())
 }
 
-async fn prove_ready_member<C: ControlPort>(
+async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
     control: &C,
+    host: &H,
     journal: &ActivationJournal,
     prepared: &PreparedMember<C>,
     targets: &mut [OwnedTarget],
@@ -2463,7 +2741,7 @@ async fn prove_ready_member<C: ControlPort>(
         || row.server_pid != target.handle.child.id()
         || row.bridge_identity != prepared.entry.bridge_identity
         || row.bridge_member != prepared.entry.bridge_member
-        || row.handoff_id != (row.host_kind == "zellij").then_some(prepared.handoff)
+        || row.handoff_id != journal.bridge().map(|_| prepared.handoff)
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
@@ -2473,7 +2751,7 @@ async fn prove_ready_member<C: ControlPort>(
         });
     }
     let status = fetch_final_ready_status(control, prepared, row, proof, deadline).await?;
-    if !target_ready(&status, row, &prepared.handoff, &journal.target_record)
+    if !target_ready(&status, row, &prepared.handoff, &journal.target_record, host)
         || !status_attests_journal(&status, journal)
         || row.live_server.as_deref() != Some(status.live_server.server_id.as_str())
         || proof.is_some_and(|(epoch, _)| {
@@ -4775,14 +5053,7 @@ mod tests {
         async fn validate_config(&self) -> Result<(), String> {
             self.fail_config.clone().map_or(Ok(()), Err)
         }
-        async fn revalidate_herdr_actions(&self, _discovery_key: &str) -> Result<(), String> {
-            Ok(())
-        }
-        async fn check_host_version(
-            &self,
-            _host_kind: &str,
-            _discovery_key: &str,
-        ) -> Result<(), String> {
+        async fn validate_host<H: HostPreflight>(&self, _host: &H) -> Result<(), String> {
             Ok(())
         }
     }
@@ -5525,6 +5796,20 @@ mod tests {
         member
     }
 
+    fn zellij_readiness_host<'a>(
+        member: &'a BrokerEntry,
+        census: &'a MemberCensus,
+    ) -> ZellijActivation<'a> {
+        ZellijActivation {
+            identity: member
+                .bridge_identity
+                .as_ref()
+                .expect("fixed Zellij fixture has bridge authority"),
+            entries: std::slice::from_ref(member),
+            census,
+        }
+    }
+
     fn attested(mut status: ActivationStatus, member: &BrokerEntry) -> ActivationStatus {
         status.bridge_unit = member.bridge_identity.as_ref().map(BridgeIdentity::unit);
         if member.host_kind == "zellij" {
@@ -5666,14 +5951,18 @@ mod tests {
             &herdr,
             &expected,
             &target_record(),
+            &HerdrActivation(&herdr),
         ));
         let temp = tempfile::tempdir().unwrap();
         let zellij = attested_zellij_member(temp.path(), socket, "session-a");
+        let census = MemberCensus::default();
+        let host = zellij_readiness_host(&zellij, &census);
         assert!(!target_ready(
             &attested(census_status(expected, "session-a", None), &zellij),
             &zellij,
             &expected,
             &target_record(),
+            &host,
         ));
         assert!(!target_ready(
             &attested(
@@ -5687,6 +5976,7 @@ mod tests {
             &zellij,
             &expected,
             &target_record(),
+            &host,
         ));
         assert!(target_ready(
             &attested(
@@ -5700,6 +5990,7 @@ mod tests {
             &zellij,
             &expected,
             &target_record(),
+            &host,
         ));
         assert!(!target_ready(
             &attested(
@@ -5713,6 +6004,7 @@ mod tests {
             &zellij,
             &handoff(3),
             &target_record(),
+            &host,
         ));
     }
 
@@ -5720,7 +6012,10 @@ mod tests {
     fn target_ready_rejects_missing_or_zero_bridge_build_id() {
         let expected = handoff(9);
         let socket = PathBuf::from("/run/census.sock");
-        let member = census_member(socket, "zellij", "session-a");
+        let temp = tempfile::tempdir().unwrap();
+        let member = attested_zellij_member(temp.path(), socket, "session-a");
+        let census = MemberCensus::default();
+        let host = zellij_readiness_host(&member, &census);
         let ready = Some(ready_census(&["a", "b"], Some(&["a", "b"])));
 
         let mut missing = target_record();
@@ -5729,18 +6024,18 @@ mod tests {
             .as_mut()
             .expect("test target has Zellij compatibility")
             .bridge_build_id = None;
-        let mut missing_status = census_status(expected, "session-a", ready.clone());
+        let mut missing_status = attested(census_status(expected, "session-a", ready.clone()), &member);
         missing_status.current = missing.clone();
-        assert!(!target_ready(&missing_status, &member, &expected, &missing));
+        assert!(!target_ready(&missing_status, &member, &expected, &missing, &host));
 
         let mut zero = target_record();
         zero.zellij
             .as_mut()
             .expect("test target has Zellij compatibility")
             .bridge_build_id = Some(muxe_protocol::SchemaFingerprint([0; 32]));
-        let mut zero_status = census_status(expected, "session-a", ready);
+        let mut zero_status = attested(census_status(expected, "session-a", ready), &member);
         zero_status.current = zero.clone();
-        assert!(!target_ready(&zero_status, &member, &expected, &zero));
+        assert!(!target_ready(&zero_status, &member, &expected, &zero, &host));
     }
 
     /// Serves one fixed readiness status over the real control framing so
@@ -5887,6 +6182,8 @@ mod tests {
         let handoff = handoff(7);
         let partial = temp.path().join("partial.sock");
         let member = attested_zellij_member(temp.path(), partial.clone(), "session-a");
+        let census = MemberCensus::default();
+        let host = zellij_readiness_host(&member, &census);
         serve_readiness_status(
             partial,
             attested(
@@ -5903,6 +6200,7 @@ mod tests {
             &member,
             &handoff,
             &target_record(),
+            &host,
             Instant::now() + Duration::from_millis(150),
             Duration::from_millis(10),
         )
@@ -5914,6 +6212,7 @@ mod tests {
         );
         let full = temp.path().join("full.sock");
         let member = attested_zellij_member(temp.path(), full.clone(), "session-a-full");
+        let host = zellij_readiness_host(&member, &census);
         serve_readiness_status(
             full,
             attested(
@@ -5930,6 +6229,7 @@ mod tests {
             &member,
             &handoff,
             &target_record(),
+            &host,
             Instant::now() + Duration::from_secs(5),
             Duration::from_millis(10),
         )
@@ -6003,6 +6303,8 @@ mod tests {
                     super::super::registry::BridgeMemberId::new("session-late".to_owned()).unwrap(),
                 );
                 worker_registry.register_zellij(&guard, late).unwrap();
+                // The preflight side acquires this lock after the completion signal.
+                drop(guard);
                 registered_tx.send(()).unwrap();
             });
 
@@ -6013,7 +6315,21 @@ mod tests {
             registered_rx.recv().unwrap();
             let _activation_lock =
                 journal::acquire_unit_lock(&cache, &snapshot.unit_kind()).unwrap();
-            let error = revalidate_locked_unit(&cache, &snapshot).unwrap_err();
+            let PlannedUnit::Zellij {
+                bridge_identity,
+                entries,
+                census,
+            } = &snapshot
+            else {
+                panic!("fixed Zellij fixture produced another unit");
+            };
+            let error = ZellijActivation {
+                identity: bridge_identity,
+                entries,
+                census,
+            }
+            .revalidate_locked(&cache)
+            .unwrap_err();
             assert!(error.contains("changed after preflight"));
             assert!(journal::list_journals(&cache).unwrap().is_empty());
         });
@@ -6041,7 +6357,7 @@ mod tests {
         )
         .unwrap();
         let mut bound = Vec::new();
-        for (session, socket) in [("session-a", "a.sock"), ("session-b", "b.sock")] {
+        for (session, socket) in [("session-b", "b.sock"), ("session-a", "a.sock")] {
             let path = temp.path().join(socket);
             bound.push(UnixListener::bind(&path).expect("service listener"));
             let mut entry = BrokerEntry::now("zellij", session, path, std::process::id());
@@ -6073,9 +6389,20 @@ mod tests {
                 entries,
                 census,
             } => {
-                assert_eq!(bridge_identity, &identity);
-                assert_eq!(entries.len(), 2);
+                assert_eq!(
+                    entries.iter().map(|entry| entry.discovery_key.as_str()).collect::<Vec<_>>(),
+                    vec!["session-a", "session-b"],
+                    "selection normalizes registration order"
+                );
                 assert_eq!(census.members().len(), 2);
+                let _lock = journal::acquire_unit_lock(temp.path(), &units[0].unit_kind()).unwrap();
+                ZellijActivation {
+                    identity: bridge_identity,
+                    entries,
+                    census,
+                }
+                .revalidate_locked(temp.path())
+                .expect("the same members in registry insertion order remain admissible");
             }
             unit @ PlannedUnit::Herdr { .. } => panic!("expected one Zellij group, found {unit:?}"),
         }
@@ -6088,6 +6415,8 @@ mod tests {
         let handoff = handoff(11);
         let evolving = temp.path().join("evolving.sock");
         let member = attested_zellij_member(temp.path(), evolving.clone(), "session-a");
+        let census = MemberCensus::default();
+        let host = zellij_readiness_host(&member, &census);
         let empty_round = attested(
             census_status(handoff, "session-a", Some(ready_census(&[], Some(&["a"])))),
             &member,
@@ -6106,6 +6435,7 @@ mod tests {
             &member,
             &handoff,
             &target_record(),
+            &host,
             Instant::now() + Duration::from_secs(5),
             Duration::from_millis(10),
         )
@@ -6113,6 +6443,7 @@ mod tests {
         .expect("real registrations open a fresh target");
         let vacant = temp.path().join("vacant.sock");
         let member = attested_zellij_member(temp.path(), vacant.clone(), "session-vacant");
+        let host = zellij_readiness_host(&member, &census);
         serve_readiness_status(
             vacant,
             attested(
@@ -6129,6 +6460,7 @@ mod tests {
             &member,
             &handoff,
             &target_record(),
+            &host,
             Instant::now() + Duration::from_secs(5),
             Duration::from_millis(10),
         )
@@ -7770,11 +8102,33 @@ mod tests {
                 hooks: ActivateHooks::default(),
                 logger: None,
             };
+            let PlannedUnit::Zellij {
+                bridge_identity,
+                entries,
+                census,
+            } = &self.unit
+            else {
+                panic!("Ready proof fixture is a fixed Zellij unit");
+            };
+            let host = ZellijActivation {
+                identity: bridge_identity,
+                entries,
+                census,
+            };
+            let authorities = self
+                .prepared
+                .iter()
+                .map(|member| PreparedAuthority {
+                    entry: member.entry.clone(),
+                    handoff: member.handoff,
+                })
+                .collect::<Vec<_>>();
             prove_ready_unit(
                 &inputs,
-                &self.unit,
+                &host,
                 &self.journal,
                 &self.prepared,
+                &authorities,
                 &mut self.targets,
                 Some((UnitReadinessEpochId::from_bytes([0x55; 16]).unwrap(), as_of)),
                 Instant::now() + readiness_deadline,
@@ -7872,12 +8226,14 @@ mod tests {
         let mut pending_b = case.status(1);
         pending_b.ready = None;
         case.set(1, vec![pending_b, case.status(1)]);
+        let census = MemberCensus::default();
         for member in &case.prepared {
             wait_ready(
                 &case.control,
                 &member.entry,
                 &member.handoff,
                 &case.journal.target_record,
+                &zellij_readiness_host(&member.entry, &census),
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_millis(1),
             )

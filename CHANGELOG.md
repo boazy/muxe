@@ -2,6 +2,7 @@
 
 ### 🐛 Bug Fixes
 
+- *(activation)* Keep bridge preflight, reload, and Ready proof under the selected host policy; accept unchanged bridge membership regardless of registry insertion order
 - *(zellij)* Complete fresh membership coverage before ordinary broker startup; keep activation targets gated until their reserved identity is covered
 - *(cli)* Create and validate the cache root owner-only before audit logging; refuse unsafe existing directories
 - *(ui)* Honor menu-scoped inactivity timeouts and reject binding-scoped inactivity settings
