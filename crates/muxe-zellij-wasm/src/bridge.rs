@@ -1568,7 +1568,7 @@ impl Bridge {
 
 /// Reports whether a `ListClients` census row's `running_command` proves the
 /// focused pane is the Muxe UI. Structural match mirroring the adapter's
-/// `is_ui_argv` (`crates/muxe-adapter-zellij/src/launch.rs`): the first
+/// `is_ui_argv` (`crates/muxe-adapter-api/src/launch.rs`): the first
 /// whitespace-separated token's file name is `muxe`, followed by `ui` and
 /// `menu`. The host renders a `Run::Command` pane as `"{command} {args…}"`
 /// and anything else (`Run::Cwd`, no command) as `"N/A"`, so empty, `"N/A"`,

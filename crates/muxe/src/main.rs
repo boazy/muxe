@@ -2273,7 +2273,7 @@ async fn herdr_open_pane(
     // Canonical UI argv launches through the broker-gated UI transaction so
     // the placed pane carries a minted launch token; the adapter revalidates
     // the canonical shape before creating anything.
-    if muxe_adapter_zellij::is_ui_argv(&argv) {
+    if muxe_adapter_api::launch::is_ui_argv(&argv) {
         return Box::pin(herdr_open_ui_pane(
             logger,
             cache_dir,

@@ -38,7 +38,7 @@ pub use adapter::{
 };
 pub use launch::{
     LaunchError, LaunchKind, LaunchTarget, SizeSpec, ZellijPaneKind, ZellijPaneLaunch,
-    ZellijPlacement, ZellijSplitDirection, is_ui_argv, normalize_placement, resolve_launch_cwd,
+    ZellijPlacement, ZellijSplitDirection, normalize_placement, resolve_launch_cwd,
     split_argv,
 };
 pub use names::{

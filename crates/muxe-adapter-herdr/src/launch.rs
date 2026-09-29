@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use muxe_adapter_api::launch::is_ui_argv;
 use muxe_adapter_api::{AdapterError, AdapterErrorKind};
 use muxe_core::{PaneId, TabId, WorkspaceId};
 use serde_json::{Map, Value, json};
@@ -573,18 +574,10 @@ pub(crate) async fn move_prepared_ui_pane_with(
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
 fn validate_ui_argv(argv: &[String]) -> Result<(), AdapterError> {
-    let executable_is_muxe = argv.first().is_some_and(|value| {
-        if value == "muxe" {
-            true
-        } else {
-            let path = Path::new(value);
-            path.is_absolute() && path.file_name().is_some_and(|name| name == "muxe")
-        }
-    });
-    if !executable_is_muxe
-        || argv.get(1).map(String::as_str) != Some("ui")
-        || argv.get(2).map(String::as_str) != Some("menu")
-    {
+    let executable_is_allowed = argv
+        .first()
+        .is_some_and(|value| value == "muxe" || Path::new(value).is_absolute());
+    if !is_ui_argv(argv) || !executable_is_allowed {
         return Err(invalid(
             "Herdr UI launch command must begin with `muxe ui menu`",
         ));

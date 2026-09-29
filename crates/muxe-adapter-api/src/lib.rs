@@ -5,6 +5,7 @@
 //! and terminal dependencies.
 
 #![forbid(unsafe_code)]
+pub mod launch;
 
 use std::fmt;
 use std::sync::Arc;
