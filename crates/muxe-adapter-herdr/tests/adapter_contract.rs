@@ -212,6 +212,10 @@ impl HostAdapter for RecordedContractAdapter {
         })
     }
 
+    fn config_override_filename(&self) -> &'static str {
+        "herdr.yml"
+    }
+
     async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
         Ok(AdapterCapabilities {
             keyboard: KeyboardCapabilities {

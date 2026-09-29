@@ -152,6 +152,7 @@ pub const ZELLIJ_CONTRACT_DIR: &str = "contract_version_1";
 /// activation; hosts separate by registry identity only. Matches
 /// `paths::resolve` (`$XDG_*/muxe`) under the fixture environment.
 pub async fn init_shared_dirs(binary: &Path, scoped_root: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     ensure_scoped_dirs(scoped_root)?;
     let config_file = scoped_root.join("config").join("muxe").join("config.yml");
     let cache_dir = scoped_root.join("cache").join("muxe");
@@ -173,7 +174,13 @@ pub async fn init_shared_dirs(binary: &Path, scoped_root: &Path) -> io::Result<(
             config_file.display()
         )));
     }
-    std::fs::create_dir_all(&cache_dir)?;
+    // The cache parent is already scoped. Create the target owner-only;
+    // a preexisting cache root is an error, never silently repaired.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(&cache_dir)?;
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))?;
+    muxe_broker::validate_owner_directory(&cache_dir).map_err(io::Error::other)?;
     Ok((config_file, cache_dir))
 }
 

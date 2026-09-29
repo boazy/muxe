@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use muxe_adapter_api::{HostAdapter, HostKind as AdapterHostKind};
+use muxe_adapter_api::HostAdapter;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -227,7 +227,7 @@ async fn dump_menu(command: muxe::cli::MenuDump) -> Result<()> {
     let config = match host {
         HostSelector::Zellij => muxe_broker::load_effective_config(
             &config_file,
-            AdapterHostKind::Zellij,
+            muxe_adapter_zellij::CONFIG_OVERRIDE_FILENAME,
             muxe_core::KeyCapabilities::default(),
             &muxe_adapter_zellij::ZellijValidator,
         )
@@ -240,7 +240,7 @@ async fn dump_menu(command: muxe::cli::MenuDump) -> Result<()> {
                     .wrap_err("could not load the installed Herdr schema for menu dump")?;
             muxe_broker::load_effective_config(
                 &config_file,
-                AdapterHostKind::Herdr,
+                muxe_adapter_herdr::CONFIG_OVERRIDE_FILENAME,
                 muxe_core::KeyCapabilities::default(),
                 &validator,
             )
@@ -1153,13 +1153,26 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         .await
         .wrap_err("could not connect the pinned Zellij session for broker startup")?,
     );
-    // Load and authorize before binding. The initial census round splits by
-    // bootstrap kind: ordinary Running has no broker-side UI latch (adapter
-    // health is broadcast-only), so its round completes before the endpoint
-    // binds and any UI observes readiness from the first byte. An activation
-    // target must bind first and serve TargetGated status with ready=None
-    // before the coordinator swaps the bridge; its round runs concurrently
-    // with serving below.
+    // Ordinary brokers must prove a fresh census before configuration asks
+    // for a live identity. Targets cannot do so until the coordinator swaps
+    // the bridge: reserve a gated identity now and prove it after binding.
+    let is_target = command.handoff.is_some();
+    let reserved = if is_target {
+        let identity = adapter
+            .reserve_startup_identity()
+            .wrap_err("could not reserve the gated Zellij target identity")?;
+        Some(muxe_protocol::LiveServerIdentity {
+            host: ProtocolHostKind::Zellij,
+            discovery_key: identity.discovery_key.as_str().to_owned(),
+            server_id: muxe_protocol::ServerId::new(identity.live_server_id.as_str()),
+        })
+    } else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+        establish_initial_round_until(&adapter, deadline, &logger)
+            .await
+            .wrap_err("Zellij initial census round never established")?;
+        None
+    };
     let adapter_object: std::sync::Arc<dyn muxe_adapter_api::HostAdapter> = adapter.clone();
     let broker = muxe_broker::Broker::load(adapter_object, &command.config)
         .await
@@ -1169,10 +1182,14 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         .await
         .expect("new broker owns its diagnostic sink");
     let diagnostics_task = retain_broker_diagnostics(Arc::clone(&logger), "zellij", diagnostics);
-    let live_server = broker
-        .live_identity()
-        .await
-        .wrap_err("could not capture the pinned Zellij live identity")?;
+    let live_server = if let Some(reserved) = reserved {
+        reserved
+    } else {
+        broker
+            .live_identity()
+            .await
+            .wrap_err("could not capture the pinned Zellij live identity")?
+    };
     if live_server.discovery_key != command.session {
         bail!(
             "broker live session {} does not match the requested Zellij session {}",
@@ -1190,10 +1207,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         );
     }
     let current = muxe::compatibility::embedded_record()?.handoff;
-    // A half pair bails in the bootstrap match below; the flag only steers the
-    // initial-round placement (pre-bind for ordinary Running, concurrent with
-    // serving for an activation target).
-    let is_target = command.handoff.is_some();
+    // A half pair bails in the bootstrap match below.
     let (bootstrap, target_registration, registration_handoff) = match (
         command.handoff,
         command.activation_journal,
@@ -1239,22 +1253,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         }
         _ => bail!("broker target startup requires both --handoff and --activation-journal"),
     };
-    if !is_target {
-        // Ordinary Running admits UI the moment the endpoint binds (adapter
-        // health is broadcast-only, never a broker-side latch), so bounded
-        // census attempts complete before bind. Exhausting the shared budget
-        // fails startup closed.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
-        if let Err(error) = establish_initial_round_until(&adapter, deadline, &logger).await {
-            serve_event(
-                &logger,
-                "zellij",
-                "broker-serve",
-                &format!("initial census round never established: {error}"),
-            );
-            return Err(error).wrap_err("Zellij initial census round never established");
-        }
-    }
+
     let registry = muxe::lifecycle::Registry::open(&command.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
     if let Some(receipt) = muxe::integration::receipt::load(bridge_identity.directory())
@@ -1384,12 +1383,26 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
-        if let Err(error) = establish_initial_round_until(&adapter, deadline, &logger).await {
+        let covered = async {
+            establish_initial_round_until(&adapter, deadline, &logger).await?;
+            let identity = broker
+                .live_identity()
+                .await
+                .wrap_err("could not read the covered Zellij target identity")?;
+            if identity != live_server {
+                bail!(
+                    "covered Zellij target identity differs from the gated registration: expected {live_server:?}, found {identity:?}"
+                );
+            }
+            Ok::<(), color_eyre::Report>(())
+        }
+        .await;
+        if let Err(error) = covered {
             serve_event(
                 &logger,
                 "zellij",
                 "broker-serve",
-                &format!("initial census round never established: {error}"),
+                &format!("target census or identity verification failed: {error}"),
             );
             let _ = shutdown_tx.send(true);
             let _ = server_handle.await;
@@ -1402,7 +1415,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 &registration,
             )
             .wrap_err("could not remove failed Zellij target registration")?;
-            return Err(error).wrap_err("Zellij initial census round never established");
+            return Err(error).wrap_err("Zellij target census or identity verification failed");
         }
         let joined = server_handle.await;
         diagnostics_task.stop_and_join().await;
@@ -4682,6 +4695,10 @@ mod mixed_recovery_production_tests {
             })
         }
 
+        fn config_override_filename(&self) -> &'static str {
+            "zellij.yml"
+        }
+
         async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
             Ok(AdapterCapabilities {
                 keyboard: KeyboardCapabilities {
@@ -4910,7 +4927,7 @@ mod mixed_recovery_production_tests {
     }
 
     async fn assert_native_diagnostic_written(
-        cache: &tempfile::TempDir,
+        cache: &std::path::Path,
         broker: Arc<muxe_broker::Broker>,
         consumer: super::DiagnosticConsumer,
     ) {
@@ -4918,7 +4935,7 @@ mod mixed_recovery_production_tests {
         let health = tokio::spawn(Arc::clone(&broker).monitor(shutdown_rx));
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if cache.path().join("logs/muxe.jsonl").exists() {
+                if cache.join("logs/muxe.jsonl").exists() {
                     return;
                 }
                 tokio::task::yield_now().await;
@@ -4930,8 +4947,8 @@ mod mixed_recovery_production_tests {
         health.await.expect("broker health monitor stops");
         consumer.stop_and_join().await;
 
-        let record = fs::read_to_string(cache.path().join("logs/muxe.jsonl"))
-            .expect("native diagnostic record");
+        let record =
+            fs::read_to_string(cache.join("logs/muxe.jsonl")).expect("native diagnostic record");
         assert!(record.contains("detached execution failed"));
         assert!(record.contains("Failed: ActionBlocked"));
         assert!(!record.contains("secret-sentinel"));
@@ -4940,6 +4957,7 @@ mod mixed_recovery_production_tests {
     #[tokio::test]
     async fn detached_broker_failure_after_ui_close_reaches_native_json_log() {
         let cache = tempfile::tempdir().expect("owned cache directory");
+        let cache_dir = cache.path().join("muxe");
         let config_path = cache.path().join("config.yml");
         let adapter = Arc::new(RecoveryAdapter {
             discovery_key: "diagnostic-host".to_owned(),
@@ -4974,7 +4992,7 @@ mod mixed_recovery_production_tests {
             .await
             .expect("native composition root owns the broker diagnostic receiver");
         let logger = Arc::new(
-            muxe::logging::Logger::open(cache.path(), "test").expect("open owner-only logger"),
+            muxe::logging::Logger::open(&cache_dir, "test").expect("open owner-only logger"),
         );
         let consumer = super::retain_broker_diagnostics(Arc::clone(&logger), "zellij", diagnostics);
         invoke_detached_then_close_ui(
@@ -4985,6 +5003,6 @@ mod mixed_recovery_production_tests {
             },
         )
         .await;
-        assert_native_diagnostic_written(&cache, broker, consumer).await;
+        assert_native_diagnostic_written(&cache_dir, broker, consumer).await;
     }
 }

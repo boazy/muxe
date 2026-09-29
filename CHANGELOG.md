@@ -2,6 +2,8 @@
 
 ### 🐛 Bug Fixes
 
+- *(zellij)* Complete fresh membership coverage before ordinary broker startup; keep activation targets gated until their reserved identity is covered
+- *(cli)* Create and validate the cache root owner-only before audit logging; refuse unsafe existing directories
 - *(ui)* Honor menu-scoped inactivity timeouts and reject binding-scoped inactivity settings
 - *(broker)* Reconcile authenticated cold-start endpoints before spawning, preserving live registration ownership and refusing ambiguous recovery
 - *(ui)* Honor per-invocation theme and color-scheme overrides without changing the pinned menu-session choice

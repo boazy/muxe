@@ -29,6 +29,9 @@ mod readiness_gate;
 mod registry;
 mod validation;
 
+/// Optional configuration override used by this host adapter.
+pub const CONFIG_OVERRIDE_FILENAME: &str = "zellij.yml";
+
 pub use adapter::{
     CliMembershipSource, MembershipSource, ZellijAdapter, ZellijAdapterConfig, resolve_zellij_exe,
     zellij_session_from_env,

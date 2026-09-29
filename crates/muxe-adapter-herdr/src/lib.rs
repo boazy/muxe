@@ -16,6 +16,10 @@ mod schema;
 mod subscription;
 mod transport;
 mod validation;
+
+/// Optional configuration override used by this host adapter.
+pub const CONFIG_OVERRIDE_FILENAME: &str = "herdr.yml";
+
 #[doc(hidden)]
 pub use adapter::WaitHook;
 #[doc(hidden)]

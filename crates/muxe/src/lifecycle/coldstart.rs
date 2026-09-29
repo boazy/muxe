@@ -1155,6 +1155,11 @@ mod tests {
                 .expect("valid test incarnation"),
             })
         }
+
+        fn config_override_filename(&self) -> &'static str {
+            "gate.yml"
+        }
+
         async fn capabilities(
             &self,
         ) -> Result<muxe_adapter_api::AdapterCapabilities, muxe_adapter_api::AdapterError> {
@@ -1934,12 +1939,19 @@ mod tests {
                             );
                             return Err(RegistryError::Conflict("PID reused".to_owned()));
                         }
-                        std::fs::remove_file(socket).unwrap();
                         if race == "symlink" {
+                            std::fs::remove_file(socket).unwrap();
                             let target = fixture.root.path().join("foreign");
                             std::fs::write(&target, b"unowned").unwrap();
                             std::os::unix::fs::symlink(target, socket).unwrap();
                         } else {
+                            // Keep the displaced inode alive: unlinking it lets some
+                            // filesystems recycle its number for the replacement.
+                            std::fs::rename(
+                                socket,
+                                fixture.root.path().join("displaced-stale-socket"),
+                            )
+                            .unwrap();
                             let rebound = UnixListener::bind(socket).unwrap();
                             std::fs::set_permissions(
                                 socket,

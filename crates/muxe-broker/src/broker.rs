@@ -5208,6 +5208,10 @@ menus:
             })
         }
 
+        fn config_override_filename(&self) -> &'static str {
+            "herdr.yml"
+        }
+
         async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
             Ok(AdapterCapabilities {
                 keyboard: KeyboardCapabilities {
@@ -5423,6 +5427,10 @@ menus:
                 )
                 .expect("validated live server incarnation"),
             })
+        }
+
+        fn config_override_filename(&self) -> &'static str {
+            "herdr.yml"
         }
 
         async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
@@ -9521,16 +9529,9 @@ colors:
             block_origin: AtomicBool::new(false),
             fail_origin: AtomicBool::new(false),
         });
-        let store = ConfigStore::load_inputs(
-            crate::config::ConfigInputs::for_host(
-                config_dir.join("config.yml"),
-                muxe_adapter_api::HostKind::Zellij,
-            )
-            .unwrap(),
-            adapter.as_ref(),
-        )
-        .await
-        .unwrap();
+        let store = ConfigStore::load(config_dir.join("config.yml"), adapter.as_ref())
+            .await
+            .unwrap();
         let broker = Arc::new(Broker {
             adapter: adapter.clone(),
             config: store,

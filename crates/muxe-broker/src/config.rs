@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use muxe_adapter_api::{AdapterCapabilities, HostAdapter, HostKind as AdapterHostKind};
+use muxe_adapter_api::{AdapterCapabilities, HostAdapter};
 use muxe_core::{
     ActionValidation, ActionValidator, CompileInput, CompiledConfig, CompiledGeneration, Compiler,
     ConfigDiagnostic, ConfigDocument, KeyCapabilities, ReloadSettings, SourceId, ThemeAssets,
@@ -14,10 +14,8 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 /// All source inputs that define one effective configuration generation.
-///
-/// The broker discovers the host override once from the adapter kind, then uses the same source
-/// set for every reload. The watch service uses the accessors below rather than reconstructing
-/// paths independently.
+/// The broker discovers the host override from its adapter without requiring
+/// live identity, then retains the same input set for every reload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigInputs {
     base: PathBuf,
@@ -28,23 +26,17 @@ pub struct ConfigInputs {
 impl ConfigInputs {
     #[expect(
         clippy::result_large_err,
-        reason = "ConfigError is a public cold-path error API shared with the native binary; boxing diagnostic variants churns consumers for no frame-size gain"
+        reason = "ConfigError is the shared cold-path error; boxing it would churn callers"
     )]
-    /// Derives watched input locations for one host kind.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConfigError::AssetDirectory` when the base path has no parent.
-    pub fn for_host(base: impl Into<PathBuf>, host: AdapterHostKind) -> Result<Self, ConfigError> {
+    fn for_override(
+        base: impl Into<PathBuf>,
+        override_name: &'static str,
+    ) -> Result<Self, ConfigError> {
         let base = base.into();
         let directory = base
             .parent()
             .ok_or_else(|| ConfigError::AssetDirectory(base.clone()))?
             .to_path_buf();
-        let override_name = match host {
-            AdapterHostKind::Zellij => "zellij.yml",
-            AdapterHostKind::Herdr => "herdr.yml",
-        };
         Ok(Self {
             base,
             host_override: Some(directory.join(override_name)),
@@ -123,8 +115,7 @@ impl ConfigStore {
         path: impl Into<PathBuf>,
         adapter: &dyn HostAdapter,
     ) -> Result<Self, ConfigError> {
-        let identity = adapter.identity().await.map_err(ConfigError::Adapter)?;
-        let inputs = ConfigInputs::for_host(path, identity.kind)?;
+        let inputs = ConfigInputs::for_override(path, adapter.config_override_filename())?;
         Self::load_inputs(inputs, adapter).await
     }
 
@@ -214,6 +205,8 @@ impl ConfigStore {
 /// This is the inspection boundary for commands that need the same built-in,
 /// base, host-override, injection, asset, and action validation pipeline as a
 /// broker without claiming the host adapter's live channels.
+/// The caller supplies the same adapter-owned override filename that broker
+/// startup uses; inspection does not claim a live host identity.
 ///
 /// # Errors
 ///
@@ -225,11 +218,11 @@ impl ConfigStore {
 )]
 pub fn load_effective_config(
     path: impl Into<PathBuf>,
-    host: AdapterHostKind,
+    override_filename: &'static str,
     key_capabilities: KeyCapabilities,
     action_validator: &dyn ActionValidator,
 ) -> Result<CompiledConfig, ConfigError> {
-    let inputs = ConfigInputs::for_host(path, host)?;
+    let inputs = ConfigInputs::for_override(path, override_filename)?;
     let loaded = read_config_inputs(&inputs)?;
     compile_loaded_inputs(
         loaded,
@@ -445,9 +438,9 @@ mod tests {
     use async_trait::async_trait;
     use muxe_adapter_api::{
         AdapterError, AdapterErrorKind, AdapterHealthEvent, CaptureLease, CaptureReleaseReason,
-        CaptureRequest, DispatchAccepted, HostIdentity, KeyboardCapabilities, ModalScopeId,
-        NativeDispatchRequest, OriginCaptureRequest, PendingPaneRegistration,
-        PortableDispatchRequest,
+        CaptureRequest, DispatchAccepted, HostIdentity, HostKind as AdapterHostKind,
+        KeyboardCapabilities, ModalScopeId, NativeDispatchRequest, OriginCaptureRequest,
+        PendingPaneRegistration, PortableDispatchRequest,
     };
     use tokio::{sync::Notify, time::timeout};
 
@@ -455,6 +448,7 @@ mod tests {
 
     struct ReloadAdapter {
         pause_capabilities: AtomicBool,
+        identity_unavailable: AtomicBool,
         capabilities_started: Notify,
         capabilities_release: Notify,
     }
@@ -463,6 +457,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 pause_capabilities: AtomicBool::new(false),
+                identity_unavailable: AtomicBool::new(false),
                 capabilities_started: Notify::new(),
                 capabilities_release: Notify::new(),
             }
@@ -496,6 +491,12 @@ mod tests {
     #[async_trait]
     impl HostAdapter for ReloadAdapter {
         async fn identity(&self) -> Result<HostIdentity, AdapterError> {
+            if self.identity_unavailable.load(Ordering::Acquire) {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "host coverage is pending",
+                ));
+            }
             Ok(HostIdentity {
                 kind: AdapterHostKind::Herdr,
                 discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
@@ -507,6 +508,10 @@ mod tests {
                 )
                 .expect("validated live server incarnation"),
             })
+        }
+
+        fn config_override_filename(&self) -> &'static str {
+            "herdr.yml"
         }
 
         async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
@@ -614,7 +619,7 @@ mod tests {
     fn host_inputs_track_optional_override_and_asset_changes() {
         let directory = tempfile::tempdir().unwrap();
         let base = directory.path().join("config.yml");
-        let inputs = ConfigInputs::for_host(&base, AdapterHostKind::Herdr).unwrap();
+        let inputs = ConfigInputs::for_override(&base, "herdr.yml").unwrap();
         let override_path = directory.path().join("herdr.yml");
         assert_eq!(inputs.host_override(), Some(override_path.as_path()));
         assert!(inputs.tracks_change(&base));
@@ -633,6 +638,31 @@ mod tests {
         assert_eq!(after.inputs, before.inputs);
         assert_eq!(after.root, directory.path());
         assert_eq!(after.settings, settings);
+    }
+
+    #[tokio::test]
+    async fn loads_host_override_before_live_identity_is_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("config.yml");
+        fs::write(
+            &base,
+            "version: 1\nmenus:\n  main:\n    bindings:\n      q:\n        label: Base\n        action: menu:quit\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("herdr.yml"),
+            "menus:\n  main:\n    bindings:\n      q:\n        label: Host\n        action: menu:quit\n",
+        )
+        .unwrap();
+        let adapter = ReloadAdapter::new();
+        adapter.identity_unavailable.store(true, Ordering::Release);
+        let config = ConfigStore::load(&base, &adapter).await.unwrap();
+        assert_eq!(
+            config.snapshot().await.config.menus[0].bindings[0]
+                .label
+                .as_deref(),
+            Some("Host")
+        );
     }
 
     #[tokio::test]

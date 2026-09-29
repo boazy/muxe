@@ -2105,6 +2105,10 @@ impl HostAdapter for HerdrAdapter {
         Ok(self.identity())
     }
 
+    fn config_override_filename(&self) -> &'static str {
+        crate::CONFIG_OVERRIDE_FILENAME
+    }
+
     fn native_compatibility_snapshot(&self) -> Option<NativeCompatibilitySnapshot> {
         let incarnation = self
             .incarnation

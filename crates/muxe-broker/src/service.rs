@@ -270,22 +270,35 @@ impl ActivationController {
         broker: &Broker,
         bootstrap: ActivationBootstrap,
     ) -> Result<Arc<Self>, ServerError> {
-        let actual = broker.live_identity().await?;
         let (current, expected_live_server, bridge_unit, state) = match bootstrap {
             ActivationBootstrap::Running {
                 current,
                 bridge_unit,
-            } => (current, actual, bridge_unit, ActivationState::Running),
+            } => (
+                current,
+                broker.live_identity().await?,
+                bridge_unit,
+                ActivationState::Running,
+            ),
             ActivationBootstrap::Target {
                 current,
                 handoff,
                 live_server,
                 bridge_unit,
             } => {
-                if actual != live_server {
-                    return Err(ServerError::Activation(format!(
-                        "target host identity changed before broker startup: expected {live_server:?}, found {actual:?}"
-                    )));
+                // Before the bridge swap, the target has no covered identity.
+                // Its caller reserved this candidate on the adapter; Status
+                // stays gated until the adapter proves that exact identity.
+                match broker.live_identity().await {
+                    Ok(actual) if actual != live_server => {
+                        return Err(ServerError::Activation(format!(
+                            "target host identity changed before broker startup: expected {live_server:?}, found {actual:?}"
+                        )));
+                    }
+                    Err(BrokerError::Adapter(error))
+                        if error.kind == AdapterErrorKind::Unavailable => {}
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {}
                 }
                 (
                     current,
@@ -335,15 +348,27 @@ impl ActivationController {
         proof: Option<(muxe_protocol::AsOfTick, muxe_protocol::UnitReadinessEpochId)>,
     ) -> Result<ActivationStatus, String> {
         let state = self.state.lock().await.clone();
-        // A suspended adapter cannot answer host dispatch: suspend marks continuity
-        // unhealthy, so `live_identity` fails exactly when the broker is Draining or
-        // SupervisorOnly. Serve the verified identity retained at startup through those
-        // states; never revive host dispatch to answer status. Live states still verify
-        // against the host so a replacement is detected.
-        let live_server = match state {
+        // Draining retains the previously proven identity while the adapter
+        // is suspended. A gated target may report only its reserved candidate
+        // before coverage; readiness remains absent until the host proves it.
+        // All other live states compare the current covered identity.
+        let (live_server, uncovered_target) = match state {
             ActivationState::Draining { .. } | ActivationState::SupervisorOnly { .. } => {
-                self.expected_live_server.clone()
+                (self.expected_live_server.clone(), false)
             }
+            ActivationState::TargetGated { .. } => match broker.live_identity().await {
+                Err(BrokerError::Adapter(error)) if error.kind == AdapterErrorKind::Unavailable => {
+                    (self.expected_live_server.clone(), true)
+                }
+                Err(error) => return Err(error.to_string()),
+                Ok(actual) if actual == self.expected_live_server => (actual, false),
+                Ok(actual) => {
+                    return Err(format!(
+                        "live host identity changed during activation: expected {:?}, found {:?}",
+                        self.expected_live_server, actual
+                    ));
+                }
+            },
             _ => {
                 let actual = broker
                     .live_identity()
@@ -355,7 +380,7 @@ impl ActivationController {
                         self.expected_live_server, actual
                     ));
                 }
-                actual
+                (actual, false)
             }
         };
         let (lifecycle, phase, target, handoff_id, suspended) = match state {
@@ -414,11 +439,10 @@ impl ActivationController {
             prepare_handoff: Some(PrepareHandoffProtocol::CoordinatorSuppliedV1),
             registration: self.registration.get().copied(),
             bridge_unit: self.bridge_unit,
-            // Per-client bridge evidence comes from the live adapter only. Suspended
-            // states serve None without touching host dispatch; a failed query also
-            // serves None so status stays observable and the coordinator applies the
-            // host-appropriate gate (Herdr gates on adapter health instead).
-            ready: if suspended {
+            // Per-client bridge evidence comes from the live adapter only.
+            // Suspended brokers and uncovered targets never report Ready.
+            // A failed query also serves None so Status stays observable.
+            ready: if suspended || uncovered_target {
                 None
             } else if let Some((as_of, epoch)) = proof {
                 broker.activation_readiness_at(as_of, epoch).await
@@ -2892,6 +2916,10 @@ mod tests {
             })
         }
 
+        fn config_override_filename(&self) -> &'static str {
+            "herdr.yml"
+        }
+
         async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
             Ok(AdapterCapabilities {
                 keyboard: KeyboardCapabilities {
@@ -3032,6 +3060,8 @@ mod tests {
         suspend_unsupported: bool,
         resume_fails: bool,
         readiness: std::sync::Mutex<Option<muxe_adapter_api::ActivationReadiness>>,
+        current_identity: tokio::sync::RwLock<Option<HostIdentity>>,
+        config_override_filename: &'static str,
         shutdown: AtomicBool,
         shutdown_wake: tokio::sync::Notify,
         block_shutdown: AtomicBool,
@@ -3099,17 +3129,16 @@ mod tests {
     #[async_trait]
     impl HostAdapter for OrderingAdapter {
         async fn identity(&self) -> Result<HostIdentity, AdapterError> {
-            Ok(HostIdentity {
-                kind: muxe_adapter_api::HostKind::Herdr,
-                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
-                    "owned-fake-host".to_owned(),
+            self.current_identity.read().await.clone().ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Unavailable,
+                    "fresh membership coverage is pending",
                 )
-                .expect("validated host discovery key"),
-                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
-                    "owned-fake-server".to_owned(),
-                )
-                .expect("validated live server incarnation"),
             })
+        }
+
+        fn config_override_filename(&self) -> &'static str {
+            self.config_override_filename
         }
 
         async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
@@ -3316,6 +3345,30 @@ mod tests {
         suspend_unsupported: bool,
         resume_fails: bool,
     ) -> (Arc<Broker>, Arc<OrderingAdapter>, tempfile::TempDir) {
+        ordering_broker_with_identity(
+            suspend_unsupported,
+            resume_fails,
+            HostIdentity {
+                kind: muxe_adapter_api::HostKind::Herdr,
+                discovery_key: muxe_adapter_api::HostDiscoveryKey::parse(
+                    "owned-fake-host".to_owned(),
+                )
+                .expect("validated host discovery key"),
+                live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                    "owned-fake-server".to_owned(),
+                )
+                .expect("validated live server incarnation"),
+            },
+            "herdr.yml",
+        )
+    }
+
+    fn ordering_broker_with_identity(
+        suspend_unsupported: bool,
+        resume_fails: bool,
+        identity: HostIdentity,
+        config_override_filename: &'static str,
+    ) -> (Arc<Broker>, Arc<OrderingAdapter>, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("owned activation runtime directory");
         let config_path = directory.path().join("config.yml");
         std::fs::write(
@@ -3330,6 +3383,8 @@ mod tests {
             suspend_unsupported,
             resume_fails,
             readiness: std::sync::Mutex::new(None),
+            current_identity: tokio::sync::RwLock::new(Some(identity)),
+            config_override_filename,
             shutdown: AtomicBool::new(false),
             shutdown_wake: tokio::sync::Notify::new(),
             block_shutdown: AtomicBool::new(false),
@@ -4617,6 +4672,63 @@ mod tests {
             "failed resume keeps the endpoint drained, got {result:?}"
         );
         responder.abort();
+    }
+
+    #[tokio::test]
+    async fn gated_target_reports_reserved_identity_only_until_coverage() {
+        let identity = HostIdentity {
+            kind: muxe_adapter_api::HostKind::Zellij,
+            discovery_key: muxe_adapter_api::HostDiscoveryKey::parse("owned-fake-host".to_owned())
+                .unwrap(),
+            live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
+                "owned-fake-server".to_owned(),
+            )
+            .unwrap(),
+        };
+        let (broker, adapter, _directory) =
+            ordering_broker_with_identity(false, false, identity.clone(), "zellij.yml");
+        *adapter.current_identity.write().await = None;
+        adapter.set_readiness(Some(muxe_adapter_api::ActivationReadiness {
+            registered_clients: Vec::new(),
+            member_clients: Vec::new(),
+        }));
+        let reserved = LiveServerIdentity {
+            host: HostKind::Zellij,
+            discovery_key: "owned-fake-host".to_owned(),
+            server_id: WireServerId::new("owned-fake-server"),
+        };
+        let controller = ActivationController::start(
+            &broker,
+            ActivationBootstrap::Target {
+                current: test_record(),
+                handoff: HandoffId([7; 16]),
+                live_server: reserved.clone(),
+                bridge_unit: None,
+            },
+        )
+        .await
+        .expect("uncovered target binds gated");
+        let gated = controller.status(&broker).await.expect("gated status");
+        assert_eq!(gated.phase, ActivationPhase::TargetGated);
+        assert_eq!(gated.live_server, reserved);
+        assert!(gated.ready.is_none());
+
+        *adapter.current_identity.write().await = Some(identity.clone());
+        let covered = controller.status(&broker).await.unwrap();
+        assert_eq!(
+            covered.live_server, reserved,
+            "covered identity matches the reserved target"
+        );
+        assert!(covered.ready.is_some(), "coverage permits Ready evidence");
+        let mut replaced = identity;
+        replaced.live_server_id =
+            muxe_adapter_api::LiveServerIncarnationId::parse("replaced-fake-server".to_owned())
+                .unwrap();
+        *adapter.current_identity.write().await = Some(replaced);
+        assert!(
+            controller.status(&broker).await.is_err(),
+            "a different covered incarnation cannot claim the gated target"
+        );
     }
 
     #[tokio::test]

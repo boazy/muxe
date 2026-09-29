@@ -736,6 +736,9 @@ struct AdapterInner {
     /// The currently proven live continuity. It is absent before initial
     /// coverage and across every event-channel or activation transition.
     incarnation: StdRwLock<Option<CoveredIncarnation>>,
+    /// Target bootstrap may advertise a candidate identity while gated.
+    /// Only a successful fresh census promotes this value to `incarnation`.
+    startup_incarnation: StdRwLock<Option<ZellijIncarnationId>>,
     /// Coverage round installed by automatic whole-pipe recovery. Fresh
     /// registrations complete it without requiring an external caller.
     pending_coverage: Mutex<Option<PendingCoverage>>,
@@ -849,6 +852,7 @@ impl ZellijAdapter {
                 resume_epoch: AtomicU64::new(0),
                 register_epoch: Mutex::new(BTreeMap::new()),
                 incarnation: StdRwLock::new(None),
+                startup_incarnation: StdRwLock::new(None),
                 pending_coverage: Mutex::new(None),
                 success_snapshot: Mutex::new(None),
                 membership,
@@ -912,6 +916,60 @@ impl ZellijAdapter {
     pub fn event_channel(&self) -> &Arc<dyn PipeChannel> {
         &self.inner.event
     }
+    /// Reserves an identity for a gated target before its bridge is installed.
+    /// This is not evidence of live continuity: `identity` and all host-bound
+    /// operations still require fresh membership coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] if the adapter is shut down or suspended, the
+    /// session key is invalid, or entropy fails.
+    #[expect(
+        clippy::result_large_err,
+        reason = "AdapterError is the fixed public adapter error for unavailable startup continuity"
+    )]
+    pub fn reserve_startup_identity(&self) -> Result<HostIdentity, AdapterError> {
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Shutdown,
+                "Zellij adapter is shut down; target identity is unavailable",
+            ));
+        }
+        if self.inner.suspended.load(Ordering::Acquire)
+            || self.inner.quiescing.load(Ordering::Acquire)
+        {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Unavailable,
+                "Zellij adapter is suspended; target identity is unavailable",
+            ));
+        }
+        let discovery_key = self.discovery_key()?;
+        let mut reserved = self
+            .inner
+            .startup_incarnation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self
+            .inner
+            .incarnation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = if let Some(covered) = *current {
+            covered.id
+        } else if let Some(id) = *reserved {
+            id
+        } else {
+            let id = ZellijIncarnationId::mint()?;
+            *reserved = Some(id);
+            id
+        };
+        Ok(HostIdentity {
+            kind: ApiHostKind::Zellij,
+            discovery_key,
+            live_server_id: id.as_shared(),
+        })
+    }
+
     /// Establishes the initial census round on a fresh target that never
     /// went through suspend/resume: takes one authoritative membership
     /// snapshot and awaits fresh compatible registrations covering it on
@@ -2533,7 +2591,20 @@ impl ZellijAdapter {
         pending: Option<&PendingCoverage>,
         resume: bool,
     ) -> Result<HostIdentity, AdapterError> {
-        let incarnation = ZellijIncarnationId::mint()?;
+        let incarnation = {
+            let mut reserved = self
+                .inner
+                .startup_incarnation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(id) = *reserved {
+                id
+            } else {
+                let id = ZellijIncarnationId::mint()?;
+                *reserved = Some(id);
+                id
+            }
+        };
         let identity = HostIdentity {
             kind: ApiHostKind::Zellij,
             discovery_key: self.discovery_key()?,
@@ -2587,6 +2658,11 @@ impl ZellijAdapter {
                 "Zellij live continuity health publication is unavailable",
             ));
         }
+        self.inner
+            .startup_incarnation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|reserved| *reserved == incarnation);
         Ok(identity)
     }
 
@@ -3497,6 +3573,10 @@ impl ZellijAdapter {
 impl HostAdapter for ZellijAdapter {
     async fn identity(&self) -> Result<HostIdentity, AdapterError> {
         self.host_identity()
+    }
+
+    fn config_override_filename(&self) -> &'static str {
+        crate::CONFIG_OVERRIDE_FILENAME
     }
 
     async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError> {
@@ -7211,6 +7291,18 @@ mod tests {
         let membership =
             ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
+        let reserved = adapter
+            .reserve_startup_identity()
+            .expect("target reserves a candidate before coverage");
+        assert_eq!(
+            adapter.reserve_startup_identity().unwrap(),
+            reserved,
+            "repeated target bootstrap retains one candidate"
+        );
+        assert!(
+            adapter.identity().await.is_err(),
+            "a reserved candidate is not covered host identity"
+        );
         // Fresh target, nonempty session, no round ever ran: no evidence.
         assert!(
             adapter
@@ -7227,6 +7319,11 @@ mod tests {
             .establish_initial_round()
             .await
             .expect("initial round covers the live membership");
+        assert_eq!(
+            adapter.identity().await.unwrap().live_server_id,
+            reserved.live_server_id,
+            "fresh coverage promotes the exact gated target identity"
+        );
         let readiness = adapter
             .activation_readiness()
             .await

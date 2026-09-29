@@ -113,12 +113,15 @@ pub struct Logger {
 }
 
 impl Logger {
-    /// Opens the logger for `cache_dir`, creating `$CACHE_DIR/logs/` owner-only.
+    /// Opens the logger for `cache_dir`, creating both the cache root and
+    /// `$CACHE_DIR/logs/` owner-only. Existing unsafe directories are refused.
     ///
     /// # Errors
     ///
-    /// Returns [`LogError`] when the owner-only log directory cannot be created or validated.
+    /// Returns [`LogError`] when either owner-only directory cannot be created
+    /// or validated.
     pub fn open(cache_dir: &Path, version: impl Into<String>) -> Result<Self, LogError> {
+        fsutil::ensure_owner_dir(cache_dir)?;
         let directory = cache_dir.join("logs");
         fsutil::ensure_owner_dir(&directory)?;
         Ok(Self {
@@ -273,6 +276,38 @@ mod tests {
 
     fn event(message: &str) -> LogEvent {
         LogEvent::new("0.1.0", "zellij", "install", message).unwrap()
+    }
+
+    #[test]
+    fn fresh_cache_root_is_owner_only_and_existing_wrong_mode_is_refused() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache/muxe");
+        let logger = Logger::open(&cache_dir, "0.1.0").unwrap();
+        logger.append(&event("fresh cache")).unwrap();
+        let logs_dir = cache_dir.join("logs");
+        for directory in [&cache_dir, &logs_dir] {
+            assert_eq!(
+                fs::symlink_metadata(directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "{} must be owner-only",
+                directory.display()
+            );
+        }
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Logger::open(&cache_dir, "0.1.0").is_err());
+        assert_eq!(
+            fs::symlink_metadata(&cache_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "an unsafe existing cache root must not be repaired"
+        );
     }
 
     #[test]

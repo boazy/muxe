@@ -590,6 +590,11 @@ pub struct ActivationReadiness {
 #[async_trait]
 pub trait HostAdapter: ActionValidator + Send + Sync {
     async fn identity(&self) -> Result<HostIdentity, AdapterError>;
+    /// Basename of this adapter's optional configuration override in the
+    /// base configuration directory (for example, `zellij.yml`). This is
+    /// static adapter policy; loading configuration must not require a live
+    /// host identity or a completed activation census.
+    fn config_override_filename(&self) -> &'static str;
 
     async fn capabilities(&self) -> Result<AdapterCapabilities, AdapterError>;
 

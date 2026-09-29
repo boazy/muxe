@@ -6,9 +6,12 @@ use std::{
 };
 
 use ariadne::{Config, IndexType, Label, Report, ReportKind, sources};
-use muxe_adapter_api::HostKind as AdapterHostKind;
-use muxe_adapter_herdr::HerdrConfigValidator;
-use muxe_adapter_zellij::ZellijValidator;
+use muxe_adapter_herdr::{
+    CONFIG_OVERRIDE_FILENAME as HERDR_CONFIG_OVERRIDE_FILENAME, HerdrConfigValidator,
+};
+use muxe_adapter_zellij::{
+    CONFIG_OVERRIDE_FILENAME as ZELLIJ_CONFIG_OVERRIDE_FILENAME, ZellijValidator,
+};
 use muxe_broker::{ConfigError, load_effective_config};
 use muxe_core::{ActionValidator, ConfigDiagnostic, DiagnosticSeverity, KeyCapabilities};
 use thiserror::Error;
@@ -35,13 +38,19 @@ pub async fn check(
     let mut valid = check_host(
         config_path,
         "zellij",
-        AdapterHostKind::Zellij,
+        ZELLIJ_CONFIG_OVERRIDE_FILENAME,
         &zellij,
         output,
     )?;
     match HerdrConfigValidator::load(herdr_binary, cache_dir).await {
         Ok(herdr) => {
-            valid &= check_host(config_path, "herdr", AdapterHostKind::Herdr, &herdr, output)?;
+            valid &= check_host(
+                config_path,
+                "herdr",
+                HERDR_CONFIG_OVERRIDE_FILENAME,
+                &herdr,
+                output,
+            )?;
         }
         Err(error) => {
             writeln!(
@@ -57,12 +66,12 @@ pub async fn check(
 #[cfg(test)]
 fn check_hosts(
     config_path: &Path,
-    checks: &[(&str, AdapterHostKind, &dyn ActionValidator)],
+    checks: &[(&str, &'static str, &dyn ActionValidator)],
     output: &mut dyn Write,
 ) -> Result<bool, CheckError> {
     let mut valid = true;
-    for &(host_name, host, validator) in checks {
-        valid &= check_host(config_path, host_name, host, validator, output)?;
+    for &(host_name, override_filename, validator) in checks {
+        valid &= check_host(config_path, host_name, override_filename, validator, output)?;
     }
     Ok(valid)
 }
@@ -70,11 +79,16 @@ fn check_hosts(
 fn check_host(
     config_path: &Path,
     host_name: &str,
-    host: AdapterHostKind,
+    override_filename: &'static str,
     validator: &dyn ActionValidator,
     output: &mut dyn Write,
 ) -> Result<bool, CheckError> {
-    match load_effective_config(config_path, host, KeyCapabilities::default(), validator) {
+    match load_effective_config(
+        config_path,
+        override_filename,
+        KeyCapabilities::default(),
+        validator,
+    ) {
         Ok(_) => Ok(true),
         Err(error) => {
             render_config_error(host_name, &error, output)?;
@@ -239,9 +253,9 @@ mod tests {
         write_config(&directory, "herdr.yml", "invalid-herdr: true\n");
 
         let zellij = ZellijValidator;
-        let checks: [(&str, AdapterHostKind, &dyn ActionValidator); 2] = [
-            ("zellij", AdapterHostKind::Zellij, &zellij),
-            ("herdr", AdapterHostKind::Herdr, &zellij),
+        let checks: [(&str, &'static str, &dyn ActionValidator); 2] = [
+            ("zellij", ZELLIJ_CONFIG_OVERRIDE_FILENAME, &zellij),
+            ("herdr", HERDR_CONFIG_OVERRIDE_FILENAME, &zellij),
         ];
         let mut output = Vec::new();
         assert!(
@@ -265,7 +279,7 @@ mod tests {
             !check_host(
                 &config,
                 "zellij",
-                AdapterHostKind::Zellij,
+                ZELLIJ_CONFIG_OVERRIDE_FILENAME,
                 &zellij,
                 &mut output
             )
@@ -296,7 +310,7 @@ mod tests {
             !check_host(
                 &config,
                 "zellij",
-                AdapterHostKind::Zellij,
+                ZELLIJ_CONFIG_OVERRIDE_FILENAME,
                 &zellij,
                 &mut output
             )
@@ -349,7 +363,7 @@ mod tests {
         let zellij = ZellijValidator;
         let checks = [(
             "zellij",
-            AdapterHostKind::Zellij,
+            ZELLIJ_CONFIG_OVERRIDE_FILENAME,
             &zellij as &dyn ActionValidator,
         )];
         let mut output = Vec::new();
