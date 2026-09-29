@@ -2146,58 +2146,75 @@ pub async fn installed_wasm_digest(binary: &Path) -> io::Result<Option<String>> 
 
 /// Bound on one activate child lifetime.
 pub const ACTIVATE_TIMEOUT: Duration = Duration::from_mins(10);
+/// Environment capability required for a public activate child.
+///
+/// Implementations must apply the complete owned scope; there is no
+/// host-independent fallback inside the command builder.
+pub trait ActivateCommandEnvironment {
+    fn apply_owned_scoped_env(&self, command: &mut Command, scoped_root: &Path);
+}
 
-/// Drives `<binary> activate` (public CLI) under the scoped environment and
-/// asserts a clean exit. The child runs under an owned handle with a
-/// bounded lifetime: expiry kills with escalation and fails closed with
-/// the preserved diagnostics. Post-conditions are asserted by the caller
-/// against the serving brokers, never by parsing report text.
+/// Applies only the Muxe-owned TempDir environment for a host-free runner.
+pub struct ScopedOnlyActivateEnvironment;
+
+impl ActivateCommandEnvironment for ScopedOnlyActivateEnvironment {
+    fn apply_owned_scoped_env(&self, command: &mut Command, scoped_root: &Path) {
+        apply_scoped_env(command, scoped_root);
+    }
+}
+
+impl ActivateCommandEnvironment for OwnedZellijHost {
+    fn apply_owned_scoped_env(&self, command: &mut Command, scoped_root: &Path) {
+        self.apply_host_scoped_env(command, scoped_root);
+    }
+}
+
+/// Drives `<binary> activate` (public CLI) with an explicit owned scoped
+/// environment policy and asserts a clean exit. The child runs under an
+/// owned handle with a bounded lifetime: expiry kills with escalation and
+/// fails closed with preserved diagnostics. Post-conditions are asserted by
+/// the caller against serving brokers, never by parsing report text.
 pub async fn drive_activate(
     binary: &Path,
     scoped_root: &Path,
-    zellij_host: Option<&OwnedZellijHost>,
+    environment: &dyn ActivateCommandEnvironment,
     tag: &str,
 ) -> io::Result<String> {
-    let child = spawn_activate(binary, scoped_root, zellij_host, None, &[], tag)?;
+    let child = spawn_activate(binary, scoped_root, environment, None, &[], tag)?;
     await_activate(child, tag).await
 }
 
 /// Spawns `<binary> activate` without waiting, so a test can interact
-/// (barriers, observations) while the coordinator runs. `zellij_host`
-/// propagates the owned Zellij context (socket/config/data dirs) so the
-/// coordinator and every broker it spawns address the owned sessions,
-/// never a default-user session. `path_prepend` optionally fronts one
-/// owned directory on PATH (fault-injector boundary); nothing else about
-/// the environment changes.
+/// (barriers, observations) while the coordinator runs. The required
+/// environment policy applies the Muxe-owned scope and any concrete owned
+/// host addresses. `path_prepend` optionally fronts one owned directory on
+/// PATH (fault-injector boundary); nothing else about the environment changes.
 pub fn spawn_activate(
     binary: &Path,
     scoped_root: &Path,
-    zellij_host: Option<&OwnedZellijHost>,
+    environment: &dyn ActivateCommandEnvironment,
     path_prepend: Option<&Path>,
     extra_env: &[(&str, &str)],
     tag: &str,
 ) -> io::Result<OwnedChild> {
-    let mut command = activate_command(binary, scoped_root, zellij_host, path_prepend, extra_env);
+    let mut command = activate_command(binary, scoped_root, environment, path_prepend, extra_env);
     OwnedChild::spawn(&format!("{tag}-activate"), &mut command)
 }
 
 /// Builds the `<binary> activate` command: the public CLI argv under the
-/// merged scoped+host environment with the owned scoped root as cwd.
+/// required owned scoped environment policy with `scoped_root` as cwd.
 /// `path_prepend` optionally fronts one owned directory on PATH
 /// (fault-injector boundary); nothing else about the environment changes.
 pub fn activate_command(
     binary: &Path,
     scoped_root: &Path,
-    zellij_host: Option<&OwnedZellijHost>,
+    environment: &dyn ActivateCommandEnvironment,
     path_prepend: Option<&Path>,
     extra_env: &[(&str, &str)],
 ) -> Command {
     let mut command = Command::new(binary);
     command.arg("activate");
-    match zellij_host {
-        Some(host) => host.apply_host_scoped_env(&mut command, scoped_root),
-        None => apply_scoped_env(&mut command, scoped_root),
-    }
+    environment.apply_owned_scoped_env(&mut command, scoped_root);
     if let Some(prepend) = path_prepend {
         let mut path = std::ffi::OsString::from(prepend.as_os_str());
         path.push(":");
@@ -2566,6 +2583,7 @@ mod scoped_spawn_tests {
         let marker_herdr = case.path().join("herdr.marker");
         let marker_zellij = case.path().join("zellij.marker");
         let marker_activate = case.path().join("activate.marker");
+        let marker_activate_scoped = case.path().join("activate-scoped.marker");
         let fake_herdr = write_fake(
             case.path(),
             "fake-muxe-herdr",
@@ -2597,6 +2615,15 @@ mod scoped_spawn_tests {
             &marker_activate,
             "resolve-zellij",
         );
+        let fake_activate_scoped = write_fake(
+            case.path(),
+            "fake-muxe-activate-scoped",
+            case.path(),
+            MUXE_VARS,
+            false,
+            &marker_activate_scoped,
+            "ok",
+        );
         let host =
             OwnedZellijHost::prepare(&fake_zellij, case.path(), "scope").expect("prepare host");
         let endpoint = scoped.join("runtime").join("test.sock");
@@ -2621,12 +2648,20 @@ mod scoped_spawn_tests {
             &config_file,
             &cache_dir,
         );
-        let mut activate_command =
-            activate_command(&fake_activate, &scoped, Some(&host), None, &[]);
+        let mut zellij_activate_command =
+            activate_command(&fake_activate, &scoped, &host, None, &[]);
+        let mut scoped_activate_command = activate_command(
+            &fake_activate_scoped,
+            &scoped,
+            &ScopedOnlyActivateEnvironment,
+            None,
+            &[],
+        );
         for (tag, command, marker) in [
             ("herdr", &mut herdr_command, &marker_herdr),
             ("zellij", &mut zellij_command, &marker_zellij),
-            ("activate", &mut activate_command, &marker_activate),
+            ("activate", &mut zellij_activate_command, &marker_activate),
+            ("activate-scoped", &mut scoped_activate_command, &marker_activate_scoped),
         ] {
             let mut child =
                 OwnedChild::spawn(&format!("scope-{tag}"), command).expect("spawn muxe fake");

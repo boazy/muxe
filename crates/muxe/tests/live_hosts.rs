@@ -78,9 +78,10 @@ use muxe_zellij_protocol::{
 };
 use sha2::{Digest, Sha256};
 use support::{
-    ContinuityGuard, OwnedChild, OwnedHerdrServer, OwnedZellijHost, ServedBroker, apply_scoped_env,
-    assert_broker_serving, assert_no_preserved_journals, await_activate, await_session_ready,
-    await_target_ready, drive_activate, emit_owned_host_log_tails, init_shared_dirs, input_path,
+    ActivateCommandEnvironment, ContinuityGuard, OwnedChild, OwnedHerdrServer, OwnedZellijHost,
+    ScopedOnlyActivateEnvironment, ServedBroker, apply_scoped_env, assert_broker_serving,
+    assert_no_preserved_journals, await_activate, await_session_ready, await_target_ready,
+    drive_activate, emit_owned_host_log_tails, init_shared_dirs, input_path,
     install_zellij_integration, installed_version, installed_wasm_digest, poll_until,
     read_broker_record, retire_broker, short_tempdir, spawn_activate, spawn_herdr_client,
     spawn_serve_herdr, spawn_serve_zellij, validate_installation,
@@ -126,6 +127,14 @@ struct Rig {
 }
 
 impl Rig {
+    fn activate_environment(&self) -> &dyn ActivateCommandEnvironment {
+        static SCOPED_ONLY: ScopedOnlyActivateEnvironment = ScopedOnlyActivateEnvironment;
+        match self.zellij.as_ref() {
+            Some(host) => host,
+            None => &SCOPED_ONLY,
+        }
+    }
+
     /// Reverse-order teardown, preserving every failure.
     /// Brokers retire first so they exit orderly; witnesses close while
     /// hosts still run; hosts reap last with diagnostics logged.
@@ -1440,7 +1449,13 @@ async fn run_target_only_smoke() -> io::Result<()> {
         // Pre-transfer sanity: the old broker serves its installed version.
         assert_broker_serving(&herdr_endpoint, "smoke", &target_version).await?;
         let report =
-            drive_activate(&target_bin, &rig.scoped_root, rig.zellij.as_ref(), "smoke").await?;
+            drive_activate(
+                &target_bin,
+                &rig.scoped_root,
+                rig.activate_environment(),
+                "smoke",
+            )
+            .await?;
         eprintln!("[smoke] activate report:\n{report}");
         let live = assert_broker_serving(&herdr_endpoint, "smoke", &target_version).await?;
         if live != rig.discovery {
@@ -1497,7 +1512,13 @@ async fn transfer_to(
     sessions: &[&str],
     case: &str,
 ) -> io::Result<()> {
-    let report = drive_activate(to_bin, &rig.scoped_root, rig.zellij.as_ref(), case).await?;
+    let report = drive_activate(
+        to_bin,
+        &rig.scoped_root,
+        rig.activate_environment(),
+        case,
+    )
+    .await?;
     eprintln!("[matrix] {case} activate report:\n{report}");
     assert_serving_record(herdr_endpoint, case, expected_herdr, &rig.discovery).await?;
     for (endpoint, expected, session) in zellij_endpoints
@@ -1747,7 +1768,7 @@ async fn run_final_session_reload_failure() -> io::Result<()> {
         let child = spawn_activate(
             &old_bin,
             &rig.scoped_root,
-            rig.zellij.as_ref(),
+            rig.activate_environment(),
             Some(&injector_dir),
             &injector_refs,
             "fault-downgrade",
