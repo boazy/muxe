@@ -537,6 +537,7 @@ async fn run_activation(
         !matches!(scope, HostScope::Zellij) && live.iter().any(|entry| entry.host_kind == "herdr");
     let zellij_selected =
         !matches!(scope, HostScope::Herdr) && live.iter().any(|entry| entry.host_kind == "zellij");
+    drop(live);
     let herdr_binary = herdr_selected.then(herdr_binary_from_path).transpose()?;
     let zellij_exe = zellij_selected
         .then(|| {
@@ -557,22 +558,22 @@ async fn run_activation(
     let executable = env::current_exe().wrap_err("could not locate the running muxe executable")?;
     let config_file = paths.config_file();
     let cache_dir = paths.cache_dir.clone();
-    let entries = live
-        .iter()
-        .map(|entry| (entry.socket.clone(), entry.host_kind.clone()))
-        .collect::<std::collections::HashMap<_, _>>();
-    let spawn_herdr_binary = herdr_binary.clone();
-    let spawn_zellij_exe = zellij_exe.clone();
-    let spawn_argv = move |member: &muxe::lifecycle::SpawnMember| {
-        activate_spawn_argv(
-            &executable,
-            &config_file,
-            &cache_dir,
-            spawn_herdr_binary.as_ref(),
-            spawn_zellij_exe.as_ref(),
-            &entries,
-            member,
-        )
+    let spawn_context = TargetSpawnContext {
+        executable: &executable,
+        config_file: &config_file,
+        cache_dir: &cache_dir,
+    };
+    let herdr_spawn = HerdrTargetSpawn {
+        context: &spawn_context,
+        binary: herdr_binary.as_ref(),
+    };
+    let zellij_spawn = ZellijTargetSpawn {
+        context: &spawn_context,
+        binary: zellij_exe.as_ref(),
+    };
+    let select_spawn = SelectedTargetSpawns {
+        herdr: &herdr_spawn,
+        zellij: &zellij_spawn,
     };
     let preflight = muxe::lifecycle::LivePreflight {
         config_path: paths.config_file(),
@@ -594,7 +595,7 @@ async fn run_activation(
             program: preflight.zellij_exe.clone(),
         },
         preflight: &preflight,
-        spawn_argv: &spawn_argv,
+        spawn_policy: &select_spawn,
         readiness_deadline: Duration::from_mins(2),
         poll_interval: Duration::from_millis(200),
         hooks: muxe::lifecycle::ActivateHooks::default(),
@@ -615,8 +616,8 @@ async fn ensure_herdr_broker(
 ) -> Result<PathBuf> {
     let record = muxe::compatibility::embedded_record()
         .wrap_err("could not load the embedded compatibility record")?;
-    let discovery = runtime.identity().discovery_key.as_str().to_owned();
-    let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Herdr, &discovery)
+    let discovery = runtime.identity().discovery_key.clone();
+    let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Herdr, discovery.as_str())
         .wrap_err("could not derive the normal Herdr broker endpoint")?;
     let executable = env::current_exe().wrap_err("could not locate the running muxe executable")?;
     let inputs = muxe::lifecycle::ColdstartInputs {
@@ -672,7 +673,8 @@ async fn ensure_zellij_broker(
 ) -> Result<muxe::lifecycle::LiveBroker> {
     let record = muxe::compatibility::embedded_record()
         .wrap_err("could not load the embedded compatibility record")?;
-    let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Zellij, session)
+    let session = muxe_adapter_api::HostDiscoveryKey::parse(session)?;
+    let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Zellij, session.as_str())
         .wrap_err("could not derive the normal Zellij broker endpoint")?;
     let executable = env::current_exe().wrap_err("could not locate the running muxe executable")?;
     let reloader = muxe::lifecycle::ZellijCliReloader {
@@ -684,7 +686,7 @@ async fn ensure_zellij_broker(
         executable: &executable,
         endpoint,
         host: muxe::lifecycle::ColdstartHost::Zellij {
-            session: session.to_owned(),
+            session,
             zellij_exe: zellij_exe.to_path_buf(),
         },
         current_record: record.handoff,
@@ -728,85 +730,120 @@ fn activation_incomplete(units: &[muxe::lifecycle::UnitOutcome]) -> bool {
         )
     })
 }
-/// normal-endpoint stem (`b-z-`/`b-h-`) covers a member registered between
-/// the coordinator's probe and this spawn.
-fn activate_spawn_argv(
-    executable: &Path,
-    config_file: &Path,
-    cache_dir: &Path,
-    herdr_binary: Option<&PathBuf>,
-    zellij_exe: Option<&PathBuf>,
-    entries: &std::collections::HashMap<PathBuf, String>,
-    member: &muxe::lifecycle::SpawnMember,
-) -> Result<(PathBuf, Vec<OsString>), muxe::lifecycle::ActivateError> {
-    let handoff = member.authority.handoff_id;
-    let program = executable.to_path_buf();
-    let kind = entries
-        .get(member.authority.endpoint.as_path())
-        .cloned()
-        .or_else(|| {
-            member
-                .authority
-                .endpoint
-                .as_path()
-                .file_name()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| {
-                    stem.strip_prefix("b-")
-                        .and_then(|rest| rest.split('-').next())
-                        .and_then(|kind| match kind {
-                            "z" => Some("zellij".to_owned()),
-                            "h" => Some("herdr".to_owned()),
-                            _ => None,
-                        })
-                })
-        })
-        .ok_or_else(|| {
-            muxe::lifecycle::ActivateError::Spawn(format!(
-                "cannot determine the host kind for broker endpoint {}",
-                member.authority.endpoint.as_path().display()
-            ))
-        })?;
-    if kind == "zellij" {
-        let journal = member.journal_path.clone();
-        let spawn = muxe_broker::ServeZellijSpawn {
+/// Owned path inputs borrowed by one selected target renderer.
+struct TargetSpawnContext<'a> {
+    executable: &'a Path,
+    config_file: &'a Path,
+    cache_dir: &'a Path,
+}
+
+struct HerdrTargetSpawn<'a> {
+    context: &'a TargetSpawnContext<'a>,
+    binary: Option<&'a PathBuf>,
+}
+
+impl muxe::lifecycle::TargetSpawnPolicy for HerdrTargetSpawn<'_> {
+    fn render(
+        &self,
+        member: &muxe::lifecycle::SpawnMember<'_>,
+    ) -> Result<(PathBuf, Vec<OsString>), muxe::lifecycle::ActivateError> {
+        let muxe::lifecycle::UnitKind::Herdr { host_hash } = member.unit else {
+            return Err(muxe::lifecycle::ActivateError::Spawn(
+                "Herdr renderer received a foreign journal unit".to_owned(),
+            ));
+        };
+        if member.observed_host != ProtocolHostKind::Herdr
+            || member.observed_bridge_identity.is_some()
+            || member.observed_bridge_member.is_some()
+            || member.observed_handoff_id.is_some()
+            || muxe::lifecycle::journal::unit_hash(member.authority.member.as_str()) != *host_hash
+        {
+            return Err(muxe::lifecycle::ActivateError::Spawn(
+                "observed Herdr member disagrees with journal unit".to_owned(),
+            ));
+        }
+        let program = self.context.executable.to_path_buf();
+        let args = muxe_broker::ServeHerdrSpawn {
             binary: program.clone(),
             socket: member.authority.endpoint.as_path().to_path_buf(),
-            zellij_exe: zellij_exe.cloned().ok_or_else(|| {
+            herdr_binary: self.binary.cloned().ok_or_else(|| {
+                muxe::lifecycle::ActivateError::Spawn(
+                    "no Herdr executable is installed for a Herdr target".to_owned(),
+                )
+            })?,
+            herdr_socket: PathBuf::from(member.authority.member.as_str()),
+            config: self.context.config_file.to_path_buf(),
+            cache_dir: self.context.cache_dir.to_path_buf(),
+            handoff: Some(member.authority.handoff_id),
+            activation_journal: Some(member.journal_path.clone()),
+        }
+        .argv()
+        .map_err(|error| muxe::lifecycle::ActivateError::Spawn(error.to_string()))?;
+        Ok((program, args))
+    }
+}
+
+struct ZellijTargetSpawn<'a> {
+    context: &'a TargetSpawnContext<'a>,
+    binary: Option<&'a PathBuf>,
+}
+
+impl muxe::lifecycle::TargetSpawnPolicy for ZellijTargetSpawn<'_> {
+    fn render(
+        &self,
+        member: &muxe::lifecycle::SpawnMember<'_>,
+    ) -> Result<(PathBuf, Vec<OsString>), muxe::lifecycle::ActivateError> {
+        let muxe::lifecycle::UnitKind::Zellij { bridge_unit } = member.unit else {
+            return Err(muxe::lifecycle::ActivateError::Spawn(
+                "Zellij renderer received a foreign journal unit".to_owned(),
+            ));
+        };
+        if member.observed_host != ProtocolHostKind::Zellij
+            || member
+                .observed_bridge_identity
+                .is_none_or(|identity| identity.unit() != *bridge_unit)
+            || member
+                .observed_bridge_member
+                .is_none_or(|id| id.as_str() != member.authority.member.as_str())
+        {
+            return Err(muxe::lifecycle::ActivateError::Spawn(
+                "observed bridge member disagrees with journal unit".to_owned(),
+            ));
+        }
+        let program = self.context.executable.to_path_buf();
+        let args = muxe_broker::ServeZellijSpawn {
+            binary: program.clone(),
+            socket: member.authority.endpoint.as_path().to_path_buf(),
+            zellij_exe: self.binary.cloned().ok_or_else(|| {
                 muxe::lifecycle::ActivateError::Spawn(
                     "no Zellij executable is installed for a Zellij target".to_owned(),
                 )
             })?,
             session: member.authority.member.as_str().to_owned(),
-            config: config_file.to_path_buf(),
-            cache_dir: cache_dir.to_path_buf(),
-            handoff: Some(handoff),
-            activation_journal: Some(journal),
-        };
-        let args = spawn
-            .argv()
-            .map_err(|error| muxe::lifecycle::ActivateError::Spawn(error.to_string()))?;
-        return Ok((program, args));
-    }
-    let journal = member.journal_path.clone();
-    let spawn = muxe_broker::ServeHerdrSpawn {
-        binary: program.clone(),
-        socket: member.authority.endpoint.as_path().to_path_buf(),
-        herdr_binary: herdr_binary.cloned().ok_or_else(|| {
-            muxe::lifecycle::ActivateError::Spawn(
-                "no Herdr executable is installed for a Herdr target".to_owned(),
-            )
-        })?,
-        herdr_socket: PathBuf::from(member.authority.member.as_str()),
-        config: config_file.to_path_buf(),
-        cache_dir: cache_dir.to_path_buf(),
-        handoff: Some(handoff),
-        activation_journal: Some(journal),
-    };
-    let args = spawn
+            config: self.context.config_file.to_path_buf(),
+            cache_dir: self.context.cache_dir.to_path_buf(),
+            handoff: Some(member.authority.handoff_id),
+            activation_journal: Some(member.journal_path.clone()),
+        }
         .argv()
         .map_err(|error| muxe::lifecycle::ActivateError::Spawn(error.to_string()))?;
-    Ok((program, args))
+        Ok((program, args))
+    }
+}
+
+/// Selects a borrowed concrete renderer once per journal unit.
+struct SelectedTargetSpawns<'a> {
+    herdr: &'a HerdrTargetSpawn<'a>,
+    zellij: &'a ZellijTargetSpawn<'a>,
+}
+
+impl muxe::lifecycle::TargetSpawnSelector for SelectedTargetSpawns<'_> {
+    fn select(&self, unit: &muxe::lifecycle::UnitKind) -> &dyn muxe::lifecycle::TargetSpawnPolicy {
+        match unit {
+            muxe::lifecycle::UnitKind::Herdr { .. } => self.herdr,
+            muxe::lifecycle::UnitKind::Zellij { .. } => self.zellij,
+        }
+    }
 }
 
 /// Appends one broker-service audit record. Failures to write the log never
@@ -4523,93 +4560,43 @@ mod consumer_tests {
     }
 
     #[test]
-    fn activate_spawn_renders_both_host_shapes() {
-        let temp = tempfile::tempdir().expect("owned spawn render root");
-        let exe = temp.path().join("muxe");
+    fn activation_spawn_rejects_a_foreign_observed_host_before_rendering_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = PathBuf::from("/run/b-h-member.sock");
+        let unit = muxe::lifecycle::UnitKind::Herdr {
+            host_hash: muxe::lifecycle::journal::unit_hash("/herdr.sock"),
+        };
+        let member = muxe::lifecycle::SpawnMember {
+            unit: &unit,
+            authority: muxe::lifecycle::MemberLaunchAuthority {
+                member: muxe::lifecycle::ActivationMemberId::new("/herdr.sock".to_owned()).unwrap(),
+                endpoint: muxe::lifecycle::MemberEndpoint::new(socket.clone()).unwrap(),
+                handoff_id: muxe_protocol::HandoffId([0xab; 16]),
+            },
+            observed_host: ProtocolHostKind::Zellij,
+            observed_bridge_identity: None,
+            observed_bridge_member: None,
+            observed_handoff_id: None,
+            journal_path: temp.path().join("activation.json"),
+        };
+        let executable = temp.path().join("muxe");
         let config = temp.path().join("config.yml");
-        let cache = temp.path().join("cache");
-        let herdr_journal = temp.path().join("herdr.json");
-        let zellij_journal = temp.path().join("zellij.json");
-        let entries = std::collections::HashMap::from([
-            (PathBuf::from("/run/b-h.sock"), "herdr".to_owned()),
-            (PathBuf::from("/run/b-z.sock"), "zellij".to_owned()),
-        ]);
-        let herdr = activate_spawn_argv(
-            &exe,
-            &config,
-            &cache,
-            Some(&PathBuf::from("/bin/herdr")),
-            None,
-            &entries,
-            &muxe::lifecycle::SpawnMember {
-                authority: muxe::lifecycle::MemberLaunchAuthority {
-                    member: muxe::lifecycle::ActivationMemberId::new("/herdr.sock".to_owned())
-                        .unwrap(),
-                    endpoint: muxe::lifecycle::MemberEndpoint::new(PathBuf::from("/run/b-h.sock"))
-                        .unwrap(),
-                    handoff_id: muxe_protocol::HandoffId([0xab; 16]),
-                },
-                journal_path: herdr_journal,
-            },
-        )
-        .expect("herdr spawn renders");
-        let herdr_text = herdr
-            .1
-            .iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(herdr_text[0], "broker");
-        assert_eq!(herdr_text[1], "serve-herdr");
-        assert!(herdr_text.contains(&"--herdr-socket".to_owned()));
-        let zellij = activate_spawn_argv(
-            &exe,
-            &config,
-            &cache,
-            None,
-            Some(&PathBuf::from("/bin/zellij")),
-            &entries,
-            &muxe::lifecycle::SpawnMember {
-                authority: muxe::lifecycle::MemberLaunchAuthority {
-                    member: muxe::lifecycle::ActivationMemberId::new("session-a".to_owned())
-                        .unwrap(),
-                    endpoint: muxe::lifecycle::MemberEndpoint::new(PathBuf::from("/run/b-z.sock"))
-                        .unwrap(),
-                    handoff_id: muxe_protocol::HandoffId([0xcd; 16]),
-                },
-                journal_path: zellij_journal,
-            },
-        )
-        .expect("zellij spawn renders");
-        let zellij_text = zellij
-            .1
-            .iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(zellij_text[1], "serve-zellij");
-        assert!(zellij_text.contains(&"--session".to_owned()));
-        assert!(
-            activate_spawn_argv(
-                &exe,
-                &config,
-                &cache,
-                None,
-                None,
-                &std::collections::HashMap::new(),
-                &muxe::lifecycle::SpawnMember {
-                    authority: muxe::lifecycle::MemberLaunchAuthority {
-                        member: muxe::lifecycle::ActivationMemberId::new("x".to_owned()).unwrap(),
-                        endpoint: muxe::lifecycle::MemberEndpoint::new(PathBuf::from(
-                            "/run/odd.sock",
-                        ))
-                        .unwrap(),
-                        handoff_id: muxe_protocol::HandoffId([0xab; 16]),
-                    },
-                    journal_path: temp.path().join("unknown.json"),
-                },
-            )
-            .is_err()
-        );
+        let context = TargetSpawnContext {
+            executable: &executable,
+            config_file: &config,
+            cache_dir: temp.path(),
+        };
+        let binary = PathBuf::from("/bin/herdr");
+        let renderer = HerdrTargetSpawn {
+            context: &context,
+            binary: Some(&binary),
+        };
+        assert!(matches!(
+            muxe::lifecycle::TargetSpawnPolicy::render(&renderer, &member),
+            Err(muxe::lifecycle::ActivateError::Spawn(_))
+        ));
     }
+
 }
 #[cfg(test)]
 mod mixed_recovery_production_tests {

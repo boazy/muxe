@@ -447,18 +447,18 @@ async fn assert_coldstart_owned_child(scenario: &str) {
         })
         .await
         .expect("retained Herdr runtime identifies current incarnation");
-    let discovery = runtime.identity().discovery_key.as_str().to_owned();
+    let discovery = runtime.identity().discovery_key.clone();
     let current_server =
         muxe_protocol::wire::ServerId::new(runtime.identity().live_server_id.as_str());
     let endpoint = RuntimeEndpoint::in_runtime_dir(
         root.path().join("runtime"),
         muxe_protocol::wire::HostKind::Herdr,
-        &discovery,
+        discovery.as_str(),
     )
     .unwrap();
     let registry = muxe::lifecycle::Registry::open(&cache).unwrap();
     let stale_id =
-        register_stale_owner(scenario, &endpoint, &registry, &discovery, &current_server);
+        register_stale_owner(scenario, &endpoint, &registry, discovery.as_str(), &current_server);
     let spawner = ScopedColdstartSpawner::new(root.path());
     let executable = Path::new(env!("CARGO_BIN_EXE_muxe"));
     let inputs = ColdstartInputs {

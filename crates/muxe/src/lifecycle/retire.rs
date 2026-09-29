@@ -20,8 +20,10 @@ use super::{
         unit_label,
     },
     control::ControlError,
-    registry::{BrokerEntry, Registry, RegistryError},
+    registry::{BrokerEntry, HerdrRegistryAuthority, Registry, RegistryAuthority, RegistryError},
 };
+
+const HERDR_AUTHORITY: HerdrRegistryAuthority = HerdrRegistryAuthority;
 
 #[derive(Debug, Error)]
 pub enum RetireError {
@@ -103,6 +105,10 @@ where
 {
     let label = unit_label(unit);
     let unit_guard = unit.retirement_guard(cache_dir)?;
+    let authority: &dyn RegistryAuthority = unit_guard.as_ref().map_or(
+        &HERDR_AUTHORITY,
+        |guard| guard as &dyn RegistryAuthority,
+    );
     let entries: Vec<&BrokerEntry> = match unit {
         PlannedUnit::Herdr { entry } => vec![entry],
         PlannedUnit::Zellij { entries, .. } => entries.iter().collect(),
@@ -115,7 +121,7 @@ where
         let outcome = match control.connect(&entry.socket).await {
             Ok(mut session) => session.retire().await.map(|_| ()),
             Err(error) if error.is_absent_endpoint() => {
-                registry.unregister_entry(entry, unit_guard.as_ref())?;
+                registry.unregister_entry(entry, authority)?;
                 continue;
             }
             Err(error) => Err(error),
@@ -123,7 +129,7 @@ where
         match outcome {
             Ok(()) => {
                 retired_any = true;
-                registry.unregister_entry(entry, unit_guard.as_ref())?;
+                registry.unregister_entry(entry, authority)?;
             }
             Err(error) => {
                 log(

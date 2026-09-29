@@ -14,7 +14,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use muxe_protocol::control::{BrokerRegistrationId, HandoffId};
+use muxe_protocol::{
+    control::{BrokerRegistrationId, HandoffId},
+    wire::HostKind,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -34,6 +37,14 @@ pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
 /// read-modify-write so concurrent broker startups cannot overwrite each
 /// other's entries. The inode is persistent: it is never deleted.
 const REGISTRY_LOCK_FILE_NAME: &str = "registry.json.lock";
+
+/// Closed registry schema spelling, used only at the persistence boundary.
+pub(crate) fn persisted_host_label(host: HostKind) -> &'static str {
+    match host {
+        HostKind::Herdr => "herdr",
+        HostKind::Zellij => "zellij",
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
@@ -101,6 +112,21 @@ impl BrokerEntry {
             bridge_member: None,
             handoff_id: None,
             live_server: None,
+        }
+    }
+
+    /// Wraps the persisted host label before lifecycle code compares it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown registry host label.
+    pub(crate) fn parsed_host_kind(&self) -> Result<HostKind, RegistryError> {
+        match self.host_kind.as_str() {
+            "herdr" => Ok(HostKind::Herdr),
+            "zellij" => Ok(HostKind::Zellij),
+            _ => Err(RegistryError::Unauthorized(
+                "registry row carries an unknown host kind".to_owned(),
+            )),
         }
     }
 }
@@ -277,6 +303,54 @@ impl BridgeUnitGuard {
     }
 }
 
+mod authority_seal {
+    pub trait Sealed {}
+}
+
+/// The caller's already-selected host authority, never inferred from an
+/// untrusted persisted `host_kind` label. Implementations validate that label
+/// and every host-specific field before a registry mutation or reuse.
+pub(crate) trait RegistryAuthority: authority_seal::Sealed {
+    fn validate_entry(&self, entry: &BrokerEntry) -> Result<(), RegistryError>;
+}
+
+/// Herdr coldstart retains its unit lock while reconciling registry ownership.
+#[derive(Debug)]
+pub(crate) struct HerdrUnitGuard {
+    _lock: UnitLock,
+}
+
+impl HerdrUnitGuard {
+    pub(crate) fn new(lock: UnitLock) -> Self {
+        Self { _lock: lock }
+    }
+}
+
+/// Retirement has exact-entry ownership but no Herdr unit lock, as before.
+pub(crate) struct HerdrRegistryAuthority;
+
+impl authority_seal::Sealed for HerdrUnitGuard {}
+impl authority_seal::Sealed for HerdrRegistryAuthority {}
+impl authority_seal::Sealed for BridgeUnitGuard {}
+
+impl RegistryAuthority for HerdrUnitGuard {
+    fn validate_entry(&self, entry: &BrokerEntry) -> Result<(), RegistryError> {
+        validate_herdr_entry(entry)
+    }
+}
+
+impl RegistryAuthority for HerdrRegistryAuthority {
+    fn validate_entry(&self, entry: &BrokerEntry) -> Result<(), RegistryError> {
+        validate_herdr_entry(entry)
+    }
+}
+
+impl RegistryAuthority for BridgeUnitGuard {
+    fn validate_entry(&self, entry: &BrokerEntry) -> Result<(), RegistryError> {
+        validate_zellij_entry(entry, &self.identity, entry.handoff_id)
+    }
+}
+
 /// Exact journal-derived permission for one same-member target replacement.
 #[derive(Clone, Debug)]
 pub struct TargetRegistrationCapability {
@@ -391,15 +465,7 @@ impl Registry {
     ///
     /// Returns [`RegistryError`] when the registry cannot be locked, read, or written.
     pub fn register_herdr(&self, entry: BrokerEntry) -> Result<Registration, RegistryError> {
-        if entry.host_kind != "herdr"
-            || entry.bridge_identity.is_some()
-            || entry.bridge_member.is_some()
-            || entry.handoff_id.is_some()
-        {
-            return Err(RegistryError::Unauthorized(
-                "Herdr registration carries Zellij bridge authority".to_owned(),
-            ));
-        }
+        validate_herdr_entry(&entry)?;
         self.register_inner(entry)
     }
 
@@ -602,27 +668,14 @@ impl Registry {
     /// # Errors
     ///
     /// Any snapshot, path, owner, or peer drift refuses mutation.
-    pub fn reconcile_live(
+    pub(crate) fn reconcile_live(
         &self,
-        guard: Option<&BridgeUnitGuard>,
+        authority: &dyn RegistryAuthority,
         observed: &[BrokerEntry],
         candidate: BrokerEntry,
         revalidate: impl FnOnce() -> Result<(), RegistryError>,
     ) -> Result<BrokerEntry, RegistryError> {
-        if candidate.host_kind == "zellij" {
-            let guard = guard.ok_or_else(|| {
-                RegistryError::Conflict("Zellij reconciliation lacks bridge-unit guard".to_owned())
-            })?;
-            validate_zellij_entry(&candidate, guard.identity(), candidate.handoff_id)?;
-        } else if candidate.host_kind != "herdr"
-            || candidate.bridge_identity.is_some()
-            || candidate.bridge_member.is_some()
-            || candidate.handoff_id.is_some()
-        {
-            return Err(RegistryError::Conflict(
-                "live candidate has conflicting host authority".to_owned(),
-            ));
-        }
+        authority.validate_entry(&candidate)?;
         if candidate
             .registration_id
             .is_none_or(BrokerRegistrationId::is_zero)
@@ -685,19 +738,14 @@ impl Registry {
     /// # Errors
     ///
     /// Refuses snapshot, bridge, or endpoint drift under the registry lock.
-    pub fn verify_existing(
+    pub(crate) fn verify_existing(
         &self,
-        guard: Option<&BridgeUnitGuard>,
+        authority: &dyn RegistryAuthority,
         observed: &[BrokerEntry],
         entry: &BrokerEntry,
         revalidate: impl FnOnce() -> Result<(), RegistryError>,
     ) -> Result<(), RegistryError> {
-        if entry.host_kind == "zellij" {
-            let guard = guard.ok_or_else(|| {
-                RegistryError::Conflict("Zellij reuse lacks bridge-unit guard".to_owned())
-            })?;
-            validate_zellij_entry(entry, guard.identity(), entry.handoff_id)?;
-        }
+        authority.validate_entry(entry)?;
         let _lock = RegistryLock::acquire(&self.lock_path)?;
         let file = self.read()?;
         if file.brokers != observed || !file.brokers.contains(entry) {
@@ -714,19 +762,14 @@ impl Registry {
     /// # Errors
     ///
     /// A changed snapshot, foreign row, or failed recheck refuses removal.
-    pub fn remove_exact_stale(
+    pub(crate) fn remove_exact_stale(
         &self,
-        guard: Option<&BridgeUnitGuard>,
+        authority: &dyn RegistryAuthority,
         observed: &[BrokerEntry],
         stale: &BrokerEntry,
         revalidate: impl FnOnce() -> Result<(), RegistryError>,
     ) -> Result<(), RegistryError> {
-        if stale.host_kind == "zellij" {
-            let guard = guard.ok_or_else(|| {
-                RegistryError::Conflict("Zellij stale removal lacks bridge-unit guard".to_owned())
-            })?;
-            validate_zellij_entry(stale, guard.identity(), stale.handoff_id)?;
-        }
+        authority.validate_entry(stale)?;
         let _lock = RegistryLock::acquire(&self.lock_path)?;
         let mut file = self.read()?;
         if file.brokers != observed || !file.brokers.contains(stale) {
@@ -746,19 +789,12 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`RegistryError`] when the registry cannot be locked, read, or written.
-    pub fn unregister_entry(
+    pub(crate) fn unregister_entry(
         &self,
         entry: &BrokerEntry,
-        guard: Option<&BridgeUnitGuard>,
+        authority: &dyn RegistryAuthority,
     ) -> Result<bool, RegistryError> {
-        if entry.host_kind == "zellij" {
-            let guard = guard.ok_or_else(|| {
-                RegistryError::Unauthorized(
-                    "Zellij membership cleanup requires its bridge-unit guard".to_owned(),
-                )
-            })?;
-            validate_zellij_entry(entry, guard.identity(), entry.handoff_id)?;
-        }
+        authority.validate_entry(entry)?;
         self.unregister_entry_inner(entry)
     }
 
@@ -846,7 +882,21 @@ impl Registry {
     }
 }
 
-/// Connect-probes one broker socket: refused or missing is stale, accepted is
+/// Checks an untrusted Herdr row against the unguarded registration format.
+fn validate_herdr_entry(entry: &BrokerEntry) -> Result<(), RegistryError> {
+    if entry.host_kind != "herdr"
+        || entry.bridge_identity.is_some()
+        || entry.bridge_member.is_some()
+        || entry.handoff_id.is_some()
+    {
+        return Err(RegistryError::Unauthorized(
+            "Herdr registration carries Zellij bridge authority".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks an untrusted Zellij row against the retained bridge-unit guard.
 fn validate_zellij_entry(
     entry: &BrokerEntry,
     identity: &BridgeIdentity,
@@ -871,6 +921,7 @@ fn validate_zellij_entry(
     Ok(())
 }
 
+/// Connect-probes one broker socket: refused or missing is stale, accepted is
 /// live. Any other socket error fails closed instead of guessing.
 fn socket_is_stale(socket: &Path) -> Result<bool, RegistryError> {
     match UnixStream::connect(socket) {
@@ -966,7 +1017,7 @@ mod tests {
         candidate.server_pid = std::process::id();
         assert_eq!(
             registry
-                .reconcile_live(None, &[], candidate.clone(), || Ok(()))
+                .reconcile_live(&HerdrRegistryAuthority, &[], candidate.clone(), || Ok(()))
                 .unwrap(),
             candidate,
             "no-row adoption retains attested token and timestamp"
@@ -985,7 +1036,7 @@ mod tests {
         let observed = registry.entries().unwrap();
         assert_eq!(
             registry
-                .reconcile_live(None, &observed, candidate.clone(), || Ok(()))
+                .reconcile_live(&HerdrRegistryAuthority, &observed, candidate.clone(), || Ok(()))
                 .unwrap(),
             candidate
         );
@@ -998,7 +1049,7 @@ mod tests {
         registry.register(candidate.clone()).unwrap();
         assert!(
             registry
-                .reconcile_live(None, &stale_snapshot, candidate.clone(), || Ok(()))
+                .reconcile_live(&HerdrRegistryAuthority, &stale_snapshot, candidate.clone(), || Ok(()))
                 .is_err()
         );
         assert_eq!(registry.entries().unwrap(), vec![candidate.clone()]);
@@ -1007,7 +1058,7 @@ mod tests {
         changed.socket = temp.path().join("rebound.sock");
         assert!(
             registry
-                .reconcile_live(None, &observed, changed, || {
+                .reconcile_live(&HerdrRegistryAuthority, &observed, changed, || {
                     Err(RegistryError::Conflict("injected socket rebind".to_owned()))
                 })
                 .is_err()
@@ -1106,6 +1157,53 @@ mod tests {
         entry.live_server = Some(format!("{member}-server"));
         entry.registration_id = Some(BrokerRegistrationId::generate().unwrap());
         entry
+    }
+
+    #[test]
+    fn selected_authority_rejects_foreign_rows_before_registry_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = test_registry(temp.path());
+        let identity = BridgeIdentity::resolve(
+            &temp.path().join("integration"),
+            std::ffi::OsStr::new(crate::integration::BRIDGE_FILE_NAME),
+        )
+        .unwrap();
+        let guard = BridgeUnitGuard::acquire(temp.path(), identity.clone()).unwrap();
+        let herdr = entry(temp.path().join("herdr.sock"));
+        let zellij = zellij_entry(&identity, "session-a", temp.path().join("zellij.sock"), None);
+        assert!(matches!(
+            registry.reconcile_live(&HerdrRegistryAuthority, &[], zellij, || {
+                panic!("foreign row must fail before endpoint revalidation")
+            }),
+            Err(RegistryError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            registry.reconcile_live(&guard, &[], herdr.clone(), || {
+                panic!("foreign row must fail before endpoint revalidation")
+            }),
+            Err(RegistryError::Unauthorized(_))
+        ));
+        assert!(registry.entries().unwrap().is_empty());
+
+        registry.register_herdr(herdr.clone()).unwrap();
+        let observed = registry.entries().unwrap();
+        assert!(matches!(
+            registry.verify_existing(&guard, &observed, &herdr, || {
+                panic!("foreign legacy row must fail before reuse")
+            }),
+            Err(RegistryError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            registry.remove_exact_stale(&guard, &observed, &herdr, || {
+                panic!("foreign stale row must fail before removal")
+            }),
+            Err(RegistryError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            registry.unregister_entry(&herdr, &guard),
+            Err(RegistryError::Unauthorized(_))
+        ));
+        assert_eq!(registry.entries().unwrap(), observed);
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 ### 🐛 Bug Fixes
 
+- *(broker)* Require the selected host's registry authority for cold-start adoption, reuse, stale removal, and retirement; reject foreign persisted rows before mutation
+- *(activation)* Spawn targets from the typed journal unit instead of a registry label or socket filename
 - *(activation)* Keep bridge preflight, reload, and Ready proof under the selected host policy; accept unchanged bridge membership regardless of registry insertion order
 - *(zellij)* Complete fresh membership coverage before ordinary broker startup; keep activation targets gated until their reserved identity is covered
 - *(cli)* Create and validate the cache root owner-only before audit logging; refuse unsafe existing directories

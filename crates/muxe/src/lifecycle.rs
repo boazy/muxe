@@ -23,7 +23,9 @@ pub use activate::{
     ActivateError, ActivateHooks, ActivateInputs, ActivateReport, ActivateStep,
     BrokerRollbackOutcome, BrokerSpawner, ControlPort, ControlSession, DetectedHost, HostReloader,
     LiveControl, LivePreflight, Preflight, ProcessSpawner, RecoveryOutcome, SpawnMember,
-    SpawnRequest, StagedBridge, TargetHandle, UnitOutcome, ZellijCliReloader, activate, recover,
+    SpawnPolicySelector, SpawnRequest, StagedBridge, TargetHandle, TargetSpawnPolicy,
+    TargetSpawnSelector, UnitOutcome,
+    ZellijCliReloader, activate, recover,
 };
 pub use coldstart::{
     ColdstartError, ColdstartHost, ColdstartInputs, ColdstartOutcome, LiveBroker, ensure_broker,

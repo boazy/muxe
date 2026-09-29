@@ -48,6 +48,7 @@ use muxe_protocol::control::{
     ActivationStatus, AsOfTick, CompatibilityRecord, HandoffId, LifecycleState,
     PrepareHandoffProtocol, TargetReadiness, UnitReadinessEpochId,
 };
+use muxe_protocol::wire::HostKind;
 use thiserror::Error;
 
 use crate::{
@@ -68,7 +69,7 @@ use super::{
         TargetProcessId, TargetRetirementAuthority, TargetRetirementIntent, TransactionDirective,
         TransactionMember, UnitKind, unit_hash,
     },
-    registry::{BrokerEntry, MemberCensus, Registry, RegistryError},
+    registry::{BridgeMemberId, BrokerEntry, MemberCensus, Registry, RegistryError},
 };
 
 /// Activation transaction boundaries for failure injection.
@@ -265,10 +266,16 @@ impl ControlPort for LiveControl {
     }
 }
 
-/// Exact typed authority of one prepared member for target spawning.
+/// Exact selected unit and typed observed row authority for target spawning.
+/// A persisted host label is wrapped and checked before reaching the renderer.
 #[derive(Clone, Debug)]
-pub struct SpawnMember {
+pub struct SpawnMember<'a> {
+    pub unit: &'a UnitKind,
     pub authority: MemberLaunchAuthority,
+    pub observed_host: HostKind,
+    pub observed_bridge_identity: Option<&'a BridgeIdentity>,
+    pub observed_bridge_member: Option<&'a BridgeMemberId>,
+    pub observed_handoff_id: Option<HandoffId>,
     /// Exact journal path resolved by the coordinator under unit authority.
     pub journal_path: PathBuf,
 }
@@ -1366,11 +1373,34 @@ pub struct ActivateReport {
     pub units: Vec<UnitOutcome>,
 }
 
-/// Inputs for `muxe activate`.
-/// Renders the exact owned spawn request for one prepared member: the current
-/// executable plus the broker-authored serve arguments.
-pub type SpawnArgv<'a> =
-    &'a dyn Fn(&SpawnMember) -> Result<(PathBuf, Vec<OsString>), ActivateError>;
+/// One concrete target renderer selected before iterating a unit's members.
+/// Its implementation owns host-specific serve argv and exact row admission.
+pub trait TargetSpawnPolicy {
+    /// Builds the exact owned child request under the selected unit.
+    ///
+    /// # Errors
+    ///
+    /// Refuses absent executable authority or a mismatched observed member.
+    fn render(&self, member: &SpawnMember<'_>) -> Result<(PathBuf, Vec<OsString>), ActivateError>;
+}
+
+impl<F> TargetSpawnPolicy for F
+where
+    F: for<'m> Fn(&SpawnMember<'m>) -> Result<(PathBuf, Vec<OsString>), ActivateError>,
+{
+    fn render(&self, member: &SpawnMember<'_>) -> Result<(PathBuf, Vec<OsString>), ActivateError> {
+        self(member)
+    }
+}
+
+/// One composition-boundary selection for an entire typed activation unit.
+pub trait TargetSpawnSelector {
+    /// Returns the concrete policy chosen for the complete unit transaction.
+    fn select(&self, unit: &UnitKind) -> &dyn TargetSpawnPolicy;
+}
+
+/// Borrowed selector installed at the executable composition boundary.
+pub type SpawnPolicySelector<'a> = &'a dyn TargetSpawnSelector;
 
 pub struct ActivateInputs<'a, C, S, R, P> {
     pub config_dir: &'a Path,
@@ -1384,8 +1414,8 @@ pub struct ActivateInputs<'a, C, S, R, P> {
     pub spawner: &'a S,
     pub reloader: &'a R,
     pub preflight: &'a P,
-    /// Builds the exact owned spawn request per member.
-    pub spawn_argv: SpawnArgv<'a>,
+    /// Selects one concrete target renderer before the unit's member loop.
+    pub spawn_policy: SpawnPolicySelector<'a>,
     pub readiness_deadline: Duration,
     pub poll_interval: Duration,
     pub hooks: ActivateHooks,
@@ -1669,7 +1699,8 @@ where
     H: ActivationHost,
 {
     let label = unit_label(unit);
-    let _unit_lock = match journal::acquire_unit_lock(inputs.cache_dir, &unit.unit_kind()) {
+    let unit_kind = unit.unit_kind();
+    let _unit_lock = match journal::acquire_unit_lock(inputs.cache_dir, &unit_kind) {
         Ok(lock) => lock,
         Err(error) => {
             return UnitOutcome::Failed {
@@ -1686,7 +1717,7 @@ where
             reason,
         };
     }
-    match activate_unit_inner_prepared(inputs, unit, host, preparation).await {
+    match activate_unit_inner_prepared(inputs, unit, host, unit_kind, preparation).await {
         Ok(outcome) => outcome,
         Err(ActivateError::FaultInjected { step }) => UnitOutcome::Failed {
             unit: label,
@@ -1791,6 +1822,7 @@ async fn activate_unit_inner_prepared<C, S, R, P, H>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     unit: &PlannedUnit,
     host: &H,
+    unit_kind: UnitKind,
     preparation: &mut GlobalPreflight,
 ) -> Result<UnitOutcome, ActivateError>
 where
@@ -1839,6 +1871,7 @@ where
     if all_current && host.bridge().is_none_or(|bridge| bridge.unchanged_bridge(preparation)) {
         return Ok(UnitOutcome::Unchanged { unit: label });
     }
+    let spawn_policy = inputs.spawn_policy.select(&unit_kind);
 
     let activation_id = ActivationId::generate()?;
     let members = observed
@@ -1855,7 +1888,7 @@ where
         .collect::<Result<Vec<_>, JournalError>>()?;
     let mut journal = ActivationJournal::new(
         activation_id,
-        unit.unit_kind(),
+        unit_kind,
         inputs.target.clone(),
         members,
     )?;
@@ -2035,11 +2068,23 @@ where
             return Ok(rollback_outcome(label, reason, &diagnostics));
         }
         let record = &journal.members()[index];
+        if member.entry.discovery_key != record.member().as_str()
+            || member.entry.socket != record.endpoint().as_path()
+        {
+            return Err(ActivateError::UnitFailed {
+                reason: "prepared registry member differs from journal authority".to_owned(),
+            });
+        }
         let spawn_member = SpawnMember {
+            unit: &journal.unit,
             authority: record.authority.clone(),
+            observed_host: member.entry.parsed_host_kind()?,
+            observed_bridge_identity: member.entry.bridge_identity.as_ref(),
+            observed_bridge_member: member.entry.bridge_member.as_ref(),
+            observed_handoff_id: member.entry.handoff_id,
             journal_path: journal_path.clone(),
         };
-        let (program, args) = match (inputs.spawn_argv)(&spawn_member) {
+        let (program, args) = match spawn_policy.render(&spawn_member) {
             Ok(request) => request,
             Err(error) => {
                 let reason = error.to_string();
@@ -4696,6 +4741,29 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::{net::UnixListener, task::JoinHandle};
 
+    fn sleep_spawn(_member: &SpawnMember<'_>) -> Result<(PathBuf, Vec<OsString>), ActivateError> {
+        Ok((PathBuf::from("/bin/sleep"), vec![OsString::from("30")]))
+    }
+
+    fn true_spawn(_member: &SpawnMember<'_>) -> Result<(PathBuf, Vec<OsString>), ActivateError> {
+        Ok((PathBuf::from("/bin/true"), Vec::new()))
+    }
+
+    type FixtureRenderer =
+        for<'m> fn(&SpawnMember<'m>) -> Result<(PathBuf, Vec<OsString>), ActivateError>;
+
+    /// Fixed process mechanics for transaction tests, without host selection.
+    struct FixedSpawnSelection(FixtureRenderer);
+
+    impl TargetSpawnSelector for FixedSpawnSelection {
+        fn select(&self, _unit: &UnitKind) -> &dyn TargetSpawnPolicy {
+            &self.0
+        }
+    }
+
+    static SLEEP_SPAWN: FixedSpawnSelection = FixedSpawnSelection(sleep_spawn);
+    static TRUE_SPAWN: FixedSpawnSelection = FixedSpawnSelection(true_spawn);
+
     fn old_record() -> CompatibilityRecord {
         CompatibilityRecord {
             muxe_version: "0.1.0".to_owned(),
@@ -4738,6 +4806,7 @@ mod tests {
         current: CompatibilityRecord,
         prepare_refusals: usize,
         supports_supplied_handoff: bool,
+        host: HostKind,
         bridge_unit: Option<muxe_protocol::BridgeUnitId>,
     }
 
@@ -4751,9 +4820,7 @@ mod tests {
         ) -> ActivationStatus {
             let mut status = status_of(current, handoff, discovery, lifecycle);
             status.bridge_unit = self.bridge_unit;
-            if self.bridge_unit.is_some() {
-                status.live_server.host = HostKind::Zellij;
-            }
+            status.live_server.host = self.host;
             status
         }
     }
@@ -5139,9 +5206,7 @@ mod tests {
                 cache_dir: &self.cache,
                 target: target_record(),
                 staged_bridge: None,
-                spawn_argv: &|_member| {
-                    Ok((PathBuf::from("/bin/sleep"), vec![OsString::from("30")]))
-                },
+                spawn_policy: &SLEEP_SPAWN,
                 scope: HostScope::Herdr,
                 current: None,
                 control: &self.control,
@@ -5161,6 +5226,7 @@ mod tests {
             current: old_record(),
             prepare_refusals: 0,
             supports_supplied_handoff: true,
+            host: HostKind::Herdr,
             bridge_unit: None,
         }
     }
@@ -5218,6 +5284,7 @@ mod tests {
                 "session",
                 BrokerScript {
                     current,
+                    host: HostKind::Zellij,
                     bridge_unit: Some(identity.unit()),
                     ..herdr_script()
                 },
@@ -5248,7 +5315,7 @@ mod tests {
             spawner: &fixture.spawner,
             reloader: &fixture.reloader,
             preflight: &fixture.preflight,
-            spawn_argv: &|_member| Ok((PathBuf::from("/bin/sleep"), vec![OsString::from("30")])),
+            spawn_policy: &SLEEP_SPAWN,
             readiness_deadline: Duration::from_millis(100),
             poll_interval: Duration::from_millis(5),
             hooks: ActivateHooks::default(),
@@ -5810,11 +5877,15 @@ mod tests {
         }
     }
 
-    fn attested(mut status: ActivationStatus, member: &BrokerEntry) -> ActivationStatus {
-        status.bridge_unit = member.bridge_identity.as_ref().map(BridgeIdentity::unit);
-        if member.host_kind == "zellij" {
-            status.live_server.host = HostKind::Zellij;
-        }
+    fn attested_zellij_status(mut status: ActivationStatus, member: &BrokerEntry) -> ActivationStatus {
+        status.bridge_unit = Some(
+            member
+                .bridge_identity
+                .as_ref()
+                .expect("fixed Zellij fixture has bridge authority")
+                .unit(),
+        );
+        status.live_server.host = HostKind::Zellij;
         status
     }
 
@@ -5958,14 +6029,14 @@ mod tests {
         let census = MemberCensus::default();
         let host = zellij_readiness_host(&zellij, &census);
         assert!(!target_ready(
-            &attested(census_status(expected, "session-a", None), &zellij),
+            &attested_zellij_status(census_status(expected, "session-a", None), &zellij),
             &zellij,
             &expected,
             &target_record(),
             &host,
         ));
         assert!(!target_ready(
-            &attested(
+            &attested_zellij_status(
                 census_status(
                     expected,
                     "session-a",
@@ -5979,7 +6050,7 @@ mod tests {
             &host,
         ));
         assert!(target_ready(
-            &attested(
+            &attested_zellij_status(
                 census_status(
                     expected,
                     "session-a",
@@ -5993,7 +6064,7 @@ mod tests {
             &host,
         ));
         assert!(!target_ready(
-            &attested(
+            &attested_zellij_status(
                 census_status(
                     expected,
                     "session-a",
@@ -6024,7 +6095,7 @@ mod tests {
             .as_mut()
             .expect("test target has Zellij compatibility")
             .bridge_build_id = None;
-        let mut missing_status = attested(census_status(expected, "session-a", ready.clone()), &member);
+        let mut missing_status = attested_zellij_status(census_status(expected, "session-a", ready.clone()), &member);
         missing_status.current = missing.clone();
         assert!(!target_ready(&missing_status, &member, &expected, &missing, &host));
 
@@ -6033,7 +6104,7 @@ mod tests {
             .as_mut()
             .expect("test target has Zellij compatibility")
             .bridge_build_id = Some(muxe_protocol::SchemaFingerprint([0; 32]));
-        let mut zero_status = attested(census_status(expected, "session-a", ready), &member);
+        let mut zero_status = attested_zellij_status(census_status(expected, "session-a", ready), &member);
         zero_status.current = zero.clone();
         assert!(!target_ready(&zero_status, &member, &expected, &zero, &host));
     }
@@ -6186,7 +6257,7 @@ mod tests {
         let host = zellij_readiness_host(&member, &census);
         serve_readiness_status(
             partial,
-            attested(
+            attested_zellij_status(
                 census_status(
                     handoff,
                     "session-a",
@@ -6215,7 +6286,7 @@ mod tests {
         let host = zellij_readiness_host(&member, &census);
         serve_readiness_status(
             full,
-            attested(
+            attested_zellij_status(
                 census_status(
                     handoff,
                     "session-a-full",
@@ -6323,14 +6394,19 @@ mod tests {
             else {
                 panic!("fixed Zellij fixture produced another unit");
             };
-            let error = ZellijActivation {
-                identity: bridge_identity,
-                entries,
-                census,
-            }
-            .revalidate_locked(&cache)
-            .unwrap_err();
-            assert!(error.contains("changed after preflight"));
+            assert!(
+                ZellijActivation {
+                    identity: bridge_identity,
+                    entries,
+                    census,
+                }
+                .revalidate_locked(&cache)
+                .is_err(),
+                "locked revalidation refuses the newly registered member"
+            );
+            let rows = registry.entries().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().any(|row| row.discovery_key == "session-late"));
             assert!(journal::list_journals(&cache).unwrap().is_empty());
         });
     }
@@ -6417,11 +6493,11 @@ mod tests {
         let member = attested_zellij_member(temp.path(), evolving.clone(), "session-a");
         let census = MemberCensus::default();
         let host = zellij_readiness_host(&member, &census);
-        let empty_round = attested(
+        let empty_round = attested_zellij_status(
             census_status(handoff, "session-a", Some(ready_census(&[], Some(&["a"])))),
             &member,
         );
-        let full_round = attested(
+        let full_round = attested_zellij_status(
             census_status(
                 handoff,
                 "session-a",
@@ -6446,7 +6522,7 @@ mod tests {
         let host = zellij_readiness_host(&member, &census);
         serve_readiness_status(
             vacant,
-            attested(
+            attested_zellij_status(
                 census_status(
                     handoff,
                     "session-vacant",
@@ -8084,7 +8160,6 @@ mod tests {
             as_of: AsOfTick,
             readiness_deadline: Duration,
         ) -> Result<(), ActivateError> {
-            let spawn_argv = |_member: &SpawnMember| Ok((PathBuf::from("/bin/true"), Vec::new()));
             let inputs = ActivateInputs {
                 config_dir: &self.config,
                 cache_dir: &self.cache,
@@ -8096,7 +8171,7 @@ mod tests {
                 spawner: &self.spawner,
                 reloader: &self.reloader,
                 preflight: &self.preflight,
-                spawn_argv: &spawn_argv,
+                spawn_policy: &TRUE_SPAWN,
                 readiness_deadline,
                 poll_interval: Duration::from_millis(1),
                 hooks: ActivateHooks::default(),
@@ -8151,7 +8226,6 @@ mod tests {
         }
 
         async fn rollback_after_failed_proof(&mut self) -> Vec<String> {
-            let spawn_argv = |_member: &SpawnMember| Ok((PathBuf::from("/bin/true"), Vec::new()));
             let inputs = ActivateInputs {
                 config_dir: &self.config,
                 cache_dir: &self.cache,
@@ -8163,7 +8237,7 @@ mod tests {
                 spawner: &self.spawner,
                 reloader: &self.reloader,
                 preflight: &self.preflight,
-                spawn_argv: &spawn_argv,
+                spawn_policy: &TRUE_SPAWN,
                 readiness_deadline: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
                 hooks: ActivateHooks::default(),
@@ -8933,7 +9007,7 @@ mod tests {
         let guard =
             super::super::registry::BridgeUnitGuard::acquire(&case.cache, case.identity.clone())
                 .unwrap();
-        assert!(registry.unregister_entry(&original, Some(&guard)).unwrap());
+        assert!(registry.unregister_entry(&original, &guard).unwrap());
         drop(guard);
         assert!(matches!(
             recover(&case.cache, &case.control, &case.reloader, None)
@@ -9202,8 +9276,6 @@ mod tests {
             let reloader = BarrierReloader::default();
             let preflight = FixturePreflight::default();
             let spawner = ProcessSpawner;
-            let spawn_argv =
-                |_member: &SpawnMember| Ok((PathBuf::from("/bin/true"), Vec::<OsString>::new()));
             let inputs = ActivateInputs {
                 config_dir: &config,
                 cache_dir: &cache,
@@ -9215,7 +9287,7 @@ mod tests {
                 spawner: &spawner,
                 reloader: &reloader,
                 preflight: &preflight,
-                spawn_argv: &spawn_argv,
+                spawn_policy: &TRUE_SPAWN,
                 readiness_deadline: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
                 hooks: ActivateHooks::default(),
@@ -9283,8 +9355,6 @@ mod tests {
             let reloader = BarrierReloader::default();
             let preflight = FixturePreflight::default();
             let spawner = ProcessSpawner;
-            let spawn_argv =
-                |_member: &SpawnMember| Ok((PathBuf::from("/bin/true"), Vec::<OsString>::new()));
             let inputs = ActivateInputs {
                 config_dir: &config,
                 cache_dir: &cache,
@@ -9296,7 +9366,7 @@ mod tests {
                 spawner: &spawner,
                 reloader: &reloader,
                 preflight: &preflight,
-                spawn_argv: &spawn_argv,
+                spawn_policy: &TRUE_SPAWN,
                 readiness_deadline: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
                 hooks: ActivateHooks::default(),
@@ -9352,8 +9422,6 @@ mod tests {
         let reloader = BarrierReloader::default();
         let preflight = FixturePreflight::default();
         let spawner = ProcessSpawner;
-        let spawn_argv =
-            |_member: &SpawnMember| Ok((PathBuf::from("/bin/true"), Vec::<OsString>::new()));
         let inputs = ActivateInputs {
             config_dir: &config,
             cache_dir: &cache,
@@ -9365,7 +9433,7 @@ mod tests {
             spawner: &spawner,
             reloader: &reloader,
             preflight: &preflight,
-            spawn_argv: &spawn_argv,
+            spawn_policy: &TRUE_SPAWN,
             readiness_deadline: Duration::from_secs(1),
             poll_interval: Duration::from_millis(1),
             hooks: ActivateHooks::default(),
@@ -9541,8 +9609,6 @@ mod tests {
             let reloader = BarrierReloader::default();
             let preflight = FixturePreflight::default();
             let spawner = ProcessSpawner;
-            let spawn_argv =
-                |_member: &SpawnMember| Ok((PathBuf::from("/bin/true"), Vec::<OsString>::new()));
             let inputs = ActivateInputs {
                 config_dir: &config,
                 cache_dir: &cache,
@@ -9554,7 +9620,7 @@ mod tests {
                 spawner: &spawner,
                 reloader: &reloader,
                 preflight: &preflight,
-                spawn_argv: &spawn_argv,
+                spawn_policy: &TRUE_SPAWN,
                 readiness_deadline: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
                 hooks: ActivateHooks::default(),
@@ -9608,8 +9674,6 @@ mod tests {
             let reloader = FixtureReloader::default();
             let preflight = FixturePreflight::default();
             let spawner = ProcessSpawner;
-            let spawn_argv =
-                |_member: &SpawnMember| Ok((PathBuf::from("/bin/true"), Vec::<OsString>::new()));
             let inputs = ActivateInputs {
                 config_dir: &config,
                 cache_dir: &cache,
@@ -9621,7 +9685,7 @@ mod tests {
                 spawner: &spawner,
                 reloader: &reloader,
                 preflight: &preflight,
-                spawn_argv: &spawn_argv,
+                spawn_policy: &TRUE_SPAWN,
                 readiness_deadline: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
                 hooks: ActivateHooks::default(),
