@@ -876,8 +876,11 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        let identity =
-            BridgeIdentity::resolve(temp.path(), std::ffi::OsStr::new(BRIDGE_FILE_NAME)).unwrap();
+        let identity = BridgeIdentity::resolve(
+            &temp.path().join("integration"),
+            std::ffi::OsStr::new(BRIDGE_FILE_NAME),
+        )
+        .unwrap();
         let activation = crate::lifecycle::journal::ActivationId::from_bytes([0x31; 16]).unwrap();
         let old = BridgeArtifactId::new(
             activation,
@@ -952,8 +955,11 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        let identity =
-            BridgeIdentity::resolve(temp.path(), std::ffi::OsStr::new(BRIDGE_FILE_NAME)).unwrap();
+        let identity = BridgeIdentity::resolve(
+            &temp.path().join("integration"),
+            std::ffi::OsStr::new(BRIDGE_FILE_NAME),
+        )
+        .unwrap();
         let activation = crate::lifecycle::journal::ActivationId::from_bytes([0x41; 16]).unwrap();
         let artifact = BridgeArtifactId::new(
             activation,
