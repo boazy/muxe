@@ -308,84 +308,6 @@ impl NamedKey {
         matches!(self, Self::Enter | Self::Tab | Self::Backspace)
     }
 
-    /// Converts every assigned Kitty `CSI ... u` functional key code accepted by v1. The published
-    /// map is contiguous through `57454`; only values outside it return `None` and stay
-    /// non-matching.
-    #[must_use]
-    pub fn from_kitty_functional_code(code: u32) -> Option<Self> {
-        Some(match code {
-            9 | 57346 => Self::Tab,
-            13 | 57345 => Self::Enter,
-            27 | 57344 => Self::Escape,
-            127 | 57347 => Self::Backspace,
-            57348 => Self::Insert,
-            57349 => Self::Delete,
-            57350 => Self::Left,
-            57351 => Self::Right,
-            57352 => Self::Up,
-            57353 => Self::Down,
-            57354 => Self::PageUp,
-            57355 => Self::PageDown,
-            57356 => Self::Home,
-            57357 => Self::End,
-            57358 => Self::CapsLock,
-            57359 => Self::ScrollLock,
-            57360 => Self::NumLock,
-            57361 => Self::PrintScreen,
-            57362 => Self::Pause,
-            57363 => Self::Menu,
-            57364..=57398 => Self::Function(u8::try_from(code - 57363).ok()?),
-            57399..=57408 => Self::Keypad(u8::try_from(code - 57399).ok()?),
-            57409 => Self::KeypadDecimal,
-            57410 => Self::KeypadDivide,
-            57411 => Self::KeypadMultiply,
-            57412 => Self::KeypadSubtract,
-            57413 => Self::KeypadAdd,
-            57414 => Self::KeypadEnter,
-            57415 => Self::KeypadEqual,
-            57416 => Self::KeypadSeparator,
-            57417 => Self::KeypadLeft,
-            57418 => Self::KeypadRight,
-            57419 => Self::KeypadUp,
-            57420 => Self::KeypadDown,
-            57421 => Self::KeypadPageUp,
-            57422 => Self::KeypadPageDown,
-            57423 => Self::KeypadHome,
-            57424 => Self::KeypadEnd,
-            57425 => Self::KeypadInsert,
-            57426 => Self::KeypadDelete,
-            57427 => Self::KeypadBegin,
-            57428 => Self::MediaPlay,
-            57429 => Self::MediaPause,
-            57430 => Self::MediaPlayPause,
-            57431 => Self::MediaReverse,
-            57432 => Self::MediaStop,
-            57433 => Self::MediaFastForward,
-            57434 => Self::MediaRewind,
-            57435 => Self::MediaTrackNext,
-            57436 => Self::MediaTrackPrevious,
-            57437 => Self::MediaRecord,
-            57438 => Self::LowerVolume,
-            57439 => Self::RaiseVolume,
-            57440 => Self::MuteVolume,
-            57441 => Self::LeftShift,
-            57442 => Self::LeftControl,
-            57443 => Self::LeftAlt,
-            57444 => Self::LeftSuper,
-            57445 => Self::LeftHyper,
-            57446 => Self::LeftMeta,
-            57447 => Self::RightShift,
-            57448 => Self::RightControl,
-            57449 => Self::RightAlt,
-            57450 => Self::RightSuper,
-            57451 => Self::RightHyper,
-            57452 => Self::RightMeta,
-            57453 => Self::IsoLevel3Shift,
-            57454 => Self::IsoLevel5Shift,
-            _ => return None,
-        })
-    }
-
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
@@ -1005,16 +927,5 @@ mod tests {
                 .matches(&event)
         );
         assert!(!CanonicalKey::parse("shift+left").unwrap().matches(&event));
-    }
-
-    #[test]
-    fn every_assigned_kitty_functional_code_has_a_core_identity() {
-        for code in 57_344..=57_454 {
-            assert!(
-                NamedKey::from_kitty_functional_code(code).is_some(),
-                "missing {code}"
-            );
-        }
-        assert_eq!(NamedKey::from_kitty_functional_code(57_455), None);
     }
 }

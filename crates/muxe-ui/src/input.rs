@@ -70,101 +70,85 @@ fn convert_identity(identity: RawKeyIdentity) -> Option<KeyIdentity> {
 }
 
 fn convert_functional(key: FunctionalKey) -> Option<NamedKey> {
-    NamedKey::from_kitty_functional_code(functional_code(key)?)
-}
-
-fn functional_code(key: FunctionalKey) -> Option<u32> {
     Some(match key {
-        FunctionalKey::Escape => 57344,
-        FunctionalKey::Enter => 57345,
-        FunctionalKey::Tab => 57346,
-        FunctionalKey::Backspace => 57347,
-        FunctionalKey::Insert => 57348,
-        FunctionalKey::Delete => 57349,
-        FunctionalKey::Left => 57350,
-        FunctionalKey::Right => 57351,
-        FunctionalKey::Up => 57352,
-        FunctionalKey::Down => 57353,
-        FunctionalKey::PageUp => 57354,
-        FunctionalKey::PageDown => 57355,
-        FunctionalKey::Home => 57356,
-        FunctionalKey::End => 57357,
-        FunctionalKey::Begin => 57427,
-        FunctionalKey::CapsLock => 57358,
-        FunctionalKey::ScrollLock => 57359,
-        FunctionalKey::NumLock => 57360,
-        FunctionalKey::PrintScreen => 57361,
-        FunctionalKey::Pause => 57362,
-        FunctionalKey::Menu => 57363,
-        FunctionalKey::Function(number @ 1..=35) => 57363 + u32::from(number),
+        FunctionalKey::Escape => NamedKey::Escape,
+        FunctionalKey::Enter => NamedKey::Enter,
+        FunctionalKey::Tab => NamedKey::Tab,
+        FunctionalKey::Backspace => NamedKey::Backspace,
+        FunctionalKey::Insert => NamedKey::Insert,
+        FunctionalKey::Delete => NamedKey::Delete,
+        FunctionalKey::Left => NamedKey::Left,
+        FunctionalKey::Right => NamedKey::Right,
+        FunctionalKey::Up => NamedKey::Up,
+        FunctionalKey::Down => NamedKey::Down,
+        FunctionalKey::PageUp => NamedKey::PageUp,
+        FunctionalKey::PageDown => NamedKey::PageDown,
+        FunctionalKey::Home => NamedKey::Home,
+        FunctionalKey::End => NamedKey::End,
+        FunctionalKey::Begin => NamedKey::KeypadBegin,
+        FunctionalKey::CapsLock => NamedKey::CapsLock,
+        FunctionalKey::ScrollLock => NamedKey::ScrollLock,
+        FunctionalKey::NumLock => NamedKey::NumLock,
+        FunctionalKey::PrintScreen => NamedKey::PrintScreen,
+        FunctionalKey::Pause => NamedKey::Pause,
+        FunctionalKey::Menu => NamedKey::Menu,
+        FunctionalKey::Function(number @ 1..=35) => NamedKey::Function(number),
         FunctionalKey::Function(_) => return None,
-        FunctionalKey::Keypad(key) => keypad_code(key)?,
-        FunctionalKey::Media(key) => media_code(key),
-        FunctionalKey::Modifier(key) => modifier_key_code(key),
+        FunctionalKey::Keypad(key) => match key {
+            KeypadKey::Digit(number @ 0..=9) => NamedKey::Keypad(number),
+            KeypadKey::Digit(_) => return None,
+            KeypadKey::Decimal => NamedKey::KeypadDecimal,
+            KeypadKey::Divide => NamedKey::KeypadDivide,
+            KeypadKey::Multiply => NamedKey::KeypadMultiply,
+            KeypadKey::Subtract => NamedKey::KeypadSubtract,
+            KeypadKey::Add => NamedKey::KeypadAdd,
+            KeypadKey::Enter => NamedKey::KeypadEnter,
+            KeypadKey::Equal => NamedKey::KeypadEqual,
+            KeypadKey::Separator => NamedKey::KeypadSeparator,
+            KeypadKey::Left => NamedKey::KeypadLeft,
+            KeypadKey::Right => NamedKey::KeypadRight,
+            KeypadKey::Up => NamedKey::KeypadUp,
+            KeypadKey::Down => NamedKey::KeypadDown,
+            KeypadKey::PageUp => NamedKey::KeypadPageUp,
+            KeypadKey::PageDown => NamedKey::KeypadPageDown,
+            KeypadKey::Home => NamedKey::KeypadHome,
+            KeypadKey::End => NamedKey::KeypadEnd,
+            KeypadKey::Insert => NamedKey::KeypadInsert,
+            KeypadKey::Delete => NamedKey::KeypadDelete,
+            KeypadKey::Begin => NamedKey::KeypadBegin,
+        },
+        FunctionalKey::Media(key) => match key {
+            MediaKey::Play => NamedKey::MediaPlay,
+            MediaKey::Pause => NamedKey::MediaPause,
+            MediaKey::PlayPause => NamedKey::MediaPlayPause,
+            MediaKey::Reverse => NamedKey::MediaReverse,
+            MediaKey::Stop => NamedKey::MediaStop,
+            MediaKey::FastForward => NamedKey::MediaFastForward,
+            MediaKey::Rewind => NamedKey::MediaRewind,
+            MediaKey::TrackNext => NamedKey::MediaTrackNext,
+            MediaKey::TrackPrevious => NamedKey::MediaTrackPrevious,
+            MediaKey::Record => NamedKey::MediaRecord,
+            MediaKey::LowerVolume => NamedKey::LowerVolume,
+            MediaKey::RaiseVolume => NamedKey::RaiseVolume,
+            MediaKey::MuteVolume => NamedKey::MuteVolume,
+        },
+        FunctionalKey::Modifier(key) => match key {
+            ModifierKey::LeftShift => NamedKey::LeftShift,
+            ModifierKey::LeftControl => NamedKey::LeftControl,
+            ModifierKey::LeftAlt => NamedKey::LeftAlt,
+            ModifierKey::LeftSuper => NamedKey::LeftSuper,
+            ModifierKey::LeftHyper => NamedKey::LeftHyper,
+            ModifierKey::LeftMeta => NamedKey::LeftMeta,
+            ModifierKey::RightShift => NamedKey::RightShift,
+            ModifierKey::RightControl => NamedKey::RightControl,
+            ModifierKey::RightAlt => NamedKey::RightAlt,
+            ModifierKey::RightSuper => NamedKey::RightSuper,
+            ModifierKey::RightHyper => NamedKey::RightHyper,
+            ModifierKey::RightMeta => NamedKey::RightMeta,
+            ModifierKey::IsoLevel3Shift => NamedKey::IsoLevel3Shift,
+            ModifierKey::IsoLevel5Shift => NamedKey::IsoLevel5Shift,
+        },
     })
-}
-
-fn keypad_code(key: KeypadKey) -> Option<u32> {
-    Some(match key {
-        KeypadKey::Digit(number @ 0..=9) => 57399 + u32::from(number),
-        KeypadKey::Digit(_) => return None,
-        KeypadKey::Decimal => 57409,
-        KeypadKey::Divide => 57410,
-        KeypadKey::Multiply => 57411,
-        KeypadKey::Subtract => 57412,
-        KeypadKey::Add => 57413,
-        KeypadKey::Enter => 57414,
-        KeypadKey::Equal => 57415,
-        KeypadKey::Separator => 57416,
-        KeypadKey::Left => 57417,
-        KeypadKey::Right => 57418,
-        KeypadKey::Up => 57419,
-        KeypadKey::Down => 57420,
-        KeypadKey::PageUp => 57421,
-        KeypadKey::PageDown => 57422,
-        KeypadKey::Home => 57423,
-        KeypadKey::End => 57424,
-        KeypadKey::Insert => 57425,
-        KeypadKey::Delete => 57426,
-        KeypadKey::Begin => 57427,
-    })
-}
-
-fn media_code(key: MediaKey) -> u32 {
-    match key {
-        MediaKey::Play => 57428,
-        MediaKey::Pause => 57429,
-        MediaKey::PlayPause => 57430,
-        MediaKey::Reverse => 57431,
-        MediaKey::Stop => 57432,
-        MediaKey::FastForward => 57433,
-        MediaKey::Rewind => 57434,
-        MediaKey::TrackNext => 57435,
-        MediaKey::TrackPrevious => 57436,
-        MediaKey::Record => 57437,
-        MediaKey::LowerVolume => 57438,
-        MediaKey::RaiseVolume => 57439,
-        MediaKey::MuteVolume => 57440,
-    }
-}
-
-fn modifier_key_code(key: ModifierKey) -> u32 {
-    match key {
-        ModifierKey::LeftShift => 57441,
-        ModifierKey::LeftControl => 57442,
-        ModifierKey::LeftAlt => 57443,
-        ModifierKey::LeftSuper => 57444,
-        ModifierKey::LeftHyper => 57445,
-        ModifierKey::LeftMeta => 57446,
-        ModifierKey::RightShift => 57447,
-        ModifierKey::RightControl => 57448,
-        ModifierKey::RightAlt => 57449,
-        ModifierKey::RightSuper => 57450,
-        ModifierKey::RightHyper => 57451,
-        ModifierKey::RightMeta => 57452,
-        ModifierKey::IsoLevel3Shift => 57453,
-        ModifierKey::IsoLevel5Shift => 57454,
-    }
 }
 
 fn convert_modifiers(raw: RawModifiers) -> Modifiers {
@@ -298,29 +282,78 @@ mod tests {
     }
 
     #[test]
-    fn every_canonical_kitty_functional_identity_reaches_the_core_registry() {
-        for code in [9_u32, 13, 27, 127].into_iter().chain(57344..=57454) {
-            let mut parser = Parser::new();
-            let mut parsed = None;
-            let stream = format!("\x1b[{code};198:3u");
-            parser.push(stream.as_bytes(), |event| parsed = Some(event));
-            parser.finish(|event| parsed = Some(event));
-            let Some(InputEvent::Key(raw)) = parsed else {
-                panic!("canonical Kitty key did not parse: {code}");
+    fn functional_key_families_match_only_their_configured_bindings() {
+        use muxe_core::CanonicalKey;
+
+        for (bytes, binding, other) in [
+            (b"\x1b[57380;1u".as_slice(), "f17", "f16"),
+            (b"\x1b[57404;1u".as_slice(), "keypad+5", "5"),
+            (b"\x1b[57427;1u".as_slice(), "keypad+begin", "home"),
+            (b"\x1b[E".as_slice(), "keypad+begin", "home"),
+            (
+                b"\x1b[57430;1u".as_slice(),
+                "media-play-pause",
+                "media-play",
+            ),
+            (b"\x1b[57448;1u".as_slice(), "right-ctrl", "left-ctrl"),
+            (
+                b"\x1b[57454;1u".as_slice(),
+                "iso-level5-shift",
+                "iso-level3-shift",
+            ),
+        ] {
+            let converted = parsed_key_event(bytes);
+            assert!(
+                CanonicalKey::parse(binding)
+                    .unwrap()
+                    .matches(&converted.event)
+            );
+            assert!(
+                !CanonicalKey::parse(other)
+                    .unwrap()
+                    .matches(&converted.event)
+            );
+        }
+    }
+
+    #[test]
+    fn numbered_functional_key_bounds_preserve_raw_nonmatching_identities() {
+        use muxe_core::CanonicalKey;
+
+        for key in [
+            FunctionalKey::Function(0),
+            FunctionalKey::Function(36),
+            FunctionalKey::Function(u8::MAX),
+            FunctionalKey::Keypad(KeypadKey::Digit(10)),
+            FunctionalKey::Keypad(KeypadKey::Digit(u8::MAX)),
+        ] {
+            let raw = RawKeyEvent {
+                primary: RawKeyIdentity::Functional(key),
+                shifted: Some(RawKeyIdentity::Functional(key)),
+                base: Some(RawKeyIdentity::Functional(key)),
+                modifiers: RawModifiers::NONE,
+                kind: RawEventKind::Press,
+                locks: LockState::NONE,
+                keypad: None,
             };
             let ConvertedInput::Key(converted) = convert_input(InputEvent::Key(raw)) else {
-                panic!("canonical Kitty key did not convert: {code}");
+                panic!("out-of-range identities must remain observable");
             };
-            assert_eq!(
-                converted.event.primary,
-                NamedKey::from_kitty_functional_code(code).map(KeyIdentity::Named),
-                "core registry mismatch for {code}"
+            assert_eq!(converted.raw, raw);
+            assert!(!converted.is_matchable(), "{key:?}");
+        }
+        for (bytes, binding) in [
+            (b"\x1b[57364;1u".as_slice(), "f1"),
+            (b"\x1b[57398;1u".as_slice(), "f35"),
+            (b"\x1b[57399;1u".as_slice(), "keypad+0"),
+            (b"\x1b[57408;1u".as_slice(), "keypad+9"),
+        ] {
+            let converted = parsed_key_event(bytes);
+            assert!(
+                CanonicalKey::parse(binding)
+                    .unwrap()
+                    .matches(&converted.event)
             );
-            assert_eq!(converted.event.kind, EventKind::Release);
-            assert!(converted.event.modifiers.contains(Modifiers::SHIFT));
-            assert!(converted.event.modifiers.contains(Modifiers::CTRL));
-            assert!(converted.event.locks.caps_lock);
-            assert!(converted.event.locks.num_lock);
         }
     }
 

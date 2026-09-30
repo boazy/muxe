@@ -2,6 +2,7 @@
 
 ### 🐛 Bug Fixes
 
+- *(input)* Map parsed terminal key enums directly to core named keys, keeping Kitty wire-code decoding in the terminal parser and preserving key-binding behavior
 - *(ci)* Use existing Zellij adapter recovery before two-client smoke admission, discard stale epoch/generation coverage, and retain exact addressed origin checks with fail-fast post-admission loss and no request replay
 - *(ci)* Retry unavailable Zellij census queries within the original two-client admission deadline without accepting changed membership, and log both bounded CLI stderr tails before recovery or shutdown discards them
 - *(broker)* Require the selected host's registry authority for cold-start adoption, reuse, stale removal, and retirement; reject foreign persisted rows before mutation
