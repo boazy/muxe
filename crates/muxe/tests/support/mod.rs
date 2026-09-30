@@ -1210,6 +1210,38 @@ impl OwnedZellijHost {
         ]
     }
 
+    /// Gives production subprocess channels an immutable, owned environment
+    /// without changing the test process's ambient state. Every respawn execs
+    /// the exact pinned CLI under the same explicit host and Muxe roots.
+    pub fn scoped_cli_wrapper(&self, scoped_root: &Path) -> io::Result<PathBuf> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let path = self.workdir.join("scoped-zellij");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)?;
+        file.write_all(b"#!/bin/sh\ncd ")?;
+        file.write_all(shell_quote(scoped_root.as_os_str()).as_encoded_bytes())?;
+        file.write_all(b" || exit 1\nexec /usr/bin/env -i")?;
+        let mut command = Command::new(&self.zellij_binary);
+        self.apply_host_scoped_env(&mut command, scoped_root);
+        for (name, value) in command.as_std().get_envs() {
+            let value =
+                value.ok_or_else(|| io::Error::other("scoped environment removes a value"))?;
+            file.write_all(b" ")?;
+            file.write_all(shell_quote(name).as_encoded_bytes())?;
+            file.write_all(b"=")?;
+            file.write_all(shell_quote(value).as_encoded_bytes())?;
+        }
+        file.write_all(b" ")?;
+        file.write_all(shell_quote(self.zellij_binary.as_os_str()).as_encoded_bytes())?;
+        file.write_all(b" \"$@\"\n")?;
+        Ok(path)
+    }
+
     /// Scoped base command for every Zellij CLI child of this host: the
     /// pinned binary plus the isolated environment and config flags, with
     /// the owned workdir as cwd. Only explicitly named sessions are ever
@@ -1505,12 +1537,19 @@ impl OwnedZellijHost {
         Ok(diagnostics)
     }
 }
-/// Single-quotes one argv element for the util-linux `script -c` shell
-/// string. Lossy conversion is documented: runner paths are UTF-8 by
-/// construction (`TempDir` + session names).
+/// Single-quotes one shell word without altering its Unix bytes.
 fn shell_quote(arg: &std::ffi::OsStr) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt as _;
+
     let mut quoted = std::ffi::OsString::from("'");
-    quoted.push(arg.to_string_lossy().replace('\'', "'\\''"));
+    let mut chunks = arg.as_bytes().split(|byte| *byte == b'\'');
+    if let Some(first) = chunks.next() {
+        quoted.push(std::ffi::OsStr::from_bytes(first));
+    }
+    for chunk in chunks {
+        quoted.push("'\\''");
+        quoted.push(std::ffi::OsStr::from_bytes(chunk));
+    }
     quoted.push("'");
     quoted
 }
@@ -2427,6 +2466,25 @@ mod scoped_spawn_tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[tokio::test]
+    async fn shell_words_preserve_non_utf8_and_metacharacters() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let case = case_dir("shell-word");
+        let scoped = scoped_root(case.path());
+        let bytes = b"raw-\xff-'\"-$HOME-`printf injected`-; printf extra";
+        let mut shell = std::ffi::OsString::from("printf '%s' ");
+        shell.push(shell_quote(std::ffi::OsStr::from_bytes(bytes)));
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(shell).current_dir(&scoped);
+        apply_scoped_env(&mut command, &scoped);
+        let output = run_cli_bounded("shell-word", &mut command)
+            .await
+            .expect("owned shell quoting proof");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.as_slice(), bytes);
     }
 
     #[tokio::test]

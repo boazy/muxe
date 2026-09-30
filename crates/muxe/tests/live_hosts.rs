@@ -61,19 +61,24 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use muxe_adapter_zellij::channel_names;
+use muxe_adapter_api::{AdapterHealthEvent, HostAdapter as _};
+use muxe_adapter_zellij::{
+    CliMembershipSource, MembershipSource, PipeChannel, PipeTransportError, ReadinessGate,
+    SubprocessChannel, ZellijAdapter, ZellijAdapterConfig, channel_names,
+};
 use muxe_protocol::control::CompatibilityRecord;
 use muxe_zellij_protocol::{
     BRIDGE_PROTOCOL_VERSION, BridgeEvent, BridgeRequest, BridgeResponse, BridgeTarget,
-    ChannelGeneration, EventSubscription, MAX_PIPE_LINE_LEN, PipeEvent, PipeEventKind, PipeRequest,
-    RegistrationId, RequestId, ZellijOriginRequest, bridge_build_id, bridge_protocol_fingerprint,
-    decode_event_line, decode_event_subscription, encode_event_subscription, encode_request_line,
+    ChannelGeneration, EventSubscription, PipeEvent, PipeEventKind, PipeRequest, RegistrationId,
+    RequestId, ZellijOriginRequest, bridge_build_id, bridge_protocol_fingerprint,
+    decode_event_line, encode_event_subscription, encode_request_line,
     generated_action_fingerprint, pinned_source_revision,
 };
 use sha2::{Digest, Sha256};
@@ -86,7 +91,6 @@ use support::{
     read_broker_record, retire_broker, run_cli_bounded, short_tempdir, spawn_activate,
     spawn_herdr_client, spawn_serve_herdr, spawn_serve_zellij, validate_installation,
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// Bounded wait for one barrier file to appear.
 const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
@@ -94,10 +98,6 @@ const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
 /// Bounded wait for one addressed duo origin round (release plus snapshot).
 const DUO_ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
-/// Bounded wait to reap one owned duo pipe child after kill.
-const DUO_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Bounded wait for one owned duo pipe child's stderr drain at shutdown.
-const DUO_STDERR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Explicit human approval for live hosts. Checked before any spawn,
 /// installation probe, or host launch: without exactly `true` the test
@@ -582,202 +582,237 @@ fn stable_digest(config_file: &Path) -> io::Result<String> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
-/// One owned `zellij pipe` child for the duo scenario: retained tokio child
-/// with split stdio, spawned through the existing host-scoped environment
-/// (never the test process env, never a global). The request child carries
-/// typed outbound frames; the event child carries the single subscription.
-/// Both children are reaped before the owning Rig finishes on every path.
-struct DuoPipe {
-    tag: String,
-    child: tokio::process::Child,
-    reader: BufReader<tokio::process::ChildStdout>,
-    stdin: tokio::process::ChildStdin,
-    stderr: Option<tokio::task::JoinHandle<Vec<u8>>>,
+/// The subprocess epoch is a transport identity, distinct from the wire generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DuoChannelEpoch(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DuoFence {
+    epoch: DuoChannelEpoch,
+    generation: ChannelGeneration,
 }
 
-/// Spawns one owned pipe child with the production argv shape
-/// (`zellij --session <s> pipe --name <pipe> [-- payload]`) under the
-/// existing scoped spawn path. `SubprocessChannel::launch` is deliberately
-/// not used: it inherits the test process env, which is not the owned
-/// Rig's host/scoped env.
-fn spawn_duo_pipe(
-    host: &OwnedZellijHost,
-    scoped_root: &Path,
-    zellij_binary: &Path,
-    session: &str,
-    pipe_name: &str,
-    initial_payload: Option<&str>,
-    tag: &str,
-) -> io::Result<DuoPipe> {
-    let mut command = tokio::process::Command::new(zellij_binary);
-    command
-        .arg("--session")
-        .arg(session)
-        .arg("pipe")
-        .arg("--name")
-        .arg(pipe_name)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if let Some(payload) = initial_payload {
-        command.arg("--").arg(payload);
+struct DuoObservation {
+    epoch: Option<DuoChannelEpoch>,
+    result: Result<String, PipeTransportError>,
+}
+
+/// Snapshots both real 4 KiB transport tails before either child is discarded.
+/// Recovery replaces/parks request before event; shutdown closes event first.
+struct DuoDiagnostics {
+    request: Arc<SubprocessChannel>,
+    event: Arc<SubprocessChannel>,
+}
+
+impl DuoDiagnostics {
+    async fn log(&self, reason: &str) {
+        for (label, channel) in [("request", &self.request), ("event", &self.event)] {
+            duo_log_stderr_tail(label, channel, reason).await;
+        }
     }
-    host.apply_host_scoped_env(&mut command, scoped_root);
-    command.current_dir(scoped_root);
-    let mut child = command.spawn().map_err(|error| {
-        io::Error::other(format!("{tag}: cannot spawn zellij pipe child: {error}"))
-    })?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other(format!("{tag}: pipe child has no stdin")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other(format!("{tag}: pipe child has no stdout")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other(format!("{tag}: pipe child has no stderr")))?;
-    // Continuously drained fixed-cap tail: no stream buffer grows without
-    // bound, mirroring the production stderr tail cap.
-    let stderr_drain = tokio::spawn(async move {
-        let mut stderr = stderr;
-        let mut tail: VecDeque<u8> = VecDeque::new();
-        let mut chunk = [0u8; 1024];
-        loop {
-            match stderr.read(&mut chunk).await {
-                Err(_) | Ok(0) => break,
-                Ok(count) => {
-                    tail.extend(chunk[..count].iter().copied());
-                    while tail.len() > 4096 {
-                        tail.pop_front();
-                    }
-                }
-            }
-        }
-        tail.into_iter().collect::<Vec<u8>>()
-    });
-    Ok(DuoPipe {
-        tag: tag.to_owned(),
-        child,
-        reader: BufReader::new(stdout),
-        stdin,
-        stderr: Some(stderr_drain),
-    })
 }
 
-/// Sends one typed request frame on the owned request pipe.
-async fn duo_send_request_line(pipe: &mut DuoPipe, line: &str) -> io::Result<()> {
-    // The encoded frame is already newline-terminated; a second newline
-    // would send a blank request no bridge unblocks.
-    let tag = pipe.tag.as_str();
-    pipe.stdin
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|error| io::Error::other(format!("{tag}: request pipe write failed: {error}")))?;
-    pipe.stdin
-        .flush()
-        .await
-        .map_err(|error| io::Error::other(format!("{tag}: request pipe flush failed: {error}")))?;
-    Ok(())
-}
-/// Reads one newline-delimited event under the protocol's per-line bound.
-/// `fill_buf`/`consume` preserves coalesced lines in `BufReader` while the
-/// accumulated current line remains bounded before every read.
-async fn duo_next_event_line(
-    pipe: &mut DuoPipe,
-    timeout: std::time::Duration,
-) -> io::Result<String> {
-    let tag = pipe.tag.as_str();
-    tokio::time::timeout(timeout, async {
-        let mut line = Vec::new();
-        loop {
-            let available = pipe.reader.fill_buf().await?;
-            if available.is_empty() {
-                return Err(io::Error::other(format!("{tag}: event pipe child exited")));
-            }
-            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-                if line.len() + newline + 1 > MAX_PIPE_LINE_LEN {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{tag}: event line exceeds bound"),
-                    ));
-                }
-                line.extend_from_slice(&available[..newline]);
-                pipe.reader.consume(newline + 1);
-                return String::from_utf8(line).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{tag}: event line is not UTF-8: {error}"),
-                    )
-                });
-            }
-            if line.len() + available.len() + 1 > MAX_PIPE_LINE_LEN {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{tag}: event line exceeds bound before any newline"),
-                ));
-            }
-            let count = available.len();
-            line.extend_from_slice(available);
-            pipe.reader.consume(count);
-        }
-    })
-    .await
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{tag}: timed out waiting for an event line"),
-        )
-    })?
+async fn duo_log_stderr_tail(label: &str, channel: &SubprocessChannel, reason: &str) {
+    let tail = channel.stderr_tail().await;
+    eprintln!(
+        "[duo] {reason}: {label} epoch {:?} stderr tail ({} bytes):\n{}",
+        channel.install_epoch().await,
+        tail.len(),
+        String::from_utf8_lossy(&tail),
+    );
 }
 
-/// Reaps one owned pipe child: kill, bounded wait, then the bounded stderr
-/// tail for diagnostics. Production close discipline, owned here so no
-/// global pipe state is touched.
-async fn shutdown_duo_pipe(pipe: &mut DuoPipe) -> io::Result<()> {
-    let tag = pipe.tag.as_str();
-    let _ = pipe.child.start_kill();
-    let reap = match tokio::time::timeout(DUO_REAP_TIMEOUT, pipe.child.wait()).await {
-        Ok(Ok(status)) => {
-            eprintln!("[{tag}] reaped pipe child ({status})");
-            Ok(())
+/// Fixture-only diagnostics; transport semantics remain production-owned.
+struct DuoDiagnosticChannel {
+    channel: Arc<SubprocessChannel>,
+    label: &'static str,
+    diagnostics: Arc<DuoDiagnostics>,
+}
+
+#[async_trait::async_trait]
+impl PipeChannel for DuoDiagnosticChannel {
+    async fn send_line(&self, line: String) -> Result<(), PipeTransportError> {
+        let result = self.channel.send_line(line).await;
+        if let Err(error) = &result {
+            self.diagnostics
+                .log(&format!("{} write error: {error}", self.label))
+                .await;
         }
-        Ok(Err(error)) => Err(io::Error::other(format!(
-            "{tag}: pipe child reap failed: {error}"
-        ))),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{tag}: pipe child did not exit within {DUO_REAP_TIMEOUT:?}"),
-        )),
-    };
-    let stderr = match pipe.stderr.take() {
-        None => Ok(()),
-        Some(mut task) => match tokio::time::timeout(DUO_STDERR_TIMEOUT, &mut task).await {
-            Ok(Ok(tail)) => {
-                if !tail.is_empty() {
-                    // The drain already caps at 4096 bytes; convert the bytes whole so
-                    // no char-boundary slicing can panic before Rig teardown.
-                    eprintln!("[{tag}] stderr tail:\n{}", String::from_utf8_lossy(&tail));
-                }
-                Ok(())
-            }
-            Ok(Err(error)) => Err(io::Error::other(format!(
-                "{tag}: stderr drain failed: {error}"
-            ))),
-            Err(_) => {
-                task.abort();
-                let _ = task.await;
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("{tag}: stderr drain did not exit within {DUO_STDERR_TIMEOUT:?}"),
+        result
+    }
+
+    async fn next_line(&self) -> Result<String, PipeTransportError> {
+        self.next_line_tagged().await.map(|(_, line)| line)
+    }
+
+    async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
+        let result = self.channel.next_line_tagged().await;
+        if let Err(error) = &result {
+            self.diagnostics
+                .log(&format!("{} read error: {error}", self.label))
+                .await;
+        }
+        result
+    }
+
+    async fn install_epoch(&self) -> Option<u64> {
+        self.channel.install_epoch().await
+    }
+
+    async fn close(&self) {
+        self.diagnostics
+            .log(&format!("before {} close", self.label))
+            .await;
+        self.channel.close().await;
+    }
+
+    async fn park(&self) {
+        self.diagnostics
+            .log(&format!("before {} park", self.label))
+            .await;
+        self.channel.park().await;
+    }
+
+    async fn respawn(&self) -> Result<(), PipeTransportError> {
+        self.diagnostics
+            .log(&format!("before {} respawn", self.label))
+            .await;
+        let result = self.channel.respawn().await;
+        if let Err(error) = &result {
+            self.diagnostics
+                .log(&format!("{} respawn error: {error}", self.label))
+                .await;
+        }
+        result
+    }
+
+    async fn respawn_with_payload(&self, payload: String) -> Result<(), PipeTransportError> {
+        self.diagnostics
+            .log(&format!("before {} subscription respawn", self.label))
+            .await;
+        let result = self.channel.respawn_with_payload(payload).await;
+        if let Err(error) = &result {
+            self.diagnostics
+                .log(&format!(
+                    "{} subscription respawn error: {error}",
+                    self.label
                 ))
-            }
-        },
-    };
-    combine_body_and_cleanup(reap, stderr)
+                .await;
+        }
+        result
+    }
+}
+
+/// Observes real transport results while the production adapter owns recovery.
+/// The queue is bounded; it neither substitutes responses nor replays requests.
+struct DuoEventChannel {
+    channel: Arc<DuoDiagnosticChannel>,
+    overflowed: Arc<AtomicBool>,
+    observations: tokio::sync::mpsc::Sender<DuoObservation>,
+}
+
+#[async_trait::async_trait]
+impl PipeChannel for DuoEventChannel {
+    async fn send_line(&self, line: String) -> Result<(), PipeTransportError> {
+        self.channel.send_line(line).await
+    }
+
+    async fn next_line(&self) -> Result<String, PipeTransportError> {
+        self.next_line_tagged().await.map(|(_, line)| line)
+    }
+
+    async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
+        let result = self.channel.next_line_tagged().await;
+        let observation = DuoObservation {
+            epoch: result
+                .as_ref()
+                .ok()
+                .map(|(epoch, _)| DuoChannelEpoch(*epoch)),
+            result: result
+                .as_ref()
+                .map(|(_, line)| line.clone())
+                .map_err(Clone::clone),
+        };
+        if self.observations.try_send(observation).is_err() {
+            self.overflowed.store(true, Ordering::Release);
+            return Err(PipeTransportError::Closed);
+        }
+        result
+    }
+
+    async fn install_epoch(&self) -> Option<u64> {
+        self.channel.install_epoch().await
+    }
+
+    async fn close(&self) {
+        self.channel.close().await;
+    }
+
+    async fn park(&self) {
+        self.channel.park().await;
+    }
+
+    async fn respawn(&self) -> Result<(), PipeTransportError> {
+        self.channel.respawn().await
+    }
+
+    async fn respawn_with_payload(&self, payload: String) -> Result<(), PipeTransportError> {
+        self.channel.respawn_with_payload(payload).await
+    }
+}
+
+struct DuoEvents {
+    channel: Arc<SubprocessChannel>,
+    observations: tokio::sync::mpsc::Receiver<DuoObservation>,
+    fence: Option<DuoFence>,
+    overflowed: Arc<AtomicBool>,
+}
+
+impl DuoEvents {
+    async fn observe(&mut self, timeout: std::time::Duration) -> io::Result<DuoObservation> {
+        if self.overflowed.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "duo: bounded event observation queue failed",
+            ));
+        }
+        tokio::time::timeout(timeout, self.observations.recv())
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "duo: event observation timed out")
+            })?
+            .ok_or_else(|| io::Error::other("duo: event observation ended"))
+    }
+}
+
+async fn duo_send_request_line(pipe: &dyn PipeChannel, line: &str) -> io::Result<()> {
+    pipe.send_line(line.to_owned())
+        .await
+        .map_err(|error| io::Error::other(format!("duo: request pipe write failed: {error}")))
+}
+
+/// Once admitted, any transport or generation change fails without replay.
+async fn duo_next_event(
+    event: &mut DuoEvents,
+    timeout: std::time::Duration,
+) -> io::Result<PipeEvent> {
+    let fence = event
+        .fence
+        .ok_or_else(|| io::Error::other("duo: routing began without current census coverage"))?;
+    let observation = event.observe(timeout).await?;
+    let line = observation.result.map_err(|error| {
+        io::Error::other(format!("duo: admitted event transport failed: {error}"))
+    })?;
+    if observation.epoch != Some(fence.epoch)
+        || event.channel.install_epoch().await.map(DuoChannelEpoch) != Some(fence.epoch)
+    {
+        return Err(io::Error::other("duo: admitted event channel changed"));
+    }
+    let frame = decode_event_line(&line)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if frame.channel_generation != fence.generation {
+        return Err(io::Error::other("duo: admitted event generation changed"));
+    }
+    Ok(frame)
 }
 
 /// Deterministic registration-scoped request IDs for waiter routing.
@@ -824,16 +859,16 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
         let Some(host) = rig.zellij.as_ref() else {
             return Err(io::Error::other("duo: zellij host is gone"));
         };
+        let executable = host.scoped_cli_wrapper(&rig.scoped_root)?;
+        let membership = CliMembershipSource::new(executable.clone(), "duo".to_owned());
         // Authoritative anchor first: exactly two live clients, never one.
         // A one-client snapshot is a poll retry, never admission.
         let census_deadline = tokio::time::Instant::now() + READY_TIMEOUT;
         let anchor = loop {
-            let census = host.list_clients("duo").await.map_err(|error| {
-                io::Error::other(format!("duo: list-clients query failed: {error}"))
-            })?;
-            if census.len() == 2 {
-                break census;
-            }
+            let census = match duo_snapshot_census(&membership, census_deadline).await? {
+                Some(census) if census.len() == 2 => break census,
+                census => census,
+            };
             if tokio::time::Instant::now() >= census_deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -846,42 +881,97 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
         };
         eprintln!("[duo] authoritative census: {anchor:?}");
 
-        let (request_name, event_name) = channel_names("duo");
-        let subscription = duo_subscription_payload()?;
-        let mut request = spawn_duo_pipe(
-            host,
-            &rig.scoped_root,
-            &zellij_binary,
-            "duo",
-            &request_name,
-            None,
-            "duo-request",
-        )?;
-        let mut event = match spawn_duo_pipe(
-            host,
-            &rig.scoped_root,
-            &zellij_binary,
-            "duo",
-            &event_name,
-            Some(&subscription),
-            "duo-event",
-        ) {
-            Ok(event) => event,
-            Err(error) => {
-                let shutdown = shutdown_duo_pipe(&mut request).await;
-                return combine_body_and_cleanup(Err(error), shutdown);
-            }
-        };
-
-        let body = duo_probe_rounds(&anchor, &mut request, &mut event).await;
-        let shutdown = combine_body_and_cleanup(
-            shutdown_duo_pipe(&mut request).await,
-            shutdown_duo_pipe(&mut event).await,
-        );
-        combine_body_and_cleanup(body, shutdown)
+        duo_connect_and_probe(&rig, &anchor, executable).await
     }
     .await;
     rig.finish("duo", result).await
+}
+
+async fn duo_connect_and_probe(
+    rig: &Rig,
+    anchor: &[String],
+    executable: PathBuf,
+) -> io::Result<()> {
+    let (request_name, event_name) = channel_names("duo");
+    let bridge = muxe::integration::bridge_identity(
+        rig.config_file.parent().expect("owned config has a parent"),
+    )
+    .map_err(io::Error::other)?;
+    let subscription = duo_subscription_payload()?;
+    let request =
+        SubprocessChannel::launch(executable.clone(), "duo".to_owned(), request_name, None)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("duo: request pipe launch failed: {error}"))
+            })?;
+    let channel = match SubprocessChannel::launch(
+        executable.clone(),
+        "duo".to_owned(),
+        event_name,
+        Some(subscription),
+    )
+    .await
+    {
+        Ok(channel) => channel,
+        Err(error) => {
+            duo_log_stderr_tail("request", &request, "event launch failed").await;
+            request.close().await;
+            return Err(io::Error::other(format!(
+                "duo: event pipe launch failed: {error}",
+            )));
+        }
+    };
+    let diagnostics = Arc::new(DuoDiagnostics {
+        request: Arc::clone(&request),
+        event: Arc::clone(&channel),
+    });
+    let request = Arc::new(DuoDiagnosticChannel {
+        channel: request,
+        label: "request",
+        diagnostics: Arc::clone(&diagnostics),
+    });
+    let observed_channel = Arc::new(DuoDiagnosticChannel {
+        channel: Arc::clone(&channel),
+        label: "event",
+        diagnostics: Arc::clone(&diagnostics),
+    });
+    let (observations, receiver) = tokio::sync::mpsc::channel(64);
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let event_channel = Arc::new(DuoEventChannel {
+        channel: observed_channel,
+        observations,
+        overflowed: Arc::clone(&overflowed),
+    });
+    let adapter = ZellijAdapter::new(
+        ZellijAdapterConfig {
+            session_name: "duo".to_owned(),
+            zellij_exe: executable.clone(),
+            readiness_gate: ReadinessGate::new(rig.cache_dir.clone(), bridge.unit()),
+        },
+        request.clone(),
+        event_channel,
+    );
+    let monitor = adapter.clone();
+    let health = tokio::spawn(async move {
+        while let Ok(event) = monitor.next_health_event().await {
+            if let AdapterHealthEvent::Unhealthy { error, .. } = event {
+                eprintln!("[duo] adapter unavailable: {error}");
+            }
+        }
+    });
+    let membership = CliMembershipSource::new(executable, "duo".to_owned());
+    let mut event = DuoEvents {
+        channel,
+        observations: receiver,
+        fence: None,
+        overflowed,
+    };
+    let body = duo_probe_rounds(anchor, request.as_ref(), &mut event, &adapter, &membership).await;
+    diagnostics.log("before adapter shutdown").await;
+    let cleanup = adapter.shutdown().await.map_err(io::Error::other);
+    health.abort();
+    let _ = health.await;
+    combine_body_and_cleanup(body, cleanup)
 }
 
 /// Census coverage plus addressed routing for the duo scenario. First awaits
@@ -893,21 +983,26 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
 /// wrong owners, wrong requests, and UI-session mismatches all fail closed.
 async fn duo_probe_rounds(
     anchor: &[String],
-    request: &mut DuoPipe,
-    event: &mut DuoPipe,
+    request: &dyn PipeChannel,
+    event: &mut DuoEvents,
+    adapter: &ZellijAdapter,
+    membership: &dyn MembershipSource,
 ) -> io::Result<()> {
-    let registrations = duo_collect_registrations(anchor, event).await?;
+    let registrations = duo_collect_registrations(anchor, event, adapter, membership).await?;
     let targets = duo_route_targets(anchor, &registrations, request, event).await?;
     duo_drain_route_heartbeats(anchor, &registrations, &targets, event).await
 }
 
 async fn duo_collect_registrations(
     anchor: &[String],
-    event: &mut DuoPipe,
+    event: &mut DuoEvents,
+    adapter: &ZellijAdapter,
+    membership: &dyn MembershipSource,
 ) -> io::Result<BTreeMap<String, (RegistrationId, String)>> {
     let coverage_deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     let mut registrations: BTreeMap<String, (RegistrationId, String)> = BTreeMap::new();
-    while registrations.len() < anchor.len() {
+    let mut candidate = None;
+    loop {
         let remaining = coverage_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
@@ -918,13 +1013,68 @@ async fn duo_collect_registrations(
                 ),
             ));
         }
-        let line = duo_next_event_line(event, remaining).await?;
+        let current = event.channel.install_epoch().await.map(DuoChannelEpoch);
+        if candidate.is_some_and(|fence: DuoFence| Some(fence.epoch) != current) {
+            registrations.clear();
+            candidate = None;
+        }
+        if duo_admit_coverage(
+            anchor,
+            registrations.len(),
+            event,
+            adapter,
+            membership,
+            candidate,
+            coverage_deadline,
+        )
+        .await?
+        {
+            return Ok(registrations);
+        }
+        let observation = if registrations.len() == anchor.len() {
+            tokio::select! {
+                observation = event.observe(remaining) => observation?,
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => continue,
+            }
+        } else {
+            event.observe(remaining).await?
+        };
+        let line = match observation.result {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("[duo] pre-admission transport loss: {error}; requiring fresh coverage");
+                registrations.clear();
+                candidate = None;
+                continue;
+            }
+        };
+        let epoch = observation
+            .epoch
+            .ok_or_else(|| io::Error::other("duo: untagged event"))?;
+        if Some(epoch) != event.channel.install_epoch().await.map(DuoChannelEpoch) {
+            registrations.clear();
+            candidate = None;
+            continue;
+        }
         let frame = decode_event_line(&line).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("duo: cannot decode event line: {error}"),
             )
         })?;
+        let fence = DuoFence {
+            epoch,
+            generation: frame.channel_generation,
+        };
+        if let Some(candidate) = candidate {
+            if candidate != fence {
+                return Err(io::Error::other(
+                    "duo: mixed subscription generations in one epoch",
+                ));
+            }
+        } else {
+            candidate = Some(fence);
+        }
         let registration = frame.registration;
         match frame.event {
             PipeEventKind::Event(BridgeEvent::Register {
@@ -933,36 +1083,7 @@ async fn duo_collect_registrations(
             PipeEventKind::Event(BridgeEvent::Register {
                 registration: details,
             }) => {
-                let client_id = details.client_id;
-                let current_pane = details.current_pane;
-                let identity = details.identity;
-                if !(identity.bridge_build_id == Some(bridge_build_id())
-                    && identity.source_revision == pinned_source_revision()
-                    && identity.action_fingerprint == generated_action_fingerprint().0
-                    && identity.protocol_fingerprint == bridge_protocol_fingerprint().0)
-                {
-                    return Err(io::Error::other(format!(
-                        "duo: incompatible bridge handshake for client {client_id:?}"
-                    )));
-                }
-                if identity.muxe_version != env!("CARGO_PKG_VERSION") {
-                    return Err(io::Error::other(format!(
-                        "duo: bridge version {:?} does not match target {:?} for client {client_id:?}",
-                        identity.muxe_version,
-                        env!("CARGO_PKG_VERSION"),
-                    )));
-                }
-                let Some(current_pane) = current_pane else {
-                    return Err(io::Error::other(format!(
-                        "duo: no focused-pane anchor for client {client_id:?}, cannot address an origin query"
-                    )));
-                };
-                if let Some((previous, _)) = registrations.get(&client_id) {
-                    eprintln!(
-                        "[duo] superseding registration for client {client_id:?} (previous {previous:?})"
-                    );
-                }
-                registrations.insert(client_id, (registration, current_pane));
+                duo_add_registration(&mut registrations, registration, details)?;
             }
             PipeEventKind::Event(BridgeEvent::Heartbeat) => {}
             other => {
@@ -972,13 +1093,129 @@ async fn duo_collect_registrations(
             }
         }
     }
-    Ok(registrations)
+}
+
+async fn duo_admit_coverage(
+    anchor: &[String],
+    registered: usize,
+    event: &mut DuoEvents,
+    adapter: &ZellijAdapter,
+    membership: &dyn MembershipSource,
+    candidate: Option<DuoFence>,
+    deadline: tokio::time::Instant,
+) -> io::Result<bool> {
+    let Some(fence) = candidate else {
+        return Ok(false);
+    };
+    if registered != anchor.len()
+        || event.channel.install_epoch().await.map(DuoChannelEpoch) != Some(fence.epoch)
+        || adapter.identity().await.is_err()
+    {
+        return Ok(false);
+    }
+    if !duo_recheck_census(anchor, membership, deadline).await? {
+        eprintln!(
+            "[duo] retrying admission census: candidate {fence:?}, current epoch {:?}, ready {}",
+            event.channel.install_epoch().await.map(DuoChannelEpoch),
+            adapter.identity().await.is_ok(),
+        );
+        return Ok(false);
+    }
+    if event.overflowed.load(Ordering::Acquire) {
+        return Err(io::Error::other(
+            "duo: bounded event observation queue failed",
+        ));
+    }
+    if event.channel.install_epoch().await.map(DuoChannelEpoch) != Some(fence.epoch)
+        || adapter.identity().await.is_err()
+    {
+        return Ok(false);
+    }
+    event.fence = Some(fence);
+    Ok(true)
+}
+
+async fn duo_recheck_census(
+    anchor: &[String],
+    membership: &dyn MembershipSource,
+    deadline: tokio::time::Instant,
+) -> io::Result<bool> {
+    let Some(members) = duo_snapshot_census(membership, deadline).await? else {
+        return Ok(false);
+    };
+    if members != anchor {
+        return Err(io::Error::other(format!(
+            "duo: membership changed before admission: {members:?}",
+        )));
+    }
+    Ok(true)
+}
+
+async fn duo_snapshot_census(
+    membership: &dyn MembershipSource,
+    deadline: tokio::time::Instant,
+) -> io::Result<Option<Vec<String>>> {
+    let result = tokio::time::timeout_at(deadline, membership.snapshot_members())
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "duo: pre-admission census timed out",
+            )
+        })?;
+    match result {
+        Ok(members) => Ok(Some(members)),
+        Err(error) if error.kind == muxe_adapter_api::AdapterErrorKind::Unavailable => {
+            eprintln!("[duo] pre-admission census unavailable: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
+fn duo_add_registration(
+    registrations: &mut BTreeMap<String, (RegistrationId, String)>,
+    registration: RegistrationId,
+    details: muxe_zellij_protocol::ZellijRegistration,
+) -> io::Result<()> {
+    let identity = &details.identity;
+    if !(identity.bridge_build_id == Some(bridge_build_id())
+        && identity.source_revision == pinned_source_revision()
+        && identity.action_fingerprint == generated_action_fingerprint().0
+        && identity.protocol_fingerprint == bridge_protocol_fingerprint().0)
+    {
+        return Err(io::Error::other(format!(
+            "duo: incompatible bridge handshake for client {:?}",
+            details.client_id,
+        )));
+    }
+    if identity.muxe_version != env!("CARGO_PKG_VERSION") {
+        return Err(io::Error::other(format!(
+            "duo: bridge version {:?} does not match target {:?} for client {:?}",
+            identity.muxe_version,
+            env!("CARGO_PKG_VERSION"),
+            details.client_id,
+        )));
+    }
+    let client_id = details.client_id;
+    let Some(current_pane) = details.current_pane else {
+        return Err(io::Error::other(format!(
+            "duo: no focused-pane anchor for client {client_id:?}, cannot address an origin query",
+        )));
+    };
+    if let Some((previous, _)) = registrations.get(&client_id) {
+        eprintln!(
+            "[duo] superseding registration for client {client_id:?} (previous {previous:?})",
+        );
+    }
+    registrations.insert(client_id, (registration, current_pane));
+    Ok(())
 }
 async fn duo_route_targets(
     anchor: &[String],
     registrations: &BTreeMap<String, (RegistrationId, String)>,
-    request: &mut DuoPipe,
-    event: &mut DuoPipe,
+    request: &dyn PipeChannel,
+    event: &mut DuoEvents,
 ) -> io::Result<Vec<(String, RegistrationId)>> {
     let targets: Vec<(String, RegistrationId)> = anchor
         .iter()
@@ -1020,8 +1257,8 @@ async fn duo_route_targets(
 async fn duo_route_one(
     anchor: &[String],
     registrations: &BTreeMap<String, (RegistrationId, String)>,
-    request: &mut DuoPipe,
-    event: &mut DuoPipe,
+    request: &dyn PipeChannel,
+    event: &mut DuoEvents,
     index: usize,
     client_id: &str,
     registration: RegistrationId,
@@ -1033,11 +1270,15 @@ async fn duo_route_one(
     })?;
     let request_id = duo_request_id(index as u64 + 1);
     let ui_session = format!("duo-route-{client_id}");
+    let generation = event
+        .fence
+        .ok_or_else(|| io::Error::other("duo: origin route has no current coverage"))?
+        .generation;
     let outbound = PipeRequest {
         protocol: BRIDGE_PROTOCOL_VERSION,
         request_id,
         registration,
-        channel_generation: ChannelGeneration::INITIAL,
+        channel_generation: generation,
         target: BridgeTarget {
             client_id: client_id.to_owned(),
         },
@@ -1065,6 +1306,7 @@ async fn duo_route_one(
         anchor,
         request_id,
         registration,
+        generation,
         ui_session: &ui_session,
         current_pane,
         client_id,
@@ -1080,6 +1322,7 @@ struct DuoRouteState<'a> {
     anchor: &'a [String],
     request_id: RequestId,
     registration: RegistrationId,
+    generation: ChannelGeneration,
     ui_session: &'a str,
     current_pane: &'a str,
     client_id: &'a str,
@@ -1111,7 +1354,7 @@ impl DuoRouteState<'_> {
                     frame.registration, self.client_id
                 )));
             }
-            if frame.channel_generation != ChannelGeneration::INITIAL {
+            if frame.channel_generation != self.generation {
                 return Err(io::Error::other(format!(
                     "duo: event on wrong generation {} for client {:?}",
                     frame.channel_generation, self.client_id
@@ -1184,7 +1427,7 @@ impl DuoRouteState<'_> {
 }
 
 async fn duo_await_route_response(
-    event: &mut DuoPipe,
+    event: &mut DuoEvents,
     state: &mut DuoRouteState<'_>,
 ) -> io::Result<()> {
     while !(state.released && state.snapshot) {
@@ -1200,13 +1443,7 @@ async fn duo_await_route_response(
                 ),
             ));
         }
-        let line = duo_next_event_line(event, remaining).await?;
-        let frame = decode_event_line(&line).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("duo: cannot decode event line: {error}"),
-            )
-        })?;
+        let frame = duo_next_event(event, remaining).await?;
         state.apply(frame)?;
     }
     Ok(())
@@ -1215,7 +1452,7 @@ async fn duo_drain_route_heartbeats(
     anchor: &[String],
     registrations: &BTreeMap<String, (RegistrationId, String)>,
     targets: &[(String, RegistrationId)],
-    event: &mut DuoPipe,
+    event: &mut DuoEvents,
 ) -> io::Result<()> {
     // Let the protocol drain through the next heartbeat from both active
     // anchors. This catches queued duplicate replies after the final route
@@ -1230,13 +1467,7 @@ async fn duo_drain_route_heartbeats(
                 format!("duo: timed out awaiting post-route heartbeats, observed {heartbeats:?}"),
             ));
         }
-        let line = duo_next_event_line(event, remaining).await?;
-        let frame = decode_event_line(&line).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("duo: cannot decode post-route event line: {error}"),
-            )
-        })?;
+        let frame = duo_next_event(event, remaining).await?;
         let registration = frame.registration;
         match frame.event {
             PipeEventKind::Event(BridgeEvent::Heartbeat) => {
@@ -2537,6 +2768,99 @@ async fn zellij_locked_menu_coldstart_restores_locked_mode() {
 mod tests {
     use super::*;
 
+    struct CensusSequence {
+        results: tokio::sync::Mutex<
+            std::collections::VecDeque<Result<Vec<String>, muxe_adapter_api::AdapterError>>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl MembershipSource for CensusSequence {
+        async fn snapshot_members(&self) -> Result<Vec<String>, muxe_adapter_api::AdapterError> {
+            self.results.lock().await.pop_front().expect("census query")
+        }
+    }
+    struct PendingCensus;
+    #[async_trait::async_trait]
+    impl MembershipSource for PendingCensus {
+        async fn snapshot_members(&self) -> Result<Vec<String>, muxe_adapter_api::AdapterError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_retries_empty_census_but_rejects_changed_membership() {
+        let anchor = vec!["1".to_owned(), "2".to_owned()];
+        let membership = CensusSequence {
+            results: tokio::sync::Mutex::new(std::collections::VecDeque::from([
+                Err(muxe_adapter_api::AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Unavailable,
+                    "temporary discovery failure",
+                )),
+                Ok(anchor.clone()),
+                Ok(vec!["1".to_owned(), "3".to_owned()]),
+            ])),
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(
+            !duo_recheck_census(&anchor, &membership, deadline)
+                .await
+                .unwrap()
+        );
+        assert!(
+            duo_recheck_census(&anchor, &membership, deadline)
+                .await
+                .unwrap()
+        );
+        assert!(
+            duo_recheck_census(&anchor, &membership, deadline)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_permanent_errors_and_keeps_original_deadline() {
+        let anchor = vec!["1".to_owned(), "2".to_owned()];
+        let permanent_kinds = [
+            muxe_adapter_api::AdapterErrorKind::InvalidRequest,
+            muxe_adapter_api::AdapterErrorKind::ContextUnavailable,
+        ];
+        let membership = CensusSequence {
+            results: tokio::sync::Mutex::new(std::collections::VecDeque::from([
+                Err(muxe_adapter_api::AdapterError::new(
+                    permanent_kinds[0],
+                    "permanent failure",
+                )),
+                Err(muxe_adapter_api::AdapterError::new(
+                    permanent_kinds[1],
+                    "permanent failure",
+                )),
+            ])),
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        for kind in permanent_kinds {
+            let error = duo_recheck_census(&anchor, &membership, deadline)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<muxe_adapter_api::AdapterError>())
+                    .expect("preserved typed oracle error")
+                    .kind,
+                kind,
+            );
+        }
+        assert_eq!(
+            duo_recheck_census(&anchor, &PendingCensus, tokio::time::Instant::now())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut,
+        );
+    }
+
     #[test]
     fn finish_preserves_body_and_cleanup_errors() {
         let error = combine_body_and_cleanup(
@@ -2550,12 +2874,33 @@ mod tests {
     }
 
     #[test]
-    fn duo_subscription_payload_carries_initial_generation() {
-        let payload = duo_subscription_payload().expect("subscription payload");
-        let subscription = decode_event_subscription(&payload).expect("valid subscription");
-        assert_eq!(
-            subscription.channel_generation(),
-            ChannelGeneration::INITIAL
-        );
+    fn routed_release_rejects_pre_recovery_generation() {
+        let registration = RegistrationId::from_random_bytes([1; 16]).expect("registration");
+        let generation = ChannelGeneration::try_from(2_u64).expect("recovered generation");
+        let anchors = ["1".to_owned(), "2".to_owned()];
+        let mut state = DuoRouteState {
+            anchor: &anchors,
+            request_id: RequestId::INITIAL,
+            registration,
+            generation,
+            ui_session: "duo-route-1",
+            current_pane: "plugin_3",
+            client_id: "1",
+            round_deadline: tokio::time::Instant::now() + DUO_ROUTE_TIMEOUT,
+            released: false,
+            snapshot: false,
+        };
+        let mut release = PipeEvent {
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            request_id: Some(RequestId::INITIAL),
+            registration,
+            channel_generation: ChannelGeneration::INITIAL,
+            event: PipeEventKind::Response(BridgeResponse::RequestReleased),
+        };
+        assert!(state.apply(release.clone()).is_err());
+        assert!(!state.released);
+        release.channel_generation = generation;
+        state.apply(release).expect("current-generation release");
+        assert!(state.released);
     }
 }

@@ -2,6 +2,8 @@
 
 ### 🐛 Bug Fixes
 
+- *(ci)* Use existing Zellij adapter recovery before two-client smoke admission, discard stale epoch/generation coverage, and retain exact addressed origin checks with fail-fast post-admission loss and no request replay
+- *(ci)* Retry unavailable Zellij census queries within the original two-client admission deadline without accepting changed membership, and log both bounded CLI stderr tails before recovery or shutdown discards them
 - *(broker)* Require the selected host's registry authority for cold-start adoption, reuse, stale removal, and retirement; reject foreign persisted rows before mutation
 - *(activation)* Spawn targets from the typed journal unit instead of a registry label or socket filename
 - *(activation)* Keep bridge preflight, reload, and Ready proof under the selected host policy; accept unchanged bridge membership regardless of registry insertion order
