@@ -35,8 +35,8 @@ use muxe_adapter_api::{
     PostDismissalPortableDispatchRequest, UiSessionId,
 };
 use muxe_core::{
-    ActionValidation, ActionValidator, ConfigDiagnostic, ExecutionCapabilities, ExecutionId,
-    NativeActionCandidate, OriginContext, PaneId, PortableAction, SourceSpan,
+    ActionValidation, ActionValidator, ClientId, ConfigDiagnostic, ExecutionCapabilities,
+    ExecutionId, NativeActionCandidate, OriginContext, PaneId, PortableAction, SourceSpan,
 };
 use muxe_protocol::{
     AsOfTick, CaptureLeaseId as CommonCaptureLeaseId, ExecutionId as CommonExecutionId,
@@ -122,9 +122,10 @@ fn subscription_payload(generation: ChannelGeneration) -> Result<String, Adapter
 
 /// Pending capture waiters keyed by lease, each tagged with the owning
 /// client so lease expiry can release only that client's waiters.
-type CaptureWaiters = BTreeMap<[u8; 16], (String, PendingReply<oneshot::Sender<CaptureReady>>)>;
+type CaptureWaiters =
+    BTreeMap<CommonCaptureLeaseId, (ClientId, PendingReply<oneshot::Sender<CaptureReady>>)>;
 type OriginWaiters =
-    BTreeMap<String, PendingReply<oneshot::Sender<Result<ZellijOrigin, OriginError>>>>;
+    BTreeMap<CommonUiSessionId, PendingReply<oneshot::Sender<Result<ZellijOrigin, OriginError>>>>;
 
 /// Static adapter configuration. Live-server identity beyond the session name
 /// is verified against bridge registrations, never assumed.
@@ -168,7 +169,7 @@ impl ZellijAdapterConfig {
 #[async_trait]
 pub trait MembershipSource: Send + Sync {
     /// Returns the current attached client IDs, sorted and deduplicated.
-    async fn snapshot_members(&self) -> Result<Vec<String>, AdapterError>;
+    async fn snapshot_members(&self) -> Result<Vec<ClientId>, AdapterError>;
 }
 
 /// Production oracle: a bounded one-shot `zellij --session <session> action
@@ -219,7 +220,7 @@ impl CliMembershipSource {
     clippy::result_large_err,
     reason = "AdapterError is the public host-adapter error; boxing it would burden every caller"
 )]
-fn parse_list_clients_output(output: &str) -> Result<Vec<String>, AdapterError> {
+fn parse_list_clients_output(output: &str) -> Result<Vec<ClientId>, AdapterError> {
     let mut lines = output
         .lines()
         .map(str::trim)
@@ -246,7 +247,7 @@ fn parse_list_clients_output(output: &str) -> Result<Vec<String>, AdapterError> 
                 "zellij list-clients returned an unsupported row shape",
             ));
         }
-        members.push(id.to_owned());
+        members.push(ClientId::new(id));
     }
     members.sort();
     members.dedup();
@@ -255,7 +256,7 @@ fn parse_list_clients_output(output: &str) -> Result<Vec<String>, AdapterError> 
 
 #[async_trait]
 impl MembershipSource for CliMembershipSource {
-    async fn snapshot_members(&self) -> Result<Vec<String>, AdapterError> {
+    async fn snapshot_members(&self) -> Result<Vec<ClientId>, AdapterError> {
         use tokio::io::AsyncReadExt;
         let mut child = tokio::process::Command::new(&self.zellij_exe)
             .arg("--session")
@@ -443,7 +444,7 @@ struct QueuedItem {
     /// Covered continuity admitted with this origin-bound request. Lifecycle
     /// traffic has no origin and leaves this absent.
     incarnation: Option<CoveredIncarnation>,
-    client_id: String,
+    client_id: ClientId,
     /// Taken for encoding; restored on retry so no clone is needed.
     payload: Option<BridgeRequest>,
 }
@@ -666,7 +667,7 @@ struct CoveredIncarnation {
 struct PendingCoverage {
     resume_epoch: u64,
     channel: u64,
-    members: Vec<String>,
+    members: Vec<ClientId>,
 }
 #[cfg(test)]
 struct WaitHook {
@@ -682,17 +683,17 @@ struct AdapterInner {
     registry: Mutex<ZellijRegistry>,
     /// Serializes registration publication with request allocation and sends.
     registration_transition: Mutex<()>,
-    scheduler_cursor: Mutex<Option<String>>,
+    scheduler_cursor: Mutex<Option<ClientId>>,
     pending_origin: Mutex<OriginWaiters>,
     captures: Mutex<CaptureTable>,
-    queues: Mutex<BTreeMap<String, VecDeque<QueuedItem>>>,
+    queues: Mutex<BTreeMap<ClientId, VecDeque<QueuedItem>>>,
     in_flight: Mutex<Option<InFlight>>,
-    live_executions: Mutex<BTreeMap<u64, ExecutionRecord>>,
-    close_waiters: StdMutex<BTreeMap<u64, oneshot::Sender<DispatchCompletion>>>,
+    live_executions: Mutex<BTreeMap<ExecutionId, ExecutionRecord>>,
+    close_waiters: StdMutex<BTreeMap<ExecutionId, oneshot::Sender<DispatchCompletion>>>,
     pending_capture: Mutex<CaptureWaiters>,
-    pane_claims: Mutex<BTreeMap<String, String>>,
-    pending_leases: StdMutex<BTreeMap<String, (String, RegistrationId)>>,
-    snapshots: Mutex<BTreeMap<String, ZellijOrigin>>,
+    pane_claims: Mutex<BTreeMap<PaneId, ClientId>>,
+    pending_leases: StdMutex<BTreeMap<PendingPaneLeaseId, (ClientId, RegistrationId)>>,
+    snapshots: Mutex<BTreeMap<PaneId, ZellijOrigin>>,
     generation: AtomicChannelGeneration,
     next_correlation: AtomicU64,
     next_local_execution: AtomicU64,
@@ -732,7 +733,7 @@ struct AdapterInner {
     /// it. Coverage requires both to match the current attempt. Registration
     /// identities also rotate on every new event channel; transport freshness
     /// never permits reuse of a retired identity.
-    register_epoch: Mutex<BTreeMap<String, (u64, u64)>>,
+    register_epoch: Mutex<BTreeMap<ClientId, (u64, u64)>>,
     /// The currently proven live continuity. It is absent before initial
     /// coverage and across every event-channel or activation transition.
     incarnation: StdRwLock<Option<CoveredIncarnation>>,
@@ -748,7 +749,7 @@ struct AdapterInner {
     /// to `None` on suspend and failed resume so stale evidence — and in
     /// particular constructor defaults on a fresh adapter that never ran
     /// a census — can never serve a coordinator.
-    success_snapshot: Mutex<Option<Vec<String>>>,
+    success_snapshot: Mutex<Option<Vec<ClientId>>>,
     /// Authoritative host membership oracle (production: bounded
     /// `list-clients` CLI query). Resume measures coverage against a fresh
     /// snapshot per attempt; the readiness hook reports the retained
@@ -1217,15 +1218,15 @@ impl ZellijAdapter {
     /// Fresh compatible census for the readiness hook: client IDs holding a
     /// compatible record in the current evidence generation. Private; the
     /// typed `activation_readiness` hook is the only consumer surface.
-    async fn fresh_census(&self) -> Vec<String> {
+    async fn fresh_census(&self) -> Vec<ClientId> {
         self.fresh_census_for(self.clock_millis()).await
     }
 
-    async fn fresh_census_for(&self, as_of_millis: u64) -> Vec<String> {
+    async fn fresh_census_for(&self, as_of_millis: u64) -> Vec<ClientId> {
         let registry = self.inner.registry.lock().await;
         let stamps = self.inner.register_epoch.lock().await;
         let epoch = self.inner.resume_epoch.load(Ordering::SeqCst);
-        let mut census: Vec<String> = stamps
+        let mut census: Vec<ClientId> = stamps
             .iter()
             .filter(|(client, stamped)| {
                 stamped.0 == epoch
@@ -1326,7 +1327,7 @@ impl ZellijAdapter {
                     .close_waiters
                     .lock()
                     .expect("Zellij close waiter registry is not poisoned")
-                    .remove(&execution.0);
+                    .remove(&execution);
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(completion);
                 }
@@ -1450,8 +1451,8 @@ impl ZellijAdapter {
                 self.on_register(
                     channel,
                     frame.channel_generation,
-                    details.client_id,
-                    details.current_pane,
+                    ClientId::new(details.client_id),
+                    details.current_pane.map(PaneId::new),
                     registration,
                     details.identity,
                 )
@@ -1464,7 +1465,7 @@ impl ZellijAdapter {
                     .lock()
                     .await
                     .client_for_registration(registration)
-                    .map(str::to_owned);
+                    .cloned();
                 let Some(client_id) = client_id else {
                     return;
                 };
@@ -1499,9 +1500,9 @@ impl ZellijAdapter {
                         };
                         let mut pending = self.inner.pending_origin.lock().await;
                         if pending
-                            .get(ui_session.as_str())
+                            .get(&ui_session)
                             .is_some_and(|reply| reply.request == Some(request))
-                            && let Some(reply) = pending.remove(ui_session.as_str())
+                            && let Some(reply) = pending.remove(&ui_session)
                         {
                             let _ = reply.sender.send(Ok(origin));
                         }
@@ -1513,9 +1514,9 @@ impl ZellijAdapter {
                         };
                         let mut pending = self.inner.pending_origin.lock().await;
                         if pending
-                            .get(ui_session.as_str())
+                            .get(&ui_session)
                             .is_some_and(|reply| reply.request == Some(request))
-                            && let Some(reply) = pending.remove(ui_session.as_str())
+                            && let Some(reply) = pending.remove(&ui_session)
                         {
                             let _ = reply.sender.send(Err(OriginError::InvalidId {
                                 field: "ui-pane",
@@ -1530,15 +1531,15 @@ impl ZellijAdapter {
                         };
                         let mut pending = self.inner.pending_capture.lock().await;
                         if pending
-                            .get(&lease.0)
+                            .get(&lease)
                             .is_some_and(|(_, reply)| reply.request == Some(request))
-                            && let Some((_, reply)) = pending.remove(&lease.0)
+                            && let Some((_, reply)) = pending.remove(&lease)
                         {
                             let _ = reply.sender.send(Ok(state.prior_mode));
                         }
                     }
                     PipeEventKind::Event(BridgeEvent::CaptureLost { lease, reason }) => {
-                        self.inner.pending_capture.lock().await.remove(&lease.0);
+                        self.inner.pending_capture.lock().await.remove(&lease);
                         let loss = match reason {
                             muxe_zellij_protocol::CaptureLostReason::UserModeChanged => {
                                 muxe_adapter_api::CaptureLossReason::UserModeChanged
@@ -1595,8 +1596,8 @@ impl ZellijAdapter {
         &self,
         channel: u64,
         channel_generation: ChannelGeneration,
-        client_id: String,
-        current_pane: Option<String>,
+        client_id: ClientId,
+        current_pane: Option<PaneId>,
         registration: RegistrationId,
         identity: muxe_zellij_protocol::BridgeIdentity,
     ) {
@@ -1729,7 +1730,7 @@ impl ZellijAdapter {
         };
         let terminal = {
             let mut live = self.inner.live_executions.lock().await;
-            let Some(record) = live.get_mut(&execution.0) else {
+            let Some(record) = live.get_mut(&execution) else {
                 // Completion for an unsent, forgotten, or displaced execution.
                 return;
             };
@@ -1756,7 +1757,7 @@ impl ZellijAdapter {
                 return;
             }
             let terminal = record.terminal();
-            live.remove(&execution.0);
+            live.remove(&execution);
             terminal
         };
         self.emit(AdapterHealthEvent::DispatchCompleted(terminal))
@@ -1770,12 +1771,12 @@ impl ZellijAdapter {
     /// settled, or already removed) return `None` and change nothing, so
     /// every interruption path resolves each request exactly once.
     fn settle_slot(
-        live: &mut BTreeMap<u64, ExecutionRecord>,
+        live: &mut BTreeMap<ExecutionId, ExecutionRecord>,
         execution: ExecutionId,
         slot: RequestId,
         outcome: Option<(OutcomeRank, AdapterError)>,
     ) -> Option<DispatchCompletion> {
-        let record = live.get_mut(&execution.0)?;
+        let record = live.get_mut(&execution)?;
         // The slot must still be outstanding (never-sent `None` and
         // sent `Some` both count). Settled slots were removed, so a second
         // settle of the same slot finds no key and changes nothing: each
@@ -1789,7 +1790,7 @@ impl ZellijAdapter {
             return None;
         }
         let terminal = record.terminal();
-        live.remove(&execution.0);
+        live.remove(&execution);
         Some(terminal)
     }
 
@@ -1798,11 +1799,11 @@ impl ZellijAdapter {
     /// acceptance slot, then any outstanding slot; returns the terminal when
     /// the execution reaches all-terminal.
     fn settle_any_slot(
-        live: &mut BTreeMap<u64, ExecutionRecord>,
+        live: &mut BTreeMap<ExecutionId, ExecutionRecord>,
         execution: ExecutionId,
         outcome: Option<(OutcomeRank, AdapterError)>,
     ) -> Option<DispatchCompletion> {
-        let record = live.get_mut(&execution.0)?;
+        let record = live.get_mut(&execution)?;
         let slot = record.requests.keys().copied().next()?;
         Self::settle_slot(live, execution, slot, outcome)
     }
@@ -1847,7 +1848,7 @@ impl ZellijAdapter {
                 }
                 if unknown > 0 && done {
                     terminals.push(record.terminal());
-                    remove.push(record.execution.0);
+                    remove.push(record.execution);
                 }
             }
             for execution in &remove {
@@ -1869,7 +1870,7 @@ impl ZellijAdapter {
     }
     async fn retire_registration_state(
         &self,
-        client_id: &str,
+        client_id: &ClientId,
         registration: RegistrationId,
         reason: &str,
     ) {
@@ -1954,8 +1955,8 @@ impl ZellijAdapter {
         if let Some((ui_session, lease)) = capture {
             self.emit(AdapterHealthEvent::CaptureLost {
                 lease: ApiCaptureLease {
-                    id: CaptureLeaseId::new(hex_id(&lease)),
-                    ui_session: UiSessionId::new(ui_session),
+                    id: CaptureLeaseId::new(hex_id(&lease.0)),
+                    ui_session: UiSessionId::new(ui_session.0),
                     modal_scope: Self::scope_for_client(client_id),
                 },
                 reason: muxe_adapter_api::CaptureLossReason::AdapterHealth,
@@ -1992,7 +1993,7 @@ impl ZellijAdapter {
             {
                 return;
             }
-            let mut order: Vec<String> = {
+            let mut order: Vec<ClientId> = {
                 let queues = self.inner.queues.lock().await;
                 queues
                     .iter()
@@ -2044,7 +2045,7 @@ impl ZellijAdapter {
         }
     }
 
-    async fn pump_one(&self, client_id: &str) -> SendItemResult {
+    async fn pump_one(&self, client_id: &ClientId) -> SendItemResult {
         // One request-child respawn retry inline. Lifecycle payloads retry
         // only when their semantics are idempotent; dispatch never replays.
         for _ in 0..2 {
@@ -2124,7 +2125,7 @@ impl ZellijAdapter {
     )]
     async fn send_item(
         &self,
-        client_id: &str,
+        client_id: &ClientId,
         request: RequestProvenance,
         mut item: QueuedItem,
     ) -> SendItemResult {
@@ -2164,17 +2165,12 @@ impl ZellijAdapter {
         };
         let replay_safe = !matches!(&payload, BridgeRequest::Dispatch { .. });
         if let BridgeRequest::BeginCapture { lease, .. } = &payload
-            && let Some((_, pending)) = self.inner.pending_capture.lock().await.get_mut(&lease.0)
+            && let Some((_, pending)) = self.inner.pending_capture.lock().await.get_mut(lease)
         {
             pending.request = Some(request);
         }
         if let BridgeRequest::RequestOrigin { ui_session, .. } = &payload
-            && let Some(pending) = self
-                .inner
-                .pending_origin
-                .lock()
-                .await
-                .get_mut(ui_session.as_str())
+            && let Some(pending) = self.inner.pending_origin.lock().await.get_mut(ui_session)
         {
             pending.request = Some(request);
         }
@@ -2184,7 +2180,7 @@ impl ZellijAdapter {
             registration: request.registration,
             channel_generation: generation,
             target: muxe_zellij_protocol::BridgeTarget {
-                client_id: client_id.to_owned(),
+                client_id: item.client_id.into_string(),
             },
             payload,
         };
@@ -2225,11 +2221,14 @@ impl ZellijAdapter {
                 return SendItemResult::Continue;
             }
         };
-        let PipeRequest { payload, .. } = frame;
+        let PipeRequest {
+            payload, target, ..
+        } = frame;
+        item.client_id = ClientId::new(target.client_id);
         item.payload = Some(payload);
         if let Some(execution) = item.execution {
             let mut live_executions = self.inner.live_executions.lock().await;
-            if let Some(record) = live_executions.get_mut(&execution.0) {
+            if let Some(record) = live_executions.get_mut(&execution) {
                 // Rename the acceptance slot to the minted request id on
                 // first send; retries keep the minted key.
                 if let Some(slot) = item.request_slot
@@ -2543,7 +2542,7 @@ impl ZellijAdapter {
         &self,
         resume_epoch: u64,
         channel: u64,
-        members: &[String],
+        members: &[ClientId],
         pending: Option<&PendingCoverage>,
         resume: bool,
     ) -> Result<HostIdentity, AdapterError> {
@@ -2573,13 +2572,13 @@ impl ZellijAdapter {
         }
         let registry = self.inner.registry.lock().await;
         let stamps = self.inner.register_epoch.lock().await;
-        let fresh_compatible = |client: &str| {
+        let fresh_compatible = |client: &ClientId| {
             registry.get(client).is_some_and(|record| record.compatible)
                 && stamps
                     .get(client)
                     .is_some_and(|stamped| *stamped == (resume_epoch, channel))
         };
-        if !members.iter().all(|client| fresh_compatible(client))
+        if !members.iter().all(fresh_compatible)
             || !stamps
                 .iter()
                 .filter(|(_, stamped)| stamped.0 == resume_epoch)
@@ -2648,7 +2647,7 @@ impl ZellijAdapter {
     async fn publish_new_incarnation(
         &self,
         owner: CoverageOwner,
-        members: &[String],
+        members: &[ClientId],
         pending: Option<&PendingCoverage>,
         resume: bool,
     ) -> Result<HostIdentity, AdapterError> {
@@ -2813,19 +2812,19 @@ impl ZellijAdapter {
     /// gated by the normal compatibility handshake instead of slipping past.
     /// A member absent from the snapshot (detached before the query) is not
     /// required; a member present without a registration fails closed.
-    async fn resume_covered(&self, epoch: u64, channel: u64, snapshot: &[String]) -> bool {
+    async fn resume_covered(&self, epoch: u64, channel: u64, snapshot: &[ClientId]) -> bool {
         // A bridge that registered then went quiet past its lease is dead
         // evidence: expire it before coverage so silence never counts.
         self.sweep_expired_clients().await;
         let registry = self.inner.registry.lock().await;
         let stamps = self.inner.register_epoch.lock().await;
-        let fresh_compatible = |client: &str| {
+        let fresh_compatible = |client: &ClientId| {
             registry.get(client).is_some_and(|record| record.compatible)
                 && stamps
                     .get(client)
                     .is_some_and(|stamped| *stamped == (epoch, channel))
         };
-        if !snapshot.iter().all(|client| fresh_compatible(client)) {
+        if !snapshot.iter().all(fresh_compatible) {
             return false;
         }
         stamps
@@ -2840,7 +2839,12 @@ impl ZellijAdapter {
     /// count immediately; later ones wake the wait without polling. Shutdown
     /// fails the wait promptly (`false`) so callers map it without stalling
     /// to the deadline; [`Self::shutdown`] notifies this wait first.
-    async fn await_resume_membership(&self, epoch: u64, channel: u64, snapshot: &[String]) -> bool {
+    async fn await_resume_membership(
+        &self,
+        epoch: u64,
+        channel: u64,
+        snapshot: &[ClientId],
+    ) -> bool {
         let deadline = tokio::time::Instant::now() + RESUME_READY_TIMEOUT;
         loop {
             // Shutdown wins over a simultaneously completing coverage: no
@@ -2866,7 +2870,7 @@ impl ZellijAdapter {
             let _ = tokio::time::timeout(remaining, &mut wake).await;
         }
     }
-    fn scope_for_client(client_id: &str) -> ModalScopeId {
+    fn scope_for_client(client_id: &ClientId) -> ModalScopeId {
         ModalScopeId::new(format!("zellij-client:{client_id}"))
     }
 
@@ -2874,15 +2878,18 @@ impl ZellijAdapter {
         clippy::result_large_err,
         reason = "the HostAdapter implementation returns AdapterError without allocations"
     )]
-    fn client_for_scope(scope: &ModalScopeId) -> Result<String, AdapterError> {
+    fn client_for_scope(scope: &ModalScopeId) -> Result<ClientId, AdapterError> {
         scope
             .as_str()
             .strip_prefix("zellij-client:")
-            .map(str::to_owned)
+            .map(ClientId::new)
             .ok_or_else(|| invalid_request("modal scope is not a Zellij client scope"))
     }
 
-    async fn active_registration(&self, client_id: &str) -> Result<RegistrationId, AdapterError> {
+    async fn active_registration(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<RegistrationId, AdapterError> {
         self.sweep_expired_clients().await;
         let _transition = self.inner.registration_transition.lock().await;
         let registry = self.inner.registry.lock().await;
@@ -2970,7 +2977,7 @@ impl ZellijAdapter {
         {
             return;
         }
-        let renewals: Vec<(String, CommonCaptureLeaseId)> = self
+        let renewals: Vec<(ClientId, CommonCaptureLeaseId)> = self
             .inner
             .captures
             .lock()
@@ -3021,18 +3028,18 @@ impl ZellijAdapter {
     /// rather than guessing.
     async fn resolve_client_for_pane(
         &self,
-        ui_session: &str,
-        ui_pane: &str,
-    ) -> Result<String, AdapterError> {
+        ui_session: &CommonUiSessionId,
+        ui_pane: &PaneId,
+    ) -> Result<ClientId, AdapterError> {
         if let Some(client) = self.inner.pane_claims.lock().await.get(ui_pane).cloned() {
             return Ok(client);
         }
         if let Some(snapshot) = self.inner.snapshots.lock().await.get(ui_pane).cloned() {
-            return Ok(snapshot.client_id);
+            return Ok(ClientId::new(snapshot.client_id));
         }
         let deadline = tokio::time::Instant::now() + BOOTSTRAP_TIMEOUT;
         loop {
-            let clients: Vec<(String, RegistrationId)> = {
+            let clients: Vec<(ClientId, RegistrationId)> = {
                 let registry = self.inner.registry.lock().await;
                 registry
                     .client_ids()
@@ -3076,10 +3083,10 @@ impl ZellijAdapter {
     /// Requests an origin snapshot from one client with a bounded wait.
     async fn request_origin_from(
         &self,
-        client_id: &str,
+        client_id: &ClientId,
         registration: RegistrationId,
-        ui_session: &str,
-        ui_pane: &str,
+        ui_session: &CommonUiSessionId,
+        ui_pane: &PaneId,
     ) -> Result<ZellijOrigin, OriginError> {
         if self
             .inner
@@ -3105,9 +3112,9 @@ impl ZellijAdapter {
         self.enqueue_lifecycle(
             client_id.to_owned(),
             BridgeRequest::RequestOrigin {
-                ui_session: CommonUiSessionId::new(ui_session),
+                ui_session: ui_session.clone(),
                 request: ZellijOriginRequest {
-                    ui_pane: ui_pane.to_owned(),
+                    ui_pane: ui_pane.as_str().to_owned(),
                 },
             },
         )
@@ -3121,7 +3128,7 @@ impl ZellijAdapter {
                     Some(BridgeRequest::RequestOrigin {
                         ui_session: pending,
                         ..
-                    }) if pending.as_str() == ui_session
+                    }) if pending == ui_session
                 )
             });
         }
@@ -3194,20 +3201,16 @@ impl ZellijAdapter {
     async fn dispatch_commands(
         &self,
         execution: ExecutionId,
-        origin: &OriginContext,
+        origin: OriginContext,
         incarnation: CoveredIncarnation,
         commands: Vec<RawNativeCommand>,
     ) -> Result<DispatchAccepted, AdapterError> {
-        let client_id = origin
-            .client_id
-            .as_ref()
-            .map(|id| id.as_str().to_owned())
-            .ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorKind::ContextUnavailable,
-                    "Zellij dispatch requires the captured origin client",
-                )
-            })?;
+        let client_id = origin.client_id.ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::ContextUnavailable,
+                "Zellij dispatch requires the captured origin client",
+            )
+        })?;
         self.dispatch_to_client(execution, client_id, commands, Some(incarnation))
             .await
     }
@@ -3215,7 +3218,7 @@ impl ZellijAdapter {
     async fn dispatch_to_client(
         &self,
         execution: ExecutionId,
-        client_id: String,
+        client_id: ClientId,
         commands: Vec<RawNativeCommand>,
         incarnation: Option<CoveredIncarnation>,
     ) -> Result<DispatchAccepted, AdapterError> {
@@ -3236,7 +3239,7 @@ impl ZellijAdapter {
     async fn admit_dispatch(
         &self,
         execution: ExecutionId,
-        client_id: String,
+        client_id: ClientId,
         payloads: Vec<BridgeRequest>,
         incarnation: Option<CoveredIncarnation>,
     ) -> Result<DispatchAccepted, AdapterError> {
@@ -3306,7 +3309,7 @@ impl ZellijAdapter {
             .live_executions
             .lock()
             .await
-            .insert(execution.0, ExecutionRecord::new(execution, slots.clone()));
+            .insert(execution, ExecutionRecord::new(execution, slots.clone()));
         let mut queues = self.inner.queues.lock().await;
         let queue = queues.entry(client_id.clone()).or_default();
         for (payload, slot) in payloads.into_iter().zip(slots) {
@@ -3370,8 +3373,9 @@ impl ZellijAdapter {
         let client_id = match target {
             crate::launch::LaunchTarget::Client(client) => client,
             crate::launch::LaunchTarget::UiPane(pane) => {
-                let probe = format!("launch-{}", hex_id(&self.mint_local_id()));
-                self.resolve_client_for_pane(&probe, pane.as_str()).await?
+                let probe =
+                    CommonUiSessionId::new(format!("launch-{}", hex_id(&self.mint_local_id())));
+                self.resolve_client_for_pane(&probe, &pane).await?
             }
         };
         self.dispatch_to_client(execution, client_id, vec![raw], None)
@@ -3383,7 +3387,7 @@ impl ZellijAdapter {
     /// mode restoration (the bridge owns Locked mode and restores it through
     /// its own guarded path). Idempotent: releasing an already-released or
     /// never-held lease is a no-op.
-    async fn release_on_setup_failure(&self, client_id: &str, lease: [u8; 16]) {
+    async fn release_on_setup_failure(&self, client_id: &ClientId, lease: CommonCaptureLeaseId) {
         let _ = self
             .inner
             .captures
@@ -3392,7 +3396,7 @@ impl ZellijAdapter {
             .release(client_id, lease, false);
     }
 
-    async fn enqueue_lifecycle(&self, client_id: String, payload: BridgeRequest) {
+    async fn enqueue_lifecycle(&self, client_id: ClientId, payload: BridgeRequest) {
         self.enqueue(QueuedItem {
             execution: None,
             request_slot: None,
@@ -3432,7 +3436,7 @@ fn hex_id(id: &[u8; 16]) -> String {
     clippy::result_large_err,
     reason = "this parser feeds the allocation-free HostAdapter error path"
 )]
-fn parse_hex_lease(text: &str) -> Result<[u8; 16], AdapterError> {
+fn parse_hex_lease(text: &str) -> Result<CommonCaptureLeaseId, AdapterError> {
     if text.len() != 32 || !text.chars().all(|character| character.is_ascii_hexdigit()) {
         return Err(invalid_request("capture lease is not a 128-bit hex ID"));
     }
@@ -3441,7 +3445,7 @@ fn parse_hex_lease(text: &str) -> Result<[u8; 16], AdapterError> {
         let chunk = std::str::from_utf8(chunk).map_err(|_| invalid_request("bad lease hex"))?;
         id[index] = u8::from_str_radix(chunk, 16).map_err(|_| invalid_request("bad lease hex"))?;
     }
-    Ok(id)
+    Ok(CommonCaptureLeaseId(id))
 }
 
 fn transport_error(error: &PipeTransportError) -> AdapterError {
@@ -3474,7 +3478,7 @@ const MAX_READINESS_MEMBERS: usize = 1024;
 /// parse boundary's job (non-numeric CLI rows already fail closed there),
 /// never a report-time reinterpretation. A count alone could let a
 /// newcomer mask a missing member; the exact set cannot.
-fn canonical_member_set(mut members: Vec<String>) -> Option<Vec<String>> {
+fn canonical_member_set(mut members: Vec<ClientId>) -> Option<Vec<ClientId>> {
     if members.len() > MAX_READINESS_MEMBERS {
         return None;
     }
@@ -3587,7 +3591,7 @@ impl ZellijAdapter {
                 let mut routed = Vec::new();
                 for terminal in terminals {
                     let execution = dispatch_completion_execution(&terminal);
-                    if let Some(waiter) = waiters.remove(&execution.0) {
+                    if let Some(waiter) = waiters.remove(&execution) {
                         routed.push(PurgeRoute::Waiter(waiter, terminal));
                     } else {
                         routed.push(PurgeRoute::Broker(terminal));
@@ -3658,9 +3662,10 @@ impl HostAdapter for ZellijAdapter {
         self.require_active()?;
         // A throwaway session namespace keeps the claim fan-out keyed without
         // allocating a broker session.
-        let probe_session = format!("claim-{}", hex_id(&self.mint_local_id()));
+        let probe_session =
+            CommonUiSessionId::new(format!("claim-{}", hex_id(&self.mint_local_id())));
         let client = self
-            .resolve_client_for_pane(&probe_session, ui_pane.as_str())
+            .resolve_client_for_pane(&probe_session, ui_pane)
             .await?;
         Ok(Self::scope_for_client(&client))
     }
@@ -3673,11 +3678,12 @@ impl HostAdapter for ZellijAdapter {
         let client_id = Self::client_for_scope(&request.modal_scope)?;
         // Guard: a live compatible bridge must own the client before capture.
         let _registration = self.active_registration(&client_id).await?;
-        let lease = self.mint_local_id();
+        let lease = CommonCaptureLeaseId(self.mint_local_id());
+        let ui_session = CommonUiSessionId::new(request.ui_session.as_str());
         {
             let mut captures = self.inner.captures.lock().await;
             captures
-                .begin(&client_id, request.ui_session.as_str(), lease)
+                .begin(&client_id, &ui_session, lease)
                 .map_err(|error| {
                     AdapterError::new(AdapterErrorKind::Unavailable, error.to_string())
                 })?;
@@ -3695,10 +3701,7 @@ impl HostAdapter for ZellijAdapter {
         );
         self.enqueue_lifecycle(
             client_id.clone(),
-            BridgeRequest::BeginCapture {
-                lease: CommonCaptureLeaseId(lease),
-                ui_session: CommonUiSessionId::new(request.ui_session.as_str()),
-            },
+            BridgeRequest::BeginCapture { lease, ui_session },
         )
         .await;
         // `CaptureReady` arrived: confirm, but re-check the table first. A
@@ -3718,7 +3721,7 @@ impl HostAdapter for ZellijAdapter {
                 .is_ok();
             if confirmed {
                 return Ok(ApiCaptureLease {
-                    id: CaptureLeaseId::new(hex_id(&lease)),
+                    id: CaptureLeaseId::new(hex_id(&lease.0)),
                     ui_session: request.ui_session,
                     modal_scope: request.modal_scope,
                 });
@@ -3742,7 +3745,7 @@ impl HostAdapter for ZellijAdapter {
                 !matches!(
                     item.payload.as_ref(),
                     Some(BridgeRequest::BeginCapture { lease: pending, .. })
-                        if pending.0 == lease
+                        if *pending == lease
                 )
             });
         }
@@ -3757,7 +3760,7 @@ impl HostAdapter for ZellijAdapter {
             self.enqueue_lifecycle(
                 client_id,
                 BridgeRequest::EndCapture {
-                    lease: CommonCaptureLeaseId(lease),
+                    lease,
                     reason: CaptureEndReason::LeaseExpired,
                 },
             )
@@ -3809,7 +3812,7 @@ impl HostAdapter for ZellijAdapter {
             self.enqueue_lifecycle(
                 client_id,
                 BridgeRequest::EndCapture {
-                    lease: CommonCaptureLeaseId(lease_id),
+                    lease: lease_id,
                     reason: end_reason,
                 },
             )
@@ -3834,7 +3837,7 @@ impl HostAdapter for ZellijAdapter {
             .registry
             .lock()
             .await
-            .client_for_pane(registration.pane.as_str())
+            .client_for_pane(&registration.pane)
             .map(|record| record.client_id.clone())
             .ok_or_else(|| {
                 AdapterError::new(
@@ -3843,10 +3846,10 @@ impl HostAdapter for ZellijAdapter {
                 )
             })?;
         let bridge_registration = self.active_registration(&client).await?;
-        let id = format!(
+        let id = PendingPaneLeaseId::new(format!(
             "zellij:{client}:{bridge_registration}:{}",
             registration.pane
-        );
+        ));
         self.inner
             .pending_leases
             .lock()
@@ -3854,7 +3857,7 @@ impl HostAdapter for ZellijAdapter {
             .insert(id.clone(), (client, bridge_registration));
         let _ = pane;
         Ok(PendingPaneLease {
-            id: PendingPaneLeaseId::new(id),
+            id,
             ui_session: registration.ui_session,
         })
     }
@@ -3878,7 +3881,7 @@ impl HostAdapter for ZellijAdapter {
             .pending_leases
             .lock()
             .expect("Zellij pending lease registry is not poisoned")
-            .get(lease.id.as_str())
+            .get(&lease.id)
             .cloned()
             .ok_or_else(|| {
                 AdapterError::new(
@@ -3900,9 +3903,9 @@ impl HostAdapter for ZellijAdapter {
             .close_waiters
             .lock()
             .expect("Zellij close waiter registry is not poisoned")
-            .insert(execution.0, sender);
+            .insert(execution, sender);
         self.inner.live_executions.lock().await.insert(
-            execution.0,
+            execution,
             ExecutionRecord::new(execution, vec![RequestId::INITIAL]),
         );
         self.enqueue(QueuedItem {
@@ -3930,13 +3933,13 @@ impl HostAdapter for ZellijAdapter {
             removed
         };
         if queued_unsent {
-            self.inner.live_executions.lock().await.remove(&execution.0);
+            self.inner.live_executions.lock().await.remove(&execution);
         }
         self.inner
             .close_waiters
             .lock()
             .expect("Zellij close waiter registry is not poisoned")
-            .remove(&execution.0);
+            .remove(&execution);
         if queued_unsent {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
@@ -3964,7 +3967,7 @@ impl HostAdapter for ZellijAdapter {
                     .pending_leases
                     .lock()
                     .expect("Zellij pending lease registry is not poisoned")
-                    .remove(lease.id.as_str());
+                    .remove(&lease.id);
                 Ok(())
             }
             DispatchCompletion::Failed { .. } => Err(AdapterError::new(
@@ -3983,7 +3986,7 @@ impl HostAdapter for ZellijAdapter {
             .pending_leases
             .lock()
             .expect("Zellij pending lease registry is not poisoned")
-            .remove(lease.id.as_str());
+            .remove(&lease.id);
     }
     async fn capture_origin(
         &self,
@@ -3994,14 +3997,15 @@ impl HostAdapter for ZellijAdapter {
         // through its own pane ID and the target bridge snapshots the prior
         // non-Muxe pane as the authoritative origin (DESIGN 1189-1196,
         // 1959-1967). Hint/caller tuples are never required here.
-        let ui_pane = request.ui_pane.as_str().to_owned();
+        let ui_pane = request.ui_pane;
         // The claim fan-out in modal_scope usually cached the snapshot already;
         // reuse it so attach costs no second host round-trip.
         let snapshot =
             if let Some(snapshot) = self.inner.snapshots.lock().await.get(&ui_pane).cloned() {
                 snapshot
             } else {
-                let ui_session = format!("origin-{}", hex_id(&self.mint_local_id()));
+                let ui_session =
+                    CommonUiSessionId::new(format!("origin-{}", hex_id(&self.mint_local_id())));
                 self.resolve_client_for_pane(&ui_session, &ui_pane).await?;
                 self.inner
                     .snapshots
@@ -4024,7 +4028,7 @@ impl HostAdapter for ZellijAdapter {
             &snapshot,
             &identity.discovery_key,
             &identity.live_server_id,
-            &ui_pane,
+            ui_pane.as_str(),
             None,
             None,
             None,
@@ -4053,21 +4057,16 @@ impl HostAdapter for ZellijAdapter {
                 "broker-owned portable action must not reach the host adapter",
             )),
             Ok(PortableMapping::HostAction { commands }) => {
-                self.dispatch_commands(request.execution, &request.origin, incarnation, commands)
+                self.dispatch_commands(request.execution, request.origin, incarnation, commands)
                     .await
             }
             Ok(PortableMapping::BridgeFocus { request: focus }) => {
-                let client_id = request
-                    .origin
-                    .client_id
-                    .as_ref()
-                    .map(|id| id.as_str().to_owned())
-                    .ok_or_else(|| {
-                        AdapterError::new(
-                            AdapterErrorKind::ContextUnavailable,
-                            "Zellij focus requires the captured origin client",
-                        )
-                    })?;
+                let client_id = request.origin.client_id.ok_or_else(|| {
+                    AdapterError::new(
+                        AdapterErrorKind::ContextUnavailable,
+                        "Zellij focus requires the captured origin client",
+                    )
+                })?;
                 let payload = match focus {
                     crate::FocusRequest::ByIndex { index } => BridgeRequest::Dispatch {
                         execution: execution_to_common(request.execution),
@@ -4114,17 +4113,12 @@ impl HostAdapter for ZellijAdapter {
         ValidatedNativeCommand::try_from(raw.clone()).map_err(|error| {
             AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
         })?;
-        let client_id = request
-            .origin
-            .client_id
-            .as_ref()
-            .map(|id| id.as_str().to_owned())
-            .ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorKind::ContextUnavailable,
-                    "Zellij post-dismissal dispatch requires the captured origin client",
-                )
-            })?;
+        let client_id = request.origin.client_id.ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::ContextUnavailable,
+                "Zellij post-dismissal dispatch requires the captured origin client",
+            )
+        })?;
         let origin_pane = request
             .origin
             .pane_id
@@ -4164,7 +4158,7 @@ impl HostAdapter for ZellijAdapter {
             candidate_to_raw(&candidate.type_name, &candidate.fields, false).map_err(|error| {
                 AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
             })?;
-        self.dispatch_commands(request.execution, &request.origin, incarnation, vec![raw])
+        self.dispatch_commands(request.execution, request.origin, incarnation, vec![raw])
             .await
     }
 
@@ -4639,13 +4633,13 @@ mod tests {
     /// snapshot per attempt instead of snapshot reuse. A set failure makes
     /// every query fail closed like a broken CLI transport.
     struct ScriptedMembership {
-        snapshot: Mutex<Vec<String>>,
+        snapshot: Mutex<Vec<ClientId>>,
         fail: AtomicBool,
         queries: AtomicU64,
     }
 
     impl ScriptedMembership {
-        fn fresh(members: Vec<String>) -> Arc<Self> {
+        fn fresh(members: Vec<ClientId>) -> Arc<Self> {
             Arc::new(Self {
                 snapshot: Mutex::new(members),
                 fail: AtomicBool::new(false),
@@ -4654,7 +4648,7 @@ mod tests {
         }
 
         /// Stages the snapshot for the next query.
-        async fn stage(&self, members: Vec<String>) {
+        async fn stage(&self, members: Vec<ClientId>) {
             *self.snapshot.lock().await = members;
         }
 
@@ -4674,7 +4668,7 @@ mod tests {
 
     #[async_trait]
     impl MembershipSource for ScriptedMembership {
-        async fn snapshot_members(&self) -> Result<Vec<String>, AdapterError> {
+        async fn snapshot_members(&self) -> Result<Vec<ClientId>, AdapterError> {
             self.queries.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err(AdapterError::new(
@@ -4690,7 +4684,7 @@ mod tests {
         test_adapter_with(
             request,
             event,
-            ScriptedMembership::fresh(vec!["client-1".to_owned()]),
+            ScriptedMembership::fresh(vec![ClientId::new("client-1")]),
         )
     }
 
@@ -4823,8 +4817,8 @@ while IFS= read -r line; do :; done
             .lock()
             .expect("Zellij pending lease registry is not poisoned")
             .insert(
-                lease.id.as_str().to_owned(),
-                ("client-1".to_owned(), registration_id(1)),
+                lease.id.clone(),
+                (ClientId::new("client-1"), registration_id(1)),
             );
         adapter.release_pending_pane(lease.clone());
         adapter.release_pending_pane(lease);
@@ -4878,7 +4872,7 @@ while IFS= read -r line; do :; done
                 .pending_leases
                 .lock()
                 .expect("Zellij pending lease registry is not poisoned")
-                .contains_key(lease_id.as_str())
+                .contains_key(&lease_id)
         );
         adapter.shutdown().await.expect("shutdown");
     }
@@ -4922,7 +4916,7 @@ while IFS= read -r line; do :; done
                 .pending_leases
                 .lock()
                 .expect("Zellij pending lease registry is not poisoned")
-                .contains_key(lease_id.as_str())
+                .contains_key(&lease_id)
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
@@ -4998,7 +4992,7 @@ while IFS= read -r line; do :; done
         )]
         let execution = ExecutionId(LOCAL_EXECUTION_CEILING | 777);
         adapter.inner.live_executions.lock().await.insert(
-            execution.0,
+            execution,
             ExecutionRecord::new(execution, vec![RequestId::INITIAL]),
         );
         adapter
@@ -5006,13 +5000,13 @@ while IFS= read -r line; do :; done
             .queues
             .lock()
             .await
-            .entry("client-1".to_owned())
+            .entry(ClientId::new("client-1"))
             .or_default()
             .push_back(QueuedItem {
                 execution: Some(execution),
                 request_slot: Some(RequestId::INITIAL),
                 incarnation: None,
-                client_id: "client-1".to_owned(),
+                client_id: ClientId::new("client-1"),
                 payload: None,
             });
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -5021,7 +5015,7 @@ while IFS= read -r line; do :; done
             .close_waiters
             .lock()
             .expect("close waiter registry is writable")
-            .insert(execution.0, sender);
+            .insert(execution, sender);
         adapter.suspend_for_activation().await.expect("suspend");
         let completion = tokio::time::timeout(Duration::from_secs(2), receiver)
             .await
@@ -5039,7 +5033,7 @@ while IFS= read -r line; do :; done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0),
+                .contains_key(&execution),
             "purged execution is removed from live_executions"
         );
         assert!(
@@ -5057,7 +5051,7 @@ while IFS= read -r line; do :; done
         let adapter = test_adapter_with_channels(
             failing_request as Arc<dyn PipeChannel>,
             Arc::clone(&event) as Arc<dyn PipeChannel>,
-            ScriptedMembership::fresh(vec!["client-1".to_owned()]),
+            ScriptedMembership::fresh(vec![ClientId::new("client-1")]),
         );
         let (registration, lease) = registered_pending_pane(&adapter, &event).await;
         let lease_id = lease.id.clone();
@@ -5072,7 +5066,7 @@ while IFS= read -r line; do :; done
                 .pending_leases
                 .lock()
                 .expect("Zellij pending lease registry is not poisoned")
-                .contains_key(lease_id.as_str())
+                .contains_key(&lease_id)
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
@@ -5116,7 +5110,7 @@ while IFS= read -r line; do :; done
     }
     /// Observable readiness barrier: returns only after every named client is
     /// routable and authoritative coverage has published a live identity.
-    async fn await_registered(adapter: &ZellijAdapter, clients: &[&str]) {
+    async fn await_registered(adapter: &ZellijAdapter, clients: &[ClientId]) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let mut ready = adapter.identity().await.is_ok();
@@ -5140,7 +5134,7 @@ while IFS= read -r line; do :; done
         event: &ScriptedChannel,
     ) -> (PendingPaneRegistration, PendingPaneLease) {
         push_register(event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(adapter, &["client-1"]).await;
+        await_registered(adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -5248,6 +5242,7 @@ while IFS= read -r line; do :; done
     /// Turnover barrier, not a sleep: returns once the re-registered bridge
     /// lands in the registry under its new ID, bounded by an explicit deadline.
     async fn await_turnover_registration(adapter: &ZellijAdapter) {
+        let client_id = ClientId::new("client-1");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let refreshed = adapter
@@ -5255,7 +5250,7 @@ while IFS= read -r line; do :; done
                 .registry
                 .lock()
                 .await
-                .get("client-1")
+                .get(&client_id)
                 .is_some_and(|record| record.registration == registration_id(8));
             if refreshed {
                 return;
@@ -5270,7 +5265,7 @@ while IFS= read -r line; do :; done
 
     async fn await_incompatible_registration(
         adapter: &ZellijAdapter,
-        client: &str,
+        client: &ClientId,
         registration: RegistrationId,
     ) {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -5404,17 +5399,21 @@ while IFS= read -r line; do :; done
         Arc<ScriptedChannel>,
         Arc<ScriptedChannel>,
         Arc<ScriptedMembership>,
-        [u8; 16],
+        CommonCaptureLeaseId,
     ) {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let membership =
-            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+            ScriptedMembership::fresh(vec![ClientId::new("client-1"), ClientId::new("client-2")]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
         for (client, registration) in [("client-1", [7; 16]), ("client-2", [8; 16])] {
             push_register(&event, client, registration, env!("CARGO_PKG_VERSION"));
         }
-        await_registered(&adapter, &["client-1", "client-2"]).await;
+        await_registered(
+            &adapter,
+            &[ClientId::new("client-1"), ClientId::new("client-2")],
+        )
+        .await;
         // Drain the covered-round health report so later assertions observe
         // exactly the suspend/resume transitions below.
         assert!(matches!(
@@ -5423,13 +5422,17 @@ while IFS= read -r line; do :; done
         ));
         // Seed an old capture lease: suspend must invalidate it and resume
         // must never restore it.
-        let stale_lease = adapter.mint_local_id();
+        let stale_lease = CommonCaptureLeaseId(adapter.mint_local_id());
         adapter
             .inner
             .captures
             .lock()
             .await
-            .begin("client-1", "session-9", stale_lease)
+            .begin(
+                &ClientId::new("client-1"),
+                &CommonUiSessionId::new("session-9"),
+                stale_lease,
+            )
             .expect("old lease begins");
         let old_channel = event
             .install_epoch()
@@ -5454,7 +5457,12 @@ while IFS= read -r line; do :; done
         let stale = encode_event_line(&register_event([7; 16], Some(bridge_build_id())))
             .expect("stale register encodes");
         adapter.handle_event_line(old_channel, &stale).await;
-        assert!(adapter.active_registration("client-1").await.is_err());
+        assert!(
+            adapter
+                .active_registration(&ClientId::new("client-1"))
+                .await
+                .is_err()
+        );
         membership.reset_queries();
         (adapter, request, event, membership, stale_lease)
     }
@@ -5471,7 +5479,7 @@ while IFS= read -r line; do :; done
             encode_event_line(&register_event([7; 16], Some(bridge_build_id())))
                 .expect("register encodes"),
         );
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         let accepted = adapter
             .dispatch_native(NativeDispatchRequest {
                 execution: ExecutionId(7),
@@ -5546,7 +5554,12 @@ while IFS= read -r line; do :; done
             "single-request execution publishes exactly one terminal"
         );
         assert!(
-            !adapter.inner.live_executions.lock().await.contains_key(&7),
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&ExecutionId(7)),
             "single-request execution is removed after its terminal"
         );
         adapter.shutdown().await.expect("shutdown");
@@ -5558,7 +5571,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -5566,7 +5579,12 @@ while IFS= read -r line; do :; done
 
         let execution = ExecutionId(101);
         adapter
-            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch(), None)
+            .dispatch_to_client(
+                execution,
+                ClientId::new("client-1"),
+                two_request_batch(),
+                None,
+            )
             .await
             .expect("two-request batch is accepted");
         let first = decode_request_line(&poll_outbound(&request).await).expect("first request");
@@ -5622,7 +5640,7 @@ while IFS= read -r line; do :; done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0),
+                .contains_key(&execution),
             "aggregate record is removed after the final request"
         );
         adapter.shutdown().await.expect("shutdown");
@@ -5636,10 +5654,10 @@ while IFS= read -r line; do :; done
         let adapter = test_adapter_with_channels(
             failing_request as Arc<dyn PipeChannel>,
             Arc::clone(&event) as Arc<dyn PipeChannel>,
-            ScriptedMembership::fresh(vec!["client-1".to_owned()]),
+            ScriptedMembership::fresh(vec![ClientId::new("client-1")]),
         );
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -5647,7 +5665,12 @@ while IFS= read -r line; do :; done
 
         let execution = ExecutionId(202);
         adapter
-            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch(), None)
+            .dispatch_to_client(
+                execution,
+                ClientId::new("client-1"),
+                two_request_batch(),
+                None,
+            )
             .await
             .expect("mixed batch remains accepted before transport outcome");
         match next_event(&adapter).await {
@@ -5672,7 +5695,7 @@ while IFS= read -r line; do :; done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0),
+                .contains_key(&execution),
             "write-failure batch leaves no live execution"
         );
         adapter.shutdown().await.expect("shutdown");
@@ -5684,7 +5707,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -5692,7 +5715,12 @@ while IFS= read -r line; do :; done
 
         let execution = ExecutionId(303);
         adapter
-            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch(), None)
+            .dispatch_to_client(
+                execution,
+                ClientId::new("client-1"),
+                two_request_batch(),
+                None,
+            )
             .await
             .expect("two-request batch is accepted");
         let _first = decode_request_line(&poll_outbound(&request).await).expect("first request");
@@ -5734,7 +5762,7 @@ while IFS= read -r line; do :; done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0),
+                .contains_key(&execution),
             "retired batch leaves no live execution"
         );
         assert!(
@@ -5756,7 +5784,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -5764,7 +5792,12 @@ while IFS= read -r line; do :; done
 
         let execution = ExecutionId(404);
         adapter
-            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch(), None)
+            .dispatch_to_client(
+                execution,
+                ClientId::new("client-1"),
+                two_request_batch(),
+                None,
+            )
             .await
             .expect("two-request batch is accepted");
         let _first = decode_request_line(&poll_outbound(&request).await).expect("first request");
@@ -5799,7 +5832,7 @@ while IFS= read -r line; do :; done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0),
+                .contains_key(&execution),
             "purged batch leaves no live execution"
         );
         assert!(
@@ -5826,7 +5859,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -5834,7 +5867,12 @@ while IFS= read -r line; do :; done
 
         let execution = ExecutionId(303);
         adapter
-            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch(), None)
+            .dispatch_to_client(
+                execution,
+                ClientId::new("client-1"),
+                two_request_batch(),
+                None,
+            )
             .await
             .expect("two-request batch is accepted");
         let first = decode_request_line(&poll_outbound(&request).await).expect("first request");
@@ -5891,7 +5929,7 @@ while IFS= read -r line; do :; done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0),
+                .contains_key(&execution),
             "aggregate record is removed after success+unknown"
         );
         adapter.shutdown().await.expect("shutdown");
@@ -5907,7 +5945,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -5915,7 +5953,12 @@ while IFS= read -r line; do :; done
 
         let execution = ExecutionId(404);
         adapter
-            .dispatch_to_client(execution, "client-1".to_owned(), two_request_batch(), None)
+            .dispatch_to_client(
+                execution,
+                ClientId::new("client-1"),
+                two_request_batch(),
+                None,
+            )
             .await
             .expect("two-request batch is accepted");
         let first = decode_request_line(&poll_outbound(&request).await).expect("first request");
@@ -5970,7 +6013,7 @@ while IFS= read -r line; do :; done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0),
+                .contains_key(&execution),
             "record empties after genuine completion"
         );
         adapter.shutdown().await.expect("shutdown");
@@ -5986,7 +6029,12 @@ while IFS= read -r line; do :; done
         // deliberate bounded behavior: an empty batch is rejected rather than
         // accepted with no request capable of producing a terminal result.
         let error = adapter
-            .dispatch_to_client(ExecutionId(505), "client-1".to_owned(), Vec::new(), None)
+            .dispatch_to_client(
+                ExecutionId(505),
+                ClientId::new("client-1"),
+                Vec::new(),
+                None,
+            )
             .await
             .expect_err("empty batch is invalid");
         assert_eq!(error.kind, AdapterErrorKind::InvalidRequest);
@@ -6008,16 +6056,20 @@ while IFS= read -r line; do :; done
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
         push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1", "client-2"]).await;
+        await_registered(
+            &adapter,
+            &[ClientId::new("client-1"), ClientId::new("client-2")],
+        )
+        .await;
 
         adapter
-            .enqueue_lifecycle("client-1".to_owned(), BridgeRequest::Retire)
+            .enqueue_lifecycle(ClientId::new("client-1"), BridgeRequest::Retire)
             .await;
         adapter
-            .enqueue_lifecycle("client-1".to_owned(), BridgeRequest::Retire)
+            .enqueue_lifecycle(ClientId::new("client-1"), BridgeRequest::Retire)
             .await;
         adapter
-            .enqueue_lifecycle("client-2".to_owned(), BridgeRequest::Retire)
+            .enqueue_lifecycle(ClientId::new("client-2"), BridgeRequest::Retire)
             .await;
         let first =
             decode_request_line(&poll_outbound(&request).await).expect("first request frame");
@@ -6042,7 +6094,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         adapter
             .dispatch_native(NativeDispatchRequest {
                 execution: ExecutionId(77),
@@ -6076,7 +6128,14 @@ while IFS= read -r line; do :; done
             );
         }
         assert!(saw_unknown);
-        assert!(!adapter.inner.live_executions.lock().await.contains_key(&77));
+        assert!(
+            !adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&ExecutionId(77))
+        );
         adapter.shutdown().await.expect("shutdown");
     }
 
@@ -6093,7 +6152,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -6107,7 +6166,7 @@ while IFS= read -r line; do :; done
                 adapter
                     .begin_capture(CaptureRequest {
                         ui_session: UiSessionId::new("session-1"),
-                        modal_scope: ZellijAdapter::scope_for_client("client-1"),
+                        modal_scope: ZellijAdapter::scope_for_client(&ClientId::new("client-1")),
                     })
                     .await
             }
@@ -6128,7 +6187,7 @@ while IFS= read -r line; do :; done
         // Simulate the racing loss: drop the waiter sender like
         // `CaptureLost` handling does, so the receiver errors even though
         // the bridge may have entered Locked mode.
-        adapter.inner.pending_capture.lock().await.remove(&lease.0);
+        adapter.inner.pending_capture.lock().await.remove(&lease);
         let error = first
             .await
             .expect("capture task joins")
@@ -6141,7 +6200,7 @@ while IFS= read -r line; do :; done
                 .captures
                 .lock()
                 .await
-                .state("client-1")
+                .state(&ClientId::new("client-1"))
                 .is_idle(),
             "failed setup leaves no stale capture record"
         );
@@ -6149,7 +6208,7 @@ while IFS= read -r line; do :; done
         let lease = drive_capture_to_ready(&adapter, &request, &event).await;
         assert_eq!(
             lease.modal_scope,
-            ZellijAdapter::scope_for_client("client-1")
+            ZellijAdapter::scope_for_client(&ClientId::new("client-1"))
         );
         adapter.shutdown().await.expect("shutdown");
     }
@@ -6168,7 +6227,7 @@ while IFS= read -r line; do :; done
                 adapter
                     .begin_capture(CaptureRequest {
                         ui_session: UiSessionId::new("session-1"),
-                        modal_scope: ZellijAdapter::scope_for_client("client-1"),
+                        modal_scope: ZellijAdapter::scope_for_client(&ClientId::new("client-1")),
                     })
                     .await
             }
@@ -6215,19 +6274,23 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
         ));
-        let lease = [9; 16];
+        let lease = CommonCaptureLeaseId([9; 16]);
         {
             let mut captures = adapter.inner.captures.lock().await;
             captures
-                .begin("client-1", "session-1", lease)
+                .begin(
+                    &ClientId::new("client-1"),
+                    &CommonUiSessionId::new("session-1"),
+                    lease,
+                )
                 .expect("capture begins");
             captures
-                .confirm("client-1", lease, "Normal".to_owned())
+                .confirm(&ClientId::new("client-1"), lease, "Normal".to_owned())
                 .expect("capture confirms");
         }
         // One sweep tick renews: a single RenewCapture line for the lease.
@@ -6238,7 +6301,7 @@ while IFS= read -r line; do :; done
         assert_eq!(frame.target.client_id, "client-1");
         match frame.payload {
             BridgeRequest::RenewCapture { lease: renewed } => {
-                assert_eq!(renewed.0, lease);
+                assert_eq!(renewed, lease);
             }
             other => panic!("expected RenewCapture, got {other:?}"),
         }
@@ -6254,7 +6317,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -6291,7 +6354,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -6303,7 +6366,8 @@ while IFS= read -r line; do :; done
             ))
             .expect("encodes"),
         );
-        await_incompatible_registration(&adapter, "client-1", registration_id(9)).await;
+        await_incompatible_registration(&adapter, &ClientId::new("client-1"), registration_id(9))
+            .await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let result = adapter
@@ -6335,11 +6399,15 @@ while IFS= read -r line; do :; done
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let membership =
-            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+            ScriptedMembership::fresh(vec![ClientId::new("client-1"), ClientId::new("client-2")]);
         let adapter = test_adapter_with(&request, &event, membership);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
         push_register(&event, "client-2", [10; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1", "client-2"]).await;
+        await_registered(
+            &adapter,
+            &[ClientId::new("client-1"), ClientId::new("client-2")],
+        )
+        .await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -6347,7 +6415,8 @@ while IFS= read -r line; do :; done
         event.push_line(
             encode_event_line(&register_event([9; 16], None)).expect("missing-ID register encodes"),
         );
-        await_incompatible_registration(&adapter, "client-1", registration_id(9)).await;
+        await_incompatible_registration(&adapter, &ClientId::new("client-1"), registration_id(9))
+            .await;
 
         let mut missing_origin = current_test_origin(&adapter);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -6421,7 +6490,7 @@ while IFS= read -r line; do :; done
                     ExecutionId(21),
                     ZellijPaneLaunch {
                         kind: LaunchKind::Menu,
-                        target: LaunchTarget::Client("client-1".to_owned()),
+                        target: LaunchTarget::Client(ClientId::new("client-1")),
                         cwd: Some(std::path::PathBuf::from("/work")),
                         program: std::path::PathBuf::from("muxe"),
                         args: vec!["ui".to_owned(), "menu".to_owned(), "main".to_owned()],
@@ -6463,7 +6532,7 @@ while IFS= read -r line; do :; done
     async fn activation_suspend_blocks_host_work_and_resume_restores() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
-        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let membership = ScriptedMembership::fresh(vec![ClientId::new("client-1")]);
         let adapter = test_adapter_with(&request, &event, membership);
         // Resume without suspend fabricates nothing: fails closed.
         let premature = adapter
@@ -6560,7 +6629,7 @@ while IFS= read -r line; do :; done
         // The snapshot still needs client-2, so the attempt fails and its
         // evidence is dropped, never retained for the next attempt.
         membership
-            .stage(vec!["client-1".to_owned(), "client-2".to_owned()])
+            .stage(vec![ClientId::new("client-1"), ClientId::new("client-2")])
             .await;
         let partial = resume_once(&adapter, &event, Some(("client-1", [9; 16])))
             .await
@@ -6578,7 +6647,7 @@ while IFS= read -r line; do :; done
         // snapshot holds only client-1. Its bridge mints a new registration for
         // this event channel; the retired pre-suspend and failed-attempt IDs
         // remain invalid.
-        membership.stage(vec!["client-1".to_owned()]).await;
+        membership.stage(vec![ClientId::new("client-1")]).await;
         resume_once(&adapter, &event, Some(("client-1", [10; 16])))
             .await
             .expect("complete resume succeeds");
@@ -6593,11 +6662,14 @@ while IFS= read -r line; do :; done
             .await
             .expect("readiness query")
             .expect("ready after complete resume");
-        assert_eq!(readiness.registered_clients, vec!["client-1".to_owned()]);
-        assert_eq!(readiness.member_clients, vec!["client-1".to_owned()]);
+        assert_eq!(
+            readiness.registered_clients,
+            vec![ClientId::new("client-1")]
+        );
+        assert_eq!(readiness.member_clients, vec![ClientId::new("client-1")]);
         assert_eq!(
             adapter
-                .active_registration("client-1")
+                .active_registration(&ClientId::new("client-1"))
                 .await
                 .expect("client-1 live"),
             registration_id(10)
@@ -6627,7 +6699,7 @@ while IFS= read -r line; do :; done
                 .captures
                 .lock()
                 .await
-                .release("client-1", stale_lease, false)
+                .release(&ClientId::new("client-1"), stale_lease, false)
                 .is_err()
         );
         adapter.shutdown().await.expect("shutdown");
@@ -6639,7 +6711,7 @@ while IFS= read -r line; do :; done
     #[tokio::test]
     async fn activation_readiness_reports_covered_subset_only() {
         let (adapter, _request, event, membership, _lease) = suspend_with_stale_evidence().await;
-        membership.stage(vec!["client-1".to_owned()]).await;
+        membership.stage(vec![ClientId::new("client-1")]).await;
         let pending = begin_resume_attempt(&adapter, &event).await;
         push_register(&event, "client-1", [10; 16], env!("CARGO_PKG_VERSION"));
         // client-9 holds a compatible registration in this generation but
@@ -6653,8 +6725,11 @@ while IFS= read -r line; do :; done
             .await
             .expect("readiness query")
             .expect("ready after covered resume");
-        assert_eq!(readiness.member_clients, vec!["client-1".to_owned()]);
-        assert_eq!(readiness.registered_clients, vec!["client-1".to_owned()]);
+        assert_eq!(readiness.member_clients, vec![ClientId::new("client-1")]);
+        assert_eq!(
+            readiness.registered_clients,
+            vec![ClientId::new("client-1")]
+        );
         adapter.shutdown().await.expect("shutdown");
     }
     /// A fresh authoritative empty snapshot is exact coverage. It can mint
@@ -6739,7 +6814,7 @@ while IFS= read -r line; do :; done
         let adapter = test_adapter_with(
             &request,
             &event,
-            ScriptedMembership::fresh(vec!["client-1".to_owned()]),
+            ScriptedMembership::fresh(vec![ClientId::new("client-1")]),
         );
         adapter.suspend_for_activation().await.unwrap();
         let _ = next_event(&adapter).await;
@@ -6757,7 +6832,7 @@ while IFS= read -r line; do :; done
                 .unwrap()
                 .unwrap()
                 .registered_clients,
-            vec!["client-1"]
+            vec![ClientId::new("client-1")]
         );
         let attempted = Arc::new(Notify::new());
         *adapter.inner.readiness_gate_attempt.lock().unwrap() = Some(Arc::clone(&attempted));
@@ -6775,7 +6850,7 @@ while IFS= read -r line; do :; done
                 .registry
                 .lock()
                 .await
-                .get("client-1")
+                .get(&ClientId::new("client-1"))
                 .is_some()
         );
         assert!(
@@ -6793,7 +6868,7 @@ while IFS= read -r line; do :; done
                 .unwrap()
                 .unwrap()
                 .registered_clients,
-            vec!["client-1"],
+            vec![ClientId::new("client-1")],
             "the broker-observed as-of epoch remains valid while current readiness ages out"
         );
         drop(proof);
@@ -6807,7 +6882,7 @@ while IFS= read -r line; do :; done
                 .registry
                 .lock()
                 .await
-                .get("client-1")
+                .get(&ClientId::new("client-1"))
                 .is_none()
         );
         *adapter.inner.readiness_gate_attempt.lock().unwrap() = None;
@@ -6817,14 +6892,14 @@ while IFS= read -r line; do :; done
     async fn live_incarnation_rotates_and_rejects_pre_rotation_origin() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
-        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let membership = ScriptedMembership::fresh(vec![ClientId::new("client-1")]);
         let adapter = test_adapter_with(&request, &event, membership);
         assert!(
             adapter.identity().await.is_err(),
             "identity is unavailable before authoritative coverage"
         );
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
 
         let before = adapter.identity().await.expect("initial identity");
         adapter
@@ -6885,7 +6960,7 @@ while IFS= read -r line; do :; done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -6895,7 +6970,7 @@ while IFS= read -r line; do :; done
             .expect("initial coverage");
         let execution = ExecutionId(205);
         adapter.inner.live_executions.lock().await.insert(
-            execution.0,
+            execution,
             ExecutionRecord::new(execution, vec![RequestId::INITIAL]),
         );
         adapter
@@ -6903,13 +6978,13 @@ while IFS= read -r line; do :; done
             .queues
             .lock()
             .await
-            .entry("client-1".to_owned())
+            .entry(ClientId::new("client-1"))
             .or_default()
             .push_back(QueuedItem {
                 execution: Some(execution),
                 request_slot: Some(RequestId::INITIAL),
                 incarnation: Some(retired),
-                client_id: "client-1".to_owned(),
+                client_id: ClientId::new("client-1"),
                 payload: Some(BridgeRequest::Dispatch {
                     execution: execution_to_common(execution),
                     request: ZellijDispatchRequest::Command(RawNativeCommand::CloseFocus),
@@ -6949,10 +7024,10 @@ while IFS= read -r line; do :; done
     async fn dispatch_validation_race_rejects_origin_after_continuity_rotation() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
-        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let membership = ScriptedMembership::fresh(vec![ClientId::new("client-1")]);
         let adapter = test_adapter_with(&request, &event, membership);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -7034,7 +7109,7 @@ while IFS= read -r line; do :; done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0),
+                .contains_key(&execution),
             "rejected dispatch leaves no live execution"
         );
         assert!(
@@ -7050,10 +7125,10 @@ while IFS= read -r line; do :; done
     async fn rotation_after_admission_before_send_returns_accepted_and_drains_once() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
-        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let membership = ScriptedMembership::fresh(vec![ClientId::new("client-1")]);
         let adapter = test_adapter_with(&request, &event, membership);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -7138,10 +7213,10 @@ while IFS= read -r line; do :; done
     async fn rotation_after_send_returns_accepted_and_settles_in_flight_once() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
-        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let membership = ScriptedMembership::fresh(vec![ClientId::new("client-1")]);
         let adapter = test_adapter_with(&request, &event, membership);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         assert!(matches!(
             next_event(&adapter).await,
             AdapterHealthEvent::Healthy { .. }
@@ -7332,7 +7407,7 @@ while IFS= read -r line; do :; done
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let membership =
-            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+            ScriptedMembership::fresh(vec![ClientId::new("client-1"), ClientId::new("client-2")]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
         // Fresh adapter, nonempty session, no round ever ran: no evidence.
         assert!(
@@ -7355,7 +7430,7 @@ while IFS= read -r line; do :; done
         // reports an old bridge. The member blocks coverage and the attempt
         // fails closed; nothing dispatches to the stale bridge.
         membership
-            .stage(vec!["client-1".to_owned(), "client-2".to_owned()])
+            .stage(vec![ClientId::new("client-1"), ClientId::new("client-2")])
             .await;
         let pending = begin_resume_attempt(&adapter, &event).await;
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
@@ -7386,11 +7461,11 @@ while IFS= read -r line; do :; done
             .expect("covered round is evidence");
         assert_eq!(
             readiness.member_clients,
-            vec!["client-1".to_owned(), "client-2".to_owned()]
+            vec![ClientId::new("client-1"), ClientId::new("client-2")]
         );
         assert_eq!(
             readiness.registered_clients,
-            vec!["client-1".to_owned(), "client-2".to_owned()]
+            vec![ClientId::new("client-1"), ClientId::new("client-2")]
         );
         adapter.shutdown().await.expect("shutdown");
     }
@@ -7405,7 +7480,7 @@ while IFS= read -r line; do :; done
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let membership =
-            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+            ScriptedMembership::fresh(vec![ClientId::new("client-1"), ClientId::new("client-2")]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
         let reserved = adapter
             .reserve_startup_identity()
@@ -7430,7 +7505,11 @@ while IFS= read -r line; do :; done
         // Bridges register on the live channel before the census starts.
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
         push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1", "client-2"]).await;
+        await_registered(
+            &adapter,
+            &[ClientId::new("client-1"), ClientId::new("client-2")],
+        )
+        .await;
         adapter
             .establish_initial_round()
             .await
@@ -7447,11 +7526,11 @@ while IFS= read -r line; do :; done
             .expect("covered fresh target is evidence");
         assert_eq!(
             readiness.member_clients,
-            vec!["client-1".to_owned(), "client-2".to_owned()]
+            vec![ClientId::new("client-1"), ClientId::new("client-2")]
         );
         assert_eq!(
             readiness.registered_clients,
-            vec!["client-1".to_owned(), "client-2".to_owned()]
+            vec![ClientId::new("client-1"), ClientId::new("client-2")]
         );
         assert_eq!(membership.query_count(), 2);
         adapter.shutdown().await.expect("shutdown");
@@ -7463,10 +7542,10 @@ while IFS= read -r line; do :; done
     async fn activation_initial_round_refreshes_missed_subscription() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
-        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let membership = ScriptedMembership::fresh(vec![ClientId::new("client-1")]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         let before = adapter.identity().await.expect("initial live identity");
         let displaced_channel = event.install_epoch().await.expect("initial event channel");
 
@@ -7521,7 +7600,7 @@ while IFS= read -r line; do :; done
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let membership =
-            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+            ScriptedMembership::fresh(vec![ClientId::new("client-1"), ClientId::new("client-2")]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
         // No bridge ever registers, so the round must be awaiting coverage;
         // the completed membership query proves it passed the entry checks.
@@ -7559,10 +7638,10 @@ while IFS= read -r line; do :; done
     async fn activation_shutdown_wakes_pending_capture() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
-        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let membership = ScriptedMembership::fresh(vec![ClientId::new("client-1")]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         // No bridge answers the capture, so the waiter must be pending; the
         // outbound line proves the request reached the transport.
         let pending = tokio::spawn({
@@ -7571,7 +7650,7 @@ while IFS= read -r line; do :; done
                 adapter
                     .begin_capture(CaptureRequest {
                         ui_session: UiSessionId::new("session-1"),
-                        modal_scope: ZellijAdapter::scope_for_client("client-1"),
+                        modal_scope: ZellijAdapter::scope_for_client(&ClientId::new("client-1")),
                     })
                     .await
             }
@@ -7595,10 +7674,10 @@ while IFS= read -r line; do :; done
         use crate::registry::HEARTBEAT_LEASE;
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
-        let membership = ScriptedMembership::fresh(vec!["client-1".to_owned()]);
+        let membership = ScriptedMembership::fresh(vec![ClientId::new("client-1")]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         // Drain the registration health report so only the expiry report
         // remains observable below.
         assert!(matches!(
@@ -7607,7 +7686,7 @@ while IFS= read -r line; do :; done
         ));
         tokio::time::advance(HEARTBEAT_LEASE + Duration::from_secs(1)).await;
         let expired = adapter
-            .active_registration("client-1")
+            .active_registration(&ClientId::new("client-1"))
             .await
             .expect_err("quiet bridge is unavailable");
         assert_eq!(expired.kind, AdapterErrorKind::Unavailable);
@@ -7617,7 +7696,7 @@ while IFS= read -r line; do :; done
                 AdapterHealthEvent::Unhealthy {
                     modal_scope: Some(scope),
                     ..
-                } if scope == ZellijAdapter::scope_for_client("client-1")
+                } if scope == ZellijAdapter::scope_for_client(&ClientId::new("client-1"))
             ),
             "expiry reports the client scope unhealthy once"
         );
@@ -7640,27 +7719,35 @@ while IFS= read -r line; do :; done
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
         let membership =
-            ScriptedMembership::fresh(vec!["client-1".to_owned(), "client-2".to_owned()]);
+            ScriptedMembership::fresh(vec![ClientId::new("client-1"), ClientId::new("client-2")]);
         let adapter = test_adapter_with(&request, &event, Arc::clone(&membership));
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
         push_register(&event, "client-2", [8; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1", "client-2"]).await;
+        await_registered(
+            &adapter,
+            &[ClientId::new("client-1"), ClientId::new("client-2")],
+        )
+        .await;
         // Seed the states an idle captured client holds: a confirmed
         // capture, one queued dispatch, and one pending capture waiter.
         // Seeded directly so no release-deadline timer starts before the
         // sweep under test.
-        let lease = [9; 16];
+        let lease = CommonCaptureLeaseId([9; 16]);
         {
             let mut captures = adapter.inner.captures.lock().await;
             captures
-                .begin("client-1", "session-1", lease)
+                .begin(
+                    &ClientId::new("client-1"),
+                    &CommonUiSessionId::new("session-1"),
+                    lease,
+                )
                 .expect("capture begins");
             captures
-                .confirm("client-1", lease, "normal".to_owned())
+                .confirm(&ClientId::new("client-1"), lease, "normal".to_owned())
                 .expect("capture confirms");
         }
         adapter.inner.live_executions.lock().await.insert(
-            77,
+            ExecutionId(77),
             ExecutionRecord::new(ExecutionId(77), vec![RequestId::INITIAL]),
         );
         // A real lifecycle payload: the pre-existing `payload: None` seed
@@ -7674,20 +7761,20 @@ while IFS= read -r line; do :; done
             .queues
             .lock()
             .await
-            .entry("client-1".to_owned())
+            .entry(ClientId::new("client-1"))
             .or_default()
             .push_back(QueuedItem {
                 execution: None,
                 request_slot: None,
                 incarnation: None,
-                client_id: "client-1".to_owned(),
+                client_id: ClientId::new("client-1"),
                 payload: Some(BridgeRequest::Retire),
             });
         let (waiter_tx, mut waiter_rx) = oneshot::channel();
         adapter.inner.pending_capture.lock().await.insert(
-            [10; 16],
+            CommonCaptureLeaseId([10; 16]),
             (
-                "client-1".to_owned(),
+                ClientId::new("client-1"),
                 PendingReply {
                     request: None,
                     sender: waiter_tx,
@@ -7702,12 +7789,13 @@ while IFS= read -r line; do :; done
         ));
         let first_epoch = event.install_epoch().await;
         // Keep client-2 alive while client-1 goes quiet past its lease.
+        let healthy_client = ClientId::new("client-2");
         let stamped = adapter
             .inner
             .registry
             .lock()
             .await
-            .get("client-2")
+            .get(&healthy_client)
             .map(|record| record.last_event_millis)
             .expect("client-2 registered");
         tokio::time::advance(
@@ -7732,7 +7820,7 @@ while IFS= read -r line; do :; done
                 .registry
                 .lock()
                 .await
-                .get("client-2")
+                .get(&healthy_client)
                 .is_some_and(|record| record.last_event_millis > stamped);
             if renewed {
                 break;
@@ -7741,13 +7829,14 @@ while IFS= read -r line; do :; done
         }
         tokio::time::advance(Duration::from_secs(10)).await;
         // Barrier: the timer sweep must have reaped client-1.
+        let quiet_client = ClientId::new("client-1");
         for _ in 0..1000 {
             if adapter
                 .inner
                 .registry
                 .lock()
                 .await
-                .get("client-1")
+                .get(&quiet_client)
                 .is_none()
             {
                 break;
@@ -7761,7 +7850,7 @@ while IFS= read -r line; do :; done
                 .registry
                 .lock()
                 .await
-                .get("client-1")
+                .get(&ClientId::new("client-1"))
                 .is_none(),
             "quiet registration reaped"
         );
@@ -7771,7 +7860,7 @@ while IFS= read -r line; do :; done
                 .registry
                 .lock()
                 .await
-                .get("client-2")
+                .get(&ClientId::new("client-2"))
                 .is_some_and(|record| record.registration == registration_id(8)),
             "heartbeating registration survives with its ID"
         );
@@ -7781,7 +7870,7 @@ while IFS= read -r line; do :; done
                 .captures
                 .lock()
                 .await
-                .state("client-1")
+                .state(&ClientId::new("client-1"))
                 .is_idle(),
             "expired capture never stays valid"
         );
@@ -7791,7 +7880,7 @@ while IFS= read -r line; do :; done
                 .captures
                 .lock()
                 .await
-                .confirm("client-1", lease, "normal".to_owned())
+                .confirm(&ClientId::new("client-1"), lease, "normal".to_owned())
                 .is_err(),
             "expired lease confirms nothing"
         );
@@ -7810,7 +7899,7 @@ while IFS= read -r line; do :; done
             matches!(
                 next_event(&adapter).await,
                 AdapterHealthEvent::CaptureLost { lease, .. }
-                    if lease.modal_scope == ZellijAdapter::scope_for_client("client-1")
+                    if lease.modal_scope == ZellijAdapter::scope_for_client(&ClientId::new("client-1"))
             ),
             "expiry reports capture loss for the quiet session"
         );
@@ -7820,7 +7909,7 @@ while IFS= read -r line; do :; done
                 AdapterHealthEvent::Unhealthy {
                     modal_scope: Some(scope),
                     ..
-                } if scope == ZellijAdapter::scope_for_client("client-1")
+                } if scope == ZellijAdapter::scope_for_client(&ClientId::new("client-1"))
             ),
             "expiry reports the quiet client unhealthy once"
         );
@@ -7847,7 +7936,7 @@ while IFS= read -r line; do :; done
             .queues
             .lock()
             .await
-            .get("client-1")
+            .get(&ClientId::new("client-1"))
             .map(|queue| {
                 queue
                     .iter()
@@ -7863,7 +7952,12 @@ while IFS= read -r line; do :; done
             "only renewals remain queued"
         );
         assert!(
-            adapter.inner.live_executions.lock().await.contains_key(&77),
+            adapter
+                .inner
+                .live_executions
+                .lock()
+                .await
+                .contains_key(&ExecutionId(77)),
             "paused execution never completes as unknown"
         );
         assert!(
@@ -7934,7 +8028,7 @@ while IFS= read -r line; do :; done
         // Attempt 1: the authoritative snapshot reports a newly attached
         // client that never registers. Resume fails closed: the snapshot
         // member without evidence blocks, and silence never reads Healthy.
-        membership.stage(vec!["new-client".to_owned()]).await;
+        membership.stage(vec![ClientId::new("new-client")]).await;
         let silent = resume_once(&adapter, &event, None)
             .await
             .expect_err("membership without registration fails closed");
@@ -7948,7 +8042,7 @@ while IFS= read -r line; do :; done
         // Attempt 2: the snapshotted newcomer registers with a dishonest
         // handshake. The registration is observed but incompatible, so the
         // attempt fails closed instead of covering the snapshot.
-        membership.stage(vec!["new-client".to_owned()]).await;
+        membership.stage(vec![ClientId::new("new-client")]).await;
         let pending = begin_resume_attempt(&adapter, &event).await;
         push_incompatible_newcomer(&event);
         let rejected = finish_resume_attempt(pending)
@@ -7970,7 +8064,7 @@ while IFS= read -r line; do :; done
         // Attempt 3: the newcomer returns with an honest compatible
         // handshake in this generation. Resume succeeds and the readiness
         // hook proves the current-attempt registration.
-        membership.stage(vec!["new-client".to_owned()]).await;
+        membership.stage(vec![ClientId::new("new-client")]).await;
         resume_once(&adapter, &event, Some(("new-client", [21; 16])))
             .await
             .expect("compatible newcomer succeeds");
@@ -7984,8 +8078,11 @@ while IFS= read -r line; do :; done
             .await
             .expect("readiness query")
             .expect("ready after newcomer resume");
-        assert_eq!(readiness.registered_clients, vec!["new-client".to_owned()]);
-        assert_eq!(readiness.member_clients, vec!["new-client".to_owned()]);
+        assert_eq!(
+            readiness.registered_clients,
+            vec![ClientId::new("new-client")]
+        );
+        assert_eq!(readiness.member_clients, vec![ClientId::new("new-client")]);
         adapter.shutdown().await.expect("shutdown");
     }
     /// A failed membership query parks both children and stays suspended:
@@ -8038,7 +8135,7 @@ while IFS= read -r line; do :; done
                      2         terminal_5     N/A           \n";
         assert_eq!(
             super::parse_list_clients_output(table).expect("table parses"),
-            vec!["1".to_owned(), "2".to_owned()]
+            vec![ClientId::new("1"), ClientId::new("2")]
         );
         let header_only = "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n";
         assert!(
@@ -8080,7 +8177,7 @@ printf 'CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n3         terminal_2     /bin/
             .snapshot_members()
             .await
             .expect("table oracle succeeds");
-        assert_eq!(members, vec!["1".to_owned(), "3".to_owned()]);
+        assert_eq!(members, vec![ClientId::new("1"), ClientId::new("3")]);
         let rejecting = "#!/bin/sh\nexit 3\n";
         let (_dir, exe) = write_fake_exe(rejecting);
         let failed = super::CliMembershipSource::new(exe, "session-alpha".to_owned())
@@ -8251,9 +8348,9 @@ done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         adapter.inner.snapshots.lock().await.insert(
-            "plugin-9".to_owned(),
+            PaneId::new("plugin-9"),
             origin_snapshot("plugin-9", Some("terminal_2")),
         );
         let origin = adapter
@@ -8288,9 +8385,9 @@ done
         let event = ScriptedChannel::new();
         let adapter = test_adapter(&request, &event);
         push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
         adapter.inner.snapshots.lock().await.insert(
-            "plugin-9".to_owned(),
+            PaneId::new("plugin-9"),
             origin_snapshot("plugin-8", Some("terminal_2")),
         );
         let mismatch = adapter
@@ -8319,7 +8416,7 @@ done
             encode_event_line(&register_event([7; 16], Some(bridge_build_id())))
                 .expect("register line"),
         );
-        await_registered(&adapter, &["client-1"]).await;
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
 
         let worker = tokio::spawn({
             let adapter = adapter.clone();
@@ -8558,7 +8655,7 @@ done
             settled: false,
         });
         adapter.inner.live_executions.lock().await.insert(
-            execution.0,
+            execution,
             ExecutionRecord {
                 execution,
                 total: 1,
@@ -8599,7 +8696,7 @@ done
                 .live_executions
                 .lock()
                 .await
-                .contains_key(&execution.0)
+                .contains_key(&execution)
         );
     }
 }

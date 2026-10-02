@@ -39,6 +39,14 @@ opaque_id!(WorktreeId, "Opaque host worktree identity.");
 opaque_id!(AgentId, "Opaque host agent identity.");
 opaque_id!(LinkHandlerId, "Opaque host link-handler identity.");
 
+impl ClientId {
+    /// Consumes the identity's owned storage at a serialization boundary.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
 #[strum(serialize_all = "lowercase")]
 pub enum OriginHostKind {

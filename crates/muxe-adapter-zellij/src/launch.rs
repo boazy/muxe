@@ -48,7 +48,7 @@ use std::{
 };
 
 use muxe_adapter_api::{AdapterError, AdapterErrorKind};
-use muxe_core::PaneId;
+use muxe_core::{ClientId, PaneId};
 use muxe_zellij_protocol::generated::{RawNativeCommand, raw};
 use thiserror::Error;
 
@@ -153,7 +153,7 @@ pub enum LaunchKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchTarget {
     /// Target a client directly (broker-resolved origin client).
-    Client(String),
+    Client(ClientId),
     /// Resolve the unique client owning this pane through active
     /// registrations; fails rather than guessing when unavailable.
     UiPane(PaneId),
@@ -454,7 +454,7 @@ mod tests {
     fn menu_launch() -> ZellijPaneLaunch {
         ZellijPaneLaunch {
             kind: LaunchKind::Menu,
-            target: LaunchTarget::Client("client-1".to_owned()),
+            target: LaunchTarget::Client(ClientId::new("client-1")),
             cwd: Some(PathBuf::from("/work")),
             program: PathBuf::from("muxe"),
             args: vec!["ui".to_owned(), "menu".to_owned(), "main".to_owned()],
@@ -470,7 +470,7 @@ mod tests {
         let launch = menu_launch();
         let expected_args = launch.args.clone();
         let (raw, target) = launch.into_command().expect("builds");
-        assert_eq!(target, LaunchTarget::Client("client-1".to_owned()));
+        assert_eq!(target, LaunchTarget::Client(ClientId::new("client-1")));
         let RawNativeCommand::RunAction { action, .. } = raw else {
             panic!("expected run-action wrap");
         };
@@ -496,7 +496,7 @@ mod tests {
     fn floating_carries_coordinates_and_no_focus() {
         let launch = ZellijPaneLaunch {
             kind: LaunchKind::Generic,
-            target: LaunchTarget::Client("c".to_owned()),
+            target: LaunchTarget::Client(ClientId::new("c")),
             cwd: None,
             program: PathBuf::from("htop"),
             args: Vec::new(),

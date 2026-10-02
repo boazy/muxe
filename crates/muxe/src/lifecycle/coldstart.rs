@@ -2458,8 +2458,8 @@ mod tests {
         // Fresh exact coverage: the full compatible set reads ready, the UI
         // gate still holds until commit, and nothing retired mid-stream.
         *adapter.readiness.lock() = Some(muxe_adapter_api::ActivationReadiness {
-            registered_clients: vec!["1".to_owned()],
-            member_clients: vec!["1".to_owned()],
+            registered_clients: vec![muxe_core::ClientId::new("1")],
+            member_clients: vec![muxe_core::ClientId::new("1")],
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {

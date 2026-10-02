@@ -12,6 +12,8 @@
 //! never restored over. This is a pure state machine; the adapter performs the
 //! host round-trips the transitions require.
 
+use muxe_core::ClientId;
+use muxe_protocol::{CaptureLeaseId, UiSessionId};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -19,9 +21,9 @@ use thiserror::Error;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureRecord {
     /// Broker UI session the capture serves.
-    pub ui_session: String,
+    pub ui_session: UiSessionId,
     /// Lease minted for this capture generation.
-    pub lease: [u8; 16],
+    pub lease: CaptureLeaseId,
     /// Input mode snapshotted before Locked mode, as a Zellij mode name.
     pub prior_mode: String,
     /// Whether the bridge confirmed Locked mode.
@@ -36,9 +38,9 @@ pub enum CaptureState {
     /// Capture requested; waiting for the bridge to confirm Locked mode.
     Beginning {
         /// UI session the pending capture serves.
-        ui_session: String,
+        ui_session: UiSessionId,
         /// Lease minted for the pending capture.
-        lease: [u8; 16],
+        lease: CaptureLeaseId,
     },
     /// One UI session owns Locked-mode capture.
     Captured(CaptureRecord),
@@ -70,7 +72,7 @@ pub enum CaptureError {
 /// single-owner invariant and guarded restoration decisions.
 #[derive(Clone, Debug, Default)]
 pub struct CaptureTable {
-    states: BTreeMap<String, CaptureState>,
+    states: BTreeMap<ClientId, CaptureState>,
 }
 
 impl CaptureTable {
@@ -83,12 +85,12 @@ impl CaptureTable {
     /// health. Prior-mode restoration metadata lives broker-side; the
     /// adapter keeps no restorable lease afterward, so an expired capture
     /// can never restore or confirm again.
-    pub fn invalidate_client(&mut self, client_id: &str) -> Option<CaptureState> {
+    pub fn invalidate_client(&mut self, client_id: &ClientId) -> Option<CaptureState> {
         self.states.remove(client_id)
     }
 
     /// Current state for a client, defaulting to idle.
-    pub fn state(&self, client_id: &str) -> &CaptureState {
+    pub fn state(&self, client_id: &ClientId) -> &CaptureState {
         self.states.get(client_id).unwrap_or(&CaptureState::Idle)
     }
 
@@ -96,14 +98,11 @@ impl CaptureTable {
     /// lease renewal. Pending (`Beginning`) captures are excluded: the
     /// bridge has no active lease to renew until `CaptureReady` confirms
     /// it, and the adapter's capture timeout already bounds that wait.
-    pub fn captured_leases(&self) -> Vec<(String, muxe_protocol::CaptureLeaseId)> {
+    pub fn captured_leases(&self) -> Vec<(ClientId, CaptureLeaseId)> {
         self.states
             .iter()
             .filter_map(|(client_id, state)| match state {
-                CaptureState::Captured(record) => Some((
-                    client_id.clone(),
-                    muxe_protocol::CaptureLeaseId(record.lease),
-                )),
+                CaptureState::Captured(record) => Some((client_id.clone(), record.lease)),
                 CaptureState::Beginning { .. } | CaptureState::Idle => None,
             })
             .collect()
@@ -113,9 +112,9 @@ impl CaptureTable {
     /// acquires the client so replacements serialize through release first.
     pub fn begin(
         &mut self,
-        client_id: &str,
-        ui_session: &str,
-        lease: [u8; 16],
+        client_id: &ClientId,
+        ui_session: &UiSessionId,
+        lease: CaptureLeaseId,
     ) -> Result<(), CaptureError> {
         if !self.state(client_id).is_idle() {
             return Err(CaptureError::Busy);
@@ -133,8 +132,8 @@ impl CaptureTable {
     /// Confirms Locked mode with the snapshotted prior mode.
     pub fn confirm(
         &mut self,
-        client_id: &str,
-        lease: [u8; 16],
+        client_id: &ClientId,
+        lease: CaptureLeaseId,
         prior_mode: String,
     ) -> Result<(), CaptureError> {
         match self.states.get(client_id) {
@@ -169,8 +168,8 @@ impl CaptureTable {
     /// state and must be preserved.
     pub fn release(
         &mut self,
-        client_id: &str,
-        lease: [u8; 16],
+        client_id: &ClientId,
+        lease: CaptureLeaseId,
         still_locked: bool,
     ) -> Result<Option<String>, CaptureError> {
         match self.states.get(client_id) {
@@ -191,7 +190,7 @@ impl CaptureTable {
     }
     #[cfg(test)]
     /// Releases a test capture after a simulated user-owned mode change.
-    fn user_mode_changed(&mut self, client_id: &str) -> Option<String> {
+    fn user_mode_changed(&mut self, client_id: &ClientId) -> Option<UiSessionId> {
         let session = match self.states.get(client_id) {
             Some(CaptureState::Captured(record)) => Some(record.ui_session.clone()),
             Some(CaptureState::Beginning { ui_session, .. }) => Some(ui_session.clone()),
@@ -211,68 +210,132 @@ mod tests {
     #[test]
     fn replacement_serializes_through_release() {
         let mut table = CaptureTable::new();
-        table.begin("a", "ui-1", [1; 16]).expect("begins");
+        table
+            .begin(
+                &ClientId::new("a"),
+                &UiSessionId::new("ui-1"),
+                CaptureLeaseId([1; 16]),
+            )
+            .expect("begins");
         // A second root cannot begin while the first owns the client.
         assert!(matches!(
-            table.begin("a", "ui-2", [2; 16]),
+            table.begin(
+                &ClientId::new("a"),
+                &UiSessionId::new("ui-2"),
+                CaptureLeaseId([2; 16])
+            ),
             Err(CaptureError::Busy)
         ));
         table
-            .confirm("a", [1; 16], "Normal".to_owned())
+            .confirm(
+                &ClientId::new("a"),
+                CaptureLeaseId([1; 16]),
+                "Normal".to_owned(),
+            )
             .expect("confirms");
         // Release restores the captured mode while still Locked.
         assert_eq!(
-            table.release("a", [1; 16], true).expect("releases"),
+            table
+                .release(&ClientId::new("a"), CaptureLeaseId([1; 16]), true)
+                .expect("releases"),
             Some("Normal".to_owned())
         );
         // After release the replacement begins cleanly.
         table
-            .begin("a", "ui-2", [2; 16])
+            .begin(
+                &ClientId::new("a"),
+                &UiSessionId::new("ui-2"),
+                CaptureLeaseId([2; 16]),
+            )
             .expect("replacement begins");
     }
 
     #[test]
     fn externally_changed_mode_is_preserved() {
         let mut table = CaptureTable::new();
-        table.begin("a", "ui-1", [1; 16]).expect("begins");
         table
-            .confirm("a", [1; 16], "Normal".to_owned())
+            .begin(
+                &ClientId::new("a"),
+                &UiSessionId::new("ui-1"),
+                CaptureLeaseId([1; 16]),
+            )
+            .expect("begins");
+        table
+            .confirm(
+                &ClientId::new("a"),
+                CaptureLeaseId([1; 16]),
+                "Normal".to_owned(),
+            )
             .expect("confirms");
         // The mode already changed: no restoration, capture still released.
-        assert_eq!(table.release("a", [1; 16], false).expect("releases"), None);
-        assert!(table.state("a").is_idle());
+        assert_eq!(
+            table
+                .release(&ClientId::new("a"), CaptureLeaseId([1; 16]), false)
+                .expect("releases"),
+            None
+        );
+        assert!(table.state(&ClientId::new("a")).is_idle());
     }
 
     #[test]
     fn user_mode_change_dismisses_without_restore() {
         let mut table = CaptureTable::new();
-        table.begin("a", "ui-1", [1; 16]).expect("begins");
         table
-            .confirm("a", [1; 16], "Normal".to_owned())
+            .begin(
+                &ClientId::new("a"),
+                &UiSessionId::new("ui-1"),
+                CaptureLeaseId([1; 16]),
+            )
+            .expect("begins");
+        table
+            .confirm(
+                &ClientId::new("a"),
+                CaptureLeaseId([1; 16]),
+                "Normal".to_owned(),
+            )
             .expect("confirms");
-        assert_eq!(table.user_mode_changed("a"), Some("ui-1".to_owned()));
-        assert!(table.state("a").is_idle());
-        assert_eq!(table.user_mode_changed("a"), None);
+        assert_eq!(
+            table.user_mode_changed(&ClientId::new("a")),
+            Some(UiSessionId::new("ui-1"))
+        );
+        assert!(table.state(&ClientId::new("a")).is_idle());
+        assert_eq!(table.user_mode_changed(&ClientId::new("a")), None);
     }
 
     #[test]
     fn stale_lease_never_restores() {
         let mut table = CaptureTable::new();
-        table.begin("a", "ui-1", [1; 16]).expect("begins");
         table
-            .confirm("a", [1; 16], "Normal".to_owned())
+            .begin(
+                &ClientId::new("a"),
+                &UiSessionId::new("ui-1"),
+                CaptureLeaseId([1; 16]),
+            )
+            .expect("begins");
+        table
+            .confirm(
+                &ClientId::new("a"),
+                CaptureLeaseId([1; 16]),
+                "Normal".to_owned(),
+            )
             .expect("confirms");
         assert!(matches!(
-            table.release("a", [9; 16], true),
+            table.release(&ClientId::new("a"), CaptureLeaseId([9; 16]), true),
             Err(CaptureError::StaleLease)
         ));
         assert!(matches!(
-            table.confirm("a", [9; 16], "Normal".to_owned()),
+            table.confirm(
+                &ClientId::new("a"),
+                CaptureLeaseId([9; 16]),
+                "Normal".to_owned()
+            ),
             Err(CaptureError::StaleLease)
         ));
         // The rightful lease still owns capture.
         assert_eq!(
-            table.release("a", [1; 16], true).expect("releases"),
+            table
+                .release(&ClientId::new("a"), CaptureLeaseId([1; 16]), true)
+                .expect("releases"),
             Some("Normal".to_owned())
         );
     }
@@ -280,25 +343,96 @@ mod tests {
     #[test]
     fn renewal_covers_only_confirmed_captures() {
         let mut table = CaptureTable::new();
-        table.begin("a", "ui-1", [1; 16]).expect("begins");
+        table
+            .begin(
+                &ClientId::new("a"),
+                &UiSessionId::new("ui-1"),
+                CaptureLeaseId([1; 16]),
+            )
+            .expect("begins");
         // Pending captures have no active bridge lease: no renewal.
         assert!(table.captured_leases().is_empty());
         table
-            .confirm("a", [1; 16], "Normal".to_owned())
+            .confirm(
+                &ClientId::new("a"),
+                CaptureLeaseId([1; 16]),
+                "Normal".to_owned(),
+            )
             .expect("confirms");
         let leases = table.captured_leases();
         assert_eq!(leases.len(), 1);
-        assert_eq!(leases[0].0, "a");
+        assert_eq!(leases[0].0, ClientId::new("a"));
         assert_eq!(leases[0].1, muxe_protocol::CaptureLeaseId([1; 16]));
-        table.release("a", [1; 16], true).expect("releases");
+        table
+            .release(&ClientId::new("a"), CaptureLeaseId([1; 16]), true)
+            .expect("releases");
         assert!(table.captured_leases().is_empty());
     }
 
     #[test]
     fn pending_begin_releases_without_restore() {
         let mut table = CaptureTable::new();
-        table.begin("a", "ui-1", [1; 16]).expect("begins");
-        assert_eq!(table.release("a", [1; 16], true).expect("aborts"), None);
-        assert!(table.state("a").is_idle());
+        table
+            .begin(
+                &ClientId::new("a"),
+                &UiSessionId::new("ui-1"),
+                CaptureLeaseId([1; 16]),
+            )
+            .expect("begins");
+        assert_eq!(
+            table
+                .release(&ClientId::new("a"), CaptureLeaseId([1; 16]), true)
+                .expect("aborts"),
+            None
+        );
+        assert!(table.state(&ClientId::new("a")).is_idle());
+    }
+
+    #[test]
+    fn captures_isolate_clients_sessions_and_lease_generations() {
+        let mut table = CaptureTable::new();
+        let first = ClientId::new("01");
+        let second = ClientId::new("1");
+        let first_session = UiSessionId::new("ui-1");
+        let second_session = UiSessionId::new("ui-2");
+        let first_lease = CaptureLeaseId([1; 16]);
+        let second_lease = CaptureLeaseId([2; 16]);
+        table.begin(&first, &first_session, first_lease).unwrap();
+        table.begin(&second, &second_session, second_lease).unwrap();
+        assert_eq!(
+            table.confirm(&second, first_lease, "Normal".to_owned()),
+            Err(CaptureError::StaleLease)
+        );
+        table
+            .confirm(&first, first_lease, "Normal".to_owned())
+            .unwrap();
+        table
+            .confirm(&second, second_lease, "Locked".to_owned())
+            .unwrap();
+        assert_eq!(
+            table.release(&first, second_lease, true),
+            Err(CaptureError::StaleLease)
+        );
+        let CaptureState::Captured(record) = table.state(&second) else {
+            panic!("second client retains capture");
+        };
+        assert_eq!(record.ui_session, second_session);
+        assert_eq!(record.lease, second_lease);
+        assert_eq!(
+            table.release(&first, first_lease, true),
+            Ok(Some("Normal".to_owned()))
+        );
+        let replacement = CaptureLeaseId([3; 16]);
+        table.begin(&first, &first_session, replacement).unwrap();
+        assert_eq!(
+            table.confirm(&first, first_lease, "Normal".to_owned()),
+            Err(CaptureError::StaleLease)
+        );
+        table.invalidate_client(&second);
+        assert_eq!(
+            table.release(&second, second_lease, true),
+            Err(CaptureError::NotCaptured)
+        );
+        assert_eq!(table.release(&first, replacement, true), Ok(None));
     }
 }

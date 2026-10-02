@@ -10,7 +10,8 @@ use muxe_protocol::{
     ArchivedConditionIrWire, ArchivedKeyboardProfileWire, ArchivedLocalMenuActionWire,
     ArchivedMenuControl, ArchivedMenuId, ArchivedMenuViewMenuWire, BindingAvailability, BindingId,
     BrokerEvent, ConditionEvaluationErrorWire, ExecutionId as WireExecutionId, ExecutionOutcome,
-    MenuControl, PagesContextWire, ProtocolDiagnostic, evaluate_archived_binding_state,
+    MenuControl, PagesContextWire, ProtocolDiagnostic, UiSessionId,
+    evaluate_archived_binding_state,
 };
 use ratatui::{layout::Rect, style::Style as RatatuiStyle};
 use thiserror::Error;
@@ -316,7 +317,7 @@ pub struct UiRuntime {
     snapshot: ArchivedUiSnapshot,
     renderer: TemplateRenderer,
     keyboard_profile: KeyboardProfile,
-    session_id: String,
+    session_id: UiSessionId,
     routing: RoutingMetadata,
     menu_session: MenuSession,
     current_page: usize,
@@ -363,7 +364,7 @@ impl UiRuntime {
                     .ok_or(UiError::MissingRoot)?
                     .inactivity_timeout;
                 Ok::<_, UiError>((
-                    session_id.to_owned(),
+                    UiSessionId::new(session_id.0.as_str()),
                     renderer,
                     keyboard_profile,
                     root,
@@ -391,7 +392,7 @@ impl UiRuntime {
 
     /// Returns the broker session ID captured during attachment initialization.
     #[must_use]
-    pub fn session_id(&self) -> &str {
+    pub fn session_id(&self) -> &UiSessionId {
         &self.session_id
     }
 
@@ -675,7 +676,7 @@ impl UiRuntime {
                 execution,
                 outcome,
                 diagnostic,
-            } if session.as_str() == self.session_id => {
+            } if session == &self.session_id => {
                 Ok(self.on_execution_completed(execution, *outcome, diagnostic.as_ref(), at))
             }
             BrokerEvent::BindingAvailabilityChanged {
@@ -684,7 +685,7 @@ impl UiRuntime {
                 binding,
                 availability,
                 diagnostic,
-            } if session.as_str() == self.session_id => {
+            } if session == &self.session_id => {
                 let known = self.routing.generation == *generation
                     && self.routing.binding_policies.contains_key(binding);
                 if !known {
@@ -3211,7 +3212,7 @@ pub(crate) mod tests {
     fn checked_broker_archive_drives_templates_conditions_navigation_and_invocation() {
         let mut runtime = UiRuntime::attach(archived_attachment()).expect("archive attaches");
 
-        assert_eq!(runtime.session_id(), "ui");
+        assert_eq!(runtime.session_id(), &UiSessionId::new("ui"));
         assert_eq!(
             runtime.keyboard_profile().expect("profile is archived"),
             KeyboardProfile::Kitty(KeyCapabilities {

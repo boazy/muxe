@@ -18,6 +18,8 @@
 - *(activation)* Require exact target-incarnation Ready authority and replay crash recovery through ordered barriers
 - *(activation)* Apply Herdr's supported-version policy using the runtime's typed server version
 - *(integration)* Keep artifact digests typed through installation and recovery. Reject malformed journal digests before changing the journal or artifacts, preserving corrupt transactions for diagnosis.
+- *(zellij)* Retain typed client, pane, session, execution, and lease identities in adapter state and capture APIs. Keep archived UI session IDs typed through attachment and event routing without changing wire formats.
+- *(activation)* Use the existing host-neutral `ClientId` for both registered and observed readiness membership, preserving client text and lexical ordering through wire serialization.
 - *(zellij)* Bind uninstall configuration ownership to the recorded path
 - *(zellij)* Preserve receipt-owned configuration provenance across reinstalls
 - *(broker)* Propagate retirement and registry cleanup failures

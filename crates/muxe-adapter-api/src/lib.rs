@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use muxe_core::{
-    ActionValidation, ActionValidator, BindingId, CompiledGeneration, ConfigDiagnostic,
+    ActionValidation, ActionValidator, BindingId, ClientId, CompiledGeneration, ConfigDiagnostic,
     ContextResolutionError, ExecutionCapabilities, ExecutionId, NativeActionCandidate,
     OriginContext, PaneId, PortableAction, PortableActionResolutionError, TabId, WorkspaceId,
 };
@@ -579,11 +579,11 @@ impl std::error::Error for AdapterError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivationReadiness {
     /// Client IDs holding a fresh compatible registration in this attempt.
-    pub registered_clients: Vec<String>,
+    pub registered_clients: Vec<ClientId>,
     /// Authoritative member IDs of the same snapshot round, canonical order,
     /// deduplicated. A count alone cannot prove coverage: a newcomer could
     /// mask a missing member.
-    pub member_clients: Vec<String>,
+    pub member_clients: Vec<ClientId>,
 }
 
 /// One constructor-injected adapter per broker. Implementations must retain their own typed host

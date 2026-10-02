@@ -660,8 +660,8 @@ struct SingleClientMembership;
 
 #[async_trait]
 impl MembershipSource for SingleClientMembership {
-    async fn snapshot_members(&self) -> Result<Vec<String>, AdapterError> {
-        Ok(vec!["client-1".to_owned()])
+    async fn snapshot_members(&self) -> Result<Vec<muxe_core::ClientId>, AdapterError> {
+        Ok(vec![muxe_core::ClientId::new("client-1")])
     }
 }
 

@@ -1951,9 +1951,19 @@ impl Broker {
     pub(crate) async fn activation_readiness(&self) -> Option<muxe_protocol::TargetReadiness> {
         match self.adapter.activation_readiness().await {
             Ok(Some(evidence)) => Some(muxe_protocol::TargetReadiness {
-                registered_clients: evidence.registered_clients,
+                registered_clients: evidence
+                    .registered_clients
+                    .into_iter()
+                    .map(muxe_core::ClientId::into_string)
+                    .collect(),
                 member_clients: u64::try_from(evidence.member_clients.len()).unwrap_or(u64::MAX),
-                member_ids: Some(evidence.member_clients),
+                member_ids: Some(
+                    evidence
+                        .member_clients
+                        .into_iter()
+                        .map(muxe_core::ClientId::into_string)
+                        .collect(),
+                ),
                 proof_epoch: None,
             }),
             _ => None,
@@ -1967,9 +1977,19 @@ impl Broker {
     ) -> Option<muxe_protocol::TargetReadiness> {
         match self.adapter.activation_readiness_at(as_of).await {
             Ok(Some(evidence)) => Some(muxe_protocol::TargetReadiness {
-                registered_clients: evidence.registered_clients,
+                registered_clients: evidence
+                    .registered_clients
+                    .into_iter()
+                    .map(muxe_core::ClientId::into_string)
+                    .collect(),
                 member_clients: u64::try_from(evidence.member_clients.len()).unwrap_or(u64::MAX),
-                member_ids: Some(evidence.member_clients),
+                member_ids: Some(
+                    evidence
+                        .member_clients
+                        .into_iter()
+                        .map(muxe_core::ClientId::into_string)
+                        .collect(),
+                ),
                 proof_epoch: Some(epoch),
             }),
             _ => None,

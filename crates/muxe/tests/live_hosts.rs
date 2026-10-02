@@ -889,7 +889,7 @@ async fn run_simultaneous_two_clients() -> io::Result<()> {
 
 async fn duo_connect_and_probe(
     rig: &Rig,
-    anchor: &[String],
+    anchor: &[muxe_core::ClientId],
     executable: PathBuf,
 ) -> io::Result<()> {
     let (request_name, event_name) = channel_names("duo");
@@ -982,7 +982,7 @@ async fn duo_connect_and_probe(
 /// on the owner. Release and snapshot may arrive in either order; duplicates,
 /// wrong owners, wrong requests, and UI-session mismatches all fail closed.
 async fn duo_probe_rounds(
-    anchor: &[String],
+    anchor: &[muxe_core::ClientId],
     request: &dyn PipeChannel,
     event: &mut DuoEvents,
     adapter: &ZellijAdapter,
@@ -994,13 +994,14 @@ async fn duo_probe_rounds(
 }
 
 async fn duo_collect_registrations(
-    anchor: &[String],
+    anchor: &[muxe_core::ClientId],
     event: &mut DuoEvents,
     adapter: &ZellijAdapter,
     membership: &dyn MembershipSource,
-) -> io::Result<BTreeMap<String, (RegistrationId, String)>> {
+) -> io::Result<BTreeMap<muxe_core::ClientId, (RegistrationId, String)>> {
     let coverage_deadline = tokio::time::Instant::now() + READY_TIMEOUT;
-    let mut registrations: BTreeMap<String, (RegistrationId, String)> = BTreeMap::new();
+    let mut registrations: BTreeMap<muxe_core::ClientId, (RegistrationId, String)> =
+        BTreeMap::new();
     let mut candidate = None;
     loop {
         let remaining = coverage_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1079,7 +1080,9 @@ async fn duo_collect_registrations(
         match frame.event {
             PipeEventKind::Event(BridgeEvent::Register {
                 registration: details,
-            }) if !anchor.contains(&details.client_id) => {}
+            }) if !anchor
+                .iter()
+                .any(|client| client.as_str() == details.client_id) => {}
             PipeEventKind::Event(BridgeEvent::Register {
                 registration: details,
             }) => {
@@ -1096,7 +1099,7 @@ async fn duo_collect_registrations(
 }
 
 async fn duo_admit_coverage(
-    anchor: &[String],
+    anchor: &[muxe_core::ClientId],
     registered: usize,
     event: &mut DuoEvents,
     adapter: &ZellijAdapter,
@@ -1136,7 +1139,7 @@ async fn duo_admit_coverage(
 }
 
 async fn duo_recheck_census(
-    anchor: &[String],
+    anchor: &[muxe_core::ClientId],
     membership: &dyn MembershipSource,
     deadline: tokio::time::Instant,
 ) -> io::Result<bool> {
@@ -1154,7 +1157,7 @@ async fn duo_recheck_census(
 async fn duo_snapshot_census(
     membership: &dyn MembershipSource,
     deadline: tokio::time::Instant,
-) -> io::Result<Option<Vec<String>>> {
+) -> io::Result<Option<Vec<muxe_core::ClientId>>> {
     let result = tokio::time::timeout_at(deadline, membership.snapshot_members())
         .await
         .map_err(|_| {
@@ -1174,7 +1177,7 @@ async fn duo_snapshot_census(
 }
 
 fn duo_add_registration(
-    registrations: &mut BTreeMap<String, (RegistrationId, String)>,
+    registrations: &mut BTreeMap<muxe_core::ClientId, (RegistrationId, String)>,
     registration: RegistrationId,
     details: muxe_zellij_protocol::ZellijRegistration,
 ) -> io::Result<()> {
@@ -1197,7 +1200,7 @@ fn duo_add_registration(
             details.client_id,
         )));
     }
-    let client_id = details.client_id;
+    let client_id = muxe_core::ClientId::new(details.client_id);
     let Some(current_pane) = details.current_pane else {
         return Err(io::Error::other(format!(
             "duo: no focused-pane anchor for client {client_id:?}, cannot address an origin query",
@@ -1212,12 +1215,12 @@ fn duo_add_registration(
     Ok(())
 }
 async fn duo_route_targets(
-    anchor: &[String],
-    registrations: &BTreeMap<String, (RegistrationId, String)>,
+    anchor: &[muxe_core::ClientId],
+    registrations: &BTreeMap<muxe_core::ClientId, (RegistrationId, String)>,
     request: &dyn PipeChannel,
     event: &mut DuoEvents,
-) -> io::Result<Vec<(String, RegistrationId)>> {
-    let targets: Vec<(String, RegistrationId)> = anchor
+) -> io::Result<Vec<(muxe_core::ClientId, RegistrationId)>> {
+    let targets: Vec<(muxe_core::ClientId, RegistrationId)> = anchor
         .iter()
         .map(|client| {
             let (registration, _) = registrations.get(client).ok_or_else(|| {
@@ -1255,12 +1258,12 @@ async fn duo_route_targets(
     Ok(targets)
 }
 async fn duo_route_one(
-    anchor: &[String],
-    registrations: &BTreeMap<String, (RegistrationId, String)>,
+    anchor: &[muxe_core::ClientId],
+    registrations: &BTreeMap<muxe_core::ClientId, (RegistrationId, String)>,
     request: &dyn PipeChannel,
     event: &mut DuoEvents,
     index: usize,
-    client_id: &str,
+    client_id: &muxe_core::ClientId,
     registration: RegistrationId,
 ) -> io::Result<()> {
     let (_, current_pane) = registrations.get(client_id).ok_or_else(|| {
@@ -1280,7 +1283,7 @@ async fn duo_route_one(
         registration,
         channel_generation: generation,
         target: BridgeTarget {
-            client_id: client_id.to_owned(),
+            client_id: client_id.as_str().to_owned(),
         },
         payload: BridgeRequest::RequestOrigin {
             ui_session: muxe_protocol::UiSessionId::new(ui_session.clone()),
@@ -1319,13 +1322,13 @@ async fn duo_route_one(
     Ok(())
 }
 struct DuoRouteState<'a> {
-    anchor: &'a [String],
+    anchor: &'a [muxe_core::ClientId],
     request_id: RequestId,
     registration: RegistrationId,
     generation: ChannelGeneration,
     ui_session: &'a str,
     current_pane: &'a str,
-    client_id: &'a str,
+    client_id: &'a muxe_core::ClientId,
     round_deadline: tokio::time::Instant,
     released: bool,
     snapshot: bool,
@@ -1378,10 +1381,11 @@ impl DuoRouteState<'_> {
                         self.client_id
                     )));
                 }
-                if origin.client_id != self.client_id {
+                let client_id = muxe_core::ClientId::new(origin.client_id);
+                if client_id != *self.client_id {
                     return Err(io::Error::other(format!(
                         "duo: snapshot for wrong client {:?} while routing client {:?}",
-                        origin.client_id, self.client_id
+                        client_id, self.client_id
                     )));
                 }
                 if origin.ui_pane_id != self.current_pane {
@@ -1408,10 +1412,11 @@ impl DuoRouteState<'_> {
             PipeEventKind::Event(BridgeEvent::Register {
                 registration: details,
             }) => {
-                if self.anchor.contains(&details.client_id) {
+                let client_id = muxe_core::ClientId::new(details.client_id);
+                if self.anchor.contains(&client_id) {
                     return Err(io::Error::other(format!(
                         "duo: unexpected re-registration for client {:?} while routing client {:?}",
-                        details.client_id, self.client_id
+                        client_id, self.client_id
                     )));
                 }
             }
@@ -1449,9 +1454,9 @@ async fn duo_await_route_response(
     Ok(())
 }
 async fn duo_drain_route_heartbeats(
-    anchor: &[String],
-    registrations: &BTreeMap<String, (RegistrationId, String)>,
-    targets: &[(String, RegistrationId)],
+    anchor: &[muxe_core::ClientId],
+    registrations: &BTreeMap<muxe_core::ClientId, (RegistrationId, String)>,
+    targets: &[(muxe_core::ClientId, RegistrationId)],
     event: &mut DuoEvents,
 ) -> io::Result<()> {
     // Let the protocol drain through the next heartbeat from both active
@@ -1482,10 +1487,10 @@ async fn duo_drain_route_heartbeats(
             PipeEventKind::Event(BridgeEvent::Register {
                 registration: details,
             }) => {
-                if anchor.contains(&details.client_id) {
+                let client_id = muxe_core::ClientId::new(details.client_id);
+                if anchor.contains(&client_id) {
                     return Err(io::Error::other(format!(
-                        "duo: unexpected re-registration for active client {:?} after routing",
-                        details.client_id
+                        "duo: unexpected re-registration for active client {client_id:?} after routing"
                     )));
                 }
             }
@@ -2770,27 +2775,33 @@ mod tests {
 
     struct CensusSequence {
         results: tokio::sync::Mutex<
-            std::collections::VecDeque<Result<Vec<String>, muxe_adapter_api::AdapterError>>,
+            std::collections::VecDeque<
+                Result<Vec<muxe_core::ClientId>, muxe_adapter_api::AdapterError>,
+            >,
         >,
     }
 
     #[async_trait::async_trait]
     impl MembershipSource for CensusSequence {
-        async fn snapshot_members(&self) -> Result<Vec<String>, muxe_adapter_api::AdapterError> {
+        async fn snapshot_members(
+            &self,
+        ) -> Result<Vec<muxe_core::ClientId>, muxe_adapter_api::AdapterError> {
             self.results.lock().await.pop_front().expect("census query")
         }
     }
     struct PendingCensus;
     #[async_trait::async_trait]
     impl MembershipSource for PendingCensus {
-        async fn snapshot_members(&self) -> Result<Vec<String>, muxe_adapter_api::AdapterError> {
+        async fn snapshot_members(
+            &self,
+        ) -> Result<Vec<muxe_core::ClientId>, muxe_adapter_api::AdapterError> {
             std::future::pending().await
         }
     }
 
     #[tokio::test]
     async fn admission_retries_empty_census_but_rejects_changed_membership() {
-        let anchor = vec!["1".to_owned(), "2".to_owned()];
+        let anchor = vec![muxe_core::ClientId::new("1"), muxe_core::ClientId::new("2")];
         let membership = CensusSequence {
             results: tokio::sync::Mutex::new(std::collections::VecDeque::from([
                 Err(muxe_adapter_api::AdapterError::new(
@@ -2798,7 +2809,10 @@ mod tests {
                     "temporary discovery failure",
                 )),
                 Ok(anchor.clone()),
-                Ok(vec!["1".to_owned(), "3".to_owned()]),
+                Ok(vec![
+                    muxe_core::ClientId::new("1"),
+                    muxe_core::ClientId::new("3"),
+                ]),
             ])),
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -2821,7 +2835,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_rejects_permanent_errors_and_keeps_original_deadline() {
-        let anchor = vec!["1".to_owned(), "2".to_owned()];
+        let anchor = vec![muxe_core::ClientId::new("1"), muxe_core::ClientId::new("2")];
         let permanent_kinds = [
             muxe_adapter_api::AdapterErrorKind::InvalidRequest,
             muxe_adapter_api::AdapterErrorKind::ContextUnavailable,
@@ -2877,7 +2891,7 @@ mod tests {
     fn routed_release_rejects_pre_recovery_generation() {
         let registration = RegistrationId::from_random_bytes([1; 16]).expect("registration");
         let generation = ChannelGeneration::try_from(2_u64).expect("recovered generation");
-        let anchors = ["1".to_owned(), "2".to_owned()];
+        let anchors = [muxe_core::ClientId::new("1"), muxe_core::ClientId::new("2")];
         let mut state = DuoRouteState {
             anchor: &anchors,
             request_id: RequestId::INITIAL,
@@ -2885,7 +2899,7 @@ mod tests {
             generation,
             ui_session: "duo-route-1",
             current_pane: "plugin_3",
-            client_id: "1",
+            client_id: &anchors[0],
             round_deadline: tokio::time::Instant::now() + DUO_ROUTE_TIMEOUT,
             released: false,
             snapshot: false,

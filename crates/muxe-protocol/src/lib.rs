@@ -28,3 +28,28 @@ pub use frame::{
 };
 pub use text::truncate_utf8;
 pub use wire::*;
+
+// Non-wire traits live here because wire.rs source participates in the protocol fingerprint.
+impl Ord for UiSessionId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for UiSessionId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CaptureLeaseId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for CaptureLeaseId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}

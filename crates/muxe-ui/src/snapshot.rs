@@ -2,8 +2,8 @@
 use std::cell::Cell;
 
 use muxe_protocol::{
-    ArchivedBrokerResponse, ArchivedFrame, ArchivedUiAttachmentWire, ArchivedWireMessage,
-    DecodeError,
+    ArchivedBrokerResponse, ArchivedFrame, ArchivedUiAttachmentWire, ArchivedUiSessionId,
+    ArchivedWireMessage, DecodeError,
 };
 use thiserror::Error;
 
@@ -35,13 +35,13 @@ impl ArchivedUiSnapshot {
     /// [`SnapshotError::NotUiAttached`] when the frame is not a UI attachment response.
     pub fn with_new_attachment<T>(
         frame: ArchivedFrame,
-        visit: impl FnOnce(&str, &ArchivedUiAttachmentWire) -> T,
+        visit: impl FnOnce(&ArchivedUiSessionId, &ArchivedUiAttachmentWire) -> T,
     ) -> Result<(Self, T), SnapshotError> {
         let value = match frame.archived()? {
             ArchivedWireMessage::Response {
                 response: ArchivedBrokerResponse::UiAttached { session, snapshot },
                 ..
-            } => visit(session.0.as_str(), snapshot),
+            } => visit(session, snapshot),
             _ => return Err(SnapshotError::NotUiAttached),
         };
         Ok((
