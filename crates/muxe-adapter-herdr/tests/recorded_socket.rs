@@ -756,6 +756,245 @@ async fn defers_focused_tab_creation_until_the_retained_ui_close_event() {
     drop(fixture);
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one production fixture exercises matching pane-close release, unrelated-entry retention, and immediate release after an already-absent pane snapshot"
+)]
+#[tokio::test]
+async fn pane_close_dispatch_only_releases_matching_post_dismissal_requests() {
+    let mut snapshot = lifecycle_snapshot();
+    snapshot["panes"]
+        .as_array_mut()
+        .expect("lifecycle snapshot has panes")
+        .push(json!({
+            "pane_id": "pane-3",
+            "tab_id": "tab-1",
+            "workspace_id": "workspace-1",
+            "cwd": "/ui/third",
+        }));
+    let mut already_gone_snapshot = snapshot.clone();
+    already_gone_snapshot["panes"]
+        .as_array_mut()
+        .expect("lifecycle snapshot has panes")
+        .retain(|pane| pane.get("pane_id").and_then(serde_json::Value::as_str) != Some("pane-3"));
+
+    let mut script = ProductionConnectFixture::initial_handshake();
+    for _ in 0..4 {
+        script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    }
+    script.push(RecordedExchange {
+        method: "tab.create",
+        params: json!({
+            "workspace_id": "workspace-1",
+            "label": "first",
+            "focus": true,
+            "cwd": null,
+        }),
+        response: RecordedResponse::Result(json!({
+            "type": "tab_created",
+            "tab_id": "first-tab",
+            "workspace_id": "workspace-1",
+        })),
+    });
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(RecordedExchange {
+        method: "tab.create",
+        params: json!({
+            "workspace_id": "workspace-1",
+            "label": "second",
+            "focus": true,
+            "cwd": null,
+        }),
+        response: RecordedResponse::Result(json!({
+            "type": "tab_created",
+            "tab_id": "second-tab",
+            "workspace_id": "workspace-1",
+        })),
+    });
+    script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
+    script.push(ProductionConnectFixture::snapshot_exchange(
+        &already_gone_snapshot,
+    ));
+    script.push(RecordedExchange {
+        method: "tab.create",
+        params: json!({
+            "workspace_id": "workspace-1",
+            "label": "already-gone",
+            "focus": true,
+            "cwd": null,
+        }),
+        response: RecordedResponse::Result(json!({
+            "type": "tab_created",
+            "tab_id": "already-gone-tab",
+            "workspace_id": "workspace-1",
+        })),
+    });
+
+    let fixture =
+        ProductionConnectFixture::start_scripted(script).expect("owned lifecycle fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("production adapter connects");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+
+    let first_origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("first pane origin captures from the owned snapshot");
+    let mut second_capture = lifecycle_capture_request();
+    second_capture.ui_pane = PaneId::new("pane-1");
+    let second_caller = second_capture
+        .caller_identity
+        .as_mut()
+        .expect("capture request has a caller");
+    second_caller.pane_id = PaneId::new("pane-1");
+    second_caller.cwd = Some("/saved/origin".into());
+    let second_origin = adapter
+        .capture_origin(second_capture.clone())
+        .await
+        .expect("second pane origin captures from the owned snapshot");
+
+    let action = |label| ResolvedPortableAction {
+        action: PortableAction::Tab(TabAction::Create {
+            workspace_id: Some(lifecycle_scalar("workspace-1")),
+            name: Some(lifecycle_scalar(label)),
+            focus: None,
+            command: CreateCommand::default(),
+        }),
+    };
+    let first_execution = ExecutionId(72);
+    adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution: first_execution,
+            action: action("first"),
+            origin: first_origin,
+            ui_pane: PaneId::new("pane-2"),
+        })
+        .await
+        .expect("first focused creation remains queued while its pane is live");
+    adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution: ExecutionId(73),
+            action: action("second"),
+            origin: second_origin,
+            ui_pane: PaneId::new("pane-1"),
+        })
+        .await
+        .expect("second focused creation remains queued while its pane is live");
+    wait_for_lifecycle_requests(&fixture, 6, "both UI-live snapshots").await;
+
+    fixture
+        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .expect("retained subscription accepts the matching first-pane close event");
+    wait_for_lifecycle_requests(&fixture, 7, "first tab.create after pane_closed").await;
+    let requests = fixture.requests().await;
+    let creations = requests
+        .iter()
+        .filter(|request| request["method"] == json!("tab.create"))
+        .collect::<Vec<_>>();
+    assert_eq!(creations[0]["params"]["label"], json!("first"));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
+            .await
+            .expect("first creation completion arrives")
+            .expect("adapter reports completion"),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
+            execution: completed,
+        }) if completed == first_execution
+    ));
+
+    // This request fences the same ordered runtime queue; an early second creation cannot pass it.
+    let _fence_origin = adapter
+        .capture_origin(second_capture)
+        .await
+        .expect("first close is followed by the queued snapshot fence");
+    wait_for_lifecycle_requests(&fixture, 8, "snapshot fence after first close").await;
+    let requests = fixture.requests().await;
+    let creations = requests
+        .iter()
+        .filter(|request| request["method"] == json!("tab.create"))
+        .collect::<Vec<_>>();
+    assert_eq!(creations.len(), 1, "the unrelated pane remains pending");
+
+    fixture
+        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-1" }))
+        .expect("retained subscription accepts the matching second-pane close event");
+    wait_for_lifecycle_requests(&fixture, 9, "second tab.create after pane_closed").await;
+    let requests = fixture.requests().await;
+    let creations = requests
+        .iter()
+        .filter(|request| request["method"] == json!("tab.create"))
+        .collect::<Vec<_>>();
+    assert_eq!(creations.len(), 2);
+    assert_eq!(creations[1]["params"]["label"], json!("second"));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
+            .await
+            .expect("second creation completion arrives")
+            .expect("adapter reports completion"),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
+            execution: ExecutionId(73),
+        })
+    ));
+
+    let mut already_gone_capture = lifecycle_capture_request();
+    already_gone_capture.ui_pane = PaneId::new("pane-3");
+    let already_gone_caller = already_gone_capture
+        .caller_identity
+        .as_mut()
+        .expect("capture request has a caller");
+    already_gone_caller.pane_id = PaneId::new("pane-3");
+    already_gone_caller.cwd = Some("/ui/third".into());
+    let already_gone_origin = adapter
+        .capture_origin(already_gone_capture)
+        .await
+        .expect("third pane origin captures before it disappears");
+    adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution: ExecutionId(74),
+            action: action("already-gone"),
+            origin: already_gone_origin,
+            ui_pane: PaneId::new("pane-3"),
+        })
+        .await
+        .expect("already-gone pane snapshot releases its creation immediately");
+    wait_for_lifecycle_requests(
+        &fixture,
+        12,
+        "immediate creation after absent-pane snapshot",
+    )
+    .await;
+    let requests = fixture.requests().await;
+    assert_eq!(
+        requests
+            .last()
+            .expect("third creation follows the absent-pane snapshot")["params"]["label"],
+        json!("already-gone")
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
+            .await
+            .expect("already-gone creation completion arrives")
+            .expect("adapter reports completion"),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
+            execution: ExecutionId(74),
+        })
+    ));
+
+    adapter
+        .shutdown()
+        .await
+        .expect("adapter stops its retained monitor");
+    drop(adapter);
+    drop(fixture);
+}
+
 #[tokio::test]
 async fn deferred_preflight_failure_emits_one_retained_terminal() {
     let snapshot = lifecycle_snapshot();

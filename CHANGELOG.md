@@ -21,6 +21,7 @@
 - *(zellij)* Preserve receipt-owned configuration provenance across reinstalls
 - *(broker)* Propagate retirement and registry cleanup failures
 - *(herdr)* Close only the leased pending pane and retain uncertain cleanup ownership
+- *(herdr)* Retain typed pane IDs in Herdr post-dismissal queues, removing string round-trips while preserving close-event and confirmed-absence dispatch.
 - *(herdr)* Serialize unary requests and multi-step host transactions per runtime incarnation
 - *(config)* Reject unknown underscore-prefixed fields
 - *(config)* Serialize concurrent reloads before publishing newer contents

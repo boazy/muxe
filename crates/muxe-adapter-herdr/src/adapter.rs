@@ -76,7 +76,7 @@ pub struct HerdrAdapter {
     dispatch_wake: Notify,
     dispatch_tasks: StdMutex<DispatchTaskRegistry>,
     pending_leases: Arc<StdMutex<HashMap<PendingPaneLeaseId, PendingPaneLeaseRecord>>>,
-    post_dismissal: Mutex<HashMap<String, Vec<PostDismissalPortableDispatchRequest>>>,
+    post_dismissal: Mutex<HashMap<muxe_core::PaneId, Vec<PostDismissalPortableDispatchRequest>>>,
     health_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
     reconnect_install_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
     resume_install_wait_hook: StdMutex<Option<Arc<WaitHook>>>,
@@ -1280,7 +1280,7 @@ impl HerdrAdapter {
         request: PostDismissalPortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
         self.require_current_origin(&request.origin)?;
-        let pane = request.ui_pane.as_str().to_owned();
+        let pane = request.ui_pane.clone();
         let execution = request.execution;
         self.post_dismissal
             .lock()
@@ -1288,10 +1288,7 @@ impl HerdrAdapter {
             .entry(pane.clone())
             .or_default()
             .push(request);
-        let is_live = match self
-            .ui_pane_is_live(&muxe_core::PaneId::new(pane.clone()))
-            .await
-        {
+        let is_live = match self.ui_pane_is_live(&pane).await {
             Ok(is_live) => is_live,
             Err(error) => {
                 let still_queued = snapshot_failure_reclaims_request(
@@ -1315,14 +1312,21 @@ impl HerdrAdapter {
         Ok(self.post_dismissal_accepted(execution))
     }
 
-    async fn observe_subscription_event(&self, event: Value) {
+    async fn observe_subscription_event(&self, mut event: Value) {
         if event.get("type").and_then(Value::as_str) != Some("pane_closed") {
             return;
         }
-        let Some(pane) = event.get("pane_id").and_then(Value::as_str) else {
+        let Some(pane) = event
+            .as_object_mut()
+            .and_then(|event| event.remove("pane_id"))
+        else {
             return;
         };
-        let queued = self.post_dismissal.lock().await.remove(pane);
+        let Value::String(pane) = pane else {
+            return;
+        };
+        let pane = muxe_core::PaneId::new(pane);
+        let queued = self.post_dismissal.lock().await.remove(&pane);
         if let Some(queued) = queued {
             self.start_post_dismissals(queued);
         }
@@ -3095,8 +3099,8 @@ fn snapshot_contains_pane(
 /// means a pane-close or terminal lifecycle path already claimed its request,
 /// so the snapshot error cannot retract work that may have begun.
 fn snapshot_failure_reclaims_request(
-    pending: &mut HashMap<String, Vec<PostDismissalPortableDispatchRequest>>,
-    pane: &str,
+    pending: &mut HashMap<muxe_core::PaneId, Vec<PostDismissalPortableDispatchRequest>>,
+    pane: &muxe_core::PaneId,
     execution: muxe_core::ExecutionId,
 ) -> bool {
     let Some(requests) = pending.get_mut(pane) else {
@@ -4359,17 +4363,12 @@ mod tests {
     #[test]
     fn pane_close_claim_makes_later_snapshot_failure_nonrejecting() {
         let request = deferred_request();
-        let mut pending =
-            HashMap::from([(request.ui_pane.as_str().to_owned(), vec![request.clone()])]);
+        let mut pending = HashMap::from([(request.ui_pane.clone(), vec![request.clone()])]);
 
-        let claimed = pending.remove(request.ui_pane.as_str());
+        let claimed = pending.remove(&request.ui_pane);
         assert_eq!(claimed, Some(vec![request.clone()]));
         assert!(
-            !snapshot_failure_reclaims_request(
-                &mut pending,
-                request.ui_pane.as_str(),
-                request.execution,
-            ),
+            !snapshot_failure_reclaims_request(&mut pending, &request.ui_pane, request.execution),
             "a later snapshot failure must not retract the pane-close dispatch"
         );
     }
