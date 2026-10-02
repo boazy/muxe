@@ -92,7 +92,7 @@ pub enum Eligibility {
     /// Nothing is installed; the staged bridge commits directly.
     Absent,
     /// Current bytes match the receipt digest; replacement may proceed.
-    EligibleReplace { current_digest: String },
+    EligibleReplace { current_digest: Sha256Digest },
 }
 
 /// Reads the current destination state without mutating anything.
@@ -105,8 +105,8 @@ pub enum Eligibility {
 /// Returns [`BridgeError`] when the destination is unsafe, foreign, untracked, or unreadable.
 pub fn check_destination(
     stable: &Path,
-    receipt_digest: Option<&str>,
-) -> Result<(Eligibility, Option<String>), BridgeError> {
+    receipt_digest: Option<&Sha256Digest>,
+) -> Result<(Eligibility, Option<Sha256Digest>), BridgeError> {
     match fs::symlink_metadata(stable) {
         Ok(metadata) => {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -116,9 +116,9 @@ pub fn check_destination(
             }
             let current = fs::read(stable)
                 .map_err(|source| fsutil::io_error("reading installed bridge", stable, source))?;
-            let found = fsutil::sha256_hex(&current);
+            let found = Sha256Digest::from_bytes(&current);
             match receipt_digest {
-                Some(expected) if found == expected => Ok((
+                Some(expected) if &found == expected => Ok((
                     Eligibility::EligibleReplace {
                         current_digest: found.clone(),
                     },
@@ -126,12 +126,12 @@ pub fn check_destination(
                 )),
                 Some(expected) => Err(BridgeError::ForeignBytes {
                     path: stable.to_path_buf(),
-                    found,
-                    expected: expected.to_owned(),
+                    found: found.into_string(),
+                    expected: expected.to_string(),
                 }),
                 None => Err(BridgeError::UntrackedBytes {
                     path: stable.to_path_buf(),
-                    found,
+                    found: found.into_string(),
                 }),
             }
         }
@@ -191,7 +191,7 @@ pub fn stage(stable: &Path, bytes: &[u8]) -> Result<PathBuf, BridgeError> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Backup {
     pub path: PathBuf,
-    pub digest: String,
+    pub digest: Sha256Digest,
 }
 
 /// Preserves the current stable bridge as the `.previous` rollback copy.
@@ -206,7 +206,7 @@ pub struct Backup {
 /// # Errors
 ///
 /// Returns [`BridgeError`] when the destination is unsafe, the prior copy is protected, or the backup cannot be verified.
-pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeError> {
+pub fn backup(stable: &Path, authority: Option<&Sha256Digest>) -> Result<Backup, BridgeError> {
     let previous = previous_path(stable);
     if let Ok(metadata) = fs::symlink_metadata(&previous) {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -214,9 +214,9 @@ pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeEr
         }
         let existing = fs::read(&previous)
             .map_err(|source| fsutil::io_error("reading rollback copy", &previous, source))?;
-        let found = fsutil::sha256_hex(&existing);
+        let found = Sha256Digest::from_bytes(&existing);
         match authority {
-            Some(recorded) if recorded == found => {
+            Some(recorded) if recorded == &found => {
                 fs::remove_file(&previous).map_err(|source| {
                     fsutil::io_error("replacing rollback copy", &previous, source)
                 })?;
@@ -224,22 +224,22 @@ pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeEr
             Some(recorded) => {
                 return Err(BridgeError::PreviousProtected {
                     path: previous,
-                    recorded: recorded.to_owned(),
-                    found,
+                    recorded: recorded.to_string(),
+                    found: found.into_string(),
                 });
             }
             None => {
                 return Err(BridgeError::PreviousProtected {
                     path: previous,
                     recorded: "<no recorded digest>".to_owned(),
-                    found,
+                    found: found.into_string(),
                 });
             }
         }
     }
     let stable_bytes = fs::read(stable)
         .map_err(|source| fsutil::io_error("reading old bridge", stable, source))?;
-    let digest = fsutil::sha256_hex(&stable_bytes);
+    let digest = Sha256Digest::from_bytes(&stable_bytes);
     if fs::hard_link(stable, &previous).is_err() {
         // Cross-device or unsupported: fall back to a synced byte copy.
         let (staging, mut file) = fsutil::create_staging_file(
@@ -268,11 +268,12 @@ pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeEr
     // Owner-verified: the backup must digest identically, however it was made.
     let backed = fs::read(&previous)
         .map_err(|source| fsutil::io_error("verifying rollback copy", &previous, source))?;
-    if fsutil::sha256_hex(&backed) != digest {
+    let found = Sha256Digest::from_bytes(&backed);
+    if found != digest {
         let _ = fs::remove_file(&previous);
         return Err(BridgeError::StagedDigestChanged {
-            expected: digest,
-            found: fsutil::sha256_hex(&backed),
+            expected: digest.into_string(),
+            found: found.into_string(),
         });
     }
     fsutil::sync_dir_of(&previous)?;
@@ -291,7 +292,7 @@ pub fn backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeEr
 ///
 /// Returns [`BridgeError`] when the rollback path is unsafe, unreadable, or
 /// does not match the receipt-authorized digest.
-pub fn check_previous(stable: &Path, authority: Option<&str>) -> Result<(), BridgeError> {
+pub fn check_previous(stable: &Path, authority: Option<&Sha256Digest>) -> Result<(), BridgeError> {
     let previous = previous_path(stable);
     let metadata = match fs::symlink_metadata(&previous) {
         Ok(metadata) => metadata,
@@ -309,18 +310,18 @@ pub fn check_previous(stable: &Path, authority: Option<&str>) -> Result<(), Brid
     }
     let bytes = fs::read(&previous)
         .map_err(|source| fsutil::io_error("reading rollback copy", &previous, source))?;
-    let found = fsutil::sha256_hex(&bytes);
+    let found = Sha256Digest::from_bytes(&bytes);
     match authority {
-        Some(recorded) if recorded == found => Ok(()),
+        Some(recorded) if recorded == &found => Ok(()),
         Some(recorded) => Err(BridgeError::PreviousProtected {
             path: previous,
-            recorded: recorded.to_owned(),
-            found,
+            recorded: recorded.to_string(),
+            found: found.into_string(),
         }),
         None => Err(BridgeError::PreviousProtected {
             path: previous,
             recorded: "<no recorded digest>".to_owned(),
-            found,
+            found: found.into_string(),
         }),
     }
 }
@@ -332,16 +333,19 @@ pub fn check_previous(stable: &Path, authority: Option<&str>) -> Result<(), Brid
 /// # Errors
 ///
 /// Returns [`BridgeError`] when the stable bytes cannot be read or the backup cannot be created.
-pub fn ensure_backup(stable: &Path, authority: Option<&str>) -> Result<Backup, BridgeError> {
+pub fn ensure_backup(
+    stable: &Path,
+    authority: Option<&Sha256Digest>,
+) -> Result<Backup, BridgeError> {
     let stable_bytes = fs::read(stable)
         .map_err(|source| fsutil::io_error("reading old bridge", stable, source))?;
-    let digest = fsutil::sha256_hex(&stable_bytes);
+    let digest = Sha256Digest::from_bytes(&stable_bytes);
     let previous = previous_path(stable);
     if let Ok(metadata) = fs::symlink_metadata(&previous)
         && metadata.is_file()
         && !metadata.file_type().is_symlink()
         && let Ok(existing) = fs::read(&previous)
-        && fsutil::sha256_hex(&existing) == digest
+        && Sha256Digest::from_bytes(&existing) == digest
     {
         return Ok(Backup {
             path: previous,
@@ -368,7 +372,7 @@ fn previous_parent(previous: &Path) -> &Path {
 pub fn commit(
     staged: &Path,
     stable: &Path,
-    expected_current: Option<&str>,
+    expected_current: Option<&Sha256Digest>,
 ) -> Result<(), BridgeError> {
     match fs::symlink_metadata(stable) {
         Ok(metadata) => {
@@ -380,14 +384,14 @@ pub fn commit(
             check_owner_only(stable, &metadata)?;
             let current = fs::read(stable)
                 .map_err(|source| fsutil::io_error("reading installed bridge", stable, source))?;
-            let found = fsutil::sha256_hex(&current);
+            let found = Sha256Digest::from_bytes(&current);
             match expected_current {
-                Some(expected) if found == expected => {}
+                Some(expected) if &found == expected => {}
                 Some(expected) => {
                     return Err(BridgeError::ConcurrentChange {
                         path: stable.to_path_buf(),
-                        expected: expected.to_owned(),
-                        found,
+                        expected: expected.to_string(),
+                        found: found.into_string(),
                     });
                 }
                 None => {
@@ -398,10 +402,10 @@ pub fn commit(
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if expected_current.is_some() {
+            if let Some(expected) = expected_current {
                 return Err(BridgeError::ConcurrentChange {
                     path: stable.to_path_buf(),
-                    expected: expected_current.unwrap_or("").to_owned(),
+                    expected: expected.to_string(),
                     found: "<absent>".to_owned(),
                 });
             }
@@ -740,7 +744,7 @@ mod tests {
         .unwrap();
         let stable = stable(temp.path());
         install_bytes(temp.path(), b"wasm-v1");
-        let digest_v1 = fsutil::sha256_hex(b"wasm-v1");
+        let digest_v1 = Sha256Digest::from_bytes(b"wasm-v1");
         let (eligibility, _) = check_destination(&stable, Some(&digest_v1)).unwrap();
         assert!(matches!(eligibility, Eligibility::EligibleReplace { .. }));
         // Stable bytes stay in place until the swap: backup copies, not moves.
@@ -767,7 +771,7 @@ mod tests {
         // A second backup without authority refuses to destroy the copy,
         // even when the caller names a wrong recorded digest.
         assert!(matches!(
-            backup(&stable, Some(&"0".repeat(64))),
+            backup(&stable, Some(&Sha256Digest::parse("0".repeat(64)).unwrap())),
             Err(BridgeError::PreviousProtected { .. })
         ));
         assert!(matches!(
@@ -775,7 +779,7 @@ mod tests {
             Err(BridgeError::PreviousProtected { .. })
         ));
         // With matching authority the copy rotates.
-        let digest_v1 = fsutil::sha256_hex(b"wasm-v1");
+        let digest_v1 = Sha256Digest::from_bytes(b"wasm-v1");
         backup(&stable, Some(&digest_v1)).unwrap();
     }
 
@@ -789,7 +793,7 @@ mod tests {
         .unwrap();
         let stable = stable(temp.path());
         install_bytes(temp.path(), b"wasm-v1");
-        let digest_v1 = fsutil::sha256_hex(b"wasm-v1");
+        let digest_v1 = Sha256Digest::from_bytes(b"wasm-v1");
         let staged = stage(&stable, b"wasm-v2").unwrap();
         fs::write(&stable, b"intruder").unwrap();
         assert!(matches!(
@@ -832,7 +836,8 @@ mod tests {
         .unwrap();
         let stable = stable(temp.path());
         fs::write(&stable, b"someone-elses-wasm").unwrap();
-        let error = check_destination(&stable, Some(&"a".repeat(64))).unwrap_err();
+        let error = check_destination(&stable, Some(&Sha256Digest::parse("a".repeat(64)).unwrap()))
+            .unwrap_err();
         assert!(matches!(error, BridgeError::ForeignBytes { .. }));
         assert!(matches!(
             check_destination(&stable, None),

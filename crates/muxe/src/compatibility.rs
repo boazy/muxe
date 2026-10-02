@@ -9,6 +9,8 @@ use muxe_protocol::control::{CompatibilityRecord, HerdrCompatibility, ZellijComp
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::integration::receipt::Sha256Digest;
+
 /// Minimum-supported and latest-verified Zellij version for V1.
 pub const ZELLIJ_MINIMUM: &str = "0.46.0";
 /// Latest-verified Zellij version for V1.
@@ -146,7 +148,7 @@ pub fn embedded_record() -> Result<NativeCompatibilityRecord, CompatibilityError
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeAssetVerification {
     /// SHA-256 of the packaged `lib/muxe/muxe-zellij.wasm` bytes.
-    pub packaged_digest: String,
+    pub packaged_digest: Sha256Digest,
 }
 
 #[derive(Debug, Error)]
@@ -185,9 +187,12 @@ pub fn verify_packaged_asset(
             return Err(AssetVerificationError::Unavailable { reason });
         }
     };
-    let found = crate::fsutil::sha256_hex(packaged_bytes);
-    if found != expected {
-        return Err(AssetVerificationError::DigestMismatch { expected, found });
+    let found = Sha256Digest::from_bytes(packaged_bytes);
+    if found.as_str() != expected {
+        return Err(AssetVerificationError::DigestMismatch {
+            expected,
+            found: found.into_string(),
+        });
     }
     Ok(NativeAssetVerification {
         packaged_digest: found,
@@ -338,7 +343,7 @@ mod tests {
         let bytes = std::fs::read(&wasm_path)
             .unwrap_or_else(|_| panic!("missing producer bridge at {}", wasm_path.display()));
         let verified = verify_packaged_asset(&bytes).expect("producer bytes verify");
-        assert_eq!(verified.packaged_digest, hex_lower(&sha256));
+        assert_eq!(verified.packaged_digest.as_str(), hex_lower(&sha256));
         let rendered = render_json(&record);
         assert_eq!(
             rendered["packaged_wasm"]["sha256"],

@@ -59,6 +59,12 @@ impl Sha256Digest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Moves the owned digest into diagnostic or serialization text without copying.
+    #[must_use]
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
 }
 
 impl<'de> Deserialize<'de> for Sha256Digest {

@@ -17,6 +17,7 @@
 - *(broker)* Reject requests for replaced host incarnations and rebuild native-binding availability after reconnect
 - *(activation)* Require exact target-incarnation Ready authority and replay crash recovery through ordered barriers
 - *(activation)* Apply Herdr's supported-version policy using the runtime's typed server version
+- *(integration)* Keep artifact digests typed through installation and recovery. Reject malformed journal digests before changing the journal or artifacts, preserving corrupt transactions for diagnosis.
 - *(zellij)* Bind uninstall configuration ownership to the recorded path
 - *(zellij)* Preserve receipt-owned configuration provenance across reinstalls
 - *(broker)* Propagate retirement and registry cleanup failures

@@ -55,7 +55,7 @@ use crate::{
     cli::HostScope,
     compatibility,
     fsutil::{self, FsError},
-    integration,
+    integration::{self, receipt::Sha256Digest},
     logging::Logger,
     paths::BridgeIdentity,
 };
@@ -1303,20 +1303,11 @@ impl BridgeActivation for ZellijActivation<'_> {
                 receipt.bridge.bridge_identity, identity
             ));
         }
-        integration::bridge::check_previous(
-            &stable,
-            receipt
-                .bridge
-                .previous_digest
-                .as_ref()
-                .map(integration::receipt::Sha256Digest::as_str),
-        )
-        .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
-        let (eligibility, _) = integration::bridge::check_destination(
-            &stable,
-            Some(receipt.bridge.installed_digest.as_str()),
-        )
-        .map_err(|error| format!("bridge preflight failed: {error}"))?;
+        integration::bridge::check_previous(&stable, receipt.bridge.previous_digest.as_ref())
+            .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
+        let (eligibility, _) =
+            integration::bridge::check_destination(&stable, Some(&receipt.bridge.installed_digest))
+                .map_err(|error| format!("bridge preflight failed: {error}"))?;
         let expected_current = match eligibility {
             integration::bridge::Eligibility::Absent => {
                 return Err(
@@ -1357,22 +1348,14 @@ impl BridgeActivation for ZellijActivation<'_> {
                 .ok_or_else(|| ActivateError::UnitFailed {
                     reason: "Zellij receipt authority is absent".to_owned(),
                 })?;
-        let old_digest = integration::receipt::Sha256Digest::parse(
+        let old_digest =
             preparation
                 .expected_current
                 .clone()
                 .ok_or_else(|| ActivateError::UnitFailed {
                     reason: "receipt-owned stable bridge is absent".to_owned(),
-                })?,
-        )
-        .map_err(|error| ActivateError::UnitFailed {
-            reason: format!("old bridge digest is invalid: {error}"),
-        })?;
-        let target_digest =
-            integration::receipt::Sha256Digest::parse(verification.packaged_digest.clone())
-                .map_err(|error| ActivateError::UnitFailed {
-                    reason: format!("target bridge digest is invalid: {error}"),
                 })?;
+        let target_digest = verification.packaged_digest.clone();
         let receipt_target = integration::receipt::BridgeRecord {
             bridge_identity: self.identity.clone(),
             installed_version: target.muxe_version.clone(),
@@ -1553,7 +1536,7 @@ pub struct ActivateInputs<'a, C, S, R, P> {
 #[derive(Debug)]
 struct GlobalPreflight {
     verified_bridge: Option<compatibility::NativeAssetVerification>,
-    expected_current: Option<String>,
+    expected_current: Option<Sha256Digest>,
     bridge_receipt: Option<integration::receipt::BridgeRecord>,
 }
 
@@ -2843,7 +2826,7 @@ fn prove_ready_bridge(
         ),
     ] {
         let bytes = fsutil::read_owner_file(&path)?;
-        if fsutil::sha256_hex(&bytes) != digest.as_str() {
+        if Sha256Digest::from_bytes(&bytes) != *digest {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
                     "final Ready proof found foreign bridge bytes at {}",
@@ -5490,7 +5473,7 @@ mod tests {
         }
     }
 
-    fn store_bridge_receipt(fixture: &Fixture, _stable: &Path, installed_digest: String) {
+    fn store_bridge_receipt(fixture: &Fixture, _stable: &Path, installed_digest: Sha256Digest) {
         let identity = integration::bridge_identity(&fixture.config).unwrap();
         integration::receipt::store(
             identity.directory(),
@@ -5499,8 +5482,7 @@ mod tests {
                 bridge: integration::receipt::BridgeRecord {
                     bridge_identity: identity.clone(),
                     installed_version: "0.1.0".to_owned(),
-                    installed_digest: integration::receipt::Sha256Digest::parse(installed_digest)
-                        .expect("test digest is SHA-256"),
+                    installed_digest,
                     previous_digest: None,
                     bridge_compat: None,
                 },
@@ -5541,7 +5523,7 @@ mod tests {
         std::fs::write(&stable, &target_bytes).unwrap();
         std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
-        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
+        store_bridge_receipt(&fixture, &stable, Sha256Digest::from_bytes(&target_bytes));
         let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
         let outcome = activate_unit_with_global_preflight(
             &zellij_inputs(&fixture, &target_bytes),
@@ -5583,7 +5565,7 @@ mod tests {
             std::fs::write(&stable, &target_bytes).unwrap();
             std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                 .unwrap();
-            store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
+            store_bridge_receipt(&fixture, &stable, Sha256Digest::from_bytes(&target_bytes));
             let directory = integration::integration_dir(&fixture.config);
             let mut receipt = integration::receipt::load(&directory).unwrap().unwrap();
             receipt.bridge.previous_digest = Some(integration::receipt::Sha256Digest::from_bytes(
@@ -5631,7 +5613,7 @@ mod tests {
         std::fs::write(&stable, &old_bytes).unwrap();
         std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
-        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&old_bytes));
+        store_bridge_receipt(&fixture, &stable, Sha256Digest::from_bytes(&old_bytes));
         let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
         let outcome = activate_unit_with_global_preflight(
             &zellij_inputs(&fixture, &target_bytes),
@@ -5666,7 +5648,7 @@ mod tests {
         std::fs::write(&stable, &old_bytes).unwrap();
         std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
-        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&old_bytes));
+        store_bridge_receipt(&fixture, &stable, Sha256Digest::from_bytes(&old_bytes));
         let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
         let reject = RejectingTargetSpawner;
         let inputs = ActivateInputs {
@@ -5700,8 +5682,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            receipt.bridge.installed_digest.as_str(),
-            fsutil::sha256_hex(&old_bytes)
+            receipt.bridge.installed_digest,
+            Sha256Digest::from_bytes(&old_bytes)
         );
         assert_eq!(
             Registry::open(&fixture.cache).unwrap().entries().unwrap(),
@@ -5726,7 +5708,11 @@ mod tests {
                     std::os::unix::fs::PermissionsExt::from_mode(0o600),
                 )
                 .unwrap();
-                store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(b"wrong-receipt"));
+                store_bridge_receipt(
+                    &fixture,
+                    &stable,
+                    Sha256Digest::from_bytes(b"wrong-receipt"),
+                );
                 Some(target_bytes.as_slice())
             } else {
                 None
@@ -5794,7 +5780,7 @@ mod tests {
         std::fs::write(&stable, &target_bytes).unwrap();
         std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
-        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
+        store_bridge_receipt(&fixture, &stable, Sha256Digest::from_bytes(&target_bytes));
         let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
         let unit = test_zellij_unit(stable.clone(), vec![entry]);
         std::fs::remove_file(&stable).unwrap();
@@ -5867,7 +5853,7 @@ mod tests {
         std::fs::write(&stable, &target_bytes).unwrap();
         std::fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o644))
             .unwrap();
-        store_bridge_receipt(&fixture, &stable, fsutil::sha256_hex(&target_bytes));
+        store_bridge_receipt(&fixture, &stable, Sha256Digest::from_bytes(&target_bytes));
         let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
         let result = activate_unit_with_global_preflight(
             &zellij_inputs(&fixture, &target_bytes),
