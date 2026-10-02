@@ -1026,16 +1026,7 @@ impl HostPreflight for HerdrActivation<'_> {
         let discovery_key = &self.0.discovery_key;
         let policy = live.version_policy()?;
         let runtime = live.herdr_runtime(discovery_key).await?;
-        let version = runtime
-            .identity()
-            .live_server_id
-            .as_str()
-            .split("/ver:")
-            .nth(1)
-            .and_then(|tail| tail.split('/').next())
-            .ok_or_else(|| {
-                format!("Herdr host {discovery_key} reports an unrecognized identity shape")
-            })?;
+        let version = runtime.server_version().as_str();
         live.check_version(
             "herdr",
             discovery_key,

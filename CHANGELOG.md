@@ -16,6 +16,7 @@
 - *(ui)* Honor per-invocation theme and color-scheme overrides without changing the pinned menu-session choice
 - *(broker)* Reject requests for replaced host incarnations and rebuild native-binding availability after reconnect
 - *(activation)* Require exact target-incarnation Ready authority and replay crash recovery through ordered barriers
+- *(activation)* Apply Herdr's supported-version policy using the runtime's typed server version
 - *(zellij)* Bind uninstall configuration ownership to the recorded path
 - *(zellij)* Preserve receipt-owned configuration provenance across reinstalls
 - *(broker)* Propagate retirement and registry cleanup failures
