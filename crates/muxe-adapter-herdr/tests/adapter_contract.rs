@@ -31,7 +31,7 @@ use muxe_adapter_api::{
 };
 use muxe_adapter_herdr::HerdrAdapter;
 use muxe_adapter_zellij::{
-    MembershipSource, PipeChannel, PipeTransportError, ReadinessGate, ZellijAdapter,
+    MembershipSource, PipeChannel, PipeEpoch, PipeTransportError, ReadinessGate, ZellijAdapter,
     ZellijAdapterConfig,
 };
 use muxe_core::{
@@ -117,12 +117,14 @@ impl PipeChannel for RecordedPipeChannel {
         }
     }
 
-    async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
-        self.next_line().await.map(|line| (0, line))
+    async fn next_line_tagged(&self) -> Result<(PipeEpoch, String), PipeTransportError> {
+        self.next_line()
+            .await
+            .map(|line| (PipeEpoch::INITIAL, line))
     }
 
-    async fn install_epoch(&self) -> Option<u64> {
-        Some(0)
+    async fn install_epoch(&self) -> Option<PipeEpoch> {
+        Some(PipeEpoch::INITIAL)
     }
 
     async fn close(&self) {

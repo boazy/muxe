@@ -72,7 +72,10 @@ use crate::{
     capture::CaptureTable,
     origin::{OriginError, build_origin_context},
     parse::candidate_to_raw,
-    pipes::{PipeChannel, PipeTransportError, RELEASE_TIMEOUT, SubprocessChannel, channel_names},
+    pipes::{
+        PipeChannel, PipeEpoch, PipeTransportError, RELEASE_TIMEOUT, SubprocessChannel,
+        channel_names,
+    },
     portable::{
         PortableError, PortableMapping, creation_requires_post_dismissal, map_portable,
         map_post_dismissal_creation,
@@ -589,6 +592,37 @@ impl AtomicChannelGeneration {
             .map_err(|error| AdapterError::new(AdapterErrorKind::Unavailable, error.to_string()))
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResumeEpoch(u64);
+
+impl ResumeEpoch {
+    const INITIAL: Self = Self(0);
+
+    fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    fn from_counter(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+struct AtomicResumeEpoch(AtomicU64);
+
+impl AtomicResumeEpoch {
+    fn new() -> Self {
+        Self(AtomicU64::new(ResumeEpoch::INITIAL.0))
+    }
+
+    fn current(&self) -> ResumeEpoch {
+        ResumeEpoch::from_counter(self.0.load(Ordering::SeqCst))
+    }
+
+    fn advance(&self) -> ResumeEpoch {
+        ResumeEpoch::from_counter(self.0.fetch_add(1, Ordering::SeqCst)).next()
+    }
+}
+
 /// Broker executions stay below this ceiling; dispatch admission rejects the
 /// reserved range so adapter-owned local executions cannot collide with them.
 const LOCAL_EXECUTION_CEILING: u64 = 1 << 63;
@@ -653,8 +687,8 @@ impl ZellijIncarnationId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CoverageOwner {
-    resume_epoch: u64,
-    channel: u64,
+    resume_epoch: ResumeEpoch,
+    channel: PipeEpoch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -665,8 +699,8 @@ struct CoveredIncarnation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingCoverage {
-    resume_epoch: u64,
-    channel: u64,
+    resume_epoch: ResumeEpoch,
+    channel: PipeEpoch,
     members: Vec<ClientId>,
 }
 #[cfg(test)]
@@ -727,13 +761,13 @@ struct AdapterInner {
     /// Monotonic resume-attempt generation. Incremented at the start of every
     /// resume attempt; each registration is stamped with the observing
     /// generation, so evidence never combines across attempts.
-    resume_epoch: AtomicU64,
+    resume_epoch: AtomicResumeEpoch,
     /// Freshness stamp of the last registration per client: the observing
     /// resume generation plus the event-channel install epoch that delivered
     /// it. Coverage requires both to match the current attempt. Registration
     /// identities also rotate on every new event channel; transport freshness
     /// never permits reuse of a retired identity.
-    register_epoch: Mutex<BTreeMap<ClientId, (u64, u64)>>,
+    register_epoch: Mutex<BTreeMap<ClientId, (ResumeEpoch, PipeEpoch)>>,
     /// The currently proven live continuity. It is absent before initial
     /// coverage and across every event-channel or activation transition.
     incarnation: StdRwLock<Option<CoveredIncarnation>>,
@@ -877,7 +911,7 @@ impl ZellijAdapter {
                 health_wake: Notify::new(),
                 shutdown: AtomicBool::new(false),
                 suspended: AtomicBool::new(false),
-                resume_epoch: AtomicU64::new(0),
+                resume_epoch: AtomicResumeEpoch::new(),
                 register_epoch: Mutex::new(BTreeMap::new()),
                 incarnation: StdRwLock::new(None),
                 startup_incarnation: StdRwLock::new(None),
@@ -1071,7 +1105,7 @@ impl ZellijAdapter {
         {
             return Ok(());
         }
-        let epoch = self.inner.resume_epoch.load(Ordering::SeqCst);
+        let epoch = self.inner.resume_epoch.current();
         let Some(channel) = self.inner.event.install_epoch().await else {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
@@ -1208,7 +1242,7 @@ impl ZellijAdapter {
         AdapterError::new(AdapterErrorKind::Unavailable, diagnostic)
     }
 
-    async fn bounded_event_epoch(&self) -> Option<u64> {
+    async fn bounded_event_epoch(&self) -> Option<PipeEpoch> {
         timeout(Duration::from_secs(2), self.inner.event.install_epoch())
             .await
             .ok()
@@ -1225,7 +1259,7 @@ impl ZellijAdapter {
     async fn fresh_census_for(&self, as_of_millis: u64) -> Vec<ClientId> {
         let registry = self.inner.registry.lock().await;
         let stamps = self.inner.register_epoch.lock().await;
-        let epoch = self.inner.resume_epoch.load(Ordering::SeqCst);
+        let epoch = self.inner.resume_epoch.current();
         let mut census: Vec<ClientId> = stamps
             .iter()
             .filter(|(client, stamped)| {
@@ -1434,7 +1468,7 @@ impl ZellijAdapter {
         clippy::too_many_lines,
         reason = "the exhaustive event/provenance dispatch stays co-located for protocol review"
     )]
-    async fn handle_event_line(&self, channel: u64, line: &str) {
+    async fn handle_event_line(&self, channel: PipeEpoch, line: &str) {
         let Ok(frame) = decode_event_line(line) else {
             self.restart_whole_pipe().await;
             return;
@@ -1594,7 +1628,7 @@ impl ZellijAdapter {
     /// the bridge to mint a new unpredictable identity.
     async fn on_register(
         &self,
-        channel: u64,
+        channel: PipeEpoch,
         channel_generation: ChannelGeneration,
         client_id: ClientId,
         current_pane: Option<PaneId>,
@@ -1638,7 +1672,7 @@ impl ZellijAdapter {
         // Stamp receipt, not execution: `channel` was fixed when the line
         // arrived, so coverage can require current-attempt evidence per
         // member without cross-attempt reuse.
-        let epoch = self.inner.resume_epoch.load(Ordering::SeqCst);
+        let epoch = self.inner.resume_epoch.current();
         self.inner
             .register_epoch
             .lock()
@@ -2405,7 +2439,7 @@ impl ZellijAdapter {
         *self.inner.pending_coverage.lock().await = None;
         *self.inner.success_snapshot.lock().await = None;
         self.inner.register_epoch.lock().await.clear();
-        let epoch = self.inner.resume_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let epoch = self.inner.resume_epoch.advance();
         self.emit(AdapterHealthEvent::Unhealthy {
             modal_scope: None,
             error: AdapterError::new(
@@ -2540,8 +2574,8 @@ impl ZellijAdapter {
 
     async fn complete_covered_incarnation(
         &self,
-        resume_epoch: u64,
-        channel: u64,
+        resume_epoch: ResumeEpoch,
+        channel: PipeEpoch,
         members: &[ClientId],
         pending: Option<&PendingCoverage>,
         resume: bool,
@@ -2553,7 +2587,7 @@ impl ZellijAdapter {
         let _transition = self.inner.registration_transition.lock().await;
         if self.inner.shutdown.load(Ordering::Acquire)
             || self.inner.quiescing.load(Ordering::Acquire)
-            || self.inner.resume_epoch.load(Ordering::SeqCst) != resume_epoch
+            || self.inner.resume_epoch.current() != resume_epoch
             || self.bounded_event_epoch().await != Some(channel)
             || (!resume && self.inner.suspended.load(Ordering::SeqCst))
         {
@@ -2610,7 +2644,7 @@ impl ZellijAdapter {
         }
         if self.inner.shutdown.load(Ordering::Acquire)
             || self.inner.quiescing.load(Ordering::Acquire)
-            || self.inner.resume_epoch.load(Ordering::SeqCst) != resume_epoch
+            || self.inner.resume_epoch.current() != resume_epoch
             || self.bounded_event_epoch().await != Some(channel)
         {
             return Err(AdapterError::new(
@@ -2812,7 +2846,12 @@ impl ZellijAdapter {
     /// gated by the normal compatibility handshake instead of slipping past.
     /// A member absent from the snapshot (detached before the query) is not
     /// required; a member present without a registration fails closed.
-    async fn resume_covered(&self, epoch: u64, channel: u64, snapshot: &[ClientId]) -> bool {
+    async fn resume_covered(
+        &self,
+        epoch: ResumeEpoch,
+        channel: PipeEpoch,
+        snapshot: &[ClientId],
+    ) -> bool {
         // A bridge that registered then went quiet past its lease is dead
         // evidence: expire it before coverage so silence never counts.
         self.sweep_expired_clients().await;
@@ -2841,8 +2880,8 @@ impl ZellijAdapter {
     /// to the deadline; [`Self::shutdown`] notifies this wait first.
     async fn await_resume_membership(
         &self,
-        epoch: u64,
-        channel: u64,
+        epoch: ResumeEpoch,
+        channel: PipeEpoch,
         snapshot: &[ClientId],
     ) -> bool {
         let deadline = tokio::time::Instant::now() + RESUME_READY_TIMEOUT;
@@ -4319,7 +4358,7 @@ impl HostAdapter for ZellijAdapter {
         // The registry and stamps are cleared with the new generation; a line
         // already read from the old pipe keeps its older channel tag at
         // receipt and can never satisfy the new channel boundary below.
-        let epoch = self.inner.resume_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let epoch = self.inner.resume_epoch.advance();
         self.invalidate_all_registrations("Zellij adapter resumed before completion")
             .await;
         self.inner.register_epoch.lock().await.clear();
@@ -4765,8 +4804,14 @@ while IFS= read -r line; do :; done
             .start()
             .await
             .expect("owner opened the fresh bridge");
-        assert_eq!(adapter.request_channel().install_epoch().await, Some(1));
-        assert_eq!(adapter.event_channel().install_epoch().await, Some(1));
+        assert_eq!(
+            adapter.request_channel().install_epoch().await,
+            Some(PipeEpoch::INITIAL.next())
+        );
+        assert_eq!(
+            adapter.event_channel().install_epoch().await,
+            Some(PipeEpoch::INITIAL.next())
+        );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             if let Ok(names) = std::fs::read_to_string(&marker)
@@ -5223,13 +5268,13 @@ while IFS= read -r line; do :; done
     /// transport and fixed its delivery boundary. Pushing lines only after
     /// this barrier models bridges re-registering on the new child after
     /// respawn; lines pushed before it carry the displaced epoch.
-    async fn await_channel_bump(event: &ScriptedChannel, prev: u64) {
+    async fn await_channel_bump(event: &ScriptedChannel, prev: PipeEpoch) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if event
                     .install_epoch()
                     .await
-                    .is_some_and(|epoch| epoch > prev)
+                    .is_some_and(|epoch| epoch.is_after(prev))
                 {
                     return;
                 }
@@ -5341,7 +5386,7 @@ while IFS= read -r line; do :; done
         adapter: &ZellijAdapter,
         event: &ScriptedChannel,
     ) -> tokio::task::JoinHandle<Result<(), AdapterError>> {
-        let channel = event.install_epoch().await.unwrap_or(0);
+        let channel = event.install_epoch().await.unwrap_or(PipeEpoch::INITIAL);
         let pending = tokio::spawn({
             let adapter = adapter.clone();
             async move { adapter.resume_after_activation_abort().await }
@@ -7561,7 +7606,7 @@ while IFS= read -r line; do :; done
             event
                 .install_epoch()
                 .await
-                .is_some_and(|channel| channel > displaced_channel),
+                .is_some_and(|channel| channel.is_after(displaced_channel)),
             "subscription refresh must install a new event-channel epoch"
         );
 
@@ -8104,7 +8149,7 @@ while IFS= read -r line; do :; done
             next_event(&adapter).await,
             AdapterHealthEvent::Unhealthy { .. }
         ));
-        let channel = event.install_epoch().await.unwrap_or(0);
+        let channel = event.install_epoch().await.unwrap_or(PipeEpoch::INITIAL);
         let pending = tokio::spawn({
             let adapter = adapter.clone();
             async move { adapter.resume_after_activation_abort().await }

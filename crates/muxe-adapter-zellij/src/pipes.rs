@@ -51,6 +51,49 @@ use tokio::{
 };
 
 use muxe_zellij_protocol::MAX_PIPE_LINE_LEN;
+/// Identifies an installed child of a pipe channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PipeEpoch(u64);
+
+impl PipeEpoch {
+    /// Epoch assigned to channels whose implementation does not track child replacements.
+    pub const INITIAL: Self = Self(0);
+
+    /// Returns the epoch for the next installed child.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+    /// Returns whether this epoch follows `previous` in the install sequence.
+    #[must_use]
+    pub const fn is_after(self, previous: Self) -> bool {
+        self.0 > previous.0
+    }
+
+    fn from_counter(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+struct AtomicPipeEpoch(AtomicU64);
+
+impl AtomicPipeEpoch {
+    fn new() -> Self {
+        Self(AtomicU64::new(PipeEpoch::INITIAL.0))
+    }
+
+    fn current(&self) -> PipeEpoch {
+        PipeEpoch::from_counter(self.0.load(Ordering::SeqCst))
+    }
+
+    fn advance(&self) -> PipeEpoch {
+        PipeEpoch::from_counter(self.0.fetch_add(1, Ordering::SeqCst)).next()
+    }
+
+    fn advance_relaxed(&self) -> PipeEpoch {
+        PipeEpoch::from_counter(self.0.fetch_add(1, Ordering::Relaxed)).next()
+    }
+}
 
 /// Deterministic pipe names for one live session.
 #[must_use]
@@ -115,9 +158,9 @@ pub enum PipeTransportError {
 
 /// Shared line queue for one pipe-child epoch. Cloned under a short state
 /// lock so `next_line` can await without holding lifecycle state.
-type EpochLines = Arc<Mutex<mpsc::Receiver<(u64, Result<String, PipeTransportError>)>>>;
+type EpochLines = Arc<Mutex<mpsc::Receiver<(PipeEpoch, Result<String, PipeTransportError>)>>>;
 struct LiveChild {
-    epoch: u64,
+    epoch: PipeEpoch,
     lines: EpochLines,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
@@ -137,13 +180,15 @@ pub trait PipeChannel: Send + Sync {
     /// captured at receipt. Resume freshness stamps this tag, never the
     /// handler's execution time, so a line already read from a displaced
     /// child can never be mistaken for post-respawn evidence.
-    async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
-        self.next_line().await.map(|line| (0, line))
+    async fn next_line_tagged(&self) -> Result<(PipeEpoch, String), PipeTransportError> {
+        self.next_line()
+            .await
+            .map(|line| (PipeEpoch::INITIAL, line))
     }
     /// Epoch of the currently installed child, if any. Resume records this
     /// after respawn as the attempt's channel boundary; only lines tagged
     /// with it count as current-attempt evidence.
-    async fn install_epoch(&self) -> Option<u64> {
+    async fn install_epoch(&self) -> Option<PipeEpoch> {
         None
     }
     /// Closes the channel and reaps the child, if any.
@@ -178,7 +223,7 @@ pub struct SubprocessChannel {
     /// in the gap wait for the replacement instead of failing the pending
     /// receive.
     replacing: AtomicBool,
-    epochs: AtomicU64,
+    epochs: AtomicPipeEpoch,
     closed: AtomicBool,
     zellij_exe: PathBuf,
     session: String,
@@ -219,7 +264,7 @@ impl SubprocessChannel {
             lifecycle: Mutex::new(()),
             state_notify: Notify::new(),
             replacing: AtomicBool::new(true),
-            epochs: AtomicU64::new(0),
+            epochs: AtomicPipeEpoch::new(),
             closed: AtomicBool::new(false),
             zellij_exe,
             session,
@@ -275,7 +320,7 @@ impl SubprocessChannel {
             self.state_notify.notify_waiters();
             return Err(error);
         }
-        let epoch = self.epochs.fetch_add(1, Ordering::Relaxed) + 1;
+        let epoch = self.epochs.advance_relaxed();
         let live = match self.spawn_epoch(epoch).await {
             Ok(live) => live,
             Err(error) => {
@@ -311,7 +356,7 @@ impl SubprocessChannel {
     /// replaced-child error), decides whether the pending receive survives:
     /// waits out a respawn gap, retries on an installed replacement (`true`),
     /// or reports that the caller owns the terminal (`false`).
-    async fn survive_stale(&self, epoch: u64) -> bool {
+    async fn survive_stale(&self, observed_epoch: Option<PipeEpoch>) -> bool {
         if self.closed.load(Ordering::Relaxed) {
             return false;
         }
@@ -320,7 +365,7 @@ impl SubprocessChannel {
             .lock()
             .await
             .as_ref()
-            .is_some_and(|live| live.epoch != epoch)
+            .is_some_and(|live| observed_epoch.is_none_or(|epoch| live.epoch != epoch))
         {
             return true;
         }
@@ -341,7 +386,7 @@ impl SubprocessChannel {
         true
     }
 
-    async fn spawn_epoch(&self, epoch: u64) -> Result<LiveChild, PipeTransportError> {
+    async fn spawn_epoch(&self, epoch: PipeEpoch) -> Result<LiveChild, PipeTransportError> {
         let mut command = Command::new(&self.zellij_exe);
         command
             .arg("--session")
@@ -437,8 +482,8 @@ async fn terminate_child(mut previous: LiveChild) -> Result<(), PipeTransportErr
 
 async fn read_lines(
     stdout: ChildStdout,
-    epoch: u64,
-    lines_tx: mpsc::Sender<(u64, Result<String, PipeTransportError>)>,
+    epoch: PipeEpoch,
+    lines_tx: mpsc::Sender<(PipeEpoch, Result<String, PipeTransportError>)>,
 ) {
     let mut stdout = stdout;
     let mut pending: Vec<u8> = Vec::new();
@@ -524,7 +569,7 @@ impl SubprocessChannel {
     /// Receives one line tagged with the delivering child's epoch. The tag
     /// is fixed here at receipt: lines queued from a displaced child carry
     /// its older epoch even if the adapter processes them after a respawn.
-    async fn next_line_inner(&self) -> Result<(u64, String), PipeTransportError> {
+    async fn next_line_inner(&self) -> Result<(PipeEpoch, String), PipeTransportError> {
         loop {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(PipeTransportError::Closed);
@@ -546,7 +591,7 @@ impl SubprocessChannel {
                 // dead, never launched) report Closed so the adapter's
                 // restart loop can replace the child. Close sets `closed`
                 // first, so shutdown still wakes bounded via the notify.
-                if self.survive_stale(u64::MAX).await {
+                if self.survive_stale(None).await {
                     continue;
                 }
                 return Err(PipeTransportError::Closed);
@@ -558,7 +603,7 @@ impl SubprocessChannel {
                     // replacement or an in-flight respawn means this receive
                     // is stale: survive into the replacement. Otherwise the
                     // channel is dead: report Closed.
-                    if self.survive_stale(epoch).await {
+                    if self.survive_stale(Some(epoch)).await {
                         continue;
                     }
                     return Err(PipeTransportError::Closed);
@@ -571,7 +616,7 @@ impl SubprocessChannel {
                     // respawn is in flight, the pending receive survives and
                     // retries for the replacement's line; otherwise the error
                     // belongs to this caller.
-                    if self.survive_stale(epoch).await {
+                    if self.survive_stale(Some(epoch)).await {
                         continue;
                     }
                     if self.closed.load(Ordering::Relaxed) {
@@ -620,11 +665,11 @@ impl PipeChannel for SubprocessChannel {
         self.next_line_inner().await.map(|(_, line)| line)
     }
 
-    async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
+    async fn next_line_tagged(&self) -> Result<(PipeEpoch, String), PipeTransportError> {
         self.next_line_inner().await
     }
 
-    async fn install_epoch(&self) -> Option<u64> {
+    async fn install_epoch(&self) -> Option<PipeEpoch> {
         self.state.lock().await.as_ref().map(|live| live.epoch)
     }
 
@@ -663,18 +708,15 @@ fn bounded(mut reason: String) -> String {
 /// Plain `cargo check` builds report no in-crate caller; the module serves the
 /// external contract suite through the injected `PipeChannel` boundary.
 pub mod testing {
-    use std::sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
-    };
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use async_trait::async_trait;
     use tokio::sync::mpsc;
 
-    use super::{PipeChannel, PipeTransportError};
+    use super::{AtomicPipeEpoch, PipeChannel, PipeEpoch, PipeTransportError};
 
     /// A line queued under one install epoch with its delivery result.
-    type TaggedLine = (u64, Result<String, PipeTransportError>);
+    type TaggedLine = (PipeEpoch, Result<String, PipeTransportError>);
 
     /// Scripted line channel: `send_line` records outbound lines, `next_line`
     /// blocks until a queued inbound line arrives (like a real pipe child),
@@ -686,7 +728,7 @@ pub mod testing {
         outbound: StdMutex<Vec<String>>,
         inbound_tx: StdMutex<Option<mpsc::UnboundedSender<TaggedLine>>>,
         inbound_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<TaggedLine>>,
-        epoch: AtomicU64,
+        epoch: AtomicPipeEpoch,
         initial_payload: StdMutex<Option<String>>,
     }
 
@@ -700,7 +742,7 @@ pub mod testing {
                 inbound_tx: StdMutex::new(Some(inbound_tx)),
                 inbound_rx: tokio::sync::Mutex::new(inbound_rx),
                 initial_payload: StdMutex::new(None),
-                epoch: AtomicU64::new(0),
+                epoch: AtomicPipeEpoch::new(),
             })
         }
 
@@ -712,7 +754,7 @@ pub mod testing {
         /// production channel escapes the same wait through the killed
         /// child's EOF; the scripted queue has no death, so the tag alone
         /// decides.)
-        async fn next_line_inner(&self) -> Result<(u64, String), PipeTransportError> {
+        async fn next_line_inner(&self) -> Result<(PipeEpoch, String), PipeTransportError> {
             loop {
                 let received = {
                     let mut guard = self.inbound_rx.lock().await;
@@ -721,7 +763,7 @@ pub mod testing {
                 match received {
                     None => return Err(PipeTransportError::Closed),
                     Some((tag, result)) => {
-                        let current = self.epoch.load(Ordering::SeqCst);
+                        let current = self.epoch.current();
                         if tag != current {
                             continue;
                         }
@@ -734,7 +776,7 @@ pub mod testing {
         /// Queues one inbound line for the next `next_line` call, tagged with
         /// the current install epoch.
         pub fn push_line(&self, line: impl Into<String>) {
-            let epoch = self.epoch.load(Ordering::SeqCst);
+            let epoch = self.epoch.current();
             if let Ok(guard) = self.inbound_tx.lock()
                 && let Some(sender) = guard.as_ref()
             {
@@ -743,7 +785,7 @@ pub mod testing {
         }
 
         pub fn push_error(&self, error: PipeTransportError) {
-            let epoch = self.epoch.load(Ordering::SeqCst);
+            let epoch = self.epoch.current();
             if let Ok(guard) = self.inbound_tx.lock()
                 && let Some(sender) = guard.as_ref()
             {
@@ -776,7 +818,7 @@ pub mod testing {
                 outbound: StdMutex::new(Vec::new()),
                 inbound_tx: StdMutex::new(Some(inbound_tx)),
                 inbound_rx: tokio::sync::Mutex::new(inbound_rx),
-                epoch: AtomicU64::new(0),
+                epoch: AtomicPipeEpoch::new(),
                 initial_payload: StdMutex::new(None),
             }
         }
@@ -795,19 +837,19 @@ pub mod testing {
             self.next_line_inner().await.map(|(_, line)| line)
         }
 
-        async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
+        async fn next_line_tagged(&self) -> Result<(PipeEpoch, String), PipeTransportError> {
             self.next_line_inner().await
         }
 
-        async fn install_epoch(&self) -> Option<u64> {
-            Some(self.epoch.load(Ordering::SeqCst))
+        async fn install_epoch(&self) -> Option<PipeEpoch> {
+            Some(self.epoch.current())
         }
 
         /// Respawning installs a fresh epoch: lines still queued under the
         /// displaced epoch are skipped at receipt, like a replaced child's
         /// discarded pipe buffer.
         async fn respawn(&self) -> Result<(), PipeTransportError> {
-            self.epoch.fetch_add(1, Ordering::SeqCst);
+            self.epoch.advance();
             Ok(())
         }
 
@@ -992,7 +1034,10 @@ exec sleep 60
             .respawn()
             .await
             .expect("authorized reload starts first child");
-        assert_eq!(channel.install_epoch().await, Some(1));
+        assert_eq!(
+            channel.install_epoch().await,
+            Some(PipeEpoch::INITIAL.next())
+        );
         channel.send_line("fresh\n".to_owned()).await.unwrap();
         assert_eq!(channel.next_line().await.unwrap(), "got:fresh");
         channel.close().await;

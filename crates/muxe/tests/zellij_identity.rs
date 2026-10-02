@@ -131,7 +131,7 @@ async fn rotated_adapter() -> (
             if event
                 .install_epoch()
                 .await
-                .is_some_and(|epoch| epoch > previous_epoch)
+                .is_some_and(|epoch| epoch.is_after(previous_epoch))
             {
                 return;
             }

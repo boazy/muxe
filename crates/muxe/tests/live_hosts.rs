@@ -70,8 +70,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use muxe_adapter_api::{AdapterHealthEvent, HostAdapter as _};
 use muxe_adapter_zellij::{
-    CliMembershipSource, MembershipSource, PipeChannel, PipeTransportError, ReadinessGate,
-    SubprocessChannel, ZellijAdapter, ZellijAdapterConfig, channel_names,
+    CliMembershipSource, MembershipSource, PipeChannel, PipeEpoch, PipeTransportError,
+    ReadinessGate, SubprocessChannel, ZellijAdapter, ZellijAdapterConfig, channel_names,
 };
 use muxe_protocol::control::CompatibilityRecord;
 use muxe_zellij_protocol::{
@@ -582,18 +582,15 @@ fn stable_digest(config_file: &Path) -> io::Result<String> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
-/// The subprocess epoch is a transport identity, distinct from the wire generation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DuoChannelEpoch(u64);
-
+/// The fence combines a child epoch with its separate wire generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DuoFence {
-    epoch: DuoChannelEpoch,
+    epoch: PipeEpoch,
     generation: ChannelGeneration,
 }
 
 struct DuoObservation {
-    epoch: Option<DuoChannelEpoch>,
+    epoch: Option<PipeEpoch>,
     result: Result<String, PipeTransportError>,
 }
 
@@ -645,7 +642,7 @@ impl PipeChannel for DuoDiagnosticChannel {
         self.next_line_tagged().await.map(|(_, line)| line)
     }
 
-    async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
+    async fn next_line_tagged(&self) -> Result<(PipeEpoch, String), PipeTransportError> {
         let result = self.channel.next_line_tagged().await;
         if let Err(error) = &result {
             self.diagnostics
@@ -655,7 +652,7 @@ impl PipeChannel for DuoDiagnosticChannel {
         result
     }
 
-    async fn install_epoch(&self) -> Option<u64> {
+    async fn install_epoch(&self) -> Option<PipeEpoch> {
         self.channel.install_epoch().await
     }
 
@@ -721,13 +718,10 @@ impl PipeChannel for DuoEventChannel {
         self.next_line_tagged().await.map(|(_, line)| line)
     }
 
-    async fn next_line_tagged(&self) -> Result<(u64, String), PipeTransportError> {
+    async fn next_line_tagged(&self) -> Result<(PipeEpoch, String), PipeTransportError> {
         let result = self.channel.next_line_tagged().await;
         let observation = DuoObservation {
-            epoch: result
-                .as_ref()
-                .ok()
-                .map(|(epoch, _)| DuoChannelEpoch(*epoch)),
+            epoch: result.as_ref().ok().map(|(epoch, _)| *epoch),
             result: result
                 .as_ref()
                 .map(|(_, line)| line.clone())
@@ -740,7 +734,7 @@ impl PipeChannel for DuoEventChannel {
         result
     }
 
-    async fn install_epoch(&self) -> Option<u64> {
+    async fn install_epoch(&self) -> Option<PipeEpoch> {
         self.channel.install_epoch().await
     }
 
@@ -803,7 +797,7 @@ async fn duo_next_event(
         io::Error::other(format!("duo: admitted event transport failed: {error}"))
     })?;
     if observation.epoch != Some(fence.epoch)
-        || event.channel.install_epoch().await.map(DuoChannelEpoch) != Some(fence.epoch)
+        || event.channel.install_epoch().await != Some(fence.epoch)
     {
         return Err(io::Error::other("duo: admitted event channel changed"));
     }
@@ -1014,7 +1008,7 @@ async fn duo_collect_registrations(
                 ),
             ));
         }
-        let current = event.channel.install_epoch().await.map(DuoChannelEpoch);
+        let current = event.channel.install_epoch().await;
         if candidate.is_some_and(|fence: DuoFence| Some(fence.epoch) != current) {
             registrations.clear();
             candidate = None;
@@ -1052,7 +1046,7 @@ async fn duo_collect_registrations(
         let epoch = observation
             .epoch
             .ok_or_else(|| io::Error::other("duo: untagged event"))?;
-        if Some(epoch) != event.channel.install_epoch().await.map(DuoChannelEpoch) {
+        if Some(epoch) != event.channel.install_epoch().await {
             registrations.clear();
             candidate = None;
             continue;
@@ -1111,7 +1105,7 @@ async fn duo_admit_coverage(
         return Ok(false);
     };
     if registered != anchor.len()
-        || event.channel.install_epoch().await.map(DuoChannelEpoch) != Some(fence.epoch)
+        || event.channel.install_epoch().await != Some(fence.epoch)
         || adapter.identity().await.is_err()
     {
         return Ok(false);
@@ -1119,7 +1113,7 @@ async fn duo_admit_coverage(
     if !duo_recheck_census(anchor, membership, deadline).await? {
         eprintln!(
             "[duo] retrying admission census: candidate {fence:?}, current epoch {:?}, ready {}",
-            event.channel.install_epoch().await.map(DuoChannelEpoch),
+            event.channel.install_epoch().await,
             adapter.identity().await.is_ok(),
         );
         return Ok(false);
@@ -1129,8 +1123,7 @@ async fn duo_admit_coverage(
             "duo: bounded event observation queue failed",
         ));
     }
-    if event.channel.install_epoch().await.map(DuoChannelEpoch) != Some(fence.epoch)
-        || adapter.identity().await.is_err()
+    if event.channel.install_epoch().await != Some(fence.epoch) || adapter.identity().await.is_err()
     {
         return Ok(false);
     }

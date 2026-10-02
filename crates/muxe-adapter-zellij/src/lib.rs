@@ -51,7 +51,7 @@ pub use origin::{OriginError, build_origin_context, prior_pane_id};
 /// production path and never touches a live host.
 pub use pipes::testing::ScriptedChannel;
 pub use pipes::{
-    PipeChannel, PipeTransportError, RELEASE_TIMEOUT, SubprocessChannel, channel_names,
+    PipeChannel, PipeEpoch, PipeTransportError, RELEASE_TIMEOUT, SubprocessChannel, channel_names,
 };
 pub use portable::{
     Cardinal, FocusRequest, PortableError, PortableMapping, map_portable, to_validated_action,
