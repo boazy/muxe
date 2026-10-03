@@ -35,6 +35,7 @@
 - *(zellij)* Filter Muxe-owned panes from eligible focus targets
 - *(broker)* Retain dispatch ownership through shutdown and release timed-out UI work
 - *(herdr)* Fix tab swaps when stable public tab numbers differ from row positions. Preserve number-based selectors, use the pinned host's insertion boundaries, and verify the resulting order by tab identity.
+- *(broker)* Publish Unix sockets atomically only after securing their owner-only permissions. Preserve existing endpoints on collision and keep strict startup identity checks.
 
 ### Miscellaneous Tasks
 
