@@ -1569,7 +1569,7 @@ fn select_binding(
 pub(crate) mod tests {
     use std::collections::BTreeMap;
 
-    use muxe_core::{ThemeSection, compiled_default_theme};
+    use muxe_core::{Color, ColorAliasName, ResolvedThemeSection, compiled_default_theme};
     use muxe_protocol::{
         AfterAction, BindingConditionsWire, BindingSettingsWire, BindingStateWire, BrokerResponse,
         ColorSchemeWire, CompiledThemeWire, ConnectionDecoder, ConnectionPolicy, ExecutionMode,
@@ -1596,7 +1596,17 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn theme_section(section: &ThemeSection) -> ThemeSectionWire {
+    fn colors(values: &BTreeMap<ColorAliasName, Color>) -> Vec<NamedStringWire> {
+        values
+            .iter()
+            .map(|(name, value)| NamedStringWire {
+                name: name.as_str().to_owned(),
+                value: value.to_string(),
+            })
+            .collect()
+    }
+
+    fn theme_section(section: &ResolvedThemeSection) -> ThemeSectionWire {
         ThemeSectionWire {
             styles: section
                 .styles
@@ -1604,8 +1614,8 @@ pub(crate) mod tests {
                 .map(|(name, style)| NamedStyleWire {
                     name: name.clone(),
                     style: StyleWire {
-                        foreground: style.foreground.clone(),
-                        background: style.background.clone(),
+                        foreground: style.foreground.map(|color| color.to_string()),
+                        background: style.background.map(|color| color.to_string()),
                         bold: style.bold,
                         dim: style.dim,
                         italic: style.italic,
@@ -1626,8 +1636,8 @@ pub(crate) mod tests {
             settings: strings(&theme.theme.settings),
             scheme: ColorSchemeWire {
                 title: theme.scheme.title,
-                palette: strings(&theme.scheme.palette),
-                colors: strings(&theme.scheme.colors),
+                palette: colors(&theme.scheme.palette),
+                colors: colors(&theme.scheme.colors),
             },
         }
     }
@@ -3345,6 +3355,162 @@ pub(crate) mod tests {
             "configured menu title style must reach the surface frame"
         );
     }
+
+    #[test]
+    fn archived_aliases_keep_precedence_duplicates_and_terminal_defaults() {
+        use ratatui::style::{Color as RatatuiColor, Modifier, Style as RatatuiStyle};
+
+        let mut theme = theme_with_cell(
+            "[legacy]{{ title }}[/legacy][inherited] reset[/inherited][plain] bare[/plain]",
+        );
+        let plain = StyleWire {
+            foreground: None,
+            background: None,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        };
+        theme.common.styles.clear();
+        theme.menu.styles = vec![
+            NamedStyleWire {
+                name: "legacy".into(),
+                style: StyleWire {
+                    foreground: Some("accent".into()),
+                    background: Some("terminal".into()),
+                    bold: true,
+                    dim: true,
+                    italic: true,
+                    underline: true,
+                    strikethrough: true,
+                },
+            },
+            NamedStyleWire {
+                name: "inherited".into(),
+                style: StyleWire {
+                    foreground: Some("inherit".into()),
+                    ..plain.clone()
+                },
+            },
+            NamedStyleWire {
+                name: "plain".into(),
+                style: plain,
+            },
+        ];
+        theme.scheme.palette = [
+            ("accent", "#f00"),
+            ("palette.alias", "shared"),
+            ("shared", "#123"),
+            ("shared", "#not-a-color"),
+            ("inherit", "#fff"),
+            ("unused.literal", "#invalid"),
+            ("unused.unknown", "missing"),
+            ("unused.cycle", "unused.cycle"),
+        ]
+        .into_iter()
+        .map(|(name, value)| NamedStringWire {
+            name: name.into(),
+            value: value.into(),
+        })
+        .collect();
+        theme.scheme.colors = [
+            ("accent", "palette.alias"),
+            ("accent", "#invalid"),
+            ("terminal", "inherit"),
+        ]
+        .into_iter()
+        .map(|(name, value)| NamedStringWire {
+            name: name.into(),
+            value: value.into(),
+        })
+        .collect();
+        let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+            vec![binding(
+                1,
+                "a",
+                "Open",
+                BindingConditionsWire::default(),
+                None,
+            )],
+            theme,
+        ))
+        .expect("unused failures and shadowed duplicate failures stay deferred");
+        let prepared = runtime
+            .prepare(Rect::new(0, 0, 40, 8))
+            .expect("legacy aliases render");
+        assert_eq!(prepared.cells[0].plain, "Open reset bare");
+        let spans = &prepared.cells[0].spans;
+        assert_eq!(
+            spans[0].style,
+            RatatuiStyle::default()
+                .fg(RatatuiColor::Rgb(0x11, 0x22, 0x33))
+                .bg(RatatuiColor::Reset)
+                .add_modifier(
+                    Modifier::BOLD
+                        | Modifier::DIM
+                        | Modifier::ITALIC
+                        | Modifier::UNDERLINED
+                        | Modifier::CROSSED_OUT,
+                ),
+        );
+        assert_eq!(
+            spans[1].style,
+            RatatuiStyle::default().fg(RatatuiColor::Reset),
+        );
+        assert_eq!(spans[2].style, RatatuiStyle::default());
+    }
+
+    #[test]
+    fn archived_used_unknown_cycle_and_literal_errors_reject_attachment() {
+        for (root, entries) in [
+            ("missing", vec![]),
+            (
+                "cycle.a",
+                vec![("cycle.a", "cycle.b"), ("cycle.b", "cycle.a")],
+            ),
+            ("#invalid", vec![]),
+            ("broken", vec![("broken", "#invalid")]),
+        ] {
+            let mut theme = theme_with_cell("[legacy]{{ title }}[/legacy]");
+            theme.common.styles.clear();
+            theme.menu.styles = vec![NamedStyleWire {
+                name: "legacy".into(),
+                style: StyleWire {
+                    foreground: Some(root.into()),
+                    background: None,
+                    bold: false,
+                    dim: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                },
+            }];
+            theme.scheme.palette.clear();
+            theme.scheme.colors = entries
+                .into_iter()
+                .map(|(name, value)| NamedStringWire {
+                    name: name.into(),
+                    value: value.into(),
+                })
+                .collect();
+            let result = UiRuntime::attach(profiled_attachment_with_theme(
+                vec![binding(
+                    1,
+                    "a",
+                    "Open",
+                    BindingConditionsWire::default(),
+                    None,
+                )],
+                theme,
+            ));
+            assert!(matches!(
+                result,
+                Err(UiError::Template(TemplateError::Render(_))),
+            ));
+        }
+    }
+
     #[test]
     fn undefined_cell_variable_degrades_to_plain_values_with_an_error_status() {
         let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(

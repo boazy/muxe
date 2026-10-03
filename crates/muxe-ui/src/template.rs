@@ -1,11 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::{self, Write},
 };
 
 use minijinja::{Environment, Error as MiniError, ErrorKind, UndefinedBehavior, context};
 use muxe_core::{
-    Color, CompiledTheme, REQUIRED_COMPONENT_TEMPLATES, Style, has_loader_backed_construct,
+    Color, ColorAliasName, ColorExpr, ColorExpressions, ColorResolver, CompiledTheme,
+    REQUIRED_COMPONENT_TEMPLATES, ResolvedStyle, Style, has_loader_backed_construct,
 };
 use muxe_protocol::{ArchivedCompiledThemeWire, ArchivedStyleWire};
 use ratatui::style::{Color as RatatuiColor, Modifier, Style as RatatuiStyle};
@@ -136,7 +137,7 @@ impl TemplateRenderer {
     /// [`TemplateError::ForbiddenLoaderBackedConstruct`] when a template uses a loader-backed
     /// construct, or [`TemplateError::Render`] when `MiniJinja` rejects a template.
     pub fn new(theme: &CompiledTheme) -> Result<Self, TemplateError> {
-        Self::from_sources(|name| template_source(theme, name), resolve_styles(theme)?)
+        Self::from_sources(|name| template_source(theme, name), resolved_styles(theme))
     }
 
     /// Compiles the resolved, checked theme embedded in a broker attachment without
@@ -384,38 +385,72 @@ fn archived_template_source<'a>(
         .map(|template| template.value.as_str())
 }
 
-fn resolve_styles(theme: &CompiledTheme) -> Result<BTreeMap<String, RatatuiStyle>, TemplateError> {
+fn resolved_styles(theme: &CompiledTheme) -> BTreeMap<String, RatatuiStyle> {
     let mut output = BTreeMap::new();
     for section in [&theme.theme.common, &theme.theme.menu] {
         for (name, style) in &section.styles {
-            output.insert(name.clone(), resolve_style(theme, style)?);
+            output.insert(name.clone(), ratatui_style(style));
         }
     }
-    Ok(output)
+    output
 }
 
 fn resolve_archived_styles(
     theme: &ArchivedCompiledThemeWire,
 ) -> Result<BTreeMap<String, RatatuiStyle>, TemplateError> {
+    // Keep boundary parse failures deferred until a style uses the entry. Legacy
+    // archives allow aliases in either map and use the first duplicate name.
+    let mut expressions = ColorExpressions::default();
+    for entry in theme.scheme.palette.iter() {
+        expressions.insert_palette_first(
+            ColorAliasName::new(entry.name.as_str()),
+            ColorExpr::parse_wire(entry.value.as_str()),
+        );
+    }
+    for entry in theme.scheme.colors.iter() {
+        expressions.insert_semantic_first(
+            ColorAliasName::new(entry.name.as_str()),
+            ColorExpr::parse_wire(entry.value.as_str()),
+        );
+    }
+    let mut resolver = ColorResolver::from_expressions(&expressions);
     let mut output = BTreeMap::new();
     for section in [&theme.common, &theme.menu] {
         for named_style in section.styles.iter() {
-            output.insert(
-                named_style.name.as_str().to_owned(),
-                resolve_archived_style(theme, &named_style.style)?,
-            );
+            let style = archived_style(&named_style.style)
+                .resolve(&mut resolver)
+                .map_err(|error| TemplateError::Render(error.to_string()))?;
+            output.insert(named_style.name.as_str().to_owned(), ratatui_style(&style));
         }
     }
     Ok(output)
 }
 
-fn resolve_style(theme: &CompiledTheme, style: &Style) -> Result<RatatuiStyle, TemplateError> {
-    let mut resolved = RatatuiStyle::default();
-    if let Some(color) = &style.foreground {
-        resolved = resolved.fg(resolve_color(theme, color)?);
+fn archived_style(style: &ArchivedStyleWire) -> Style {
+    Style {
+        foreground: style
+            .foreground
+            .as_ref()
+            .map(|color| ColorExpr::parse_wire(color.as_str())),
+        background: style
+            .background
+            .as_ref()
+            .map(|color| ColorExpr::parse_wire(color.as_str())),
+        bold: style.bold,
+        dim: style.dim,
+        italic: style.italic,
+        underline: style.underline,
+        strikethrough: style.strikethrough,
     }
-    if let Some(color) = &style.background {
-        resolved = resolved.bg(resolve_color(theme, color)?);
+}
+
+fn ratatui_style(style: &ResolvedStyle) -> RatatuiStyle {
+    let mut resolved = RatatuiStyle::default();
+    if let Some(color) = style.foreground {
+        resolved = resolved.fg(ratatui_color(color));
+    }
+    if let Some(color) = style.background {
+        resolved = resolved.bg(ratatui_color(color));
     }
     for (enabled, modifier) in [
         (style.bold, Modifier::BOLD),
@@ -428,91 +463,14 @@ fn resolve_style(theme: &CompiledTheme, style: &Style) -> Result<RatatuiStyle, T
             resolved = resolved.add_modifier(modifier);
         }
     }
-    Ok(resolved)
+    resolved
 }
 
-fn resolve_archived_style(
-    theme: &ArchivedCompiledThemeWire,
-    style: &ArchivedStyleWire,
-) -> Result<RatatuiStyle, TemplateError> {
-    let mut resolved = RatatuiStyle::default();
-    if let Some(color) = style.foreground.as_ref() {
-        resolved = resolved.fg(resolve_archived_color(theme, color.as_str())?);
-    }
-    if let Some(color) = style.background.as_ref() {
-        resolved = resolved.bg(resolve_archived_color(theme, color.as_str())?);
-    }
-    for (enabled, modifier) in [
-        (style.bold, Modifier::BOLD),
-        (style.dim, Modifier::DIM),
-        (style.italic, Modifier::ITALIC),
-        (style.underline, Modifier::UNDERLINED),
-        (style.strikethrough, Modifier::CROSSED_OUT),
-    ] {
-        if enabled {
-            resolved = resolved.add_modifier(modifier);
-        }
-    }
-    Ok(resolved)
-}
-
-fn resolve_color(theme: &CompiledTheme, color: &str) -> Result<RatatuiColor, TemplateError> {
-    let color = if color.starts_with('#') {
-        Color::parse(color)
-    } else {
-        theme.scheme.resolve(color)
-    }
-    .map_err(|error| TemplateError::Render(error.to_string()))?;
-    Ok(match color {
+fn ratatui_color(color: Color) -> RatatuiColor {
+    match color {
         Color::Inherit => RatatuiColor::Reset,
         Color::Rgb { red, green, blue } => RatatuiColor::Rgb(red, green, blue),
-    })
-}
-
-fn resolve_archived_color(
-    theme: &ArchivedCompiledThemeWire,
-    color: &str,
-) -> Result<RatatuiColor, TemplateError> {
-    let mut seen = BTreeSet::new();
-    let color = resolve_archived_color_inner(theme, color, &mut seen)?;
-    Ok(match color {
-        Color::Inherit => RatatuiColor::Reset,
-        Color::Rgb { red, green, blue } => RatatuiColor::Rgb(red, green, blue),
-    })
-}
-
-fn resolve_archived_color_inner(
-    theme: &ArchivedCompiledThemeWire,
-    color: &str,
-    seen: &mut BTreeSet<String>,
-) -> Result<Color, TemplateError> {
-    if color == "inherit" {
-        return Ok(Color::Inherit);
     }
-    if color.starts_with('#') {
-        return Color::parse(color).map_err(|error| TemplateError::Render(error.to_string()));
-    }
-    if !seen.insert(color.to_owned()) {
-        return Err(TemplateError::Render(format!(
-            "color alias cycle at `{color}`"
-        )));
-    }
-    let value = theme
-        .scheme
-        .colors
-        .iter()
-        .find(|entry| entry.name.as_str() == color)
-        .or_else(|| {
-            theme
-                .scheme
-                .palette
-                .iter()
-                .find(|entry| entry.name.as_str() == color)
-        })
-        .ok_or_else(|| {
-            TemplateError::Render(format!("unknown palette or semantic color `{color}`"))
-        })?;
-    resolve_archived_color_inner(theme, value.value.as_str(), seen)
 }
 
 fn parse_style_markup(rendered: &str, styles: &BTreeMap<String, RatatuiStyle>) -> RenderedText {
@@ -846,6 +804,61 @@ mod tests {
             },
         )
         .expect("fixture uses a valid core theme")
+    }
+
+    #[test]
+    fn normal_style_inherit_is_an_alias_not_a_terminal_reset() {
+        let templates = theme_with_templates("[hotkey]{{ title }}[/hotkey]")
+            .theme
+            .menu
+            .templates;
+        let theme = CompiledTheme::compile(
+            Theme {
+                common: ThemeSection::default(),
+                menu: ThemeSection {
+                    styles: BTreeMap::from([(
+                        "hotkey".into(),
+                        Style {
+                            foreground: Some(ColorExpr::parse_style("inherit")),
+                            background: Some(ColorExpr::parse_style("#456")),
+                            ..Style::default()
+                        },
+                    )]),
+                    templates,
+                },
+                settings: BTreeMap::new(),
+            },
+            ColorScheme {
+                title: "test".into(),
+                palette: BTreeMap::from([(
+                    ColorAliasName::new("inherit"),
+                    Color::Rgb {
+                        red: 0x11,
+                        green: 0x22,
+                        blue: 0x33,
+                    },
+                )]),
+                colors: BTreeMap::new(),
+            },
+        )
+        .expect("normal inherit resolves through the scheme");
+        let rendered = TemplateRenderer::new(&theme)
+            .expect("resolved theme constructs")
+            .render_cell(CellTemplate {
+                key: "a",
+                title: "Open",
+                disabled: false,
+                blocked: false,
+                max_title_width: 24,
+            })
+            .expect("normal style renders");
+        assert_eq!(rendered.plain, "Open");
+        assert_eq!(
+            rendered.spans[0].style,
+            RatatuiStyle::default()
+                .fg(RatatuiColor::Rgb(0x11, 0x22, 0x33))
+                .bg(RatatuiColor::Rgb(0x44, 0x55, 0x66)),
+        );
     }
 
     #[test]

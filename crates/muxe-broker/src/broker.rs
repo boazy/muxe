@@ -792,14 +792,14 @@ fn resolve_attachment_theme(
     request: &AttachUi,
 ) -> Result<ResolvedAttachmentTheme, BrokerError> {
     let selection = ThemeSelection {
-        theme: request
-            .theme
-            .clone()
-            .unwrap_or_else(|| config.theme_selection.theme.clone()),
-        color_scheme: request
-            .color_scheme
-            .clone()
-            .unwrap_or_else(|| config.theme_selection.color_scheme.clone()),
+        theme: request.theme.as_deref().map_or_else(
+            || config.theme_selection.theme.clone(),
+            muxe_core::ThemeName::new,
+        ),
+        color_scheme: request.color_scheme.as_deref().map_or_else(
+            || config.theme_selection.color_scheme.clone(),
+            muxe_core::ColorSchemeName::new,
+        ),
     };
     config
         .resolve_theme(&selection)
@@ -9650,10 +9650,34 @@ colors:
             panic!("expected Immediate UiAttached for B");
         };
 
-        // Snapshots differ
-        assert_ne!(snap_a.theme, snap_b.theme);
         assert_eq!(snap_a.theme.scheme.title, "Scheme One");
         assert_eq!(snap_b.theme.scheme.title, "Scheme Two");
+        assert_eq!(
+            snap_a
+                .theme
+                .menu
+                .styles
+                .iter()
+                .find(|style| style.name == "title")
+                .unwrap()
+                .style
+                .foreground
+                .as_deref(),
+            Some("#222222")
+        );
+        assert_eq!(
+            snap_b
+                .theme
+                .menu
+                .styles
+                .iter()
+                .find(|style| style.name == "title")
+                .unwrap()
+                .style
+                .foreground
+                .as_deref(),
+            Some("#444444")
+        );
         assert!(
             snap_a
                 .theme
@@ -9673,8 +9697,14 @@ colors:
 
         // Generation default remains untouched
         let current_config = broker.config.snapshot().await.config;
-        assert_eq!(current_config.theme_selection.theme, "theme-one");
-        assert_eq!(current_config.theme_selection.color_scheme, "scheme-one");
+        assert_eq!(
+            current_config.theme_selection.theme,
+            muxe_core::ThemeName::new("theme-one")
+        );
+        assert_eq!(
+            current_config.theme_selection.color_scheme,
+            muxe_core::ColorSchemeName::new("scheme-one")
+        );
     }
 
     #[tokio::test]

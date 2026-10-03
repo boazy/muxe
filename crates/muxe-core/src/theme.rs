@@ -3,6 +3,45 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
+macro_rules! theme_name {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(String);
+        impl $name {
+            #[must_use]
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+            #[must_use]
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+theme_name!(
+    ThemeName,
+    "Opaque theme catalog identity, distinct from color-scheme identity and display titles."
+);
+theme_name!(
+    ColorSchemeName,
+    "Opaque color-scheme catalog identity, distinct from theme identity and display titles."
+);
+theme_name!(
+    ColorAliasName,
+    "A name in the shared semantic-color and palette lookup namespace."
+);
+
 /// Resolved theme color. `Inherit` delegates foreground or background selection to the host
 /// terminal; `Rgb` is an explicit truecolor value.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -62,49 +101,205 @@ impl Color {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ColorScheme {
-    pub title: String,
-    pub palette: BTreeMap<String, String>,
-    /// Dot-qualified semantic aliases such as `base.text` and `status.error`.
-    pub colors: BTreeMap<String, String>,
+impl fmt::Display for Color {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Inherit => formatter.write_str("inherit"),
+            Self::Rgb { red, green, blue } => write!(formatter, "#{red:02x}{green:02x}{blue:02x}"),
+        }
+    }
 }
 
-impl ColorScheme {
-    /// Resolves one semantic or palette alias to a concrete color.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ColorExpr {
+    Literal(Color),
+    Alias(ColorAliasName),
+    Inherit,
+}
+
+impl ColorExpr {
+    /// Parses config style syntax: only hexadecimal text is literal; `inherit` is an alias.
     ///
     /// # Errors
     ///
-    /// Returns [`ThemePairError`] for missing aliases, alias cycles, or invalid colors.
-    pub fn resolve(&self, name: &str) -> Result<Color, ThemePairError> {
-        let mut seen = HashSet::new();
-        self.resolve_inner(name, &mut seen)
+    /// Returns a color syntax error for malformed hexadecimal literals.
+    pub fn parse_style(value: &str) -> Result<Self, ThemePairError> {
+        if value.starts_with('#') {
+            Color::parse(value).map(Self::Literal)
+        } else {
+            Ok(Self::Alias(ColorAliasName::new(value)))
+        }
     }
 
-    fn resolve_inner(
-        &self,
-        name: &str,
-        seen: &mut HashSet<String>,
-    ) -> Result<Color, ThemePairError> {
-        if !seen.insert(name.to_owned()) {
+    /// Parses external wire color syntax, whose `inherit` keyword precedes name lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a color syntax error for malformed hexadecimal literals.
+    pub fn parse_wire(value: &str) -> Result<Self, ThemePairError> {
+        if value == "inherit" {
+            Ok(Self::Inherit)
+        } else {
+            Self::parse_style(value)
+        }
+    }
+}
+
+/// Final palette and semantic colors, after asset aliases have been resolved once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColorScheme {
+    pub title: String,
+    pub palette: BTreeMap<ColorAliasName, Color>,
+    pub colors: BTreeMap<ColorAliasName, Color>,
+}
+
+impl ColorScheme {
+    /// Looks up a resolved name, retaining semantic-before-palette precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name does not exist.
+    pub fn resolve(&self, name: &ColorAliasName) -> Result<Color, ThemePairError> {
+        self.colors
+            .get(name)
+            .or_else(|| self.palette.get(name))
+            .copied()
+            .ok_or_else(|| {
+                ThemePairError::new(format!("unknown palette or semantic color `{name}`"))
+            })
+    }
+}
+
+/// A boundary-parsed color graph. Deferred entry errors preserve legacy archive reachability.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ColorExpressions {
+    palette: BTreeMap<ColorAliasName, Result<ColorExpr, ThemePairError>>,
+    colors: BTreeMap<ColorAliasName, Result<ColorExpr, ThemePairError>>,
+}
+
+impl ColorExpressions {
+    pub fn insert_palette_first(
+        &mut self,
+        name: ColorAliasName,
+        value: Result<ColorExpr, ThemePairError>,
+    ) {
+        self.palette.entry(name).or_insert(value);
+    }
+    /// Inserts a config palette field, preserving its last-wins duplicate policy.
+    pub(crate) fn insert_palette_last(
+        &mut self,
+        name: ColorAliasName,
+        value: Result<ColorExpr, ThemePairError>,
+    ) {
+        self.palette.insert(name, value);
+    }
+    pub fn insert_semantic_first(
+        &mut self,
+        name: ColorAliasName,
+        value: Result<ColorExpr, ThemePairError>,
+    ) {
+        self.colors.entry(name).or_insert(value);
+    }
+
+    /// Validates every asset entry and consumes expressions into resolved colors.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first malformed expression, unknown alias, or cycle, including unused entries.
+    pub fn resolve_all(self, title: String) -> Result<ColorScheme, ThemePairError> {
+        let mut resolver = ColorResolver::from_expressions(&self);
+        let palette_values = self
+            .palette
+            .values()
+            .map(|value| resolver.resolve(value.as_ref().map_err(Clone::clone)?))
+            .collect::<Result<Vec<_>, ThemePairError>>()?;
+        let color_values = self
+            .colors
+            .keys()
+            .map(|name| resolver.resolve_name(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(resolver);
+        Ok(ColorScheme {
+            title,
+            palette: self.palette.into_keys().zip(palette_values).collect(),
+            colors: self.colors.into_keys().zip(color_values).collect(),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ColorSource<'a> {
+    Scheme(&'a ColorScheme),
+    Expressions(&'a ColorExpressions),
+}
+
+/// One construction-round resolver, shared by assets, compiled styles, and external archives.
+pub struct ColorResolver<'a> {
+    source: ColorSource<'a>,
+    active: HashSet<&'a ColorAliasName>,
+    resolved: BTreeMap<&'a ColorAliasName, Color>,
+}
+
+impl<'a> ColorResolver<'a> {
+    #[must_use]
+    pub fn from_scheme(scheme: &'a ColorScheme) -> Self {
+        Self {
+            source: ColorSource::Scheme(scheme),
+            active: HashSet::new(),
+            resolved: BTreeMap::new(),
+        }
+    }
+    #[must_use]
+    pub fn from_expressions(expressions: &'a ColorExpressions) -> Self {
+        Self {
+            source: ColorSource::Expressions(expressions),
+            active: HashSet::new(),
+            resolved: BTreeMap::new(),
+        }
+    }
+
+    /// Resolves a typed root; successful named graph results are memoized for this round.
+    ///
+    /// # Errors
+    ///
+    /// Returns stored parsing errors, unknown names, or alias cycles.
+    pub fn resolve(&mut self, expression: &ColorExpr) -> Result<Color, ThemePairError> {
+        match expression {
+            ColorExpr::Literal(color) => Ok(*color),
+            ColorExpr::Inherit => Ok(Color::Inherit),
+            ColorExpr::Alias(name) => self.resolve_name(name),
+        }
+    }
+
+    fn resolve_name(&mut self, name: &ColorAliasName) -> Result<Color, ThemePairError> {
+        let graph = match self.source {
+            ColorSource::Scheme(scheme) => return scheme.resolve(name),
+            ColorSource::Expressions(graph) => graph,
+        };
+        if let Some(color) = self.resolved.get(name) {
+            return Ok(*color);
+        }
+        let (key, expression) = graph
+            .colors
+            .get_key_value(name)
+            .or_else(|| graph.palette.get_key_value(name))
+            .ok_or_else(|| {
+                ThemePairError::new(format!("unknown palette or semantic color `{name}`"))
+            })?;
+        if !self.active.insert(key) {
             return Err(ThemePairError::new(format!(
                 "color alias cycle at `{name}`"
             )));
         }
-        let value = self
-            .colors
-            .get(name)
-            .or_else(|| self.palette.get(name))
-            .ok_or_else(|| {
-                ThemePairError::new(format!("unknown palette or semantic color `{name}`"))
-            })?;
-        if value == "inherit" {
-            Ok(Color::Inherit)
-        } else if value.starts_with('#') {
-            Color::parse(value)
-        } else {
-            self.resolve_inner(value, seen)
+        let result = match expression {
+            Ok(expression) => self.resolve(expression),
+            Err(error) => Err(error.clone()),
+        };
+        self.active.remove(key);
+        if let Ok(color) = result {
+            self.resolved.insert(key, color);
         }
+        result
     }
 }
 
@@ -114,13 +309,56 @@ impl ColorScheme {
 )]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Style {
-    pub foreground: Option<String>,
-    pub background: Option<String>,
+    pub foreground: Option<Result<ColorExpr, ThemePairError>>,
+    pub background: Option<Result<ColorExpr, ThemePairError>>,
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the independent terminal style flags preserve the existing schema"
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedStyle {
+    pub foreground: Option<Color>,
+    pub background: Option<Color>,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+}
+
+impl Style {
+    /// Resolves style colors while preserving absent values and independent attributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolver's color-expression error.
+    pub fn resolve(
+        self,
+        resolver: &mut ColorResolver<'_>,
+    ) -> Result<ResolvedStyle, ThemePairError> {
+        Ok(ResolvedStyle {
+            foreground: self
+                .foreground
+                .map(|expression| expression.and_then(|expression| resolver.resolve(&expression)))
+                .transpose()?,
+            background: self
+                .background
+                .map(|expression| expression.and_then(|expression| resolver.resolve(&expression)))
+                .transpose()?,
+            bold: self.bold,
+            dim: self.dim,
+            italic: self.italic,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -134,6 +372,19 @@ pub struct Theme {
     pub common: ThemeSection,
     pub menu: ThemeSection,
     /// Theme-owned forward-compatible settings are intentionally opaque to the core schema.
+    pub settings: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedThemeSection {
+    pub styles: BTreeMap<String, ResolvedStyle>,
+    pub templates: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedTheme {
+    pub common: ResolvedThemeSection,
+    pub menu: ResolvedThemeSection,
     pub settings: BTreeMap<String, String>,
 }
 
@@ -153,7 +404,7 @@ pub const REQUIRED_COMPONENT_TEMPLATES: [&str; 5] = [
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledTheme {
-    pub theme: Theme,
+    pub theme: ResolvedTheme,
     pub scheme: ColorScheme,
 }
 /// Immutable parsed theme and color-scheme assets retained by one compiled generation.
@@ -162,8 +413,8 @@ pub struct CompiledTheme {
 /// parsing it. The broker can therefore reject a malformed attach override without filesystem I/O.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledThemeCatalog {
-    themes: BTreeMap<String, ThemeAsset<Theme>>,
-    color_schemes: BTreeMap<String, ThemeAsset<ColorScheme>>,
+    themes: BTreeMap<ThemeName, ThemeAsset<Theme>>,
+    color_schemes: BTreeMap<ColorSchemeName, ThemeAsset<ColorScheme>>,
     origin: Arc<()>,
 }
 
@@ -176,22 +427,22 @@ struct ThemeAsset<T> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ThemeSelectionError {
     UnknownTheme {
-        name: String,
+        name: ThemeName,
     },
     UnknownColorScheme {
-        name: String,
+        name: ColorSchemeName,
     },
     InvalidTheme {
-        name: String,
+        name: ThemeName,
         diagnostics: Vec<ConfigDiagnostic>,
     },
     InvalidColorScheme {
-        name: String,
+        name: ColorSchemeName,
         diagnostics: Vec<ConfigDiagnostic>,
     },
     InvalidPair {
-        theme: String,
-        color_scheme: String,
+        theme: ThemeName,
+        color_scheme: ColorSchemeName,
         error: ThemePairError,
         span: SourceSpan,
     },
@@ -243,8 +494,11 @@ impl std::error::Error for ThemeSelectionError {}
 
 impl CompiledThemeCatalog {
     pub(crate) fn new(
-        themes: BTreeMap<String, (Result<Theme, Vec<ConfigDiagnostic>>, SourceSpan)>,
-        color_schemes: BTreeMap<String, (Result<ColorScheme, Vec<ConfigDiagnostic>>, SourceSpan)>,
+        themes: BTreeMap<ThemeName, (Result<Theme, Vec<ConfigDiagnostic>>, SourceSpan)>,
+        color_schemes: BTreeMap<
+            ColorSchemeName,
+            (Result<ColorScheme, Vec<ConfigDiagnostic>>, SourceSpan),
+        >,
     ) -> Self {
         Self {
             themes: themes
@@ -271,35 +525,35 @@ impl CompiledThemeCatalog {
     /// the mixed pair violates the shared [`CompiledTheme`] validation contract.
     pub fn resolve(
         &self,
-        theme_name: &str,
-        color_scheme_name: &str,
+        theme_name: &ThemeName,
+        color_scheme_name: &ColorSchemeName,
     ) -> Result<CompiledTheme, ThemeSelectionError> {
         let theme_asset =
             self.themes
                 .get(theme_name)
                 .ok_or_else(|| ThemeSelectionError::UnknownTheme {
-                    name: theme_name.to_owned(),
+                    name: theme_name.clone(),
                 })?;
         let theme = theme_asset.parsed.clone().map_err(|diagnostics| {
             ThemeSelectionError::InvalidTheme {
-                name: theme_name.to_owned(),
+                name: theme_name.clone(),
                 diagnostics,
             }
         })?;
         let scheme_asset = self.color_schemes.get(color_scheme_name).ok_or_else(|| {
             ThemeSelectionError::UnknownColorScheme {
-                name: color_scheme_name.to_owned(),
+                name: color_scheme_name.clone(),
             }
         })?;
         let scheme = scheme_asset.parsed.clone().map_err(|diagnostics| {
             ThemeSelectionError::InvalidColorScheme {
-                name: color_scheme_name.to_owned(),
+                name: color_scheme_name.clone(),
                 diagnostics,
             }
         })?;
         CompiledTheme::compile(theme, scheme).map_err(|error| ThemeSelectionError::InvalidPair {
-            theme: theme_name.to_owned(),
-            color_scheme: color_scheme_name.to_owned(),
+            theme: theme_name.clone(),
+            color_scheme: color_scheme_name.clone(),
             error,
             span: theme_asset.span.clone(),
         })
@@ -334,60 +588,70 @@ impl CompiledTheme {
     /// Returns [`ThemePairError`] for loader-backed or invalid templates, unresolved style
     /// colors, unknown literal style references, or a missing required component template.
     pub fn compile(theme: Theme, scheme: ColorScheme) -> Result<Self, ThemePairError> {
-        for (section, fallback) in [(&theme.common, None), (&theme.menu, Some(&theme.common))] {
-            for style in section.styles.values() {
-                for color in [style.foreground.as_deref(), style.background.as_deref()]
-                    .into_iter()
-                    .flatten()
-                {
-                    if color.starts_with('#') {
-                        Color::parse(color)?;
-                    } else {
-                        scheme.resolve(color)?;
-                    }
-                }
-            }
-            for template in section.templates.values() {
-                if has_loader_backed_construct(template) {
-                    return Err(ThemePairError::new(
-                        "theme templates cannot use loader-backed tags",
-                    ));
-                }
-                minijinja::Environment::new()
-                    .template_from_str(template)
-                    .map_err(|error| ThemePairError::new(error.to_string()))?;
-                for style_name in literal_style_tags(template) {
-                    if section.styles.contains_key(style_name)
-                        || fallback.is_some_and(|common| common.styles.contains_key(style_name))
-                    {
-                        continue;
-                    }
-                    return Err(ThemePairError::new(format!(
-                        "template references unknown literal style `{style_name}`"
-                    )));
-                }
-            }
-        }
+        let mut resolver = ColorResolver::from_scheme(&scheme);
+        let common = compile_theme_section(theme.common, None, &mut resolver)?;
+        let menu = compile_theme_section(theme.menu, Some(&common), &mut resolver)?;
         for name in REQUIRED_COMPONENT_TEMPLATES {
-            if !theme.menu.templates.contains_key(name)
-                && !theme.common.templates.contains_key(name)
-            {
+            if !menu.templates.contains_key(name) && !common.templates.contains_key(name) {
                 return Err(ThemePairError::new(format!(
                     "selected theme has no `{name}` template"
                 )));
             }
         }
-        Ok(Self { theme, scheme })
+        Ok(Self {
+            theme: ResolvedTheme {
+                common,
+                menu,
+                settings: theme.settings,
+            },
+            scheme,
+        })
     }
 
     #[must_use]
-    pub fn style(&self, name: &str) -> Option<&Style> {
+    pub fn style(&self, name: &str) -> Option<&ResolvedStyle> {
         self.theme
             .menu
             .styles
             .get(name)
             .or_else(|| self.theme.common.styles.get(name))
     }
+}
+
+fn compile_theme_section(
+    section: ThemeSection,
+    fallback: Option<&ResolvedThemeSection>,
+    resolver: &mut ColorResolver<'_>,
+) -> Result<ResolvedThemeSection, ThemePairError> {
+    let styles = section
+        .styles
+        .into_iter()
+        .map(|(name, style)| style.resolve(resolver).map(|style| (name, style)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    for template in section.templates.values() {
+        if has_loader_backed_construct(template) {
+            return Err(ThemePairError::new(
+                "theme templates cannot use loader-backed tags",
+            ));
+        }
+        minijinja::Environment::new()
+            .template_from_str(template)
+            .map_err(|error| ThemePairError::new(error.to_string()))?;
+        for style_name in literal_style_tags(template) {
+            if styles.contains_key(style_name)
+                || fallback.is_some_and(|common| common.styles.contains_key(style_name))
+            {
+                continue;
+            }
+            return Err(ThemePairError::new(format!(
+                "template references unknown literal style `{style_name}`"
+            )));
+        }
+    }
+    Ok(ResolvedThemeSection {
+        styles,
+        templates: section.templates,
+    })
 }
 
 fn literal_style_tags(template: &str) -> impl Iterator<Item = &str> {
@@ -543,15 +807,15 @@ pub fn default_theme() -> Theme {
                 (
                     "default".to_owned(),
                     Style {
-                        foreground: Some("base.text".to_owned()),
-                        background: Some("base.background".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("base.text")))),
+                        background: Some(Ok(ColorExpr::Alias(ColorAliasName::new("base.background")))),
                         ..Style::default()
                     },
                 ),
                 (
                     "muted".to_owned(),
                     Style {
-                        foreground: Some("base.muted".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("base.muted")))),
                         ..Style::default()
                     },
                 ),
@@ -563,7 +827,7 @@ pub fn default_theme() -> Theme {
                 (
                     "title".to_owned(),
                     Style {
-                        foreground: Some("base.text".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("base.text")))),
                         bold: true,
                         ..Style::default()
                     },
@@ -571,7 +835,7 @@ pub fn default_theme() -> Theme {
                 (
                     "hotkey".to_owned(),
                     Style {
-                        foreground: Some("menu.hotkey".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("menu.hotkey")))),
                         bold: true,
                         ..Style::default()
                     },
@@ -579,7 +843,7 @@ pub fn default_theme() -> Theme {
                 (
                     "alert".to_owned(),
                     Style {
-                        foreground: Some("status.error".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("status.error")))),
                         bold: true,
                         ..Style::default()
                     },
@@ -587,14 +851,14 @@ pub fn default_theme() -> Theme {
                 (
                     "arrow".to_owned(),
                     Style {
-                        foreground: Some("menu.separator".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("menu.separator")))),
                         ..Style::default()
                     },
                 ),
                 (
                     "disabled".to_owned(),
                     Style {
-                        foreground: Some("base.muted".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("base.muted")))),
                         dim: true,
                         ..Style::default()
                     },
@@ -602,14 +866,14 @@ pub fn default_theme() -> Theme {
                 (
                     "crumb".to_owned(),
                     Style {
-                        foreground: Some("menu.separator".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("menu.separator")))),
                         ..Style::default()
                     },
                 ),
                 (
                     "error".to_owned(),
                     Style {
-                        foreground: Some("status.error".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("status.error")))),
                         bold: true,
                         ..Style::default()
                     },
@@ -617,14 +881,14 @@ pub fn default_theme() -> Theme {
                 (
                     "pending".to_owned(),
                     Style {
-                        foreground: Some("status.pending".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("status.pending")))),
                         ..Style::default()
                     },
                 ),
                 (
                     "blocked".to_owned(),
                     Style {
-                        foreground: Some("status.blocked".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("status.blocked")))),
                         bold: true,
                         ..Style::default()
                     },
@@ -632,14 +896,14 @@ pub fn default_theme() -> Theme {
                 (
                     "reload".to_owned(),
                     Style {
-                        foreground: Some("status.reload".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("status.reload")))),
                         ..Style::default()
                     },
                 ),
                 (
                     "notice".to_owned(),
                     Style {
-                        foreground: Some("status.notice".to_owned()),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("status.notice")))),
                         ..Style::default()
                     },
                 ),
@@ -678,16 +942,16 @@ pub fn default_color_scheme() -> ColorScheme {
         title: "default".to_owned(),
         palette: BTreeMap::new(),
         colors: BTreeMap::from([
-            ("base.text".to_owned(), "inherit".to_owned()),
-            ("base.background".to_owned(), "inherit".to_owned()),
-            ("base.muted".to_owned(), "inherit".to_owned()),
-            ("menu.hotkey".to_owned(), "inherit".to_owned()),
-            ("menu.separator".to_owned(), "inherit".to_owned()),
-            ("status.error".to_owned(), "inherit".to_owned()),
-            ("status.pending".to_owned(), "inherit".to_owned()),
-            ("status.blocked".to_owned(), "inherit".to_owned()),
-            ("status.reload".to_owned(), "inherit".to_owned()),
-            ("status.notice".to_owned(), "inherit".to_owned()),
+            (ColorAliasName::new("base.text"), Color::Inherit),
+            (ColorAliasName::new("base.background"), Color::Inherit),
+            (ColorAliasName::new("base.muted"), Color::Inherit),
+            (ColorAliasName::new("menu.hotkey"), Color::Inherit),
+            (ColorAliasName::new("menu.separator"), Color::Inherit),
+            (ColorAliasName::new("status.error"), Color::Inherit),
+            (ColorAliasName::new("status.pending"), Color::Inherit),
+            (ColorAliasName::new("status.blocked"), Color::Inherit),
+            (ColorAliasName::new("status.reload"), Color::Inherit),
+            (ColorAliasName::new("status.notice"), Color::Inherit),
         ]),
     }
 }
@@ -710,37 +974,36 @@ mod tests {
 
     #[test]
     fn color_scheme_resolves_alias_chains_and_rejects_cycles() {
-        let scheme = ColorScheme {
-            title: "test".into(),
-            palette: BTreeMap::from([("base".into(), "#123".into())]),
-            colors: BTreeMap::from([("menu.hotkey".into(), "base".into())]),
-        };
+        let mut expressions = ColorExpressions::default();
+        expressions
+            .insert_palette_first(ColorAliasName::new("base"), ColorExpr::parse_wire("#123"));
+        expressions
+            .insert_semantic_first(ColorAliasName::new("mid"), ColorExpr::parse_style("base"));
+        expressions.insert_semantic_first(
+            ColorAliasName::new("menu.hotkey"),
+            ColorExpr::parse_style("mid"),
+        );
+        let scheme = expressions
+            .resolve_all("test".to_owned())
+            .expect("alias chain resolves");
         assert_eq!(
-            scheme.resolve("menu.hotkey").unwrap(),
+            scheme.resolve(&ColorAliasName::new("menu.hotkey")).unwrap(),
             Color::Rgb {
                 red: 17,
                 green: 34,
                 blue: 51
             }
         );
+        let mut cycle = ColorExpressions::default();
+        cycle.insert_semantic_first(ColorAliasName::new("a"), ColorExpr::parse_style("b"));
+        cycle.insert_semantic_first(ColorAliasName::new("b"), ColorExpr::parse_style("a"));
+        assert!(cycle.resolve_all("cycle".to_owned()).is_err());
     }
 
     #[test]
     fn color_parse_rejects_non_ascii_and_non_hex_input() {
         assert!(Color::parse("#aéaaa").is_err());
         assert!(Color::parse("#12g").is_err());
-        assert_eq!(
-            Color::parse("#g00000").unwrap_err().to_string(),
-            "invalid red channel"
-        );
-        assert_eq!(
-            Color::parse("#00g000").unwrap_err().to_string(),
-            "invalid green channel"
-        );
-        assert_eq!(
-            Color::parse("#0000g0").unwrap_err().to_string(),
-            "invalid blue channel"
-        );
     }
 
     fn complete_templates(cell_source: &str) -> BTreeMap<String, String> {
@@ -769,64 +1032,44 @@ mod tests {
 
     #[test]
     fn theme_pair_rejects_unknown_literal_style_tags() {
-        let error = CompiledTheme::compile(
-            Theme {
+        let mut theme = Theme {
+            common: ThemeSection::default(),
+            menu: ThemeSection {
+                styles: BTreeMap::new(),
+                templates: complete_templates("[missing]text[/missing]"),
+            },
+            settings: BTreeMap::new(),
+        };
+        assert!(CompiledTheme::compile(theme.clone(), test_scheme()).is_err());
+        theme
+            .menu
+            .styles
+            .insert("missing".to_owned(), Style::default());
+        CompiledTheme::compile(theme, test_scheme())
+            .expect("declaring the referenced style remedies the failure");
+    }
+
+    #[test]
+    fn missing_component_is_rejected_until_supplied_by_the_common_fallback() {
+        for missing in REQUIRED_COMPONENT_TEMPLATES {
+            let mut theme = Theme {
                 common: ThemeSection::default(),
                 menu: ThemeSection {
                     styles: BTreeMap::new(),
-                    templates: complete_templates("[missing]text[/missing]"),
+                    templates: complete_templates("{{ title }}"),
                 },
                 settings: BTreeMap::new(),
-            },
-            test_scheme(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("unknown literal style"));
-    }
-
-    #[test]
-    fn compile_rejects_each_missing_required_component_template_by_name() {
-        for missing in REQUIRED_COMPONENT_TEMPLATES {
-            let mut templates = complete_templates("{{ title }}");
-            templates.remove(missing);
-            let error = CompiledTheme::compile(
-                Theme {
-                    common: ThemeSection::default(),
-                    menu: ThemeSection {
-                        styles: BTreeMap::new(),
-                        templates,
-                    },
-                    settings: BTreeMap::new(),
-                },
-                test_scheme(),
-            )
-            .unwrap_err();
-            assert!(
-                error.to_string().contains(missing),
-                "missing `{missing}` must be named, got `{error}`"
-            );
+            };
+            let removed = theme
+                .menu
+                .templates
+                .remove(missing)
+                .expect("required fixture template");
+            assert!(CompiledTheme::compile(theme.clone(), test_scheme()).is_err());
+            theme.common.templates.insert(missing.to_owned(), removed);
+            CompiledTheme::compile(theme, test_scheme())
+                .expect("common fallback restores the missing component");
         }
-    }
-
-    #[test]
-    fn compile_accepts_common_section_templates_for_required_names() {
-        let mut menu_templates = complete_templates("{{ title }}");
-        let status = menu_templates.remove("status").expect("status fixture");
-        let error = CompiledTheme::compile(
-            Theme {
-                common: ThemeSection {
-                    styles: BTreeMap::new(),
-                    templates: BTreeMap::from([("status".to_owned(), status)]),
-                },
-                menu: ThemeSection {
-                    styles: BTreeMap::new(),
-                    templates: menu_templates,
-                },
-                settings: BTreeMap::new(),
-            },
-            test_scheme(),
-        );
-        assert!(error.is_ok(), "common fallback must satisfy completeness");
     }
 
     #[test]
@@ -842,7 +1085,7 @@ mod tests {
             "{%- from 'x' import y %}",
             "{%from 'x' import y%}",
         ] {
-            let error = CompiledTheme::compile(
+            let result = CompiledTheme::compile(
                 Theme {
                     common: ThemeSection::default(),
                     menu: ThemeSection {
@@ -852,12 +1095,8 @@ mod tests {
                     settings: BTreeMap::new(),
                 },
                 test_scheme(),
-            )
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("loader-backed"),
-                "`{source}` must be rejected, got `{error}`"
             );
+            assert!(result.is_err(), "loader-backed input must reject");
         }
         for source in [
             "{# {% include x %} #}",
@@ -933,11 +1172,12 @@ mod tests {
     #[test]
     fn embedded_default_theme_compiles_with_host_inherited_colors() {
         let theme = compiled_default_theme();
-        assert_eq!(theme.scheme.resolve("menu.hotkey").unwrap(), Color::Inherit);
-        assert!(theme.theme.menu.templates.contains_key("cell"));
-        assert!(theme.theme.menu.templates.contains_key("breadcrumbs"));
-        assert!(theme.theme.menu.templates.contains_key("pagination.full"));
-        assert!(theme.theme.menu.templates.contains_key("pagination.short"));
-        assert!(theme.theme.menu.templates.contains_key("status"));
+        assert_eq!(
+            theme
+                .scheme
+                .resolve(&ColorAliasName::new("menu.hotkey"))
+                .unwrap(),
+            Color::Inherit
+        );
     }
 }

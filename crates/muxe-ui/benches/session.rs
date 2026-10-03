@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, hint::black_box, time::Duration};
 
-use muxe_core::{SessionInstant, ThemeSection, compiled_default_theme};
+use muxe_core::{
+    Color, ColorAliasName, ResolvedThemeSection, SessionInstant, compiled_default_theme,
+};
 use muxe_protocol::{
     AfterAction, BindingConditionsWire, BindingId, BindingSettingsWire, BindingStateWire,
     BrokerResponse, ColorSchemeWire, CompiledThemeWire, ConnectionDecoder, ConnectionPolicy,
@@ -43,7 +45,17 @@ fn strings(values: &BTreeMap<String, String>) -> Vec<NamedStringWire> {
         .collect()
 }
 
-fn theme_section(section: &ThemeSection) -> ThemeSectionWire {
+fn colors(values: &BTreeMap<ColorAliasName, Color>) -> Vec<NamedStringWire> {
+    values
+        .iter()
+        .map(|(name, value)| NamedStringWire {
+            name: name.as_str().to_owned(),
+            value: value.to_string(),
+        })
+        .collect()
+}
+
+fn theme_section(section: &ResolvedThemeSection) -> ThemeSectionWire {
     ThemeSectionWire {
         styles: section
             .styles
@@ -51,8 +63,8 @@ fn theme_section(section: &ThemeSection) -> ThemeSectionWire {
             .map(|(name, style)| NamedStyleWire {
                 name: name.clone(),
                 style: StyleWire {
-                    foreground: style.foreground.clone(),
-                    background: style.background.clone(),
+                    foreground: style.foreground.map(|color| color.to_string()),
+                    background: style.background.map(|color| color.to_string()),
                     bold: style.bold,
                     dim: style.dim,
                     italic: style.italic,
@@ -73,8 +85,8 @@ fn default_theme_wire() -> CompiledThemeWire {
         settings: strings(&theme.theme.settings),
         scheme: ColorSchemeWire {
             title: theme.scheme.title,
-            palette: strings(&theme.scheme.palette),
-            colors: strings(&theme.scheme.colors),
+            palette: colors(&theme.scheme.palette),
+            colors: colors(&theme.scheme.colors),
         },
     }
 }

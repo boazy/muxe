@@ -1,9 +1,10 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use muxe_core::{
-    AfterAction as CoreAfterAction, BindingConditions, BindingId as CoreBindingId, ConditionIr,
-    KeyboardProfile, LocalMenuAction, MenuControl as CoreMenuControl, MenuId as CoreMenuId,
-    MenuView, MenuViewMenu, ThemeSection, UiAttachmentView, ViewBindingSettings,
+    AfterAction as CoreAfterAction, BindingConditions, BindingId as CoreBindingId, Color,
+    ColorAliasName, ConditionIr, KeyboardProfile, LocalMenuAction, MenuControl as CoreMenuControl,
+    MenuId as CoreMenuId, MenuView, MenuViewMenu, ResolvedThemeSection, UiAttachmentView,
+    ViewBindingSettings,
 };
 use muxe_protocol::{
     AfterAction, BindingConditionsWire, BindingId, BindingSettingsWire, BindingStateWire,
@@ -248,13 +249,13 @@ fn theme(value: &muxe_core::CompiledTheme) -> CompiledThemeWire {
         settings: strings(&value.theme.settings),
         scheme: ColorSchemeWire {
             title: value.scheme.title.clone(),
-            palette: strings(&value.scheme.palette),
-            colors: strings(&value.scheme.colors),
+            palette: colors(&value.scheme.palette),
+            colors: colors(&value.scheme.colors),
         },
     }
 }
 
-fn theme_section(section: &ThemeSection) -> ThemeSectionWire {
+fn theme_section(section: &ResolvedThemeSection) -> ThemeSectionWire {
     ThemeSectionWire {
         styles: section
             .styles
@@ -262,8 +263,8 @@ fn theme_section(section: &ThemeSection) -> ThemeSectionWire {
             .map(|(name, style)| NamedStyleWire {
                 name: name.clone(),
                 style: StyleWire {
-                    foreground: style.foreground.clone(),
-                    background: style.background.clone(),
+                    foreground: style.foreground.map(|color| color.to_string()),
+                    background: style.background.map(|color| color.to_string()),
                     bold: style.bold,
                     dim: style.dim,
                     italic: style.italic,
@@ -282,6 +283,16 @@ fn strings(values: &std::collections::BTreeMap<String, String>) -> Vec<NamedStri
         .map(|(name, value)| NamedStringWire {
             name: name.clone(),
             value: value.clone(),
+        })
+        .collect()
+}
+
+fn colors(values: &BTreeMap<ColorAliasName, Color>) -> Vec<NamedStringWire> {
+    values
+        .iter()
+        .map(|(name, value)| NamedStringWire {
+            name: name.as_str().to_owned(),
+            value: value.to_string(),
         })
         .collect()
 }

@@ -1,6 +1,6 @@
 use muxe_core::{
-    CompileInput, CompiledGeneration, Compiler, ConfigDocument, DiagnosticCode, KeyCapabilities,
-    MenuName, SourceId, ThemeAssets,
+    Color, ColorAliasName, ColorSchemeName, CompileInput, CompiledGeneration, Compiler,
+    ConfigDocument, DiagnosticCode, KeyCapabilities, MenuName, SourceId, ThemeAssets, ThemeName,
 };
 use std::sync::Mutex;
 
@@ -665,11 +665,11 @@ menu:
 fn custom_theme_assets(theme_yaml: &str) -> ThemeAssets {
     ThemeAssets {
         themes: std::collections::BTreeMap::from([(
-            "custom".to_owned(),
+            ThemeName::new("custom"),
             document("themes/custom.yml", theme_yaml),
         )]),
         color_schemes: std::collections::BTreeMap::from([(
-            "ink".to_owned(),
+            ColorSchemeName::new("ink"),
             document(
                 "color-schemes/ink.yml",
                 r##"
@@ -714,6 +714,19 @@ menus:
 
 #[test]
 fn incomplete_theme_is_rejected_before_attachment() {
+    let control = custom_theme_config(COMPLETE_CUSTOM_THEME_YAML);
+    assert_eq!(
+        control
+            .theme
+            .style("title")
+            .expect("valid complete template control")
+            .foreground,
+        Some(Color::Rgb {
+            red: 0x78,
+            green: 0x9a,
+            blue: 0xbc
+        })
+    );
     let diagnostics = Compiler
         .compile(
             CompileInput {
@@ -748,16 +761,24 @@ menu:
             None,
         )
         .expect_err("a theme with only `cell` must not compile");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("breadcrumbs")),
-        "missing `breadcrumbs` must be named, got {diagnostics:?}"
-    );
+    assert_eq!(diagnostics[0].code, DiagnosticCode::InvalidTheme);
 }
 
 #[test]
 fn whitespace_controlled_loader_tags_are_rejected_at_compile() {
+    let control = custom_theme_config(COMPLETE_CUSTOM_THEME_YAML);
+    assert_eq!(
+        control
+            .theme
+            .style("title")
+            .expect("valid non-loader template control")
+            .foreground,
+        Some(Color::Rgb {
+            red: 0x78,
+            green: 0x9a,
+            blue: 0xbc
+        })
+    );
     for (name, cell) in [
         ("dash include", "{%- include 'status' %}"),
         ("plus include", "{%+ include 'status' %}"),
@@ -804,32 +825,15 @@ menus:
                 None,
             )
             .expect_err("a loader-backed cell must not compile");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("loader-backed")),
-            "{name} must be rejected as loader-backed, got {diagnostics:?}"
-        );
+        assert_eq!(diagnostics[0].code, DiagnosticCode::InvalidTheme, "{name}");
     }
-}
-
-#[test]
-fn selected_theme_and_color_scheme_are_carried_to_attachment() {
-    let config = custom_theme_config(COMPLETE_CUSTOM_THEME_YAML);
-    assert_eq!(config.theme_selection.theme, "custom");
-    assert_eq!(config.theme_selection.color_scheme, "ink");
-    let attachment = config
-        .attachment_view(&id("main"), &config.theme_selection)
-        .expect("compiled main menu has an attachment");
-    assert_eq!(attachment.theme_selection, config.theme_selection);
-    assert_eq!(attachment.theme.as_ref(), &config.theme);
 }
 
 #[test]
 fn unused_malformed_asset_does_not_block_generation_but_preserves_attach_diagnostic() {
     let mut assets = custom_theme_assets(COMPLETE_CUSTOM_THEME_YAML);
     assets.themes.insert(
-        "unused-malformed".to_owned(),
+        ThemeName::new("unused-malformed"),
         document("themes/unused-malformed.yml", "common:\n  unknown: true\n"),
     );
     let config = Compiler
@@ -857,8 +861,8 @@ menus:
         .expect("unused malformed assets do not block the selected generation pair");
     let error = config
         .resolve_theme(&muxe_core::ThemeSelection {
-            theme: "unused-malformed".to_owned(),
-            color_scheme: "ink".to_owned(),
+            theme: ThemeName::new("unused-malformed"),
+            color_scheme: ColorSchemeName::new("ink"),
         })
         .expect_err("selecting malformed asset reports its pinned diagnostics");
     let muxe_core::ThemeSelectionError::InvalidTheme { diagnostics, .. } = error else {
@@ -873,6 +877,52 @@ menus:
 }
 
 #[test]
+fn style_color_faults_remain_deferred_selected_pair_errors_at_the_asset_root() {
+    for value in ["#ggg", "missing.color"] {
+        let mut assets = custom_theme_assets(COMPLETE_CUSTOM_THEME_YAML);
+        let bad_yaml = COMPLETE_CUSTOM_THEME_YAML
+            .replace("foreground: base.text", &format!("foreground: '{value}'"));
+        let bad_document = document("themes/bad-style.yml", &bad_yaml);
+        let expected_span = bad_document.root.span.clone();
+        assets
+            .themes
+            .insert(ThemeName::new("bad-style"), bad_document);
+        let config = compile_selected_assets(assets, "custom", "ink")
+            .expect("an unselected style color fault does not block the valid pair");
+        assert_eq!(
+            config
+                .theme
+                .style("title")
+                .expect("valid selected style")
+                .foreground,
+            Some(Color::Rgb {
+                red: 0x78,
+                green: 0x9a,
+                blue: 0xbc
+            })
+        );
+        let error = config
+            .resolve_theme(&muxe_core::ThemeSelection {
+                theme: ThemeName::new("bad-style"),
+                color_scheme: ColorSchemeName::new("ink"),
+            })
+            .expect_err("the same retained style fault rejects the selected pair");
+        let muxe_core::ThemeSelectionError::InvalidPair {
+            theme,
+            color_scheme,
+            span,
+            ..
+        } = error
+        else {
+            panic!("style color faults must remain selected-pair errors");
+        };
+        assert_eq!(theme, ThemeName::new("bad-style"));
+        assert_eq!(color_scheme, ColorSchemeName::new("ink"));
+        assert_eq!(span, expected_span);
+    }
+}
+
+#[test]
 fn attachment_view_distinguishes_missing_menu_from_theme_resolution() {
     let config = custom_theme_config(COMPLETE_CUSTOM_THEME_YAML);
     assert!(matches!(
@@ -880,7 +930,7 @@ fn attachment_view_distinguishes_missing_menu_from_theme_resolution() {
         Err(muxe_core::AttachmentViewError::MissingMenu(_))
     ));
     let unknown = muxe_core::ThemeSelection {
-        theme: "missing".to_owned(),
+        theme: ThemeName::new("missing"),
         color_scheme: config.theme_selection.color_scheme.clone(),
     };
     assert!(matches!(
@@ -950,7 +1000,7 @@ menus:
                 key_capabilities: KeyCapabilities::default(),
                 theme_assets: ThemeAssets {
                     themes: std::collections::BTreeMap::from([(
-                        "broken".to_owned(),
+                        ThemeName::new("broken"),
                         document(
                             "themes/broken.yml",
                             r"
@@ -961,7 +1011,7 @@ common:
                         ),
                     )]),
                     color_schemes: std::collections::BTreeMap::from([(
-                        "ink".to_owned(),
+                        ColorSchemeName::new("ink"),
                         document(
                             "color-schemes/ink.yml",
                             r##"
@@ -981,6 +1031,248 @@ colors: { base: { text: foreground } }
             .iter()
             .any(|diagnostic| diagnostic.code == muxe_core::DiagnosticCode::InvalidTheme)
     );
+}
+
+fn compile_selected_assets(
+    assets: ThemeAssets,
+    theme: &str,
+    scheme: &str,
+) -> Result<muxe_core::CompiledConfig, Vec<muxe_core::ConfigDiagnostic>> {
+    Compiler.compile(
+        CompileInput {
+            generation: CompiledGeneration(13),
+            base: document(
+                "selection.yml",
+                &format!(
+                    "version: 1\ntheme: {theme}\ncolor-scheme: {scheme}\nmenus:\n  main:\n    bindings:\n      q: {{ label: quit, action: menu:quit }}\n"
+                ),
+            ),
+            host_override: None,
+            key_capabilities: KeyCapabilities::default(),
+            theme_assets: assets,
+        },
+        None,
+    )
+}
+
+#[test]
+fn unused_selected_semantic_errors_are_deferred_only_for_unselected_schemes() {
+    for yaml in [
+        "title: Broken\ncolors: { unused: absent }\n",
+        "title: Broken\ncolors: { unused: other, other: unused }\n",
+        "title: Broken\ncolors: { unused: '#zzzzzz' }\n",
+        "title: Broken\ncolors: { unused: inherit }\n",
+        "title: Broken\npalette: { unused: alias }\n",
+    ] {
+        let assets = ThemeAssets {
+            color_schemes: std::collections::BTreeMap::from([(
+                ColorSchemeName::new("broken"),
+                document("color-schemes/broken.yml", yaml),
+            )]),
+            ..ThemeAssets::default()
+        };
+        let config = compile_selected_assets(assets.clone(), "default", "default")
+            .expect("unselected invalid color schemes must not block generation");
+        let error = config
+            .resolve_theme(&muxe_core::ThemeSelection {
+                theme: ThemeName::new("default"),
+                color_scheme: ColorSchemeName::new("broken"),
+            })
+            .expect_err("attachment selection validates even unused semantic entries");
+        let muxe_core::ThemeSelectionError::InvalidColorScheme { diagnostics, .. } = error else {
+            panic!("malformed scheme must retain its asset diagnostics");
+        };
+        assert_eq!(diagnostics[0].code, DiagnosticCode::InvalidColorScheme);
+        assert_eq!(
+            diagnostics[0].labels[0].span.source.as_str(),
+            "color-schemes/broken.yml"
+        );
+        let selected = compile_selected_assets(assets, "default", "broken")
+            .expect_err("root selection must validate the entire scheme");
+        assert_eq!(selected, diagnostics);
+    }
+}
+
+#[test]
+fn flattened_semantic_collisions_validate_only_winning_string_expressions() {
+    let mut assets = custom_theme_assets(COMPLETE_CUSTOM_THEME_YAML);
+    assets.color_schemes.insert(
+        ColorSchemeName::new("ink"),
+        document(
+            "color-schemes/ink.yml",
+            r##"
+title: Ink
+palette: { foreground: "#123", accent: "#456" }
+colors:
+  base: { text: "#zzzzzz" }
+  base.text: foreground
+  menu: { hotkey: missing }
+  menu.hotkey: accent
+  unused: { color: inherit }
+  unused.color: "#789"
+"##,
+        ),
+    );
+    let config = compile_selected_assets(assets, "custom", "ink")
+        .expect("last-wins flattened strings discard shadowed syntax, alias and inherit faults");
+    assert_eq!(
+        config.theme.style("default").unwrap().foreground,
+        Some(Color::Rgb {
+            red: 0x11,
+            green: 0x22,
+            blue: 0x33
+        })
+    );
+    assert_eq!(
+        config.theme.style("title").unwrap().foreground,
+        Some(Color::Rgb {
+            red: 0x44,
+            green: 0x55,
+            blue: 0x66
+        })
+    );
+    assert_eq!(
+        config.theme.scheme.colors[&ColorAliasName::new("unused.color")],
+        Color::Rgb {
+            red: 0x77,
+            green: 0x88,
+            blue: 0x99
+        }
+    );
+}
+
+#[test]
+fn shadowed_non_string_semantic_leaf_keeps_its_immediate_source_error() {
+    let scheme = document(
+        "color-schemes/shadow.yml",
+        r##"
+title: Shadow
+colors:
+  base: { text: 17 }
+  base.text: inherit
+  bad: "#zzzzzz"
+"##,
+    );
+    let expected = scheme
+        .root
+        .field("colors")
+        .unwrap()
+        .value
+        .field("base")
+        .unwrap()
+        .value
+        .field("text")
+        .unwrap()
+        .value
+        .span
+        .clone();
+    let assets = ThemeAssets {
+        color_schemes: std::collections::BTreeMap::from([(ColorSchemeName::new("shadow"), scheme)]),
+        ..ThemeAssets::default()
+    };
+    let diagnostics = compile_selected_assets(assets, "default", "shadow").expect_err(
+        "all scalar leaves must be strings before winner or semantic resolution policy applies",
+    );
+    assert_eq!(diagnostics[0].code, DiagnosticCode::InvalidValue);
+    assert_eq!(diagnostics[0].labels[0].span, expected);
+}
+
+#[test]
+fn config_ast_palette_duplicates_keep_the_last_valid_literal() {
+    let mut assets = custom_theme_assets(COMPLETE_CUSTOM_THEME_YAML);
+    let scheme = assets
+        .color_schemes
+        .get_mut(&ColorSchemeName::new("ink"))
+        .unwrap();
+    let muxe_core::ConfigValueKind::Mapping(root) = &mut scheme.root.kind else {
+        panic!("scheme fixture is a mapping");
+    };
+    let palette = root
+        .iter_mut()
+        .find(|field| field.name == "palette")
+        .unwrap();
+    let muxe_core::ConfigValueKind::Mapping(fields) = &mut palette.value.kind else {
+        panic!("palette fixture is a mapping");
+    };
+    // Programmatic ConfigDocument input permits duplicate fields; YAML syntax
+    // still rejects duplicate keys before compilation.
+    let mut replacement = fields
+        .iter()
+        .find(|field| field.name == "foreground")
+        .unwrap()
+        .clone();
+    replacement.value.kind = muxe_core::ConfigValueKind::String("#123".to_owned());
+    fields.push(replacement);
+    let config = compile_selected_assets(assets, "custom", "ink").unwrap();
+    assert_eq!(
+        config.theme.style("default").unwrap().foreground,
+        Some(Color::Rgb {
+            red: 0x11,
+            green: 0x22,
+            blue: 0x33
+        })
+    );
+}
+
+#[test]
+fn same_spelling_catalog_names_preserve_domain_and_semantic_precedence() {
+    let mut assets = custom_theme_assets(COMPLETE_CUSTOM_THEME_YAML);
+    let theme = assets.themes.remove(&ThemeName::new("custom")).unwrap();
+    assets.themes.insert(ThemeName::new("shared"), theme);
+    assets.color_schemes = std::collections::BTreeMap::from([(
+        ColorSchemeName::new("shared"),
+        document(
+            "color-schemes/shared.yml",
+            "title: Display Title\npalette: { target: '#123', menu.hotkey: '#456' }\ncolors: { base.text: target, target: '#abc', menu.hotkey: base.text }\n",
+        ),
+    )]);
+    let config = compile_selected_assets(assets, "shared", "shared")
+        .expect("same spelling belongs to separate theme and scheme catalogs");
+    let expected = Color::Rgb {
+        red: 0xaa,
+        green: 0xbb,
+        blue: 0xcc,
+    };
+    assert_eq!(config.theme_selection.theme, ThemeName::new("shared"));
+    assert_eq!(
+        config.theme_selection.color_scheme,
+        ColorSchemeName::new("shared")
+    );
+    assert_eq!(config.theme.scheme.title, "Display Title");
+    assert_eq!(
+        config
+            .theme
+            .scheme
+            .resolve(&ColorAliasName::new("base.text"))
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        config.theme.style("title").unwrap().foreground,
+        Some(expected)
+    );
+    assert_eq!(
+        config.theme.scheme.palette[&ColorAliasName::new("target")],
+        Color::Rgb {
+            red: 0x11,
+            green: 0x22,
+            blue: 0x33
+        }
+    );
+    assert!(matches!(
+        config.resolve_theme(&muxe_core::ThemeSelection {
+            theme: ThemeName::new("Display Title"),
+            color_scheme: ColorSchemeName::new("shared"),
+        }),
+        Err(muxe_core::ThemeSelectionError::UnknownTheme { .. })
+    ));
+    assert!(matches!(
+        config.resolve_theme(&muxe_core::ThemeSelection {
+            theme: ThemeName::new("shared"),
+            color_scheme: ColorSchemeName::new("Display Title"),
+        }),
+        Err(muxe_core::ThemeSelectionError::UnknownColorScheme { .. })
+    ));
 }
 
 struct DirectionalHostValidator;

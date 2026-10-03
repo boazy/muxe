@@ -145,6 +145,16 @@ Muxe recursively merges the active host override file into `config.yml`. Overrid
 
 Automatic configuration watching is enabled by default. A valid reload applies immediately to newly opened menus, while open menus retain their pinned configuration generation. If an edit produces invalid YAML or unsupported actions, Muxe logs the error and keeps the last valid configuration active.
 
+### Themes and color schemes
+
+Set `theme` and `color-scheme` to the corresponding filenames without `.yml`, under `$CONFIG_DIR/themes/` and `$CONFIG_DIR/color-schemes/`. Both default to `default`. The catalogs are independent: the same name can identify a theme and a color scheme. A scheme's `title` is display text, not its selection name.
+
+Palette values must be `#rgb` or `#rrggbb` literals. Semantic colors may reference palette entries or other semantic colors; a semantic name takes precedence when it also exists in the palette. Muxe rejects unknown references and alias cycles, including unused entries in the selected scheme. The built-in default scheme inherits terminal colors; user-defined semantic color values cannot use `inherit`.
+
+Muxe validates every style in a selected theme/scheme pair, then retains its resolved colors for rendering. All asset files must first parse successfully as supported YAML; syntax errors prevent configuration loading even in an unselected asset. Validation errors in unselected theme or color-scheme definitions are deferred until selection. An attachment's theme or scheme override does not change other menus that are already attached.
+
+In configuration style fields, `inherit` is an alias name, not a reset keyword. Omitting foreground or background leaves that part of the underlying terminal style unchanged; an inherited color from the default scheme explicitly resets it to the terminal default.
+
 ### Inactivity timeout
 
 Set `settings.timeout` globally or in a menu to a duration in milliseconds (`250ms`), seconds (`10s`), or minutes (`2m`). The default is `10s`. Use `off` to disable inactivity dismissal. A menu inherits the global setting unless it specifies its own value; a finite menu value re-enables a global `off`.

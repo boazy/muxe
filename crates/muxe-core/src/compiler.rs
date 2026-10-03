@@ -30,7 +30,8 @@ use crate::menu::{
     CompiledMenu, InlineMenuId, LayoutSettings, MenuId, MenuName, binding_index,
 };
 use crate::theme::{
-    Color, ColorScheme, CompiledTheme, CompiledThemeCatalog, Style, Theme, ThemeSection,
+    Color, ColorAliasName, ColorExpr, ColorExpressions, ColorScheme, ColorSchemeName,
+    CompiledTheme, CompiledThemeCatalog, Style, Theme, ThemeName, ThemeSection,
     default_color_scheme, default_theme,
 };
 
@@ -612,10 +613,10 @@ fn compile_theme_catalog(assets: &ThemeAssets) -> CompiledThemeCatalog {
         .collect();
     let default_span = SourceSpan::new(SourceId::new("<muxe built-in>"), 0, 0);
     themes
-        .entry("default".to_owned())
+        .entry(ThemeName::new("default"))
         .or_insert_with(|| (Ok(default_theme()), default_span.clone()));
     color_schemes
-        .entry("default".to_owned())
+        .entry(ColorSchemeName::new("default"))
         .or_insert_with(|| (Ok(default_color_scheme()), default_span));
     CompiledThemeCatalog::new(themes, color_schemes)
 }
@@ -627,8 +628,8 @@ fn compile_theme_pair(
     let (theme_name, theme_span) = selected_asset_name(root, "theme")?;
     let (color_scheme_name, scheme_span) = selected_asset_name(root, "color-scheme")?;
     let selection = ThemeSelection {
-        theme: theme_name,
-        color_scheme: color_scheme_name,
+        theme: ThemeName::new(theme_name),
+        color_scheme: ColorSchemeName::new(color_scheme_name),
     };
     let compiled = catalog
         .resolve(&selection.theme, &selection.color_scheme)
@@ -727,8 +728,8 @@ fn parse_theme_section(value: Option<&ConfigValue>) -> Result<ThemeSection, Vec<
             styles.insert(
                 style.name.clone(),
                 Style {
-                    foreground: optional_string(&style.value, "foreground")?.map(str::to_owned),
-                    background: optional_string(&style.value, "background")?.map(str::to_owned),
+                    foreground: parse_style_color(&style.value, "foreground")?,
+                    background: parse_style_color(&style.value, "background")?,
                     bold: style
                         .value
                         .field("bold")
@@ -767,9 +768,26 @@ fn parse_theme_section(value: Option<&ConfigValue>) -> Result<ThemeSection, Vec<
     }
     let mut templates = BTreeMap::new();
     if let Some(template_map) = value.field("templates") {
-        flatten_scalar_mapping(&template_map.value, "", &mut templates, "theme template")?;
+        flatten_scalar_mapping(
+            &template_map.value,
+            "",
+            &mut templates,
+            "theme template",
+            str::to_owned,
+        )?;
     }
     Ok(ThemeSection { styles, templates })
+}
+
+fn parse_style_color(
+    style: &ConfigValue,
+    name: &str,
+) -> Result<Option<Result<ColorExpr, crate::theme::ThemePairError>>, Vec<ConfigDiagnostic>> {
+    let Some(field) = style.field(name) else {
+        return Ok(None);
+    };
+    let value = expect_string(&field.value, format!("`{name}` must be a string"))?;
+    Ok(Some(ColorExpr::parse_style(value)))
 }
 
 fn parse_color_scheme_document(
@@ -781,7 +799,7 @@ fn parse_color_scheme_document(
         "color-scheme `title` must be a string",
     )?
     .to_owned();
-    let mut palette = BTreeMap::new();
+    let mut expressions = ColorExpressions::default();
     if let Some(palette_map) = document.root.field("palette") {
         for field in mapping_fields(
             &palette_map.value,
@@ -790,51 +808,55 @@ fn parse_color_scheme_document(
             let value = expect_string(
                 &field.value,
                 "palette values must be `#rgb` or `#rrggbb` strings",
-            )?
-            .to_owned();
-            Color::parse(&value).map_err(|error| {
+            )?;
+            let color = Color::parse(value).map_err(|error| {
                 vec![ConfigDiagnostic::error(
                     DiagnosticCode::InvalidColorScheme,
                     error.to_string(),
                     field.value.span.clone(),
                 )]
             })?;
-            palette.insert(field.name.clone(), value);
+            expressions.insert_palette_last(
+                ColorAliasName::new(field.name.clone()),
+                Ok(ColorExpr::Literal(color)),
+            );
         }
     }
     let mut colors = BTreeMap::new();
     if let Some(color_map) = document.root.field("colors") {
-        flatten_scalar_mapping(&color_map.value, "", &mut colors, "color-scheme color")?;
+        flatten_scalar_mapping(
+            &color_map.value,
+            "",
+            &mut colors,
+            "color-scheme color",
+            |text| text,
+        )?;
     }
-    if colors.values().any(|value| value == "inherit") {
+    if colors.values().any(|value| *value == "inherit") {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidColorScheme,
             "`inherit` is reserved for the embedded default color scheme; user color values must be palette aliases or `#hex`",
             document.root.span.clone(),
         )]);
     }
-    let scheme = ColorScheme {
-        title,
-        palette,
-        colors,
-    };
-    for name in scheme.colors.keys() {
-        scheme.resolve(name).map_err(|error| {
-            vec![ConfigDiagnostic::error(
-                DiagnosticCode::InvalidColorScheme,
-                error.to_string(),
-                document.root.span.clone(),
-            )]
-        })?;
+    for (name, value) in colors {
+        expressions.insert_semantic_first(ColorAliasName::new(name), ColorExpr::parse_style(value));
     }
-    Ok(scheme)
+    expressions.resolve_all(title).map_err(|error| {
+        vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidColorScheme,
+            error.to_string(),
+            document.root.span.clone(),
+        )]
+    })
 }
 
-fn flatten_scalar_mapping(
-    value: &ConfigValue,
+fn flatten_scalar_mapping<'value, Text>(
+    value: &'value ConfigValue,
     prefix: &str,
-    output: &mut BTreeMap<String, String>,
+    output: &mut BTreeMap<String, Text>,
     subject: &str,
+    to_text: impl Fn(&'value str) -> Text + Copy,
 ) -> Result<(), Vec<ConfigDiagnostic>> {
     for field in mapping_fields(value, &format!("{subject} must be a mapping"))? {
         let name = if prefix.is_empty() {
@@ -843,10 +865,10 @@ fn flatten_scalar_mapping(
             format!("{prefix}.{}", field.name)
         };
         if let ConfigValueKind::Mapping(_) = &field.value.kind {
-            flatten_scalar_mapping(&field.value, &name, output, subject)?;
+            flatten_scalar_mapping(&field.value, &name, output, subject, to_text)?;
         } else {
             let text = expect_string(&field.value, format!("{subject} values must be strings"))?;
-            output.insert(name, text.to_owned());
+            output.insert(name, to_text(text));
         }
     }
     Ok(())

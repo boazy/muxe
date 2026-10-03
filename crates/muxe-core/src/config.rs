@@ -14,7 +14,9 @@ use crate::menu::{
     BindingId, BindingLocation, CompiledBinding, CompiledGeneration, CompiledMenu, MenuId,
     UiAttachmentView, menu_view,
 };
-use crate::theme::{CompiledTheme, CompiledThemeCatalog, ThemeSelectionError};
+use crate::theme::{
+    ColorSchemeName, CompiledTheme, CompiledThemeCatalog, ThemeName, ThemeSelectionError,
+};
 
 /// One configuration value with the exact source range that produced it.
 #[derive(Clone, Debug, PartialEq)]
@@ -442,21 +444,21 @@ pub struct HostSettings {
 /// pairing validation without filesystem access.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ThemeAssets {
-    pub themes: BTreeMap<String, ConfigDocument>,
-    pub color_schemes: BTreeMap<String, ConfigDocument>,
+    pub themes: BTreeMap<ThemeName, ConfigDocument>,
+    pub color_schemes: BTreeMap<ColorSchemeName, ConfigDocument>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThemeSelection {
-    pub theme: String,
-    pub color_scheme: String,
+    pub theme: ThemeName,
+    pub color_scheme: ColorSchemeName,
 }
 
 impl Default for ThemeSelection {
     fn default() -> Self {
         Self {
-            theme: "default".to_owned(),
-            color_scheme: "default".to_owned(),
+            theme: ThemeName::new("default"),
+            color_scheme: ColorSchemeName::new("default"),
         }
     }
 }

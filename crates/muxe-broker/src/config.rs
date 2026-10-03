@@ -7,8 +7,9 @@ use std::{
 
 use muxe_adapter_api::{AdapterCapabilities, HostAdapter};
 use muxe_core::{
-    ActionValidation, ActionValidator, CompileInput, CompiledConfig, CompiledGeneration, Compiler,
-    ConfigDiagnostic, ConfigDocument, KeyCapabilities, ReloadSettings, SourceId, ThemeAssets,
+    ActionValidation, ActionValidator, ColorSchemeName, CompileInput, CompiledConfig,
+    CompiledGeneration, Compiler, ConfigDiagnostic, ConfigDocument, KeyCapabilities,
+    ReloadSettings, SourceId, ThemeAssets, ThemeName,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -354,8 +355,10 @@ fn load_theme_assets(config_path: &Path) -> Result<ThemeAssets, ConfigError> {
         .parent()
         .ok_or_else(|| ConfigError::AssetDirectory(config_path.to_path_buf()))?;
     Ok(ThemeAssets {
-        themes: load_asset_catalog(&config_dir.join("themes"))?,
-        color_schemes: load_asset_catalog(&config_dir.join("color-schemes"))?,
+        themes: load_asset_catalog(&config_dir.join("themes"), |stem| ThemeName::new(stem))?,
+        color_schemes: load_asset_catalog(&config_dir.join("color-schemes"), |stem| {
+            ColorSchemeName::new(stem)
+        })?,
     })
 }
 
@@ -363,7 +366,10 @@ fn load_theme_assets(config_path: &Path) -> Result<ThemeAssets, ConfigError> {
     clippy::result_large_err,
     reason = "ConfigError is a public cold-path error API shared with the native binary; boxing diagnostic variants churns consumers for no frame-size gain"
 )]
-fn load_asset_catalog(directory: &Path) -> Result<BTreeMap<String, ConfigDocument>, ConfigError> {
+fn load_asset_catalog<Name: Ord>(
+    directory: &Path,
+    name: impl Fn(&str) -> Name,
+) -> Result<BTreeMap<Name, ConfigDocument>, ConfigError> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -401,7 +407,7 @@ fn load_asset_catalog(directory: &Path) -> Result<BTreeMap<String, ConfigDocumen
         })?;
         let source = SourceId::new(path.display().to_string());
         let document = ConfigDocument::parse(source, text).map_err(ConfigError::Diagnostic)?;
-        if documents.insert(stem.to_owned(), document).is_some() {
+        if documents.insert(name(stem), document).is_some() {
             return Err(ConfigError::DuplicateAsset(stem.to_owned()));
         }
     }

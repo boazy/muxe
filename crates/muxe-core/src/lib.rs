@@ -64,7 +64,9 @@ pub use session::{
     MenuSessionState, SessionInstant,
 };
 pub use theme::{
-    Color, ColorScheme, CompiledTheme, CompiledThemeCatalog, REQUIRED_COMPONENT_TEMPLATES, Style,
-    Theme, ThemePairError, ThemeSection, ThemeSelectionError, compiled_default_theme,
-    default_color_scheme, default_theme, has_loader_backed_construct,
+    Color, ColorAliasName, ColorExpr, ColorExpressions, ColorResolver, ColorScheme,
+    ColorSchemeName, CompiledTheme, CompiledThemeCatalog, REQUIRED_COMPONENT_TEMPLATES,
+    ResolvedStyle, ResolvedTheme, ResolvedThemeSection, Style, Theme, ThemeName, ThemePairError,
+    ThemeSection, ThemeSelectionError, compiled_default_theme, default_color_scheme, default_theme,
+    has_loader_backed_construct,
 };
