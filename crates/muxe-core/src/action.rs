@@ -985,7 +985,7 @@ impl CommandCwd {
     }
 }
 
-/// Zero-based tab position, distinct from both pane positions and host tab IDs.
+/// Portable tab numeric selector; hosts preserve their action-specific lookup semantics.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TabIndex(u64);
 

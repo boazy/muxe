@@ -242,7 +242,7 @@ Exchanges the tab where you opened the menu with another tab.
 
 | Parameter | Type | Requirement | Default | Description |
 |---|---|---|---|---|
-| `index` | non-negative integer or `$origin.` reference | exactly one of `index` or `direction` | — | Index of the other tab. |
+| `index` | non-negative integer or `$origin.` reference | exactly one of `index` or `direction` | — | In Herdr, the stable public tab number from tab.list, not the current row position or tab.move insertion boundary. |
 | `direction` | direction or `$origin.` reference | exactly one of `index` or `direction` | — | Direction of the other tab. |
 
 > [!WARNING]

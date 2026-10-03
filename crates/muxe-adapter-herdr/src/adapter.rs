@@ -1150,27 +1150,29 @@ impl HerdrAdapter {
         &self,
         execution: muxe_core::ExecutionId,
         origin: &muxe_core::OriginContext,
-        target_index: u64,
+        target_selector: muxe_core::TabIndex,
     ) -> Result<DispatchAccepted, AdapterError> {
         let authority = self.require_current_origin(origin)?;
-        let source_tab = origin_tab(origin)?.to_owned();
-        let workspace = origin
-            .workspace_id
-            .as_ref()
-            .map(|workspace| workspace.as_str().to_owned())
-            .ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorKind::ContextUnavailable,
-                    "Herdr tab:swap requires the captured origin workspace",
-                )
-            })?;
+        let source_tab = origin.tab_id.clone().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::ContextUnavailable,
+                "portable tab action requires the captured origin tab",
+            )
+        })?;
+        let workspace = origin.workspace_id.clone().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::ContextUnavailable,
+                "Herdr tab:swap requires the captured origin workspace",
+            )
+        })?;
         authority
             .runtime
             .validate_method_set(&["tab.list", "tab.move"])?;
+        let target_number = PublicTabNumber::from_selector(target_selector);
         let results = self.dispatch_results_tx.clone();
         self.admit_dispatch_task(execution, move || {
             let receiver = authority.try_run_ordered(move |direct| async move {
-                match perform_tab_swap(&direct, &workspace, &source_tab, target_index).await {
+                match perform_tab_swap(&direct, &workspace, &source_tab, target_number).await {
                     Ok(()) => DispatchCompletion::Succeeded { execution },
                     Err(TabSwapError::Known(message)) => DispatchCompletion::Failed {
                         execution,
@@ -2364,7 +2366,7 @@ impl HostAdapter for HerdrAdapter {
             index,
         ))) = &request.action
         {
-            return self.dispatch_tab_swap(request.execution, &request.origin, index.get());
+            return self.dispatch_tab_swap(request.execution, &request.origin, *index);
         }
         if creation_requires_post_dismissal(&request.action) {
             return Err(AdapterError::new(
@@ -3588,11 +3590,46 @@ fn portable_request_description(
     Ok(Some(description))
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PublicTabNumber(u64);
+
+impl PublicTabNumber {
+    const fn from_response(number: u64) -> Self {
+        Self(number)
+    }
+
+    const fn from_selector(selector: muxe_core::TabIndex) -> Self {
+        Self(selector.get())
+    }
+
+    const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TabPosition(usize);
+
+impl TabPosition {
+    const fn from_list_order(position: usize) -> Self {
+        Self(position)
+    }
+
+    const fn get(self) -> usize {
+        self.0
+    }
+
+    const fn insert_after(self) -> usize {
+        self.0 + 1
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OrderedTab {
-    id: String,
-    workspace: String,
-    number: u64,
+    id: muxe_core::TabId,
+    workspace: muxe_core::WorkspaceId,
+    public_number: PublicTabNumber,
+    position: TabPosition,
 }
 fn creation_has_program(action: &ResolvedPortableAction) -> bool {
     match action {
@@ -3760,15 +3797,15 @@ enum TabSwapError {
 
 async fn perform_tab_swap(
     authority: &IncarnationTransactionAuthority,
-    workspace: &str,
-    source_tab: &str,
-    target_index: u64,
+    workspace: &muxe_core::WorkspaceId,
+    source_tab: &muxe_core::TabId,
+    target_number: PublicTabNumber,
 ) -> Result<(), TabSwapError> {
     let initial = tab_list(
         &request_tab_swap(
             authority,
             "tab.list",
-            json!({ "workspace_id": workspace }),
+            json!({ "workspace_id": workspace.as_str() }),
             "reading initial tab order",
             false,
         )
@@ -3776,46 +3813,65 @@ async fn perform_tab_swap(
         "initial tab list",
     )?;
     let source = tab_at_id(&initial, source_tab, workspace, "captured origin tab")?;
-    let target = tab_at_number(&initial, target_index, workspace, "requested tab index")?;
+    let target = tab_at_public_number(&initial, target_number, workspace, "requested tab number")?;
     if source.id == target.id {
         return Ok(());
     }
 
+    let first_insert_index = if target.position.get() < source.position.get() {
+        source.position.insert_after()
+    } else {
+        source.position.get()
+    };
     let after_first = tab_list(
         &request_tab_swap(
             authority,
             "tab.move",
-            json!({ "tab_id": target.id, "insert_index": source.number }),
-            "moving target tab to captured tab index",
+            json!({
+                "tab_id": target.id.as_str(),
+                "insert_index": first_insert_index,
+            }),
+            "moving target tab to captured tab position",
             true,
         )
         .await?,
         "first tab.move result",
     )?;
-    if tab_at_id(&after_first, &target.id, workspace, "moved target tab")?.number != source.number {
+    let target_after_first = tab_at_id(&after_first, &target.id, workspace, "moved target tab")?;
+    if target_after_first.position != source.position {
         return Err(TabSwapError::Known(format!(
-            "Herdr first tab.move did not place target tab at index {}; tab ordering may be partially changed and Muxe will not replay",
-            source.number
+            "Herdr first tab.move did not place target tab at position {}; tab ordering may be partially changed and Muxe will not replay",
+            source.position.get()
         )));
     }
+    let source_after_first = tab_at_id(&after_first, source_tab, workspace, "captured origin tab")?;
 
+    let second_insert_index = if source_after_first.position.get() < target.position.get() {
+        target.position.insert_after()
+    } else {
+        target.position.get()
+    };
     let after_second = tab_list(
         &request_tab_swap(
             authority,
             "tab.move",
-            json!({ "tab_id": source.id, "insert_index": target.number }),
-            "moving captured tab to requested index",
+            json!({
+                "tab_id": source_tab.as_str(),
+                "insert_index": second_insert_index,
+            }),
+            "moving captured tab to requested tab position",
             true,
         )
         .await?,
         "second tab.move result",
     )?;
-    let source_after = tab_at_id(&after_second, &source.id, workspace, "captured origin tab")?;
+    let source_after = tab_at_id(&after_second, source_tab, workspace, "captured origin tab")?;
     let target_after = tab_at_id(&after_second, &target.id, workspace, "target tab")?;
-    if source_after.number != target.number || target_after.number != source.number {
+    if source_after.position != target.position || target_after.position != source.position {
         return Err(TabSwapError::Known(format!(
             "Herdr tab moves completed without producing the requested swap (expected {}<->{}) ; tab ordering is partially changed and Muxe will not replay",
-            source.number, target.number
+            source.position.get(),
+            target.position.get()
         )));
     }
     Ok(())
@@ -3849,6 +3905,7 @@ async fn request_tab_swap(
     }
 }
 
+/// Workspace-scoped tab.list preserves row order; its stable number is not the current position.
 fn tab_list(result: &Value, phase: &str) -> Result<Vec<OrderedTab>, TabSwapError> {
     let object = result
         .as_object()
@@ -3865,28 +3922,37 @@ fn tab_list(result: &Value, phase: &str) -> Result<Vec<OrderedTab>, TabSwapError
         .and_then(Value::as_array)
         .ok_or_else(|| TabSwapError::Known(format!("Herdr {phase} lacks a tabs array")))?;
     let mut ordered = Vec::with_capacity(tabs.len());
-    for tab in tabs {
+    for (list_position, tab) in tabs.iter().enumerate() {
         let tab = tab.as_object().ok_or_else(|| {
             TabSwapError::Known(format!("Herdr {phase} contains a non-object tab"))
         })?;
-        let id = required_tab_field(tab, "tab_id", phase)?;
-        let workspace = required_tab_field(tab, "workspace_id", phase)?;
-        let number = tab.get("number").and_then(Value::as_u64).ok_or_else(|| {
-            TabSwapError::Known(format!(
-                "Herdr {phase} tab {id:?} lacks a nonnegative number"
-            ))
-        })?;
+        let id = muxe_core::TabId::new(required_tab_field(tab, "tab_id", phase)?);
+        let workspace =
+            muxe_core::WorkspaceId::new(required_tab_field(tab, "workspace_id", phase)?);
+        let public_number = tab
+            .get("number")
+            .and_then(Value::as_u64)
+            .map(PublicTabNumber::from_response)
+            .ok_or_else(|| {
+                TabSwapError::Known(format!(
+                    "Herdr {phase} tab {:?} lacks a nonnegative number",
+                    id.as_str()
+                ))
+            })?;
         if ordered.iter().any(|existing: &OrderedTab| {
-            existing.workspace == workspace && existing.number == number
+            existing.workspace == workspace && existing.public_number == public_number
         }) {
             return Err(TabSwapError::Known(format!(
-                "Herdr {phase} repeats tab number {number} in workspace {workspace:?}"
+                "Herdr {phase} repeats tab number {} in workspace {:?}",
+                public_number.get(),
+                workspace.as_str()
             )));
         }
         ordered.push(OrderedTab {
-            id: id.to_owned(),
-            workspace: workspace.to_owned(),
-            number,
+            id,
+            workspace,
+            public_number,
+            position: TabPosition::from_list_order(list_position),
         });
     }
     Ok(ordered)
@@ -3905,30 +3971,34 @@ fn required_tab_field<'a>(
 
 fn tab_at_id<'a>(
     tabs: &'a [OrderedTab],
-    id: &str,
-    workspace: &str,
+    id: &muxe_core::TabId,
+    workspace: &muxe_core::WorkspaceId,
     role: &str,
 ) -> Result<&'a OrderedTab, TabSwapError> {
     tabs.iter()
-        .find(|tab| tab.id == id && tab.workspace == workspace)
+        .find(|tab| &tab.id == id && &tab.workspace == workspace)
         .ok_or_else(|| {
             TabSwapError::Known(format!(
-                "Herdr tab list has no {role} {id:?} in captured workspace {workspace:?}"
+                "Herdr tab list has no {role} {:?} in captured workspace {:?}",
+                id.as_str(),
+                workspace.as_str()
             ))
         })
 }
 
-fn tab_at_number<'a>(
+fn tab_at_public_number<'a>(
     tabs: &'a [OrderedTab],
-    number: u64,
-    workspace: &str,
+    number: PublicTabNumber,
+    workspace: &muxe_core::WorkspaceId,
     role: &str,
 ) -> Result<&'a OrderedTab, TabSwapError> {
     tabs.iter()
-        .find(|tab| tab.number == number && tab.workspace == workspace)
+        .find(|tab| tab.public_number == number && &tab.workspace == workspace)
         .ok_or_else(|| {
             TabSwapError::Known(format!(
-                "Herdr tab list has no {role} {number} in captured workspace {workspace:?}"
+                "Herdr tab list has no {role} {} in captured workspace {:?}",
+                number.get(),
+                workspace.as_str()
             ))
         })
 }
@@ -4494,34 +4564,146 @@ mod tests {
     }
 
     #[test]
-    fn tab_moved_results_preserve_the_numbered_workspace_order_needed_for_swap() {
+    fn tab_swap_selector_uses_public_number_and_workspace_local_position() {
+        let workspace = muxe_core::WorkspaceId::new("workspace");
+        let other_workspace = muxe_core::WorkspaceId::new("other");
         let tabs = tab_list(
             &json!({
-                "type": "tab_moved",
-                "tab_id": "target",
-                "workspace_id": "workspace",
-                "insert_index": 4,
+                "type": "tab_list",
                 "tabs": [
-                    { "tab_id": "target", "workspace_id": "workspace", "number": 4 },
-                    { "tab_id": "source", "workspace_id": "workspace", "number": 7 },
-                    { "tab_id": "other-workspace", "workspace_id": "other", "number": 4 }
+                    { "tab_id": "workspace:t1", "workspace_id": "workspace", "number": 1 },
+                    { "tab_id": "workspace:t3", "workspace_id": "workspace", "number": 3 },
+                    { "tab_id": "workspace:t4", "workspace_id": "workspace", "number": 4 },
+                    { "tab_id": "workspace:t5", "workspace_id": "workspace", "number": 5 }
                 ]
             }),
-            "tab.move response",
+            "workspace tab list",
         )
-        .expect("a tab.move response supplies the ordered tabs for the second move");
+        .expect("tab.list returns rows in workspace order");
+        let other_tabs = tab_list(
+            &json!({
+                "type": "tab_list",
+                "tabs": [
+                    { "tab_id": "other:t1", "workspace_id": "other", "number": 1 },
+                    { "tab_id": "other:t2", "workspace_id": "other", "number": 2 },
+                    { "tab_id": "other:t3", "workspace_id": "other", "number": 3 },
+                    { "tab_id": "other:t4", "workspace_id": "other", "number": 4 },
+                    { "tab_id": "other:t5", "workspace_id": "other", "number": 5 }
+                ]
+            }),
+            "other workspace tab list",
+        )
+        .expect("other workspace has an independent ordered list");
+        let selector = PublicTabNumber::from_selector(muxe_core::TabIndex::new(5));
 
+        let target = tab_at_public_number(&tabs, selector, &workspace, "requested tab number")
+            .expect("public number 5 selects workspace:t5");
+        assert_eq!(target.id.as_str(), "workspace:t5");
+        assert_eq!(target.position.get(), 3);
+        let other_target = tab_at_public_number(
+            &other_tabs,
+            selector,
+            &other_workspace,
+            "requested tab number",
+        )
+        .expect("the same public number selects other:t5 in its workspace");
+        assert_eq!(other_target.id.as_str(), "other:t5");
+        assert_eq!(other_target.position.get(), 4);
+    }
+
+    #[tokio::test]
+    async fn tab_swap_preserves_public_number_selector_and_insert_positions() {
+        let temp = tempfile::TempDir::new().expect("owned tab swap directory");
+        let (runtime, listener) = test_incarnation_runtime(&temp, "tab-swap.sock").await;
+        let lease = runtime.lease(IncarnationEpoch::INITIAL);
+        let (continuity_loss_tx, _continuity_loss_rx) = tokio::sync::mpsc::unbounded_channel();
+        let authority = IncarnationAuthority {
+            runtime: Arc::clone(&runtime),
+            lease,
+            continuity_loss_tx,
+            request_connect_wait_hook: None,
+        };
+        let response_tabs = |order: &[u64]| {
+            order
+                .iter()
+                .map(|number| {
+                    json!({
+                        "tab_id": format!("workspace:t{number}"),
+                        "workspace_id": "workspace",
+                        "number": number,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshots = [
+            json!({
+                "type": "tab_list",
+                "tabs": response_tabs(&[1, 2, 3, 4, 5, 6, 7, 8, 9])
+            }),
+            json!({
+                "type": "tab_list",
+                "tabs": response_tabs(&[1, 2, 3, 4, 6, 7, 8, 5, 9])
+            }),
+            json!({
+                "type": "tab_list",
+                "tabs": response_tabs(&[1, 2, 3, 4, 8, 6, 7, 5, 9])
+            }),
+        ];
+        let host = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(snapshots.len());
+            for snapshot in snapshots {
+                let (stream, _) = listener.accept().await.expect("accept ordered tab request");
+                let mut reader = BufReader::new(stream);
+                let mut line = Vec::new();
+                reader
+                    .read_until(b'\n', &mut line)
+                    .await
+                    .expect("read ordered tab request");
+                let request: Value = serde_json::from_slice(&line).expect("Herdr request is JSON");
+                let id = request["id"].as_str().expect("request has an ID");
+                let response = json!({ "id": id, "result": snapshot });
+                reader
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("write ordered tab response");
+                requests.push(request);
+            }
+            requests
+        });
+
+        let workspace = muxe_core::WorkspaceId::new("workspace");
+        let source = muxe_core::TabId::new("workspace:t8");
+        let completion = authority
+            .run_ordered(move |direct| async move {
+                perform_tab_swap(
+                    &direct,
+                    &workspace,
+                    &source,
+                    PublicTabNumber::from_selector(muxe_core::TabIndex::new(5)),
+                )
+                .await
+            })
+            .await
+            .expect("ordered swap executes");
+        completion.expect("pinned row snapshots confirm the tab swap");
+
+        let requests = host.await.expect("tab swap host fixture completes");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["method"], "tab.list");
         assert_eq!(
-            tab_at_number(&tabs, 4, "workspace", "requested tab index")
-                .expect("the target tab must be selected in its own workspace")
-                .id,
-            "target"
+            requests[0]["params"],
+            json!({ "workspace_id": "workspace" })
         );
+        assert_eq!(requests[1]["method"], "tab.move");
         assert_eq!(
-            tab_at_id(&tabs, "source", "workspace", "captured origin tab")
-                .expect("the captured tab must remain addressable for the second move")
-                .number,
-            7
+            requests[1]["params"],
+            json!({ "tab_id": "workspace:t5", "insert_index": 8 })
+        );
+        assert_eq!(requests[2]["method"], "tab.move");
+        assert_eq!(
+            requests[2]["params"],
+            json!({ "tab_id": "workspace:t8", "insert_index": 4 })
         );
     }
 

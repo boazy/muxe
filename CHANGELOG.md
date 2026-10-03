@@ -41,6 +41,7 @@
 - *(core)* Type modifier-set flags and preserve canonical key matching without raw integer mutation.
 - *(cli)* Parse nonzero activation handoffs once at the validated CLI boundary and pass typed IDs into both broker serve paths.
 - *(cli)* Preserve typed Herdr workspace, tab, and pane identities through launcher-origin selection and saved tuples.
+- *(herdr)* Keep workspace/tab identity and stable public number selectors distinct from current row positions and insertion boundaries in tab swaps.
 
 ## [0.1.4] - 2026-09-12
 

@@ -67,7 +67,7 @@ actions:
   tab:swap:
     summary: Exchanges the tab where you opened the menu with another tab.
     parameters:
-      index: Index of the other tab.
+      index: In Herdr, the stable public tab number from tab.list, not the current row position or tab.move insertion boundary.
       direction: Direction of the other tab.
 
   pane:create:
