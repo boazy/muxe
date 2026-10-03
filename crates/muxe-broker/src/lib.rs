@@ -66,19 +66,8 @@ pub(crate) mod cleanup_task_hooks {
         release: Arc<Notify>,
     }
 
-    static GATES: LazyLock<StdMutex<HashMap<String, Arc<Gate>>>> =
+    static GATES: LazyLock<StdMutex<HashMap<crate::broker::CleanupTaskKey, Arc<Gate>>>> =
         LazyLock::new(|| StdMutex::new(HashMap::new()));
-
-    fn key_string(key: &crate::broker::CleanupTaskKey) -> String {
-        match key {
-            crate::broker::CleanupTaskKey::PendingPane(lease) => {
-                format!("pane:{}", lease.as_str())
-            }
-            crate::broker::CleanupTaskKey::Capture(lease) => {
-                format!("capture:{}", lease.as_str())
-            }
-        }
-    }
 
     /// Arms the exit gate for one cleanup key; returns the (entered, release)
     /// notifies. The next task pass for that key notifies `entered` and waits
@@ -89,10 +78,12 @@ pub(crate) mod cleanup_task_hooks {
             entered: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
         });
-        GATES
-            .lock()
-            .expect("cleanup task gates are not poisoned")
-            .insert(key_string(key), Arc::clone(&gate));
+        let mut gates = GATES.lock().expect("cleanup task gates are not poisoned");
+        if let Some(current) = gates.get_mut(key) {
+            *current = Arc::clone(&gate);
+        } else {
+            gates.insert(key.clone(), Arc::clone(&gate));
+        }
         (Arc::clone(&gate.entered), Arc::clone(&gate.release))
     }
 
@@ -108,7 +99,7 @@ pub(crate) mod cleanup_task_hooks {
         let gate = GATES
             .lock()
             .expect("cleanup task gates are not poisoned")
-            .get(&key_string(key))
+            .get(key)
             .cloned();
         if let Some(gate) = gate {
             gate.entered.notify_one();

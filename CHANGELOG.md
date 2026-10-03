@@ -35,6 +35,10 @@
 - *(zellij)* Filter Muxe-owned panes from eligible focus targets
 - *(broker)* Retain dispatch ownership through shutdown and release timed-out UI work
 
+### Miscellaneous Tasks
+
+- *(broker)* Type cleanup task claims and key test gates by their existing identities, preserving retry/requeue ownership for pending panes and captures.
+
 ## [0.1.4] - 2026-09-12
 
 ### 🚀 Features

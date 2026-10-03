@@ -580,12 +580,27 @@ struct CleanupSupervisor {
     /// Serializes the check/spawn/insert sequence. A spawned task waits for its
     /// handle to be installed under the typed key before it can finish and remove it.
     launch: StdMutex<()>,
-    next_claim: AtomicU64,
+    claim_issuer: AtomicCleanupClaim,
     wake: Notify,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupClaim(u64);
+
+struct AtomicCleanupClaim(AtomicU64);
+
+impl AtomicCleanupClaim {
+    fn new() -> Self {
+        Self(AtomicU64::new(1))
+    }
+
+    fn issue(&self) -> CleanupClaim {
+        CleanupClaim(self.0.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 struct CleanupTask {
-    claim: u64,
+    claim: CleanupClaim,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -600,15 +615,15 @@ impl Default for CleanupSupervisor {
         Self {
             tasks: StdMutex::new(HashMap::new()),
             launch: StdMutex::new(()),
-            next_claim: AtomicU64::new(1),
+            claim_issuer: AtomicCleanupClaim::new(),
             wake: Notify::new(),
         }
     }
 }
 
 impl CleanupSupervisor {
-    fn next_claim(&self) -> u64 {
-        self.next_claim.fetch_add(1, Ordering::Relaxed)
+    fn next_claim(&self) -> CleanupClaim {
+        self.claim_issuer.issue()
     }
 
     fn has_live_task(&self, key: &CleanupTaskKey) -> bool {
@@ -619,7 +634,7 @@ impl CleanupSupervisor {
             .is_some_and(|task| !task.handle.is_finished())
     }
 
-    fn remove_if_claim(&self, key: &CleanupTaskKey, claim: u64) {
+    fn remove_if_claim(&self, key: &CleanupTaskKey, claim: CleanupClaim) {
         let mut tasks = self.tasks.lock().expect("cleanup tasks are not poisoned");
         if tasks.get(key).is_some_and(|task| task.claim == claim) {
             tasks.remove(key);
@@ -640,7 +655,7 @@ impl CleanupSupervisor {
         &self,
         state: &Arc<Mutex<BrokerState>>,
         key: &CleanupTaskKey,
-        claim: u64,
+        claim: CleanupClaim,
     ) -> bool {
         // Test gate: pauses the task exactly between entry removal and slot
         // removal, i.e. inside the B2 race window. Every terminal arm routes
@@ -4208,7 +4223,7 @@ async fn run_pending_pane_cleanup(
     state: Arc<Mutex<BrokerState>>,
     supervisor: Arc<CleanupSupervisor>,
     key: CleanupTaskKey,
-    claim: u64,
+    claim: CleanupClaim,
 ) {
     let CleanupTaskKey::PendingPane(lease_id) = key.clone() else {
         unreachable!("pending-pane cleanup task received a capture key");
@@ -4363,7 +4378,7 @@ async fn run_capture_cleanup(
     state: Arc<Mutex<BrokerState>>,
     supervisor: Arc<CleanupSupervisor>,
     key: CleanupTaskKey,
-    claim: u64,
+    claim: CleanupClaim,
 ) {
     let CleanupTaskKey::Capture(lease_id) = key.clone() else {
         unreachable!("capture cleanup task received a pending-pane key");
@@ -7956,6 +7971,56 @@ menus:
             "one retained capture lease is ended after retry"
         );
         assert!(broker.state.lock().await.cleanup.captures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_claim_cannot_remove_replacement_slot_for_each_key() {
+        let supervisor = CleanupSupervisor::default();
+        let state = Arc::new(Mutex::new(BrokerState::default()));
+        let keys = [
+            CleanupTaskKey::PendingPane(muxe_adapter_api::PendingPaneLeaseId::new(
+                "stale-pane-claim",
+            )),
+            CleanupTaskKey::Capture(CaptureLeaseId::new("stale-capture-claim")),
+        ];
+
+        for key in keys {
+            let stale_claim = supervisor.next_claim();
+            let current_claim = supervisor.next_claim();
+            let (release, release_receiver) = tokio::sync::oneshot::channel();
+            let (finished, finished_receiver) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = release_receiver.await;
+                let _ = finished.send(());
+            });
+            supervisor
+                .tasks
+                .lock()
+                .expect("cleanup tasks are not poisoned")
+                .insert(
+                    key.clone(),
+                    CleanupTask {
+                        claim: current_claim,
+                        handle,
+                    },
+                );
+
+            assert!(
+                supervisor
+                    .release_slot_unless_requeued(&state, &key, stale_claim)
+                    .await
+            );
+            assert!(supervisor.has_live_task(&key));
+            supervisor.remove_if_claim(&key, stale_claim);
+            assert!(supervisor.has_live_task(&key));
+            supervisor.remove_if_claim(&key, current_claim);
+            assert!(!supervisor.has_live_task(&key));
+
+            release.send(()).expect("replacement task is waiting");
+            finished_receiver
+                .await
+                .expect("replacement task finishes after slot removal");
+        }
     }
 
     #[tokio::test]
