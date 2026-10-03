@@ -377,14 +377,14 @@ async fn assert_ready_and_retire(
     };
     assert_eq!(spawner.spawns.load(Ordering::SeqCst), 1);
     assert_eq!(first.entry, second.entry);
-    assert_ne!(first.entry.registration_id, stale_id);
-    assert_eq!(first.entry.socket, endpoint.socket());
+    assert_ne!(first.entry.registration_id(), stale_id);
+    assert_eq!(first.entry.socket(), endpoint.socket());
     let child_pid = spawner
         .owned
         .lock()
         .expect("spawn retained an owned child PID");
     assert_eq!(
-        first.entry.server_pid,
+        first.entry.server_pid().get(),
         u32::try_from(child_pid.0.get()).expect("owned child PID is positive")
     );
     assert!(

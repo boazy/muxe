@@ -2,10 +2,11 @@
 //!
 //! `muxe activate` selects every live host recorded in the current user's
 //! owner-only broker registry by default. The broker server registers on
-//! startup and unregisters on retirement; the coordinator lists live entries
-//! with connect-probe liveness. Stale entries are reported, never silently
-//! auto-deleted, except through the explicit [`Registry::prune_stale`] call
-//! the coordinator makes after probing.
+//! startup and unregisters on retirement. Storage reads and connect probes return
+//! untrusted [`BrokerEntry`] DTOs; concrete selected validators produce
+//! [`RegisteredBroker`] lifecycle state. Neither parsing nor connectivity is live
+//! authorization. Exact snapshot, endpoint, and selected-authority checks remain
+//! required before reuse or mutation.
 
 use std::{
     fs::File,
@@ -66,7 +67,7 @@ pub enum RegistryError {
     Entropy(String),
 }
 
-/// One registered broker endpoint.
+/// Untrusted persistence DTO; loading or connect-probing it proves no host authority.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrokerEntry {
     /// `zellij` or `herdr`.
@@ -128,6 +129,191 @@ impl BrokerEntry {
                 "registry row carries an unknown host kind".to_owned(),
             )),
         }
+    }
+}
+
+/// Discovery identity recorded on disk, not an authenticated live host identity.
+///
+/// Unlike `HostDiscoveryKey`, historical registry values may be empty. Validation
+/// here preserves those bytes; operation-specific live attestation remains required.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedDiscoveryKey(String);
+
+impl RecordedDiscoveryKey {
+    /// Wraps a value at the persistence boundary without strengthening its contract.
+    #[must_use]
+    pub fn from_recorded(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Returns the spelling at an IPC, journal, or persistence boundary.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RecordedDiscoveryKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Persisted process identifier; zero is admissible and is not live proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedServerPid(u32);
+
+impl RecordedServerPid {
+    /// Wraps a process value at the persistence boundary.
+    #[must_use]
+    pub fn from_recorded(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the process value at an OS or persistence boundary.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Host-format-validated lifecycle state, distinct from a live authorization proof.
+///
+/// Concrete selected validators construct this state. The retained host enum exists
+/// only for persistence/exact-snapshot conversion, never to reselect lifecycle policy.
+/// Registry mutations still independently require the caller's sealed authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisteredBroker {
+    persisted_host: HostKind,
+    discovery_key: RecordedDiscoveryKey,
+    socket: PathBuf,
+    server_pid: RecordedServerPid,
+    started_at: u64,
+    registration_id: Option<BrokerRegistrationId>,
+    bridge_identity: Option<BridgeIdentity>,
+    bridge_member: Option<BridgeMemberId>,
+    handoff_id: Option<HandoffId>,
+    live_server: Option<muxe_protocol::wire::ServerId>,
+}
+
+impl RegisteredBroker {
+    pub(crate) fn herdr(entry: BrokerEntry) -> Result<Self, RegistryError> {
+        validate_herdr_entry(&entry)?;
+        Ok(Self::from_validated(entry, HostKind::Herdr))
+    }
+
+    pub(crate) fn zellij(
+        entry: BrokerEntry,
+        identity: &BridgeIdentity,
+    ) -> Result<Self, RegistryError> {
+        validate_zellij_entry(&entry, identity, entry.handoff_id)?;
+        Ok(Self::from_validated(entry, HostKind::Zellij))
+    }
+
+    #[must_use]
+    pub fn discovery_key(&self) -> &RecordedDiscoveryKey {
+        &self.discovery_key
+    }
+
+    #[must_use]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Moves the endpoint path out when crossing to an external client API.
+    #[must_use]
+    pub fn into_socket(self) -> PathBuf {
+        self.socket
+    }
+
+    #[must_use]
+    pub fn server_pid(&self) -> RecordedServerPid {
+        self.server_pid
+    }
+
+    #[must_use]
+    pub fn registration_id(&self) -> Option<BrokerRegistrationId> {
+        self.registration_id
+    }
+
+    #[must_use]
+    pub fn bridge_identity(&self) -> Option<&BridgeIdentity> {
+        self.bridge_identity.as_ref()
+    }
+
+    #[must_use]
+    pub fn bridge_member(&self) -> Option<&BridgeMemberId> {
+        self.bridge_member.as_ref()
+    }
+
+    #[must_use]
+    pub fn handoff_id(&self) -> Option<HandoffId> {
+        self.handoff_id
+    }
+
+    #[must_use]
+    pub fn live_server(&self) -> Option<&muxe_protocol::wire::ServerId> {
+        self.live_server.as_ref()
+    }
+
+    /// Validates a concretely selected Zellij row while consuming its own identity.
+    pub(crate) fn recorded_zellij(entry: BrokerEntry) -> Result<Self, RegistryError> {
+        let identity = entry.bridge_identity.as_ref().ok_or_else(|| {
+            RegistryError::Unauthorized("Zellij entry lacks canonical bridge authority".to_owned())
+        })?;
+        validate_zellij_entry(&entry, identity, entry.handoff_id)?;
+        Ok(Self::from_validated(entry, HostKind::Zellij))
+    }
+
+    fn from_validated(entry: BrokerEntry, persisted_host: HostKind) -> Self {
+        Self {
+            persisted_host,
+            discovery_key: RecordedDiscoveryKey::from_recorded(entry.discovery_key),
+            socket: entry.socket,
+            server_pid: RecordedServerPid::from_recorded(entry.server_pid),
+            started_at: entry.started_at,
+            registration_id: entry.registration_id,
+            bridge_identity: entry.bridge_identity,
+            bridge_member: entry.bridge_member,
+            handoff_id: entry.handoff_id,
+            live_server: entry.live_server.map(muxe_protocol::wire::ServerId::new),
+        }
+    }
+
+    /// Rebuilds the exact DTO at a journal, persistence, or snapshot boundary.
+    #[must_use]
+    pub(crate) fn recorded_entry(&self) -> BrokerEntry {
+        BrokerEntry {
+            host_kind: persisted_host_label(self.persisted_host).to_owned(),
+            discovery_key: self.discovery_key.as_str().to_owned(),
+            socket: self.socket.clone(),
+            server_pid: self.server_pid.get(),
+            started_at: self.started_at,
+            registration_id: self.registration_id,
+            bridge_identity: self.bridge_identity.clone(),
+            bridge_member: self.bridge_member.clone(),
+            handoff_id: self.handoff_id,
+            live_server: self.live_server.as_ref().map(|id| id.as_str().to_owned()),
+        }
+    }
+
+    /// Compares an exact persisted snapshot without rebuilding or copying it.
+    #[must_use]
+    pub fn matches_recorded(&self, entry: &BrokerEntry) -> bool {
+        entry.host_kind == persisted_host_label(self.persisted_host)
+            && entry.discovery_key == self.discovery_key.as_str()
+            && entry.socket == self.socket
+            && entry.server_pid == self.server_pid.get()
+            && entry.started_at == self.started_at
+            && entry.registration_id == self.registration_id
+            && entry.bridge_identity == self.bridge_identity
+            && entry.bridge_member == self.bridge_member
+            && entry.handoff_id == self.handoff_id
+            && entry.live_server.as_deref()
+                == self
+                    .live_server
+                    .as_ref()
+                    .map(muxe_protocol::ServerId::as_str)
     }
 }
 /// Stable logical member of a bridge-sharing group.
@@ -312,6 +498,7 @@ mod authority_seal {
 /// and every host-specific field before a registry mutation or reuse.
 pub(crate) trait RegistryAuthority: authority_seal::Sealed {
     fn validate_entry(&self, entry: &BrokerEntry) -> Result<(), RegistryError>;
+    fn validate_recorded(&self, entry: BrokerEntry) -> Result<RegisteredBroker, RegistryError>;
 }
 
 /// Herdr coldstart retains its unit lock while reconciling registry ownership.
@@ -337,17 +524,29 @@ impl RegistryAuthority for HerdrUnitGuard {
     fn validate_entry(&self, entry: &BrokerEntry) -> Result<(), RegistryError> {
         validate_herdr_entry(entry)
     }
+
+    fn validate_recorded(&self, entry: BrokerEntry) -> Result<RegisteredBroker, RegistryError> {
+        RegisteredBroker::herdr(entry)
+    }
 }
 
 impl RegistryAuthority for HerdrRegistryAuthority {
     fn validate_entry(&self, entry: &BrokerEntry) -> Result<(), RegistryError> {
         validate_herdr_entry(entry)
     }
+
+    fn validate_recorded(&self, entry: BrokerEntry) -> Result<RegisteredBroker, RegistryError> {
+        RegisteredBroker::herdr(entry)
+    }
 }
 
 impl RegistryAuthority for BridgeUnitGuard {
     fn validate_entry(&self, entry: &BrokerEntry) -> Result<(), RegistryError> {
         validate_zellij_entry(entry, &self.identity, entry.handoff_id)
+    }
+
+    fn validate_recorded(&self, entry: BrokerEntry) -> Result<RegisteredBroker, RegistryError> {
+        RegisteredBroker::zellij(entry, &self.identity)
     }
 }
 
@@ -821,6 +1020,50 @@ impl Registry {
         Ok(self.read()?.brokers)
     }
 
+    /// Selects the first recorded Zellij row for the current session, then validates it.
+    ///
+    /// Unrelated rows do not participate in current-session admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for storage or a malformed selected row.
+    pub fn zellij_entry_for_session(
+        &self,
+        session: &muxe_adapter_api::HostDiscoveryKey,
+    ) -> Result<Option<RegisteredBroker>, RegistryError> {
+        self.entries()?
+            .into_iter()
+            .find(|row| {
+                row.parsed_host_kind().ok() == Some(HostKind::Zellij)
+                    && (row.live_server.as_deref() == Some(session.as_str())
+                        || row.discovery_key == session.as_str())
+            })
+            .map(RegisteredBroker::recorded_zellij)
+            .transpose()
+    }
+
+    /// Probes all raw endpoints before selecting and validating this Herdr host.
+    ///
+    /// This preserves probe errors and excludes stale or unrelated malformed rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for storage, an unexpected probe failure, or a selected malformed row.
+    pub fn live_herdr_entries_for(
+        &self,
+        discovery: &muxe_adapter_api::HostDiscoveryKey,
+    ) -> Result<Vec<RegisteredBroker>, RegistryError> {
+        self.probe()?
+            .live
+            .into_iter()
+            .filter(|row| {
+                row.parsed_host_kind().ok() == Some(HostKind::Herdr)
+                    && row.discovery_key == discovery.as_str()
+            })
+            .map(RegisteredBroker::herdr)
+            .collect()
+    }
+
     /// Probes every entry: a refused or missing socket is stale, an accepted
     /// connection is live. Any other socket error fails closed instead of
     /// guessing.
@@ -1167,6 +1410,85 @@ mod tests {
         entry.live_server = Some(format!("{member}-server"));
         entry.registration_id = Some(BrokerRegistrationId::generate().unwrap());
         entry
+    }
+
+    #[test]
+    fn exact_herdr_live_selection_ignores_unrelated_and_stale_malformed_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = test_registry(temp.path());
+        let socket = temp.path().join("current.sock");
+        let _current = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let valid = entry(socket);
+        registry.register(valid.clone()).unwrap();
+        let unrelated_socket = temp.path().join("unrelated.sock");
+        let _unrelated = std::os::unix::net::UnixListener::bind(&unrelated_socket).unwrap();
+        let mut unrelated = entry(unrelated_socket);
+        unrelated.discovery_key = "unrelated".to_owned();
+        unrelated.bridge_member = Some(BridgeMemberId::new("foreign".to_owned()).unwrap());
+        registry.register(unrelated.clone()).unwrap();
+        let mut stale = unrelated.clone();
+        stale.discovery_key = "server".to_owned();
+        stale.socket = temp.path().join("absent.sock");
+        registry.register(stale).unwrap();
+        let discovery = muxe_adapter_api::HostDiscoveryKey::parse("server").unwrap();
+        let selected = registry.live_herdr_entries_for(&discovery).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].matches_recorded(&valid));
+        assert!(
+            super::super::activate::select_units(
+                &registry.probe().unwrap().live,
+                crate::cli::HostScope::All,
+                None,
+            )
+            .is_err()
+        );
+        let mut malformed_selected = valid;
+        malformed_selected.bridge_member = unrelated.bridge_member;
+        registry.register(malformed_selected).unwrap();
+        let before = std::fs::read(&registry.path).unwrap();
+        assert!(registry.live_herdr_entries_for(&discovery).is_err());
+        assert_eq!(std::fs::read(&registry.path).unwrap(), before);
+    }
+
+    #[test]
+    fn exact_zellij_session_selection_validates_only_first_matching_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = test_registry(temp.path());
+        let identity = BridgeIdentity::resolve(
+            &temp.path().join("integration"),
+            std::ffi::OsStr::new(crate::integration::BRIDGE_FILE_NAME),
+        )
+        .unwrap();
+        let unrelated =
+            BrokerEntry::now("zellij", "unrelated", temp.path().join("unrelated.sock"), 0);
+        registry.register(unrelated).unwrap();
+        let mut selected = zellij_entry(
+            &identity,
+            "logical-member",
+            temp.path().join("selected.sock"),
+            None,
+        );
+        selected.live_server = Some("current-session".to_owned());
+        registry.register(selected.clone()).unwrap();
+        let session = muxe_adapter_api::HostDiscoveryKey::parse("current-session").unwrap();
+        let validated = registry
+            .zellij_entry_for_session(&session)
+            .unwrap()
+            .unwrap();
+        assert!(validated.matches_recorded(&selected));
+        assert!(
+            super::super::activate::select_units(
+                &registry.entries().unwrap(),
+                crate::cli::HostScope::All,
+                None,
+            )
+            .is_err()
+        );
+        selected.bridge_member = None;
+        registry.register(selected).unwrap();
+        let before = std::fs::read(&registry.path).unwrap();
+        assert!(registry.zellij_entry_for_session(&session).is_err());
+        assert_eq!(std::fs::read(&registry.path).unwrap(), before);
     }
 
     #[test]

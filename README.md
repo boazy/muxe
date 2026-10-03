@@ -406,6 +406,8 @@ muxe activate
 - One Herdr broker is one unit.
 - All live Zellij brokers with the same canonical stable bridge identity form one atomic group.
 
+`muxe activate` ignores rows with unknown host labels and rejects malformed records for selected hosts. Schema-v2 and legacy rows without registration tokens remain supported.
+
 Units commit independently after global preflight. The final output reports each unit as committed, unchanged, rolled back, or failed. Run `muxe activate` from your shell before using the menu hotkey.
 
 When a menu launch needs a broker, Muxe checks the unit's activation journal before probing the normal endpoint. It verifies `Status` and peer credentials on the same control connection, then rechecks the socket identity before consulting the registry. Muxe reuses, adopts, or relocates only the authenticated registration. Its token, process ID, and start time bind cleanup to that exact row; a legacy peer without a token may reuse only its unchanged row. A durable startup claim prevents concurrent launchers from starting competing children. Muxe removes a stale row only after a registry-locked recheck proves that the exact process is dead and the endpoint is absent or refused. Pending activation and ambiguous endpoints fail closed.
@@ -417,6 +419,8 @@ The `control-json-v1` protocol is additive: unknown fields are ignored and new s
 New activation journals use schema v5. Schemas v3 and v4 remain readable for rollback before Ready. Earlier Ready journals lack exact target-incarnation proof and remain preserved instead of authorizing a commit. Corrupt or unsupported journals are also preserved for diagnosis.
 
 For Zellij, the coordinator holds the bridge-unit readiness gate while checking every target at one OS-wide monotonic as-of tick. The v5 Ready proof records the unit epoch ID separately from the tick, the exact member set, and each target's process-scoped registration identity. Herdr Ready records its exact target identity too. This is a broker-observed snapshot, not simultaneous physical host membership: `list-clients` is a snapshot, not a host-issued lease, and clients can attach or detach around it. Later heartbeat expiry does not change the earlier proof. An endpoint and handoff match alone do not establish the recorded target incarnation.
+
+The final target check ignores registry rows outside the selected target endpoints. Duplicate rows at a target endpoint prevent Ready, even if they name another or unknown host.
 
 For a Zellij activation, the target broker binds its gated control endpoint without opening bridge pipes. After the coordinator durably records that the replacement bridge reloaded in every selected session, the target opens its request and event pipes and establishes a fresh client census. A journal with different authority or a rollback decision rejects the wait; a predecessor bridge subscription cannot authorize Ready.
 

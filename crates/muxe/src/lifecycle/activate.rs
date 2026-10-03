@@ -69,7 +69,9 @@ use super::{
         TargetProcessId, TargetRetirementAuthority, TargetRetirementIntent, TransactionDirective,
         TransactionMember, UnitKind, unit_hash,
     },
-    registry::{BridgeMemberId, BrokerEntry, MemberCensus, Registry, RegistryError},
+    registry::{
+        BridgeMemberId, BrokerEntry, MemberCensus, RegisteredBroker, Registry, RegistryError,
+    },
 };
 
 /// Activation transaction boundaries for failure injection.
@@ -907,11 +909,11 @@ impl Preflight for LivePreflight<'_> {
 #[derive(Clone, Debug)]
 pub(crate) enum PlannedUnit {
     Herdr {
-        entry: BrokerEntry,
+        entry: RegisteredBroker,
     },
     Zellij {
         bridge_identity: BridgeIdentity,
-        entries: Vec<BrokerEntry>,
+        entries: Vec<RegisteredBroker>,
         census: MemberCensus,
     },
 }
@@ -920,7 +922,7 @@ impl PlannedUnit {
     fn unit_kind(&self) -> UnitKind {
         match self {
             Self::Herdr { entry } => UnitKind::Herdr {
-                host_hash: unit_hash(&entry.discovery_key),
+                host_hash: unit_hash(entry.discovery_key().as_str()),
             },
             Self::Zellij {
                 bridge_identity, ..
@@ -957,7 +959,10 @@ trait ActivationHost: HostPreflight {
     type ReadinessGuard;
     type ProofSnapshot: Send + 'static;
 
-    fn entries(&self) -> &[BrokerEntry];
+    fn entries(&self) -> &[RegisteredBroker];
+    fn validate_recorded(&self, entry: BrokerEntry) -> Result<RegisteredBroker, RegistryError>;
+    fn attests_entry(&self, status: &ActivationStatus, entry: &RegisteredBroker) -> bool;
+    fn wire_host(&self) -> muxe_protocol::wire::HostKind;
     fn bridge(&self) -> Option<&dyn BridgeActivation>;
     async fn preflight<P: Preflight>(&self, preflight: &P, config_dir: &Path)
     -> Result<(), String>;
@@ -978,7 +983,7 @@ trait ActivationHost: HostPreflight {
         cache_dir: &Path,
         journal: &ActivationJournal,
         prepared: &[PreparedAuthority],
-    ) -> Result<Vec<BrokerEntry>, ActivateError>;
+    ) -> Result<Vec<RegisteredBroker>, ActivateError>;
 }
 
 /// Bridge transaction operations exist only for a unit with bridge authority.
@@ -1013,17 +1018,17 @@ trait BridgeActivation {
     ) -> Result<(), ActivateError>;
 }
 
-struct HerdrActivation<'a>(&'a BrokerEntry);
+struct HerdrActivation<'a>(&'a RegisteredBroker);
 
 struct ZellijActivation<'a> {
     identity: &'a BridgeIdentity,
-    entries: &'a [BrokerEntry],
+    entries: &'a [RegisteredBroker],
     census: &'a MemberCensus,
 }
 
 impl HostPreflight for HerdrActivation<'_> {
     async fn validate_live_host(&self, live: &LivePreflight<'_>) -> Result<(), String> {
-        let discovery_key = &self.0.discovery_key;
+        let discovery_key = self.0.discovery_key().as_str();
         let policy = live.version_policy()?;
         let runtime = live.herdr_runtime(discovery_key).await?;
         let version = runtime.server_version().as_str();
@@ -1058,7 +1063,7 @@ impl HostPreflight for ZellijActivation<'_> {
             })?;
             live.check_version(
                 "zellij",
-                &entry.discovery_key,
+                entry.discovery_key().as_str(),
                 version,
                 crate::compatibility::ZELLIJ_MINIMUM,
                 crate::compatibility::ZELLIJ_LATEST_VERIFIED,
@@ -1073,8 +1078,20 @@ impl ActivationHost for HerdrActivation<'_> {
     type ReadinessGuard = ();
     type ProofSnapshot = ();
 
-    fn entries(&self) -> &[BrokerEntry] {
+    fn entries(&self) -> &[RegisteredBroker] {
         std::slice::from_ref(self.0)
+    }
+
+    fn validate_recorded(&self, entry: BrokerEntry) -> Result<RegisteredBroker, RegistryError> {
+        RegisteredBroker::herdr(entry)
+    }
+
+    fn attests_entry(&self, status: &ActivationStatus, _entry: &RegisteredBroker) -> bool {
+        status.bridge_unit.is_none()
+    }
+
+    fn wire_host(&self) -> muxe_protocol::wire::HostKind {
+        muxe_protocol::wire::HostKind::Herdr
     }
 
     fn bridge(&self) -> Option<&dyn BridgeActivation> {
@@ -1114,19 +1131,44 @@ impl ActivationHost for HerdrActivation<'_> {
         (): Self::ProofSnapshot,
         _config_dir: &Path,
         cache_dir: &Path,
-        _journal: &ActivationJournal,
+        journal: &ActivationJournal,
         _prepared: &[PreparedAuthority],
-    ) -> Result<Vec<BrokerEntry>, ActivateError> {
-        Ok(Registry::open(cache_dir)?.entries()?)
+    ) -> Result<Vec<RegisteredBroker>, ActivateError> {
+        Registry::open(cache_dir)?
+            .entries()?
+            .into_iter()
+            // Select exact target endpoints before parsing host format. Keep
+            // every row at those endpoints so foreign duplicates cannot vanish.
+            .filter(|entry| {
+                journal
+                    .members()
+                    .iter()
+                    .any(|member| member.endpoint().as_path() == entry.socket)
+            })
+            .map(|entry| RegisteredBroker::herdr(entry).map_err(ActivateError::from))
+            .collect()
     }
 }
 
 impl ActivationHost for ZellijActivation<'_> {
     type ReadinessGuard = muxe_adapter_zellij::ReadinessGateGuard;
-    type ProofSnapshot = (BridgeIdentity, Vec<BrokerEntry>, MemberCensus);
+    type ProofSnapshot = (BridgeIdentity, Vec<RegisteredBroker>, MemberCensus);
 
-    fn entries(&self) -> &[BrokerEntry] {
+    fn entries(&self) -> &[RegisteredBroker] {
         self.entries
+    }
+
+    fn validate_recorded(&self, entry: BrokerEntry) -> Result<RegisteredBroker, RegistryError> {
+        RegisteredBroker::zellij(entry, self.identity)
+    }
+
+    fn attests_entry(&self, status: &ActivationStatus, entry: &RegisteredBroker) -> bool {
+        entry.bridge_identity() == Some(self.identity)
+            && status.bridge_unit == Some(self.identity.unit())
+    }
+
+    fn wire_host(&self) -> muxe_protocol::wire::HostKind {
+        muxe_protocol::wire::HostKind::Zellij
     }
 
     fn bridge(&self) -> Option<&dyn BridgeActivation> {
@@ -1206,15 +1248,18 @@ impl ActivationHost for ZellijActivation<'_> {
         cache_dir: &Path,
         journal: &ActivationJournal,
         prepared: &[PreparedAuthority],
-    ) -> Result<Vec<BrokerEntry>, ActivateError> {
+    ) -> Result<Vec<RegisteredBroker>, ActivateError> {
         prove_ready_bridge(
             config_dir, cache_dir, &identity, &entries, &census, journal, prepared,
         )?;
-        let rows = Registry::open(cache_dir)?.entries()?;
-        if rows
+        let raw = Registry::open(cache_dir)?.entries()?;
+        // Bridge membership completeness is independent of exact endpoint
+        // admission: foreign rows at a selected socket must remain observable.
+        if raw
             .iter()
             .filter(|row| {
-                row.host_kind == "zellij" && row.bridge_identity.as_ref() == Some(&identity)
+                row.parsed_host_kind().ok() == Some(muxe_protocol::wire::HostKind::Zellij)
+                    && row.bridge_identity.as_ref() == Some(&identity)
             })
             .count()
             != prepared.len()
@@ -1223,7 +1268,15 @@ impl ActivationHost for ZellijActivation<'_> {
                 reason: "final Ready proof has incomplete target registry membership".to_owned(),
             });
         }
-        Ok(rows)
+        raw.into_iter()
+            .filter(|row| {
+                journal
+                    .members()
+                    .iter()
+                    .any(|member| member.endpoint().as_path() == row.socket)
+            })
+            .map(|row| RegisteredBroker::zellij(row, &identity).map_err(ActivateError::from))
+            .collect()
     }
 }
 
@@ -1237,12 +1290,25 @@ impl BridgeActivation for ZellijActivation<'_> {
         let mut current_entries = live
             .into_iter()
             .filter(|entry| {
-                entry.host_kind == "zellij" && entry.bridge_identity.as_ref() == Some(self.identity)
+                entry.parsed_host_kind().ok() == Some(muxe_protocol::wire::HostKind::Zellij)
+                    && entry.bridge_identity.as_ref() == Some(self.identity)
             })
-            .collect::<Vec<_>>();
-        current_entries.sort_by(|left, right| left.bridge_member.cmp(&right.bridge_member));
-        let current_census = MemberCensus::from_entries(self.identity, &current_entries)
+            .map(|entry| self.validate_recorded(entry))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
+        current_entries.sort_by(|left, right| left.bridge_member().cmp(&right.bridge_member()));
+        let current_census = MemberCensus::from_members(
+            current_entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .bridge_member()
+                        .cloned()
+                        .expect("validated Zellij member")
+                })
+                .collect(),
+        )
+        .map_err(|error| error.to_string())?;
         if &current_census != self.census || current_entries != self.entries {
             return Err(
                 "Zellij bridge membership changed after preflight; activation aborted before journal or drain"
@@ -1605,50 +1671,29 @@ pub(crate) fn select_units(
 ) -> Result<Vec<PlannedUnit>, ActivateError> {
     match scope {
         HostScope::All => {
-            let mut units = live
-                .iter()
-                .filter(|entry| entry.host_kind == "herdr")
-                .cloned()
-                .map(|entry| PlannedUnit::Herdr { entry })
-                .collect::<Vec<_>>();
+            let mut units = herdr_units(live, None)?;
             units.extend(group_zellij(live)?);
             Ok(units)
         }
         HostScope::Zellij => group_zellij(live),
-        HostScope::Herdr => Ok(live
-            .iter()
-            .filter(|entry| entry.host_kind == "herdr")
-            .map(|entry| PlannedUnit::Herdr {
-                entry: entry.clone(),
-            })
-            .collect()),
+        HostScope::Herdr => herdr_units(live, None),
         HostScope::Current => {
             let Some(current) = current else {
                 return Err(ActivateError::CurrentHostRequired);
             };
             match current {
-                DetectedHost::Herdr { discovery_key } => live
-                    .iter()
-                    .find(|entry| {
-                        entry.host_kind == "herdr" && &entry.discovery_key == discovery_key
-                    })
-                    .map(|entry| {
-                        vec![PlannedUnit::Herdr {
-                            entry: entry.clone(),
-                        }]
-                    })
-                    .ok_or(ActivateError::NoLiveUnits),
+                DetectedHost::Herdr { discovery_key } => {
+                    let units = herdr_units(live, Some(discovery_key))?;
+                    units
+                        .into_iter()
+                        .next()
+                        .map(|unit| vec![unit])
+                        .ok_or(ActivateError::NoLiveUnits)
+                }
                 DetectedHost::Zellij {
                     bridge_identity, ..
                 } => {
-                    let group = live
-                        .iter()
-                        .filter(|entry| {
-                            entry.host_kind == "zellij"
-                                && entry.bridge_identity.as_ref() == Some(bridge_identity)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
+                    let group = recorded_zellij_group(live, bridge_identity)?;
                     if group.is_empty() {
                         return Err(ActivateError::NoLiveUnits);
                     }
@@ -1659,10 +1704,100 @@ pub(crate) fn select_units(
     }
 }
 
+fn herdr_units(
+    rows: &[BrokerEntry],
+    discovery: Option<&str>,
+) -> Result<Vec<PlannedUnit>, ActivateError> {
+    rows.iter()
+        .filter(|entry| {
+            entry.parsed_host_kind().ok() == Some(muxe_protocol::wire::HostKind::Herdr)
+                && discovery.is_none_or(|key| entry.discovery_key == key)
+        })
+        .take(discovery.map_or(usize::MAX, |_| 1))
+        .cloned()
+        .map(|entry| {
+            RegisteredBroker::herdr(entry)
+                .map(|entry| PlannedUnit::Herdr { entry })
+                .map_err(ActivateError::from)
+        })
+        .collect()
+}
+
+fn recorded_zellij_group(
+    rows: &[BrokerEntry],
+    identity: &BridgeIdentity,
+) -> Result<Vec<RegisteredBroker>, RegistryError> {
+    rows.iter()
+        .filter(|entry| {
+            entry.parsed_host_kind().ok() == Some(muxe_protocol::wire::HostKind::Zellij)
+                && entry.bridge_identity.as_ref() == Some(identity)
+        })
+        .cloned()
+        .map(|entry| RegisteredBroker::zellij(entry, identity))
+        .collect()
+}
+
+/// Concrete host prerequisites for native activation composition.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectedHostRequirements {
+    pub herdr: bool,
+    pub zellij: bool,
+}
+
+/// Validates selected lifecycle records before choosing native executables.
+///
+/// # Errors
+///
+/// Returns errors for an absent current host or a malformed selected record.
+pub fn selected_host_requirements(
+    rows: Vec<BrokerEntry>,
+    scope: HostScope,
+    current: Option<&DetectedHost>,
+) -> Result<SelectedHostRequirements, ActivateError> {
+    let mut requirements = SelectedHostRequirements {
+        herdr: false,
+        zellij: false,
+    };
+    if matches!(scope, HostScope::Current) && current.is_none() {
+        return Err(ActivateError::CurrentHostRequired);
+    }
+    // Native executable composition consumes the probe snapshot, avoiding
+    // copies of planned records that activation immediately rereads.
+    for row in rows {
+        match row.parsed_host_kind().ok() {
+            Some(muxe_protocol::wire::HostKind::Herdr)
+                if !matches!(scope, HostScope::Zellij)
+                    && (!matches!(scope, HostScope::Current)
+                        || matches!(current, Some(DetectedHost::Herdr { discovery_key })
+                            if row.discovery_key == *discovery_key && !requirements.herdr)) =>
+            {
+                RegisteredBroker::herdr(row)?;
+                requirements.herdr = true;
+            }
+            Some(muxe_protocol::wire::HostKind::Zellij)
+                if !matches!(scope, HostScope::Herdr)
+                    && (!matches!(scope, HostScope::Current)
+                        || matches!(current, Some(DetectedHost::Zellij { bridge_identity, .. })
+                            if row.bridge_identity.as_ref() == Some(bridge_identity))) =>
+            {
+                RegisteredBroker::recorded_zellij(row)?;
+                requirements.zellij = true;
+            }
+            _ => {}
+        }
+    }
+    if matches!(scope, HostScope::Current) && !requirements.herdr && !requirements.zellij {
+        return Err(ActivateError::NoLiveUnits);
+    }
+    Ok(requirements)
+}
+
 fn group_zellij(live: &[BrokerEntry]) -> Result<Vec<PlannedUnit>, ActivateError> {
-    let mut groups: std::collections::BTreeMap<BridgeIdentity, Vec<BrokerEntry>> =
+    let mut groups: std::collections::BTreeMap<BridgeIdentity, Vec<RegisteredBroker>> =
         std::collections::BTreeMap::new();
-    for entry in live.iter().filter(|entry| entry.host_kind == "zellij") {
+    for entry in live.iter().filter(|entry| {
+        entry.parsed_host_kind().ok() == Some(muxe_protocol::wire::HostKind::Zellij)
+    }) {
         let identity = entry
             .bridge_identity
             .clone()
@@ -1672,7 +1807,8 @@ fn group_zellij(live: &[BrokerEntry]) -> Result<Vec<PlannedUnit>, ActivateError>
                     entry.discovery_key
                 ),
             })?;
-        groups.entry(identity).or_default().push(entry.clone());
+        let registered = RegisteredBroker::zellij(entry.clone(), &identity)?;
+        groups.entry(identity).or_default().push(registered);
     }
     groups
         .into_iter()
@@ -1682,13 +1818,22 @@ fn group_zellij(live: &[BrokerEntry]) -> Result<Vec<PlannedUnit>, ActivateError>
 
 fn zellij_unit(
     bridge_identity: BridgeIdentity,
-    mut entries: Vec<BrokerEntry>,
+    mut entries: Vec<RegisteredBroker>,
 ) -> Result<PlannedUnit, ActivateError> {
-    entries.sort_by(|left, right| left.bridge_member.cmp(&right.bridge_member));
-    let census = MemberCensus::from_entries(&bridge_identity, &entries).map_err(|error| {
-        ActivateError::UnitFailed {
-            reason: error.to_string(),
-        }
+    entries.sort_by(|left, right| left.bridge_member().cmp(&right.bridge_member()));
+    let census = MemberCensus::from_members(
+        entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .bridge_member()
+                    .cloned()
+                    .expect("validated Zellij member")
+            })
+            .collect(),
+    )
+    .map_err(|error| ActivateError::UnitFailed {
+        reason: error.to_string(),
     })?;
     Ok(PlannedUnit::Zellij {
         bridge_identity,
@@ -1838,7 +1983,7 @@ where
 
 pub(crate) fn unit_label(unit: &PlannedUnit) -> String {
     match unit {
-        PlannedUnit::Herdr { entry } => format!("herdr:{}", entry.discovery_key),
+        PlannedUnit::Herdr { entry } => format!("herdr:{}", entry.discovery_key()),
         PlannedUnit::Zellij {
             bridge_identity, ..
         } => format!("zellij:{bridge_identity}"),
@@ -1849,20 +1994,27 @@ fn revalidate_transaction_membership(
     cache_dir: &Path,
     bridge_identity: &BridgeIdentity,
     census: &MemberCensus,
-    old_entries: &[BrokerEntry],
+    old_entries: &[RegisteredBroker],
     prepared: &[PreparedAuthority],
 ) -> Result<(), String> {
-    let registry_entries = Registry::open(cache_dir)
+    let raw = Registry::open(cache_dir)
         .map_err(|error| error.to_string())?
         .entries()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|entry| {
-            entry.host_kind == "zellij" && entry.bridge_identity.as_ref() == Some(bridge_identity)
-        })
-        .collect::<Vec<_>>();
-    let current_census = MemberCensus::from_entries(bridge_identity, &registry_entries)
         .map_err(|error| error.to_string())?;
+    let registry_entries =
+        recorded_zellij_group(&raw, bridge_identity).map_err(|error| error.to_string())?;
+    let current_census = MemberCensus::from_members(
+        registry_entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .bridge_member()
+                    .cloned()
+                    .expect("validated Zellij member")
+            })
+            .collect(),
+    )
+    .map_err(|error| error.to_string())?;
     if &current_census != census {
         return Err("logical Zellij bridge membership changed during activation".to_owned());
     }
@@ -1870,12 +2022,12 @@ fn revalidate_transaction_membership(
         if old_entries.contains(current) {
             continue;
         }
-        let authorized = current.bridge_identity.as_ref() == Some(bridge_identity)
+        let authorized = current.bridge_identity() == Some(bridge_identity)
             && prepared.iter().any(|member| {
-                current.bridge_member == member.entry.bridge_member
-                    && current.discovery_key == member.entry.discovery_key
-                    && current.socket == member.entry.socket
-                    && current.handoff_id == Some(member.handoff)
+                current.bridge_member() == member.entry.bridge_member()
+                    && current.discovery_key() == member.entry.discovery_key()
+                    && current.socket() == member.entry.socket()
+                    && current.handoff_id() == Some(member.handoff)
             });
         if !authorized {
             return Err("registry contains a non-journal-authorized bridge incarnation".to_owned());
@@ -1886,7 +2038,7 @@ fn revalidate_transaction_membership(
 
 /// One prepared member with its retained old-broker session.
 struct PreparedMember<C: ControlPort> {
-    entry: BrokerEntry,
+    entry: RegisteredBroker,
     handoff: HandoffId,
     old_session: C::Session,
 }
@@ -1894,7 +2046,7 @@ struct PreparedMember<C: ControlPort> {
 /// Session-free authority copied into a bounded, read-only filesystem probe.
 #[derive(Clone)]
 struct PreparedAuthority {
-    entry: BrokerEntry,
+    entry: RegisteredBroker,
     handoff: HandoffId,
 }
 
@@ -1948,26 +2100,26 @@ where
     for entry in entries {
         let mut session = inputs
             .control
-            .connect(&entry.socket)
+            .connect(entry.socket())
             .await
             .map_err(|error| ActivateError::UnitFailed {
-                reason: format!("connect {} before journal: {error}", entry.discovery_key),
+                reason: format!("connect {} before journal: {error}", entry.discovery_key()),
             })?;
         let status = session
             .status()
             .await
             .map_err(|error| ActivateError::UnitFailed {
-                reason: format!("status {} before journal: {error}", entry.discovery_key),
+                reason: format!("status {} before journal: {error}", entry.discovery_key()),
             })?;
         if status.prepare_handoff != Some(PrepareHandoffProtocol::CoordinatorSuppliedV1)
-            || !status_attests_entry(&status, entry)
+            || !host.attests_entry(&status, entry)
             || status.lifecycle != LifecycleState::Running
             || status.handoff_id.is_some()
         {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
                     "old broker {} does not attest a clean running incarnation",
-                    entry.discovery_key
+                    entry.discovery_key()
                 ),
             });
         }
@@ -1989,8 +2141,8 @@ where
         .map(|(entry, old_record)| {
             TransactionMember::new(
                 activation_id,
-                ActivationMemberId::new(entry.discovery_key.clone())?,
-                MemberEndpoint::new(entry.socket.clone())?,
+                ActivationMemberId::new(entry.discovery_key().as_str().to_owned())?,
+                MemberEndpoint::new(entry.socket().to_path_buf())?,
                 fresh_handoff()?,
                 old_record.clone(),
             )
@@ -1998,7 +2150,9 @@ where
         .collect::<Result<Vec<_>, JournalError>>()?;
     let mut journal =
         ActivationJournal::new(activation_id, unit_kind, inputs.target.clone(), members)?;
-    journal.old_registry.extend_from_slice(entries);
+    journal
+        .old_registry
+        .extend(entries.iter().map(RegisteredBroker::recorded_entry));
     if let Some(bridge) = host.bridge() {
         bridge.bind_authority(&mut journal, preparation, &inputs.target)?;
     }
@@ -2061,7 +2215,7 @@ where
         let member_index = journal
             .members()
             .iter()
-            .position(|member| member.endpoint().as_path() == entry.socket)
+            .position(|member| member.endpoint().as_path() == entry.socket())
             .expect("journal member covers every planned entry");
         journal.members_mut()[member_index].old = OldMemberProgress::PrepareIntent;
         if let Err(error) = journal::write_journal(inputs.cache_dir, &journal) {
@@ -2080,7 +2234,7 @@ where
         }
         let handoff = journal.members()[member_index].handoff_id();
         let old_record = journal.members()[member_index].old_record.clone();
-        match drain_one(inputs, unit, entry, handoff, &old_record).await {
+        match drain_one(inputs, host, entry, handoff, &old_record).await {
             Ok(member) => {
                 journal.members_mut()[member_index].old = OldMemberProgress::Drained;
                 prepared.push(member);
@@ -2156,7 +2310,7 @@ where
         let index = journal
             .members()
             .iter()
-            .position(|record| record.endpoint().as_path() == member.entry.socket)
+            .position(|record| record.endpoint().as_path() == member.entry.socket())
             .expect("prepared member remains journaled");
         journal.members_mut()[index].target = TargetMemberProgress::SpawnIntent;
         if let Err(error) = journal::write_journal(inputs.cache_dir, &journal) {
@@ -2174,8 +2328,8 @@ where
             return Ok(rollback_outcome(label, reason, &diagnostics));
         }
         let record = &journal.members()[index];
-        if member.entry.discovery_key != record.member().as_str()
-            || member.entry.socket != record.endpoint().as_path()
+        if member.entry.discovery_key().as_str() != record.member().as_str()
+            || member.entry.socket() != record.endpoint().as_path()
         {
             return Err(ActivateError::UnitFailed {
                 reason: "prepared registry member differs from journal authority".to_owned(),
@@ -2184,10 +2338,10 @@ where
         let spawn_member = SpawnMember {
             unit: &journal.unit,
             authority: record.authority.clone(),
-            observed_host: member.entry.parsed_host_kind()?,
-            observed_bridge_identity: member.entry.bridge_identity.as_ref(),
-            observed_bridge_member: member.entry.bridge_member.as_ref(),
-            observed_handoff_id: member.entry.handoff_id,
+            observed_host: host.wire_host(),
+            observed_bridge_identity: member.entry.bridge_identity(),
+            observed_bridge_member: member.entry.bridge_member(),
+            observed_handoff_id: member.entry.handoff_id(),
             journal_path: journal_path.clone(),
         };
         let (program, args) = match spawn_policy.render(&spawn_member) {
@@ -2279,7 +2433,7 @@ where
             let index = journal
                 .members()
                 .iter()
-                .position(|record| record.endpoint().as_path() == member.entry.socket)
+                .position(|record| record.endpoint().as_path() == member.entry.socket())
                 .expect("ready member remains journaled");
             journal.members_mut()[index].target = TargetMemberProgress::Ready;
             journal::write_journal(inputs.cache_dir, &journal)?;
@@ -2389,7 +2543,7 @@ where
         let index = journal
             .members()
             .iter()
-            .position(|record| record.endpoint().as_path() == member.entry.socket)
+            .position(|record| record.endpoint().as_path() == member.entry.socket())
             .expect("commit member remains journaled");
         journal.members_mut()[index].old = OldMemberProgress::CommitIntent;
         journal::write_journal(inputs.cache_dir, &journal)?;
@@ -2402,7 +2556,7 @@ where
                 )? {
                     commit_failures.push(format!(
                         "old {} acknowledged without a durable retirement receipt",
-                        member.entry.discovery_key
+                        member.entry.discovery_key()
                     ));
                     continue;
                 }
@@ -2411,7 +2565,7 @@ where
             }
             Err(error) => commit_failures.push(format!(
                 "commit old {}: {error}",
-                member.entry.discovery_key
+                member.entry.discovery_key()
             )),
         }
     }
@@ -2425,7 +2579,7 @@ where
         let index = journal
             .members()
             .iter()
-            .position(|record| record.endpoint().as_path() == member.entry.socket)
+            .position(|record| record.endpoint().as_path() == member.entry.socket())
             .expect("target commit member remains journaled");
         let mut target_session = match certified_target_session(
             inputs.cache_dir,
@@ -2439,7 +2593,7 @@ where
             Err(error) => {
                 commit_failures.push(format!(
                     "verify target {}: {error}",
-                    member.entry.discovery_key
+                    member.entry.discovery_key()
                 ));
                 continue;
             }
@@ -2453,7 +2607,7 @@ where
             }
             Err(error) => commit_failures.push(format!(
                 "commit target {}: {error}",
-                member.entry.discovery_key
+                member.entry.discovery_key()
             )),
         }
     }
@@ -2480,10 +2634,10 @@ where
 }
 
 /// Drains one old broker with a handoff that was durable before this call.
-async fn drain_one<C>(
+async fn drain_one<C, H: ActivationHost>(
     inputs: &ActivateInputs<'_, C, impl BrokerSpawner, impl HostReloader, impl Preflight>,
-    unit: &PlannedUnit,
-    entry: &BrokerEntry,
+    host: &H,
+    entry: &RegisteredBroker,
     handoff: HandoffId,
     old_record: &CompatibilityRecord,
 ) -> Result<PreparedMember<C>, PrepareFailure>
@@ -2492,43 +2646,43 @@ where
 {
     let mut session = inputs
         .control
-        .connect(&entry.socket)
+        .connect(entry.socket())
         .await
         .map_err(|error| {
-            PrepareFailure::Ambiguous(format!("connect {}: {error}", entry.discovery_key))
+            PrepareFailure::Ambiguous(format!("connect {}: {error}", entry.discovery_key()))
         })?;
     let status = session.status().await.map_err(|error| {
         PrepareFailure::Ambiguous(format!(
             "status failed for {}: {error}",
-            entry.discovery_key
+            entry.discovery_key()
         ))
     })?;
-    if !status_attests_entry(&status, entry)
+    if !host.attests_entry(&status, entry)
         || status.current != *old_record
         || status.lifecycle != LifecycleState::Running
         || status.handoff_id.is_some()
     {
         return Err(PrepareFailure::Ambiguous(format!(
             "pre-Prepare status mismatched exact old authority for {}",
-            entry.discovery_key
+            entry.discovery_key()
         )));
     }
     let prepared = match session.prepare(&inputs.target, &handoff).await {
         Ok(status) => status,
         Err(error) => match session.status().await {
             Ok(status)
-                if status_attests_unit(&status, unit)
+                if host.attests_entry(&status, entry)
                     && status.current == *old_record
                     && status.lifecycle == LifecycleState::Running
                     && status.handoff_id.is_none() =>
             {
                 return Err(PrepareFailure::Refused(format!(
                     "prepare refused for {} without mutation: {error}",
-                    entry.discovery_key
+                    entry.discovery_key()
                 )));
             }
             Ok(status)
-                if status_attests_unit(&status, unit)
+                if host.attests_entry(&status, entry)
                     && status.lifecycle == LifecycleState::Draining
                     && status.handoff_id == Some(handoff)
                     && status.target.as_ref() == Some(&inputs.target) =>
@@ -2538,19 +2692,19 @@ where
             Ok(_) | Err(_) => {
                 return Err(PrepareFailure::Ambiguous(format!(
                     "prepare outcome is ambiguous for {}: {error}",
-                    entry.discovery_key
+                    entry.discovery_key()
                 )));
             }
         },
     };
-    if !status_attests_unit(&prepared, unit)
+    if !host.attests_entry(&prepared, entry)
         || prepared.lifecycle != LifecycleState::Draining
         || prepared.handoff_id != Some(handoff)
         || prepared.target.as_ref() != Some(&inputs.target)
     {
         return Err(PrepareFailure::Ambiguous(format!(
             "prepared status mismatches exact journaled intent for {}",
-            entry.discovery_key
+            entry.discovery_key()
         )));
     }
     Ok(PreparedMember {
@@ -2573,25 +2727,6 @@ fn fresh_handoff() -> Result<HandoffId, JournalError> {
     Ok(HandoffId(bytes))
 }
 
-fn status_attests_entry(status: &ActivationStatus, entry: &BrokerEntry) -> bool {
-    match entry.host_kind.as_str() {
-        "zellij" => entry
-            .bridge_identity
-            .as_ref()
-            .is_some_and(|identity| status.bridge_unit == Some(identity.unit())),
-        "herdr" => status.bridge_unit.is_none(),
-        _ => false,
-    }
-}
-
-fn status_attests_unit(status: &ActivationStatus, unit: &PlannedUnit) -> bool {
-    match unit {
-        PlannedUnit::Zellij {
-            bridge_identity, ..
-        } => status.bridge_unit == Some(bridge_identity.unit()),
-        PlannedUnit::Herdr { .. } => status.bridge_unit.is_none(),
-    }
-}
 /// Verifies that one recovery status is bound to the journal's canonical unit.
 ///
 /// Zellij requires a canonical identity whose unit equals both the journal key
@@ -2616,17 +2751,17 @@ pub fn status_attests_journal(status: &ActivationStatus, journal: &ActivationJou
 /// requires this census.
 fn target_ready<H: ActivationHost>(
     status: &ActivationStatus,
-    member: &BrokerEntry,
+    member: &RegisteredBroker,
     expected_handoff: &HandoffId,
     target: &CompatibilityRecord,
     host: &H,
 ) -> bool {
     status.current == *target
         && status.handoff_id == Some(*expected_handoff)
-        && status.live_server.discovery_key == member.discovery_key
+        && status.live_server.discovery_key == member.discovery_key().as_str()
         && host.attests_host(status)
         && status.target.is_none()
-        && status_attests_entry(status, member)
+        && host.attests_entry(status, member)
         && status.lifecycle == LifecycleState::Running
         && host
             .bridge()
@@ -2665,7 +2800,7 @@ fn zellij_census_covered(ready: &TargetReadiness) -> bool {
 
 async fn wait_ready<C, H>(
     control: &C,
-    member: &BrokerEntry,
+    member: &RegisteredBroker,
     expected_handoff: &HandoffId,
     target: &CompatibilityRecord,
     host: &H,
@@ -2677,7 +2812,7 @@ where
     H: ActivationHost,
 {
     loop {
-        if let Ok(mut session) = control.connect(&member.socket).await
+        if let Ok(mut session) = control.connect(member.socket()).await
             && let Ok(status) = session.status().await
             && target_ready(&status, member, expected_handoff, target, host)
         {
@@ -2685,7 +2820,7 @@ where
         }
         if Instant::now() >= deadline {
             return Err(ActivateError::ReadinessTimeout {
-                identity: member.discovery_key.clone(),
+                identity: member.discovery_key().as_str().to_owned(),
             });
         }
         tokio::time::sleep(poll_interval).await;
@@ -2787,7 +2922,7 @@ fn prove_ready_bridge(
     config_dir: &Path,
     cache_dir: &Path,
     bridge_identity: &BridgeIdentity,
-    old_entries: &[BrokerEntry],
+    old_entries: &[RegisteredBroker],
     census: &MemberCensus,
     journal: &ActivationJournal,
     prepared: &[PreparedAuthority],
@@ -2854,15 +2989,15 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
     journal: &ActivationJournal,
     prepared: &PreparedMember<C>,
     targets: &mut [OwnedTarget],
-    rows: &[BrokerEntry],
+    rows: &[RegisteredBroker],
     window: ReadyWindow,
 ) -> Result<journal::ReadyMemberProof, ActivateError> {
     let member = journal
         .members()
         .iter()
         .find(|member| {
-            member.member().as_str() == prepared.entry.discovery_key
-                && member.endpoint().as_path() == prepared.entry.socket
+            member.member().as_str() == prepared.entry.discovery_key().as_str()
+                && member.endpoint().as_path() == prepared.entry.socket()
                 && member.handoff_id() == prepared.handoff
         })
         .ok_or_else(|| ActivateError::UnitFailed {
@@ -2890,7 +3025,7 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
     }
     let mut matching = rows
         .iter()
-        .filter(|row| row.socket == prepared.entry.socket);
+        .filter(|row| row.socket() == prepared.entry.socket());
     let row = matching.next().ok_or_else(|| ActivateError::UnitFailed {
         reason: format!(
             "final Ready proof target {} has no registry row",
@@ -2898,12 +3033,11 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
         ),
     })?;
     if matching.next().is_some()
-        || row.host_kind != prepared.entry.host_kind
-        || row.discovery_key != prepared.entry.discovery_key
-        || row.server_pid != target.handle.child.id()
-        || row.bridge_identity != prepared.entry.bridge_identity
-        || row.bridge_member != prepared.entry.bridge_member
-        || row.handoff_id != journal.bridge().map(|_| prepared.handoff)
+        || row.discovery_key() != prepared.entry.discovery_key()
+        || row.server_pid().get() != target.handle.child.id()
+        || row.bridge_identity() != prepared.entry.bridge_identity()
+        || row.bridge_member() != prepared.entry.bridge_member()
+        || row.handoff_id() != journal.bridge().map(|_| prepared.handoff)
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
@@ -2921,7 +3055,7 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
         &journal.target_record,
         host,
     ) || !status_attests_journal(&status, journal)
-        || row.live_server.as_deref() != Some(status.live_server.server_id.as_str())
+        || row.live_server() != Some(&status.live_server.server_id)
         || window.proof.is_some_and(|(epoch, _)| {
             status
                 .ready
@@ -2936,7 +3070,7 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
             ),
         });
     }
-    journal::ReadyMemberProof::new(member, row, &status.live_server.server_id)
+    journal::ReadyMemberProof::new(member, &row.recorded_entry(), &status.live_server.server_id)
         .map_err(ActivateError::from)
 }
 
@@ -2945,12 +3079,12 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
 async fn fetch_final_ready_status<C: ControlPort>(
     control: &C,
     prepared: &PreparedMember<C>,
-    row: &BrokerEntry,
+    row: &RegisteredBroker,
     proof: Option<(UnitReadinessEpochId, AsOfTick)>,
     deadline: Instant,
 ) -> Result<ActivationStatus, ActivateError> {
-    let discovery = prepared.entry.discovery_key.as_str();
-    let mut session = tokio::time::timeout_at(deadline.into(), control.connect(&row.socket))
+    let discovery = prepared.entry.discovery_key().as_str();
+    let mut session = tokio::time::timeout_at(deadline.into(), control.connect(row.socket()))
         .await
         .map_err(|_| ActivateError::UnitFailed {
             reason: format!("final Ready proof connection to {discovery} timed out"),
@@ -3726,7 +3860,7 @@ where
         let status = if let Some(prepared) = self
             .prepared
             .iter_mut()
-            .find(|prepared| prepared.entry.socket == member.endpoint().as_path())
+            .find(|prepared| prepared.entry.socket() == member.endpoint().as_path())
         {
             prepared
                 .old_session
@@ -3831,7 +3965,7 @@ where
         let prepared = self
             .prepared
             .iter_mut()
-            .find(|prepared| prepared.entry.socket == member.endpoint().as_path())
+            .find(|prepared| prepared.entry.socket() == member.endpoint().as_path())
             .ok_or_else(|| ActivateError::UnitFailed {
                 reason: format!(
                     "old member {} lacks retained control authority",
@@ -5416,7 +5550,11 @@ mod tests {
             std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME),
         )
         .unwrap();
-        zellij_unit(identity, entries).unwrap()
+        let registered = entries
+            .into_iter()
+            .map(|entry| RegisteredBroker::zellij(entry, &identity).unwrap())
+            .collect();
+        zellij_unit(identity, registered).unwrap()
     }
 
     async fn zellij_member(
@@ -6080,7 +6218,7 @@ mod tests {
             ready,
         }
     }
-    fn attested_zellij_member(root: &Path, socket: PathBuf, discovery: &str) -> BrokerEntry {
+    fn attested_zellij_member(root: &Path, socket: PathBuf, discovery: &str) -> RegisteredBroker {
         std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
         let identity = BridgeIdentity::resolve(
@@ -6089,20 +6227,19 @@ mod tests {
         )
         .unwrap();
         let mut member = census_member(socket, "zellij", discovery);
-        member.bridge_identity = Some(identity);
+        member.bridge_identity = Some(identity.clone());
         member.bridge_member =
             Some(super::super::registry::BridgeMemberId::new(discovery.to_owned()).unwrap());
-        member
+        RegisteredBroker::zellij(member, &identity).unwrap()
     }
 
     fn zellij_readiness_host<'a>(
-        member: &'a BrokerEntry,
+        member: &'a RegisteredBroker,
         census: &'a MemberCensus,
     ) -> ZellijActivation<'a> {
         ZellijActivation {
             identity: member
-                .bridge_identity
-                .as_ref()
+                .bridge_identity()
                 .expect("fixed Zellij fixture has bridge authority"),
             entries: std::slice::from_ref(member),
             census,
@@ -6111,12 +6248,11 @@ mod tests {
 
     fn attested_zellij_status(
         mut status: ActivationStatus,
-        member: &BrokerEntry,
+        member: &RegisteredBroker,
     ) -> ActivationStatus {
         status.bridge_unit = Some(
             member
-                .bridge_identity
-                .as_ref()
+                .bridge_identity()
                 .expect("fixed Zellij fixture has bridge authority")
                 .unit(),
         );
@@ -6197,14 +6333,17 @@ mod tests {
             )
             .unwrap();
         let mut status = census_status(handoff(3), "session-a", None);
+        let entry = RegisteredBroker::zellij(entry, &identity).unwrap();
+        let census = MemberCensus::default();
+        let host = zellij_readiness_host(&entry, &census);
 
         assert!(!status_attests_journal(&status, &journal));
-        assert!(!status_attests_entry(&status, &entry));
+        assert!(!host.attests_entry(&status, &entry));
         status.bridge_unit = Some(muxe_protocol::BridgeUnitId::from_canonical_bytes(b"wrong"));
-        assert!(!status_attests_entry(&status, &entry));
+        assert!(!host.attests_entry(&status, &entry));
         assert!(!status_attests_journal(&status, &journal));
         status.bridge_unit = Some(identity.unit());
-        assert!(status_attests_entry(&status, &entry));
+        assert!(host.attests_entry(&status, &entry));
         assert!(status_attests_journal(&status, &journal));
     }
 
@@ -6251,7 +6390,8 @@ mod tests {
     fn target_ready_gates_zellij_census_but_not_herdr_health() {
         let expected = handoff(9);
         let socket = PathBuf::from("/run/census.sock");
-        let herdr = census_member(socket.clone(), "herdr", "herdr.sock");
+        let herdr =
+            RegisteredBroker::herdr(census_member(socket.clone(), "herdr", "herdr.sock")).unwrap();
         assert!(target_ready(
             &census_status(expected, "herdr.sock", None),
             &herdr,
@@ -6660,6 +6800,41 @@ mod tests {
         });
     }
 
+    #[test]
+    fn selection_preserves_legacy_rows_and_rejects_only_selected_malformed_hosts() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+        let mut legacy = BrokerEntry::now("herdr", "", temp.path().join("legacy.sock"), 0);
+        legacy.started_at = 0;
+        legacy.live_server = Some(String::new());
+        registry.register(legacy.clone()).unwrap();
+        let unknown = BrokerEntry::now(
+            "future-host",
+            "unknown",
+            temp.path().join("unknown.sock"),
+            0,
+        );
+        registry.register(unknown).unwrap();
+        let malformed =
+            BrokerEntry::now("zellij", "session", temp.path().join("malformed.sock"), 0);
+        registry.register(malformed).unwrap();
+        let rows = registry.entries().unwrap();
+        let units = select_units(&rows, HostScope::Herdr, None).unwrap();
+        let PlannedUnit::Herdr { entry } = &units[0] else {
+            panic!("selected Herdr row must retain its concrete lifecycle policy");
+        };
+        assert!(entry.matches_recorded(&legacy));
+        assert_eq!(entry.server_pid().get(), 0);
+        assert_eq!(entry.registration_id(), None);
+        assert!(select_units(&rows, HostScope::Zellij, None).is_err());
+        assert!(select_units(&rows, HostScope::All, None).is_err());
+        assert_eq!(
+            registry.entries().unwrap(),
+            rows,
+            "selection never rewrites untrusted storage"
+        );
+    }
+
     /// Two actual service registrations sharing one stable bridge form a
     /// single atomic group: real bound listener sockets registered through
     /// the file registry prove live, and selection yields one Zellij group
@@ -6717,7 +6892,7 @@ mod tests {
                 assert_eq!(
                     entries
                         .iter()
-                        .map(|entry| entry.discovery_key.as_str())
+                        .map(|entry| entry.discovery_key().as_str())
                         .collect::<Vec<_>>(),
                     vec!["session-a", "session-b"],
                     "selection normalizes registration order"
@@ -7820,11 +7995,12 @@ mod tests {
     ) -> PreparedMember<TraceControl> {
         let member = &journal.members()[0];
         PreparedMember {
-            entry: census_member(
+            entry: RegisteredBroker::herdr(census_member(
                 member.endpoint().as_path().to_path_buf(),
                 "herdr",
                 member.member().as_str(),
-            ),
+            ))
+            .unwrap(),
             handoff: member.handoff_id(),
             old_session: control.session.clone(),
         }
@@ -8298,7 +8474,11 @@ mod tests {
             journal::write_journal(&cache, &journal).unwrap();
             let unit = PlannedUnit::Zellij {
                 bridge_identity: identity.clone(),
-                entries: entries.clone(),
+                entries: entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| RegisteredBroker::zellij(entry, &identity).unwrap())
+                    .collect(),
                 census,
             };
             let control = ReadyRoundControl::default();
@@ -8325,7 +8505,7 @@ mod tests {
                 status.ready = Some(ready_census(&["client"], Some(&["client"])));
                 control.set(&entry.socket, vec![status]);
                 prepared.push(PreparedMember {
-                    entry: entry.clone(),
+                    entry: RegisteredBroker::zellij(entry.clone(), &identity).unwrap(),
                     handoff: member.handoff_id(),
                     old_session: ReadyRoundSession {
                         socket: entry.socket.clone(),
@@ -8369,7 +8549,7 @@ mod tests {
 
         fn set(&self, index: usize, statuses: Vec<ActivationStatus>) {
             self.control
-                .set(&self.prepared[index].entry.socket, statuses);
+                .set(self.prepared[index].entry.socket(), statuses);
         }
 
         fn proof(&self) -> journal::ReadyProof {
@@ -8606,8 +8786,8 @@ mod tests {
         let mut case = ReadyProofCase::new();
         let now = Arc::new(std::sync::atomic::AtomicU64::new(100_000));
         *case.control.as_of_expiry.lock().unwrap() = Some(AsOfExpiryHook {
-            first: case.prepared[0].entry.socket.clone(),
-            second: case.prepared[1].entry.socket.clone(),
+            first: case.prepared[0].entry.socket().to_path_buf(),
+            second: case.prepared[1].entry.socket().to_path_buf(),
             lease_millis: 15_000,
             first_heartbeat: AsOfTick::from_millis(85_001).unwrap(),
             second_delay: Duration::from_millis(2),
@@ -8623,7 +8803,7 @@ mod tests {
         assert!(now.load(std::sync::atomic::Ordering::SeqCst) - 85_001 > 15_000);
         let mut a = case
             .control
-            .connect(&case.prepared[0].entry.socket)
+            .connect(case.prepared[0].entry.socket())
             .await
             .unwrap();
         assert!(
@@ -8645,8 +8825,8 @@ mod tests {
 
         let mut expired = ReadyProofCase::new();
         *expired.control.as_of_expiry.lock().unwrap() = Some(AsOfExpiryHook {
-            first: expired.prepared[0].entry.socket.clone(),
-            second: expired.prepared[1].entry.socket.clone(),
+            first: expired.prepared[0].entry.socket().to_path_buf(),
+            second: expired.prepared[1].entry.socket().to_path_buf(),
             lease_millis: 15_000,
             first_heartbeat: AsOfTick::from_millis(84_999).unwrap(),
             second_delay: Duration::from_millis(2),
@@ -8679,7 +8859,8 @@ mod tests {
     #[tokio::test]
     async fn hung_status_at_uses_one_deadline_and_releases_gate_for_rollback() {
         let mut case = ReadyProofCase::new();
-        *case.control.hung_status_at.lock().unwrap() = Some(case.prepared[1].entry.socket.clone());
+        *case.control.hung_status_at.lock().unwrap() =
+            Some(case.prepared[1].entry.socket().to_path_buf());
         let gate =
             muxe_adapter_zellij::ReadinessGate::new(case.cache.clone(), case.identity.unit());
         let read = gate.shared(Duration::from_secs(1)).await.unwrap();
@@ -8718,8 +8899,8 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (completed_tx, mut completed_rx) = tokio::sync::oneshot::channel();
         *case.control.loss.lock().unwrap() = Some(ReadinessLossHook {
-            second: case.prepared[1].entry.socket.clone(),
-            first: case.prepared[0].entry.socket.clone(),
+            second: case.prepared[1].entry.socket().to_path_buf(),
+            first: case.prepared[0].entry.socket().to_path_buf(),
             stale,
             gate: gate.clone(),
             started: started_tx,
@@ -8755,7 +8936,7 @@ mod tests {
         );
         let mut a = case
             .control
-            .connect(&case.prepared[0].entry.socket)
+            .connect(case.prepared[0].entry.socket())
             .await
             .unwrap();
         assert!(a.status().await.unwrap().ready.is_none());
@@ -8828,6 +9009,204 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixed Herdr fixture constructs the complete journal, owned child, registry incarnation and live status before exercising exact-endpoint failures"
+    )]
+    #[tokio::test]
+    async fn herdr_final_ready_selects_exact_endpoints_without_hiding_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let config = temp.path().join("config");
+        Registry::open(&cache).unwrap();
+        let endpoint = cache.join("selected.sock");
+        let old = BrokerEntry::now("herdr", "server", endpoint.clone(), 1);
+        let activation = ActivationId::from_bytes([0x42; 16]).unwrap();
+        let handoff = handoff(0x43);
+        let member = TransactionMember::new(
+            activation,
+            ActivationMemberId::new("server".to_owned()).unwrap(),
+            MemberEndpoint::new(endpoint.clone()).unwrap(),
+            handoff,
+            old_record(),
+        )
+        .unwrap();
+        let mut journal = ActivationJournal::new(
+            activation,
+            UnitKind::Herdr {
+                host_hash: unit_hash("server"),
+            },
+            target_record(),
+            vec![member],
+        )
+        .unwrap();
+        journal.old_registry = vec![old.clone()];
+        journal.enter_activating();
+        journal.members_mut()[0].old = OldMemberProgress::Drained;
+        journal.members_mut()[0].target = TargetMemberProgress::Ready;
+        let handle = h21_owned_targets(1).pop_front().unwrap();
+        let mut row = old.clone();
+        row.server_pid = handle.child.id();
+        row.registration_id =
+            Some(muxe_protocol::control::BrokerRegistrationId::generate().unwrap());
+        row.live_server = Some("id".to_owned());
+        let control = ReadyRoundControl::default();
+        control.set(
+            &endpoint,
+            vec![status_of(
+                &journal.target_record,
+                Some(handoff),
+                "server",
+                LifecycleState::Running,
+            )],
+        );
+        let prepared = vec![PreparedMember {
+            entry: RegisteredBroker::herdr(old).unwrap(),
+            handoff,
+            old_session: control.connect(&endpoint).await.unwrap(),
+        }];
+        let authorities = vec![PreparedAuthority {
+            entry: prepared[0].entry.clone(),
+            handoff,
+        }];
+        let mut targets = vec![OwnedTarget {
+            member: journal.members()[0].id.clone(),
+            handle,
+        }];
+        let inputs = ActivateInputs {
+            config_dir: &config,
+            cache_dir: &cache,
+            target: journal.target_record.clone(),
+            staged_bridge: None,
+            scope: HostScope::Herdr,
+            current: None,
+            control: &control,
+            spawner: &ProcessSpawner,
+            reloader: &FixtureReloader::default(),
+            preflight: &FixturePreflight::default(),
+            spawn_policy: &TRUE_SPAWN,
+            readiness_deadline: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(1),
+            hooks: ActivateHooks::default(),
+            logger: None,
+        };
+        let host = HerdrActivation(&prepared[0].entry);
+        let prove = async |targets: &mut [OwnedTarget]| {
+            prove_ready_unit(
+                &inputs,
+                &host,
+                &journal,
+                ReadyUnitMembers {
+                    prepared: &prepared,
+                    authorities: &authorities,
+                    targets,
+                },
+                ReadyWindow {
+                    proof: None,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                },
+            )
+            .await
+        };
+        let registry_path = cache
+            .join(super::super::registry::REGISTRY_DIR_NAME)
+            .join(super::super::registry::REGISTRY_FILE_NAME);
+        let store = |rows: &[BrokerEntry]| {
+            fsutil::write_atomic(
+                &registry_path,
+                &serde_json::to_vec(&serde_json::json!({
+                    "schema_version": super::super::registry::REGISTRY_SCHEMA_VERSION,
+                    "brokers": rows,
+                }))
+                .unwrap(),
+                "ready-selection-fixture",
+            )
+            .unwrap();
+        };
+        let mut unrelated = BrokerEntry::now("herdr", "unrelated", cache.join("stale.sock"), 0);
+        unrelated.bridge_member = Some(BridgeMemberId::new("malformed".to_owned()).unwrap());
+        store(&[row.clone(), unrelated.clone()]);
+        let proof = prove(&mut targets)
+            .await
+            .expect("unrelated stale malformed row cannot poison selected Ready proof");
+        assert_eq!(proof[0].entry.registration_id, row.registration_id);
+        for label in ["herdr", "zellij", "unknown-host"] {
+            let mut duplicate = row.clone();
+            duplicate.host_kind = label.to_owned();
+            store(&[row.clone(), unrelated.clone(), duplicate]);
+            assert!(
+                prove(&mut targets).await.is_err(),
+                "duplicate endpoint with {label} label must not certify Ready"
+            );
+        }
+        let mut wrong_host = row.clone();
+        wrong_host.host_kind = "zellij".to_owned();
+        store(&[wrong_host, unrelated]);
+        assert!(
+            prove(&mut targets).await.is_err(),
+            "selected wrong host must not certify Ready"
+        );
+        store(&[row]);
+        prove(&mut targets)
+            .await
+            .expect("exact selected incarnation remains certifiable");
+    }
+
+    #[tokio::test]
+    async fn zellij_final_ready_rejects_foreign_and_unknown_endpoint_duplicates() {
+        let mut case = ReadyProofCase::new();
+        let registry = Registry::open(&case.cache).unwrap();
+        let original = registry.entries().unwrap();
+        let mut unrelated =
+            BrokerEntry::now("herdr", "unrelated", case.cache.join("stale.sock"), 0);
+        unrelated.bridge_member = Some(BridgeMemberId::new("malformed".to_owned()).unwrap());
+        registry.register(unrelated.clone()).unwrap();
+        case.prove()
+            .await
+            .expect("unrelated stale malformed row is outside the selected bridge endpoints");
+        let registry_path = case
+            .cache
+            .join(super::super::registry::REGISTRY_DIR_NAME)
+            .join(super::super::registry::REGISTRY_FILE_NAME);
+        for label in ["herdr", "unknown-host"] {
+            let mut rows = original.clone();
+            rows.push(unrelated.clone());
+            let mut duplicate = rows[0].clone();
+            duplicate.host_kind = label.to_owned();
+            rows.push(duplicate);
+            fsutil::write_atomic(
+                &registry_path,
+                &serde_json::to_vec(&serde_json::json!({
+                    "schema_version": super::super::registry::REGISTRY_SCHEMA_VERSION,
+                    "brokers": rows,
+                }))
+                .unwrap(),
+                "ready-selection-fixture",
+            )
+            .unwrap();
+            assert!(
+                case.prove().await.is_err(),
+                "foreign or unknown duplicate endpoint must not certify Ready"
+            );
+        }
+        let mut rows = original;
+        rows[0].host_kind = "herdr".to_owned();
+        fsutil::write_atomic(
+            &registry_path,
+            &serde_json::to_vec(&serde_json::json!({
+                "schema_version": super::super::registry::REGISTRY_SCHEMA_VERSION,
+                "brokers": rows,
+            }))
+            .unwrap(),
+            "ready-selection-fixture",
+        )
+        .unwrap();
+        assert!(
+            case.prove().await.is_err(),
+            "selected wrong host must not certify Ready"
+        );
+    }
+
     #[tokio::test]
     async fn final_ready_rejects_registry_bridge_artifact_and_receipt_drift() {
         let mut case = ReadyProofCase::new();
@@ -8837,7 +9216,7 @@ mod tests {
             .entries()
             .unwrap()
             .into_iter()
-            .find(|row| row.socket == case.prepared[0].entry.socket)
+            .find(|row| row.socket == case.prepared[0].entry.socket())
             .unwrap();
         let mut foreign = row.clone();
         foreign.server_pid = 42;
@@ -8889,7 +9268,7 @@ mod tests {
         );
         integration::receipt::store(case.identity.directory(), &exact).unwrap();
 
-        let mut extra = case.prepared[0].entry.clone();
+        let mut extra = case.prepared[0].entry.recorded_entry();
         extra.discovery_key = "session-extra".to_owned();
         extra.bridge_member =
             Some(super::super::registry::BridgeMemberId::new("session-extra".to_owned()).unwrap());
@@ -9171,7 +9550,7 @@ mod tests {
             .entries()
             .unwrap()
             .into_iter()
-            .find(|row| row.socket == case.prepared[0].entry.socket)
+            .find(|row| row.socket == case.prepared[0].entry.socket())
             .unwrap();
         let commits = &case.control.commits;
         let mut partial = case.journal.clone();
@@ -9248,7 +9627,7 @@ mod tests {
             .entries()
             .unwrap()
             .into_iter()
-            .find(|row| row.socket == case.prepared[0].entry.socket)
+            .find(|row| row.socket == case.prepared[0].entry.socket())
             .unwrap();
         let commits = &case.control.commits;
         let mut wrong = case.status(0);
@@ -9634,11 +10013,12 @@ mod tests {
             let handle = h21_owned_targets(1).pop_front().unwrap();
             let pid = handle.child.id();
             let unit = PlannedUnit::Herdr {
-                entry: census_member(
+                entry: RegisteredBroker::herdr(census_member(
                     journal.members()[0].endpoint().as_path().to_path_buf(),
                     "herdr",
                     journal.members()[0].member().as_str(),
-                ),
+                ))
+                .unwrap(),
             };
             crate::fsutil::inject_tagged_durability_fault(
                 "activation",
@@ -9857,11 +10237,12 @@ mod tests {
             control.silent = true;
             let member_id = journal.members()[0].id.clone();
             let unit = PlannedUnit::Herdr {
-                entry: census_member(
+                entry: RegisteredBroker::herdr(census_member(
                     journal.members()[0].endpoint().as_path().to_path_buf(),
                     "herdr",
                     journal.members()[0].member().as_str(),
-                ),
+                ))
+                .unwrap(),
             };
             let config = temp.path().join("config");
             std::fs::create_dir(&config).unwrap();
@@ -9952,11 +10333,12 @@ mod tests {
             };
             let member = journal.members()[0].clone();
             let prepared = PreparedMember {
-                entry: census_member(
+                entry: RegisteredBroker::herdr(census_member(
                     member.endpoint().as_path().to_path_buf(),
                     "herdr",
                     member.member().as_str(),
-                ),
+                ))
+                .unwrap(),
                 handoff: member.handoff_id(),
                 old_session: control.session.clone(),
             };

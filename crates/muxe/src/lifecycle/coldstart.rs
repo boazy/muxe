@@ -47,8 +47,8 @@ use super::{
     control::{ControlError, VerifiedControlStatus},
     journal::{self, UnitKind, UnitLockAttempt},
     registry::{
-        BridgeMemberId, BridgeUnitGuard, BrokerEntry, HerdrUnitGuard, Registry, RegistryAuthority,
-        RegistryError,
+        BridgeMemberId, BridgeUnitGuard, BrokerEntry, HerdrUnitGuard, RegisteredBroker, Registry,
+        RegistryAuthority, RegistryError,
     },
 };
 use crate::{fsutil, integration, paths::BridgeIdentity};
@@ -103,7 +103,7 @@ pub struct ColdstartInputs<'a, S, C, R> {
 #[derive(Clone, Debug)]
 pub struct LiveBroker {
     /// Registry entry of the live broker.
-    pub entry: BrokerEntry,
+    pub entry: RegisteredBroker,
     /// Control status proving identity (and record) before attach.
     pub status: ActivationStatus,
 }
@@ -778,7 +778,7 @@ where
 
 /// Classifies a previously authenticated and reconciled live broker.
 fn classify<S, C, R>(
-    entry: &BrokerEntry,
+    entry: &RegisteredBroker,
     status: ActivationStatus,
     inputs: &ColdstartInputs<'_, S, C, R>,
 ) -> ColdstartOutcome {
@@ -874,7 +874,7 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
     host: &H,
     authority: &dyn RegistryAuthority,
     bridge: Option<&BridgeIdentity>,
-) -> Result<BrokerEntry, ColdstartError> {
+) -> Result<RegisteredBroker, ColdstartError> {
     validate_status_identity(&verified.status, host, bridge)?;
     if verified.authority.endpoint() != inputs.endpoint.socket() {
         return Err(ColdstartError::EndpointConflict(
@@ -915,7 +915,9 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
                 .verify_path()
                 .map_err(|error| RegistryError::Conflict(error.to_string()))
         })?;
-        return Ok(known.clone());
+        return authority
+            .validate_recorded(known.clone())
+            .map_err(ColdstartError::Registry);
     }
     let proof = verified
         .status
@@ -940,6 +942,7 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
                 .verify_path()
                 .map_err(|error| RegistryError::Conflict(error.to_string()))
         })
+        .and_then(|entry| authority.validate_recorded(entry))
         .map_err(ColdstartError::Registry)
 }
 
@@ -1855,7 +1858,10 @@ mod tests {
             assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
             let mut expected = original.clone();
             expected.socket = fixture.endpoint.socket().to_path_buf();
-            assert_eq!(live.entry, expected, "token and timestamp remain original");
+            assert!(
+                live.entry.matches_recorded(&expected),
+                "token and timestamp remain original"
+            );
             assert_eq!(live.status.phase, ActivationPhase::Ordinary);
             assert_eq!(
                 fixture.registry.entries().unwrap(),
@@ -1999,7 +2005,7 @@ mod tests {
             fixture.bridge.as_ref(),
         )
         .expect("safe legacy Running without a handoff reuses its exact row");
-        assert_eq!(reused, before[0]);
+        assert!(reused.matches_recorded(&before[0]));
         verified.status.handoff_id = Some(HandoffId([9; 16]));
         assert!(matches!(
             validate_status_identity(&verified.status, &host, fixture.bridge.as_ref()),

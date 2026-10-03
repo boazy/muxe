@@ -458,18 +458,13 @@ fn detect_current_host(cache_dir: &Path) -> Result<muxe::lifecycle::DetectedHost
     }
     if let Some(session) = env::var_os("ZELLIJ_SESSION_NAME").filter(|value| !value.is_empty()) {
         let session = session.to_string_lossy().into_owned();
+        let session_key = muxe_adapter_api::HostDiscoveryKey::parse(session.as_str())?;
         let registry = muxe::lifecycle::Registry::open(cache_dir)
             .wrap_err("could not open the owner-only broker registry")?;
         let bridge_identity = registry
-            .entries()
+            .zellij_entry_for_session(&session_key)
             .wrap_err("could not read the owner-only broker registry")?
-            .into_iter()
-            .filter(|entry| entry.host_kind == "zellij")
-            .find(|entry| {
-                entry.live_server.as_deref() == Some(session.as_str())
-                    || entry.discovery_key == session
-            })
-            .and_then(|entry| entry.bridge_identity)
+            .and_then(|entry| entry.bridge_identity().cloned())
             .ok_or_else(|| {
                 color_eyre::eyre::eyre!(
                     "no live Zellij broker serves session {session}; --host current requires invocation from a managed host"
@@ -533,11 +528,11 @@ async fn run_activation(
         .probe()
         .wrap_err("could not probe the owner-only broker registry")?
         .live;
-    let herdr_selected =
-        !matches!(scope, HostScope::Zellij) && live.iter().any(|entry| entry.host_kind == "herdr");
-    let zellij_selected =
-        !matches!(scope, HostScope::Herdr) && live.iter().any(|entry| entry.host_kind == "zellij");
-    drop(live);
+    let selected =
+        muxe::lifecycle::activate::selected_host_requirements(live, scope, current.as_ref())
+            .wrap_err("could not validate selected broker registry records")?;
+    let herdr_selected = selected.herdr;
+    let zellij_selected = selected.zellij;
     let herdr_binary = herdr_selected.then(herdr_binary_from_path).transpose()?;
     let zellij_exe = zellij_selected
         .then(|| {
@@ -644,7 +639,7 @@ async fn ensure_herdr_broker(
         .await
         .map_err(|error| color_eyre::eyre::eyre!("could not ensure the Herdr broker: {error}"))?
     {
-        muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.socket),
+        muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.into_socket()),
         muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
             Box::pin(run_activation(HostScope::Herdr, None)).await?;
             match muxe::lifecycle::ensure_broker(&inputs)
@@ -652,7 +647,7 @@ async fn ensure_herdr_broker(
                 .map_err(|error| {
                     color_eyre::eyre::eyre!("could not re-verify the Herdr broker: {error}")
                 })? {
-                muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.socket),
+                muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.into_socket()),
                 muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
                     bail!("activation did not converge the Herdr broker record")
                 }
@@ -2621,16 +2616,11 @@ async fn launcher_client(
     // is activated) before the exactly-one selection below. A wrong identity
     // fails closed here, never with a second broker.
     Box::pin(ensure_herdr_broker(cache_dir, config_file, runtime)).await?;
-    let discovery = runtime.identity().discovery_key.as_str().to_owned();
     let registry = muxe::lifecycle::Registry::open(cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
     let mut matches = registry
-        .probe()
-        .wrap_err("could not probe the owner-only broker registry")?
-        .live
-        .into_iter()
-        .filter(|entry| entry.host_kind == "herdr" && entry.discovery_key == discovery)
-        .collect::<Vec<_>>();
+        .live_herdr_entries_for(&runtime.identity().discovery_key)
+        .wrap_err("could not probe validated Herdr broker records")?;
     if matches.len() != 1 {
         bail!(
             "launching a UI pane requires exactly one live Herdr broker for this server; start one before launching UI panes"
@@ -2639,7 +2629,7 @@ async fn launcher_client(
     let entry = matches.pop().expect("exactly one live broker entry");
     let identity = runtime.identity();
     muxe_broker::BrokerClient::connect(
-        &entry.socket,
+        entry.socket(),
         muxe_protocol::PeerRole::Launcher,
         env!("CARGO_PKG_VERSION"),
         muxe_protocol::LiveServerIdentity {
@@ -2842,7 +2832,7 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
     ))
     .await?;
     let mut client = muxe_broker::BrokerClient::connect(
-        &live.entry.socket,
+        live.entry.socket(),
         muxe_protocol::PeerRole::Ui,
         env!("CARGO_PKG_VERSION"),
         live.status.live_server,
