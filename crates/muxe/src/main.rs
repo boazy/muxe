@@ -2978,9 +2978,9 @@ async fn launcher_origin_from(
     let selected = select_launcher_origin(get)?;
     let mut origin = muxe_adapter_herdr::pane_by_identity(
         runtime,
-        muxe_core::WorkspaceId::new(selected.workspace),
-        muxe_core::TabId::new(selected.tab),
-        muxe_core::PaneId::new(selected.pane),
+        selected.workspace,
+        selected.tab,
+        selected.pane,
     )
     .await
     .wrap_err(format!(
@@ -2998,9 +2998,9 @@ async fn launcher_origin_from(
 
 #[derive(Debug)]
 struct SelectedOrigin {
-    workspace: String,
-    tab: String,
-    pane: String,
+    workspace: muxe_core::WorkspaceId,
+    tab: muxe_core::TabId,
+    pane: muxe_core::PaneId,
     cwd_override: Option<PathBuf>,
     source: &'static str,
 }
@@ -3056,7 +3056,12 @@ fn select_launcher_origin(get: &dyn Fn(&str) -> Option<String>) -> Result<Select
 }
 
 /// Saved origin triple plus optional cwd from the launcher environment.
-type SavedOriginTuple = (String, String, String, Option<PathBuf>);
+type SavedOriginTuple = (
+    muxe_core::WorkspaceId,
+    muxe_core::TabId,
+    muxe_core::PaneId,
+    Option<PathBuf>,
+);
 
 fn saved_origin_tuple(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<SavedOriginTuple>> {
     const NAMES: [&str; 3] = [
@@ -3068,7 +3073,12 @@ fn saved_origin_tuple(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<Sav
     let cwd = optional_absolute_environment_path(get, "MUXE_HERDR_ORIGIN_PANE_CWD")?;
     match values {
         [None, None, None] if cwd.is_none() => Ok(None),
-        [Some(workspace), Some(tab), Some(pane)] => Ok(Some((workspace, tab, pane, cwd))),
+        [Some(workspace), Some(tab), Some(pane)] => Ok(Some((
+            muxe_core::WorkspaceId::new(workspace),
+            muxe_core::TabId::new(tab),
+            muxe_core::PaneId::new(pane),
+            cwd,
+        ))),
         _ => bail!("MUXE_HERDR_ORIGIN_* must supply one complete immutable origin tuple"),
     }
 }
@@ -3078,11 +3088,15 @@ fn launcher_tuple(
     workspace_name: &str,
     tab_name: &str,
     pane_name: &str,
-) -> Result<Option<(String, String, String)>> {
+) -> Result<Option<(muxe_core::WorkspaceId, muxe_core::TabId, muxe_core::PaneId)>> {
     let values = [workspace_name, tab_name, pane_name].map(get);
     match values {
         [None, None, None] => Ok(None),
-        [Some(workspace), Some(tab), Some(pane)] => Ok(Some((workspace, tab, pane))),
+        [Some(workspace), Some(tab), Some(pane)] => Ok(Some((
+            muxe_core::WorkspaceId::new(workspace),
+            muxe_core::TabId::new(tab),
+            muxe_core::PaneId::new(pane),
+        ))),
         _ => bail!(
             "{workspace_name}, {tab_name}, and {pane_name} must be supplied together as one Herdr launcher tuple"
         ),
@@ -4254,7 +4268,9 @@ mod launcher_tests {
         map.insert("HERDR_TAB_ID".to_owned(), "w1:tB".to_owned());
         map.insert("HERDR_PANE_ID".to_owned(), "w1:pB".to_owned());
         let selected = select_launcher_origin(&lookup(&map)).expect("complete ACTIVE wins");
-        assert_eq!(selected.pane, "w1:pA");
+        assert_eq!(selected.workspace.as_str(), "w1");
+        assert_eq!(selected.tab.as_str(), "w1:tA");
+        assert_eq!(selected.pane.as_str(), "w1:pA");
         assert_eq!(selected.source, "HERDR_ACTIVE_*");
 
         let managed_only: HashMap<String, String> = HashMap::from([
@@ -4264,7 +4280,9 @@ mod launcher_tests {
         ]);
         let selected =
             select_launcher_origin(&lookup(&managed_only)).expect("managed tuple applies");
-        assert_eq!(selected.pane, "w1:pB");
+        assert_eq!(selected.workspace.as_str(), "w1");
+        assert_eq!(selected.tab.as_str(), "w1:tB");
+        assert_eq!(selected.pane.as_str(), "w1:pB");
         assert_eq!(selected.source, "HERDR_*");
 
         let mut partial = active_map();
@@ -4285,6 +4303,9 @@ mod launcher_tests {
         ]);
         let selected = select_launcher_origin(&lookup(&map)).expect("saved tuple applies");
         assert_eq!(selected.source, "saved");
+        assert_eq!(selected.workspace.as_str(), "w1");
+        assert_eq!(selected.tab.as_str(), "w1:tA");
+        assert_eq!(selected.pane.as_str(), "w1:pA");
         assert_eq!(selected.cwd_override, None);
 
         let mut with_cwd = map.clone();
@@ -4402,6 +4423,7 @@ mod launcher_tests {
         let origin = launcher_origin_from(&runtime, &lookup(&active_map()))
             .await
             .expect("inherited ACTIVE pane resolves");
+        assert_eq!(origin.workspace.as_str(), "w1");
         assert_eq!(origin.pane.as_str(), "w1:pA");
         assert_eq!(origin.tab.as_str(), "w1:tA");
         assert_eq!(origin.cwd, PathBuf::from("/a"));
@@ -4414,6 +4436,7 @@ mod launcher_tests {
         let origin = launcher_origin_from(&runtime, &lookup(&saved))
             .await
             .expect("saved origin without cwd keeps live enrichment");
+        assert_eq!(origin.workspace.as_str(), "w1");
         assert_eq!(origin.pane.as_str(), "w1:pA");
         assert_eq!(origin.cwd, PathBuf::from("/a"));
 

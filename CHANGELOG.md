@@ -40,6 +40,7 @@
 - *(broker)* Type cleanup task claims and key test gates by their existing identities, preserving retry/requeue ownership for pending panes and captures.
 - *(core)* Type modifier-set flags and preserve canonical key matching without raw integer mutation.
 - *(cli)* Parse nonzero activation handoffs once at the validated CLI boundary and pass typed IDs into both broker serve paths.
+- *(cli)* Preserve typed Herdr workspace, tab, and pane identities through launcher-origin selection and saved tuples.
 
 ## [0.1.4] - 2026-09-12
 
