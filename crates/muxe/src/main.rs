@@ -1020,7 +1020,6 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
             bridge_unit: None,
         },
         (Some(handoff), Some(journal_path)) => {
-            let handoff = parse_handoff(&handoff)?;
             let journal = muxe::lifecycle::journal::read_journal(&journal_path)
                 .wrap_err("could not read the durable activation journal")?;
             if !matches!(journal.unit, muxe::lifecycle::UnitKind::Herdr { .. })
@@ -1269,7 +1268,6 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
             None,
         ),
         (Some(handoff), Some(journal_path)) => {
-            let handoff = parse_handoff(&handoff)?;
             let journal = muxe::lifecycle::journal::read_journal(&journal_path)
                 .wrap_err("could not read the durable activation journal")?;
             if !matches!(journal.unit, muxe::lifecycle::UnitKind::Zellij { .. })
@@ -2253,21 +2251,6 @@ fn hex_bytes(bytes: &[u8]) -> String {
         out.push(HEXDIGITS[(byte & 0xF) as usize] as char);
     }
     out
-}
-
-fn parse_handoff(value: &str) -> Result<muxe_protocol::control::HandoffId> {
-    let mut bytes = [0_u8; 16];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = u8::from_str_radix(
-            std::str::from_utf8(pair).expect("CLI parser accepts ASCII hexadecimal"),
-            16,
-        )
-        .map_err(|_| color_eyre::eyre::eyre!("handoff must be hexadecimal"))?;
-    }
-    if bytes == [0; 16] {
-        bail!("handoff must be nonzero");
-    }
-    Ok(muxe_protocol::control::HandoffId(bytes))
 }
 
 async fn launch_menu(open: muxe::cli::MenuOpen) -> Result<()> {

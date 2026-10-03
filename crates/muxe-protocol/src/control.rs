@@ -33,6 +33,32 @@ macro_rules! control_nonce {
 control_nonce!(ControlRequestId);
 control_nonce!(HandoffId);
 
+impl std::str::FromStr for HandoffId {
+    type Err = ControlSemanticError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 32 {
+            return Err(ControlSemanticError::InvalidHandoffHex);
+        }
+
+        let nibble = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let mut bytes = [0_u8; 16];
+        for (slot, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let high = nibble(pair[0]).ok_or(ControlSemanticError::InvalidHandoffHex)?;
+            let low = nibble(pair[1]).ok_or(ControlSemanticError::InvalidHandoffHex)?;
+            *slot = (high << 4) | low;
+        }
+        (bytes != [0; 16])
+            .then_some(Self(bytes))
+            .ok_or(ControlSemanticError::ZeroNonce("handoff"))
+    }
+}
+
 /// Coordinator-minted identity of one unit-wide broker-observed readiness proof.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -863,6 +889,8 @@ fn copy_from_input<const N: usize>(
 pub enum ControlSemanticError {
     #[error("{0} must be nonzero")]
     ZeroNonce(&'static str),
+    #[error("handoff must be exactly 32 hexadecimal characters")]
+    InvalidHandoffHex,
     #[error("schema fingerprint must be nonzero")]
     ZeroFingerprint,
     #[error("invalid live server identity")]
@@ -907,6 +935,40 @@ pub enum ControlDecodeError {
 mod tests {
     use super::*;
     use crate::wire::HostKind;
+
+    #[test]
+    fn handoff_id_from_str_decodes_ascii_hex_and_rejects_invalid_ids() {
+        let expected = HandoffId([
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
+        ]);
+        assert_eq!(
+            "0123456789abcdef0123456789abcdef".parse::<HandoffId>(),
+            Ok(expected)
+        );
+        assert_eq!(
+            "0123456789ABCDEF0123456789ABCDEF".parse::<HandoffId>(),
+            Ok(expected)
+        );
+        assert_eq!(
+            "00000000000000000000000000000000".parse::<HandoffId>(),
+            Err(ControlSemanticError::ZeroNonce("handoff"))
+        );
+        for invalid in [
+            "short",
+            "0123456789abcdef0123456789abcde",
+            "g123456789abcdef0123456789abcdef",
+        ] {
+            assert_eq!(
+                invalid.parse::<HandoffId>(),
+                Err(ControlSemanticError::InvalidHandoffHex)
+            );
+        }
+        assert_eq!(
+            "é".repeat(16).parse::<HandoffId>(),
+            Err(ControlSemanticError::InvalidHandoffHex)
+        );
+    }
 
     fn identity() -> LiveServerIdentity {
         LiveServerIdentity {

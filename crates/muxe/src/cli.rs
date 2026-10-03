@@ -387,13 +387,9 @@ pub struct BrokerServeHerdrCommand {
     /// Absolute cache directory for the target broker.
     #[arg(long, value_parser = parse_absolute_path)]
     pub cache_dir: PathBuf,
-    /// Exact 32-hex-character target activation handoff ID.
-    #[arg(
-        long,
-        requires = "activation_journal",
-        value_parser = parse_handoff_hex
-    )]
-    pub handoff: Option<String>,
+    /// Exact nonzero 32-hex-character target activation handoff ID.
+    #[arg(long, requires = "activation_journal")]
+    pub handoff: Option<muxe_protocol::control::HandoffId>,
     /// Durable activation journal read before the target broker binds.
     #[arg(long, requires = "handoff", value_parser = parse_absolute_path)]
     pub activation_journal: Option<PathBuf>,
@@ -426,13 +422,9 @@ pub struct BrokerServeZellijCommand {
     /// Absolute cache directory for the target broker.
     #[arg(long, value_parser = parse_absolute_path)]
     pub cache_dir: PathBuf,
-    /// Exact 32-hex-character target activation handoff ID.
-    #[arg(
-        long,
-        requires = "activation_journal",
-        value_parser = parse_handoff_hex
-    )]
-    pub handoff: Option<String>,
+    /// Exact nonzero 32-hex-character target activation handoff ID.
+    #[arg(long, requires = "activation_journal")]
+    pub handoff: Option<muxe_protocol::control::HandoffId>,
     /// Durable activation journal read before the target broker binds.
     #[arg(long, requires = "handoff", value_parser = parse_absolute_path)]
     pub activation_journal: Option<PathBuf>,
@@ -443,14 +435,6 @@ fn parse_absolute_path(value: &str) -> Result<PathBuf, String> {
         Ok(path)
     } else {
         Err("path must be absolute".to_owned())
-    }
-}
-
-fn parse_handoff_hex(value: &str) -> Result<String, String> {
-    if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(value.to_owned())
-    } else {
-        Err("handoff must be exactly 32 hexadecimal characters".to_owned())
     }
 }
 
@@ -707,6 +691,51 @@ mod tests {
     }
 
     #[test]
+    fn cli_handoff_fields_reject_invalid_boundary_values() {
+        let base_serve_args = [
+            "muxe",
+            "broker",
+            "serve-herdr",
+            "--socket",
+            "/tmp/muxe-target.sock",
+            "--herdr-binary",
+            "/opt/herdr/herdr",
+            "--herdr-socket",
+            "/tmp/herdr.sock",
+            "--config",
+            "/tmp/config.yml",
+            "--cache-dir",
+            "/tmp/muxe-cache",
+        ];
+        for value in [
+            "not-a-handoff",
+            "0123456789abcdef0123456789abcde",
+            "00000000000000000000000000000000",
+        ] {
+            assert!(
+                Cli::try_parse_from(base_serve_args.iter().copied().chain([
+                    "--handoff",
+                    value,
+                    "--activation-journal",
+                    "/tmp/activation-journal.json",
+                ]))
+                .is_err(),
+                "accepted invalid CLI handoff {value:?}"
+            );
+        }
+        let non_ascii = "é".repeat(16);
+        assert!(
+            Cli::try_parse_from(base_serve_args.iter().copied().chain([
+                "--handoff",
+                non_ascii.as_str(),
+                "--activation-journal",
+                "/tmp/activation-journal.json",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn hidden_herdr_serve_command_accepts_only_typed_inputs() {
         let base_serve_args = [
             "muxe",
@@ -767,15 +796,6 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            Cli::try_parse_from(base_serve_args.iter().copied().chain([
-                "--handoff",
-                "not-a-handoff",
-                "--activation-journal",
-                "/tmp/activation-journal.json",
-            ]))
-            .is_err()
-        );
 
         let target = Cli::try_parse_from(base_serve_args.iter().copied().chain([
             "--handoff",
@@ -791,8 +811,11 @@ mod tests {
             panic!("expected hidden target Herdr serve command");
         };
         assert_eq!(
-            target.handoff.as_deref(),
-            Some("0123456789abcdef0123456789ABCDEF")
+            target.handoff,
+            Some(muxe_protocol::control::HandoffId([
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef,
+            ]))
         );
         assert_eq!(
             target.activation_journal.as_deref(),
@@ -806,6 +829,7 @@ mod tests {
         let help = broker.render_long_help().to_string();
         assert!(!help.contains("serve-herdr"));
     }
+
     #[test]
     fn hidden_zellij_serve_command_accepts_only_typed_inputs() {
         let base_serve_args = [
@@ -868,15 +892,6 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            Cli::try_parse_from(base_serve_args.iter().copied().chain([
-                "--handoff",
-                "not-a-handoff",
-                "--activation-journal",
-                "/tmp/activation-journal.json",
-            ]))
-            .is_err()
-        );
 
         let target = Cli::try_parse_from(base_serve_args.iter().copied().chain([
             "--handoff",
@@ -892,8 +907,11 @@ mod tests {
             panic!("expected hidden target Zellij serve command");
         };
         assert_eq!(
-            target.handoff.as_deref(),
-            Some("0123456789abcdef0123456789ABCDEF")
+            target.handoff,
+            Some(muxe_protocol::control::HandoffId([
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef,
+            ]))
         );
         assert_eq!(
             target.activation_journal.as_deref(),
