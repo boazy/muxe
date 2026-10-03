@@ -139,7 +139,7 @@ complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcom
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l herdr-socket -d 'Absolute Herdr server socket path' -r -F
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l config -d 'Absolute configuration path for the target broker' -r -F
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l cache-dir -d 'Absolute cache directory for the target broker' -r -F
-complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l handoff -d 'Exact 32-hex-character target activation handoff ID' -r
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l handoff -d 'Exact nonzero 32-hex-character target activation handoff ID' -r
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -l activation-journal -d 'Durable activation journal read before the target broker binds' -r -F
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -s h -l help -d 'Print help'
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-herdr" -s V -l version -d 'Print version'
@@ -148,7 +148,7 @@ complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcom
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l session -d 'Live Zellij session name the target broker serves' -r
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l config -d 'Absolute configuration path for the target broker' -r -F
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l cache-dir -d 'Absolute cache directory for the target broker' -r -F
-complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l handoff -d 'Exact 32-hex-character target activation handoff ID' -r
+complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l handoff -d 'Exact nonzero 32-hex-character target activation handoff ID' -r
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -l activation-journal -d 'Durable activation journal read before the target broker binds' -r -F
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -s h -l help -d 'Print help'
 complete -c muxe -n "__fish_muxe_using_subcommand broker; and __fish_seen_subcommand_from serve-zellij" -s V -l version -d 'Print version'

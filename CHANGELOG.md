@@ -34,6 +34,7 @@
 - *(zellij)* Preflight uninstall journal and artifact authority before mutation
 - *(zellij)* Filter Muxe-owned panes from eligible focus targets
 - *(broker)* Retain dispatch ownership through shutdown and release timed-out UI work
+- *(herdr)* Fix tab swaps when stable public tab numbers differ from row positions. Preserve number-based selectors, use the pinned host's insertion boundaries, and verify the resulting order by tab identity.
 
 ### Miscellaneous Tasks
 
@@ -41,7 +42,11 @@
 - *(core)* Type modifier-set flags and preserve canonical key matching without raw integer mutation.
 - *(cli)* Parse nonzero activation handoffs once at the validated CLI boundary and pass typed IDs into both broker serve paths.
 - *(cli)* Preserve typed Herdr workspace, tab, and pane identities through launcher-origin selection and saved tuples.
-- *(herdr)* Keep workspace/tab identity and stable public number selectors distinct from current row positions and insertion boundaries in tab swaps.
+- *(core)* Resolve portable actions once into typed execution values across the broker and host adapters. Preserve OS command paths and retain typed Herdr pane and split directions through dispatch.
+- *(core)* Carry inline-menu identity as typed lowering metadata without serialized string markers or copied syntax trees.
+- *(theme)* Retain resolved colors and distinct theme and color-scheme identities. Reuse canonical color formatting and borrowed scalar values while preserving duplicate policies, deferred validation, and diagnostic precedence.
+- *(zellij)* Retain SDK terminal/plugin pane variants, distinct tab positions and stable tab IDs, and capture-lease identities through bridge focus and pending dismissal state.
+- *(lifecycle)* Convert persisted registry rows into immutable concrete host lifecycle state while preserving legacy rows, independent selected mutation authority, and exact live/snapshot/endpoint checks.
 
 ## [0.1.4] - 2026-09-12
 

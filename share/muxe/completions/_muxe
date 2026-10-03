@@ -461,7 +461,7 @@ _arguments "${_arguments_options[@]}" : \
 '--herdr-socket=[Absolute Herdr server socket path]:HERDR_SOCKET:_files' \
 '--config=[Absolute configuration path for the target broker]:CONFIG:_files' \
 '--cache-dir=[Absolute cache directory for the target broker]:CACHE_DIR:_files' \
-'--handoff=[Exact 32-hex-character target activation handoff ID]:HANDOFF:_default' \
+'--handoff=[Exact nonzero 32-hex-character target activation handoff ID]:HANDOFF:_default' \
 '--activation-journal=[Durable activation journal read before the target broker binds]:ACTIVATION_JOURNAL:_files' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -476,7 +476,7 @@ _arguments "${_arguments_options[@]}" : \
 '--session=[Live Zellij session name the target broker serves]:SESSION:_default' \
 '--config=[Absolute configuration path for the target broker]:CONFIG:_files' \
 '--cache-dir=[Absolute cache directory for the target broker]:CACHE_DIR:_files' \
-'--handoff=[Exact 32-hex-character target activation handoff ID]:HANDOFF:_default' \
+'--handoff=[Exact nonzero 32-hex-character target activation handoff ID]:HANDOFF:_default' \
 '--activation-journal=[Durable activation journal read before the target broker binds]:ACTIVATION_JOURNAL:_files' \
 '-h[Print help]' \
 '--help[Print help]' \
