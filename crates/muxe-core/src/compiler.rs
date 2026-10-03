@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -144,9 +145,8 @@ pub(crate) fn compile_effective(
     )?;
 
     let menus_value = required_field(&root, "menus")?;
-    let mut raw_menus =
-        mapping_fields(&menus_value.value, "`menus` must be an ordered mapping")?.to_vec();
-    for menu in &raw_menus {
+    let raw_menus = mapping_fields(&menus_value.value, "`menus` must be an ordered mapping")?;
+    for menu in raw_menus {
         reject_user_authored_inline_markers(&menu.value)?;
     }
     if raw_menus.is_empty() {
@@ -160,7 +160,7 @@ pub(crate) fn compile_effective(
     // fails with a diagnostic naming the offending menu and a duplicate named
     // identity is rejected at compile time rather than first-wins resolution.
     let mut named_menus: BTreeMap<MenuName, SourceSpan> = BTreeMap::new();
-    for menu in &raw_menus {
+    for menu in raw_menus {
         let name = MenuName::parse_diagnostic(&menu.name, menu.name_span.clone())
             .map_err(|diagnostic| vec![diagnostic])?;
         if let Some(first) = named_menus.get(&name) {
@@ -175,50 +175,39 @@ pub(crate) fn compile_effective(
         }
         named_menus.insert(name, menu.name_span.clone());
     }
-    // Collect inline submenus with structural identities (owning top-level name +
-    // a single monotonic ordinal across the compilation unit in document order),
-    // never free-form strings, so a user-chosen name such as `main#0` cannot
-    // collide with a synthesized ID.
-    // The marker encodes `owner#ordinal`; identity is read back from the marker.
-    let mut inline_counter = 0_u64;
-    let mut inline_menus: Vec<(InlineMenuId, ConfigField, SourceSpan)> = Vec::new();
-    for menu in &mut raw_menus {
-        let owner = named_menus
-            .keys()
-            .find(|name| name.as_str() == menu.name)
-            .cloned()
-            .expect("named menus are validated above");
-        collect_inline_menus(
-            &mut menu.value,
-            &owner,
-            &mut inline_counter,
-            &mut inline_menus,
-        );
-    }
-    let mut inline_identities: BTreeMap<String, (InlineMenuId, SourceSpan)> = BTreeMap::new();
-    for (id, _, name_span) in &inline_menus {
-        inline_identities.insert(inline_marker(id), (id.clone(), name_span.clone()));
-    }
-    for (_, field, _) in inline_menus {
-        raw_menus.push(field);
-    }
     let known_menus: BTreeMap<String, MenuName> = named_menus
         .keys()
         .map(|name| (name.as_str().to_owned(), name.clone()))
         .collect();
+    let mut inline_counter = 0_u64;
+    let mut inline_menus = Vec::new();
+    let mut lowered_menus = Vec::with_capacity(raw_menus.len());
+    for menu in raw_menus {
+        let owner = known_menus
+            .get(&menu.name)
+            .expect("named menus are validated above");
+        lowered_menus.push(lower_menu(
+            &menu.value,
+            MenuId::named(owner.clone()),
+            &menu.name_span,
+            owner,
+            &mut inline_counter,
+            &mut inline_menus,
+        ));
+    }
+    lowered_menus.extend(inline_menus);
     let mut compiler = MenuCompiler {
         generation,
         keyboard: &keyboard,
         global_settings,
         global_layout,
         known_menus: &known_menus,
-        inline_identities: &inline_identities,
         action_validator,
         next_binding: 0,
         diagnostics: Vec::new(),
     };
-    let mut menus = Vec::with_capacity(raw_menus.len());
-    for menu in &raw_menus {
+    let mut menus = Vec::with_capacity(lowered_menus.len());
+    for menu in &lowered_menus {
         if let Some(menu) = compiler.compile_menu(menu) {
             menus.push(menu);
         }
@@ -227,7 +216,7 @@ pub(crate) fn compile_effective(
         return Err(compiler.diagnostics);
     }
     validate_native_actions(&mut menus, action_validator)?;
-    validate_menu_cycles(&menus, &named_menus, &inline_identities)?;
+    validate_menu_cycles(&menus, &lowered_menus)?;
     let bindings = binding_index(&menus);
     Ok(CompiledConfig {
         generation,
@@ -885,13 +874,21 @@ fn nonnegative_u16(value: &ConfigValue, name: &str) -> Result<u16, Vec<ConfigDia
         )]
     })
 }
+/// One definition borrowed from the effective AST, with typed submenu targets in original row order.
+struct LoweredMenu<'a> {
+    id: MenuId,
+    definition: &'a ConfigValue,
+    name_span: &'a SourceSpan,
+    /// Empty for ordinary menus; otherwise aligned before any binding validation or filtering.
+    inline_targets: Vec<Option<InlineMenuId>>,
+}
+
 struct MenuCompiler<'a> {
     generation: CompiledGeneration,
     keyboard: &'a KeyboardProfile,
     global_settings: EffectiveSettings,
     global_layout: LayoutSettings,
     known_menus: &'a BTreeMap<String, MenuName>,
-    inline_identities: &'a BTreeMap<String, (InlineMenuId, SourceSpan)>,
     action_validator: Option<&'a dyn ActionValidator>,
     next_binding: u64,
     diagnostics: Vec<ConfigDiagnostic>,
@@ -902,45 +899,37 @@ impl MenuCompiler<'_> {
         clippy::too_many_lines,
         reason = "one menu field compiled in order; splitting would scatter diagnostics attribution"
     )]
-    fn compile_menu(&mut self, field: &ConfigField) -> Option<CompiledMenu> {
-        let mapping = match mapping_fields(&field.value, "a menu must be a mapping") {
+    fn compile_menu(&mut self, menu: &LoweredMenu<'_>) -> Option<CompiledMenu> {
+        let value = menu.definition;
+        let mapping = match mapping_fields(value, "a menu must be a mapping") {
             Ok(mapping) => mapping,
             Err(mut errors) => {
                 self.diagnostics.append(&mut errors);
                 return None;
             }
         };
-        if let Err(mut errors) = validate_fields(
-            &field.value,
-            &[
-                "title",
-                "tags",
-                "settings",
-                "layout",
-                "bindings",
-                "_muxe_inline_id",
-            ],
-        ) {
+        if let Err(mut errors) =
+            validate_fields(value, &["title", "tags", "settings", "layout", "bindings"])
+        {
             self.diagnostics.append(&mut errors);
             return None;
         }
-        let title = match optional_string(&field.value, "title") {
+        let title = match optional_string(value, "title") {
             Ok(title) => title.map(str::to_owned),
             Err(mut errors) => {
                 self.diagnostics.append(&mut errors);
                 return None;
             }
         };
-        let tags =
-            match string_sequence(field.value.field("tags").map(|field| &field.value), "tags") {
-                Ok(tags) => tags,
-                Err(mut errors) => {
-                    self.diagnostics.append(&mut errors);
-                    return None;
-                }
-            };
+        let tags = match string_sequence(value.field("tags").map(|field| &field.value), "tags") {
+            Ok(tags) => tags,
+            Err(mut errors) => {
+                self.diagnostics.append(&mut errors);
+                return None;
+            }
+        };
         let settings = match compile_settings(
-            field.value.field("settings").map(|field| &field.value),
+            value.field("settings").map(|field| &field.value),
             self.global_settings.clone(),
             SettingsScope::Menu,
         ) {
@@ -951,7 +940,7 @@ impl MenuCompiler<'_> {
             }
         };
         let layout = match compile_layout(
-            field.value.field("layout").map(|field| &field.value),
+            value.field("layout").map(|field| &field.value),
             self.global_layout,
         ) {
             Ok(layout) => layout,
@@ -960,12 +949,11 @@ impl MenuCompiler<'_> {
                 return None;
             }
         };
-        let Some(bindings_value) = field.value.field("bindings").map(|binding| &binding.value)
-        else {
+        let Some(bindings_value) = value.field("bindings").map(|binding| &binding.value) else {
             self.diagnostics.push(ConfigDiagnostic::error(
                 DiagnosticCode::MissingField,
                 "menu requires `bindings`",
-                field.value.span.clone(),
+                value.span.clone(),
             ));
             return None;
         };
@@ -979,8 +967,9 @@ impl MenuCompiler<'_> {
         };
         let mut compiled = Vec::with_capacity(bindings.len());
         let mut vt100_bindings = BTreeMap::<Vt100BindingKey, SourceSpan>::new();
-        for binding_field in bindings {
-            match self.compile_binding(binding_field, &settings) {
+        for (row, binding_field) in bindings.iter().enumerate() {
+            let inline_target = menu.inline_targets.get(row).and_then(Option::as_ref);
+            match self.compile_binding(binding_field, &settings, inline_target) {
                 Ok(binding) => {
                     if matches!(self.keyboard, KeyboardProfile::Vt100 { .. }) {
                         let key = binding.key.vt100_binding_key();
@@ -1009,30 +998,8 @@ impl MenuCompiler<'_> {
             }
         }
         let _ = mapping;
-        // Resolve the compiled identity by variant: a marker-carrying field is an
-        // inline submenu (structural parent + ordinal); anything else is a named
-        // menu validated against the named domain.
-        let id = match field
-            .value
-            .field("_muxe_inline_id")
-            .and_then(|marker| marker.value.as_str())
-            .and_then(|marker| self.inline_identities.get(marker))
-        {
-            Some((inline, _)) => MenuId::inline(inline.clone()),
-            None => match MenuName::parse(field.name.as_str()) {
-                Ok(name) => MenuId::named(name),
-                Err(error) => {
-                    self.diagnostics.push(ConfigDiagnostic::error(
-                        DiagnosticCode::InvalidValue,
-                        format!("invalid menu name `{}` ({})", field.name, error.reason),
-                        field.name_span.clone(),
-                    ));
-                    return None;
-                }
-            },
-        };
         Some(CompiledMenu {
-            id,
+            id: menu.id.clone(),
             title,
             tags,
             inactivity_timeout: settings.timeout,
@@ -1045,6 +1012,7 @@ impl MenuCompiler<'_> {
         &mut self,
         field: &ConfigField,
         menu_settings: &EffectiveSettings,
+        inline_target: Option<&InlineMenuId>,
     ) -> Result<CompiledBinding, Vec<ConfigDiagnostic>> {
         validate_fields(
             &field.value,
@@ -1072,7 +1040,7 @@ impl MenuCompiler<'_> {
             SettingsScope::Binding,
         )?;
         let action_value = required_field(&field.value, "action")?;
-        let (action, execution) = self.parse_action(&action_value.value)?;
+        let (action, execution) = self.parse_action(&action_value.value, inline_target)?;
         if !settings.execution_mode_explicit
             && matches!(
                 action.kind(),
@@ -1124,6 +1092,7 @@ impl MenuCompiler<'_> {
     fn parse_action(
         &self,
         value: &ConfigValue,
+        inline_target: Option<&InlineMenuId>,
     ) -> Result<(ActionSpec, Option<ExecutionCapabilities>), Vec<ConfigDiagnostic>> {
         let (type_name, type_span, fields) = action_fields(value)?;
         let kind = ActionKind::parse(&type_name).ok_or_else(|| {
@@ -1136,12 +1105,12 @@ impl MenuCompiler<'_> {
         match kind {
             ActionKind::Native(_) => {
                 for field in &fields {
-                    validate_context_references(&field.value)?;
+                    let _ = validate_context_references(&field.value)?;
                 }
                 let candidate = NativeActionCandidate {
                     type_name,
                     type_span,
-                    fields,
+                    fields: fields.into_iter().map(ActionField::into_owned).collect(),
                 };
                 if self.action_validator.is_none() {
                     return Err(vec![ConfigDiagnostic::error(
@@ -1153,7 +1122,8 @@ impl MenuCompiler<'_> {
                 Ok((ActionSpec::Native(candidate), None))
             }
             ActionKind::Portable(kind) => {
-                let (spec, baseline) = self.parse_portable(kind, &fields, &type_span)?;
+                let (spec, baseline) =
+                    self.parse_portable(kind, &fields, &type_span, inline_target)?;
                 let ActionSpec::Portable(action) = &spec else {
                     unreachable!("portable parser returns a portable action");
                 };
@@ -1175,8 +1145,9 @@ impl MenuCompiler<'_> {
     fn parse_portable(
         &self,
         kind: PortableActionKind,
-        fields: &[ConfigField],
+        fields: &[ActionField<'_>],
         span: &SourceSpan,
+        inline_target: Option<&InlineMenuId>,
     ) -> Result<(ActionSpec, ExecutionCapabilities), Vec<ConfigDiagnostic>> {
         let schema = kind.schema();
         validate_portable_action_fields(schema, fields, span)?;
@@ -1184,35 +1155,24 @@ impl MenuCompiler<'_> {
         let action = match parsed {
             ParsedPortableAction::MenuOpen { menu, submenu } => {
                 let target = if let Some((target, target_span)) = menu {
-                    if !self.known_menus.contains_key(&target) {
-                        return Err(vec![ConfigDiagnostic::error(
+                    let name = self.known_menus.get(&target).ok_or_else(|| {
+                        vec![ConfigDiagnostic::error(
                             DiagnosticCode::InvalidMenuReference,
                             format!("unknown menu `{target}`"),
                             target_span,
-                        )]);
-                    }
-                    let name = MenuName::parse(target.as_str()).map_err(|error| {
-                        vec![ConfigDiagnostic::error(
-                            DiagnosticCode::InvalidValue,
-                            format!("invalid menu name `{target}` ({})", error.reason),
-                            target_span,
                         )]
                     })?;
-                    MenuTarget::Named(name)
+                    MenuTarget::Named(name.clone())
                 } else {
-                    let submenu = submenu.expect("schema requires menu or submenu");
-                    let inline_id = required_field(&submenu, "_muxe_inline_id")?;
-                    let marker =
-                        expect_string(&inline_id.value, "invalid compiler inline menu ID")?;
-                    let (target, _) =
-                        self.inline_identities.get(marker).cloned().ok_or_else(|| {
-                            vec![ConfigDiagnostic::error(
-                                DiagnosticCode::InvalidValue,
-                                "invalid compiler inline menu ID",
-                                inline_id.value.span.clone(),
-                            )]
-                        })?;
-                    MenuTarget::Inline(target)
+                    let submenu_span = submenu.expect("schema requires menu or submenu");
+                    let target = inline_target.ok_or_else(|| {
+                        vec![ConfigDiagnostic::error(
+                            DiagnosticCode::InvalidValue,
+                            "inline submenu requires an action mapping",
+                            submenu_span,
+                        )]
+                    })?;
+                    MenuTarget::Inline(target.clone())
                 };
                 PortableAction::Menu(MenuAction::Open(target))
             }
@@ -1343,7 +1303,7 @@ fn positional_field(kind: &ActionKind, position: usize) -> Option<&'static str> 
 }
 fn validate_portable_action_fields(
     schema: PortableActionSchema,
-    fields: &[ConfigField],
+    fields: &[ActionField<'_>],
     fallback_span: &SourceSpan,
 ) -> Result<(), Vec<ConfigDiagnostic>> {
     for constraint in schema.constraints {
@@ -1445,7 +1405,7 @@ fn validate_portable_action_fields(
     Ok(())
 }
 fn validate_exactly_one(
-    fields: &[ConfigField],
+    fields: &[ActionField<'_>],
     fallback_span: &SourceSpan,
     parameters: &[ActionParameterName],
     message: &str,
@@ -1522,7 +1482,7 @@ enum ParsedActionValue {
     Sequence(Vec<ActionScalar>),
     Mapping(BTreeMap<String, ActionScalar>),
     MenuName { value: String, span: SourceSpan },
-    MenuMapping(ConfigValue),
+    MenuMapping(SourceSpan),
 }
 
 struct ParsedActionFields(BTreeMap<ActionParameterName, ParsedActionValue>);
@@ -1559,7 +1519,7 @@ impl ParsedActionFields {
         })
     }
 
-    fn take_menu_mapping(&mut self, name: ActionParameterName) -> Option<ConfigValue> {
+    fn take_menu_mapping(&mut self, name: ActionParameterName) -> Option<SourceSpan> {
         self.0.remove(&name).map(|value| match value {
             ParsedActionValue::MenuMapping(value) => value,
             _ => unreachable!("schema type for {name} is a menu mapping"),
@@ -1576,7 +1536,7 @@ macro_rules! parsed_value_type {
         (String, SourceSpan)
     };
     (MenuMapping) => {
-        ConfigValue
+        SourceSpan
     };
     (Unsupported) => {
         ()
@@ -1739,7 +1699,7 @@ portable_action_definitions!(define_parsed_portable_actions);
 
 fn parse_portable_action_fields(
     schema: PortableActionSchema,
-    fields: &[ConfigField],
+    fields: &[ActionField<'_>],
 ) -> Result<ParsedPortableAction, Vec<ConfigDiagnostic>> {
     let mut parsed = BTreeMap::new();
     for parameter in schema.parameters {
@@ -1755,7 +1715,7 @@ fn parse_portable_action_fields(
                 },
                 ActionParameterType::MenuMapping => {
                     mapping_fields(&field.value, "`submenu` must be a menu mapping")?;
-                    ParsedActionValue::MenuMapping(field.value.clone())
+                    ParsedActionValue::MenuMapping(field.value.span.clone())
                 }
                 ActionParameterType::Unsupported => continue,
                 ActionParameterType::KeySequence => {
@@ -1851,11 +1811,42 @@ fn validate_key_capabilities(
         .map_or(Ok(()), Err)
 }
 
+/// Action syntax before retained payload ownership, borrowing embedded menu definitions.
+struct ActionField<'a> {
+    name: Cow<'a, str>,
+    name_span: SourceSpan,
+    value: Cow<'a, ConfigValue>,
+}
+
+impl ActionField<'_> {
+    fn into_owned(self) -> ConfigField {
+        ConfigField {
+            name: self.name.into_owned(),
+            name_span: self.name_span,
+            value: self.value.into_owned(),
+        }
+    }
+}
+
 fn action_fields(
     value: &ConfigValue,
-) -> Result<(String, SourceSpan, Vec<ConfigField>), Vec<ConfigDiagnostic>> {
+) -> Result<(String, SourceSpan, Vec<ActionField<'_>>), Vec<ConfigDiagnostic>> {
     match &value.kind {
-        ConfigValueKind::String(compact) => compact_action_fields(compact, value.span.clone()),
+        ConfigValueKind::String(compact) => {
+            let (name, span, fields) = compact_action_fields(compact, value.span.clone())?;
+            Ok((
+                name,
+                span,
+                fields
+                    .into_iter()
+                    .map(|field| ActionField {
+                        name: Cow::Owned(field.name),
+                        name_span: field.name_span,
+                        value: Cow::Owned(field.value),
+                    })
+                    .collect(),
+            ))
+        }
         ConfigValueKind::Mapping(fields) => {
             let type_field = fields
                 .iter()
@@ -1873,10 +1864,23 @@ fn action_fields(
                 .iter()
                 .filter(|field| field.name != "type")
                 .map(|field| {
-                    Ok(ConfigField {
-                        name: field.name.clone(),
+                    let value = if type_name == PortableActionKind::MenuOpen.as_str()
+                        && field.name == "submenu"
+                    {
+                        match validate_context_references(&field.value)? {
+                            Some(reference) => Cow::Owned(ConfigValue {
+                                span: field.value.span.clone(),
+                                kind: ConfigValueKind::Context(reference),
+                            }),
+                            None => Cow::Borrowed(&field.value),
+                        }
+                    } else {
+                        Cow::Owned(normalize_action_value(&field.value)?)
+                    };
+                    Ok(ActionField {
+                        name: Cow::Borrowed(field.name.as_str()),
                         name_span: field.name_span.clone(),
-                        value: normalize_action_value(&field.value)?,
+                        value,
                     })
                 })
                 .collect::<Result<Vec<_>, Vec<ConfigDiagnostic>>>()?;
@@ -2379,13 +2383,7 @@ fn merge_defaults(target: &mut ConfigValue, defaults: &ConfigValue) {
     }
 }
 
-/// Canonical marker encoding for a structural inline identity, shared by the
-/// marker value, the `inline_identities` map key, and the synthesized field
-/// name so the three cannot drift apart.
-fn inline_marker(id: &InlineMenuId) -> String {
-    format!("{}#{}", id.owner().as_str(), id.ordinal())
-}
-
+/// Rejects reserved user syntax before lowering. Typed lowering never injects this historical field.
 fn reject_user_authored_inline_markers(value: &ConfigValue) -> Result<(), Vec<ConfigDiagnostic>> {
     fn visit(value: &ConfigValue, diagnostics: &mut Vec<ConfigDiagnostic>) {
         match &value.kind {
@@ -2424,80 +2422,69 @@ fn reject_user_authored_inline_markers(value: &ConfigValue) -> Result<(), Vec<Co
     }
 }
 
-fn collect_inline_menus(
-    menu: &mut ConfigValue,
+fn lower_menu<'a>(
+    definition: &'a ConfigValue,
+    id: MenuId,
+    name_span: &'a SourceSpan,
     owner: &MenuName,
     next: &mut u64,
-    output: &mut Vec<(InlineMenuId, ConfigField, SourceSpan)>,
-) {
+    output: &mut Vec<LoweredMenu<'a>>,
+) -> LoweredMenu<'a> {
+    let mut inline_targets = Vec::new();
     let mut discovered = Vec::new();
-    if let Some(bindings) = menu
-        .field_mut("bindings")
-        .and_then(|field| field.value.as_mapping_mut())
+    if let Some(bindings) = definition
+        .field("bindings")
+        .and_then(|field| field.value.as_mapping())
     {
-        for binding in bindings {
-            let Some(action) = binding.value.field_mut("action") else {
-                continue;
-            };
-            let Some(submenu) = action.value.field_mut("submenu") else {
+        for (row, binding) in bindings.iter().enumerate() {
+            let Some(submenu) = binding
+                .value
+                .field("action")
+                .and_then(|action| action.value.field("submenu"))
+            else {
                 continue;
             };
             if submenu.value.as_mapping().is_none() {
                 continue;
             }
-            let id = InlineMenuId::new(owner.clone(), *next);
+            let inline = InlineMenuId::new(owner.clone(), *next);
             *next += 1;
-            let marker = ConfigField {
-                name: "_muxe_inline_id".to_owned(),
-                name_span: submenu.value.span.clone(),
-                value: ConfigValue::string(inline_marker(&id)),
-            };
-            submenu
-                .value
-                .as_mapping_mut()
-                .expect("checked")
-                .push(marker);
-            let name_span = submenu.name_span.clone();
-            let mut inline = ConfigField {
-                name: inline_marker(&id),
-                name_span: name_span.clone(),
-                value: submenu.value.clone(),
-            };
-            // Nested submenus keep the top-level owner: ordinals come from the
-            // same monotonic sequence across the compilation unit, so no nested
-            // ID can collide.
-            collect_inline_menus(&mut inline.value, owner, next, output);
-            discovered.push((id, inline, name_span));
+            if inline_targets.is_empty() {
+                inline_targets.resize(bindings.len(), None);
+            }
+            inline_targets[row] = Some(inline.clone());
+            discovered.push(lower_menu(
+                &submenu.value,
+                MenuId::inline(inline),
+                &submenu.name_span,
+                owner,
+                next,
+                output,
+            ));
         }
     }
+    // Allocation is parent-first; emission keeps descendants before their containing menus.
     output.extend(discovered);
+    LoweredMenu {
+        id,
+        definition,
+        name_span,
+        inline_targets,
+    }
 }
 
 fn validate_menu_cycles(
     menus: &[CompiledMenu],
-    named_menus: &BTreeMap<MenuName, SourceSpan>,
-    inline_identities: &BTreeMap<String, (InlineMenuId, SourceSpan)>,
+    definitions: &[LoweredMenu<'_>],
 ) -> Result<(), Vec<ConfigDiagnostic>> {
     // The cycle walk is keyed by the typed identity: duplicate compiled IDs
     // cannot silently overwrite one another, and a named `main@0` never shares
     // a key with the inline submenu of `main`. Name spans are threaded from the
     // config fields so the duplicate diagnostic points at the menu definition.
-    let mut name_spans: BTreeMap<MenuId, SourceSpan> = BTreeMap::new();
-    for menu in menus {
-        name_spans.entry(menu.id.clone()).or_insert_with(|| {
-            menu.bindings
-                .first()
-                .map_or_else(fallback_span, |binding| binding.action_span.clone())
-        });
-    }
-    // Prefer config-field name spans where recoverable: named menus keep the
-    // span recorded at phase 1; inline menus keep the submenu name span.
-    for (name, span) in named_menus {
-        name_spans.insert(MenuId::named(name.clone()), span.clone());
-    }
-    for (id, span) in inline_identities.values() {
-        name_spans.insert(MenuId::inline(id.clone()), span.clone());
-    }
+    let name_spans: BTreeMap<MenuId, SourceSpan> = definitions
+        .iter()
+        .map(|menu| (menu.id.clone(), menu.name_span.clone()))
+        .collect();
     let mut graph: BTreeMap<MenuId, Vec<(MenuId, SourceSpan)>> = BTreeMap::new();
     for menu in menus {
         if graph.contains_key(&menu.id) {
@@ -2569,25 +2556,26 @@ fn detect_cycle(
     cycle
 }
 
-fn validate_context_references(value: &ConfigValue) -> Result<(), Vec<ConfigDiagnostic>> {
+fn validate_context_references(
+    value: &ConfigValue,
+) -> Result<Option<ContextReference>, Vec<ConfigDiagnostic>> {
     if let Some(reference) = context_reference(value)? {
-        let _ = reference;
-        return Ok(());
+        return Ok(Some(reference));
     }
     match &value.kind {
         ConfigValueKind::Sequence(values) => {
             for value in values {
-                validate_context_references(value)?;
+                let _ = validate_context_references(value)?;
             }
         }
         ConfigValueKind::Mapping(fields) => {
             for field in fields {
-                validate_context_references(&field.value)?;
+                let _ = validate_context_references(&field.value)?;
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 fn context_reference(
@@ -2909,7 +2897,10 @@ fn required_field_mut<'a>(
     })
 }
 
-fn field_named<'a>(fields: &'a [ConfigField], name: &str) -> Option<&'a ConfigField> {
+fn field_named<'a, 'source>(
+    fields: &'a [ActionField<'source>],
+    name: &str,
+) -> Option<&'a ActionField<'source>> {
     fields.iter().find(|field| field.name == name)
 }
 

@@ -1906,6 +1906,171 @@ fn empty_and_control_menu_names_are_rejected_at_compile_time_naming_the_menu() {
 }
 
 #[test]
+fn borrowed_submenu_preserves_context_error_precedence_and_original_span() {
+    let yaml = r"
+version: 1
+menus:
+  main:
+    bindings:
+      a:
+        label: invalid nested reference
+        action:
+          type: menu:open
+          extra: true
+          submenu:
+            bindings:
+              b:
+                label: child
+                action:
+                  type: command:execute
+                  program: { $context: origin.unknown }
+";
+    let diagnostics = compile(yaml, None, KeyCapabilities::default())
+        .expect_err("invalid nested context must fail before unknown parent arguments");
+    assert_eq!(diagnostics[0].code, DiagnosticCode::InvalidContextReference);
+    let start = yaml
+        .find("origin.unknown")
+        .expect("invalid reference location");
+    let expected = muxe_core::SourceSpan::new(
+        muxe_core::SourceId::new("config.yml"),
+        start,
+        start + "origin.unknown".len(),
+    );
+    assert!(
+        diagnostics[0]
+            .labels
+            .iter()
+            .any(|label| label.span == expected)
+    );
+}
+
+#[test]
+fn nested_inline_targets_keep_global_allocation_and_original_row_alignment() {
+    let config = compile(
+        r#"
+version: 1
+menus:
+  main:
+    bindings:
+      a: { label: named lookalike, action: 'menu:open menu="main#0"' }
+      b:
+        label: first inline
+        action:
+          type: menu:open
+          submenu:
+            bindings:
+              c:
+                label: nested inline
+                action:
+                  type: menu:open
+                  submenu:
+                    bindings:
+                      q: { label: quit nested, action: menu:quit }
+      d:
+        label: second inline
+        action:
+          type: menu:open
+          submenu:
+            bindings:
+              e: { label: quit sibling, action: menu:quit }
+  aux:
+    bindings:
+      f:
+        label: other owner
+        action:
+          type: menu:open
+          submenu:
+            bindings:
+              h: { label: quit aux, action: menu:quit }
+  "main#0":
+    bindings:
+      g: { label: quit named, action: menu:quit }
+"#,
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect("nested inline forest");
+    let inline = |owner, ordinal| {
+        muxe_core::MenuId::inline(muxe_core::InlineMenuId::new(
+            muxe_core::MenuName::parse(owner).expect("owner name"),
+            ordinal,
+        ))
+    };
+    assert_eq!(
+        config
+            .menus
+            .iter()
+            .map(|menu| menu.id.clone())
+            .collect::<Vec<_>>(),
+        [
+            id("main"),
+            id("aux"),
+            id("main#0"),
+            inline("main", 1),
+            inline("main", 0),
+            inline("main", 2),
+            inline("aux", 3),
+        ]
+    );
+    let target = |menu: &muxe_core::CompiledMenu, row: usize| {
+        let muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Menu(
+            muxe_core::MenuAction::Open(target),
+        )) = &menu.bindings[row].action
+        else {
+            panic!("expected menu navigation");
+        };
+        match target {
+            muxe_core::MenuTarget::Named(name) => muxe_core::MenuId::named(name.clone()),
+            muxe_core::MenuTarget::Inline(inline) => muxe_core::MenuId::inline(inline.clone()),
+        }
+    };
+    let main = config.menu(&id("main")).expect("main");
+    assert_eq!(target(main, 0), id("main#0"));
+    assert_eq!(target(main, 1), inline("main", 0));
+    assert_eq!(target(main, 2), inline("main", 2));
+    assert_eq!(
+        target(config.menu(&inline("main", 0)).expect("parent inline"), 0),
+        inline("main", 1)
+    );
+    assert_eq!(
+        target(config.menu(&id("aux")).expect("aux"), 0),
+        inline("aux", 3)
+    );
+}
+
+#[test]
+fn inline_cycle_diagnostics_retain_the_original_reference_span() {
+    let yaml = r"
+version: 1
+menus:
+  main:
+    bindings:
+      a:
+        label: inline cycle
+        action:
+          type: menu:open
+          submenu:
+            bindings:
+              b: { label: back to main, action: menu:open main }
+";
+    let diagnostics = compile(yaml, None, KeyCapabilities::default())
+        .expect_err("inline-to-named cycle must be rejected");
+    let cycle = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == DiagnosticCode::MenuCycle)
+        .expect("cycle diagnostic");
+    let start = yaml
+        .find("menu:open main")
+        .expect("back-reference location");
+    let expected = muxe_core::SourceSpan::new(
+        muxe_core::SourceId::new("config.yml"),
+        start,
+        start + "menu:open main".len(),
+    );
+    assert!(cycle.labels.iter().any(|label| label.span == expected));
+}
+
+#[test]
 fn named_main_at_zero_coexists_with_inline_submenu_as_distinct_identities() {
     let yaml = "version: 1\nmenus:\n  main:\n    bindings:\n      x:\n        label: tools\n        action:\n          type: menu:open\n          submenu:\n            bindings:\n              q:\n                label: quit\n                action: menu:quit\n  \"main@0\":\n    bindings:\n      a:\n        label: alpha\n        action: menu:quit\n";
     let config = compile(yaml, None, KeyCapabilities::default()).expect("collision-free compile");
