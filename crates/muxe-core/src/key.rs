@@ -13,32 +13,34 @@ pub enum EventKind {
 pub struct Modifiers(u16);
 
 impl Modifiers {
-    pub const SHIFT: u16 = 1 << 0;
-    pub const ALT: u16 = 1 << 1;
-    pub const CTRL: u16 = 1 << 2;
-    pub const SUPER: u16 = 1 << 3;
-    pub const HYPER: u16 = 1 << 4;
-    pub const META: u16 = 1 << 5;
-    pub const CAPS_LOCK: u16 = 1 << 6;
-    pub const NUM_LOCK: u16 = 1 << 7;
+    pub const SHIFT: Self = Self(1 << 0);
+    pub const ALT: Self = Self(1 << 1);
+    pub const CTRL: Self = Self(1 << 2);
+    pub const SUPER: Self = Self(1 << 3);
+    pub const HYPER: Self = Self(1 << 4);
+    pub const META: Self = Self(1 << 5);
+    pub const CAPS_LOCK: Self = Self(1 << 6);
+    pub const NUM_LOCK: Self = Self(1 << 7);
 
     #[must_use]
     pub const fn empty() -> Self {
         Self(0)
     }
 
+    /// Returns true when any flag in `flags` is present.
     #[must_use]
-    pub const fn bits(self) -> u16 {
-        self.0
+    pub const fn contains(self, flags: Self) -> bool {
+        self.0 & flags.0 != 0
+    }
+
+    /// Adds every flag in `flags`, retaining all existing flags.
+    pub fn insert(&mut self, flags: Self) {
+        self.0 |= flags.0;
     }
 
     #[must_use]
-    pub const fn contains(self, flag: u16) -> bool {
-        self.0 & flag != 0
-    }
-
-    pub fn insert(&mut self, flag: u16) {
-        self.0 |= flag;
+    const fn is_subset_of(self, flags: Self) -> bool {
+        self.0 & !flags.0 == 0
     }
 
     #[must_use]
@@ -48,7 +50,16 @@ impl Modifiers {
 
     #[must_use]
     pub const fn without_locks(self) -> Self {
-        Self(self.0 & !(Self::CAPS_LOCK | Self::NUM_LOCK))
+        Self(self.0 & !(Self::CAPS_LOCK.0 | Self::NUM_LOCK.0))
+    }
+}
+
+/// Returns the union of flags present in either modifier set.
+impl std::ops::BitOr for Modifiers {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self::Output {
+        Self(self.0 | other.0)
     }
 }
 
@@ -707,7 +718,9 @@ fn legacy_control_code(key: &CanonicalKey) -> Option<u8> {
         }
         KeyIdentity::Text(character)
             if key.modifiers.contains(Modifiers::CTRL)
-                && key.modifiers.bits() & !(Modifiers::CTRL | Modifiers::SHIFT) == 0 =>
+                && key
+                    .modifiers
+                    .is_subset_of(Modifiers::CTRL | Modifiers::SHIFT) =>
         {
             legacy_control_text_code(*character)
         }
@@ -748,7 +761,7 @@ impl fmt::Display for CanonicalKey {
     }
 }
 
-const CANONICAL_MODIFIERS: [(&str, u16); 8] = [
+const CANONICAL_MODIFIERS: [(&str, Modifiers); 8] = [
     ("ctrl", Modifiers::CTRL),
     ("alt", Modifiers::ALT),
     ("shift", Modifiers::SHIFT),
@@ -759,7 +772,7 @@ const CANONICAL_MODIFIERS: [(&str, u16); 8] = [
     ("num-lock", Modifiers::NUM_LOCK),
 ];
 
-fn modifier_flag(value: &str) -> Option<(u8, u16)> {
+fn modifier_flag(value: &str) -> Option<(u8, Modifiers)> {
     CANONICAL_MODIFIERS
         .iter()
         .zip(0_u8..)
