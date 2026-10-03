@@ -8,18 +8,51 @@
 //! - Neighbor focus computes the nearest eligible pane from the origin pane's
 //!   tab and tracked geometry: strictly separated in the requested direction,
 //!   ranked by edge overlap then center distance.
+//!
+//! Pane identity retains the pinned SDK's terminal/plugin distinction.
+//! Manifest positions and stable tab identities stay separate; only origin
+//! snapshot serialization projects them back to numeric wire fields.
 
 use std::collections::BTreeMap;
 
 use muxe_zellij_protocol::NeighborDirection;
+use zellij_tile::prelude::PaneId;
+
+/// Zero-based position indexing a pinned SDK pane manifest.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct TabPosition(usize);
+
+impl TabPosition {
+    pub(crate) fn from_host(value: usize) -> Self {
+        Self(value)
+    }
+
+    /// Projects the host position only at the origin snapshot wire boundary.
+    pub(crate) fn wire_index(self) -> Option<u64> {
+        u64::try_from(self.0).ok()
+    }
+}
+
+/// Stable SDK tab identity, independent of manifest position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StableTabId(usize);
+
+impl StableTabId {
+    pub(crate) fn from_host(value: usize) -> Self {
+        Self(value)
+    }
+
+    /// Projects the stable identity only at the origin snapshot wire boundary.
+    pub(crate) fn wire_id(self) -> Option<u64> {
+        u64::try_from(self.0).ok()
+    }
+}
 
 /// Geometry snapshot for one tracked pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneGeometry {
-    /// Numeric pane ID within its kind.
-    pub id: u32,
-    /// True for plugin panes, false for terminals.
-    pub is_plugin: bool,
+    /// Exact pinned SDK terminal or plugin identity.
+    pub id: PaneId,
     /// Left edge, in cells.
     pub x: usize,
     /// Top edge, in cells.
@@ -72,9 +105,9 @@ impl PaneGeometry {
 /// Per-tab ordered pane inventory with the active tab position.
 #[derive(Clone, Debug, Default)]
 pub struct PaneInventory {
-    panes: BTreeMap<usize, Vec<PaneGeometry>>,
-    active_tab: Option<usize>,
-    active_tab_id: Option<usize>,
+    panes: BTreeMap<TabPosition, Vec<PaneGeometry>>,
+    active_tab: Option<TabPosition>,
+    active_tab_id: Option<StableTabId>,
 }
 
 impl PaneInventory {
@@ -84,19 +117,23 @@ impl PaneInventory {
     }
 
     /// Replaces the tracked manifest wholesale from a `PaneUpdate` event.
-    pub fn set_manifest(&mut self, panes: BTreeMap<usize, Vec<PaneGeometry>>) {
+    pub fn set_manifest(&mut self, panes: BTreeMap<TabPosition, Vec<PaneGeometry>>) {
         self.panes = panes;
     }
 
     /// Records the active tab position with its stable host tab ID.
-    pub fn set_active_tab_with_id(&mut self, position: Option<usize>, tab_id: Option<usize>) {
+    pub fn set_active_tab_with_id(
+        &mut self,
+        position: Option<TabPosition>,
+        tab_id: Option<StableTabId>,
+    ) {
         self.active_tab = position;
         self.active_tab_id = tab_id;
     }
 
     /// Active tab position with its stable host tab ID, when tracked.
     #[must_use]
-    pub fn active_tab_with_id(&self) -> (Option<usize>, Option<usize>) {
+    pub fn active_tab_with_id(&self) -> (Option<TabPosition>, Option<StableTabId>) {
         (self.active_tab, self.active_tab_id)
     }
 
@@ -141,19 +178,19 @@ impl PaneInventory {
         Self::eligible_panes(self.active_panes()?, is_eligible).nth(position)
     }
 
-    /// Finds a tracked pane by numeric ID and kind.
-    pub fn find(&self, id: u32, is_plugin: bool) -> Option<PaneGeometry> {
+    /// Finds a tracked pane by its exact terminal or plugin identity.
+    pub fn find(&self, id: PaneId) -> Option<PaneGeometry> {
         self.panes
             .values()
             .flatten()
-            .find(|pane| pane.id == id && pane.is_plugin == is_plugin)
+            .find(|pane| pane.id == id)
             .copied()
     }
 
     /// Whether the current manifest contains one exact terminal or plugin pane.
     #[must_use]
-    pub fn contains(&self, id: u32, is_plugin: bool) -> bool {
-        self.find(id, is_plugin).is_some()
+    pub fn contains(&self, id: PaneId) -> bool {
+        self.find(id).is_some()
     }
 
     /// Computes the nearest eligible neighbor of a base pane in one direction.
@@ -172,7 +209,7 @@ impl PaneInventory {
     {
         let mut best: Option<(usize, usize, PaneGeometry)> = None;
         for candidate in Self::eligible_panes(self.origin_tab(base)?, is_eligible) {
-            if candidate.id == base.id && candidate.is_plugin == base.is_plugin {
+            if candidate.id == base.id {
                 continue;
             }
             let separated = match direction {
@@ -206,8 +243,7 @@ mod tests {
 
     fn pane(id: u32, x: usize, y: usize, columns: usize, rows: usize) -> PaneGeometry {
         PaneGeometry {
-            id,
-            is_plugin: false,
+            id: PaneId::Terminal(id),
             x,
             y,
             columns,
@@ -218,22 +254,50 @@ mod tests {
     fn inventory() -> PaneInventory {
         let mut inventory = PaneInventory::new();
         inventory.set_manifest(BTreeMap::from([(
-            0,
+            TabPosition::from_host(0),
             vec![
                 pane(1, 0, 0, 50, 20),
                 pane(2, 50, 0, 50, 20),
                 pane(3, 0, 20, 100, 10),
             ],
         )]));
-        inventory.set_active_tab_with_id(Some(0), None);
+        inventory.set_active_tab_with_id(Some(TabPosition::from_host(0)), None);
         inventory
+    }
+
+    #[test]
+    fn neighbor_can_share_numeric_id_with_another_pane_kind() {
+        let mut inventory = PaneInventory::new();
+        let terminal = pane(7, 0, 0, 50, 20);
+        let plugin = PaneGeometry {
+            id: PaneId::Plugin(7),
+            x: 50,
+            ..terminal
+        };
+        inventory.set_manifest(BTreeMap::from([(
+            TabPosition::from_host(4),
+            vec![terminal, plugin],
+        )]));
+        assert_eq!(
+            inventory
+                .neighbor(terminal, NeighborDirection::Right, |_| true)
+                .unwrap()
+                .id,
+            PaneId::Plugin(7),
+        );
     }
 
     #[test]
     fn index_selects_eligible_active_tab_order() {
         let inventory = inventory();
-        assert_eq!(inventory.pane_at(0, |_| true).expect("first").id, 1);
-        assert_eq!(inventory.pane_at(2, |_| true).expect("third").id, 3);
+        assert_eq!(
+            inventory.pane_at(0, |_| true).expect("first").id,
+            PaneId::Terminal(1)
+        );
+        assert_eq!(
+            inventory.pane_at(2, |_| true).expect("third").id,
+            PaneId::Terminal(3)
+        );
         assert!(inventory.pane_at(3, |_| true).is_none());
     }
 
@@ -246,14 +310,14 @@ mod tests {
                 .neighbor(base, NeighborDirection::Right, |_| true)
                 .expect("right")
                 .id,
-            2
+            PaneId::Terminal(2)
         );
         assert_eq!(
             inventory
                 .neighbor(base, NeighborDirection::Down, |_| true)
                 .expect("down")
                 .id,
-            3
+            PaneId::Terminal(3)
         );
         assert!(
             inventory
@@ -273,15 +337,14 @@ mod tests {
         // A zero-width gap is still a clean split; an overlapping edge is not.
         let mut with_overlap = inventory();
         let overlapping = PaneGeometry {
-            id: 9,
-            is_plugin: false,
+            id: PaneId::Terminal(9),
             x: 49,
             y: 0,
             columns: 10,
             rows: 20,
         };
         with_overlap.set_manifest(BTreeMap::from([(
-            0,
+            TabPosition::from_host(0),
             vec![pane(1, 0, 0, 50, 20), overlapping],
         )]));
         assert!(

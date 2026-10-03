@@ -35,6 +35,10 @@
 //! user-owned newer state: the menu is dismissed and the snapshot is never
 //! restored over it.
 //!
+//! Capture exclusions retain [`CaptureLeaseId`] keys and exact SDK [`PaneId`]
+//! values. A stale lease cannot release a newer owner's pane, and a terminal
+//! and plugin with the same numeric ID remain distinct focus targets.
+//!
 //! ## Broker-renewed capture lease (H12)
 //!
 //! An active capture owns a broker-renewed lease of [`CAPTURE_LEASE_TICKS`]
@@ -68,7 +72,7 @@ use zellij_tile::prelude::*;
 
 use crate::{
     dispatcher::{ReadyDispatch, completion_execution, execute_sync, prepare},
-    focus::{PaneGeometry, PaneInventory},
+    focus::{PaneGeometry, PaneInventory, StableTabId, TabPosition},
 };
 
 /// Pipe-name prefixes separating the two channels by role.
@@ -314,7 +318,7 @@ pub struct Bridge {
     active: Option<ActiveCapture>,
     restoring_mode: Option<RestoreBarrier>,
     pending_ui_pane: Option<PaneId>,
-    capture_panes: BTreeMap<[u8; 16], PaneId>,
+    capture_panes: BTreeMap<CaptureLeaseId, PaneId>,
     origin: ClassifiedOrigin,
     inventory: PaneInventory,
     pending_actions: BTreeMap<String, PendingAction>,
@@ -331,8 +335,10 @@ struct PendingPostDismissal {
     request_id: RequestId,
     channel_generation: ChannelGeneration,
     execution: ExecutionId,
-    ui_pane: String,
-    origin_pane: String,
+    // Parse once at request admission. `None` preserves the old `.ok()` parsing
+    // behavior for malformed pane strings; it adds no new rejection or timing rule.
+    ui_pane: Option<PaneId>,
+    origin_pane: Option<PaneId>,
     command: RawNativeCommand,
 }
 
@@ -450,10 +456,10 @@ impl Bridge {
 
     /// Test-visible capture state: pending lease, active lease, or none.
     #[cfg(test)]
-    pub fn capture_state(&self) -> (Option<[u8; 16]>, Option<[u8; 16]>) {
+    pub fn capture_state(&self) -> (Option<CaptureLeaseId>, Option<CaptureLeaseId>) {
         (
-            self.pending.as_ref().map(|p| p.lease.0),
-            self.active.as_ref().map(|a| a.lease.0),
+            self.pending.as_ref().map(|p| p.lease),
+            self.active.as_ref().map(|a| a.lease),
         )
     }
 
@@ -590,22 +596,25 @@ impl Bridge {
         let mut panes = BTreeMap::new();
         for (tab, infos) in &manifest.panes {
             panes.insert(
-                *tab,
+                TabPosition::from_host(*tab),
                 infos
                     .iter()
                     .map(|info| {
                         let pane = PaneGeometry {
-                            id: info.id,
-                            is_plugin: info.is_plugin,
+                            id: if info.is_plugin {
+                                PaneId::Plugin(info.id)
+                            } else {
+                                PaneId::Terminal(info.id)
+                            },
                             x: info.pane_x,
                             y: info.pane_y,
                             columns: info.pane_columns,
                             rows: info.pane_rows,
                         };
-                        let id = host_pane_id(pane);
+                        let id = pane.id;
                         prior_present |= self.focused_pane == Some(id);
                         confirmed_present |= self.origin.confirmed == Some(id);
-                        if info.is_focused && active_tab == Some(*tab) {
+                        if info.is_focused && active_tab == Some(TabPosition::from_host(*tab)) {
                             focused_hint = Some(id);
                         }
                         pane
@@ -637,7 +646,7 @@ impl Bridge {
     /// A retry for an already-bound lease stays idempotent; a stale overwrite
     /// replaces the pending claim before binding.
     fn bind_capture_ui(&mut self, lease: CaptureLeaseId) {
-        if self.capture_panes.contains_key(&lease.0) {
+        if self.capture_panes.contains_key(&lease) {
             return;
         }
         let Some(pane) = self.pending_ui_pane.take() else {
@@ -651,12 +660,12 @@ impl Bridge {
         // A replacement capture supersedes its former lease before the old
         // EndCapture can release the still-owned pane exclusion.
         self.capture_panes.retain(|_, excluded| *excluded != pane);
-        self.capture_panes.insert(lease.0, pane);
+        self.capture_panes.insert(lease, pane);
     }
 
     /// Releases one lease's focus exclusion; other leases keep theirs.
     fn release_capture_ui(&mut self, lease: CaptureLeaseId) {
-        self.capture_panes.remove(&lease.0);
+        self.capture_panes.remove(&lease);
     }
 
     /// Panes excluded from eligible focus targets: lease-owned Muxe panes,
@@ -688,8 +697,10 @@ impl Bridge {
 
     fn on_tab_update(&mut self, tabs: &[TabInfo]) {
         let active = tabs.iter().find(|tab| tab.active);
-        self.inventory
-            .set_active_tab_with_id(active.map(|tab| tab.position), active.map(|tab| tab.tab_id));
+        self.inventory.set_active_tab_with_id(
+            active.map(|tab| TabPosition::from_host(tab.position)),
+            active.map(|tab| StableTabId::from_host(tab.tab_id)),
+        );
     }
 
     fn on_action_complete(
@@ -1009,8 +1020,8 @@ impl Bridge {
                     request_id,
                     generation,
                     execution,
-                    ui_pane,
-                    origin_pane,
+                    PaneId::from_str(&ui_pane).ok(),
+                    PaneId::from_str(&origin_pane).ok(),
                     command,
                     effects,
                 );
@@ -1139,8 +1150,8 @@ impl Bridge {
         request_id: RequestId,
         generation: ChannelGeneration,
         execution: ExecutionId,
-        ui_pane: String,
-        origin_pane: String,
+        ui_pane: Option<PaneId>,
+        origin_pane: Option<PaneId>,
         command: RawNativeCommand,
         effects: &mut dyn HostEffects,
     ) {
@@ -1171,16 +1182,14 @@ impl Bridge {
                 remaining.push(pending);
                 continue;
             }
-            let ui_pane = PaneId::from_str(&pending.ui_pane).ok();
-            let ui_is_live = ui_pane.is_some_and(|pane| match pane {
-                PaneId::Terminal(id) => self.inventory.contains(id, false),
-                PaneId::Plugin(id) => self.inventory.contains(id, true),
-            });
+            let ui_is_live = pending
+                .ui_pane
+                .is_some_and(|pane| self.inventory.contains(pane));
             if ui_is_live {
                 remaining.push(pending);
                 continue;
             }
-            if PaneId::from_str(&pending.origin_pane).ok() != self.focused_pane {
+            if pending.origin_pane != self.focused_pane {
                 refresh_client_focus = true;
                 remaining.push(pending);
                 continue;
@@ -1395,8 +1404,8 @@ impl Bridge {
             prior = None;
         }
         let (active_tab, active_tab_id) = self.inventory.active_tab_with_id();
-        let active_tab_index = active_tab.and_then(|position| u64::try_from(position).ok());
-        let snapshot_active_tab_id = active_tab_id.and_then(|tab_id| u64::try_from(tab_id).ok());
+        let active_tab_index = active_tab.and_then(TabPosition::wire_index);
+        let snapshot_active_tab_id = active_tab_id.and_then(StableTabId::wire_id);
         // The prior is already a typed host pane ID, so its kind is known
         // without consulting the manifest inventory: a terminal prior is
         // `Some(false)`, a plugin prior is `Some(true)`, and only a genuinely
@@ -1437,10 +1446,10 @@ impl Bridge {
     ) {
         let outcome = match self
             .inventory
-            .pane_at(index, |pane| !self.is_focus_excluded(host_pane_id(pane)))
+            .pane_at(index, |pane| !self.is_focus_excluded(pane.id))
         {
             Some(pane) => {
-                effects.focus_pane(host_pane_id(pane));
+                effects.focus_pane(pane.id);
                 CommandOutcome::succeeded()
             }
             None => CommandOutcome::failed(format!("no eligible pane at manifest index {index}")),
@@ -1472,14 +1481,13 @@ impl Bridge {
         let base = self
             .origin
             .focus_base
-            .and_then(|pane| to_geometry(pane, &self.inventory));
+            .and_then(|pane| self.inventory.find(pane));
         let outcome = match base.and_then(|base| {
-            self.inventory.neighbor(base, direction, |pane| {
-                !self.is_focus_excluded(host_pane_id(pane))
-            })
+            self.inventory
+                .neighbor(base, direction, |pane| !self.is_focus_excluded(pane.id))
         }) {
             Some(neighbor) => {
-                effects.focus_pane(host_pane_id(neighbor));
+                effects.focus_pane(neighbor.id);
                 CommandOutcome::succeeded()
             }
             None => CommandOutcome::failed("no tracked neighbor in that direction".to_owned()),
@@ -1625,23 +1633,6 @@ fn is_muxe_running_command(running_command: &str) -> bool {
         .is_some_and(|name| name == "muxe")
         && first == "ui"
         && second == "menu"
-}
-
-/// Host pane ID for tracked geometry.
-fn host_pane_id(pane: PaneGeometry) -> PaneId {
-    if pane.is_plugin {
-        PaneId::Plugin(pane.id)
-    } else {
-        PaneId::Terminal(pane.id)
-    }
-}
-
-/// Geometry lookup for a host pane ID against the tracked inventory.
-fn to_geometry(pane: PaneId, inventory: &PaneInventory) -> Option<PaneGeometry> {
-    match pane {
-        PaneId::Terminal(id) => inventory.find(id, false),
-        PaneId::Plugin(id) => inventory.find(id, true),
-    }
 }
 
 #[cfg(test)]
@@ -1932,13 +1923,161 @@ mod tests {
     }
 
     #[test]
+    fn focus_keeps_pane_kind_tab_position_and_capture_lease_distinct() {
+        let (mut bridge, mut host) = boot();
+        let mut plugin = pane_info(7, 0, 0, 10, 10);
+        plugin.is_plugin = true;
+        bridge.update(
+            Event::PaneUpdate(manifest([
+                (0, vec![pane_info(99, 0, 0, 10, 10)]),
+                (4, vec![plugin, pane_info(7, 10, 0, 10, 10)]),
+            ])),
+            &mut host,
+        );
+        bridge.update(
+            Event::TabUpdate(vec![TabInfo {
+                position: 4,
+                tab_id: 0,
+                active: true,
+                ..Default::default()
+            }]),
+            &mut host,
+        );
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Plugin(7))),
+            &mut host,
+        );
+        let mut request_id = RequestId::INITIAL;
+        let mut send = |bridge: &mut Bridge, host: &mut FakeHost, payload| {
+            bridge.pipe(request_msg_with_id(request_id, payload), host);
+            request_id = request_id.next().unwrap();
+        };
+        send(
+            &mut bridge,
+            &mut host,
+            BridgeRequest::RequestOrigin {
+                ui_session: session("claim-plugin"),
+                request: ZellijOriginRequest {
+                    ui_pane: "plugin_7".to_owned(),
+                },
+            },
+        );
+        let (_, PipeEventKind::Response(BridgeResponse::OriginSnapshot { origin, .. })) =
+            host.last_event()
+        else {
+            panic!("current plugin claim must report an origin snapshot");
+        };
+        assert_eq!(
+            (origin.active_tab_index, origin.active_tab_id),
+            (Some(4), Some(0))
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
+        send(
+            &mut bridge,
+            &mut host,
+            BridgeRequest::BeginCapture {
+                lease: lease(80),
+                ui_session: session("ui-plugin"),
+            },
+        );
+        bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
+        let focus = |execution| BridgeRequest::Dispatch {
+            execution,
+            request: ZellijDispatchRequest::FocusPaneByIndex { index: 0 },
+        };
+        send(&mut bridge, &mut host, focus(exec(40)));
+        send(
+            &mut bridge,
+            &mut host,
+            BridgeRequest::EndCapture {
+                lease: lease(81),
+                reason: CaptureEndReason::UiDismissed,
+            },
+        );
+        send(&mut bridge, &mut host, focus(exec(41)));
+        send(
+            &mut bridge,
+            &mut host,
+            BridgeRequest::EndCapture {
+                lease: lease(80),
+                reason: CaptureEndReason::UiDismissed,
+            },
+        );
+        send(&mut bridge, &mut host, focus(exec(42)));
+        assert_eq!(
+            host.focused,
+            vec![PaneId::Terminal(7), PaneId::Terminal(7), PaneId::Plugin(7)]
+        );
+    }
+
+    #[test]
+    fn encoded_dismissal_waits_for_exact_pane_kind_and_preserves_malformed_inputs() {
+        let (mut bridge, mut host) = boot();
+        let mut plugin = pane_info(7, 0, 0, 10, 10);
+        plugin.is_plugin = true;
+        bridge.update(
+            Event::PaneUpdate(manifest([(0, vec![plugin, pane_info(7, 10, 0, 10, 10)])])),
+            &mut host,
+        );
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(7))),
+            &mut host,
+        );
+        let mut request_id = RequestId::INITIAL;
+        let mut send = |bridge: &mut Bridge, host: &mut FakeHost, payload| {
+            bridge.pipe(request_msg_with_id(request_id, payload), host);
+            request_id = request_id.next().unwrap();
+        };
+        let dismissal = |execution, ui: &str, origin: &str| BridgeRequest::Dispatch {
+            execution,
+            request: ZellijDispatchRequest::PostDismissalCreation {
+                ui_pane: ui.to_owned(),
+                origin_pane: origin.to_owned(),
+                command: RawNativeCommand::CloseFocus,
+            },
+        };
+        send(
+            &mut bridge,
+            &mut host,
+            dismissal(exec(50), "plugin_7", "terminal_7"),
+        );
+        assert!(matches!(host.last_event().1,
+            PipeEventKind::Response(BridgeResponse::DispatchAccepted { execution }) if execution == exec(50)));
+        bridge.update(
+            Event::PaneUpdate(manifest([(0, vec![pane_info(7, 10, 0, 10, 10)])])),
+            &mut host,
+        );
+        assert!(matches!(host.last_event().1,
+            PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, outcome })
+                if execution == exec(50) && outcome.status == muxe_zellij_protocol::CommandStatus::Succeeded));
+        send(
+            &mut bridge,
+            &mut host,
+            dismissal(exec(51), "malformed-ui", "7"),
+        );
+        assert!(matches!(host.last_event().1,
+            PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, outcome })
+                if execution == exec(51) && outcome.status == muxe_zellij_protocol::CommandStatus::Succeeded));
+        send(
+            &mut bridge,
+            &mut host,
+            dismissal(exec(52), "plugin_9", "malformed-origin"),
+        );
+        assert!(matches!(host.last_event().1,
+            PipeEventKind::Response(BridgeResponse::DispatchAccepted { execution }) if execution == exec(52)));
+        send(&mut bridge, &mut host, BridgeRequest::Retire);
+        assert!(host.events().iter().any(|(_, event)| matches!(event,
+            PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, outcome })
+                if *execution == exec(52) && outcome.status == muxe_zellij_protocol::CommandStatus::Failed)));
+    }
+
+    #[test]
     fn post_dismissal_creation_waits_for_missing_ui_and_restored_origin_focus() {
         let (mut bridge, mut host) = boot();
         bridge.inventory.set_manifest(BTreeMap::from([(
-            0,
+            TabPosition::from_host(0),
             vec![PaneGeometry {
-                id: 7,
-                is_plugin: false,
+                id: PaneId::Terminal(7),
                 x: 0,
                 y: 0,
                 columns: 80,
@@ -1953,8 +2092,8 @@ mod tests {
             RequestId::INITIAL,
             ChannelGeneration::INITIAL,
             exec(42),
-            "terminal_7".to_owned(),
-            "terminal_2".to_owned(),
+            Some(PaneId::Terminal(7)),
+            Some(PaneId::Terminal(2)),
             RawNativeCommand::CloseFocus,
             &mut host,
         );
@@ -1967,10 +2106,9 @@ mod tests {
         );
 
         bridge.inventory.set_manifest(BTreeMap::from([(
-            0,
+            TabPosition::from_host(0),
             vec![PaneGeometry {
-                id: 2,
-                is_plugin: false,
+                id: PaneId::Terminal(2),
                 x: 0,
                 y: 0,
                 columns: 80,
@@ -2271,13 +2409,13 @@ mod tests {
             &mut host,
         );
         assert!(host.modes.is_empty());
-        assert_eq!(bridge.capture_state(), (Some([11; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(11)), None));
         // First observation snapshots the true prior, then requests Locked.
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         assert_eq!(host.modes.as_slice(), [InputMode::Locked]);
         // Confirmation carries the exact observed prior, not a guess.
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([11; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(11))));
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
@@ -2329,21 +2467,21 @@ mod tests {
             ),
             &mut host,
         );
-        assert_eq!(bridge.capture_state(), (Some([62; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(62)), None));
         assert_eq!(
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal]
         );
 
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (Some([62; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(62)), None));
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         assert_eq!(
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal, InputMode::Locked]
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([62; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(62))));
     }
 
     #[test]
@@ -2380,17 +2518,17 @@ mod tests {
             ),
             &mut host,
         );
-        assert_eq!(bridge.capture_state(), (Some([72; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(72)), None));
 
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (Some([72; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(72)), None));
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         assert_eq!(
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal, InputMode::Locked]
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([72; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(72))));
     }
 
     #[test]
@@ -2415,9 +2553,9 @@ mod tests {
             &mut host,
         );
 
-        assert_eq!(bridge.capture_state(), (Some([31; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(31)), None));
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([31; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(31))));
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
@@ -2465,16 +2603,16 @@ mod tests {
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal]
         );
-        assert_eq!(bridge.capture_state(), (Some([42; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(42)), None));
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (Some([42; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(42)), None));
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         assert_eq!(
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal, InputMode::Locked]
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([42; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(42))));
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
@@ -2509,7 +2647,7 @@ mod tests {
             &mut host,
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([51; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(51))));
         // A new event subscription restores the active capture through the
         // shared guard, arming the barrier with the observed Normal prior.
         bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
@@ -2538,14 +2676,14 @@ mod tests {
             ),
             &mut host,
         );
-        assert_eq!(bridge.capture_state(), (Some([52; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(52)), None));
         assert_eq!(
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal]
         );
         // Stale Locked is ignored until the restore observation arrives.
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (Some([52; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(52)), None));
         assert_eq!(
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal]
@@ -2557,9 +2695,9 @@ mod tests {
             host.modes.as_slice(),
             [InputMode::Locked, InputMode::Normal, InputMode::Locked]
         );
-        assert_eq!(bridge.capture_state(), (Some([52; 16]), None));
+        assert_eq!(bridge.capture_state(), (Some(lease(52)), None));
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([52; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(52))));
         let (_, event) = host.last_event();
         assert!(matches!(
             event,
@@ -2732,7 +2870,7 @@ mod tests {
             &mut host,
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([12; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(12))));
         host.modes.clear();
         // User leaves Locked: dismissal, and no mode request restores Normal.
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Tab)), &mut host);
@@ -3548,7 +3686,7 @@ mod tests {
             &mut host,
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([12; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(12))));
         host.modes.clear();
         let outputs_before = host.outputs.len();
         // Two silent ticks, a renewal, then two more silent ticks: five ticks
@@ -3571,7 +3709,7 @@ mod tests {
             &mut host,
         );
         bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([12; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(12))));
         assert!(host.modes.is_empty(), "live renewal restores nothing");
         assert!(
             host.events()[outputs_before..]
@@ -3599,7 +3737,7 @@ mod tests {
             &mut host,
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([14; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(14))));
         host.modes.clear();
         let outputs_before = host.outputs.len();
         // Six ticks (twice the 3-tick window) with only a renewal between
@@ -3614,7 +3752,7 @@ mod tests {
             );
             next = next.next().expect("request IDs advance");
         }
-        assert_eq!(bridge.capture_state(), (None, Some([14; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(14))));
         assert!(
             host.modes.is_empty(),
             "idle-but-live broker restores nothing"
@@ -3645,7 +3783,7 @@ mod tests {
             &mut host,
         );
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Locked)), &mut host);
-        assert_eq!(bridge.capture_state(), (None, Some([15; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(15))));
         host.modes.clear();
         bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
         bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
@@ -3804,7 +3942,7 @@ mod tests {
         // The foreign renewal still releases the pipe (it was accepted), but
         // the active lease keeps its original deadline: three silent ticks
         // expire it.
-        assert_eq!(bridge.capture_state(), (None, Some([17; 16])));
+        assert_eq!(bridge.capture_state(), (None, Some(lease(17))));
         bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
         bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
         bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
