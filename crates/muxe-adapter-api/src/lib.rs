@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use muxe_core::{
     ActionValidation, ActionValidator, BindingId, ClientId, CompiledGeneration, ConfigDiagnostic,
     ContextResolutionError, ExecutionCapabilities, ExecutionId, NativeActionCandidate,
-    OriginContext, PaneId, PortableAction, PortableActionResolutionError, TabId, WorkspaceId,
+    OriginContext, PaneId, ResolvedPortableAction, TabId, WorkspaceId,
 };
 use muxe_protocol::AsOfTick;
 
@@ -410,30 +410,6 @@ impl ResolvedNativeAction {
     ) -> Result<Self, ContextResolutionError> {
         Ok(Self {
             candidate: candidate.resolve_context(origin)?,
-        })
-    }
-}
-
-/// An adapter-independent portable request after every scalar context reference has resolved and
-/// been concretely revalidated against the immutable origin.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedPortableAction {
-    pub action: PortableAction,
-}
-
-impl ResolvedPortableAction {
-    /// Resolves the portable action against the immutable origin.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying [`PortableActionResolutionError`] when the action
-    /// cannot resolve against the origin.
-    pub fn from_origin(
-        action: &PortableAction,
-        origin: &OriginContext,
-    ) -> Result<Self, PortableActionResolutionError> {
-        Ok(Self {
-            action: action.resolve_context(origin)?,
         })
     }
 }

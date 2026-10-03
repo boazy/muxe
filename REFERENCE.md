@@ -12,6 +12,10 @@ Muxe remembers which session, tab, and pane were active when you opened the menu
 
 Muxe rejects the configuration if a reference has a type that the parameter cannot use. Some saved values are optional and may be unavailable. If an optional value is unavailable when the binding runs, Muxe reports an error for that action and leaves the configuration loaded.
 
+References resolve once when the action runs, using the saved context. A focused creation retains those resolved values while waiting for the menu pane to close.
+
+`command:execute` preserves filesystem-path bytes when a saved path supplies its program, arguments, working directory, or environment values. Parameters that require UTF-8 text, including display labels and host JSON requests, reject a path that cannot be represented as UTF-8. A contextual tab index retains its full unsigned value; each adapter checks the range its host supports.
+
 ## Writing an action
 
 Write an action as a YAML mapping or as a compact string. The mapping form supports strings, lists, mappings, and `$context` references. The compact form accepts an action name followed by positional or `name=value` arguments.

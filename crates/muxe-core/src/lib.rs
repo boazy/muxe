@@ -18,12 +18,15 @@ mod session;
 mod theme;
 
 pub use action::{
-    ActionCategory, ActionConstraint, ActionKind, ActionParameterName, ActionParameterSchema,
-    ActionParameterType, ActionScalar, ActionSpec, CommandAction, ConfigAction,
-    ConstraintErrorLocation, ConstraintValidationPhase, CreateCommand, Direction, IndexOrDirection,
-    KeyboardAction, MenuAction, MenuTarget, NativeActionCandidate, OmittedParameterBehavior,
-    PaneAction, PortableAction, PortableActionKind, PortableActionResolutionError,
-    PortableActionSchema, SessionAction, TabAction,
+    AbsolutePath, ActionCategory, ActionConstraint, ActionKind, ActionParameterName,
+    ActionParameterSchema, ActionParameterType, ActionScalar, ActionSpec, CommandAction,
+    CommandCwd, CommandWord, ConfigAction, ConstraintErrorLocation, ConstraintValidationPhase,
+    CreateCommand, Direction, IndexOrDirection, KeyboardAction, MenuAction, MenuTarget,
+    NativeActionCandidate, OmittedParameterBehavior, PaneAction, PaneIndex, PortableAction,
+    PortableActionKind, PortableActionResolutionError, PortableActionSchema, ResizeAmount,
+    ResolvedCommandAction, ResolvedCreateCommand, ResolvedKeyboardAction, ResolvedPaneAction,
+    ResolvedPaneTarget, ResolvedPortableAction, ResolvedSessionAction, ResolvedTabAction,
+    ResolvedTabTarget, SessionAction, TabAction, TabIndex,
 };
 pub use condition::{
     ConditionEvaluationError, ConditionIr, ConditionProgram, PagesContext, evaluate_condition_ir,
@@ -37,7 +40,7 @@ pub use config::{
 pub use context::{
     AgentId, ClientId, ContextPath, ContextReference, ContextType, ContextValue, LinkHandlerId,
     OriginContext, OriginHostKind, OriginInvocationSource, OriginPaneType, PaneId, ServerId,
-    SessionId, TabId, WorkspaceId, WorktreeId,
+    SessionId, SessionName, TabId, WorkspaceId, WorktreeId,
 };
 pub use diagnostic::{
     ConfigDiagnostic, DiagnosticCode, DiagnosticLabel, DiagnosticSeverity, SourceId, SourceSpan,

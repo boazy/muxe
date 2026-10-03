@@ -212,6 +212,16 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
         "\nMuxe rejects the configuration if a reference has a type that the parameter cannot use. Some saved values are optional and may be unavailable. If an optional value is unavailable when the binding runs, Muxe reports an error for that action and leaves the configuration loaded."
     )
     .unwrap();
+    writeln!(
+        output,
+        "\nReferences resolve once when the action runs, using the saved context. A focused creation retains those resolved values while waiting for the menu pane to close."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "\n`command:execute` preserves filesystem-path bytes when a saved path supplies its program, arguments, working directory, or environment values. Parameters that require UTF-8 text, including display labels and host JSON requests, reject a path that cannot be represented as UTF-8. A contextual tab index retains its full unsigned value; each adapter checks the range its host supports."
+    )
+    .unwrap();
 
     writeln!(output, "\n## Writing an action\n").unwrap();
     writeln!(
@@ -301,6 +311,11 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
     writeln!(
         output,
         "\nUsing `alternate:` or `base:` requires alternate-key reporting. Setting `repeat` to either `true` or `false` requires key-event reporting. Lock modifiers on printable characters require all-keys-as-escape-codes mode."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "\nOn Herdr 0.8.2, Muxe rejects configurations enabling optional Kitty event types, alternate keys, or all-keys-as-escape-codes, as well as bindings that require them. The pinned encoder forwards only some event types and alternate identities; enhanced-key delivery through a live pane has not been verified. Herdr's default keyboard profile remains VT100."
     )
     .unwrap();
     writeln!(

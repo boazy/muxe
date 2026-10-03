@@ -16,7 +16,7 @@ use muxe_adapter_api::{
     AdapterError, AdapterErrorKind, AdapterHealthEvent, DispatchCompletion, HostAdapter,
     HostCallerIdentity, NativeCompatibilityOutcome, OriginCaptureRequest, OriginHintSource,
     PendingPaneRegistration, PortableDispatchRequest, PostDismissalPortableDispatchRequest,
-    ResolvedPortableAction, UiSessionId, UntrustedOriginHint,
+    UiSessionId, UntrustedOriginHint,
 };
 use muxe_adapter_herdr::{
     CommandPaneLaunch, CommandTabLaunch, FocusedPane, HerdrAdapter, HerdrResponse, HerdrRuntime,
@@ -24,9 +24,9 @@ use muxe_adapter_herdr::{
     open_command_pane, open_command_tab,
 };
 use muxe_core::{
-    ActionScalar, ActionValidator, ConfigValue, ConfigValueKind, CreateCommand, ExecutionId,
-    NativeActionCandidate, PaneAction, PaneId, PortableAction, SourceId, SourceSpan, TabAction,
-    TabId, WorkspaceId,
+    ActionValidator, CommandCwd, CommandWord, ConfigValue, Direction, ExecutionId,
+    NativeActionCandidate, PaneId, ResolvedCreateCommand, ResolvedPaneAction,
+    ResolvedPortableAction, ResolvedTabAction, SourceId, SourceSpan, TabId, WorkspaceId,
 };
 use serde_json::json;
 use support::{
@@ -110,12 +110,6 @@ fn lifecycle_capture_request() -> OriginCaptureRequest {
             cwd: Some("/ui/caller".into()),
         }),
     }
-}
-
-fn lifecycle_scalar(value: &str) -> ActionScalar {
-    ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-        value.to_owned(),
-    )))
 }
 
 async fn wait_for_lifecycle_requests(
@@ -695,14 +689,12 @@ async fn defers_focused_tab_creation_until_the_retained_ui_close_event() {
     adapter
         .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
             execution,
-            action: ResolvedPortableAction {
-                action: PortableAction::Tab(TabAction::Create {
-                    workspace_id: Some(lifecycle_scalar("workspace-1")),
-                    name: Some(lifecycle_scalar("logs")),
-                    focus: None,
-                    command: CreateCommand::default(),
-                }),
-            },
+            action: ResolvedPortableAction::Tab(ResolvedTabAction::Create {
+                workspace_id: Some(WorkspaceId::new("workspace-1")),
+                name: Some("logs".to_owned()),
+                focus: None,
+                command: ResolvedCreateCommand::default(),
+            }),
             origin,
             ui_pane: PaneId::new("pane-2"),
         })
@@ -860,13 +852,13 @@ async fn pane_close_dispatch_only_releases_matching_post_dismissal_requests() {
         .await
         .expect("second pane origin captures from the owned snapshot");
 
-    let action = |label| ResolvedPortableAction {
-        action: PortableAction::Tab(TabAction::Create {
-            workspace_id: Some(lifecycle_scalar("workspace-1")),
-            name: Some(lifecycle_scalar(label)),
+    let action = |label: &str| {
+        ResolvedPortableAction::Tab(ResolvedTabAction::Create {
+            workspace_id: Some(WorkspaceId::new("workspace-1")),
+            name: Some(label.to_owned()),
             focus: None,
-            command: CreateCommand::default(),
-        }),
+            command: ResolvedCreateCommand::default(),
+        })
     };
     let first_execution = ExecutionId(72);
     adapter
@@ -1022,13 +1014,11 @@ async fn deferred_preflight_failure_emits_one_retained_terminal() {
     adapter
         .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
             execution,
-            action: ResolvedPortableAction {
-                action: PortableAction::Pane(PaneAction::Split {
-                    direction: None,
-                    focus: None,
-                    command: CreateCommand::default(),
-                }),
-            },
+            action: ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
+                direction: None,
+                focus: None,
+                command: ResolvedCreateCommand::default(),
+            }),
             origin,
             ui_pane: PaneId::new("pane-2"),
         })
@@ -1104,18 +1094,16 @@ async fn reports_unknown_outcome_when_command_tab_layout_closes_after_flush() {
     adapter
         .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
             execution,
-            action: ResolvedPortableAction {
-                action: PortableAction::Tab(TabAction::Create {
-                    workspace_id: Some(lifecycle_scalar("workspace-1")),
-                    name: Some(lifecycle_scalar("logs")),
-                    focus: None,
-                    command: CreateCommand {
-                        program: Some(lifecycle_scalar("tool")),
-                        args: vec![lifecycle_scalar("--literal")],
-                        cwd: Some(lifecycle_scalar("/command")),
-                    },
-                }),
-            },
+            action: ResolvedPortableAction::Tab(ResolvedTabAction::Create {
+                workspace_id: Some(WorkspaceId::new("workspace-1")),
+                name: Some("logs".to_owned()),
+                focus: None,
+                command: ResolvedCreateCommand {
+                    program: Some(CommandWord::Text("tool".to_owned())),
+                    args: vec![CommandWord::Text("--literal".to_owned())],
+                    cwd: Some(CommandCwd::Literal("/command".into())),
+                },
+            }),
             origin,
             ui_pane: PaneId::new("pane-2"),
         })
@@ -1155,12 +1143,21 @@ async fn reports_unknown_outcome_when_command_tab_layout_closes_after_flush() {
     drop(fixture);
 }
 
+#[tokio::test]
+async fn reports_unknown_outcome_when_right_command_split_move_closes_and_cleanup_fails() {
+    command_split_move_lost_response(Direction::Right, "right").await;
+}
+
+#[tokio::test]
+async fn reports_unknown_outcome_when_down_command_split_move_closes_and_cleanup_fails() {
+    command_split_move_lost_response(Direction::Down, "down").await;
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one linear fault script: layout.apply, post-flush pane.move close, then rejected cleanup; the exchange order is the assertion"
 )]
-#[tokio::test]
-async fn reports_unknown_outcome_when_command_split_move_closes_and_cleanup_fails() {
+async fn command_split_move_lost_response(direction: Direction, wire_direction: &str) {
     let snapshot = lifecycle_snapshot();
     let mut script = ProductionConnectFixture::initial_handshake();
     script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
@@ -1198,7 +1195,7 @@ async fn reports_unknown_outcome_when_command_split_move_closes_and_cleanup_fail
                 "type": "tab",
                 "tab_id": "tab-1",
                 "target_pane_id": "pane-1",
-                "split": "right",
+                "split": wire_direction,
                 "ratio": 0.5,
             },
         }),
@@ -1232,17 +1229,15 @@ async fn reports_unknown_outcome_when_command_split_move_closes_and_cleanup_fail
     adapter
         .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
             execution,
-            action: ResolvedPortableAction {
-                action: PortableAction::Pane(PaneAction::Split {
-                    direction: Some(lifecycle_scalar("right")),
-                    focus: None,
-                    command: CreateCommand {
-                        program: Some(lifecycle_scalar("tool")),
-                        args: Vec::new(),
-                        cwd: Some(lifecycle_scalar("/command")),
-                    },
-                }),
-            },
+            action: ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
+                direction: Some(direction),
+                focus: None,
+                command: ResolvedCreateCommand {
+                    program: Some(CommandWord::Text("tool".to_owned())),
+                    args: Vec::new(),
+                    cwd: Some(CommandCwd::Literal("/command".into())),
+                },
+            }),
             origin,
             ui_pane: PaneId::new("pane-2"),
         })
@@ -2817,9 +2812,7 @@ async fn shutdown_interrupts_a_hung_inflight_dispatch_without_server_release() {
     adapter
         .dispatch_portable(PortableDispatchRequest {
             execution,
-            action: ResolvedPortableAction {
-                action: PortableAction::Pane(PaneAction::Close),
-            },
+            action: ResolvedPortableAction::Pane(ResolvedPaneAction::Close),
             origin,
         })
         .await
@@ -2867,9 +2860,7 @@ async fn suspend_interrupts_a_hung_inflight_dispatch_without_server_release() {
     adapter
         .dispatch_portable(PortableDispatchRequest {
             execution,
-            action: ResolvedPortableAction {
-                action: PortableAction::Pane(PaneAction::Close),
-            },
+            action: ResolvedPortableAction::Pane(ResolvedPaneAction::Close),
             origin,
         })
         .await
@@ -2981,9 +2972,7 @@ async fn shutdown_joins_queue_owner_and_settles_each_accepted_dispatch_once() {
         adapter
             .dispatch_portable(PortableDispatchRequest {
                 execution,
-                action: ResolvedPortableAction {
-                    action: PortableAction::Pane(PaneAction::Close),
-                },
+                action: ResolvedPortableAction::Pane(ResolvedPaneAction::Close),
                 origin: origin.clone(),
             })
             .await
@@ -3175,14 +3164,12 @@ async fn shutdown_leaves_no_host_bound_operation_reaching_the_recorded_server() 
     let post_dismissal = adapter
         .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
             execution: ExecutionId(7_310_001),
-            action: ResolvedPortableAction {
-                action: PortableAction::Tab(TabAction::Create {
-                    workspace_id: Some(lifecycle_scalar("workspace-1")),
-                    name: Some(lifecycle_scalar("logs")),
-                    focus: None,
-                    command: CreateCommand::default(),
-                }),
-            },
+            action: ResolvedPortableAction::Tab(ResolvedTabAction::Create {
+                workspace_id: Some(WorkspaceId::new("workspace-1")),
+                name: Some("logs".to_owned()),
+                focus: None,
+                command: ResolvedCreateCommand::default(),
+            }),
             origin,
             ui_pane: PaneId::new("pane-2"),
         })

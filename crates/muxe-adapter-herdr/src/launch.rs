@@ -20,7 +20,7 @@ pub enum UiSplitDirection {
 }
 
 impl UiSplitDirection {
-    fn wire(self) -> &'static str {
+    pub(crate) fn wire(self) -> &'static str {
         match self {
             Self::Right => "right",
             Self::Down => "down",

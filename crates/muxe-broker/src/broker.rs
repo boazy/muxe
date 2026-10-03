@@ -20,13 +20,13 @@ use muxe_adapter_api::{
     CaptureRequest, DispatchCompletion, HostAdapter, HostCallerIdentity,
     NativeCompatibilityIdentity, NativeCompatibilityOutcome, NativeCompatibilitySnapshot,
     OriginCaptureRequest, OriginHintSource, PendingPaneRegistration, PortableDispatchRequest,
-    PostDismissalPortableDispatchRequest, ResolvedNativeAction, ResolvedPortableAction,
-    UntrustedOriginHint,
+    PostDismissalPortableDispatchRequest, ResolvedNativeAction, UntrustedOriginHint,
 };
 use muxe_core::{
-    ActionSpec, BindingId as CoreBindingId, CommandAction, CompiledConfig, CompiledGeneration,
-    ConfigAction, ConfigDiagnostic, ExecutionId as CoreExecutionId, ExecutionPolicy, MenuAction,
-    PaneId, ResolvedAttachmentTheme, SourceId, SourceSpan, TabId, ThemeSelection, TimeoutAction,
+    ActionSpec, BindingId as CoreBindingId, CompiledConfig, CompiledGeneration, ConfigAction,
+    ConfigDiagnostic, ExecutionId as CoreExecutionId, ExecutionPolicy, MenuAction, PaneId,
+    ResolvedAttachmentTheme, ResolvedCommandAction, ResolvedPortableAction, SourceId, SourceSpan,
+    TabId, ThemeSelection, TimeoutAction,
 };
 use muxe_protocol::{
     AbortUiLaunch, AttachUi, BindingAvailability, BrokerEvent, BrokerResponse, ClientRequest,
@@ -3340,51 +3340,54 @@ impl Broker {
         let serial = self.next_execution.fetch_add(1, Ordering::Relaxed);
         let execution = Self::new_execution_id(serial);
         let core_execution = CoreExecutionId(serial);
-        if let ActionSpec::Portable(action) = &binding.action {
-            let action =
-                ResolvedPortableAction::from_origin(action, &origin).map_err(
-                    |error| match error {
-                        muxe_core::PortableActionResolutionError::Context(_) => {
-                            BrokerError::ContextUnavailable
-                        }
-                        muxe_core::PortableActionResolutionError::InvalidValue {
-                            parameter,
-                            message,
-                            ..
-                        } => BrokerError::PortableResolution { parameter, message },
-                    },
-                )?;
-            if requires_post_dismissal(&action.action) {
-                let ui_pane = {
-                    let sessions = self.sessions.lock().await;
-                    sessions
-                        .get(&request.session)
-                        .ok_or_else(|| BrokerError::UnknownSession(request.session.clone()))?
-                        .ui_pane
-                        .clone()
-                };
-                let deferred = PostDismissalPortableDispatchRequest {
-                    execution: core_execution,
-                    action,
-                    origin,
-                    ui_pane,
-                };
-                self.reserve_execution(
-                    request.session.clone(),
+        let resolved_action = match &binding.action {
+            ActionSpec::Portable(action) => Some(action.resolve_context(&origin).map_err(
+                |error| match error {
+                    muxe_core::PortableActionResolutionError::Context(_) => {
+                        BrokerError::ContextUnavailable
+                    }
+                    muxe_core::PortableActionResolutionError::InvalidValue {
+                        parameter,
+                        message,
+                        ..
+                    } => BrokerError::PortableResolution { parameter, message },
+                },
+            )?),
+            ActionSpec::Native(_) => None,
+        };
+        if resolved_action
+            .as_ref()
+            .is_some_and(requires_post_dismissal)
+        {
+            let ui_pane = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .get(&request.session)
+                    .ok_or_else(|| BrokerError::UnknownSession(request.session.clone()))?
+                    .ui_pane
+                    .clone()
+            };
+            let deferred = PostDismissalPortableDispatchRequest {
+                execution: core_execution,
+                action: resolved_action.expect("post-dismissal action is resolved"),
+                origin,
+                ui_pane,
+            };
+            self.reserve_execution(
+                request.session.clone(),
+                execution,
+                core_execution,
+                ExecutionOwner::Adapter,
+                Some(deferred),
+                &binding.settings.execution,
+            )
+            .await?;
+            return Ok(RequestResult::Immediate(
+                BrokerResponse::InvocationAccepted {
                     execution,
-                    core_execution,
-                    ExecutionOwner::Adapter,
-                    Some(deferred),
-                    &binding.settings.execution,
-                )
-                .await?;
-                return Ok(RequestResult::Immediate(
-                    BrokerResponse::InvocationAccepted {
-                        execution,
-                        disposition: InvocationDisposition::Dismissed,
-                    },
-                ));
-            }
+                    disposition: InvocationDisposition::Dismissed,
+                },
+            ));
         }
         let awaitable = binding.settings.execution.mode == muxe_core::ExecutionMode::Await;
         let accepted_capabilities = match binding.action {
@@ -3417,13 +3420,13 @@ impl Broker {
             ActionSpec::Portable(muxe_core::PortableAction::Menu(_)) => {
                 return Err(BrokerError::LocalMenuAction);
             }
-            ActionSpec::Portable(action) => match self
+            ActionSpec::Portable(_) => match self
                 .dispatch_portable(
                     &request.session,
                     execution,
                     core_execution,
                     origin,
-                    action,
+                    resolved_action.expect("portable action is resolved once before dispatch"),
                     &binding.settings.execution,
                 )
                 .await?
@@ -3540,33 +3543,14 @@ impl Broker {
         execution: ExecutionId,
         core_execution: CoreExecutionId,
         origin: muxe_core::OriginContext,
-        action: muxe_core::PortableAction,
+        action: ResolvedPortableAction,
         policy: &ExecutionPolicy,
     ) -> Result<
         std::ops::ControlFlow<RequestResult, Option<muxe_core::ExecutionCapabilities>>,
         BrokerError,
     > {
-        let command_cwd_from_context = matches!(
-            &action,
-            muxe_core::PortableAction::Command(command)
-                if command.cwd.as_ref().is_some_and(|cwd| matches!(
-                    &cwd.value.kind,
-                    muxe_core::ConfigValueKind::Context(_)
-                ))
-        );
-        let action =
-            ResolvedPortableAction::from_origin(&action, &origin).map_err(|error| match error {
-                muxe_core::PortableActionResolutionError::Context(_) => {
-                    BrokerError::ContextUnavailable
-                }
-                muxe_core::PortableActionResolutionError::InvalidValue {
-                    parameter,
-                    message,
-                    ..
-                } => BrokerError::PortableResolution { parameter, message },
-            })?;
-        match action.action {
-            muxe_core::PortableAction::Command(command) => {
+        match action {
+            ResolvedPortableAction::Command(command) => {
                 self.reserve_execution(
                     session.clone(),
                     execution,
@@ -3583,7 +3567,6 @@ impl Broker {
                         core: core_execution,
                         command,
                         origin,
-                        cwd_from_context: command_cwd_from_context,
                         policy: policy.clone(),
                     })
                     .await
@@ -3618,7 +3601,7 @@ impl Broker {
                     .adapter
                     .dispatch_portable(PortableDispatchRequest {
                         execution: core_execution,
-                        action: ResolvedPortableAction { action },
+                        action,
                         origin,
                     })
                     .await
@@ -3669,9 +3652,8 @@ impl Broker {
             command,
             origin,
             policy: _,
-            cwd_from_context,
         } = launch;
-        let program = command_string(&command.program, "command program")?;
+        let program = command.program.as_os_str();
         if program.is_empty() {
             return Err(BrokerError::GenericProcess(
                 "command program must not be empty".to_owned(),
@@ -3679,12 +3661,12 @@ impl Broker {
         }
         let mut child_command = Command::new(program);
         for argument in &command.args {
-            child_command.arg(command_string(argument, "command argument")?);
+            child_command.arg(argument.as_os_str());
         }
-        let cwd = resolve_command_cwd(&origin, command.cwd.as_ref(), cwd_from_context)?;
-        child_command.current_dir(cwd);
+        let cwd = resolve_command_cwd(&origin, command.cwd.as_ref())?;
+        child_command.current_dir(cwd.as_ref());
         for (name, value) in &command.env {
-            child_command.env(name, command_string(value, "command environment value")?);
+            child_command.env(name, value.as_os_str());
         }
         #[cfg(unix)]
         child_command.process_group(0);
@@ -3694,7 +3676,14 @@ impl Broker {
             .stderr(Stdio::null());
         let (cancellation, cancellation_rx) = watch::channel(None);
         let mut child = child_command.spawn().map_err(|error| {
-            BrokerError::GenericProcess(format!("could not spawn {program:?}: {error}"))
+            let message = match program.to_str() {
+                Some(text) => format!("could not spawn {text:?}: {error}"),
+                None => format!(
+                    "could not spawn OS path bytes {:?}: {error}",
+                    program.as_encoded_bytes()
+                ),
+            };
+            BrokerError::GenericProcess(message)
         })?;
         let Some(process_group) = child.id().and_then(|id| i32::try_from(id).ok()) else {
             let _ = child.start_kill();
@@ -4523,9 +4512,8 @@ pub(crate) struct CommandLaunch {
     pub(crate) session: UiSessionId,
     pub(crate) wire: ExecutionId,
     pub(crate) core: CoreExecutionId,
-    pub(crate) command: CommandAction,
+    pub(crate) command: ResolvedCommandAction,
     pub(crate) origin: muxe_core::OriginContext,
-    pub(crate) cwd_from_context: bool,
     pub(crate) policy: ExecutionPolicy,
 }
 
@@ -4799,51 +4787,34 @@ async fn finish_generic(
     .await;
 }
 
-fn requires_post_dismissal(action: &muxe_core::PortableAction) -> bool {
-    let (muxe_core::PortableAction::Tab(muxe_core::TabAction::Create { focus, .. })
-    | muxe_core::PortableAction::Pane(muxe_core::PaneAction::Split { focus, .. })) = action
+fn requires_post_dismissal(action: &ResolvedPortableAction) -> bool {
+    let (ResolvedPortableAction::Tab(muxe_core::ResolvedTabAction::Create { focus, .. })
+    | ResolvedPortableAction::Pane(muxe_core::ResolvedPaneAction::Split { focus, .. })) = action
     else {
         return false;
     };
-    focus
-        .as_ref()
-        .is_none_or(|focus| matches!(focus.value.kind, muxe_core::ConfigValueKind::Boolean(true)))
+    focus.unwrap_or(true)
 }
 
-fn command_string<'a>(
-    scalar: &'a muxe_core::ActionScalar,
-    parameter: &str,
-) -> Result<&'a str, BrokerError> {
-    scalar.value.as_str().ok_or_else(|| {
-        BrokerError::GenericProcess(format!("{parameter} must be a resolved string"))
-    })
-}
-
-fn resolve_command_cwd(
-    origin: &muxe_core::OriginContext,
-    configured: Option<&muxe_core::ActionScalar>,
-    configured_from_context: bool,
-) -> Result<std::path::PathBuf, BrokerError> {
+fn resolve_command_cwd<'a>(
+    origin: &'a muxe_core::OriginContext,
+    configured: Option<&'a muxe_core::CommandCwd>,
+) -> Result<std::borrow::Cow<'a, std::path::Path>, BrokerError> {
     let captured = || {
         origin
             .pane_cwd
-            .as_ref()
+            .as_deref()
             .filter(|cwd| cwd.is_absolute())
             .ok_or(BrokerError::ContextUnavailable)
     };
     match configured {
-        None => Ok(captured()?.clone()),
-        Some(value) => {
-            let configured = std::path::PathBuf::from(command_string(value, "command cwd")?);
-            if configured.is_absolute() {
-                Ok(configured)
-            } else if configured_from_context {
-                Err(BrokerError::GenericProcess(
-                    "origin-derived command cwd must resolve to an absolute path".to_owned(),
-                ))
-            } else {
-                Ok(captured()?.join(configured))
-            }
+        None => Ok(std::borrow::Cow::Borrowed(captured()?)),
+        Some(muxe_core::CommandCwd::Origin(path)) => Ok(std::borrow::Cow::Borrowed(path.as_path())),
+        Some(muxe_core::CommandCwd::Literal(path)) if path.is_absolute() => {
+            Ok(std::borrow::Cow::Borrowed(path))
+        }
+        Some(muxe_core::CommandCwd::Literal(path)) => {
+            Ok(std::borrow::Cow::Owned(captured()?.join(path)))
         }
     }
 }
@@ -4872,9 +4843,8 @@ mod tests {
         NativeDispatchRequest,
     };
     use muxe_core::{
-        ActionScalar, ActionValidation, ActionValidator, ConfigDiagnostic, ConfigValue,
-        ConfigValueKind, KeyCapabilities, OriginContext, OriginHostKind, OriginInvocationSource,
-        ServerId, SourceId,
+        ActionValidation, ActionValidator, ConfigDiagnostic, KeyCapabilities, OriginContext,
+        OriginHostKind, OriginInvocationSource, ServerId, SourceId,
     };
     use muxe_protocol::{BindingId, HostTabId, PeerRole};
     use tokio::sync::{Barrier, Notify, mpsc};
@@ -6464,16 +6434,13 @@ menus:
                 session,
                 wire,
                 core,
-                command: CommandAction {
-                    program: ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-                        "/usr/bin/true".to_owned(),
-                    ))),
+                command: ResolvedCommandAction {
+                    program: muxe_core::CommandWord::Text("/usr/bin/true".to_owned()),
                     args: Vec::new(),
                     cwd: None,
                     env: std::collections::BTreeMap::default(),
                 },
                 origin,
-                cwd_from_context: false,
                 policy: muxe_core::ExecutionPolicy {
                     mode: muxe_core::ExecutionMode::Await,
                     timeout: None,
@@ -8853,33 +8820,27 @@ menus:
     fn command_cwd_resolves_only_from_the_captured_origin() {
         let mut origin = CountingAdapter::origin_without_cwd();
         origin.pane_cwd = Some(PathBuf::from("/captured"));
-        let literal_relative = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-            "child".to_owned(),
-        )));
+        let literal_relative = muxe_core::CommandCwd::Literal(PathBuf::from("child"));
 
         assert_eq!(
-            resolve_command_cwd(&origin, None, false).expect("default uses captured cwd"),
+            resolve_command_cwd(&origin, None).expect("default uses captured cwd"),
             PathBuf::from("/captured")
         );
         assert_eq!(
-            resolve_command_cwd(&origin, Some(&literal_relative), false)
+            resolve_command_cwd(&origin, Some(&literal_relative))
                 .expect("literal relative cwd joins captured cwd"),
             PathBuf::from("/captured/child")
         );
-        assert!(matches!(
-            resolve_command_cwd(&origin, Some(&literal_relative), true),
-            Err(BrokerError::GenericProcess(_))
-        ));
 
         let missing = CountingAdapter::origin_without_cwd();
         assert!(matches!(
-            resolve_command_cwd(&missing, None, false),
+            resolve_command_cwd(&missing, None),
             Err(BrokerError::ContextUnavailable)
         ));
         let mut relative = CountingAdapter::origin_without_cwd();
         relative.pane_cwd = Some(PathBuf::from("not-absolute"));
         assert!(matches!(
-            resolve_command_cwd(&relative, Some(&literal_relative), false),
+            resolve_command_cwd(&relative, Some(&literal_relative)),
             Err(BrokerError::ContextUnavailable)
         ));
     }
@@ -8912,16 +8873,13 @@ menus:
                 session: UiSessionId::new("generic-test"),
                 wire: ExecutionId([7; 16]),
                 core: CoreExecutionId(7),
-                command: muxe_core::CommandAction {
-                    program: ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-                        "/usr/bin/true".to_owned(),
-                    ))),
+                command: ResolvedCommandAction {
+                    program: muxe_core::CommandWord::Text("/usr/bin/true".to_owned()),
                     args: Vec::new(),
                     cwd: None,
                     env: std::collections::BTreeMap::default(),
                 },
                 origin,
-                cwd_from_context: false,
                 policy: muxe_core::ExecutionPolicy {
                     mode: muxe_core::ExecutionMode::Detach,
                     timeout: None,
@@ -9234,24 +9192,21 @@ menus:
             .expect("cancel-policy generic execution reserves");
         let mut origin = CountingAdapter::origin_without_cwd();
         origin.pane_cwd = Some(directory.path().to_path_buf());
-        let script_arg = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-            script.to_string_lossy().into_owned(),
-        )));
+        let script_arg = muxe_core::CommandWord::Path(
+            muxe_core::AbsolutePath::new(script).expect("absolute fixture script"),
+        );
         broker
             .execute_command(CommandLaunch {
                 session: session.clone(),
                 wire,
                 core,
-                command: CommandAction {
-                    program: ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-                        "/bin/sh".to_owned(),
-                    ))),
+                command: ResolvedCommandAction {
+                    program: muxe_core::CommandWord::Text("/bin/sh".to_owned()),
                     args: vec![script_arg],
                     cwd: None,
                     env: std::collections::BTreeMap::default(),
                 },
                 origin,
-                cwd_from_context: false,
                 policy: muxe_core::ExecutionPolicy {
                     mode: muxe_core::ExecutionMode::Await,
                     timeout: None,

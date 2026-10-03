@@ -19,6 +19,12 @@ macro_rules! opaque_id {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
+
+            /// Consumes the identity at a textual serialization boundary.
+            #[must_use]
+            pub fn into_string(self) -> String {
+                self.0
+            }
         }
 
         impl fmt::Display for $name {
@@ -32,20 +38,16 @@ macro_rules! opaque_id {
 opaque_id!(ServerId, "Opaque live-host server identity.");
 opaque_id!(ClientId, "Opaque host client identity.");
 opaque_id!(SessionId, "Opaque host session identity.");
+opaque_id!(
+    SessionName,
+    "Session lookup or rename name, distinct from a captured session ID."
+);
 opaque_id!(WorkspaceId, "Opaque host workspace identity.");
 opaque_id!(TabId, "Opaque host tab identity.");
 opaque_id!(PaneId, "Opaque host pane identity.");
 opaque_id!(WorktreeId, "Opaque host worktree identity.");
 opaque_id!(AgentId, "Opaque host agent identity.");
 opaque_id!(LinkHandlerId, "Opaque host link-handler identity.");
-
-impl ClientId {
-    /// Consumes the identity's owned storage at a serialization boundary.
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
 
 #[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
 #[strum(serialize_all = "lowercase")]

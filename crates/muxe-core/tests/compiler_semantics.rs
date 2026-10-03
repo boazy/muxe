@@ -1284,17 +1284,6 @@ fn portable_main_action<'a>(
 }
 
 #[test]
-fn available_portable_context_values_resolve_for_each_action_kind() {
-    let config = portable_context_config();
-    let origin = origin_with_context_values();
-    for key in ["c", "k", "p", "s", "t", "w"] {
-        portable_main_action(&config, key)
-            .resolve_context(&origin)
-            .expect("available context must resolve and pass concrete validation");
-    }
-}
-
-#[test]
 fn command_context_values_preserve_source_and_revalidate_cwd() {
     let config = portable_context_config();
     let action = portable_main_action(&config, "c");
@@ -1308,21 +1297,27 @@ fn command_context_values_preserve_source_and_revalidate_cwd() {
     assert_eq!(unresolved.program.value.span.source.as_str(), "config.yml");
 
     let origin = origin_with_context_values();
-    let muxe_core::PortableAction::Command(command) = action
+    let muxe_core::ResolvedPortableAction::Command(command) = action
         .resolve_context(&origin)
         .expect("command context should resolve")
     else {
         panic!("expected resolved command");
     };
-    assert_eq!(command.program.value.as_str(), Some("selected text"));
-    assert_eq!(command.args[0].value.as_str(), Some("selected text"));
     assert_eq!(
-        command.cwd.expect("configured cwd").value.as_str(),
-        Some("/tmp/project")
+        command.program,
+        muxe_core::CommandWord::Text("selected text".to_owned())
     );
     assert_eq!(
-        command.env["SELECTED"].value.as_str(),
-        Some("selected text")
+        command.args[0],
+        muxe_core::CommandWord::Text("selected text".to_owned())
+    );
+    assert_eq!(
+        command.cwd.expect("configured cwd").as_path(),
+        std::path::Path::new("/tmp/project")
+    );
+    assert_eq!(
+        command.env["SELECTED"],
+        muxe_core::CommandWord::Text("selected text".to_owned())
     );
 
     let relative_cwd_origin = muxe_core::OriginContext {
@@ -1343,21 +1338,18 @@ fn tab_and_keyboard_context_values_revalidate_to_their_declared_types() {
     let config = portable_context_config();
     let origin = origin_with_context_values();
     let tab_action = portable_main_action(&config, "t");
-    let muxe_core::PortableAction::Tab(muxe_core::TabAction::Focus(
-        muxe_core::IndexOrDirection::Index(index),
+    let muxe_core::ResolvedPortableAction::Tab(muxe_core::ResolvedTabAction::Focus(
+        muxe_core::ResolvedTabTarget::Index(index),
     )) = tab_action
         .resolve_context(&origin)
         .expect("tab index context resolves")
     else {
         panic!("expected resolved tab index");
     };
-    assert!(matches!(
-        index.value.kind,
-        muxe_core::ConfigValueKind::Integer(4)
-    ));
+    assert_eq!(index.get(), 4);
 
     let create_action = portable_main_action(&config, "w");
-    let muxe_core::PortableAction::Tab(muxe_core::TabAction::Create {
+    let muxe_core::ResolvedPortableAction::Tab(muxe_core::ResolvedTabAction::Create {
         workspace_id: Some(workspace_id),
         ..
     }) = create_action
@@ -1366,16 +1358,25 @@ fn tab_and_keyboard_context_values_revalidate_to_their_declared_types() {
     else {
         panic!("expected resolved workspace-targeted tab create");
     };
-    assert_eq!(workspace_id.value.as_str(), Some("workspace"));
+    assert_eq!(workspace_id.as_str(), "workspace");
 
     let key_action = portable_main_action(&config, "q");
     let key_origin = muxe_core::OriginContext {
         selection_text: Some("ctrl+c".to_owned()),
         ..origin.clone()
     };
-    key_action
+    let muxe_core::ResolvedPortableAction::Keyboard(muxe_core::ResolvedKeyboardAction::SendKeys(
+        keys,
+    )) = key_action
         .resolve_context(&key_origin)
-        .expect("resolved keyboard key must revalidate");
+        .expect("resolved keyboard key must revalidate")
+    else {
+        panic!("expected resolved keys");
+    };
+    assert_eq!(
+        keys,
+        [muxe_core::CanonicalKey::parse("ctrl+c").expect("fixture key")]
+    );
     let invalid_key_origin = muxe_core::OriginContext {
         selection_text: Some("not-a-canonical-key".to_owned()),
         ..origin
@@ -1397,6 +1398,89 @@ fn missing_context_value_fails_resolution() {
         portable_main_action(&config, "c").resolve_context(&unavailable),
         Err(muxe_core::PortableActionResolutionError::Context(_))
     ));
+}
+
+#[test]
+fn context_tab_index_preserves_the_full_unsigned_range() {
+    let config = portable_context_config();
+    let origin = muxe_core::OriginContext {
+        tab_index: Some(u64::MAX),
+        ..origin_with_context_values()
+    };
+    let muxe_core::ResolvedPortableAction::Tab(muxe_core::ResolvedTabAction::Focus(
+        muxe_core::ResolvedTabTarget::Index(index),
+    )) = portable_main_action(&config, "t")
+        .resolve_context(&origin)
+        .expect("unsigned context index")
+    else {
+        panic!("expected positional tab target");
+    };
+    assert_eq!(index.get(), u64::MAX);
+    let muxe_core::ResolvedPortableAction::Pane(muxe_core::ResolvedPaneAction::Resize {
+        amount: Some(muxe_core::ResizeAmount::Unsigned(amount)),
+        ..
+    }) = portable_main_action(&config, "p")
+        .resolve_context(&origin)
+        .expect("unsigned amount")
+    else {
+        panic!("expected unsigned resize amount");
+    };
+    assert_eq!(amount, u64::MAX);
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_context_retains_non_utf8_command_paths_and_rejects_text_projection() {
+    use std::os::unix::ffi::OsStringExt;
+    let config = compile(
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      c:
+        label: path command
+        action:
+          type: command:execute
+          program: { $context: origin.worktree.path }
+          args: [{ $context: origin.pane.cwd }]
+          cwd: { $context: origin.pane.cwd }
+          env: { PATH_VALUE: { $context: origin.worktree.path } }
+      t:
+        label: path label
+        action: tab:create name=$origin.pane.cwd
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect("filesystem context config");
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/muxe-\xff".to_vec()));
+    let origin = muxe_core::OriginContext {
+        pane_cwd: Some(path.clone()),
+        worktree_path: Some(path.clone()),
+        ..origin_with_context_values()
+    };
+    let muxe_core::ResolvedPortableAction::Command(command) = portable_main_action(&config, "c")
+        .resolve_context(&origin)
+        .expect("OS path context")
+    else {
+        panic!("expected command");
+    };
+    assert_eq!(command.program.as_os_str(), path.as_os_str());
+    assert_eq!(command.args[0].as_os_str(), path.as_os_str());
+    assert_eq!(command.cwd.expect("cwd").as_path(), path.as_path());
+    assert_eq!(command.env["PATH_VALUE"].as_os_str(), path.as_os_str());
+    let error = portable_main_action(&config, "t")
+        .resolve_context(&origin)
+        .expect_err("a label requires UTF-8");
+    let muxe_core::PortableActionResolutionError::InvalidValue {
+        parameter, span, ..
+    } = error
+    else {
+        panic!("expected text projection error");
+    };
+    assert_eq!(parameter, "tab.name");
+    assert_eq!(span.source.as_str(), "config.yml");
 }
 
 #[expect(

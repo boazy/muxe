@@ -4082,16 +4082,12 @@ impl HostAdapter for ZellijAdapter {
         let incarnation = self.require_current_origin(&request.origin)?;
         #[cfg(test)]
         self.pause_after_origin_validation().await;
-        match creation_requires_post_dismissal(&request.action.action) {
-            Ok(true) => {
-                return Err(invalid_request(
-                    "focused creation must use post-dismissal dispatch after the Muxe UI closes",
-                ));
-            }
-            Ok(false) => {}
-            Err(error) => return Err(invalid_request(error.to_string())),
+        if creation_requires_post_dismissal(&request.action) {
+            return Err(invalid_request(
+                "focused creation must use post-dismissal dispatch after the Muxe UI closes",
+            ));
         }
-        match map_portable(&request.action.action, &request.origin) {
+        match map_portable(&request.action, &request.origin) {
             Ok(PortableMapping::BrokerOwned) => Err(invalid_request(
                 "broker-owned portable action must not reach the host adapter",
             )),
@@ -4141,14 +4137,15 @@ impl HostAdapter for ZellijAdapter {
         let incarnation = self.require_current_origin(&request.origin)?;
         #[cfg(test)]
         self.pause_after_origin_validation().await;
-        let raw = map_post_dismissal_creation(&request.action.action, &request.origin).map_err(
-            |error| match error {
-                PortableError::Incompatible { reason, .. } => {
-                    AdapterError::new(AdapterErrorKind::Incompatible, reason)
+        let raw =
+            map_post_dismissal_creation(&request.action, &request.origin).map_err(|error| {
+                match error {
+                    PortableError::Incompatible { reason, .. } => {
+                        AdapterError::new(AdapterErrorKind::Incompatible, reason)
+                    }
+                    error => invalid_request(error.to_string()),
                 }
-                error => invalid_request(error.to_string()),
-            },
-        )?;
+            })?;
         ValidatedNativeCommand::try_from(raw.clone()).map_err(|error| {
             AdapterError::new(AdapterErrorKind::InvalidRequest, error.to_string())
         })?;
@@ -8546,7 +8543,7 @@ done
         // Consumer proof: closing the origin pane closes the PRIOR pane, not
         // the Muxe UI that now holds focus.
         let PortableMapping::HostAction { commands } = map_portable(
-            &muxe_core::PortableAction::Pane(muxe_core::PaneAction::Close),
+            &muxe_core::ResolvedPortableAction::Pane(muxe_core::ResolvedPaneAction::Close),
             &origin,
         )
         .expect("pane close maps") else {

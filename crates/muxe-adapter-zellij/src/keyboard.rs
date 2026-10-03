@@ -1,11 +1,8 @@
 //! Finite canonical-key mapping for `keyboard:send`.
 //!
-//! Canonical keys arrive as strings (`ctrl+c`, `F1`, `pgdn`, `a`, …) per
-//! `muxe-core/src/key.rs`: optional `alternate:`/`base:` source prefixes,
-//! `+`-joined modifiers from `ctrl, alt, shift, super, hyper, meta, caps-lock,
-//! num-lock`, and an identity (single graphic char, `unicode+hex`, named key,
-//! `f1`-`f35`, or `keypad+…`). This module maps the finite subset with exact
-//! pinned representations into `(BareKey, modifiers, bytes)`:
+//! Canonical keys arrive already parsed by core into identity, source, and
+//! modifiers. This module maps the finite subset with exact pinned
+//! representations into `(BareKey, modifiers, bytes)`:
 //!
 //! - Text identities map to their UTF-8 bytes with `BareKey::Char`.
 //! - `ctrl` + ASCII letter (with optional `shift`, per core's
@@ -31,6 +28,7 @@
 
 use std::collections::BTreeSet;
 
+use muxe_core::{CanonicalKey, KeyIdentity, KeyIdentitySource, Modifiers, NamedKey};
 use muxe_zellij_protocol::generated::raw::{BareKey, KeyModifier};
 use thiserror::Error;
 
@@ -58,136 +56,78 @@ pub struct MappedKey {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Modifier {
-    Ctrl,
-    Alt,
-    Shift,
-    Super,
-}
-
-fn parse_modifiers(parts: &[&str]) -> Result<(Vec<Modifier>, BTreeSet<KeyModifier>), &'static str> {
-    let mut ordered = Vec::new();
-    let mut set = BTreeSet::new();
-    for part in parts {
-        let modifier = match *part {
-            "ctrl" => Modifier::Ctrl,
-            "alt" => Modifier::Alt,
-            "shift" => Modifier::Shift,
-            "super" => Modifier::Super,
-            _ => {
-                return Err(
-                    "unknown modifier; hyper, meta, caps-lock, and num-lock have no pinned KeyModifier",
-                );
-            }
-        };
-        if !set.insert(match modifier {
-            Modifier::Ctrl => KeyModifier::Ctrl,
-            Modifier::Alt => KeyModifier::Alt,
-            Modifier::Shift => KeyModifier::Shift,
-            Modifier::Super => KeyModifier::Super,
-        }) {
-            return Err("duplicate modifier");
-        }
-        ordered.push(modifier);
-    }
-    Ok((ordered, set))
-}
-
-fn has(modifiers: &[Modifier], target: Modifier) -> bool {
-    modifiers.contains(&target)
-}
-
-/// Maps one canonical key string to its pinned representation.
+/// Maps one parsed canonical key to its pinned representation.
 ///
 /// Alternate/base-layout sources need alternate-keys support, which stock
 /// Zellij cannot provide; they fail precisely rather than silently degrading.
-pub fn map_canonical_key(key: &str) -> Result<MappedKey, KeyboardError> {
+pub fn map_canonical_key(key: &CanonicalKey) -> Result<MappedKey, KeyboardError> {
     let unsupported = |reason: &'static str| KeyboardError::Unsupported {
-        key: key.to_owned(),
+        key: key.to_string(),
         reason,
     };
-    let (identity, modifiers) = split_key(key).map_err(unsupported)?;
-    if identity.starts_with("alternate:") || identity.starts_with("base:") {
+    if key.source != KeyIdentitySource::Primary {
         return Err(unsupported(
             "alternate/base-layout identities need alternate-keys support, unavailable on Zellij",
         ));
     }
-    let (ordered, set) = parse_modifiers(&modifiers).map_err(unsupported)?;
-    // unicode+hex identities carry exact text.
-    if let Some(codepoint) = identity.strip_prefix("unicode+") {
-        let scalar = u32::from_str_radix(codepoint, 16)
-            .ok()
-            .and_then(char::from_u32)
-            .ok_or(unsupported("invalid unicode+hex identity"))?;
-        return map_text_key(&set, &ordered, scalar, key, unsupported);
-    }
-    if identity.chars().count() == 1 {
-        let character = identity.chars().next().expect("count checked");
-        if !character.is_control() {
-            return map_text_key(&set, &ordered, character, key, unsupported);
-        }
+    let modifiers = key.modifiers;
+    if [
+        Modifiers::HYPER,
+        Modifiers::META,
+        Modifiers::CAPS_LOCK,
+        Modifiers::NUM_LOCK,
+    ]
+    .into_iter()
+    .any(|flag| modifiers.contains(flag))
+    {
         return Err(unsupported(
-            "control characters must use named or ctrl+ identities",
+            "unknown modifier; hyper, meta, caps-lock, and num-lock have no pinned KeyModifier",
         ));
     }
-    map_named_key(&set, &ordered, identity, unsupported)
-}
-
-fn split_key(key: &str) -> Result<(&str, Vec<&str>), &'static str> {
-    // Split trailing identity from leading modifiers. unicode+/keypad+ markers
-    // bind to the identity, never to a modifier boundary.
-    for marker in ["unicode+", "keypad+"] {
-        if let Some(start) = key.rfind(marker) {
-            let (modifiers, identity) = key.split_at(start);
-            let modifiers = modifiers.strip_suffix('+').unwrap_or(modifiers);
-            let parts = if modifiers.is_empty() {
-                Vec::new()
-            } else {
-                modifiers.split('+').collect()
-            };
-            if parts.iter().any(|part| part.is_empty()) {
-                return Err("empty modifier segment");
-            }
-            return Ok((identity, parts));
+    let mut set = BTreeSet::new();
+    for (flag, modifier) in [
+        (Modifiers::CTRL, KeyModifier::Ctrl),
+        (Modifiers::ALT, KeyModifier::Alt),
+        (Modifiers::SHIFT, KeyModifier::Shift),
+        (Modifiers::SUPER, KeyModifier::Super),
+    ] {
+        if modifiers.contains(flag) {
+            set.insert(modifier);
         }
     }
-    match key.rsplit_once('+') {
-        Some((modifiers, identity)) if !identity.contains('+') && !modifiers.is_empty() => {
-            Ok((identity, modifiers.split('+').collect()))
-        }
-        _ => Ok((key, Vec::new())),
+    match &key.identity {
+        KeyIdentity::Text(character) => map_text_key(set, modifiers, *character, unsupported),
+        KeyIdentity::Named(identity) => map_named_key(set, modifiers, *identity, unsupported),
     }
 }
 
 fn map_text_key(
-    set: &BTreeSet<KeyModifier>,
-    ordered: &[Modifier],
+    mut modifiers: BTreeSet<KeyModifier>,
+    flags: Modifiers,
     character: char,
-    _key: &str,
     unsupported: impl Fn(&'static str) -> KeyboardError,
 ) -> Result<MappedKey, KeyboardError> {
     // Shift on an ASCII letter folds into the uppercase identity.
     let (bare_char, shift_folded) = match character {
-        'a'..='z' if has(ordered, Modifier::Shift) => (character.to_ascii_uppercase(), true),
+        'a'..='z' if flags.contains(Modifiers::SHIFT) => (character.to_ascii_uppercase(), true),
         _ => (character, false),
     };
-    let mut modifiers = set.clone();
     if shift_folded {
         modifiers.remove(&KeyModifier::Shift);
     }
-    let remaining: Vec<Modifier> = ordered
-        .iter()
-        .copied()
-        .filter(|modifier| *modifier != Modifier::Shift || !shift_folded)
-        .collect();
-    match remaining.as_slice() {
-        [] => Ok(MappedKey {
+    let remaining = (
+        flags.contains(Modifiers::SHIFT) && !shift_folded,
+        flags.contains(Modifiers::ALT),
+        flags.contains(Modifiers::CTRL),
+        flags.contains(Modifiers::SUPER),
+    );
+    match remaining {
+        (false, false, false, false) => Ok(MappedKey {
             bare: BareKey::Char(bare_char),
             modifiers,
             bytes: bare_char.to_string().into_bytes(),
         }),
-        [Modifier::Ctrl] => {
+        (false, false, true, false) => {
             let byte = control_byte(bare_char).ok_or_else(|| {
                 unsupported("ctrl maps only ASCII letters and [ to C0 control bytes")
             })?;
@@ -197,16 +137,17 @@ fn map_text_key(
                 bytes: vec![byte],
             })
         }
-        [Modifier::Alt] => {
-            let mut bytes = vec![0x1b];
-            bytes.extend_from_slice(bare_char.to_string().as_bytes());
+        (false, true, false, false) => {
+            let mut bytes = Vec::with_capacity(1 + bare_char.len_utf8());
+            bytes.push(0x1b);
+            bytes.extend_from_slice(bare_char.encode_utf8(&mut [0; 4]).as_bytes());
             Ok(MappedKey {
                 bare: BareKey::Char(bare_char),
                 modifiers,
                 bytes,
             })
         }
-        [Modifier::Ctrl, Modifier::Shift] | [Modifier::Shift, Modifier::Ctrl] => {
+        (true, false, true, false) => {
             let byte = control_byte(bare_char).ok_or_else(|| {
                 unsupported("ctrl+shift maps only ASCII letters to C0 control bytes")
             })?;
@@ -266,75 +207,75 @@ fn csi_modified_sequence(sequence: &[u8], code: u8) -> Option<Vec<u8>> {
     Some(modified)
 }
 fn map_named_key(
-    set: &BTreeSet<KeyModifier>,
-    ordered: &[Modifier],
-    identity: &str,
+    set: BTreeSet<KeyModifier>,
+    modifiers: Modifiers,
+    identity: NamedKey,
     unsupported: impl Fn(&'static str) -> KeyboardError,
 ) -> Result<MappedKey, KeyboardError> {
     let (bare, sequence) = named_sequence(identity).ok_or_else(|| {
         unsupported("keypad, media, modifier, and F13+ identities have no pinned representation")
     })?;
-    if ordered.is_empty() {
+    if modifiers == Modifiers::empty() {
         return Ok(MappedKey {
             bare,
-            modifiers: set.clone(),
+            modifiers: set,
             bytes: sequence,
         });
     }
-    let code = csi_modifier_code(ordered).ok_or_else(|| {
+    let code = csi_modifier_code(modifiers).ok_or_else(|| {
         unsupported("only ctrl, alt, and shift combine with special keys via CSI 1;<modifier>")
     })?;
     let bytes = csi_modified_sequence(&sequence, code)
         .ok_or_else(|| unsupported("this special key has no CSI-modifiable sequence"))?;
     Ok(MappedKey {
         bare,
-        modifiers: set.clone(),
+        modifiers: set,
         bytes,
     })
 }
 
 /// Pinned identity plus standard bare sequence for named specials.
-fn named_sequence(identity: &str) -> Option<(BareKey, Vec<u8>)> {
+fn named_sequence(identity: NamedKey) -> Option<(BareKey, Vec<u8>)> {
     let sequence = match identity {
-        "esc" => (BareKey::Esc, vec![0x1b]),
-        "enter" => (BareKey::Enter, vec![0x0d]),
-        "tab" => (BareKey::Tab, vec![0x09]),
-        "backspace" => (BareKey::Backspace, vec![0x08]),
-        "left" => (BareKey::Left, b"\x1b[D".to_vec()),
-        "right" => (BareKey::Right, b"\x1b[C".to_vec()),
-        "up" => (BareKey::Up, b"\x1b[A".to_vec()),
-        "down" => (BareKey::Down, b"\x1b[B".to_vec()),
-        "home" => (BareKey::Home, b"\x1b[H".to_vec()),
-        "end" => (BareKey::End, b"\x1b[F".to_vec()),
-        "insert" => (BareKey::Insert, b"\x1b[2~".to_vec()),
-        "delete" => (BareKey::Delete, b"\x1b[3~".to_vec()),
-        "pgup" => (BareKey::PageUp, b"\x1b[5~".to_vec()),
-        "pgdn" => (BareKey::PageDown, b"\x1b[6~".to_vec()),
-        "f1" => (BareKey::F(1), b"\x1bOP".to_vec()),
-        "f2" => (BareKey::F(2), b"\x1bOQ".to_vec()),
-        "f3" => (BareKey::F(3), b"\x1bOR".to_vec()),
-        "f4" => (BareKey::F(4), b"\x1bOS".to_vec()),
-        "f5" => (BareKey::F(5), b"\x1b[15~".to_vec()),
-        "f6" => (BareKey::F(6), b"\x1b[17~".to_vec()),
-        "f7" => (BareKey::F(7), b"\x1b[18~".to_vec()),
-        "f8" => (BareKey::F(8), b"\x1b[19~".to_vec()),
-        "f9" => (BareKey::F(9), b"\x1b[20~".to_vec()),
-        "f10" => (BareKey::F(10), b"\x1b[21~".to_vec()),
-        "f11" => (BareKey::F(11), b"\x1b[23~".to_vec()),
-        "f12" => (BareKey::F(12), b"\x1b[24~".to_vec()),
+        NamedKey::Escape => (BareKey::Esc, vec![0x1b]),
+        NamedKey::Enter => (BareKey::Enter, vec![0x0d]),
+        NamedKey::Tab => (BareKey::Tab, vec![0x09]),
+        NamedKey::Backspace => (BareKey::Backspace, vec![0x08]),
+        NamedKey::Left => (BareKey::Left, b"\x1b[D".to_vec()),
+        NamedKey::Right => (BareKey::Right, b"\x1b[C".to_vec()),
+        NamedKey::Up => (BareKey::Up, b"\x1b[A".to_vec()),
+        NamedKey::Down => (BareKey::Down, b"\x1b[B".to_vec()),
+        NamedKey::Home => (BareKey::Home, b"\x1b[H".to_vec()),
+        NamedKey::End => (BareKey::End, b"\x1b[F".to_vec()),
+        NamedKey::Insert => (BareKey::Insert, b"\x1b[2~".to_vec()),
+        NamedKey::Delete => (BareKey::Delete, b"\x1b[3~".to_vec()),
+        NamedKey::PageUp => (BareKey::PageUp, b"\x1b[5~".to_vec()),
+        NamedKey::PageDown => (BareKey::PageDown, b"\x1b[6~".to_vec()),
+        NamedKey::Function(1) => (BareKey::F(1), b"\x1bOP".to_vec()),
+        NamedKey::Function(2) => (BareKey::F(2), b"\x1bOQ".to_vec()),
+        NamedKey::Function(3) => (BareKey::F(3), b"\x1bOR".to_vec()),
+        NamedKey::Function(4) => (BareKey::F(4), b"\x1bOS".to_vec()),
+        NamedKey::Function(5) => (BareKey::F(5), b"\x1b[15~".to_vec()),
+        NamedKey::Function(6) => (BareKey::F(6), b"\x1b[17~".to_vec()),
+        NamedKey::Function(7) => (BareKey::F(7), b"\x1b[18~".to_vec()),
+        NamedKey::Function(8) => (BareKey::F(8), b"\x1b[19~".to_vec()),
+        NamedKey::Function(9) => (BareKey::F(9), b"\x1b[20~".to_vec()),
+        NamedKey::Function(10) => (BareKey::F(10), b"\x1b[21~".to_vec()),
+        NamedKey::Function(11) => (BareKey::F(11), b"\x1b[23~".to_vec()),
+        NamedKey::Function(12) => (BareKey::F(12), b"\x1b[24~".to_vec()),
         _ => return None,
     };
     Some(sequence)
 }
 
 /// CSI `1;<modifier>` code for modified specials.
-fn csi_modifier_code(ordered: &[Modifier]) -> Option<u8> {
+fn csi_modifier_code(modifiers: Modifiers) -> Option<u8> {
     let (shift, alt, ctrl) = (
-        has(ordered, Modifier::Shift),
-        has(ordered, Modifier::Alt),
-        has(ordered, Modifier::Ctrl),
+        modifiers.contains(Modifiers::SHIFT),
+        modifiers.contains(Modifiers::ALT),
+        modifiers.contains(Modifiers::CTRL),
     );
-    if has(ordered, Modifier::Super) {
+    if modifiers.contains(Modifiers::SUPER) {
         return None;
     }
     match (shift, alt, ctrl) {
@@ -353,24 +294,28 @@ fn csi_modifier_code(ordered: &[Modifier]) -> Option<u8> {
 mod tests {
     use super::*;
 
+    fn map_input(input: &str) -> Result<MappedKey, KeyboardError> {
+        map_canonical_key(&CanonicalKey::parse(input).expect("valid canonical input"))
+    }
+
     #[test]
     fn text_ctrl_alt_and_shift_fold_map() {
-        let key = map_canonical_key("a").expect("text maps");
+        let key = map_input("a").expect("text maps");
         assert_eq!(key.bare, BareKey::Char('a'));
         assert!(key.modifiers.is_empty());
         assert_eq!(key.bytes, b"a");
 
-        let key = map_canonical_key("ctrl+c").expect("ctrl maps to C0");
+        let key = map_input("ctrl+c").expect("ctrl maps to C0");
         assert_eq!(key.bytes, vec![0x03]);
         assert!(key.modifiers.contains(&KeyModifier::Ctrl));
 
-        let key = map_canonical_key("ctrl+shift+c").expect("ctrl+shift keeps C0");
+        let key = map_input("ctrl+shift+c").expect("ctrl+shift keeps C0");
         assert_eq!(key.bytes, vec![0x03]);
 
-        let key = map_canonical_key("alt+x").expect("alt prefixes ESC");
+        let key = map_input("alt+x").expect("alt prefixes ESC");
         assert_eq!(key.bytes, b"\x1bx".to_vec());
 
-        let key = map_canonical_key("shift+a").expect("shift folds into uppercase");
+        let key = map_input("shift+a").expect("shift folds into uppercase");
         assert_eq!(key.bare, BareKey::Char('A'));
         assert_eq!(key.bytes, b"A");
     }
@@ -384,37 +329,37 @@ mod tests {
             ("tab", 0x09),
             ("backspace", 0x08),
         ] {
-            let mapped = map_canonical_key(key).expect("legacy key maps");
+            let mapped = map_input(key).expect("legacy key maps");
             assert_eq!(mapped.bytes, vec![byte], "{key}");
         }
-        let mapped = map_canonical_key("ctrl+[").expect("ctrl+[ maps");
+        let mapped = map_input("ctrl+[").expect("ctrl+[ maps");
         assert_eq!(mapped.bytes, vec![0x1b]);
     }
 
     #[test]
     fn bare_specials_carry_standard_sequences() {
-        let key = map_canonical_key("up").expect("arrow maps");
+        let key = map_input("up").expect("arrow maps");
         assert_eq!(key.bare, BareKey::Up);
         assert_eq!(key.bytes, b"\x1b[A");
 
-        let key = map_canonical_key("f1").expect("F1 maps");
+        let key = map_input("f1").expect("F1 maps");
         assert_eq!(key.bare, BareKey::F(1));
         assert_eq!(key.bytes, b"\x1bOP");
 
-        let key = map_canonical_key("pgdn").expect("pgdn maps");
+        let key = map_input("pgdn").expect("pgdn maps");
         assert_eq!(key.bytes, b"\x1b[6~");
     }
 
     #[test]
     fn modified_specials_use_csi_modifier_codes() {
-        let key = map_canonical_key("ctrl+up").expect("ctrl+arrow maps");
+        let key = map_input("ctrl+up").expect("ctrl+arrow maps");
         assert_eq!(key.bytes, b"\x1b[1;5A");
         assert!(key.modifiers.contains(&KeyModifier::Ctrl));
 
-        let key = map_canonical_key("shift+f1").expect("shift+F1 maps");
+        let key = map_input("shift+f1").expect("shift+F1 maps");
         assert_eq!(key.bytes, b"\x1b[1;2P".as_slice());
 
-        let key = map_canonical_key("ctrl+f1").expect("ctrl+F1 maps");
+        let key = map_input("ctrl+f1").expect("ctrl+F1 maps");
         assert_eq!(key.bytes, b"\x1b[1;5P".as_slice());
     }
 
@@ -433,13 +378,13 @@ mod tests {
             "alternate:a",
             "super+up",
         ] {
-            assert!(map_canonical_key(key).is_err(), "{key} must fail precisely");
+            assert!(map_input(key).is_err(), "{key} must fail precisely");
         }
     }
 
     #[test]
     fn unicode_text_maps_by_value() {
-        let key = map_canonical_key("unicode+1f642").expect("emoji maps");
+        let key = map_input("unicode+1f642").expect("emoji maps");
         assert_eq!(key.bare, BareKey::Char('🙂'));
         assert_eq!(key.bytes, "🙂".as_bytes());
     }

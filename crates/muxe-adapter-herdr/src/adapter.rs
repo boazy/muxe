@@ -21,8 +21,10 @@ use muxe_adapter_api::{
 };
 use muxe_core::{
     ActionScalar, ActionValidation, ActionValidator, ConfigDiagnostic, ConfigValueKind,
-    ContextType, DiagnosticCode, ExecutionCapabilities, NativeActionCandidate, PaneAction,
-    PortableAction, TabAction,
+    ContextType, DiagnosticCode, Direction, ExecutionCapabilities, NativeActionCandidate,
+    PaneAction, PortableAction, ResizeAmount, ResolvedCreateCommand, ResolvedKeyboardAction,
+    ResolvedPaneAction, ResolvedPaneTarget, ResolvedPortableAction, ResolvedTabAction,
+    ResolvedTabTarget, TabAction,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -1225,14 +1227,14 @@ impl HerdrAdapter {
         request: &PostDismissalPortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
         let authority = self.require_current_origin(&request.origin)?;
-        if creation_has_program(&request.action.action) {
+        if creation_has_program(&request.action) {
             return self.dispatch_command_creation(
                 request.execution,
-                &request.action.action,
+                &request.action,
                 &request.origin,
             );
         }
-        let invocation = portable_invocation(&request.action.action, &request.origin)?;
+        let invocation = portable_invocation(&request.action, &request.origin)?;
         self.dispatch(authority, request.execution, invocation)
     }
 
@@ -1243,7 +1245,7 @@ impl HerdrAdapter {
     fn dispatch_command_creation(
         &self,
         execution: muxe_core::ExecutionId,
-        action: &PortableAction,
+        action: &ResolvedPortableAction,
         origin: &muxe_core::OriginContext,
     ) -> Result<DispatchAccepted, AdapterError> {
         let authority = self.require_current_origin(origin)?;
@@ -1548,18 +1550,15 @@ fn portable_compile_validation(
     }
 }
 
-fn command_creation_methods(action: &PortableAction) -> Option<&'static [&'static str]> {
-    match action {
-        PortableAction::Tab(TabAction::Create { command, .. }) if command.program.is_some() => {
-            Some(&["layout.apply"])
-        }
-        PortableAction::Pane(PaneAction::Split {
-            direction: Some(direction),
-            command,
-            ..
-        }) if command.program.is_some() && split_direction_is_supported(direction) => {
-            Some(&["session.snapshot", "layout.apply", "pane.move", "tab.close"])
-        }
+fn command_creation_methods(
+    action: impl Into<PortableRequestKind>,
+) -> Option<&'static [&'static str]> {
+    match action.into() {
+        PortableRequestKind::TabCreate { command: true } => Some(&["layout.apply"]),
+        PortableRequestKind::PaneSplit {
+            direction: Some(true),
+            command: true,
+        } => Some(&["session.snapshot", "layout.apply", "pane.move", "tab.close"]),
         _ => None,
     }
 }
@@ -1880,8 +1879,8 @@ fn converted_literal_probe(
         PortableScalarKind::Bool => scalar_bool_value(scalar).map(Value::Bool),
         PortableScalarKind::Index => scalar_index_value(scalar).map(|index| Value::Number(index.into())),
         PortableScalarKind::Number => scalar_number_value(scalar).and_then(number_to_json),
-        PortableScalarKind::SplitDirection => scalar_split_direction_value(scalar).map(Value::String),
-        PortableScalarKind::PaneDirection => scalar_pane_direction_value(scalar).map(Value::String),
+        PortableScalarKind::SplitDirection => scalar_split_direction_value(scalar).map(|direction| Value::String(direction.wire().to_owned())),
+        PortableScalarKind::PaneDirection => scalar_pane_direction_value(scalar).map(|direction| Value::String(direction.as_str().to_owned())),
         PortableScalarKind::Keys => {
             Err(format!("portable action supplies an invalid value for parameter {field_name:?}: keys convert as a list, not a scalar"))
         }
@@ -2361,29 +2360,26 @@ impl HostAdapter for HerdrAdapter {
         request: PortableDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
         let authority = self.require_current_origin(&request.origin)?;
-        if let PortableAction::Tab(TabAction::Swap(muxe_core::IndexOrDirection::Index(index))) =
-            &request.action.action
+        if let ResolvedPortableAction::Tab(ResolvedTabAction::Swap(ResolvedTabTarget::Index(
+            index,
+        ))) = &request.action
         {
-            return self.dispatch_tab_swap(
-                request.execution,
-                &request.origin,
-                scalar_index(index)?,
-            );
+            return self.dispatch_tab_swap(request.execution, &request.origin, index.get());
         }
-        if creation_requires_post_dismissal(&request.action.action)? {
+        if creation_requires_post_dismissal(&request.action) {
             return Err(AdapterError::new(
                 AdapterErrorKind::InvalidRequest,
                 "focused creation must use post-dismissal dispatch after the Muxe UI closes",
             ));
         }
-        if creation_has_program(&request.action.action) {
+        if creation_has_program(&request.action) {
             return self.dispatch_command_creation(
                 request.execution,
-                &request.action.action,
+                &request.action,
                 &request.origin,
             );
         }
-        let invocation = portable_invocation(&request.action.action, &request.origin)?;
+        let invocation = portable_invocation(&request.action, &request.origin)?;
         self.dispatch(authority, request.execution, invocation)
     }
 
@@ -3129,7 +3125,7 @@ struct Invocation {
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
 fn portable_invocation(
-    action: &PortableAction,
+    action: &ResolvedPortableAction,
     origin: &muxe_core::OriginContext,
 ) -> Result<Invocation, AdapterError> {
     let description = portable_request_description(action)
@@ -3159,67 +3155,32 @@ fn portable_invocation(
     Ok(invocation)
 }
 
-/// Builds the dispatch-time invocation from the shared request description plus the
-/// concrete config scalars. The field list (method and parameter names) comes only from
-/// the description; this function only converts each field's runtime value.
+/// Builds the dispatch-time invocation from the shared description and typed IR.
+/// The description excludes command-bearing creations and unsupported directions.
 #[expect(
     clippy::result_large_err,
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
 fn build_portable_invocation(
     description: &PortableRequestDescription,
-    action: &PortableAction,
-    origin: &muxe_core::OriginContext,
-) -> Result<Invocation, AdapterError> {
-    // The direction diagnostic outranks the command-lifecycle diagnostic: a split without a
-    // direction reports the missing direction even when it also carries a program.
-    if let PortableAction::Pane(PaneAction::Split {
-        direction: None, ..
-    }) = action
-    {
-        return Err(incompatible(
-            "Herdr pane.split requires an explicit right or down direction",
-        ));
-    }
-    if creation_has_program(action) {
-        // Command-bearing creations never reach the single-request builder: dispatch routes
-        // them through the ordered dismiss-and-dispatch lifecycle with its helper RPCs.
-        let message = match action {
-            PortableAction::Tab(TabAction::Create { .. }) => {
-                "Herdr command-bearing tab:create requires the ordered dismiss-and-dispatch lifecycle"
-            }
-            _ => {
-                "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle"
-            }
-        };
-        return Err(incompatible(message));
-    }
-    single_request_invocation(description, action, origin)
-}
-
-/// Builds one single-request invocation from the shared description. Callers guarantee the
-/// action carries no command program and, for splits, a direction; every remaining arm
-/// converts exactly the described fields.
-#[expect(
-    clippy::result_large_err,
-    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
-)]
-fn single_request_invocation(
-    description: &PortableRequestDescription,
-    action: &PortableAction,
+    action: &ResolvedPortableAction,
     origin: &muxe_core::OriginContext,
 ) -> Result<Invocation, AdapterError> {
     let pane = origin_pane(origin)?;
     match action {
-        PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(keys)) => Ok(Invocation {
-            method: description.method,
-            params: json!({ "pane_id": pane, "keys": keys.iter().map(scalar_string).collect::<Result<Vec<_>, _>>()? }),
-        }),
-        PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(text)) => Ok(Invocation {
-            method: description.method,
-            params: json!({ "pane_id": pane, "text": scalar_string(text)? }),
-        }),
-        PortableAction::Tab(TabAction::Create {
+        ResolvedPortableAction::Keyboard(ResolvedKeyboardAction::SendKeys(keys)) => {
+            Ok(Invocation {
+                method: description.method,
+                params: json!({ "pane_id": pane, "keys": keys.iter().map(muxe_core::CanonicalKey::canonical_string).collect::<Vec<_>>() }),
+            })
+        }
+        ResolvedPortableAction::Keyboard(ResolvedKeyboardAction::SendText(text)) => {
+            Ok(Invocation {
+                method: description.method,
+                params: json!({ "pane_id": pane, "text": text }),
+            })
+        }
+        ResolvedPortableAction::Tab(ResolvedTabAction::Create {
             workspace_id,
             name,
             focus,
@@ -3227,30 +3188,32 @@ fn single_request_invocation(
         }) => Ok(Invocation {
             method: description.method,
             params: json!({
-                "workspace_id": workspace_id.as_ref().map(scalar_string).transpose()?,
-                "label": name.as_ref().map(scalar_string).transpose()?,
-                "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
-                "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+                "workspace_id": workspace_id.as_ref().map(muxe_core::WorkspaceId::as_str),
+                "label": name,
+                "focus": focus.unwrap_or(true),
+                "cwd": command.cwd.as_ref().map(|cwd| json_path(cwd.as_path(), "tab.cwd")).transpose()?,
             }),
         }),
-        PortableAction::Tab(TabAction::Close) => Ok(Invocation {
+        ResolvedPortableAction::Tab(ResolvedTabAction::Close) => Ok(Invocation {
             method: description.method,
             params: json!({ "tab_id": origin_tab(origin)? }),
         }),
-        PortableAction::Tab(TabAction::Rename { name: Some(label) }) => Ok(Invocation {
-            method: description.method,
-            params: json!({ "tab_id": origin_tab(origin)?, "label": scalar_string(label)? }),
-        }),
-        PortableAction::Tab(TabAction::Move(muxe_core::IndexOrDirection::Index(index))) => {
+        ResolvedPortableAction::Tab(ResolvedTabAction::Rename { name: Some(label) }) => {
             Ok(Invocation {
                 method: description.method,
-                params: json!({ "tab_id": origin_tab(origin)?, "insert_index": scalar_index(index)? }),
+                params: json!({ "tab_id": origin_tab(origin)?, "label": label }),
             })
         }
-        PortableAction::Pane(PaneAction::Create) => Err(incompatible(
+        ResolvedPortableAction::Tab(ResolvedTabAction::Move(ResolvedTabTarget::Index(index))) => {
+            Ok(Invocation {
+                method: description.method,
+                params: json!({ "tab_id": origin_tab(origin)?, "insert_index": index.get() }),
+            })
+        }
+        ResolvedPortableAction::Pane(ResolvedPaneAction::Create) => Err(incompatible(
             "Herdr has no pane.create method; pane.split requires an explicit direction",
         )),
-        PortableAction::Pane(PaneAction::Split {
+        ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
             direction: Some(direction),
             focus,
             command,
@@ -3258,29 +3221,31 @@ fn single_request_invocation(
             method: description.method,
             params: json!({
                 "target_pane_id": pane,
-                "direction": scalar_split_direction(direction)?,
-                "focus": focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
-                "cwd": command.cwd.as_ref().map(scalar_string).transpose()?,
+                "direction": split_direction(*direction).map_err(direction_request_error)?.wire(),
+                "focus": focus.unwrap_or(true),
+                "cwd": command.cwd.as_ref().map(|cwd| json_path(cwd.as_path(), "pane.cwd")).transpose()?,
             }),
         }),
-        PortableAction::Pane(PaneAction::Close) => Ok(Invocation {
+        ResolvedPortableAction::Pane(ResolvedPaneAction::Close) => Ok(Invocation {
             method: description.method,
             params: json!({ "pane_id": pane }),
         }),
-        PortableAction::Pane(
-            PaneAction::Focus(muxe_core::IndexOrDirection::Direction(direction))
-            | PaneAction::Swap(muxe_core::IndexOrDirection::Direction(direction)),
+        ResolvedPortableAction::Pane(
+            ResolvedPaneAction::Focus(ResolvedPaneTarget::Direction(direction))
+            | ResolvedPaneAction::Swap(ResolvedPaneTarget::Direction(direction)),
         ) => Ok(Invocation {
             method: description.method,
-            params: json!({ "pane_id": pane, "direction": scalar_pane_direction(direction)? }),
+            params: json!({ "pane_id": pane, "direction": HerdrPaneDirection::try_from(*direction).map_err(direction_request_error)?.as_str() }),
         }),
-        PortableAction::Pane(PaneAction::Resize { direction, amount }) => Ok(Invocation {
+        ResolvedPortableAction::Pane(ResolvedPaneAction::Resize { direction, amount }) => {
+            Ok(Invocation {
+                method: description.method,
+                params: json!({ "pane_id": pane, "direction": HerdrPaneDirection::try_from(*direction).map_err(direction_request_error)?.as_str(), "amount": amount.as_ref().map(resize_number).transpose()? }),
+            })
+        }
+        ResolvedPortableAction::Pane(ResolvedPaneAction::Zoom { enabled }) => Ok(Invocation {
             method: description.method,
-            params: json!({ "pane_id": pane, "direction": scalar_pane_direction(direction)?, "amount": amount.as_ref().map(scalar_number).transpose()? }),
-        }),
-        PortableAction::Pane(PaneAction::Zoom { enabled }) => Ok(Invocation {
-            method: description.method,
-            params: json!({ "pane_id": pane, "mode": enabled.as_ref().map(scalar_bool).transpose()?.map_or("toggle", |value| if value { "on" } else { "off" }) }),
+            params: json!({ "pane_id": pane, "mode": enabled.map_or("toggle", |value| if value { "on" } else { "off" }) }),
         }),
         _ => Err(AdapterError::new(
             AdapterErrorKind::Incompatible,
@@ -3297,9 +3262,8 @@ fn single_request_invocation(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PortableRequestDescription {
     method: &'static str,
-    /// Fields the action always emits. Origin-derived values (pane/tab ids) are marked
-    /// `Origin` so load-time checks know they resolve to concrete host strings at dispatch;
-    /// unresolved context references stay marked `Unresolved` with their declared type.
+    /// Fields the action always emits. `Origin` marks captured host identity fields;
+    /// config-backed fields are checked against the schema before origin resolution.
     fields: &'static [PortableRequestField],
 }
 
@@ -3310,10 +3274,9 @@ struct PortableRequestField {
     origin: PortableValueOrigin,
 }
 
-/// Where one emitted field's value comes from. Concrete scalars resolve at dispatch to the
-/// adapter's checked scalar conversion; `Origin` fields resolve to captured host identity
-/// strings; `Unresolved` fields are context references whose declared type must be accepted
-/// by the schema's parameter type/domain.
+/// Where one emitted field's value comes from. Config literals face the adapter's
+/// conversion and the schema domain. Deferred markers face their declared type;
+/// execution values arrive through the resolved IR, never through config scalars.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PortableValueOrigin {
     /// A config scalar converted by the named adapter scalar check. A literal faces full
@@ -3327,7 +3290,7 @@ enum PortableValueOrigin {
     Default(PortableScalarKind),
 }
 
-/// The adapter scalar conversion one literal field passes through at dispatch.
+/// The adapter conversion used to probe a configured literal's wire value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PortableScalarKind {
     String,
@@ -3338,6 +3301,149 @@ enum PortableScalarKind {
     PaneDirection,
     Keys,
 }
+/// Shape-only projection shared by config validation and the resolved execution IR.
+/// It never reconstructs config values; values stay owned by their source domain.
+enum PortableRequestKind {
+    BrokerOwned,
+    SendKeys,
+    SendText,
+    TabCreate {
+        command: bool,
+    },
+    TabClose,
+    TabRename {
+        named: bool,
+    },
+    TabFocus,
+    TabMove {
+        index: bool,
+    },
+    TabSwap {
+        index: bool,
+    },
+    PaneCreate,
+    PaneSplit {
+        direction: Option<bool>,
+        command: bool,
+    },
+    PaneClose,
+    PaneFocus {
+        cardinal: bool,
+    },
+    PaneMove,
+    PaneSwap {
+        cardinal: bool,
+    },
+    PaneResize,
+    PaneZoom,
+    PaneFullscreen,
+    PaneFloating,
+    PaneFrame,
+    Session,
+}
+
+impl From<&PortableAction> for PortableRequestKind {
+    fn from(action: &PortableAction) -> Self {
+        match action {
+            PortableAction::Menu(_) | PortableAction::Config(_) | PortableAction::Command(_) => {
+                Self::BrokerOwned
+            }
+            PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(_)) => Self::SendKeys,
+            PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(_)) => Self::SendText,
+            PortableAction::Tab(TabAction::Create { command, .. }) => Self::TabCreate {
+                command: command.program.is_some(),
+            },
+            PortableAction::Tab(TabAction::Close) => Self::TabClose,
+            PortableAction::Tab(TabAction::Rename { name }) => Self::TabRename {
+                named: name.is_some(),
+            },
+            PortableAction::Tab(TabAction::Focus(_)) => Self::TabFocus,
+            PortableAction::Tab(TabAction::Move(target)) => Self::TabMove {
+                index: target_is_index(target),
+            },
+            PortableAction::Tab(TabAction::Swap(target)) => Self::TabSwap {
+                index: target_is_index(target),
+            },
+            PortableAction::Pane(PaneAction::Create) => Self::PaneCreate,
+            PortableAction::Pane(PaneAction::Split {
+                direction, command, ..
+            }) => Self::PaneSplit {
+                direction: direction.as_ref().map(split_direction_is_supported),
+                command: command.program.is_some(),
+            },
+            PortableAction::Pane(PaneAction::Close) => Self::PaneClose,
+            PortableAction::Pane(PaneAction::Focus(target)) => Self::PaneFocus {
+                cardinal: target_is_cardinal_direction(target),
+            },
+            PortableAction::Pane(PaneAction::Move(_)) => Self::PaneMove,
+            PortableAction::Pane(PaneAction::Swap(target)) => Self::PaneSwap {
+                cardinal: target_is_cardinal_direction(target),
+            },
+            PortableAction::Pane(PaneAction::Resize { .. }) => Self::PaneResize,
+            PortableAction::Pane(PaneAction::Zoom { .. }) => Self::PaneZoom,
+            PortableAction::Pane(PaneAction::Fullscreen { .. }) => Self::PaneFullscreen,
+            PortableAction::Pane(PaneAction::Floating { .. }) => Self::PaneFloating,
+            PortableAction::Pane(PaneAction::Frame { .. }) => Self::PaneFrame,
+            PortableAction::Session(_) => Self::Session,
+        }
+    }
+}
+
+impl From<&ResolvedPortableAction> for PortableRequestKind {
+    fn from(action: &ResolvedPortableAction) -> Self {
+        let cardinal = |target: &ResolvedPaneTarget| {
+            matches!(target,
+            ResolvedPaneTarget::Direction(direction) if HerdrPaneDirection::try_from(*direction).is_ok())
+        };
+        match action {
+            ResolvedPortableAction::Menu(_)
+            | ResolvedPortableAction::Config(_)
+            | ResolvedPortableAction::Command(_) => Self::BrokerOwned,
+            ResolvedPortableAction::Keyboard(ResolvedKeyboardAction::SendKeys(_)) => Self::SendKeys,
+            ResolvedPortableAction::Keyboard(ResolvedKeyboardAction::SendText(_)) => Self::SendText,
+            ResolvedPortableAction::Tab(ResolvedTabAction::Create { command, .. }) => {
+                Self::TabCreate {
+                    command: command.program.is_some(),
+                }
+            }
+            ResolvedPortableAction::Tab(ResolvedTabAction::Close) => Self::TabClose,
+            ResolvedPortableAction::Tab(ResolvedTabAction::Rename { name }) => Self::TabRename {
+                named: name.is_some(),
+            },
+            ResolvedPortableAction::Tab(ResolvedTabAction::Focus(_)) => Self::TabFocus,
+            ResolvedPortableAction::Tab(ResolvedTabAction::Move(target)) => Self::TabMove {
+                index: matches!(target, ResolvedTabTarget::Index(_)),
+            },
+            ResolvedPortableAction::Tab(ResolvedTabAction::Swap(target)) => Self::TabSwap {
+                index: matches!(target, ResolvedTabTarget::Index(_)),
+            },
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Create) => Self::PaneCreate,
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
+                direction, command, ..
+            }) => Self::PaneSplit {
+                direction: direction.map(|direction| split_direction(direction).is_ok()),
+                command: command.program.is_some(),
+            },
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Close) => Self::PaneClose,
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Focus(target)) => Self::PaneFocus {
+                cardinal: cardinal(target),
+            },
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Move(_)) => Self::PaneMove,
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Swap(target)) => Self::PaneSwap {
+                cardinal: cardinal(target),
+            },
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Resize { .. }) => Self::PaneResize,
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Zoom { .. }) => Self::PaneZoom,
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Fullscreen { .. }) => {
+                Self::PaneFullscreen
+            }
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Floating { .. }) => Self::PaneFloating,
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Frame { .. }) => Self::PaneFrame,
+            ResolvedPortableAction::Session(_) => Self::Session,
+        }
+    }
+}
+
 /// Derives the single emitted-request description for one portable action, or reports the
 /// same unsupported-form diagnostic the dispatch builder reports. Optional config scalars
 /// that stay absent still emit their builder default, so they appear as `Default` fields;
@@ -3348,28 +3454,28 @@ enum PortableScalarKind {
     reason = "The explicit action-to-request table is the validation and dispatch contract."
 )]
 fn portable_request_description(
-    action: &PortableAction,
+    action: impl Into<PortableRequestKind>,
 ) -> Result<Option<PortableRequestDescription>, String> {
     use PortableScalarKind as Scalar;
     use PortableValueOrigin as Origin;
-    let description = match action {
-        PortableAction::Menu(_) | PortableAction::Config(_) | PortableAction::Command(_) => return Ok(None),
-        PortableAction::Keyboard(muxe_core::KeyboardAction::SendKeys(_)) => PortableRequestDescription {
+    let description = match action.into() {
+        PortableRequestKind::BrokerOwned | PortableRequestKind::TabSwap { index: true } => return Ok(None),
+        PortableRequestKind::SendKeys => PortableRequestDescription {
             method: "pane.send_keys",
             fields: &[
                 PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
                 PortableRequestField { name: "keys", origin: Origin::Literal(Scalar::Keys) },
             ],
         },
-        PortableAction::Keyboard(muxe_core::KeyboardAction::SendText(_)) => PortableRequestDescription {
+        PortableRequestKind::SendText => PortableRequestDescription {
             method: "pane.send_text",
             fields: &[
                 PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
                 PortableRequestField { name: "text", origin: Origin::Literal(Scalar::String) },
             ],
         },
-        PortableAction::Tab(TabAction::Create { command, .. }) => {
-            if command.program.is_some() {
+        PortableRequestKind::TabCreate { command } => {
+            if command {
                 return Ok(None);
             }
             PortableRequestDescription {
@@ -3382,43 +3488,40 @@ fn portable_request_description(
                 ],
             }
         }
-        PortableAction::Tab(TabAction::Close) => PortableRequestDescription {
+        PortableRequestKind::TabClose => PortableRequestDescription {
             method: "tab.close",
             fields: &[PortableRequestField { name: "tab_id", origin: Origin::Origin(ContextType::TabId) }],
         },
-        PortableAction::Tab(TabAction::Rename { name: Some(_) }) => PortableRequestDescription {
+        PortableRequestKind::TabRename { named: true } => PortableRequestDescription {
             method: "tab.rename",
             fields: &[
                 PortableRequestField { name: "tab_id", origin: Origin::Origin(ContextType::TabId) },
                 PortableRequestField { name: "label", origin: Origin::Literal(Scalar::String) },
             ],
         },
-        PortableAction::Tab(TabAction::Rename { name: None }) => {
+        PortableRequestKind::TabRename { named: false } => {
             return Err(
                 "Herdr tab.rename requires `label`; the portable bare `tab:rename` has no specified Herdr prompt mapping"
                     .to_owned(),
             );
         }
-        PortableAction::Tab(TabAction::Move(target)) if target_is_index(target) => PortableRequestDescription {
+        PortableRequestKind::TabMove { index: true } => PortableRequestDescription {
             method: "tab.move",
             fields: &[
                 PortableRequestField { name: "tab_id", origin: Origin::Origin(ContextType::TabId) },
                 PortableRequestField { name: "insert_index", origin: Origin::Literal(Scalar::Index) },
             ],
         },
-        PortableAction::Tab(TabAction::Swap(target)) if target_is_index(target) => return Ok(None),
-        PortableAction::Pane(PaneAction::Create) => {
+        PortableRequestKind::PaneCreate => {
             return Err(
                 "Herdr has no pane.create method; pane.split requires an explicit right or down direction"
                     .to_owned(),
             );
         }
-        PortableAction::Pane(PaneAction::Split { direction: None, .. }) => {
+        PortableRequestKind::PaneSplit { direction: None, .. } => {
             return Err("Herdr pane.split requires an explicit right or down direction".to_owned());
         }
-        PortableAction::Pane(PaneAction::Split { direction: Some(direction), command, .. })
-            if command.program.is_none() && split_direction_is_supported(direction) =>
-        {
+        PortableRequestKind::PaneSplit { direction: Some(true), command: false } => {
             PortableRequestDescription {
                 method: "pane.split",
                 fields: &[
@@ -3429,36 +3532,34 @@ fn portable_request_description(
                 ],
             }
         }
-        PortableAction::Pane(PaneAction::Split { direction: Some(direction), .. })
-            if !split_direction_is_supported(direction) =>
-        {
+        PortableRequestKind::PaneSplit { direction: Some(false), .. } => {
             return Err("Herdr pane.split supports only right or down directions".to_owned());
         }
-        PortableAction::Pane(PaneAction::Split { .. }) => {
+        PortableRequestKind::PaneSplit { command: true, .. } => {
             return Err(
                 "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle"
                     .to_owned(),
             );
         }
-        PortableAction::Pane(PaneAction::Close) => PortableRequestDescription {
+        PortableRequestKind::PaneClose => PortableRequestDescription {
             method: "pane.close",
             fields: &[PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) }],
         },
-        PortableAction::Pane(PaneAction::Focus(target)) if target_is_cardinal_direction(target) => PortableRequestDescription {
+        PortableRequestKind::PaneFocus { cardinal: true } => PortableRequestDescription {
             method: "pane.focus_direction",
             fields: &[
                 PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
                 PortableRequestField { name: "direction", origin: Origin::Literal(Scalar::PaneDirection) },
             ],
         },
-        PortableAction::Pane(PaneAction::Swap(target)) if target_is_cardinal_direction(target) => PortableRequestDescription {
+        PortableRequestKind::PaneSwap { cardinal: true } => PortableRequestDescription {
             method: "pane.swap",
             fields: &[
                 PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
                 PortableRequestField { name: "direction", origin: Origin::Literal(Scalar::PaneDirection) },
             ],
         },
-        PortableAction::Pane(PaneAction::Resize { .. }) => PortableRequestDescription {
+        PortableRequestKind::PaneResize => PortableRequestDescription {
             method: "pane.resize",
             fields: &[
                 PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
@@ -3466,23 +3567,23 @@ fn portable_request_description(
                 PortableRequestField { name: "amount", origin: Origin::Literal(Scalar::Number) },
             ],
         },
-        PortableAction::Pane(PaneAction::Zoom { .. }) => PortableRequestDescription {
+        PortableRequestKind::PaneZoom => PortableRequestDescription {
             method: "pane.zoom",
             fields: &[
                 PortableRequestField { name: "pane_id", origin: Origin::Origin(ContextType::PaneId) },
                 PortableRequestField { name: "mode", origin: Origin::Default(Scalar::String) },
             ],
         },
-        PortableAction::Tab(TabAction::Focus(_)) => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that protocol 20 does not expose as a typed action".to_owned()),
-        PortableAction::Tab(TabAction::Move(_)) => return Err("Herdr tab.move supports only a concrete insert index".to_owned()),
-        PortableAction::Tab(TabAction::Swap(_)) => return Err("Herdr tab:swap supports only an index; the schema offers tab.list plus tab.move, not directional tab targeting".to_owned()),
-        PortableAction::Pane(PaneAction::Focus(_)) => return Err("Herdr pane.focus supports only cardinal directions".to_owned()),
-        PortableAction::Pane(PaneAction::Move(_)) => return Err("Herdr pane.move requires an explicit tab/new-tab destination, not a portable index or direction".to_owned()),
-        PortableAction::Pane(PaneAction::Swap(_)) => return Err("Herdr pane.swap supports only cardinal directions".to_owned()),
-        PortableAction::Pane(PaneAction::Fullscreen { .. }) => return Err("Herdr protocol 20 exposes no pane fullscreen method".to_owned()),
-        PortableAction::Pane(PaneAction::Floating { .. }) => return Err("Herdr protocol 20 exposes no pane floating method".to_owned()),
-        PortableAction::Pane(PaneAction::Frame { .. }) => return Err("Herdr protocol 20 exposes no pane frame method".to_owned()),
-        PortableAction::Session(_) => return Err("Herdr protocol 20 exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
+        PortableRequestKind::TabFocus => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that protocol 20 does not expose as a typed action".to_owned()),
+        PortableRequestKind::TabMove { index: false } => return Err("Herdr tab.move supports only a concrete insert index".to_owned()),
+        PortableRequestKind::TabSwap { index: false } => return Err("Herdr tab:swap supports only an index; the schema offers tab.list plus tab.move, not directional tab targeting".to_owned()),
+        PortableRequestKind::PaneFocus { cardinal: false } => return Err("Herdr pane.focus supports only cardinal directions".to_owned()),
+        PortableRequestKind::PaneMove => return Err("Herdr pane.move requires an explicit tab/new-tab destination, not a portable index or direction".to_owned()),
+        PortableRequestKind::PaneSwap { cardinal: false } => return Err("Herdr pane.swap supports only cardinal directions".to_owned()),
+        PortableRequestKind::PaneFullscreen => return Err("Herdr protocol 20 exposes no pane fullscreen method".to_owned()),
+        PortableRequestKind::PaneFloating => return Err("Herdr protocol 20 exposes no pane floating method".to_owned()),
+        PortableRequestKind::PaneFrame => return Err("Herdr protocol 20 exposes no pane frame method".to_owned()),
+        PortableRequestKind::Session => return Err("Herdr protocol 20 exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
     };
     Ok(Some(description))
 }
@@ -3493,45 +3594,45 @@ struct OrderedTab {
     workspace: String,
     number: u64,
 }
-fn creation_has_program(action: &PortableAction) -> bool {
+fn creation_has_program(action: &ResolvedPortableAction) -> bool {
     match action {
-        PortableAction::Tab(TabAction::Create { command, .. })
-        | PortableAction::Pane(PaneAction::Split { command, .. }) => command.program.is_some(),
+        ResolvedPortableAction::Tab(ResolvedTabAction::Create { command, .. })
+        | ResolvedPortableAction::Pane(ResolvedPaneAction::Split { command, .. }) => {
+            command.program.is_some()
+        }
         _ => false,
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
-)]
-fn creation_requires_post_dismissal(action: &PortableAction) -> Result<bool, AdapterError> {
+fn creation_requires_post_dismissal(action: &ResolvedPortableAction) -> bool {
     match action {
-        PortableAction::Tab(TabAction::Create { focus, .. })
-        | PortableAction::Pane(PaneAction::Split { focus, .. }) => {
-            Ok(focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true))
+        ResolvedPortableAction::Tab(ResolvedTabAction::Create { focus, .. })
+        | ResolvedPortableAction::Pane(ResolvedPaneAction::Split { focus, .. }) => {
+            focus.unwrap_or(true)
         }
-        _ => Ok(false),
+        _ => false,
     }
 }
 
 async fn perform_command_creation(
     authority: &IncarnationTransactionAuthority,
-    action: &PortableAction,
+    action: &ResolvedPortableAction,
     origin: &muxe_core::OriginContext,
 ) -> Result<(), AdapterError> {
     match action {
-        PortableAction::Tab(TabAction::Create {
+        ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
+            direction: None, ..
+        }) => Err(incompatible(
+            "Herdr pane.split requires an explicit right or down direction",
+        )),
+        ResolvedPortableAction::Tab(ResolvedTabAction::Create {
             workspace_id,
             name,
             focus,
             command,
         }) if command.program.is_some() => {
             let workspace = workspace_id
-                .as_ref()
-                .map(scalar_string)
-                .transpose()?
-                .map(muxe_core::WorkspaceId::new)
+                .clone()
                 .or_else(|| origin.workspace_id.clone())
                 .ok_or_else(|| {
                     AdapterError::new(
@@ -3539,24 +3640,20 @@ async fn perform_command_creation(
                         "Herdr command tab creation requires the captured origin workspace",
                     )
                 })?;
-            let label = name
-                .as_ref()
-                .map(scalar_string)
-                .transpose()?
-                .map(str::to_owned);
+            let label = name.clone();
             crate::launch::open_command_tab_with(
                 authority,
                 crate::CommandTabLaunch {
                     workspace,
                     label,
-                    cwd: creation_cwd(command, origin)?,
-                    argv: creation_argv(command)?,
-                    focus: focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                    cwd: creation_cwd(command, origin, "tab.cwd")?,
+                    argv: creation_argv(command, "tab.program", "tab.args")?,
+                    focus: focus.unwrap_or(true),
                 },
             )
             .await
         }
-        PortableAction::Pane(PaneAction::Split {
+        ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
             direction: Some(direction),
             focus,
             command,
@@ -3581,23 +3678,17 @@ async fn perform_command_creation(
             })?;
             let destination =
                 crate::launch::pane_by_identity_with(authority, workspace, tab, pane).await?;
-            let direction = match scalar_split_direction(direction)? {
-                "right" => crate::UiSplitDirection::Right,
-                "down" => crate::UiSplitDirection::Down,
-                _ => {
-                    unreachable!("scalar_split_direction validates the closed Herdr direction set")
-                }
-            };
+            let direction = split_direction(*direction).map_err(direction_request_error)?;
             crate::launch::open_command_pane_with(
                 authority,
                 crate::CommandPaneLaunch {
                     origin: destination.clone(),
                     destination,
-                    cwd: creation_cwd(command, origin)?,
-                    argv: creation_argv(command)?,
+                    cwd: creation_cwd(command, origin, "pane.cwd")?,
+                    argv: creation_argv(command, "pane.program", "pane.args")?,
                     direction,
                     ratio: 0.5,
-                    focus: focus.as_ref().map(scalar_bool).transpose()?.unwrap_or(true),
+                    focus: focus.unwrap_or(true),
                 },
             )
             .await
@@ -3613,19 +3704,23 @@ async fn perform_command_creation(
     clippy::result_large_err,
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
-fn creation_argv(command: &muxe_core::CreateCommand) -> Result<Vec<String>, AdapterError> {
+fn creation_argv(
+    command: &ResolvedCreateCommand,
+    program_field: &str,
+    args_field: &str,
+) -> Result<Vec<String>, AdapterError> {
     let program = command
         .program
         .as_ref()
         .ok_or_else(|| incompatible("creation command requires program"))?;
-    let program = scalar_string(program)?;
+    let program = json_word(program, program_field)?;
     if program.is_empty() {
         return Err(incompatible("creation command program must not be empty"));
     }
     let mut argv = Vec::with_capacity(command.args.len().saturating_add(1));
     argv.push(program.to_owned());
     for argument in &command.args {
-        argv.push(scalar_string(argument)?.to_owned());
+        argv.push(json_word(argument, args_field)?.to_owned());
     }
     Ok(argv)
 }
@@ -3635,15 +3730,14 @@ fn creation_argv(command: &muxe_core::CreateCommand) -> Result<Vec<String>, Adap
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
 fn creation_cwd(
-    command: &muxe_core::CreateCommand,
+    command: &ResolvedCreateCommand,
     origin: &muxe_core::OriginContext,
+    field: &str,
 ) -> Result<PathBuf, AdapterError> {
     let cwd = command
         .cwd
         .as_ref()
-        .map(scalar_string)
-        .transpose()?
-        .map(PathBuf::from)
+        .map(|cwd| cwd.as_path().to_owned())
         .or_else(|| origin.pane_cwd.clone())
         .ok_or_else(|| {
             AdapterError::new(
@@ -3654,6 +3748,7 @@ fn creation_cwd(
     if !cwd.is_absolute() {
         return Err(incompatible("creation command cwd must be absolute"));
     }
+    json_path(&cwd, field)?;
     Ok(cwd)
 }
 
@@ -3854,21 +3949,13 @@ fn target_is_cardinal_direction(target: &muxe_core::IndexOrDirection) -> bool {
 }
 
 fn split_direction_is_supported(direction: &ActionScalar) -> bool {
-    match &direction.value.kind {
-        ConfigValueKind::Context(_) => true,
-        ConfigValueKind::String(value) => matches!(value.as_str(), "right" | "down"),
-        _ => false,
-    }
+    matches!(direction.value.kind, ConfigValueKind::Context(_))
+        || scalar_split_direction(direction).is_ok()
 }
 
 fn scalar_is_cardinal_or_context(scalar: &ActionScalar) -> bool {
-    match &scalar.value.kind {
-        ConfigValueKind::Context(_) => true,
-        ConfigValueKind::String(value) => {
-            matches!(value.as_str(), "left" | "right" | "up" | "down")
-        }
-        _ => false,
-    }
+    matches!(scalar.value.kind, ConfigValueKind::Context(_))
+        || scalar_pane_direction(scalar).is_ok()
 }
 
 fn scalar_is_unsigned_or_context(scalar: &ActionScalar) -> bool {
@@ -3981,28 +4068,22 @@ fn scalar_number(value: &ActionScalar) -> Result<f64, AdapterError> {
     clippy::result_large_err,
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
-fn scalar_pane_direction(value: &ActionScalar) -> Result<&str, AdapterError> {
-    match scalar_string(value)? {
-        "left" | "right" | "up" | "down" => scalar_string(value),
-        _ => Err(AdapterError::new(
-            AdapterErrorKind::InvalidRequest,
-            "Herdr pane direction must be left, right, up, or down",
-        )),
-    }
+fn scalar_pane_direction(value: &ActionScalar) -> Result<HerdrPaneDirection, AdapterError> {
+    let direction = scalar_string(value)?
+        .parse::<Direction>()
+        .map_err(|_| direction_request_error(PANE_DIRECTION_ERROR))?;
+    HerdrPaneDirection::try_from(direction).map_err(direction_request_error)
 }
 
 #[expect(
     clippy::result_large_err,
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
-fn scalar_split_direction(value: &ActionScalar) -> Result<&str, AdapterError> {
-    match scalar_string(value)? {
-        "right" | "down" => scalar_string(value),
-        _ => Err(AdapterError::new(
-            AdapterErrorKind::InvalidRequest,
-            "Herdr pane split direction must be right or down",
-        )),
-    }
+fn scalar_split_direction(value: &ActionScalar) -> Result<crate::UiSplitDirection, AdapterError> {
+    let direction = scalar_string(value)?
+        .parse::<Direction>()
+        .map_err(|_| direction_request_error(SPLIT_DIRECTION_ERROR))?;
+    split_direction(direction).map_err(direction_request_error)
 }
 
 /// Load-time scalar readers mirroring the dispatch-time `scalar_*` conversions without
@@ -4026,16 +4107,101 @@ fn scalar_number_value(value: &ActionScalar) -> Result<f64, String> {
     scalar_number(value).map_err(|error| error.to_string())
 }
 
-fn scalar_split_direction_value(value: &ActionScalar) -> Result<String, String> {
-    scalar_split_direction(value)
-        .map(str::to_owned)
-        .map_err(|error| error.to_string())
+fn scalar_split_direction_value(value: &ActionScalar) -> Result<crate::UiSplitDirection, String> {
+    scalar_split_direction(value).map_err(|error| error.to_string())
 }
 
-fn scalar_pane_direction_value(value: &ActionScalar) -> Result<String, String> {
-    scalar_pane_direction(value)
-        .map(str::to_owned)
-        .map_err(|error| error.to_string())
+fn scalar_pane_direction_value(value: &ActionScalar) -> Result<HerdrPaneDirection, String> {
+    scalar_pane_direction(value).map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HerdrPaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl HerdrPaneDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+}
+
+impl TryFrom<Direction> for HerdrPaneDirection {
+    type Error = &'static str;
+
+    fn try_from(direction: Direction) -> Result<Self, Self::Error> {
+        match direction {
+            Direction::Left => Ok(Self::Left),
+            Direction::Right => Ok(Self::Right),
+            Direction::Up => Ok(Self::Up),
+            Direction::Down => Ok(Self::Down),
+            Direction::Next | Direction::Previous => Err(PANE_DIRECTION_ERROR),
+        }
+    }
+}
+
+const PANE_DIRECTION_ERROR: &str = "Herdr pane direction must be left, right, up, or down";
+const SPLIT_DIRECTION_ERROR: &str = "Herdr pane split direction must be right or down";
+
+fn direction_request_error(message: &'static str) -> AdapterError {
+    AdapterError::new(AdapterErrorKind::InvalidRequest, message)
+}
+
+fn split_direction(direction: Direction) -> Result<crate::UiSplitDirection, &'static str> {
+    match direction {
+        Direction::Right => Ok(crate::UiSplitDirection::Right),
+        Direction::Down => Ok(crate::UiSplitDirection::Down),
+        Direction::Left | Direction::Up | Direction::Next | Direction::Previous => {
+            Err(SPLIT_DIRECTION_ERROR)
+        }
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Herdr resize amounts are floating-point JSON numbers"
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the shared public error type"
+)]
+fn resize_number(amount: &ResizeAmount) -> Result<f64, AdapterError> {
+    match amount {
+        ResizeAmount::Integer(value) => Ok(*value as f64),
+        ResizeAmount::Unsigned(value) => Ok(*value as f64),
+        ResizeAmount::Float(value) => Ok(*value),
+        ResizeAmount::Boolean(_) | ResizeAmount::Text(_) => Err(AdapterError::new(
+            AdapterErrorKind::InvalidRequest,
+            "resolved pane resize amount must be numeric",
+        )),
+    }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the shared public error type"
+)]
+fn json_word<'a>(word: &'a muxe_core::CommandWord, field: &str) -> Result<&'a str, AdapterError> {
+    word.as_os_str()
+        .to_str()
+        .ok_or_else(|| incompatible(format!("Herdr {field} cannot be represented as UTF-8 text")))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the shared public error type"
+)]
+fn json_path<'a>(path: &'a Path, field: &str) -> Result<&'a str, AdapterError> {
+    path.to_str()
+        .ok_or_else(|| incompatible(format!("Herdr {field} cannot be represented as UTF-8 text")))
 }
 
 /// JSON-number probe for a resize amount. Non-finite floats have no JSON encoding, so
@@ -4257,12 +4423,12 @@ mod tests {
     #[test]
     fn unsupported_portable_forms_do_not_receive_invented_herdr_defaults() {
         for action in [
-            PortableAction::Tab(TabAction::Rename { name: None }),
-            PortableAction::Pane(PaneAction::Create),
-            PortableAction::Pane(PaneAction::Split {
+            ResolvedPortableAction::Tab(ResolvedTabAction::Rename { name: None }),
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Create),
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
                 direction: None,
                 focus: None,
-                command: muxe_core::CreateCommand::default(),
+                command: ResolvedCreateCommand::default(),
             }),
         ] {
             let Err(error) = portable_invocation(&action, &origin()) else {
@@ -4272,89 +4438,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn split_without_direction_reports_the_direction_diagnostic_before_any_command() {
-        let scalar = |value: &str| {
-            ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-                value.to_owned(),
-            )))
-        };
-        let command = muxe_core::CreateCommand {
-            program: Some(scalar("tool")),
-            args: Vec::new(),
-            cwd: None,
-        };
-
-        let missing_direction = PortableAction::Pane(PaneAction::Split {
-            direction: None,
-            focus: None,
-            command: command.clone(),
-        });
-        let Err(error) = portable_invocation(&missing_direction, &origin()) else {
-            panic!("split without a direction must fail");
-        };
-        assert_eq!(
-            error.to_string(),
-            "Herdr pane.split requires an explicit right or down direction",
-            "the direction diagnostic outranks the command-lifecycle diagnostic"
-        );
-
-        let command_bearing = PortableAction::Pane(PaneAction::Split {
-            direction: Some(scalar("right")),
-            focus: None,
-            command,
-        });
-        let Err(error) = portable_invocation(&command_bearing, &origin()) else {
-            panic!("command-bearing split must fail without the dismiss lifecycle");
-        };
-        assert_eq!(
-            error.to_string(),
-            "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle"
-        );
-    }
-
-    #[test]
-    fn command_creations_require_every_helper_rpc_at_compile_time() {
-        let scalar = |value: &str| {
-            ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-                value.to_owned(),
-            )))
-        };
-        let command = || muxe_core::CreateCommand {
-            program: Some(scalar("tool")),
-            args: Vec::new(),
-            cwd: None,
-        };
-        let tab = PortableAction::Tab(TabAction::Create {
-            workspace_id: None,
-            name: None,
-            focus: None,
-            command: command(),
-        });
-        let split = PortableAction::Pane(PaneAction::Split {
-            direction: Some(scalar("right")),
-            focus: None,
-            command: command(),
-        });
-
-        assert_eq!(command_creation_methods(&tab), Some(&["layout.apply"][..]));
-        assert_eq!(
-            command_creation_methods(&split),
-            Some(&["session.snapshot", "layout.apply", "pane.move", "tab.close",][..])
-        );
-    }
-
     fn deferred_request() -> PostDismissalPortableDispatchRequest {
         PostDismissalPortableDispatchRequest {
             execution: muxe_core::ExecutionId(1),
-            action: muxe_adapter_api::ResolvedPortableAction {
-                action: PortableAction::Tab(TabAction::Create {
-                    workspace_id: None,
-                    name: None,
-                    focus: None,
-                    command: muxe_core::CreateCommand::default(),
-                }),
-            },
+            action: ResolvedPortableAction::Tab(ResolvedTabAction::Create {
+                workspace_id: None,
+                name: None,
+                focus: None,
+                command: ResolvedCreateCommand::default(),
+            }),
             origin: origin(),
             ui_pane: muxe_core::PaneId::new("muxe-ui"),
         }
@@ -4385,40 +4477,10 @@ mod tests {
     }
 
     #[test]
-    fn only_focused_creations_require_post_dismissal_dispatch() {
-        let focused = PortableAction::Tab(TabAction::Create {
-            workspace_id: None,
-            name: None,
-            focus: None,
-            command: muxe_core::CreateCommand::default(),
-        });
-        let unfocused = PortableAction::Pane(PaneAction::Split {
-            direction: Some(ActionScalar::new(ConfigValue::synthetic(
-                ConfigValueKind::String("right".to_owned()),
-            ))),
-            focus: Some(ActionScalar::new(ConfigValue::synthetic(
-                ConfigValueKind::Boolean(false),
-            ))),
-            command: muxe_core::CreateCommand::default(),
-        });
-
-        assert!(
-            creation_requires_post_dismissal(&focused)
-                .expect("default tab creation focus is valid")
-        );
-        assert!(
-            !creation_requires_post_dismissal(&unfocused)
-                .expect("explicit unfocused split is valid")
-        );
-    }
-
-    #[test]
     fn pane_zoom_preserves_its_direct_host_mode() {
         let invocation = portable_invocation(
-            &PortableAction::Pane(PaneAction::Zoom {
-                enabled: Some(ActionScalar::new(ConfigValue::synthetic(
-                    ConfigValueKind::Boolean(true),
-                ))),
+            &ResolvedPortableAction::Pane(ResolvedPaneAction::Zoom {
+                enabled: Some(true),
             }),
             &origin(),
         )
@@ -4464,20 +4526,228 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_typed_context_forms_remain_routable_until_origin_capture() {
-        let source = SourceSpan::new(SourceId::new("<test>"), 0, 0);
-        let index = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::Context(
-            ContextReference::parse("origin.tab.index", source.clone())
-                .expect("known unsigned context path"),
-        )));
-        let direction = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::Context(
-            ContextReference::parse("origin.selection.text", source)
-                .expect("known textual context path"),
-        )));
-
-        assert!(target_is_index(&muxe_core::IndexOrDirection::Index(index)));
-        assert!(split_direction_is_supported(&direction));
+    fn pane_and_split_direction_domains_match_the_emitted_host_requests() {
+        let schema = bundled_schema();
+        for (text, direction) in [
+            ("left", Direction::Left),
+            ("right", Direction::Right),
+            ("up", Direction::Up),
+            ("down", Direction::Down),
+            ("next", Direction::Next),
+            ("previous", Direction::Previous),
+        ] {
+            let scalar = || {
+                ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
+                    text.to_owned(),
+                )))
+            };
+            let target = || muxe_core::IndexOrDirection::Direction(scalar());
+            for (action, method) in [
+                (
+                    PortableAction::Pane(PaneAction::Focus(target())),
+                    "pane.focus_direction",
+                ),
+                (
+                    PortableAction::Pane(PaneAction::Swap(target())),
+                    "pane.swap",
+                ),
+                (
+                    PortableAction::Pane(PaneAction::Resize {
+                        direction: scalar(),
+                        amount: None,
+                    }),
+                    "pane.resize",
+                ),
+            ] {
+                let resolved = action
+                    .resolve_context(&origin())
+                    .expect("core direction resolves");
+                let load = portable_compile_validation(&schema, &action);
+                let dispatch = portable_invocation(&resolved, &origin());
+                if matches!(direction, Direction::Next | Direction::Previous) {
+                    assert!(load.is_err(), "{method} must reject {text} at load");
+                    assert!(matches!(
+                        dispatch,
+                        Err(AdapterError {
+                            kind: AdapterErrorKind::Incompatible | AdapterErrorKind::InvalidRequest,
+                            ..
+                        })
+                    ));
+                } else {
+                    load.expect("cardinal pane direction passes the pinned schema");
+                    let invocation = dispatch.expect("cardinal pane direction dispatches");
+                    assert_eq!(invocation.method, method);
+                    assert_eq!(invocation.params["direction"], text);
+                    assert_eq!(invocation.params["pane_id"], "pane");
+                }
+            }
+            let action = PortableAction::Pane(PaneAction::Split {
+                direction: Some(scalar()),
+                focus: None,
+                command: muxe_core::CreateCommand::default(),
+            });
+            let resolved = action
+                .resolve_context(&origin())
+                .expect("core split direction resolves");
+            let load = portable_compile_validation(&schema, &action);
+            let dispatch = portable_invocation(&resolved, &origin());
+            if matches!(direction, Direction::Right | Direction::Down) {
+                load.expect("right/down split direction passes the pinned schema");
+                let invocation = dispatch.expect("right/down split dispatches");
+                assert_eq!(invocation.method, "pane.split");
+                assert_eq!(
+                    invocation.params,
+                    json!({
+                        "target_pane_id": "pane", "direction": text, "focus": true, "cwd": null,
+                    })
+                );
+            } else {
+                assert!(load.is_err(), "split must reject {text} at load");
+                assert!(matches!(
+                    dispatch,
+                    Err(AdapterError {
+                        kind: AdapterErrorKind::Incompatible,
+                        ..
+                    })
+                ));
+            }
+        }
     }
+
+    #[test]
+    fn selection_text_direction_is_resolved_before_host_restrictions() {
+        let marker = || {
+            ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::Context(
+                ContextReference::parse(
+                    "origin.selection.text",
+                    SourceSpan::new(SourceId::new("<test>"), 0, 0),
+                )
+                .expect("known textual context path"),
+            )))
+        };
+        let pane = PortableAction::Pane(PaneAction::Focus(muxe_core::IndexOrDirection::Direction(
+            marker(),
+        )));
+        let split = PortableAction::Pane(PaneAction::Split {
+            direction: Some(marker()),
+            focus: Some(ActionScalar::new(ConfigValue::synthetic(
+                ConfigValueKind::Boolean(false),
+            ))),
+            command: muxe_core::CreateCommand::default(),
+        });
+        let schema = bundled_schema();
+        portable_compile_validation(&schema, &pane)
+            .expect("selection direction is deferred at load");
+        portable_compile_validation(&schema, &split)
+            .expect("selection split direction is deferred at load");
+        for (text, pane_supported, split_supported) in [
+            ("left", true, false),
+            ("right", true, true),
+            ("up", true, false),
+            ("down", true, true),
+            ("next", false, false),
+            ("previous", false, false),
+        ] {
+            let mut captured = origin();
+            captured.selection_text = Some(text.to_owned());
+            for (action, supported, is_split) in [
+                (&pane, pane_supported, false),
+                (&split, split_supported, true),
+            ] {
+                let resolved = action
+                    .resolve_context(&captured)
+                    .expect("selection resolves to a core direction");
+                // Dispatch must not consult changed context after the action is resolved.
+                captured.selection_text = Some("not-a-direction".to_owned());
+                let invocation = portable_invocation(&resolved, &captured);
+                captured.selection_text = Some(text.to_owned());
+                if supported {
+                    let invocation = invocation.expect("resolved supported direction dispatches");
+                    assert_eq!(invocation.params["direction"], text);
+                    if is_split {
+                        assert_eq!(invocation.params["focus"], false);
+                    }
+                } else {
+                    assert!(matches!(
+                        invocation,
+                        Err(AdapterError {
+                            kind: AdapterErrorKind::Incompatible,
+                            ..
+                        })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_creation_rejects_non_utf8_json_fields() {
+        use muxe_core::{AbsolutePath, CommandCwd, CommandWord};
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let path = || {
+            AbsolutePath::new(PathBuf::from(OsString::from_vec(b"/bad\xff".to_vec())))
+                .expect("absolute OS path")
+        };
+        for (program, args, cwd, field) in [
+            (
+                Some(CommandWord::Path(path())),
+                Vec::new(),
+                None,
+                "tab.program",
+            ),
+            (
+                Some(CommandWord::Text("tool".to_owned())),
+                vec![CommandWord::Path(path())],
+                None,
+                "tab.args",
+            ),
+            (
+                Some(CommandWord::Text("tool".to_owned())),
+                Vec::new(),
+                Some(CommandCwd::Origin(path())),
+                "tab.cwd",
+            ),
+        ] {
+            let command = ResolvedCreateCommand { program, args, cwd };
+            let error = if field == "tab.cwd" {
+                creation_cwd(&command, &origin(), field)
+                    .expect_err("JSON cannot encode non-UTF8 cwd")
+            } else {
+                creation_argv(&command, "tab.program", "tab.args")
+                    .expect_err("JSON cannot encode non-UTF8 argv")
+            };
+            assert_eq!(error.kind, AdapterErrorKind::Incompatible);
+            assert!(error.to_string().contains(field));
+        }
+    }
+
+    #[test]
+    fn captured_tab_move_index_retains_the_full_unsigned_range() {
+        let index = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::Context(
+            ContextReference::parse(
+                "origin.tab.index",
+                SourceSpan::new(SourceId::new("<test>"), 0, 0),
+            )
+            .expect("known unsigned context path"),
+        )));
+        let action =
+            PortableAction::Tab(TabAction::Move(muxe_core::IndexOrDirection::Index(index)));
+        portable_compile_validation(&bundled_schema(), &action)
+            .expect("unsigned context index passes load validation");
+        let mut captured = origin();
+        captured.tab_index = Some(u64::MAX);
+        let resolved = action
+            .resolve_context(&captured)
+            .expect("unsigned index resolves without an i64 intermediate");
+        let invocation = portable_invocation(&resolved, &captured)
+            .expect("tab move serializes its resolved index");
+        assert_eq!(invocation.method, "tab.move");
+        assert_eq!(
+            invocation.params,
+            json!({ "tab_id": "tab", "insert_index": u64::MAX })
+        );
+    }
+
     fn bundled_schema() -> ApiSchema {
         let raw = serde_json::from_str(include_str!(
             "../../../fixtures/herdr/herdr-api.schema.json"
@@ -4493,6 +4763,51 @@ mod tests {
         .expect("bundled fixture schema is valid JSON");
         mutate(&mut raw);
         ApiSchema::parse(raw).expect("mutated schema parses")
+    }
+
+    #[test]
+    fn command_bindings_reject_missing_host_helpers_at_load_time() {
+        for (form, helpers) in [
+            ("tab:create program=tool", &["layout.apply"][..]),
+            (
+                "pane:split direction=right program=tool",
+                &["session.snapshot", "layout.apply", "pane.move", "tab.close"][..],
+            ),
+        ] {
+            for missing in helpers {
+                let schema = mutated_schema(|raw| {
+                    raw["schemas"]["request"]["oneOf"]
+                        .as_array_mut()
+                        .expect("request catalog")
+                        .retain(|branch| {
+                            branch["properties"]["method"]["const"].as_str() != Some(*missing)
+                        });
+                });
+                let validator = HerdrConfigValidator {
+                    schema: Arc::new(schema),
+                };
+                let yaml = format!(
+                    "version: 1\nmenus:\n  main:\n    bindings:\n      c:\n        label: command\n        action: {form}\n"
+                );
+                let diagnostics = muxe_core::compile_yaml(
+                    muxe_core::CompiledGeneration(1),
+                    SourceId::new("missing-helper.yml"),
+                    yaml.as_str(),
+                    muxe_core::KeyCapabilities::default(),
+                    Some(&validator),
+                )
+                .expect_err("a binding requiring an unavailable helper must not be published");
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code
+                    == DiagnosticCode::InvalidAction
+                    && diagnostic.message.contains(missing)));
+                assert!(
+                    diagnostics
+                        .iter()
+                        .flat_map(|diagnostic| &diagnostic.labels)
+                        .any(|label| label.span.source.as_str() == "missing-helper.yml")
+                );
+            }
+        }
     }
 
     #[test]
@@ -4616,8 +4931,11 @@ mod tests {
     fn pane_close_dispatch_emits_exact_close_request() {
         // Guards the restored arm: portable pane:close dispatches exactly
         // method "pane.close" with params { "pane_id": <origin pane> }.
-        let invocation = portable_invocation(&PortableAction::Pane(PaneAction::Close), &origin())
-            .expect("pane:close dispatches");
+        let invocation = portable_invocation(
+            &ResolvedPortableAction::Pane(ResolvedPaneAction::Close),
+            &origin(),
+        )
+        .expect("pane:close dispatches");
         assert_eq!(invocation.method, "pane.close");
         assert_eq!(
             invocation.params,
@@ -4671,13 +4989,9 @@ mod tests {
         // Guards the multi-field arm: portable pane:resize dispatches exactly method
         // "pane.resize" with params { "pane_id", "direction", "amount" }, so a deleted
         // or narrowed arm fails loudly instead of dispatching a silent wrong shape.
-        let direction = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::String(
-            "right".to_owned(),
-        )));
-        let amount = ActionScalar::new(ConfigValue::synthetic(ConfigValueKind::Float(2.0)));
-        let action = PortableAction::Pane(PaneAction::Resize {
-            direction,
-            amount: Some(amount),
+        let action = ResolvedPortableAction::Pane(ResolvedPaneAction::Resize {
+            direction: Direction::Right,
+            amount: Some(ResizeAmount::Float(2.0)),
         });
         let invocation = portable_invocation(&action, &origin()).expect("pane:resize dispatches");
         assert_eq!(invocation.method, "pane.resize");

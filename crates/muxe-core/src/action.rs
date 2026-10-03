@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
 use crate::config::{ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError};
-use crate::context::OriginContext;
+use crate::context::{ContextValue, OriginContext, SessionName, WorkspaceId};
 use crate::diagnostic::SourceSpan;
 use crate::execution::{ExecutionCapabilities, ExecutionMode};
 use crate::key::CanonicalKey;
@@ -756,17 +758,6 @@ impl ActionScalar {
     pub fn new(value: ConfigValue) -> Self {
         Self { value }
     }
-
-    /// Resolves a context scalar or reports the unavailable origin field.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the referenced origin context is unavailable.
-    pub fn resolve_context(&self, origin: &OriginContext) -> Result<Self, ContextResolutionError> {
-        Ok(Self {
-            value: self.value.resolve_context(origin)?,
-        })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -931,6 +922,212 @@ impl PortableAction {
     }
 }
 
+/// Validated absolute filesystem path, retaining the original OS representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbsolutePath(PathBuf);
+
+impl AbsolutePath {
+    /// Validates a path without changing its representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original path when it is not absolute.
+    pub fn new(path: PathBuf) -> Result<Self, PathBuf> {
+        if path.is_absolute() {
+            Ok(Self(path))
+        } else {
+            Err(path)
+        }
+    }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+/// One command-vector word, with filesystem context retained until the OS boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandWord {
+    Text(String),
+    Path(AbsolutePath),
+}
+
+impl CommandWord {
+    #[must_use]
+    pub fn as_os_str(&self) -> &OsStr {
+        match self {
+            Self::Text(value) => OsStr::new(value),
+            Self::Path(value) => value.as_path().as_os_str(),
+        }
+    }
+}
+
+/// A literal cwd may be relative; origin-derived cwd must already be absolute.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandCwd {
+    Literal(PathBuf),
+    Origin(AbsolutePath),
+}
+
+impl CommandCwd {
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        match self {
+            Self::Literal(path) => path,
+            Self::Origin(path) => path.as_path(),
+        }
+    }
+}
+
+/// Zero-based tab position, distinct from both pane positions and host tab IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TabIndex(u64);
+
+impl TabIndex {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Pane position, distinct from both tab positions and host pane IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PaneIndex(u64);
+
+impl PaneIndex {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvedTabTarget {
+    Index(TabIndex),
+    Direction(Direction),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvedPaneTarget {
+    Index(PaneIndex),
+    Direction(Direction),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedKeyboardAction {
+    SendKeys(Vec<CanonicalKey>),
+    SendText(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedCommandAction {
+    pub program: CommandWord,
+    pub args: Vec<CommandWord>,
+    pub cwd: Option<CommandCwd>,
+    pub env: BTreeMap<String, CommandWord>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedCreateCommand {
+    pub program: Option<CommandWord>,
+    pub args: Vec<CommandWord>,
+    pub cwd: Option<CommandCwd>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedTabAction {
+    Create {
+        workspace_id: Option<WorkspaceId>,
+        name: Option<String>,
+        focus: Option<bool>,
+        command: ResolvedCreateCommand,
+    },
+    Close,
+    Rename {
+        name: Option<String>,
+    },
+    Focus(ResolvedTabTarget),
+    Move(ResolvedTabTarget),
+    Swap(ResolvedTabTarget),
+}
+
+/// The portable schema admits non-null scalar amounts; concrete adapters impose their ranges.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResizeAmount {
+    Integer(i64),
+    Unsigned(u64),
+    Float(f64),
+    Boolean(bool),
+    Text(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResolvedPaneAction {
+    Create,
+    Split {
+        direction: Option<Direction>,
+        focus: Option<bool>,
+        command: ResolvedCreateCommand,
+    },
+    Close,
+    Focus(ResolvedPaneTarget),
+    Move(ResolvedPaneTarget),
+    Swap(ResolvedPaneTarget),
+    Resize {
+        direction: Direction,
+        amount: Option<ResizeAmount>,
+    },
+    Zoom {
+        enabled: Option<bool>,
+    },
+    Fullscreen {
+        enabled: Option<bool>,
+    },
+    Floating {
+        enabled: Option<bool>,
+    },
+    Frame {
+        visible: Option<bool>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedSessionAction {
+    Create,
+    Attach { name: SessionName },
+    Switch { name: SessionName },
+    Rename { name: SessionName },
+    Detach,
+    Quit,
+    Kill,
+}
+
+/// Owned execution action after origin resolution, with no YAML values or deferred markers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResolvedPortableAction {
+    Menu(MenuAction),
+    Config(ConfigAction),
+    Keyboard(ResolvedKeyboardAction),
+    Command(ResolvedCommandAction),
+    Tab(ResolvedTabAction),
+    Pane(ResolvedPaneAction),
+    Session(ResolvedSessionAction),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PortableActionResolutionError {
     Context(ContextResolutionError),
@@ -942,75 +1139,53 @@ pub enum PortableActionResolutionError {
 }
 
 impl PortableAction {
-    /// Resolves every portable scalar against the immutable attach-time origin and validates the
-    /// resulting concrete values before an adapter can observe or dispatch the action.
+    /// Resolves against the immutable captured origin into an owned execution action.
     ///
     /// # Errors
     ///
-    /// Returns an error when a required origin field is unavailable or a resolved scalar is invalid.
+    /// Returns a source-aware error for missing context or an invalid resolved parameter.
     #[expect(
         clippy::too_many_lines,
-        reason = "the closed portable action registry stays co-located with its context validation"
+        reason = "the closed action registry preserves parameter resolution order in one place"
     )]
     pub fn resolve_context(
         &self,
         origin: &OriginContext,
-    ) -> Result<Self, PortableActionResolutionError> {
+    ) -> Result<ResolvedPortableAction, PortableActionResolutionError> {
+        use ResolvedPortableAction as R;
         Ok(match self {
-            Self::Menu(action) => Self::Menu(action.clone()),
-            Self::Config(action) => Self::Config(*action),
+            Self::Menu(action) => R::Menu(action.clone()),
+            Self::Config(action) => R::Config(*action),
             Self::Keyboard(KeyboardAction::SendKeys(keys)) => {
-                let keys = keys
-                    .iter()
-                    .map(|key| {
-                        let key = resolve_scalar(key, origin)?;
-                        ensure_key(&key)?;
-                        Ok(key)
-                    })
-                    .collect::<Result<_, PortableActionResolutionError>>()?;
-                Self::Keyboard(KeyboardAction::SendKeys(keys))
+                R::Keyboard(ResolvedKeyboardAction::SendKeys(
+                    keys.iter()
+                        .map(|key| resolve_key(key, origin))
+                        .collect::<Result<_, _>>()?,
+                ))
             }
-            Self::Keyboard(KeyboardAction::SendText(text)) => {
-                let text = resolve_scalar(text, origin)?;
-                ensure_string(&text, "keyboard.text")?;
-                Self::Keyboard(KeyboardAction::SendText(text))
-            }
+            Self::Keyboard(KeyboardAction::SendText(text)) => R::Keyboard(
+                ResolvedKeyboardAction::SendText(resolve_text(text, origin, "keyboard.text")?),
+            ),
             Self::Command(command) => {
-                let program = resolve_scalar(&command.program, origin)?;
-                ensure_string(&program, "command.program")?;
+                let program = resolve_word(&command.program, origin, "command.program")?;
                 let args = command
                     .args
                     .iter()
-                    .map(|argument| {
-                        let argument = resolve_scalar(argument, origin)?;
-                        ensure_string(&argument, "command.args")?;
-                        Ok(argument)
-                    })
-                    .collect::<Result<_, PortableActionResolutionError>>()?;
+                    .map(|arg| resolve_word(arg, origin, "command.args"))
+                    .collect::<Result<_, _>>()?;
                 let cwd = command
                     .cwd
                     .as_ref()
-                    .map(|cwd| {
-                        let context_path = matches!(cwd.value.kind, ConfigValueKind::Context(_));
-                        let cwd = resolve_scalar(cwd, origin)?;
-                        if context_path {
-                            ensure_absolute_path(&cwd, "command.cwd")?;
-                        } else {
-                            ensure_string(&cwd, "command.cwd")?;
-                        }
-                        Ok(cwd)
-                    })
+                    .map(|cwd| resolve_cwd(cwd, origin, "command.cwd"))
                     .transpose()?;
                 let env = command
                     .env
                     .iter()
                     .map(|(name, value)| {
-                        let value = resolve_scalar(value, origin)?;
-                        ensure_string(&value, "command.env")?;
-                        Ok((name.clone(), value))
+                        Ok((name.clone(), resolve_word(value, origin, "command.env")?))
                     })
                     .collect::<Result<_, PortableActionResolutionError>>()?;
-                Self::Command(CommandAction {
+                R::Command(ResolvedCommandAction {
                     program,
                     args,
                     cwd,
@@ -1025,45 +1200,42 @@ impl PortableAction {
             }) => {
                 let workspace_id = workspace_id
                     .as_ref()
-                    .map(|workspace_id| {
-                        let workspace_id = resolve_scalar(workspace_id, origin)?;
-                        ensure_string(&workspace_id, "tab.workspace-id")?;
-                        Ok(workspace_id)
-                    })
+                    .map(|value| resolve_workspace(value, origin))
                     .transpose()?;
-                let name = resolve_optional_string(name.as_ref(), origin, "tab.name")?;
+                let name = resolve_optional_text(name.as_ref(), origin, "tab.name")?;
                 let focus = resolve_optional_bool(focus.as_ref(), origin, "tab.focus")?;
                 let command =
                     resolve_create_command(command, origin, "tab.program", "tab.args", "tab.cwd")?;
-                Self::Tab(TabAction::Create {
+                R::Tab(ResolvedTabAction::Create {
                     workspace_id,
                     name,
                     focus,
                     command,
                 })
             }
-            Self::Tab(TabAction::Close) => Self::Tab(TabAction::Close),
-            Self::Tab(TabAction::Rename { name }) => {
-                let name = resolve_optional_string(name.as_ref(), origin, "tab.name")?;
-                Self::Tab(TabAction::Rename { name })
-            }
-            Self::Tab(TabAction::Focus(target)) => {
-                Self::Tab(TabAction::Focus(resolve_target(target, origin)?))
-            }
+            Self::Tab(TabAction::Close) => R::Tab(ResolvedTabAction::Close),
+            Self::Tab(TabAction::Rename { name }) => R::Tab(ResolvedTabAction::Rename {
+                name: resolve_optional_text(name.as_ref(), origin, "tab.name")?,
+            }),
+            Self::Tab(TabAction::Focus(target)) => R::Tab(ResolvedTabAction::Focus(
+                resolve_tab_target(target, origin)?,
+            )),
             Self::Tab(TabAction::Move(target)) => {
-                Self::Tab(TabAction::Move(resolve_target(target, origin)?))
+                R::Tab(ResolvedTabAction::Move(resolve_tab_target(target, origin)?))
             }
             Self::Tab(TabAction::Swap(target)) => {
-                Self::Tab(TabAction::Swap(resolve_target(target, origin)?))
+                R::Tab(ResolvedTabAction::Swap(resolve_tab_target(target, origin)?))
             }
-            Self::Pane(PaneAction::Create) => Self::Pane(PaneAction::Create),
+            Self::Pane(PaneAction::Create) => R::Pane(ResolvedPaneAction::Create),
             Self::Pane(PaneAction::Split {
                 direction,
                 focus,
                 command,
             }) => {
-                let direction =
-                    resolve_optional_direction(direction.as_ref(), origin, "pane.direction")?;
+                let direction = direction
+                    .as_ref()
+                    .map(|value| resolve_direction(value, origin, "pane.direction"))
+                    .transpose()?;
                 let focus = resolve_optional_bool(focus.as_ref(), origin, "pane.focus")?;
                 let command = resolve_create_command(
                     command,
@@ -1072,127 +1244,332 @@ impl PortableAction {
                     "pane.args",
                     "pane.cwd",
                 )?;
-                Self::Pane(PaneAction::Split {
+                R::Pane(ResolvedPaneAction::Split {
                     direction,
                     focus,
                     command,
                 })
             }
-            Self::Pane(PaneAction::Close) => Self::Pane(PaneAction::Close),
-            Self::Pane(PaneAction::Focus(target)) => {
-                Self::Pane(PaneAction::Focus(resolve_target(target, origin)?))
-            }
-            Self::Pane(PaneAction::Move(target)) => {
-                Self::Pane(PaneAction::Move(resolve_target(target, origin)?))
-            }
-            Self::Pane(PaneAction::Swap(target)) => {
-                Self::Pane(PaneAction::Swap(resolve_target(target, origin)?))
-            }
+            Self::Pane(PaneAction::Close) => R::Pane(ResolvedPaneAction::Close),
+            Self::Pane(PaneAction::Focus(target)) => R::Pane(ResolvedPaneAction::Focus(
+                resolve_pane_target(target, origin)?,
+            )),
+            Self::Pane(PaneAction::Move(target)) => R::Pane(ResolvedPaneAction::Move(
+                resolve_pane_target(target, origin)?,
+            )),
+            Self::Pane(PaneAction::Swap(target)) => R::Pane(ResolvedPaneAction::Swap(
+                resolve_pane_target(target, origin)?,
+            )),
             Self::Pane(PaneAction::Resize { direction, amount }) => {
-                let direction = resolve_scalar(direction, origin)?;
-                ensure_direction(&direction, "pane.direction")?;
+                let direction = resolve_direction(direction, origin, "pane.direction")?;
                 let amount = amount
                     .as_ref()
-                    .map(|amount| {
-                        let amount = resolve_scalar(amount, origin)?;
-                        ensure_non_null_scalar(&amount, "pane.amount")?;
-                        Ok(amount)
-                    })
+                    .map(|value| resolve_amount(value, origin))
                     .transpose()?;
-                Self::Pane(PaneAction::Resize { direction, amount })
+                R::Pane(ResolvedPaneAction::Resize { direction, amount })
             }
-            Self::Pane(PaneAction::Zoom { enabled }) => {
-                let enabled = resolve_optional_bool(enabled.as_ref(), origin, "pane.enabled")?;
-                Self::Pane(PaneAction::Zoom { enabled })
-            }
+            Self::Pane(PaneAction::Zoom { enabled }) => R::Pane(ResolvedPaneAction::Zoom {
+                enabled: resolve_optional_bool(enabled.as_ref(), origin, "pane.enabled")?,
+            }),
             Self::Pane(PaneAction::Fullscreen { enabled }) => {
-                let enabled = resolve_optional_bool(enabled.as_ref(), origin, "pane.enabled")?;
-                Self::Pane(PaneAction::Fullscreen { enabled })
+                R::Pane(ResolvedPaneAction::Fullscreen {
+                    enabled: resolve_optional_bool(enabled.as_ref(), origin, "pane.enabled")?,
+                })
             }
-            Self::Pane(PaneAction::Floating { enabled }) => {
-                let enabled = resolve_optional_bool(enabled.as_ref(), origin, "pane.enabled")?;
-                Self::Pane(PaneAction::Floating { enabled })
-            }
-            Self::Pane(PaneAction::Frame { visible }) => {
-                let visible = resolve_optional_bool(visible.as_ref(), origin, "pane.visible")?;
-                Self::Pane(PaneAction::Frame { visible })
-            }
-            Self::Session(SessionAction::Create) => Self::Session(SessionAction::Create),
+            Self::Pane(PaneAction::Floating { enabled }) => R::Pane(ResolvedPaneAction::Floating {
+                enabled: resolve_optional_bool(enabled.as_ref(), origin, "pane.enabled")?,
+            }),
+            Self::Pane(PaneAction::Frame { visible }) => R::Pane(ResolvedPaneAction::Frame {
+                visible: resolve_optional_bool(visible.as_ref(), origin, "pane.visible")?,
+            }),
+            Self::Session(SessionAction::Create) => R::Session(ResolvedSessionAction::Create),
             Self::Session(SessionAction::Attach { name }) => {
-                let name = resolve_scalar(name, origin)?;
-                ensure_string(&name, "session.name")?;
-                Self::Session(SessionAction::Attach { name })
+                R::Session(ResolvedSessionAction::Attach {
+                    name: SessionName::new(resolve_text(name, origin, "session.name")?),
+                })
             }
             Self::Session(SessionAction::Switch { name }) => {
-                let name = resolve_scalar(name, origin)?;
-                ensure_string(&name, "session.name")?;
-                Self::Session(SessionAction::Switch { name })
+                R::Session(ResolvedSessionAction::Switch {
+                    name: SessionName::new(resolve_text(name, origin, "session.name")?),
+                })
             }
             Self::Session(SessionAction::Rename { name }) => {
-                let name = resolve_scalar(name, origin)?;
-                ensure_string(&name, "session.name")?;
-                Self::Session(SessionAction::Rename { name })
+                R::Session(ResolvedSessionAction::Rename {
+                    name: SessionName::new(resolve_text(name, origin, "session.name")?),
+                })
             }
-            Self::Session(SessionAction::Detach) => Self::Session(SessionAction::Detach),
-            Self::Session(SessionAction::Quit) => Self::Session(SessionAction::Quit),
-            Self::Session(SessionAction::Kill) => Self::Session(SessionAction::Kill),
+            Self::Session(SessionAction::Detach) => R::Session(ResolvedSessionAction::Detach),
+            Self::Session(SessionAction::Quit) => R::Session(ResolvedSessionAction::Quit),
+            Self::Session(SessionAction::Kill) => R::Session(ResolvedSessionAction::Kill),
         })
     }
 }
 
-fn resolve_scalar(
+fn context_value(
     scalar: &ActionScalar,
     origin: &OriginContext,
-) -> Result<ActionScalar, PortableActionResolutionError> {
-    scalar
-        .resolve_context(origin)
-        .map_err(PortableActionResolutionError::Context)
-}
-
-fn resolve_target(
-    target: &IndexOrDirection,
-    origin: &OriginContext,
-) -> Result<IndexOrDirection, PortableActionResolutionError> {
-    match target {
-        IndexOrDirection::Index(index) => {
-            let index = resolve_scalar(index, origin)?;
-            ensure_index(&index, "index")?;
-            Ok(IndexOrDirection::Index(index))
+) -> Result<Option<ContextValue>, PortableActionResolutionError> {
+    match &scalar.value.kind {
+        ConfigValueKind::Context(reference) => {
+            reference.path.resolve(origin).map(Some).ok_or_else(|| {
+                PortableActionResolutionError::Context(ContextResolutionError {
+                    reference: reference.clone(),
+                })
+            })
         }
-        IndexOrDirection::Direction(direction) => {
-            let direction = resolve_scalar(direction, origin)?;
-            ensure_direction(&direction, "direction")?;
-            Ok(IndexOrDirection::Direction(direction))
-        }
+        _ => Ok(None),
     }
 }
 
-fn resolve_optional_string(
+fn context_text(
+    value: ContextValue,
+    scalar: &ActionScalar,
+    parameter: &'static str,
+) -> Result<String, PortableActionResolutionError> {
+    Ok(match value {
+        ContextValue::String(value) | ContextValue::Url(value) => value,
+        ContextValue::HostKind(value) => value.to_string(),
+        ContextValue::ServerId(value) => value.into_string(),
+        ContextValue::ClientId(value) => value.into_string(),
+        ContextValue::SessionId(value) => value.into_string(),
+        ContextValue::WorkspaceId(value) => value.into_string(),
+        ContextValue::TabId(value) => value.into_string(),
+        ContextValue::PaneId(value) => value.into_string(),
+        ContextValue::PaneType(value) => value.to_string(),
+        ContextValue::InvocationSource(value) => value.to_string(),
+        ContextValue::WorktreeId(value) => value.into_string(),
+        ContextValue::AgentId(value) => value.into_string(),
+        ContextValue::LinkHandlerId(value) => value.into_string(),
+        ContextValue::AbsolutePath(value) => {
+            value.into_os_string().into_string().map_err(|_| {
+                invalid_value(
+                    scalar,
+                    parameter,
+                    "path cannot be represented as UTF-8 text",
+                )
+            })?
+        }
+        ContextValue::UnsignedInteger(_) => {
+            return Err(invalid_value(scalar, parameter, "value must be a string"));
+        }
+    })
+}
+
+fn resolve_text(
+    scalar: &ActionScalar,
+    origin: &OriginContext,
+    parameter: &'static str,
+) -> Result<String, PortableActionResolutionError> {
+    if let Some(value) = context_value(scalar, origin)? {
+        return context_text(value, scalar, parameter);
+    }
+    scalar
+        .value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_value(scalar, parameter, "value must be a string"))
+}
+
+fn resolve_word(
+    scalar: &ActionScalar,
+    origin: &OriginContext,
+    parameter: &'static str,
+) -> Result<CommandWord, PortableActionResolutionError> {
+    if let Some(value) = context_value(scalar, origin)? {
+        return match value {
+            ContextValue::AbsolutePath(path) => AbsolutePath::new(path)
+                .map(CommandWord::Path)
+                .map_err(|_| invalid_value(scalar, parameter, "path must be absolute")),
+            value => context_text(value, scalar, parameter).map(CommandWord::Text),
+        };
+    }
+    scalar
+        .value
+        .as_str()
+        .map(|value| CommandWord::Text(value.to_owned()))
+        .ok_or_else(|| invalid_value(scalar, parameter, "value must be a string"))
+}
+
+fn resolve_cwd(
+    scalar: &ActionScalar,
+    origin: &OriginContext,
+    parameter: &'static str,
+) -> Result<CommandCwd, PortableActionResolutionError> {
+    if let Some(value) = context_value(scalar, origin)? {
+        let ContextValue::AbsolutePath(path) = value else {
+            return Err(invalid_value(scalar, parameter, "value must be a string"));
+        };
+        return AbsolutePath::new(path)
+            .map(CommandCwd::Origin)
+            .map_err(|_| invalid_value(scalar, parameter, "path must be absolute"));
+    }
+    scalar
+        .value
+        .as_str()
+        .map(|value| CommandCwd::Literal(PathBuf::from(value)))
+        .ok_or_else(|| invalid_value(scalar, parameter, "value must be a string"))
+}
+
+fn resolve_workspace(
+    scalar: &ActionScalar,
+    origin: &OriginContext,
+) -> Result<WorkspaceId, PortableActionResolutionError> {
+    if let Some(value) = context_value(scalar, origin)? {
+        return match value {
+            ContextValue::WorkspaceId(id) => Ok(id),
+            _ => Err(invalid_value(
+                scalar,
+                "tab.workspace-id",
+                "value must be a string",
+            )),
+        };
+    }
+    scalar
+        .value
+        .as_str()
+        .map(WorkspaceId::new)
+        .ok_or_else(|| invalid_value(scalar, "tab.workspace-id", "value must be a string"))
+}
+
+fn resolve_optional_text(
     scalar: Option<&ActionScalar>,
     origin: &OriginContext,
     parameter: &'static str,
-) -> Result<Option<ActionScalar>, PortableActionResolutionError> {
+) -> Result<Option<String>, PortableActionResolutionError> {
     scalar
-        .map(|scalar| {
-            let scalar = resolve_scalar(scalar, origin)?;
-            ensure_string(&scalar, parameter)?;
-            Ok(scalar)
+        .map(|value| resolve_text(value, origin, parameter))
+        .transpose()
+}
+
+fn resolve_optional_bool(
+    scalar: Option<&ActionScalar>,
+    origin: &OriginContext,
+    parameter: &'static str,
+) -> Result<Option<bool>, PortableActionResolutionError> {
+    scalar
+        .map(|value| {
+            if context_value(value, origin)?.is_some() {
+                return Err(invalid_value(value, parameter, "value must be boolean"));
+            }
+            match value.value.kind {
+                ConfigValueKind::Boolean(value) => Ok(value),
+                _ => Err(invalid_value(value, parameter, "value must be boolean")),
+            }
         })
         .transpose()
 }
 
-fn resolve_optional_direction(
-    scalar: Option<&ActionScalar>,
+fn resolve_direction(
+    scalar: &ActionScalar,
     origin: &OriginContext,
     parameter: &'static str,
-) -> Result<Option<ActionScalar>, PortableActionResolutionError> {
-    scalar
-        .map(|scalar| {
-            let scalar = resolve_scalar(scalar, origin)?;
-            ensure_direction(&scalar, parameter)?;
-            Ok(scalar)
+) -> Result<Direction, PortableActionResolutionError> {
+    let parse = |value: &str| {
+        value.parse().map_err(|_| {
+            invalid_value(
+                scalar,
+                parameter,
+                "direction must be left, right, up, down, next, or previous",
+            )
         })
-        .transpose()
+    };
+    if let Some(value) = scalar.value.as_str() {
+        return parse(value);
+    }
+    parse(&resolve_text(scalar, origin, parameter)?)
+}
+
+fn resolve_key(
+    scalar: &ActionScalar,
+    origin: &OriginContext,
+) -> Result<CanonicalKey, PortableActionResolutionError> {
+    let parse = |value: &str| {
+        CanonicalKey::parse(value).map_err(|error| {
+            invalid_value(
+                scalar,
+                "keyboard.keys",
+                format!("invalid canonical key: {error}"),
+            )
+        })
+    };
+    if let Some(value) = scalar.value.as_str() {
+        return parse(value);
+    }
+    parse(&resolve_text(scalar, origin, "keyboard.keys")?)
+}
+
+fn resolve_index(
+    scalar: &ActionScalar,
+    origin: &OriginContext,
+) -> Result<u64, PortableActionResolutionError> {
+    if let Some(ContextValue::UnsignedInteger(value)) = context_value(scalar, origin)? {
+        return Ok(value);
+    }
+    if let ConfigValueKind::Integer(value) = scalar.value.kind
+        && let Ok(value) = u64::try_from(value)
+    {
+        return Ok(value);
+    }
+    Err(invalid_value(
+        scalar,
+        "index",
+        "index must be a non-negative integer",
+    ))
+}
+
+fn resolve_tab_target(
+    target: &IndexOrDirection,
+    origin: &OriginContext,
+) -> Result<ResolvedTabTarget, PortableActionResolutionError> {
+    match target {
+        IndexOrDirection::Index(value) => Ok(ResolvedTabTarget::Index(TabIndex::new(
+            resolve_index(value, origin)?,
+        ))),
+        IndexOrDirection::Direction(value) => Ok(ResolvedTabTarget::Direction(resolve_direction(
+            value,
+            origin,
+            "direction",
+        )?)),
+    }
+}
+
+fn resolve_pane_target(
+    target: &IndexOrDirection,
+    origin: &OriginContext,
+) -> Result<ResolvedPaneTarget, PortableActionResolutionError> {
+    match target {
+        IndexOrDirection::Index(value) => Ok(ResolvedPaneTarget::Index(PaneIndex::new(
+            resolve_index(value, origin)?,
+        ))),
+        IndexOrDirection::Direction(value) => Ok(ResolvedPaneTarget::Direction(resolve_direction(
+            value,
+            origin,
+            "direction",
+        )?)),
+    }
+}
+
+fn resolve_amount(
+    scalar: &ActionScalar,
+    origin: &OriginContext,
+) -> Result<ResizeAmount, PortableActionResolutionError> {
+    if let Some(value) = context_value(scalar, origin)? {
+        return match value {
+            ContextValue::UnsignedInteger(value) => Ok(ResizeAmount::Unsigned(value)),
+            value => context_text(value, scalar, "pane.amount").map(ResizeAmount::Text),
+        };
+    }
+    match &scalar.value.kind {
+        ConfigValueKind::Integer(value) => Ok(ResizeAmount::Integer(*value)),
+        ConfigValueKind::Float(value) => Ok(ResizeAmount::Float(*value)),
+        ConfigValueKind::Boolean(value) => Ok(ResizeAmount::Boolean(*value)),
+        ConfigValueKind::String(value) => Ok(ResizeAmount::Text(value.clone())),
+        _ => Err(invalid_value(
+            scalar,
+            "pane.amount",
+            "value must be a non-null scalar",
+        )),
+    }
 }
 
 fn resolve_create_command(
@@ -1201,135 +1578,23 @@ fn resolve_create_command(
     program_parameter: &'static str,
     args_parameter: &'static str,
     cwd_parameter: &'static str,
-) -> Result<CreateCommand, PortableActionResolutionError> {
+) -> Result<ResolvedCreateCommand, PortableActionResolutionError> {
     let program = command
         .program
         .as_ref()
-        .map(|program| {
-            let program = resolve_scalar(program, origin)?;
-            ensure_string(&program, program_parameter)?;
-            Ok(program)
-        })
+        .map(|value| resolve_word(value, origin, program_parameter))
         .transpose()?;
     let args = command
         .args
         .iter()
-        .map(|argument| {
-            let argument = resolve_scalar(argument, origin)?;
-            ensure_string(&argument, args_parameter)?;
-            Ok(argument)
-        })
-        .collect::<Result<_, PortableActionResolutionError>>()?;
+        .map(|value| resolve_word(value, origin, args_parameter))
+        .collect::<Result<_, _>>()?;
     let cwd = command
         .cwd
         .as_ref()
-        .map(|cwd| {
-            let context_path = matches!(cwd.value.kind, ConfigValueKind::Context(_));
-            let cwd = resolve_scalar(cwd, origin)?;
-            if context_path {
-                ensure_absolute_path(&cwd, cwd_parameter)?;
-            } else {
-                ensure_string(&cwd, cwd_parameter)?;
-            }
-            Ok(cwd)
-        })
+        .map(|value| resolve_cwd(value, origin, cwd_parameter))
         .transpose()?;
-    Ok(CreateCommand { program, args, cwd })
-}
-
-fn resolve_optional_bool(
-    scalar: Option<&ActionScalar>,
-    origin: &OriginContext,
-    parameter: &'static str,
-) -> Result<Option<ActionScalar>, PortableActionResolutionError> {
-    scalar
-        .map(|scalar| {
-            let scalar = resolve_scalar(scalar, origin)?;
-            ensure_bool(&scalar, parameter)?;
-            Ok(scalar)
-        })
-        .transpose()
-}
-
-fn ensure_key(scalar: &ActionScalar) -> Result<(), PortableActionResolutionError> {
-    let value = ensure_string(scalar, "keyboard.keys")?;
-    CanonicalKey::parse(value).map(|_| ()).map_err(|error| {
-        invalid_value(
-            scalar,
-            "keyboard.keys",
-            format!("invalid canonical key: {error}"),
-        )
-    })
-}
-
-fn ensure_direction(
-    scalar: &ActionScalar,
-    parameter: &'static str,
-) -> Result<(), PortableActionResolutionError> {
-    ensure_string(scalar, parameter)?
-        .parse::<Direction>()
-        .map(|_| ())
-        .map_err(|_| {
-            invalid_value(
-                scalar,
-                parameter,
-                "direction must be left, right, up, down, next, or previous",
-            )
-        })
-}
-
-fn ensure_index(
-    scalar: &ActionScalar,
-    parameter: &'static str,
-) -> Result<(), PortableActionResolutionError> {
-    matches!(scalar.value.kind, ConfigValueKind::Integer(value) if value >= 0)
-        .then_some(())
-        .ok_or_else(|| invalid_value(scalar, parameter, "index must be a non-negative integer"))
-}
-
-fn ensure_bool(
-    scalar: &ActionScalar,
-    parameter: &'static str,
-) -> Result<(), PortableActionResolutionError> {
-    matches!(scalar.value.kind, ConfigValueKind::Boolean(_))
-        .then_some(())
-        .ok_or_else(|| invalid_value(scalar, parameter, "value must be boolean"))
-}
-
-fn ensure_string<'a>(
-    scalar: &'a ActionScalar,
-    parameter: &'static str,
-) -> Result<&'a str, PortableActionResolutionError> {
-    scalar
-        .value
-        .as_str()
-        .ok_or_else(|| invalid_value(scalar, parameter, "value must be a string"))
-}
-
-fn ensure_absolute_path(
-    scalar: &ActionScalar,
-    parameter: &'static str,
-) -> Result<(), PortableActionResolutionError> {
-    let value = ensure_string(scalar, parameter)?;
-    std::path::Path::new(value)
-        .is_absolute()
-        .then_some(())
-        .ok_or_else(|| invalid_value(scalar, parameter, "path must be absolute"))
-}
-
-fn ensure_non_null_scalar(
-    scalar: &ActionScalar,
-    parameter: &'static str,
-) -> Result<(), PortableActionResolutionError> {
-    (!matches!(
-        scalar.value.kind,
-        ConfigValueKind::Null
-            | ConfigValueKind::Mapping(_)
-            | ConfigValueKind::Sequence(_)
-            | ConfigValueKind::Context(_)
-    ))
-    .then_some(())
-    .ok_or_else(|| invalid_value(scalar, parameter, "value must be a non-null scalar"))
+    Ok(ResolvedCreateCommand { program, args, cwd })
 }
 
 fn invalid_value(
