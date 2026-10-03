@@ -283,14 +283,7 @@ async fn bring_hosts(
     let root = short_tempdir(&format!("muxe-live-{case}-"))?;
     let scoped_root = root.path().join("scoped");
     let (config_file, cache_dir) = init_shared_dirs(init_bin, &scoped_root).await?;
-
-    let mut herdr = OwnedHerdrServer::start(herdr_binary, root.path(), &scoped_root, case).await?;
-    let discovery = herdr.discovery_key().to_owned();
-    if herdr.try_wait()?.is_some() {
-        return Err(io::Error::other(format!(
-            "{case}: herdr server exited on startup"
-        )));
-    }
+    let expected_bridge = OwnedZellijHost::installed_bridge_identity(install_bin).await?;
 
     let mut host = OwnedZellijHost::prepare(zellij_binary, root.path(), case)?;
     // Receipt-owned pre-state before any startup: the real public
@@ -299,6 +292,15 @@ async fn bring_hosts(
     // preflight finds receipt-owned bytes. `install_bin` selects the
     // pre-state generation (old for upgrade rehearsal, target for smoke).
     install_zellij_integration(case, install_bin, &host, &scoped_root).await?;
+    OwnedZellijHost::validate_prepared_bridge(&scoped_root, &expected_bridge)?;
+    let mut herdr = OwnedHerdrServer::start(herdr_binary, root.path(), &scoped_root, case).await?;
+    let discovery = herdr.discovery_key().to_owned();
+    if herdr.try_wait()?.is_some() {
+        return Err(io::Error::other(format!(
+            "{case}: herdr server exited on startup"
+        )));
+    }
+
     if let Some(binary) = ui_hotkey {
         use std::io::Write as _;
         let path = binary
@@ -377,8 +379,14 @@ keybinds {{
     host.run_permission_seed(seeder, &stable.display().to_string(), &scoped_root)
         .await?;
     for (session, _) in sessions {
-        host.serve_foreground(foreground, bootstrap, session, &scoped_root)
-            .await?;
+        host.serve_foreground(
+            foreground,
+            bootstrap,
+            session,
+            &scoped_root,
+            &expected_bridge,
+        )
+        .await?;
     }
     if !host.has_server_child() {
         return Err(io::Error::other(format!(
@@ -397,6 +405,9 @@ keybinds {{
                     .await?,
             );
         }
+    }
+    for (session, count) in sessions {
+        host.finish_bootstrap_handoff(session, *count).await?;
     }
 
     let continuity = ContinuityGuard::watch_herdr(

@@ -124,8 +124,8 @@ pub async fn install_zellij_integration(
 
 /// Startup handshake budget for one owned host server.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
-/// Bound on one bootstrap peer lifetime: connect, first-client init, and
-/// first render evidence, then a detach-style close.
+/// Bound on bootstrap initialization, bridge readiness, and the explicit
+/// retained-client handoff.
 pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
 /// Explicit PTY geometry for bootstrap and interactive clients. `script(1)`
 /// can inherit a zero/nonterminal size; every owned terminal sets its own
@@ -745,27 +745,20 @@ async fn wait_for_herdr_handshake(socket: &Path) -> io::Result<String> {
     }
 }
 
-/// One owned Zellij host: isolated environment plus named sessions.
+struct BootstrapPeer {
+    socket: PathBuf,
+    client: muxe_core::ClientId,
+    child: OwnedChild,
+}
+
+/// One owned Zellij host with isolated endpoints and retained server children.
 ///
-/// Isolation (scoped `HOME`/`XDG`/`TMPDIR`/`ZELLIJ_SOCKET_DIR`, explicit config and
-/// data dirs, session lifecycle commands, socket-directory discovery) is
-/// verified from the owned contract probe
-/// (`.local/zellij-contract-probe/run-host.sh`); only ambient-user-state
-/// avoidance comes from there. The probe script itself is NOT copied for
-/// server ownership: it also runs `attach --create-background`, whose
-/// launcher daemonizes the server.
-///
-/// Server-process ownership is deliberately NOT claimed here. The pinned
-/// server unconditionally daemonizes on Unix, so no distributed-binary argv
-/// (including `--server` alone) yields a retained host child, and no
-/// foreground flag is invented. The feasible fixture is a test-only
-/// foreground entrypoint linked against the exact pinned zellij-server
-/// calling its exported `start_server_impl` with the same real OS
-/// input/debug setup (core coordinates build and pin; no pin-source patch,
-/// no shipped helper). Until that entrypoint exists this type owns the
-/// environment, session bookkeeping, and teardown sequencing, and every
-/// runner fails closed via [`OwnedZellijHost::has_server_child`] rather
-/// than pretending a launcher owns the server.
+/// The pinned CLI daemonizes its server on Unix. The runner instead uses the
+/// test-only foreground entrypoint linked to the exact pinned
+/// `zellij-server::start_server_impl`, without patching the host source.
+/// A retained bootstrap peer proves session and bridge readiness, then hands
+/// the session to the complete initial PTY client set. Shutdown reaps the
+/// owned foreground servers and any bootstrap peers still awaiting handoff.
 pub struct OwnedZellijHost {
     zellij_binary: PathBuf,
     root: PathBuf,
@@ -775,13 +768,146 @@ pub struct OwnedZellijHost {
     config_dir: PathBuf,
     data_dir: PathBuf,
     servers: Vec<OwnedChild>,
+    bootstrap_peers: Vec<BootstrapPeer>,
     sessions: Vec<String>,
 }
 
 impl OwnedZellijHost {
+    /// Reads the selected installation's native bridge identity. The existing
+    /// installation validator returns only its path, so retain this report
+    /// separately instead of substituting this test crate's current constants.
+    pub async fn installed_bridge_identity(
+        binary: &Path,
+    ) -> io::Result<muxe_zellij_protocol::BridgeIdentity> {
+        let root = short_tempdir("muxe-bridge-probe-")?;
+        let mut command = Command::new(binary);
+        command
+            .arg("compatibility")
+            .arg("--json")
+            .current_dir(root.path());
+        apply_scoped_env(&mut command, root.path());
+        let output = run_cli_bounded("installed-bridge-identity", &mut command).await?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "selected installation's compatibility probe failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            )));
+        }
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(io::Error::other)?;
+        let muxe_version = Self::take_native_text(&mut report, "muxe_version")?;
+        let mut zellij = report
+            .get_mut("hosts")
+            .and_then(|hosts| hosts.get_mut("zellij"))
+            .map(serde_json::Value::take)
+            .ok_or_else(|| {
+                io::Error::other("selected native report has no Zellij compatibility")
+            })?;
+        let bridge_build_id = if zellij
+            .get("bridge_build_id")
+            .is_none_or(serde_json::Value::is_null)
+        {
+            None
+        } else {
+            Some(Self::take_native_fingerprint(
+                &mut zellij,
+                "bridge_build_id",
+            )?)
+        };
+        let identity = muxe_zellij_protocol::BridgeIdentity {
+            muxe_version,
+            source_revision: Self::take_native_text(&mut zellij, "source_revision")?,
+            action_fingerprint: Self::take_native_fingerprint(
+                &mut zellij,
+                "generated_action_fingerprint",
+            )?
+            .0,
+            protocol_fingerprint: Self::take_native_fingerprint(
+                &mut zellij,
+                "bridge_protocol_fingerprint",
+            )?
+            .0,
+            bridge_build_id,
+        };
+        identity.validate().map_err(io::Error::other)?;
+        Ok(identity)
+    }
+
+    fn take_native_text(report: &mut serde_json::Value, field: &str) -> io::Result<String> {
+        match report.get_mut(field).map(serde_json::Value::take) {
+            Some(serde_json::Value::String(text)) => Ok(text),
+            _ => Err(io::Error::other(format!(
+                "selected native report has no text field {field}",
+            ))),
+        }
+    }
+
+    fn take_native_fingerprint(
+        report: &mut serde_json::Value,
+        field: &str,
+    ) -> io::Result<muxe_protocol::wire::SchemaFingerprint> {
+        let digest = muxe::integration::Sha256Digest::parse(Self::take_native_text(report, field)?)
+            .map_err(io::Error::other)?;
+        let mut bytes = [0; 32];
+        for (byte, pair) in bytes
+            .iter_mut()
+            .zip(digest.as_str().as_bytes().chunks_exact(2))
+        {
+            let pair = std::str::from_utf8(pair).expect("validated hexadecimal is ASCII");
+            *byte = u8::from_str_radix(pair, 16).expect("validated hexadecimal pair");
+        }
+        Ok(muxe_protocol::wire::SchemaFingerprint(bytes))
+    }
+
+    /// Checks the prepared receipt and bytes against the selected historical
+    /// native report before spawning any Zellij server or bridge probe.
+    pub fn validate_prepared_bridge(
+        scoped_root: &Path,
+        native: &muxe_zellij_protocol::BridgeIdentity,
+    ) -> io::Result<()> {
+        let config_dir = scoped_root.join("config").join("muxe");
+        let directory = muxe::integration::integration_dir(&config_dir);
+        let prepared = muxe::integration::receipt::load(&directory)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("bootstrap has no prepared managed bridge receipt"))?
+            .bridge;
+        let authority = muxe::integration::existing_bridge_identity(&config_dir)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("prepared bridge has no physical authority"))?;
+        let (eligibility, _) = muxe::integration::bridge::check_destination(
+            &authority.stable_path(std::ffi::OsStr::new(muxe::integration::BRIDGE_FILE_NAME)),
+            Some(&prepared.installed_digest),
+        )
+        .map_err(io::Error::other)?;
+        if !matches!(
+            eligibility,
+            muxe::integration::bridge::Eligibility::EligibleReplace { .. }
+        ) {
+            return Err(io::Error::other("prepared managed bridge bytes are absent"));
+        }
+        if prepared.bridge_identity != authority
+            || prepared.installed_version != native.muxe_version
+            || prepared
+                .bridge_compat
+                .as_ref()
+                .is_some_and(|compatibility| {
+                    compatibility.source_revision != native.source_revision
+                        || compatibility.generated_action_fingerprint.0 != native.action_fingerprint
+                        || compatibility.bridge_protocol_fingerprint.0
+                            != native.protocol_fingerprint
+                        || compatibility.bridge_build_id != native.bridge_build_id
+                })
+        {
+            return Err(io::Error::other(
+                "prepared receipt, bridge bytes, and selected native record disagree",
+            ));
+        }
+        Ok(())
+    }
+
     /// Prepares the isolated environment under `root/{name}` without
-    /// starting any process. Pair with the core-coordinated foreground
-    /// server entrypoint once it lands; see the type-level docs.
+    /// starting any process. After integration install, `serve_foreground`
+    /// starts and retains the pinned server and bootstrap peer.
     pub fn prepare(zellij_binary: &Path, root: &Path, name: &str) -> io::Result<Self> {
         if !zellij_binary.is_absolute() {
             return Err(io::Error::new(
@@ -816,14 +942,11 @@ impl OwnedZellijHost {
         ] {
             std::fs::create_dir_all(dir)?;
         }
-        // Intentionally empty config: the runner supplies an explicit
-        // one-pane layout and uses no user configuration. The managed
-        // bridge is NOT smuggled through this config: it enters live
-        // sessions through the real public path, the coordinator's
-        // per-session `start-or-reload-plugin <stable-url>` reload during
-        // `muxe activate` (see the fault-injector reload shape). An empty
-        // config plus digest metadata alone would never count as bridge
-        // proof; only live bridge registrations do.
+        // Begin with an empty owned config, never user configuration. Before
+        // startup, the runner's public integration install writes the stable
+        // bridge and receipt and adds the managed autoload nodes here.
+        // Bootstrap requires a real bridge registration before client handoff;
+        // later activation reloads the bridge when the transaction requires it.
         let config_file = config_dir.join("config.kdl");
         std::fs::write(
             &config_file,
@@ -838,6 +961,7 @@ impl OwnedZellijHost {
             config_dir,
             data_dir: data,
             servers: Vec::new(),
+            bootstrap_peers: Vec::new(),
             sessions: Vec::new(),
         })
     }
@@ -846,19 +970,19 @@ impl OwnedZellijHost {
     /// this host's session socket path, initializes the session with a
     /// real first-client bootstrap, and tracks the session. The entrypoint
     /// runs the exact pinned server (`start_server_impl`, no mocks, no
-    /// pin-source patch); the returned child is the retained foreground
-    /// server process. A bare server starts with `session_data = None`,
-    /// so the socket alone is never readiness: the owned bootstrap peer
-    /// sends `FirstClientConnected` and only a real server render counts
-    /// as initialized-session evidence, observed before any PTY client
-    /// attaches. Any failure reaps the server child and reports both
-    /// diagnostics.
+    /// pin-source patch). The host retains both the foreground server and
+    /// bootstrap peer and returns the session socket path. A real render
+    /// proves session initialization; a receipt-matched bridge registration
+    /// separately proves autoload completion before any PTY client attaches.
+    /// The bootstrap remains connected until all initial PTY clients attach.
+    /// Any startup failure reaps the owned children and preserves diagnostics.
     pub async fn serve_foreground(
         &mut self,
         helper: &Path,
         bootstrap: &Path,
         session: &str,
         scoped_root: &Path,
+        expected: &muxe_zellij_protocol::BridgeIdentity,
     ) -> io::Result<PathBuf> {
         for (name, path) in [
             ("foreground entrypoint", helper),
@@ -881,18 +1005,22 @@ impl OwnedZellijHost {
             }
         }
         let mut child = self.spawn_foreground_server(helper, session, scoped_root)?;
+        let mut bootstrap_child = None;
+        let mut bootstrap_client = None;
         let outcome: io::Result<PathBuf> = async {
             // The socket proves the listener bound; the bootstrap render
             // proves initialization, and the CLI poll proves a subsequent
             // `attach` can discover the initialized session. Zellij publishes
-            // that registry state asynchronously after the bootstrap exits.
+            // that registry state asynchronously after first render.
             self.wait_for_session(session).await?;
-            self.run_bootstrap(bootstrap, session, scoped_root).await?;
+            bootstrap_child = Some(self.run_bootstrap(bootstrap, session, scoped_root).await?);
             self.wait_for_cli_session(session).await?;
-            // The bootstrap closes detach-style, so the server must still
-            // be alive with the session retained for the real clients.
-            // (`child` is not yet attached; the caller asserts the full
-            // set through `has_server_child`/`check_servers_alive`.)
+            bootstrap_client = Some(
+                self.await_bootstrap_bridge(session, scoped_root, expected)
+                    .await?,
+            );
+            // Keep the bootstrap allocated through the complete initial PTY
+            // client set, so no startup client can reuse its identity.
             if child.try_wait()?.is_some() {
                 return Err(io::Error::other(format!(
                     "owned Zellij server for session '{session}' exited during bootstrap"
@@ -905,15 +1033,41 @@ impl OwnedZellijHost {
         match outcome {
             Ok(socket) => {
                 self.attach_server_child(child);
+                self.bootstrap_peers.push(BootstrapPeer {
+                    socket: socket.clone(),
+                    client: bootstrap_client.expect("startup proved the bootstrap bridge"),
+                    child: bootstrap_child.expect("successful startup retains its bootstrap peer"),
+                });
                 Ok(socket)
             }
             Err(error) => {
-                let diagnostics = child.terminate_and_reap().await?;
-                Err(io::Error::other(format!(
-                    "foreground session '{session}' failed to initialize: {error}\n--- server stdout ---\n{}\n--- server stderr ---\n{}",
-                    diagnostics.stdout_tail.lossy(),
-                    diagnostics.stderr_tail.lossy(),
-                )))
+                use std::fmt::Write as _;
+                let bootstrap_cleanup = if let Some(mut bootstrap) = bootstrap_child {
+                    Some(bootstrap.terminate_and_reap().await)
+                } else {
+                    None
+                };
+                let server_cleanup = child.terminate_and_reap().await;
+                let mut report =
+                    format!("foreground session '{session}' failed to initialize: {error}");
+                for (role, cleanup) in [
+                    ("bootstrap", bootstrap_cleanup),
+                    ("server", Some(server_cleanup)),
+                ] {
+                    if let Some(cleanup) = cleanup {
+                        match cleanup {
+                            Ok(diagnostics) => write!(
+                                report,
+                                "\n--- {role} stdout ---\n{}\n--- {role} stderr ---\n{}",
+                                diagnostics.stdout_tail.lossy(),
+                                diagnostics.stderr_tail.lossy(),
+                            ),
+                            Err(error) => write!(report, "\n{role} cleanup failed: {error}"),
+                        }
+                        .expect("writing diagnostics to a String cannot fail");
+                    }
+                }
+                Err(io::Error::other(report))
             }
         }
     }
@@ -964,6 +1118,8 @@ impl OwnedZellijHost {
             .arg(&self.config_dir)
             .arg("--data-dir")
             .arg(&self.data_dir)
+            .arg("--ready-file")
+            .arg(self.workdir.join(format!("bootstrap-{session}.ready")))
             .arg("--cwd")
             .arg(&self.workdir)
             .arg("--rows")
@@ -978,46 +1134,127 @@ impl OwnedZellijHost {
         command
     }
 
-    /// Runs the owned bootstrap peer to completion inside a bound and
-    /// asserts initialized-session evidence: a clean exit with a nonempty
-    /// render report on stdout. Expiry kills with escalation and fails
-    /// closed with both captured streams; a live server with no session
-    /// can never pass.
+    /// Retains the bootstrap after its explicit first-render evidence. Bridge
+    /// readiness and the complete initial PTY client set must be observed
+    /// before the runner authorizes its detach.
     async fn run_bootstrap(
         &self,
         bootstrap: &Path,
         session: &str,
         scoped_root: &Path,
-    ) -> io::Result<()> {
+    ) -> io::Result<OwnedChild> {
         let mut command = self.bootstrap_command(bootstrap, session, scoped_root);
-        let mut child = OwnedChild::spawn(&format!("{session}-bootstrap"), &mut command)?;
-        let outcome = tokio::time::timeout(BOOTSTRAP_TIMEOUT, child.wait()).await;
-        match outcome {
-            Err(_) => {
+        let mut child =
+            OwnedChild::spawn_with_open_stdin(&format!("{session}-bootstrap"), &mut command)?;
+        let ready = self.workdir.join(format!("bootstrap-{session}.ready"));
+        let deadline = tokio::time::Instant::now() + BOOTSTRAP_TIMEOUT;
+        loop {
+            if child.try_wait()?.is_some() || tokio::time::Instant::now() >= deadline {
                 let diagnostics = child.terminate_and_reap().await?;
                 return Err(io::Error::other(format!(
-                    "bootstrap peer for session '{session}' exceeded the bounded lifetime:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    "bootstrap peer for session '{session}' proved no initialized session (status {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    diagnostics.exit_status,
                     diagnostics.stdout_tail.lossy(),
                     diagnostics.stderr_tail.lossy(),
                 )));
             }
-            Ok(Err(error)) => return Err(error),
-            Ok(Ok(_)) => {}
+            if std::fs::read_to_string(&ready)
+                .ok()
+                .and_then(|report| report.parse::<usize>().ok())
+                .is_some_and(|bytes| bytes > 0)
+            {
+                return Ok(child);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        let diagnostics = child.terminate_and_reap().await?;
-        let clean = diagnostics
-            .exit_status
-            .is_some_and(|status| status.success());
-        let report = diagnostics.stdout_tail.lossy();
-        if !clean || report.trim().is_empty() {
-            return Err(io::Error::other(format!(
-                "bootstrap peer for session '{session}' proved no initialized session (status {:?}):\n--- stdout ---\n{report}\n--- stderr ---\n{}",
-                diagnostics.exit_status,
-                diagnostics.stderr_tail.lossy(),
-            )));
+    }
+
+    /// A first render can precede autoload completion. Prove the initial
+    /// client's real managed bridge before attaching another client: the
+    /// pinned host's `AddClient` path can only clone an installed plugin map.
+    /// Use the selected installation's native identity after the caller
+    /// validates receipt ownership and bytes. Legacy receipts can omit
+    /// compatibility metadata without changing the expected native record.
+    async fn await_bootstrap_bridge(
+        &self,
+        session: &str,
+        scoped_root: &Path,
+        expected: &muxe_zellij_protocol::BridgeIdentity,
+    ) -> io::Result<muxe_core::ClientId> {
+        use muxe_adapter_zellij::{PipeChannel as _, SubprocessChannel, channel_names};
+        use muxe_zellij_protocol::{
+            BridgeEvent, ChannelGeneration, EventSubscription, PipeEventKind, decode_event_line,
+            encode_event_subscription,
+        };
+
+        let mut members = self.typed_clients(session).await?;
+        if members.len() != 1 {
+            return Err(io::Error::other(
+                "bootstrap requires exactly one initial client",
+            ));
         }
-        eprintln!("[bootstrap] session '{session}': {report}");
-        Ok(())
+        let client = members.pop().expect("one initial client");
+        let executable =
+            self.scoped_cli_wrapper_named(scoped_root, &format!("bootstrap-zellij-{session}"))?;
+        let subscription =
+            encode_event_subscription(EventSubscription::new(ChannelGeneration::INITIAL))
+                .map_err(io::Error::other)?;
+        let channel = SubprocessChannel::launch(
+            executable,
+            session.to_owned(),
+            channel_names(session).1,
+            Some(subscription),
+        )
+        .await
+        .map_err(io::Error::other)?;
+        let result = tokio::time::timeout(BOOTSTRAP_TIMEOUT, async {
+            loop {
+                let line = channel.next_line().await.map_err(io::Error::other)?;
+                let frame = decode_event_line(&line).map_err(io::Error::other)?;
+                if let PipeEventKind::Event(BridgeEvent::Register { registration }) = frame.event {
+                    let registered = muxe_core::ClientId::new(registration.client_id);
+                    let identity = registration.identity;
+                    if registered != client
+                        || frame.channel_generation != ChannelGeneration::INITIAL
+                        || identity != *expected
+                    {
+                        return Err(io::Error::other(
+                            "bootstrap bridge registration does not match the selected installation",
+                        ));
+                    }
+                    let current = self.typed_clients(session).await?;
+                    if current.len() != 1 || current.first() != Some(&client) {
+                        return Err(io::Error::other(
+                            "bootstrap membership changed before bridge readiness",
+                        ));
+                    }
+                    eprintln!(
+                        "[bootstrap] session '{session}': initial bridge registered {client}"
+                    );
+                    return Ok(client);
+                }
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("bootstrap bridge did not register inside its lifetime"))
+        .and_then(std::convert::identity);
+        if result.is_err() {
+            eprintln!(
+                "[bootstrap] event child stderr: {}",
+                String::from_utf8_lossy(&channel.stderr_tail().await),
+            );
+        }
+        channel.close().await;
+        result
+    }
+
+    async fn typed_clients(&self, session: &str) -> io::Result<Vec<muxe_core::ClientId>> {
+        Ok(self
+            .list_clients(session)
+            .await?
+            .into_iter()
+            .map(muxe_core::ClientId::new)
+            .collect())
     }
 
     /// Builds the permission seeder command: the fixture peer plus the
@@ -1214,10 +1451,14 @@ impl OwnedZellijHost {
     /// without changing the test process's ambient state. Every respawn execs
     /// the exact pinned CLI under the same explicit host and Muxe roots.
     pub fn scoped_cli_wrapper(&self, scoped_root: &Path) -> io::Result<PathBuf> {
+        self.scoped_cli_wrapper_named(scoped_root, "scoped-zellij")
+    }
+
+    fn scoped_cli_wrapper_named(&self, scoped_root: &Path, name: &str) -> io::Result<PathBuf> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        let path = self.workdir.join("scoped-zellij");
+        let path = self.workdir.join(name);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1483,6 +1724,83 @@ impl OwnedZellijHost {
         Ok(child)
     }
 
+    /// Transfers the initial session to the complete requested PTY client set.
+    /// Keep the bootstrap ID allocated until every initial client has its own
+    /// distinct ID; only then detach and require that exact set to remain.
+    pub async fn finish_bootstrap_handoff(
+        &mut self,
+        session: &str,
+        initial_clients: usize,
+    ) -> io::Result<()> {
+        let socket = self.session_socket_path(session);
+        let Some(index) = self
+            .bootstrap_peers
+            .iter()
+            .position(|peer| peer.socket == socket)
+        else {
+            return Err(io::Error::other(format!(
+                "no retained bootstrap handoff state for session '{session}'",
+            )));
+        };
+        let BootstrapPeer {
+            client: bootstrap,
+            child: mut peer,
+            ..
+        } = self.bootstrap_peers.remove(index);
+        let outcome = async {
+            let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+            let retained = loop {
+                let mut members = self.typed_clients(session).await?;
+                if members.len() == initial_clients + 1
+                    && let Some(index) = members.iter().position(|client| client == &bootstrap)
+                {
+                    members.remove(index);
+                    break members;
+                }
+                if peer.try_wait()?.is_some() || tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::other(
+                        "bootstrap and requested distinct PTY clients never overlapped",
+                    ));
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            };
+            eprintln!(
+                "[bootstrap] session '{session}': overlapping bootstrap {bootstrap} and retained {retained:?}",
+            );
+            peer.send_input(b"detach\n").await?;
+            let status = tokio::time::timeout(BOOTSTRAP_TIMEOUT, peer.wait())
+                .await
+                .map_err(|_| io::Error::other("bootstrap detach exceeded its lifetime"))??;
+            if !status.is_some_and(|status| status.success()) {
+                return Err(io::Error::other("bootstrap detach failed"));
+            }
+            loop {
+                let members = self.typed_clients(session).await?;
+                if members == retained {
+                    eprintln!(
+                        "[bootstrap] session '{session}': detached {bootstrap}; retained {retained:?}",
+                    );
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::other(
+                        "bootstrap client remained in the post-handoff membership",
+                    ));
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            Ok(())
+        }
+        .await;
+        let diagnostics = peer.terminate_and_reap().await?;
+        eprintln!(
+            "[bootstrap] handoff for '{session}': {}\n{}",
+            diagnostics.stdout_tail.lossy(),
+            diagnostics.stderr_tail.lossy(),
+        );
+        outcome
+    }
+
     /// Sessions created on this host, in creation order.
     #[must_use]
     pub fn sessions(&self) -> &[String] {
@@ -1531,6 +1849,9 @@ impl OwnedZellijHost {
             ));
         }
         let mut diagnostics = Vec::new();
+        for mut peer in std::mem::take(&mut self.bootstrap_peers) {
+            diagnostics.push(peer.child.terminate_and_reap().await?);
+        }
         for server in &mut self.servers {
             diagnostics.push(server.terminate_and_reap().await?);
         }
@@ -2423,7 +2744,13 @@ mod scoped_spawn_tests {
                      : > \"$MARKER\" || exit 3",
                 "evidence" =>
                     ": > \"$MARKER\" || exit 3;\n\
-                     echo \"bootstrapped session: first render evidence (7 bytes)\"",
+                     while [ \"$#\" -gt 0 ]; do\n\
+                       if [ \"$1\" = '--ready-file' ]; then\n\
+                         shift; printf '7' > \"$1\" || exit 3; break\n\
+                       fi\n\
+                       shift\n\
+                     done\n\
+                     read -r handoff; [ \"$handoff\" = detach ]",
                 // Permit mode prints a fixed grant report naming the
                 // plugin location the test passes to the seed runner.
                 "permit" =>
@@ -2488,6 +2815,102 @@ mod scoped_spawn_tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_handoff_requires_retained_peer() {
+        let case = case_dir("missing-bootstrap");
+        let mut host =
+            OwnedZellijHost::prepare(&case.path().join("unused-zellij"), case.path(), "scope")
+                .expect("prepare owned host");
+        assert!(host.finish_bootstrap_handoff("absent", 1).await.is_err());
+    }
+
+    #[test]
+    fn prepared_bridge_legacy_metadata_preserves_native_and_digest_authority() {
+        use muxe::integration::{
+            Receipt, Sha256Digest,
+            receipt::{BridgeRecord, RECEIPT_SCHEMA_VERSION, store},
+        };
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let case = case_dir("legacy-bridge");
+        let scoped = scoped_root(case.path());
+        let directory = muxe::integration::integration_dir(&scoped.join("config").join("muxe"));
+        let native = muxe_zellij_protocol::BridgeIdentity {
+            muxe_version: "0.1.0".to_owned(),
+            source_revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            action_fingerprint: [1; 32],
+            protocol_fingerprint: [2; 32],
+            bridge_build_id: Some(muxe_protocol::wire::SchemaFingerprint([3; 32])),
+        };
+        assert!(OwnedZellijHost::validate_prepared_bridge(&scoped, &native).is_err());
+        assert!(
+            !directory.exists(),
+            "validation must not create missing authority"
+        );
+
+        let authority = muxe::integration::bridge_identity(&scoped.join("config").join("muxe"))
+            .expect("owned physical authority");
+        let stable = muxe::integration::stable_bridge_path(&scoped.join("config").join("muxe"));
+        let bridge = b"historical bridge bytes";
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&stable)
+            .expect("create owned bridge");
+        file.write_all(bridge).expect("write owned bridge");
+        drop(file);
+        let mut receipt = Receipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            bridge: BridgeRecord {
+                bridge_identity: authority,
+                installed_version: native.muxe_version.clone(),
+                installed_digest: Sha256Digest::from_bytes(bridge),
+                previous_digest: None,
+                bridge_compat: None,
+            },
+            configs: Vec::new(),
+        };
+        store(&directory, &receipt).expect("legacy-compatible receipt");
+        OwnedZellijHost::validate_prepared_bridge(&scoped, &native)
+            .expect("missing legacy metadata uses selected native identity");
+
+        receipt.bridge.bridge_compat = Some(muxe_protocol::control::ZellijCompatibility {
+            source_revision: "1123456789abcdef0123456789abcdef01234567".to_owned(),
+            generated_action_fingerprint: muxe_protocol::wire::SchemaFingerprint(
+                native.action_fingerprint,
+            ),
+            bridge_protocol_fingerprint: muxe_protocol::wire::SchemaFingerprint(
+                native.protocol_fingerprint,
+            ),
+            bridge_build_id: native.bridge_build_id,
+        });
+        store(&directory, &receipt).expect("present conflicting metadata");
+        let receipt_path = directory.join(muxe::integration::receipt::RECEIPT_FILE_NAME);
+        let before = std::fs::read(&receipt_path).expect("receipt bytes before guard");
+        assert!(OwnedZellijHost::validate_prepared_bridge(&scoped, &native).is_err());
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("unchanged receipt"),
+            before
+        );
+        assert_eq!(std::fs::read(&stable).expect("unchanged bridge"), bridge);
+
+        receipt.bridge.bridge_compat = None;
+        store(&directory, &receipt).expect("restore legacy metadata");
+        std::fs::write(&stable, b"foreign bytes").expect("change owned artifact");
+        let before = std::fs::read(&receipt_path).expect("receipt before digest guard");
+        assert!(OwnedZellijHost::validate_prepared_bridge(&scoped, &native).is_err());
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("unchanged receipt"),
+            before
+        );
+        assert_eq!(
+            std::fs::read(&stable).expect("unmodified foreign artifact"),
+            b"foreign bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn foreground_spawn_scopes_real_child() {
         let case = case_dir("foreground");
         let scoped = scoped_root(case.path());
@@ -2527,9 +2950,15 @@ mod scoped_spawn_tests {
             "evidence",
         );
         let host = OwnedZellijHost::prepare(&fake, case.path(), "scope").expect("prepare host");
-        host.run_bootstrap(&fake, "scope-sess", &scoped)
+        let mut peer = host
+            .run_bootstrap(&fake, "scope-sess", &scoped)
             .await
             .expect("bootstrap evidence");
+        peer.send_input(b"detach\n").await.expect("release peer");
+        peer.wait().await.expect("peer detached");
+        peer.terminate_and_reap()
+            .await
+            .expect("reap bootstrap fake");
         assert!(marker.is_file(), "bootstrap child left no owned marker");
     }
 

@@ -12,10 +12,12 @@
 //! terminal size — the same `CliAssets` shape the pinned
 //! `ClientInfo::New` path sends, minus the daemon spawn), and waits for
 //! genuine initialized-session evidence: a non-empty
-//! `ServerToClientMsg::Render` from the screen thread. It then closes
-//! cleanly with `ClientExited` (the `RemoveClient` path, which keeps the
-//! initialized session alive for the real PTY clients) and exits 0.
-//! Mere send success or socket existence is never treated as proof.
+//! `ServerToClientMsg::Render` from the screen thread. It publishes that
+//! evidence to the explicit ready file, then keeps its client connected until
+//! the runner writes `detach` to stdin after a retained PTY client attaches.
+//! First render does not mean asynchronous autoload plugins have finished
+//! loading: detaching immediately can recycle the initial client identity
+//! while those plugins are still being initialized.
 //!
 //! Typed inputs only: absolute socket/config/config-dir/data-dir/cwd
 //! paths plus explicit geometry. There is no command hook and no shell.
@@ -25,6 +27,7 @@
 //! release archive; core resolves it through an independent lockfile.
 
 use std::collections::BTreeMap;
+use std::io::BufRead as _;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -43,7 +46,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: muxe-zellij-bootstrap --socket <abs-session-socket> \
          --config <abs-config-file> --config-dir <abs-config-dir> \
-         --data-dir <abs-data-dir> --cwd <abs-dir> \
+         --data-dir <abs-data-dir> --cwd <abs-dir> --ready-file <abs-file> \
          [--rows <n>] [--cols <n>] [--timeout-secs <n>]"
     );
     std::process::exit(2);
@@ -77,6 +80,7 @@ struct BootstrapArgs {
     config_dir: PathBuf,
     data_dir: PathBuf,
     cwd: PathBuf,
+    ready_file: PathBuf,
     rows: usize,
     cols: usize,
     timeout_secs: u64,
@@ -88,6 +92,7 @@ fn parse_args() -> BootstrapArgs {
     let mut config_dir: Option<std::ffi::OsString> = None;
     let mut data_dir: Option<std::ffi::OsString> = None;
     let mut cwd: Option<std::ffi::OsString> = None;
+    let mut ready_file: Option<std::ffi::OsString> = None;
     let mut rows: usize = 30;
     let mut cols: usize = 120;
     let mut timeout_secs: u64 = 60;
@@ -119,6 +124,11 @@ fn parse_args() -> BootstrapArgs {
                 usage();
             }
             cwd = Some(args.next().unwrap_or_else(|| usage()));
+        } else if arg == "--ready-file" {
+            if ready_file.is_some() {
+                usage();
+            }
+            ready_file = Some(args.next().unwrap_or_else(|| usage()));
         } else if arg == "--rows" {
             rows = optional_uint("rows", Some(args.next().unwrap_or_else(|| usage())));
         } else if arg == "--cols" {
@@ -139,6 +149,7 @@ fn parse_args() -> BootstrapArgs {
         config_dir: required_abs("--config-dir", config_dir),
         data_dir: required_abs("--data-dir", data_dir),
         cwd: required_abs("--cwd", cwd),
+        ready_file: required_abs("--ready-file", ready_file),
         rows,
         cols,
         timeout_secs,
@@ -228,29 +239,39 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
     let (evidence_tx, evidence_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut receiver = receiver;
+        let mut evidence_tx = Some(evidence_tx);
         loop {
             match receiver.try_recv_server_msg() {
                 Ok((ServerToClientMsg::Render { content }, _)) => {
                     if content.is_empty() {
                         continue;
                     }
-                    let _ = evidence_tx.send(Ok(content.len()));
-                    return;
+                    if let Some(sender) = evidence_tx.take() {
+                        let _ = sender.send(Ok(content.len()));
+                    }
+                    // The bootstrap remains a real connected client during
+                    // handoff. Drain later renders so host writes cannot
+                    // block behind an unread bootstrap socket.
                 }
                 // The route thread unblocks the client input thread after
                 // every handled instruction, including
                 // `FirstClientConnected`, so this routinely precedes the
                 // screen thread's first render: keep waiting for it.
-                Ok((ServerToClientMsg::UnblockInputThread, _)) => continue,
+                Ok((ServerToClientMsg::UnblockInputThread, _)) => {}
                 Ok((other, _)) => {
-                    let _ =
-                        evidence_tx.send(Err(format!("got {other:?} before any session render")));
+                    if let Some(sender) = evidence_tx.take() {
+                        let _ =
+                            sender.send(Err(format!("got {other:?} before any session render")));
+                    }
                     return;
                 }
                 Err(_) => {
-                    let _ = evidence_tx.send(Err(
-                        "lost the server connection before any session render".to_owned(),
-                    ));
+                    if let Some(sender) = evidence_tx.take() {
+                        let _ =
+                            sender
+                                .send(Err("lost the server connection before any session render"
+                                    .to_owned()));
+                    }
                     return;
                 }
             }
@@ -259,11 +280,12 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     match evidence_rx.recv_timeout(remaining) {
         Ok(Ok(render_bytes)) => {
-            // Detach-style close: `ClientExited` routes to `RemoveClient`,
-            // which keeps the initialized session alive for the real PTY
-            // clients. (`ClientExit` on the last client would tear the
-            // server loop down.)
-            let _ = sender.send_client_msg(ClientToServerMsg::ClientExited);
+            std::fs::write(&args.ready_file, render_bytes.to_string())
+                .map_err(|error| format!("could not publish first-render evidence: {error}"))?;
+            await_detach(deadline)?;
+            sender
+                .send_client_msg(ClientToServerMsg::ClientExited)
+                .map_err(|_| "could not detach bootstrap client".to_owned())?;
             Ok(render_bytes)
         }
         Ok(Err(error)) => Err(error),
@@ -271,3 +293,22 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
     }
 }
 
+fn await_detach(deadline: Instant) -> Result<(), String> {
+    let (handoff_tx, handoff_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|error| format!("could not read handoff: {error}"))
+            .and_then(|_| {
+                (line.trim_end() == "detach")
+                    .then_some(())
+                    .ok_or_else(|| "expected explicit detach handoff".to_owned())
+            });
+        let _ = handoff_tx.send(result);
+    });
+    handoff_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| "no retained-client handoff inside the timeout".to_owned())?
+}

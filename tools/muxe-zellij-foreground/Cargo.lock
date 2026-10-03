@@ -1522,6 +1522,8 @@ checksum = "9bb517913cfcfb9eeda59f36020269075a152701a01606c612f547e4890be399"
 name = "muxe-zellij-foreground"
 version = "0.0.0"
 dependencies = [
+ "interprocess",
+ "tempfile",
  "zellij-server",
  "zellij-utils",
 ]
