@@ -1214,7 +1214,8 @@ impl OwnedZellijHost {
             encode_event_subscription,
         };
 
-        let mut members = self.typed_clients(session).await?;
+        let deadline = tokio::time::Instant::now() + BOOTSTRAP_TIMEOUT;
+        let mut members = self.bootstrap_census_until(session, deadline).await?;
         if members.len() != 1 {
             return Err(io::Error::other(
                 "bootstrap requires exactly one initial client",
@@ -1226,6 +1227,12 @@ impl OwnedZellijHost {
         let subscription =
             encode_event_subscription(EventSubscription::new(ChannelGeneration::INITIAL))
                 .map_err(io::Error::other)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "bootstrap readiness deadline elapsed before subscribing",
+            ));
+        }
         let channel = SubprocessChannel::launch(
             executable,
             session.to_owned(),
@@ -1234,9 +1241,23 @@ impl OwnedZellijHost {
         )
         .await
         .map_err(io::Error::other)?;
-        let result = tokio::time::timeout(BOOTSTRAP_TIMEOUT, async {
+        let result = async {
             loop {
-                let line = channel.next_line().await.map_err(io::Error::other)?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "bootstrap bridge did not register inside its lifetime",
+                    ));
+                }
+                let line = tokio::time::timeout_at(deadline, channel.next_line())
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "bootstrap bridge did not register inside its lifetime",
+                        )
+                    })?
+                    .map_err(io::Error::other)?;
                 let frame = decode_event_line(&line).map_err(io::Error::other)?;
                 if let PipeEventKind::Event(BridgeEvent::Register { registration }) = frame.event {
                     let registered = muxe_core::ClientId::new(registration.client_id);
@@ -1249,7 +1270,7 @@ impl OwnedZellijHost {
                             "bootstrap bridge registration does not match the selected installation",
                         ));
                     }
-                    let current = self.typed_clients(session).await?;
+                    let current = self.bootstrap_census_until(session, deadline).await?;
                     if current.len() != 1 || current.first() != Some(&client) {
                         return Err(io::Error::other(
                             "bootstrap membership changed before bridge readiness",
@@ -1261,10 +1282,8 @@ impl OwnedZellijHost {
                     return Ok(client);
                 }
             }
-        })
-        .await
-        .map_err(|_| io::Error::other("bootstrap bridge did not register inside its lifetime"))
-        .and_then(std::convert::identity);
+        }
+        .await;
         if result.is_err() {
             eprintln!(
                 "[bootstrap] event child stderr: {}",
@@ -1273,6 +1292,40 @@ impl OwnedZellijHost {
         }
         channel.close().await;
         result
+    }
+
+    /// Only bootstrap bridge readiness may wait for a missing CLI response.
+    /// Both observations share the phase deadline; observed data stays strict.
+    async fn bootstrap_census_until(
+        &self,
+        session: &str,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<Vec<muxe_core::ClientId>> {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "bootstrap census did not become available inside its lifetime",
+                ));
+            }
+            match self.client_census_until(session, deadline).await? {
+                ClientCensus::Observed(members) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "bootstrap census arrived after its readiness deadline",
+                        ));
+                    }
+                    return Ok(members);
+                }
+                ClientCensus::Unavailable => {
+                    tokio::time::sleep_until(
+                        deadline.min(tokio::time::Instant::now() + POLL_INTERVAL),
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     async fn typed_clients(&self, session: &str) -> io::Result<Vec<muxe_core::ClientId>> {
@@ -2915,14 +2968,32 @@ mod scoped_spawn_tests {
     fn census_fixture(
         case: &Path,
         observations: &[(&str, i32, bool)],
+        pipe_event: Option<&str>,
     ) -> (OwnedZellijHost, PathBuf) {
         use std::fmt::Write as _;
 
         let marker = case.join("detached");
         let count = case.join("census-count");
         let binary = case.join("census-cli");
-        let mut script = format!(
-            "#!/bin/sh\n\
+        let mut script = String::from("#!/bin/sh\n");
+        if let Some(event) = pipe_event {
+            writeln!(
+                script,
+                "if [ \"$3\" = pipe ]; then\n\
+                 printf '%s\\n' \"$$\" > '{}'\n\
+                 [ -z '{}' ] || printf '%s\\n' '{}'\n\
+                 while IFS= read -r line; do :; done\n\
+                 exit 0\n\
+                 fi",
+                shell_escape(&case.join("event-pid").to_string_lossy()),
+                shell_escape(event),
+                shell_escape(event),
+            )
+            .expect("write event peer script");
+        }
+        write!(
+            script,
+            "\
              count_file='{count}'\n\
              count=0\n\
              [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\n\
@@ -2930,7 +3001,8 @@ mod scoped_spawn_tests {
              printf '%s' \"$count\" > \"$count_file\" || exit 3\n\
              case \"$count\" in\n",
             count = shell_escape(&count.to_string_lossy()),
-        );
+        )
+        .expect("write census counter");
         for (index, (stdout, status, detached)) in observations.iter().enumerate() {
             writeln!(
                 script,
@@ -2951,11 +3023,172 @@ mod scoped_spawn_tests {
         (host, marker)
     }
 
+    fn readiness_identity() -> muxe_zellij_protocol::BridgeIdentity {
+        muxe_zellij_protocol::BridgeIdentity {
+            muxe_version: "0.1.4".to_owned(),
+            source_revision: "af38660c5884f50bb3726682fb92961326c4268f".to_owned(),
+            action_fingerprint: [1; 32],
+            protocol_fingerprint: [2; 32],
+            bridge_build_id: Some(muxe_protocol::wire::SchemaFingerprint([3; 32])),
+        }
+    }
+
+    fn readiness_register(
+        client: muxe_core::ClientId,
+        identity: muxe_zellij_protocol::BridgeIdentity,
+    ) -> muxe_zellij_protocol::PipeEvent {
+        use muxe_zellij_protocol::{
+            BRIDGE_PROTOCOL_VERSION, BridgeEvent, ChannelGeneration, PipeEvent, PipeEventKind,
+            ZellijRegistration,
+        };
+
+        PipeEvent {
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            request_id: None,
+            channel_generation: ChannelGeneration::INITIAL,
+            registration: "00000000000000000000000001"
+                .parse()
+                .expect("registration ID"),
+            event: PipeEventKind::Event(BridgeEvent::Register {
+                registration: ZellijRegistration {
+                    client_id: client.into_string(),
+                    current_pane: None,
+                    plugin_id: None,
+                    identity,
+                },
+            }),
+        }
+    }
+
+    fn assert_event_peer_reaped(root: &Path) -> bool {
+        let path = root.join("event-pid");
+        if !path.exists() {
+            return false;
+        }
+        let raw: i32 = std::fs::read_to_string(path)
+            .expect("owned event PID")
+            .trim()
+            .parse()
+            .expect("valid event PID");
+        assert!(raw > 0, "event PID is not a process");
+        let pid = nix::unistd::Pid::from_raw(raw);
+        assert_eq!(
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD),
+            "readiness event child was not reaped",
+        );
+        true
+    }
+
+    async fn exercise_bootstrap_readiness(
+        observations: &[(&str, i32, bool)],
+    ) -> (io::Result<muxe_core::ClientId>, String, bool) {
+        let case = case_dir("bridge-readiness");
+        let identity = readiness_identity();
+        let event = readiness_register(muxe_core::ClientId::new("1"), identity.clone());
+        let line = muxe_zellij_protocol::encode_event_line(&event).expect("canonical Register");
+        let (host, _) = census_fixture(case.path(), observations, Some(&line));
+        let scoped = scoped_root(case.path());
+        let result = host
+            .await_bootstrap_bridge("census", &scoped, &identity)
+            .await;
+        let count =
+            std::fs::read_to_string(case.path().join("census-count")).expect("census count");
+        (result, count, assert_event_peer_reaped(case.path()))
+    }
+
+    #[tokio::test]
+    async fn bootstrap_readiness_waits_for_both_missing_census_observations() {
+        let (result, count, reaped) = exercise_bootstrap_readiness(&[
+            ("", 0, false),
+            ("CLIENT_ID\n1\n", 0, false),
+            ("", 0, false),
+            ("CLIENT_ID\n1\n", 0, false),
+        ])
+        .await;
+        assert_eq!(
+            result.expect("registered bootstrap readiness"),
+            muxe_core::ClientId::new("1")
+        );
+        assert_eq!(count, "4");
+        assert!(reaped, "readiness event child never launched");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_readiness_rejects_observed_invalid_initial_membership() {
+        for initial in [
+            ("CLIENT_ID\n", 0, false),
+            ("CLIENT_ID\n1\n2\n", 0, false),
+            (" \n", 0, false),
+            ("", 1, false),
+        ] {
+            let (result, count, reaped) = exercise_bootstrap_readiness(&[initial]).await;
+            assert_eq!(
+                result.expect_err("invalid initial census").kind(),
+                io::ErrorKind::Other
+            );
+            assert_eq!(count, "1", "invalid observation was retried");
+            assert!(!reaped, "invalid initial census launched an event peer");
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_readiness_rejects_changed_or_invalid_registered_membership() {
+        for current in [
+            ("CLIENT_ID\n", 0, false),
+            ("CLIENT_ID\n2\n", 0, false),
+            ("CLIENT_ID\n1\n2\n", 0, false),
+            ("not-a-census\n", 0, false),
+            ("", 1, false),
+        ] {
+            let (result, count, reaped) =
+                exercise_bootstrap_readiness(&[("CLIENT_ID\n1\n", 0, false), current]).await;
+            assert_eq!(
+                result.expect_err("invalid registered census").kind(),
+                io::ErrorKind::Other
+            );
+            assert_eq!(count, "2", "invalid registered observation was retried");
+            assert!(reaped, "registered event peer never launched");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_readiness_silent_receive_expires_and_reaps_event_peer() {
+        let case = case_dir("silent-readiness");
+        let (host, _) = census_fixture(case.path(), &[("CLIENT_ID\n1\n", 0, false)], Some(""));
+        let scoped = scoped_root(case.path());
+        let identity = readiness_identity();
+        let task = tokio::spawn(async move {
+            host.await_bootstrap_bridge("census", &scoped, &identity)
+                .await
+        });
+        let wall_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !case.path().join("event-pid").exists() && std::time::Instant::now() < wall_deadline {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(BOOTSTRAP_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let error = task
+            .await
+            .expect("owned readiness task")
+            .expect_err("silent event timeout");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            assert_event_peer_reaped(case.path()),
+            "event peer did not launch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(case.path().join("census-count")).expect("census count"),
+            "1",
+            "silent event receive launched an extra census",
+        );
+    }
+
     async fn exercise_census_handoff(
         observations: &[(&str, i32, bool)],
     ) -> (io::Result<()>, bool, String) {
         let case = case_dir("census-handoff");
-        let (mut host, marker) = census_fixture(case.path(), observations);
+        let (mut host, marker) = census_fixture(case.path(), observations, None);
         retain_census_peer(&mut host, &marker, case.path());
         let result = host.finish_bootstrap_handoff("census", 1).await;
         let count =
@@ -3028,7 +3261,11 @@ mod scoped_spawn_tests {
     #[tokio::test]
     async fn client_census_distinguishes_unavailable_from_authoritative_empty() {
         let case = case_dir("strict-census");
-        let (host, _) = census_fixture(case.path(), &[("", 0, false), ("CLIENT_ID\n", 0, false)]);
+        let (host, _) = census_fixture(
+            case.path(),
+            &[("", 0, false), ("CLIENT_ID\n", 0, false)],
+            None,
+        );
         assert_eq!(
             host.list_clients("census")
                 .await
@@ -3047,7 +3284,8 @@ mod scoped_spawn_tests {
     #[tokio::test(start_paused = true)]
     async fn expired_bootstrap_admission_never_launches_another_census_or_detaches() {
         let case = case_dir("expired-census");
-        let (mut host, marker) = census_fixture(case.path(), &[("CLIENT_ID\n1\n2\n", 0, false)]);
+        let (mut host, marker) =
+            census_fixture(case.path(), &[("CLIENT_ID\n1\n2\n", 0, false)], None);
         retain_census_peer(&mut host, &marker, case.path());
         // A query would now fail NotFound, so TimedOut proves admission checked
         // its finite budget before trying to launch even an immediately valid CLI.
