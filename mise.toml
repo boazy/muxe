@@ -2,53 +2,53 @@
 rust = { version = "1.97.1", targets = ["wasm32-wasip1"], components = ["rustfmt", "clippy"] }
 
 [tasks.fmt]
-description = "Check Rust formatting on the pinned toolchain"
+description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
 
 [tasks.check]
-description = "Compile registered crates with the pinned lockfile"
+description = "Compile workspace crates with Cargo.lock"
 run = "cargo check --workspace --locked"
 
 [tasks.test]
-description = "Run registered workspace tests and doctests"
+description = "Run workspace tests and doctests with Cargo.lock"
 run = "cargo test --workspace --locked"
 
 [tasks.clippy]
-description = "Run strict Clippy checks"
+description = "Run Clippy with warnings treated as errors"
 run = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -W clippy::allow_attributes -W clippy::allow_attributes_without_reason -W clippy::redundant_clone -W clippy::unused_peekable"
 
 [tasks.codegen-herdr]
-description = "Verify Herdr-generated sources are byte-clean"
+description = "Check generated Herdr API code"
 run = "cargo run --locked -p muxe-herdr-gen -- --check"
 
 [tasks.codegen-zellij]
-description = "Verify Zellij-generated sources are byte-clean"
+description = "Check generated Zellij API code"
 run = "cargo run --locked -p muxe-zellij-gen -- --check"
 
 [tasks.codegen-zellij-materialize]
-description = "Materialize minimized Zellij fixtures from the pinned source"
+description = "Generate minimized Zellij fixtures from pinned source"
 run = "cargo run --locked -p muxe-zellij-gen -- --materialize-fixtures"
 
 [tasks.codegen-zellij-verify]
-description = "Verify Zellij fixtures from a fresh pinned source materialization"
+description = "Compare Zellij fixtures and generated code with pinned source"
 run = "cargo run --locked -p muxe-zellij-gen -- --verify-fixtures"
 
 [tasks.completions]
-description = "Generate committed shell completions from the clap definition"
+description = "Generate shell completions from the CLI definition"
 run = "cargo run --locked -p codegen-completions"
 
 [tasks.wasm-build]
-description = "Build the pinned Zellij bridge WASM (release) and stage dist-wasm/muxe-zellij.wasm"
+description = "Build the WebAssembly bridge in release mode and copy it to dist-wasm"
 run = "cargo build --locked --release -p muxe-zellij-wasm --target wasm32-wasip1 && mkdir -p dist-wasm && cp target/wasm32-wasip1/release/muxe-zellij-wasm.wasm dist-wasm/muxe-zellij.wasm"
 
 [tasks.wasm-build-previous]
-description = "Build a distinct same-source debug WASM artifact for rollback ownership smoke"
+description = "Build a debug WebAssembly bridge for rollback tests"
 run = "cargo build --locked -p muxe-zellij-wasm --target wasm32-wasip1"
 
 [tasks.verify-packaged-wasm]
 depends = ["wasm-build"]
 shell = "bash -c"
-description = "Verify the native packaged-WASM digest against the real producer bytes"
+description = "Verify packaged WebAssembly and reject modified bytes"
 run = '''
 set -euo pipefail
 file_digest() {
@@ -68,7 +68,7 @@ cargo test --locked -p muxe --lib -- --ignored --exact \
 [tasks.verify-activation-preflight]
 depends = ["wasm-build", "wasm-build-previous"]
 shell = "bash -c"
-description = "Run activation receipt/preflight transaction tests with the pinned producer WASM"
+description = "Test activation receipts and preflight checks with release and debug WebAssembly"
 run = '''
 set -euo pipefail
 file_digest() {
@@ -96,7 +96,7 @@ done
 '''
 
 [tasks.bench-codspeed]
-description = "Build or run CodSpeed comparisons with the pinned runner"
+description = "Build or run CodSpeed benchmarks"
 usage = '''
 arg "[mode]" default="build" help="Build benchmarks or run them with CodSpeed" {
   choices "build" "run"
@@ -111,7 +111,7 @@ esac
 '''
 
 [tasks.release]
-description = "Release the current main commit with cargo-release and Jujutsu"
+description = "Prepare a release commit and tag, then push them to start the release workflow"
 interactive = true
 raw_args = true
 tools = { uv = "0.12.10", jj = "0.45.1", gh = "2.100.0", git-cliff = "2.14.1", "cargo:cargo-release" = "1.1.5" }

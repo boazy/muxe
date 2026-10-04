@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   pull_request:
@@ -6,7 +6,7 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    # Full matrix on a schedule or manual dispatch; PRs run deterministic gate.
+    # Scheduled and manual runs also run the Linux and macOS test matrix.
     - cron: "0 6 * * 1"
 
 env:
@@ -14,30 +14,33 @@ env:
 
 jobs:
   deterministic:
-    name: deterministic gate
+    name: Rust checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install development tools
+        uses: jdx/mise-action@v2
         with:
           install: true
-      - uses: jdx/mr-boxington-action@v1
+      - name: Restore Rust build cache
+        uses: jdx/mr-boxington-action@v1
         with:
-          # These concurrent checks intentionally use distinct target roots.
+          # Concurrent checks use separate Cargo target directories.
           github-cache-mode: objects
-      - name: route divergent Cargo targets through mr-boxington
+      - name: Set up Rust build caching
         run: mbx setup --yes
-      - name: trust project tasks and assert pinned toolchain
-        # The Rust pin lives only in mise.toml; no step repeats the version.
+      - name: Trust mise tasks and check Cargo version
+        # Compare Cargo's version with the Rust version in mise.toml.
         run: |
           set -euo pipefail
           mise trust
           pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
-      - name: formatting
+      - name: Check Rust formatting
         run: mise run fmt
-      - name: compile, tests, and clippy (parallel, separate targets)
+      - name: Compile, test, and run Clippy in parallel
         run: |
           set -euo pipefail
           CARGO_TARGET_DIR=target/ci-check mise run check &
@@ -51,25 +54,27 @@ jobs:
           wait "$tests_pid" || status=$?
           wait "$clippy_pid" || status=$?
           exit "$status"
-      - name: byte-clean Herdr generation
+      - name: Check generated Herdr API code
         run: mise run codegen-herdr
-      - name: byte-clean Zellij generation
+      - name: Check generated Zellij API code
         run: mise run codegen-zellij
-      - name: Zellij fixture verification
+      - name: Verify Zellij source fixtures
         run: mise run codegen-zellij-verify
-      - name: completions byte-clean
+      - name: Check generated shell completions
         run: |
           set -euo pipefail
           mise exec -- cargo run --locked \
             -p codegen-completions -- --check
 
-      - name: packaged WASM identity gate
+      - name: Verify packaged WebAssembly
+        # Verify the packaged checksum and compatibility build ID, then
+        # confirm that modified WebAssembly bytes are rejected.
         run: mise run verify-packaged-wasm
-      - name: packaged activation preflight gate
+      - name: Test activation preflight checks
         run: mise run verify-activation-preflight
 
   full-matrix:
-    name: full matrix (${{ matrix.os }})
+    name: Rust and multiplexer tests (${{ matrix.os }})
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -77,43 +82,44 @@ jobs:
         os: [ubuntu-latest, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install development tools
+        uses: jdx/mise-action@v2
         with:
           install: true
-      - uses: jdx/mr-boxington-action@v1
+      - name: Restore Rust build cache
+        uses: jdx/mr-boxington-action@v1
         with:
-          # Zellij is an external source install, so target pruning would
-          # discard it; retain completed mbx command objects instead.
+          # Keep cached command outputs for the external Zellij source build.
+          # Cargo target pruning would otherwise discard that installation.
           github-cache-mode: objects
-      - name: trust project tasks and assert pinned toolchain
+      - name: Trust mise tasks and check Cargo version
+        # Compare Cargo's version with the Rust version in mise.toml.
         run: |
           set -euo pipefail
           mise trust
           pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
-      - name: live-host approval opt-in (before costly installs)
-        # Explicit repository-variable guard authorizes the current-target
-        # owned-host smoke below. Without recorded approval the job stops
-        # here; host installs alone never pass the gate.
+      - name: Require approval for live host tests
+        # Stop before installing hosts unless repository-level approval is set.
         env:
           ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
         run: |
           set -euo pipefail
           test "${ALLOW_LIVE_HOST_MATRIX:-}" = "true" || {
-            echo "BLOCKED: full-matrix owned-host smoke requires recorded user approval." >&2
+            echo "BLOCKED: live host tests require recorded user approval." >&2
             echo "Set the ALLOW_LIVE_HOST_MATRIX repository variable to \"true\" only after approval." >&2
             exit 1
           }
-      - name: full workspace tests (locked)
+      - name: Run workspace tests with Cargo.lock
         run: |
           set -euo pipefail
           mise exec -- cargo test --workspace --locked
-      - name: pinned Zellij host (source build at pin)
-        # No official 0.46.0 release asset exists, so CI builds the exact
-        # pinned source revision. Repository, revision, and expected version
-        # all come from pins/zellij.toml; nothing here repeats them.
+      - name: Build and install Zellij
+        # Build the repository and revision in pins/zellij.toml and check its
+        # expected version. The pinned revision has no official release asset.
         run: |
           set -euo pipefail
           zrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/zellij.toml)"
@@ -129,10 +135,9 @@ jobs:
               --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
-      - name: pinned Herdr host (digest-verified)
-        # Official release assets exist; repository, version, and per-platform
-        # asset digests all come from pins/herdr.toml (release id 373248423);
-        # nothing here repeats them.
+      - name: Download and verify Herdr
+        # Read the repository, version, asset name, and SHA-256 checksum from
+        # pins/herdr.toml.
         run: |
           set -euo pipefail
           file_digest() {
@@ -164,23 +169,18 @@ jobs:
           chmod 755 "$hdir/herdr"
           echo "$hdir" >> "$GITHUB_PATH"
           "$hdir/herdr" --version | grep -F "$hver"
-      - name: wasm bridge producer (this checkout)
-        # Same producer task as the release flow; the digest below comes
-        # from these exact bytes, never from a sidecar or hardcoded hash.
+      - name: Build WebAssembly bridge
+        # Use the release build task and hash the resulting file below.
         run: |
           set -euo pipefail
           mise trust
           mise run wasm-build
           test -f dist-wasm/muxe-zellij.wasm
-      - name: stage target installation (full, this checkout)
-        # Full installation, not a bare binary: fresh producer WASM above,
-        # native release build with the producer digest compiled in
-        # (MUXE_WASM_SHA256, release builds fail closed without it), and
-        # the canonical root layout (DESIGN 1826: `<root>/muxe` with
-        # `<root>/lib/muxe/muxe-zellij.wasm` alongside, plus completions
-        # plus LICENSE). Native resolves the packaged bridge from the
-        # executable's own parent, so a `bin/`-nested binary would look
-        # in the wrong place; no native fallback exists by design.
+      - name: Stage complete installation
+        # Embed the bridge checksum through MUXE_WASM_SHA256 in the native
+        # release build. Package muxe at the installation root, with the bridge
+        # under lib/muxe, shell completions, and LICENSE. The executable resolves
+        # its bridge relative to its own parent; a bin/ subdirectory is invalid.
         run: |
           set -euo pipefail
           file_digest() {
@@ -215,24 +215,16 @@ jobs:
             "$RUNNER_TEMP/target-install/share/muxe/completions/"
           cp LICENSE "$RUNNER_TEMP/target-install/LICENSE"
           test "$(file_digest "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm")" = "$expected"
-          echo "staged full installation from producer digest $expected"
-      - name: target-only both-host smoke (current target, this OS row)
-        # Scope of this gate: the scheduled current-target host-version
-        # matrix on this OS row. The repo-owned retained-child
-        # explicit-endpoint smoke runner (live_hosts::target_only_smoke,
-        # both pinned hosts, real foreground bootstrap plus scoped PTY
-        # clients) runs here with complete typed inputs against the staged
-        # installation above. The test first proves one-client activation,
-        # then runs the two-client read-only routing regression on a fresh
-        # owned Rig. Authorization comes from the
-        # ALLOW_LIVE_HOST_MATRIX guard at the top of this job; this step
-        # adds no approval of its own. The runner determines pass or fail:
-        # installs above never pass the gate alone, and any missing
-        # capability or input fails, never skips green.
-        # Predecessor-to-target upgrade, rollback, and final-session fault
-        # coverage stays deferred in TODO-CROSS-RELEASE.md until a genuine
-        # published predecessor exists; that matrix is release scope
-        # (release.yml live-upgrade), not this job.
+          echo "Staged installation with WebAssembly SHA-256: $expected"
+      - name: Test installation with Herdr and Zellij
+        # target_only_smoke tests activation and two-client read-only routing
+        # against the staged installation and both pinned hosts on this OS.
+        # The runner owns its child processes and uses explicit endpoints,
+        # foreground bootstrap, and scoped PTY clients.
+        # Approval comes from ALLOW_LIVE_HOST_MATRIX above. Missing capabilities
+        # or inputs fail the test. Installing hosts alone does not validate it.
+        # Cross-release upgrade, rollback, and fault tests remain deferred until
+        # a published predecessor is available; see TODO-CROSS-RELEASE.md.
         run: |
           set -euo pipefail
           mise exec -- cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
@@ -241,12 +233,10 @@ jobs:
           test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
           test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
           test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
-          # Host-free proofs run first on the real fixture path. Evidence,
-          # not a substitute for the live smoke below.
+          # Run isolated fixture tests before the live host test.
           mise exec -- cargo test --locked -p muxe --test live_hosts scoped_spawn
           mise exec -- cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
-          # Live smoke: every typed input explicit, approval recorded by
-          # the guard above. Missing anything fails the gate.
+          # Supply explicit inputs and the approval checked above.
           MUXE_TARGET_INSTALLATION="$RUNNER_TEMP/target-install" \
           MUXE_HERDR_BINARY="$(command -v herdr)" \
           MUXE_ZELLIJ_BINARY="$(command -v zellij)" \
@@ -257,7 +247,7 @@ jobs:
           mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke --show-output
 
   benches:
-    name: benchmarks (non-blocking)
+    name: Benchmarks
     # Pushes to main publish the CodSpeed baseline that pull requests compare against.
     if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -266,19 +256,23 @@ jobs:
       # OpenID Connect authentication with CodSpeed; no upload token secret is needed.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install development tools
+        uses: jdx/mise-action@v2
         with:
           install: true
-      - uses: jdx/mr-boxington-action@v1
-      - name: trust project tasks and assert pinned toolchain
+      - name: Restore Rust build cache
+        uses: jdx/mr-boxington-action@v1
+      - name: Trust mise tasks and check Cargo version
+        # Compare Cargo's version with the Rust version in mise.toml.
         run: |
           set -euo pipefail
           mise trust
           pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
-      - name: verified WASM producer for release-profile benchmarks
+      - name: Build WebAssembly for release-profile benchmarks
         run: |
           set -euo pipefail
           mise trust
@@ -294,21 +288,19 @@ jobs:
           fi
           test "${#digest}" -eq 64
           echo "MUXE_WASM_SHA256=$digest" >> "$GITHUB_ENV"
-      - name: divan comparisons
-        # Benchmark entrypoints are owned by their source crates; this step
-        # only runs the comparisons. Non-blocking: no blanket threshold.
+      - name: Run Divan benchmarks
+        # Run the benchmarks defined by workspace crates without a regression
+        # threshold. Benchmark failures still fail this job.
         run: |
           set -euo pipefail
           mise exec -- cargo bench --locked
-      - name: build benchmarks for CodSpeed (mise task)
-        # Runner binary and build flags live in the mise manifest (coordinator
-        # scope); this step only invokes the task, never installs ad hoc.
+      - name: Build CodSpeed benchmarks
+        # The mise task defines the runner version and build flags.
         run: mise run bench-codspeed
-      - name: CodSpeed comparison upload
-        # The benchmark build and normal cargo bench above remain blocking.
-        # Only external CodSpeed comparison/reporting is advisory: auth or
-        # service availability must stay visible in this step without turning
-        # the required benchmark job red.
+      - name: Run CodSpeed benchmarks and upload results
+        # Allow failure of this entire measurement and reporting step, including
+        # setup and benchmark execution. The preceding builds and cargo bench
+        # still must pass.
         continue-on-error: true
         uses: CodSpeedHQ/action@v5
         with:
@@ -316,32 +308,34 @@ jobs:
           # Run through the task to activate its pinned cargo-codspeed tool.
           run: mise run bench-codspeed run
   realhost-smoke:
-    name: small Linux real-host smoke
-    # PRs run this owned-host smoke only with explicit recorded approval.
-    # Without approval, the job is skipped rather than counted as acceptance.
+    name: Herdr and Zellij tests (Linux)
+    # Run only with recorded approval. A skipped job does not validate hosts.
     if: vars.ALLOW_LIVE_HOST_MATRIX == 'true'
     runs-on: ubuntu-latest
     env:
       MUXE_LIVE_HOSTS_APPROVED: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install development tools
+        uses: jdx/mise-action@v2
         with:
           install: true
-      - uses: jdx/mr-boxington-action@v1
+      - name: Restore Rust build cache
+        uses: jdx/mr-boxington-action@v1
         with:
           # Share the external source install with release host preparation.
           github-cache-mode: objects
-      - name: trust project tasks and assert pinned toolchain
+      - name: Trust mise tasks and check Cargo version
+        # Compare Cargo's version with the Rust version in mise.toml.
         run: |
           set -euo pipefail
           mise trust
           pin="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)"
           test -n "$pin"
           mise exec -- cargo --version | grep -F "cargo $pin"
-      - name: pinned Zellij host (source build at pin)
-        # No official 0.46.0 release asset exists, so CI builds the exact
-        # pinned source revision. Pin values come from pins/zellij.toml.
+      - name: Build and install Zellij
+        # Build the revision in pins/zellij.toml; it has no official release asset.
         run: |
           set -euo pipefail
           zrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/zellij.toml)"
@@ -357,9 +351,8 @@ jobs:
               --locked --root "$zdir" zellij
           echo "$zdir/bin" >> "$GITHUB_PATH"
           "$zdir/bin/zellij" --version | grep -F "$zver"
-      - name: pinned Herdr host (digest-verified)
-        # Linux x86_64 asset for the smoke row; repository, version, asset,
-        # and digest all come from pins/herdr.toml, mirroring the Zellij step.
+      - name: Download and verify Herdr
+        # Use the Linux x86_64 asset and SHA-256 checksum from pins/herdr.toml.
         run: |
           set -euo pipefail
           file_digest() {
@@ -385,10 +378,8 @@ jobs:
           chmod 755 "$hdir/herdr"
           echo "$hdir" >> "$GITHUB_PATH"
           "$hdir/herdr" --version | grep -F "$hver"
-      - name: host capability probe (real version asserts)
-        # Both pinned hosts must answer their version commands or this gate
-        # fails explicitly. A missing capability is a failing gate, never a
-        # silent skip, and never a shell-only success.
+      - name: Check host commands and Herdr schema access
+        # Missing hosts or unsupported commands fail this step.
         run: |
           set -euo pipefail
           command -v zellij >/dev/null 2>&1 || { echo "MISSING: pinned zellij not on PATH"; exit 1; }
@@ -396,21 +387,16 @@ jobs:
           zellij --version
           herdr --version
           herdr api schema --json > /dev/null
-      - name: wasm bridge producer (this checkout)
-        # Same producer task as the release flow; the digest below comes
-        # from these exact bytes, never from a sidecar or hardcoded hash.
+      - name: Build WebAssembly bridge
+        # Use the release build task and hash the resulting file below.
         run: |
           mise run wasm-build
           test -f dist-wasm/muxe-zellij.wasm
-      - name: stage target installation (full, this checkout)
-        # Full installation, not a bare binary: fresh producer WASM above,
-        # native release build with the producer digest compiled in
-        # (MUXE_WASM_SHA256, release builds fail closed without it), and
-        # the canonical root layout (DESIGN 1826: `<root>/muxe` with
-        # `<root>/lib/muxe/muxe-zellij.wasm` alongside, plus completions
-        # plus LICENSE). Native resolves the packaged bridge from the
-        # executable's own parent, so a `bin/`-nested binary would look
-        # in the wrong place; no native fallback exists by design.
+      - name: Stage complete installation
+        # Embed the bridge checksum through MUXE_WASM_SHA256 in the native
+        # release build. Package muxe at the installation root, with the bridge
+        # under lib/muxe, shell completions, and LICENSE. The executable resolves
+        # its bridge relative to its own parent; a bin/ subdirectory is invalid.
         run: |
           set -euo pipefail
           file_digest() {
@@ -445,18 +431,14 @@ jobs:
             "$RUNNER_TEMP/target-install/share/muxe/completions/"
           cp LICENSE "$RUNNER_TEMP/target-install/LICENSE"
           test "$(file_digest "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm")" = "$expected"
-          echo "staged full installation from producer digest $expected"
-      - name: target-only both-host smoke (real runner, DESIGN 1638-40/1795)
-        # The repo-owned retained-child explicit-endpoint smoke runner
-        # (live_hosts::target_only_smoke, both pinned hosts, real
-        # foreground bootstrap plus scoped PTY clients) runs here with
-        # complete typed inputs. The test first proves one-client
-        # activation, then runs the two-client read-only routing regression
-        # on a fresh owned Rig. This job's environment expresses the
-        # intended authorization (MUXE_LIVE_HOSTS_APPROVED=true);
-        # any missing capability or input fails, never skips green.
-        # No predecessor belongs in PR smoke: the preceding-to-target
-        # upgrade matrix is release scope (release.yml live-upgrade).
+          echo "Staged installation with WebAssembly SHA-256: $expected"
+      - name: Test installation with Herdr and Zellij
+        # target_only_smoke tests activation and two-client read-only routing
+        # against the staged installation and both pinned hosts.
+        # The runner owns its child processes and uses explicit endpoints,
+        # foreground bootstrap, and scoped PTY clients. The job environment
+        # supplies approval; missing capabilities or inputs fail the test.
+        # This tests one installation, not an upgrade from a previous release.
         run: |
           set -euo pipefail
           mise exec -- cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
@@ -465,12 +447,10 @@ jobs:
           test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
           test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
           test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
-          # the real fixture path. Evidence, not a substitute for the
-          # live smoke below.
+          # Run isolated fixture tests before the live host test.
           mise exec -- cargo test --locked -p muxe --test live_hosts scoped_spawn
           mise exec -- cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
-          # Live smoke: every typed input explicit, approval expressed by
-          # this job's environment. Missing anything fails the gate.
+          # Supply explicit inputs and the approval from this job's environment.
           MUXE_TARGET_INSTALLATION="$RUNNER_TEMP/target-install" \
           MUXE_HERDR_BINARY="$(command -v herdr)" \
           MUXE_ZELLIJ_BINARY="$(command -v zellij)" \

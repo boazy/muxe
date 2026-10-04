@@ -529,11 +529,9 @@ pub fn input_path(name: &str) -> PathBuf {
     path
 }
 
-/// Locates the `muxe` executable inside an installation directory:
-/// canonical root layout only (`<dir>/muxe` with `<dir>/lib/...`
-/// alongside, DESIGN 1826). Native resolves the packaged bridge from the
-/// executable's own parent, so a `bin/`-nested binary would misresolve;
-/// there is no fallback. Anything else fails closed naming the layout.
+/// Locates `<dir>/muxe` in a complete installation. The executable resolves
+/// its packaged bridge relative to its own parent, under `lib/muxe`.
+/// A `bin/`-nested executable is unsupported.
 pub fn installation_binary(dir: &Path) -> PathBuf {
     assert!(
         dir.is_dir(),
@@ -543,7 +541,7 @@ pub fn installation_binary(dir: &Path) -> PathBuf {
     let candidate = dir.join("muxe");
     assert!(
         candidate.is_file(),
-        "installation has no canonical root muxe executable at {} (DESIGN 1826: <root>/muxe with <root>/lib/... alongside; no bin/ fallback)",
+        "installation has no muxe executable at {}; expected <root>/muxe with <root>/lib/muxe alongside, not <root>/bin/muxe",
         candidate.display()
     );
     candidate
@@ -1028,10 +1026,7 @@ impl OwnedZellijHost {
             if !path.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!(
-                        "{name} is not a file (core checkpoint pending?): {}",
-                        path.display()
-                    ),
+                    format!("{name} is not a file: {}", path.display()),
                 ));
             }
         }

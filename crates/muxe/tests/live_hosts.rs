@@ -454,14 +454,11 @@ keybinds {{
     }
 }
 
-/// Serves old brokers on every host through the installed binary and
-/// returns the Herdr endpoint plus one endpoint per session, in order.
-/// Pre-state fixture only: these direct serves stand in for a previously
-/// activated old stack (no time travel available). They prove nothing
-/// about cold start. The lifecycle under proof is always the public
-/// `muxe activate` path (`transfer_to`/`drive_activate`); on-demand
-/// broker startup inside activation is core-owned consumer work the
-/// runner never bypasses or simulates.
+/// Starts old brokers through the installed executable and returns the Herdr
+/// endpoint plus one endpoint per Zellij session, in order.
+/// This sets up an already activated installation; it does not test cold start.
+/// The test exercises the public `muxe activate` path
+/// (`transfer_to`/`drive_activate`), including its on-demand broker startup.
 async fn serve_old_brokers(
     rig: &mut Rig,
     muxe_bin: &Path,
