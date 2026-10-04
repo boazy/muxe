@@ -269,12 +269,12 @@ def github_action_checks(repository: str, commit: str) -> list[dict[str, Any]]:
 
 
 def confirm_ci_override(failing_checks: list[str]) -> None:
-    summary = Text("CI checks are not green: ", style="bold yellow")
+    summary = Text("CI checks have not passed: ", style="bold yellow")
     summary.append(", ".join(failing_checks))
     CONSOLE.print(
         Panel.fit(
             summary,
-            title=Text("Release gate failed", style="bold red"),
+            title=Text("CI checks have not passed", style="bold red"),
             border_style="yellow",
             padding=(1, 2),
         )
@@ -283,7 +283,7 @@ def confirm_ci_override(failing_checks: list[str]) -> None:
         fail("CI override requires an interactive terminal")
 
     decision = questionary.select(
-        "Continue despite the CI result?",
+        "Continue despite unsuccessful or incomplete CI checks?",
         choices=[
             Choice("Stop", value="stop"),
             Choice("Continue", value="continue"),
@@ -293,9 +293,9 @@ def confirm_ci_override(failing_checks: list[str]) -> None:
         style=PROMPT_STYLE,
     ).ask()
     if decision != "continue":
-        fail("Release stopped because GitHub Actions checks are not green")
+        fail("Release stopped because GitHub Actions checks have not passed")
     CONSOLE.print(
-        "[bold yellow]⚠[/] Continuing despite non-green GitHub Actions checks"
+        "[bold yellow]⚠[/] Continuing despite unsuccessful or incomplete GitHub Actions checks"
     )
 
 
@@ -328,7 +328,7 @@ def verify_github_actions(repository: str, commit: str) -> None:
         confirm_ci_override(failing)
         return
     CONSOLE.print(
-        "[green]✓[/] Every GitHub Actions check on trunk() is green or skipped"
+        "[green]✓[/] Every GitHub Actions check on trunk() succeeded or was skipped"
     )
 
 

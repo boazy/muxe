@@ -126,7 +126,7 @@ export PATH="$HOME/.local/muxe/current:$PATH"
 
 When updating a direct-archive installation, keep the previous versioned directory until `muxe activate` commits. After activation succeeds, remove the prior directory. If you install through mise, retain the previous tool version until `muxe activate` commits before running `mise prune`.
 
-Release publication requires the current target-only real-host verification on all three release architectures. The real cross-release upgrade, rollback, and fault matrix is deferred until the implementation is complete and a first genuine published release is available as the live predecessor. See [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). This documentation does not claim that any live check has passed.
+Release publication requires testing the release installation with Herdr and Zellij on all three release architectures. Cross-release upgrade, rollback, and fault tests remain deferred until the implementation is complete and a published predecessor is available. See [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). This documentation does not claim that any live check has passed.
 
 ## Configuration
 
@@ -509,31 +509,29 @@ In CI, `mise run wasm-build` first builds the WebAssembly bridge, and the workfl
 
 These benchmarks cover CPU work in parsing, compilation, and UI session operations. They do not measure real-host IPC or startup latency.
 
-## Live-host test gates
+## Live-host integration tests
 
 Integration tests use isolated fixture processes under a fresh temporary directory per test. Tests never access default user sockets, configuration files, or processes.
 
 Running live-host tests requires explicit environment approval:
 
 - `MUXE_LIVE_HOSTS_APPROVED=true`: Required before any fixture process launches. Any other value fails the test immediately.
-- Zellij permission grants: The test runner seeds the bridge's full 11-permission contract (`ReadApplicationState`, `ChangeApplicationState`, `RunActionsAsUser`, `OpenFiles`, `OpenTerminalsOrPlugins`, `RunCommands`, `WriteToStdin`, `WriteToClipboard`, `Reconfigure`, `FullHdAccess`, and `ReadCliPipes`) directly into an isolated Zellij permission cache for the managed bridge path. The contract lives once in `muxe-zellij-protocol`; the runner passes it, never a retyped subset.
+- Zellij permission grants: The test runner writes the bridge's 11 required permissions (`ReadApplicationState`, `ChangeApplicationState`, `RunActionsAsUser`, `OpenFiles`, `OpenTerminalsOrPlugins`, `RunCommands`, `WriteToStdin`, `WriteToClipboard`, `Reconfigure`, `FullHdAccess`, and `ReadCliPipes`) into an isolated Zellij permission cache for the bridge path. It reads the permission list from `muxe-zellij-protocol`.
 
 Test suites and their required inputs:
 
-- `target_only_smoke`: Verifies the current target installation against live fixtures. Requires `MUXE_TARGET_INSTALLATION`, `MUXE_HERDR_BINARY`, `MUXE_ZELLIJ_BINARY`, `MUXE_ZELLIJ_FOREGROUND_BINARY`, `MUXE_ZELLIJ_BOOTSTRAP_BINARY`, and `MUXE_ZELLIJ_PERMISSION_SEEDER`. No predecessor release is required.
+- `target_only_smoke`: Tests one installation with live Herdr and Zellij fixtures. Requires `MUXE_TARGET_INSTALLATION`, `MUXE_HERDR_BINARY`, `MUXE_ZELLIJ_BINARY`, `MUXE_ZELLIJ_FOREGROUND_BINARY`, `MUXE_ZELLIJ_BOOTSTRAP_BINARY`, and `MUXE_ZELLIJ_PERMISSION_SEEDER`. No predecessor release is required.
 - `upgrade_and_rollback` and `final_session_reload_failure`: Add `MUXE_OLD_INSTALLATION` and `MUXE_ZELLIJ_FAULT_INJECTOR`. The fault test also replays a real downgrade failure.
 
-The target-only smoke covers two current-target scenarios:
+`target_only_smoke` covers two scenarios:
 
-- A one-client activation starts both pinned hosts and one Zellij PTY client, invokes same-version `muxe activate`, and checks both broker identities.
-- A fresh two-client Zellij rig performs read-only typed origin routing. It verifies exact two-client census coverage, routes requests by `(client_id, registration)`, matches each release with its origin snapshot, and observes post-route heartbeats from both clients.
+- The activation test starts Herdr and Zellij with one Zellij terminal client, runs `muxe activate` with the same version, and checks that both brokers report the expected identities.
+- The routing test starts two Zellij terminal clients and sends read-only queries addressed to each. It verifies that the correct client acknowledges and answers each query, then checks for later heartbeats from both clients.
 
-The two-client probe uses the production adapter's transport recovery during startup. Before sending requests, it requires a fresh exact census and compatible registrations from one current subprocess epoch and wire generation. A reconnect discards earlier registration coverage. Once routing begins, transport loss or an epoch or generation change fails the probe; requests are never replayed.
+Before sending queries, the routing test requires exactly the two expected clients and their current registrations. Startup may reconnect, but each reconnect discards old registrations and requires new ones. Once queries begin, any connection change fails the test; it never retries those requests.
 
-Both anchor acquisition and the final census recheck retry typed `Unavailable` results within their original deadlines. These results never count as a census; persistent unavailability times out. Other typed query errors and a changed admission census fail immediately. Admission retries recheck the current epoch and adapter readiness. Fixture-only channel wrappers log both bounded 4 KiB stderr tails on transport errors and before either child is parked, replaced, or closed, including adapter shutdown.
+If the client list is temporarily unavailable, the test waits only within its original deadline. A changed client list or permanent query error fails immediately. The test captures up to 4 KiB of stderr from each helper process on connection errors and when it stops using, replaces, or shuts down that process, including adapter shutdown.
 
-At the pinned Zellij revision, delayed cleanup of a discovery probe can disconnect a new CLI pipe that reused the probe's client ID. A controlled scheduling test reproduces this failure while the host and both PTY clients stay alive. The original CI failure log did not capture that IPC sequence, so its exact interleaving remains inferred. The fixture uses existing production recovery for startup loss without changing the host pin or weakening routing checks.
+Approved CI jobs supply the pinned host binaries and `MUXE_LIVE_HOSTS_APPROVED=true` for these tests. Live-host tests are excluded from the default local test command and must not use default local host state.
 
-CI supplies the pinned host binaries and the explicit `MUXE_LIVE_HOSTS_APPROVED=true` authorization for these live checks. They are not part of the default local test command and must not use local default host state.
-
-CI runs `target_only_smoke` as a real target-only smoke on Linux pull requests. Manual dispatches and the weekly schedule run the full matrix on Ubuntu and macOS. The release workflow runs the current-target gate on all three release architectures. Missing inputs or approvals fail the gate. The real cross-release upgrade, rollback, and fault matrix remains deferred until the first genuine published predecessor; see [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Passing fixture-only suites never stand in for this live matrix.
+When `ALLOW_LIVE_HOST_MATRIX=true`, CI runs `target_only_smoke` on Linux, including pull requests. Manual and scheduled runs also test Ubuntu and macOS; without recorded approval, that matrix job fails before installing hosts. The release workflow tests its installation with both hosts on all three release architectures. Missing inputs fail live tests, and jobs require approval before launching hosts. Cross-release upgrade, rollback, and fault tests remain deferred until a published predecessor is available; see [`TODO-CROSS-RELEASE.md`](TODO-CROSS-RELEASE.md). Isolated fixture tests do not replace live-host verification.
