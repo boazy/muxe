@@ -258,8 +258,13 @@ jobs:
 
   benches:
     name: benchmarks (non-blocking)
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Pushes to main publish the CodSpeed baseline that pull requests compare against.
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OpenID Connect authentication with CodSpeed; no upload token secret is needed.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -305,11 +310,11 @@ jobs:
         # service availability must stay visible in this step without turning
         # the required benchmark job red.
         continue-on-error: true
-        uses: CodSpeedHQ/action@v3
+        uses: CodSpeedHQ/action@v5
         with:
+          mode: simulation
           # Run through the task to activate its pinned cargo-codspeed tool.
           run: mise run bench-codspeed run
-          token: ${{ secrets.CODSPEED_TOKEN }}
   realhost-smoke:
     name: small Linux real-host smoke
     # PRs run this owned-host smoke only with explicit recorded approval.

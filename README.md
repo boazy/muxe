@@ -1,5 +1,7 @@
 # Muxe
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/boazy/muxe?utm_source=badge)
+
 Muxe is a modal menu system for terminal multiplexers, inspired by `which-key`. When you press a configured hotkey in your multiplexer, Muxe opens a temporary menu bar that displays available keys, nested submenus, and actions.
 
 Muxe supports **Zellij** (version 0.46.0) and **Herdr** (version 0.8.2) as both the minimum-supported and latest-verified versions.

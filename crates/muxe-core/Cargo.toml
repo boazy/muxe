@@ -19,5 +19,10 @@ strum.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
+divan.workspace = true
 proptest.workspace = true
 rstest.workspace = true
+
+[[bench]]
+name = "compiler"
+harness = false
