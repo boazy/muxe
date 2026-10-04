@@ -96,9 +96,19 @@ done
 '''
 
 [tasks.bench-codspeed]
-description = "Build CodSpeed comparisons with the pinned runner"
+description = "Build or run CodSpeed comparisons with the pinned runner"
+usage = '''
+arg "[mode]" default="build" help="Build benchmarks or run them with CodSpeed" {
+  choices "build" "run"
+}
+'''
 tools = { "cargo:cargo-codspeed" = "5.0.1" }
-run = "cargo codspeed build --locked"
+run = '''
+case "$usage_mode" in
+  build) cargo codspeed build --locked ;;
+  run) cargo codspeed run ;;
+esac
+'''
 
 [tasks.release]
 description = "Release the current main commit with cargo-release and Jujutsu"

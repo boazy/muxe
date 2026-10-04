@@ -307,7 +307,8 @@ jobs:
         continue-on-error: true
         uses: CodSpeedHQ/action@v3
         with:
-          run: mise exec -- cargo codspeed run
+          # Run through the task to activate its pinned cargo-codspeed tool.
+          run: mise run bench-codspeed run
           token: ${{ secrets.CODSPEED_TOKEN }}
   realhost-smoke:
     name: small Linux real-host smoke
