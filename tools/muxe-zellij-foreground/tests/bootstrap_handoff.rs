@@ -7,52 +7,72 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use zellij_utils::consts::ipc_bind;
-use zellij_utils::ipc::{ClientToServerMsg, IpcSenderWithContext, ServerToClientMsg};
+use zellij_utils::ipc::{
+    ClientToServerMsg, IpcReceiveError, IpcSenderWithContext, ServerToClientMsg,
+};
 
 fn serve_bootstrap_peer(
     listener: &interprocess::local_socket::Listener,
     drained: &std::sync::mpsc::Sender<Result<(), String>>,
-) -> bool {
+) -> Result<bool, String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let stream = loop {
         match listener.accept() {
             Ok(stream) => break stream,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "bootstrap never connected");
+                if Instant::now() >= deadline {
+                    return Err("bootstrap never connected".to_owned());
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => panic!("accept failed: {error}"),
+            Err(error) => return Err(format!("accept failed: {error}")),
         }
     };
+    // Darwin inherits the listener's O_NONBLOCK on accept; interprocess only
+    // sets that flag when requested, so explicitly clear it before timeouts.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("blocking accepted stream: {error}"))?;
     stream
         .set_recv_timeout(Some(Duration::from_secs(10)))
-        .expect("bounded protocol receive");
+        .map_err(|error| format!("bounded protocol receive: {error}"))?;
     stream
         .set_send_timeout(Some(Duration::from_secs(10)))
-        .expect("bounded protocol send");
+        .map_err(|error| format!("bounded protocol send: {error}"))?;
     let mut sender: IpcSenderWithContext<ServerToClientMsg> = IpcSenderWithContext::new(stream);
     let mut receiver = sender.get_receiver::<ClientToServerMsg>();
-    let initial = receiver.try_recv_client_msg().expect("initial message");
-    assert!(matches!(
-        initial.0,
-        ClientToServerMsg::FirstClientConnected { .. }
-    ));
+    let initial = receiver
+        .try_recv_client_msg()
+        .map_err(|error| format!("initial message: {error}"))?;
+    if !matches!(initial.0, ClientToServerMsg::FirstClientConnected { .. }) {
+        return Err(format!("unexpected initial message: {:?}", initial.0));
+    }
     sender
         .send_server_msg(ServerToClientMsg::Render {
             content: "initialized owned session".to_owned(),
         })
-        .expect("render evidence");
+        .map_err(|error| format!("render evidence: {error}"))?;
     // Larger than a Unix socket's usual send buffer: the retained
     // bootstrap must drain subsequent renders before detach is allowed.
     let sent = sender
         .send_server_msg(ServerToClientMsg::Render {
             content: "x".repeat(512 * 1024),
         })
-        .map_err(|error| error.to_string());
-    drained.send(sent).expect("render drain evidence");
-    receiver
-        .try_recv_client_msg()
-        .is_ok_and(|(message, _)| matches!(message, ClientToServerMsg::ClientExited))
+        .map_err(|error| format!("512 KiB render send failed: {error}"));
+    let send_failed = sent.is_err();
+    drained
+        .send(sent)
+        .map_err(|error| format!("render drain evidence disconnected: {error}"))?;
+    if send_failed {
+        return Ok(false);
+    }
+    match receiver.try_recv_client_msg() {
+        Ok((ClientToServerMsg::ClientExited, _)) => Ok(true),
+        Ok((message, _)) => Err(format!("unexpected handoff message: {message:?}")),
+        // An invalid handoff closes the child without sending ClientExited.
+        Err(IpcReceiveError::Disconnected) => Ok(false),
+        Err(error) => Err(format!("handoff receive failed: {error}")),
+    }
 }
 
 fn exercise_handoff(command: &[u8], expected_success: bool) {
@@ -64,7 +84,6 @@ fn exercise_handoff(command: &[u8], expected_success: bool) {
         .set_nonblocking(ListenerNonblockingMode::Accept)
         .expect("bounded accept");
     let (drained_tx, drained_rx) = std::sync::mpsc::channel();
-    let server = std::thread::spawn(move || serve_bootstrap_peer(&listener, &drained_tx));
     let mut child = Command::new(env!("CARGO_BIN_EXE_muxe-zellij-bootstrap"))
         .arg("--socket")
         .arg(&socket)
@@ -88,48 +107,67 @@ fn exercise_handoff(command: &[u8], expected_success: bool) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("retained bootstrap child");
+    let server = std::thread::spawn(move || serve_bootstrap_peer(&listener, &drained_tx));
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.is_file() {
-        if child.try_wait().expect("poll child").is_some() || Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output().expect("reap failed bootstrap");
-            panic!(
-                "no render evidence: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    let outcome = (|| -> Result<(), String> {
+        while !ready.is_file() {
+            if child
+                .try_wait()
+                .map_err(|error| format!("poll child: {error}"))?
+                .is_some()
+                || Instant::now() >= deadline
+            {
+                return Err("no render evidence before child exit/deadline".to_owned());
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    if !matches!(
-        drained_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
-        Ok(Ok(()))
-    ) {
-        let _ = child.kill();
-        let output = child.wait_with_output().expect("reap blocked bootstrap");
-        panic!(
-            "retained bootstrap blocked host renders: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    child
-        .stdin
-        .take()
-        .expect("owned handoff pipe")
-        .write_all(command)
-        .expect("explicit handoff");
-    while child.try_wait().expect("poll detach").is_none() {
-        if Instant::now() >= deadline {
-            child.kill().expect("kill exact hung child");
-            let output = child.wait_with_output().expect("reap hung bootstrap");
-            panic!("handoff hung: {}", String::from_utf8_lossy(&output.stderr));
+        drained_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| format!("render drain observation: {error}"))?
+            .map_err(|error| format!("retained bootstrap blocked host renders: {error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "missing owned handoff pipe".to_owned())?
+            .write_all(command)
+            .map_err(|error| format!("explicit handoff: {error}"))?;
+        while child
+            .try_wait()
+            .map_err(|error| format!("poll detach: {error}"))?
+            .is_none()
+        {
+            if Instant::now() >= deadline {
+                return Err("handoff hung".to_owned());
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let output = child.wait_with_output().expect("reap bootstrap");
-    assert_eq!(output.status.success(), expected_success);
+        Ok(())
+    })();
+    // No assertion may escape before the exact child is reaped and the owned
+    // protocol worker is joined, including receive/send/timeout failure paths.
+    let kill_error = outcome.as_ref().err().and_then(|_| child.kill().err());
+    let output = child.wait_with_output();
+    let server_result = server.join();
+    let output = output.expect("reap owned bootstrap");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        outcome.is_ok(),
+        "bootstrap handoff failed: {outcome:?}; kill error: {kill_error:?}; \
+         server: {server_result:?}; child status: {}; stderr: {stderr}",
+        output.status,
+    );
     assert_eq!(
-        server.join().expect("owned protocol peer"),
-        expected_success
+        output.status.success(),
+        expected_success,
+        "child status: {}; stderr: {stderr}; server: {server_result:?}",
+        output.status,
+    );
+    assert_eq!(
+        server_result
+            .expect("owned protocol peer")
+            .expect("bootstrap protocol"),
+        expected_success,
+        "stderr: {stderr}",
     );
 }
 

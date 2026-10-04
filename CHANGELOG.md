@@ -2,7 +2,10 @@
 
 ### 🐛 Bug Fixes
 
-- *(ci)* Keep the pinned cargo-codspeed runner active for both benchmark building and CodSpeed comparisons
+- *(ci)* Use the same pinned `cargo-codspeed` task to build and run benchmark comparisons.
+- *(ci)* Run the standalone scope-guard script through `/bin/sh` to avoid Linux executable-file-busy errors. Keep its environment isolation checks unchanged.
+- *(ci)* Set accepted bootstrap test sockets to blocking mode so macOS can drain render output. Preserve send errors and reap the helper before reporting failures.
+- *(ci)* Wait for missing initial Zellij client-list output within the existing startup deadline. Keep malformed output and missing post-detach observations fatal. Reap timed-out CLI children and retain their diagnostics.
 - *(ci)* Wait for installation-matched bridge registration before Zellij fixture handoff, and retain the bootstrap client until all initial PTY clients attach without reusing its ID. Preserve legacy receipt support through the selected native record and receipt digest authority.
 - *(input)* Map parsed terminal key enums directly to core named keys, keeping Kitty wire-code decoding in the terminal parser and preserving key-binding behavior
 - *(ci)* Use existing Zellij adapter recovery before two-client smoke admission, discard stale epoch/generation coverage, and retain exact addressed origin checks with fail-fast post-admission loss and no request replay
