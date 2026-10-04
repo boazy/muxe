@@ -95,6 +95,8 @@ pub struct FloatingPaneLayout {
     pub y: Option<PercentOrFixed>,
     pub pinned: Option<bool>,
     pub borderless: Option<bool>,
+    #[serde(default)]
+    pub border_style: Option<BorderStyleOverride>,
     pub run: Option<Run>,
     pub focus: Option<bool>,
     pub already_running: bool,
@@ -111,6 +113,8 @@ pub struct TiledPaneLayout {
     pub split_size: Option<SplitSize>,
     pub run: Option<Run>,
     pub borderless: Option<bool>,
+    #[serde(default)]
+    pub border_style: Option<BorderStyleOverride>,
     pub focus: Option<bool>,
     pub external_children_index: Option<usize>,
     pub children_are_stacked: bool,

@@ -2,6 +2,7 @@
 
 ### 🐛 Bug Fixes
 
+- *(zellij)* Pin the upstream client-lifecycle fix at `81f56e1aed4e17b822af5cb382a8f524e35f3eae`. Prevent duplicate cleanup from retiring a newly attached client and preserve the SDK's 32-bit client IDs through typed bridge state and membership queries.
 - *(bridge)* Request a fresh client census on timer ticks while an event subscription waits for registration under granted permissions.
 - *(ci)* Use the same pinned `cargo-codspeed` task to build and run benchmark comparisons.
 - *(ci)* Generate executable fixtures in an isolated writer child and reap it before direct execution. Prevent concurrent forks from inheriting writable script descriptors, while keeping the scope guard's environment checks unchanged.

@@ -1,4 +1,6 @@
 # Generated from the pinned Zellij source. Every public shim function has an explicit v1 boundary class.
+apply_floating_swap_layout	exposed
+apply_tiled_swap_layout	exposed
 block_cli_pipe_input	internal
 break_panes_to_new_tab	exposed
 break_panes_to_tab_with_id	exposed
@@ -165,6 +167,7 @@ scroll_up_in_pane_id	exposed
 send_sigint_to_pane_id	exposed
 send_sigkill_to_pane_id	exposed
 set_floating_pane_pinned	exposed
+set_pane_border_style	exposed
 set_pane_borderless	exposed
 set_pane_color	exposed
 set_pane_frame_style	exposed

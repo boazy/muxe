@@ -207,6 +207,8 @@ pub fn undo_rename_tab() {}
 pub fn quit_zellij() {}
 pub fn previous_swap_layout() {}
 pub fn next_swap_layout() {}
+pub fn apply_tiled_swap_layout(layout_name: &str) {}
+pub fn apply_floating_swap_layout(layout_name: &str) {}
 pub fn go_to_tab_name(tab_name: &str) {}
 pub fn focus_or_create_tab(tab_name: &str) -> Option<usize> {}
 pub fn go_to_tab(tab_index: u32) {}
@@ -364,6 +366,7 @@ pub fn change_floating_panes_coordinates(
 ) {}
 pub fn toggle_pane_borderless(pane_id: PaneId) {}
 pub fn set_pane_borderless(pane_id: PaneId, borderless: bool) {}
+pub fn set_pane_border_style(pane_id: PaneId, border_style: BorderStyleOverride) {}
 pub fn set_pane_color(pane_id: PaneId, fg: Option<String>, bg: Option<String>) {}
 pub fn start_web_server() {}
 pub fn stop_web_server() {}

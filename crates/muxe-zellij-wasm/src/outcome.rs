@@ -9,11 +9,13 @@ use muxe_zellij_protocol::{CommandOutcome, generated::NativeCommandReturn};
 /// `Failed` with their bounded message; there is no general failure value.
 #[expect(
     clippy::too_many_lines,
-    reason = "exhaustive dispatch over the pinned 153-variant return inventory: every variant is classified infallible/fallible exactly once, and a wildcard would silently misclassify future fallible variants as success"
+    reason = "exhaustive dispatch over the pinned return inventory: every variant is classified infallible/fallible exactly once, and a wildcard would silently misclassify future fallible variants as success"
 )]
 pub fn outcome_of(value: &NativeCommandReturn) -> CommandOutcome {
     match value {
-        NativeCommandReturn::BreakPanesToNewTab(_)
+        NativeCommandReturn::ApplyFloatingSwapLayout(())
+        | NativeCommandReturn::ApplyTiledSwapLayout(())
+        | NativeCommandReturn::BreakPanesToNewTab(_)
         | NativeCommandReturn::BreakPanesToTabWithId(_)
         | NativeCommandReturn::BreakPanesToTabWithIndex(_)
         | NativeCommandReturn::ChangeFloatingPanesCoordinates(())
@@ -125,6 +127,7 @@ pub fn outcome_of(value: &NativeCommandReturn) -> CommandOutcome {
         | NativeCommandReturn::SendSigintToPaneId(())
         | NativeCommandReturn::SendSigkillToPaneId(())
         | NativeCommandReturn::SetFloatingPanePinned(())
+        | NativeCommandReturn::SetPaneBorderStyle(())
         | NativeCommandReturn::SetPaneBorderless(())
         | NativeCommandReturn::SetPaneColor(())
         | NativeCommandReturn::SetPaneFrameStyle(())

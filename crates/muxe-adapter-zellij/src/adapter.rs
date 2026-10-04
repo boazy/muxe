@@ -212,7 +212,7 @@ impl CliMembershipSource {
 /// row per attached client holding a focused pane (`screen.rs`
 /// `get_layout_metadata` over `connected_clients` with
 /// `get_active_pane_id`, rendered by `ClientMetadata::render_many`), and a
-/// client ID is a `u16` (`zellij-utils/src/data.rs`). Transient CLI
+/// client ID is a `u32` (`zellij-utils/src/data.rs`). Transient CLI
 /// callers — including this query and the broker's pipe children — never
 /// enter `connected_clients` (no `AttachClient` on the `is_cli_client`
 /// path), so the census cannot include its own processes. A row whose
@@ -244,7 +244,7 @@ fn parse_list_clients_output(output: &str) -> Result<Vec<ClientId>, AdapterError
         let Some(id) = line.split_whitespace().next() else {
             continue;
         };
-        if id.parse::<u16>().is_err() {
+        if id.parse::<u32>().is_err() {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
                 "zellij list-clients returned an unsupported row shape",
@@ -8210,14 +8210,21 @@ if [ "$1" != "--session" ] || [ "$2" != "session-alpha" ] || [ "$3" != "action" 
   echo "bad argv: $*" >&2
   exit 3
 fi
-printf 'CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n3         terminal_2     /bin/zsh\n1         plugin_9       N/A\n'
+printf 'CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n65536     terminal_2     /bin/zsh\n1         plugin_9       N/A\n4294967295 terminal_7     /bin/sh\n'
 "#;
         let (_dir, exe) = write_fake_exe(table);
         let members = super::CliMembershipSource::new(exe, "session-alpha".to_owned())
             .snapshot_members()
             .await
             .expect("table oracle succeeds");
-        assert_eq!(members, vec![ClientId::new("1"), ClientId::new("3")]);
+        assert_eq!(
+            members,
+            vec![
+                ClientId::new("1"),
+                ClientId::new("4294967295"),
+                ClientId::new("65536"),
+            ]
+        );
         let rejecting = "#!/bin/sh\nexit 3\n";
         let (_dir, exe) = write_fake_exe(rejecting);
         let failed = super::CliMembershipSource::new(exe, "session-alpha".to_owned())

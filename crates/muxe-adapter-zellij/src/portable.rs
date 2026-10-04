@@ -2,7 +2,7 @@
 //!
 //! Every row names the exact pinned `Action` variant (or the precise reason no
 //! row exists) from `fixtures/zellij/0.46.0/action-inventory.rs`, itself derived
-//! from revision `af38660c5884f50bb3726682fb92961326c4268f`.
+//! from revision `81f56e1aed4e17b822af5cb382a8f524e35f3eae`.
 //!
 //! ## Targeting contract
 //!
@@ -963,6 +963,7 @@ fn map_split(
         near_current_pane,
         no_focus: false,
         borderless: None,
+        border_style: None,
         tab_id: None,
     })
 }

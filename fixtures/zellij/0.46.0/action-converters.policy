@@ -1,5 +1,6 @@
 # Generated from the pinned Zellij source. Review every entry before use.
 Action	mirror
+BorderStyleOverride	mirror
 CommandOrPlugin	mirror
 Direction	mirror
 FloatingPaneCoordinates	mirror

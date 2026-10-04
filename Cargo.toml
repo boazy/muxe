@@ -48,8 +48,8 @@ data-encoding = "2.9.0"
 ulid = { version = "1.2.1", default-features = false }
 sha2 = "0.10.9"
 async-trait = "0.1.89"
-zellij-tile = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f", package = "zellij-tile" }
-zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f", package = "zellij-utils" }
+zellij-tile = { git = "https://github.com/zellij-org/zellij.git", rev = "81f56e1aed4e17b822af5cb382a8f524e35f3eae", package = "zellij-tile" }
+zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "81f56e1aed4e17b822af5cb382a8f524e35f3eae", package = "zellij-utils" }
 syn = { version = "2.0.108", features = ["full"] }
 quote = "1.0.41"
 proc-macro2 = "1.0.103"

@@ -4,6 +4,8 @@ Muxe is a modal menu system for terminal multiplexers, inspired by `which-key`. 
 
 Muxe supports **Zellij** (version 0.46.0) and **Herdr** (version 0.8.2) as both the minimum-supported and latest-verified versions.
 
+CI and lifecycle smoke tests require Zellij built from the exact source revision in [`pins/zellij.toml`](pins/zellij.toml): [`81f56e1aed4e17b822af5cb382a8f524e35f3eae`](https://github.com/zellij-org/zellij/commit/81f56e1aed4e17b822af5cb382a8f524e35f3eae). This revision fixes duplicate client cleanup and immediate client-ID reuse. Zellij still reports version `0.46.0`, so that version string alone does not establish that a binary contains the fix.
+
 ## How it works
 
 - **Host-owned hotkeys**: You configure your root hotkey (such as `Alt m` or `prefix+m`) in your multiplexer's native configuration. Muxe never generates, modifies, or manages your multiplexer's keybindings.

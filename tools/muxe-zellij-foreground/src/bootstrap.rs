@@ -16,8 +16,8 @@
 //! evidence to the explicit ready file, then keeps its client connected until
 //! the runner writes `detach` to stdin after a retained PTY client attaches.
 //! First render does not mean asynchronous autoload plugins have finished
-//! loading: detaching immediately can recycle the initial client identity
-//! while those plugins are still being initialized.
+//! loading. The runner keeps the bootstrap client until bridge readiness and
+//! the retained PTY clients have been observed.
 //!
 //! Typed inputs only: absolute socket/config/config-dir/data-dir/cwd
 //! paths plus explicit geometry. There is no command hook and no shell.

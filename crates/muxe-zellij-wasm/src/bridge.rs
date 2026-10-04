@@ -59,7 +59,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use muxe_protocol::{CaptureLeaseId, ExecutionId, UiSessionId};
+use muxe_protocol::{CaptureLeaseId, ExecutionId, HostClientId, UiSessionId};
 use muxe_zellij_protocol::{
     BRIDGE_PERMISSIONS, BRIDGE_PROTOCOL_VERSION, BridgeEvent, BridgeIdentity, BridgeRequest,
     BridgeResponse, CaptureEndReason, CaptureLostReason, ChannelGeneration, CommandOutcome,
@@ -299,13 +299,23 @@ impl ClassifiedOrigin {
     }
 }
 
+/// Client identity returned by the SDK for this plugin instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PluginClientId(zellij_utils::data::ClientId);
+
+impl PluginClientId {
+    fn from_sdk(client_id: zellij_utils::data::ClientId) -> Self {
+        Self(client_id)
+    }
+}
+
 /// Bridge state for one Zellij client. Identity fields stay empty until
 /// verified host data arrives; no registration emits before that.
 pub struct Bridge {
-    client_id: Option<String>,
+    client_id: Option<HostClientId>,
     session_name: Option<String>,
     plugin_id: Option<u32>,
-    plugin_client_id: Option<u16>,
+    plugin_client_id: Option<PluginClientId>,
     focused_pane: Option<PaneId>,
     permission_gate: PermissionGate,
     event_cli_id: Option<String>,
@@ -390,7 +400,7 @@ impl Bridge {
         effects.request_permissions(&BRIDGE_PERMISSIONS);
         let ids = effects.plugin_ids();
         self.plugin_id = Some(ids.plugin_id);
-        self.plugin_client_id = Some(ids.client_id);
+        self.plugin_client_id = Some(PluginClientId::from_sdk(ids.client_id));
         effects.arm_timer(HEARTBEAT_SECS);
     }
 
@@ -444,8 +454,8 @@ impl Bridge {
     }
     /// Test-visible client identity.
     #[cfg(test)]
-    pub fn client_identity(&self) -> Option<&str> {
-        self.client_id.as_deref()
+    pub fn client_identity(&self) -> Option<&HostClientId> {
+        self.client_id.as_ref()
     }
 
     /// Test-visible active registration.
@@ -467,9 +477,11 @@ impl Bridge {
         let mut current_client_present = false;
         if let Some(anchor_client_id) = self.plugin_client_id {
             for client in clients {
-                if client.is_current_client && client.client_id == anchor_client_id {
+                if client.is_current_client
+                    && PluginClientId::from_sdk(client.client_id) == anchor_client_id
+                {
                     current_client_present = true;
-                    self.client_id = Some(client.client_id.to_string());
+                    self.client_id = Some(HostClientId::new(client.client_id.to_string()));
                     let focused = client.pane_id;
                     // Focus history advances only while no menu owns capture.
                     // `ListClients` proves focus, not kind: the census row's
@@ -955,7 +967,7 @@ impl Bridge {
         self.emit_unsolicited(
             BridgeEvent::Register {
                 registration: ZellijRegistration {
-                    client_id,
+                    client_id: client_id.0,
                     current_pane: self.focused_pane.map(|pane| pane.to_string()),
                     plugin_id: self.plugin_id,
                     identity: BridgeIdentity {
@@ -988,7 +1000,7 @@ impl Bridge {
         // Only the named active registration and pipe generation act; every
         // other instance drops the frame silently so exactly one bridge
         // unblocks the request child.
-        if request.target.client_id != *client_id
+        if request.target.client_id != client_id.as_str()
             || Some(request.registration) != self.registration
             || Some(request.channel_generation) != self.channel_generation
         {
@@ -1427,7 +1439,10 @@ impl Bridge {
             BridgeResponse::OriginSnapshot {
                 ui_session,
                 origin: ZellijOrigin {
-                    client_id: self.client_id.clone().unwrap_or_default(),
+                    client_id: self
+                        .client_id
+                        .as_ref()
+                        .map_or_else(String::new, |id| id.as_str().to_owned()),
                     session_name: self.session_name.clone(),
                     active_tab_index,
                     active_tab_id: snapshot_active_tab_id,
@@ -1664,6 +1679,7 @@ mod tests {
         list_clients_ready: bool,
         list_response_pending: bool,
         plugin_id: u32,
+        plugin_client_id: PluginClientId,
         cwd: BTreeMap<String, String>,
         random: VecDeque<[u8; 16]>,
     }
@@ -1683,6 +1699,7 @@ mod tests {
                 list_clients_ready: false,
                 list_response_pending: false,
                 plugin_id: 41,
+                plugin_client_id: PluginClientId::from_sdk(5),
                 cwd: BTreeMap::new(),
                 random: VecDeque::from([[7_u8; 16], [8_u8; 16], [9_u8; 16]]),
             }
@@ -1742,7 +1759,7 @@ mod tests {
                 plugin_id: self.plugin_id,
                 zellij_pid: 1000,
                 initial_cwd: PathBuf::from("/tmp"),
-                client_id: 5,
+                client_id: self.plugin_client_id.0,
             }
         }
         fn pane_cwd(&mut self, pane: PaneId) -> Option<PathBuf> {
@@ -1801,7 +1818,7 @@ mod tests {
         ExecutionId([seed; 16])
     }
 
-    fn clients_for(client_id: u16, pane: PaneId) -> Vec<ClientInfo> {
+    fn clients_for(client_id: zellij_utils::data::ClientId, pane: PaneId) -> Vec<ClientInfo> {
         clients_for_command(client_id, pane, "")
     }
 
@@ -1812,7 +1829,11 @@ mod tests {
     /// matches that signal structurally (see [`is_muxe_running_command`]):
     /// empty/`"N/A"`/unparsable stays unclassified and is never adopted on
     /// its own.
-    fn clients_for_command(client_id: u16, pane: PaneId, running_command: &str) -> Vec<ClientInfo> {
+    fn clients_for_command(
+        client_id: zellij_utils::data::ClientId,
+        pane: PaneId,
+        running_command: &str,
+    ) -> Vec<ClientInfo> {
         vec![ClientInfo {
             client_id,
             pane_id: pane,
@@ -1922,9 +1943,34 @@ mod tests {
             Event::ListClients(clients_current(PaneId::Terminal(2))),
             &mut host,
         );
-        assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.client_identity(), Some(&HostClientId::new("5")));
         assert_eq!(bridge.active_registration(), Some(registration(7)));
         (bridge, host)
+    }
+
+    #[test]
+    fn registration_preserves_sdk_client_ids_above_u16_range() {
+        let mut bridge = Bridge::default();
+        let mut host = FakeHost::new();
+        host.plugin_client_id = PluginClientId::from_sdk(65_536);
+        bridge.load(&mut host);
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Granted),
+            &mut host,
+        );
+        bridge.pipe(subscribe_msg(), &mut host);
+        bridge.update(
+            Event::ListClients(clients_for(0, PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert_eq!(bridge.active_registration(), None);
+        bridge.update(
+            Event::ListClients(clients_for(65_536, PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert_eq!(bridge.client_identity(), Some(&HostClientId::new("65536")));
+        assert_eq!(bridge.active_registration(), Some(registration(7)));
+        assert_eq!(host.register_client_ids(EVENT_CLI), vec!["65536"]);
     }
 
     #[test]
@@ -2366,7 +2412,7 @@ mod tests {
     #[test]
     fn replacement_subscription_requires_fresh_census_before_timer_stops() {
         let (mut bridge, mut host) = boot();
-        assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.client_identity(), Some(&HostClientId::new("5")));
         assert_eq!(bridge.active_registration(), Some(registration(7)));
 
         // Replacement subscription arrives on EVENT_CLI_TWO: clears registration;
@@ -2439,7 +2485,7 @@ mod tests {
         let before = host.outputs.len();
         bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
         assert_eq!(host.lists, 3);
-        assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.client_identity(), Some(&HostClientId::new("5")));
         assert_eq!(bridge.active_registration(), None);
         assert!(host.outputs[before..].is_empty());
         bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
@@ -2461,7 +2507,7 @@ mod tests {
             Event::ListClients(clients_for(6, PaneId::Terminal(2))),
             &mut host,
         );
-        assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.client_identity(), Some(&HostClientId::new("5")));
         assert_eq!(bridge.active_registration(), None);
         assert!(host.register_client_ids(EVENT_CLI_TWO).is_empty());
 

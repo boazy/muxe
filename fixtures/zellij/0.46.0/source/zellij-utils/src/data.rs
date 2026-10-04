@@ -1,6 +1,6 @@
 // Minimized from the exact pinned source: zellij-utils/src/data.rs
 
-pub type ClientId = u16;
+pub type ClientId = u32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnblockCondition {
     /// Unblock only when exit status is 0 (success)
@@ -450,10 +450,38 @@ pub struct Palette {
     pub brown: PaletteColor,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum LineStyle {
+    #[default]
+    Single,
+    Double,
+    Heavy,
+    Dashed,
+    HeavyDashed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct BorderStyle {
+    pub top: LineStyle,
+    pub right: LineStyle,
+    pub bottom: LineStyle,
+    pub left: LineStyle,
+    pub rounded_corners: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct BorderStyleOverride {
+    pub all: Option<LineStyle>,
+    pub top: Option<LineStyle>,
+    pub right: Option<LineStyle>,
+    pub bottom: Option<LineStyle>,
+    pub left: Option<LineStyle>,
+    pub rounded_corners: Option<bool>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Style {
     pub colors: Styling,
     pub rounded_corners: bool,
     pub hide_session_name: bool,
+    pub border_style: BorderStyle,
+    pub floating_border_style: BorderStyle,
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum Coloration {
@@ -598,6 +626,7 @@ pub struct TabInfo {
     pub is_sync_panes_active: bool,
     pub are_floating_panes_visible: bool,
     pub other_focused_clients: Vec<ClientId>,
+    pub other_focused_client_slots: Vec<usize>,
     pub active_swap_layout_name: Option<String>,
     /// Whether the user manually changed the layout, moving out of the swap layout scheme
     pub is_swap_layout_dirty: bool,
@@ -843,12 +872,15 @@ pub struct FileToOpen {
     pub path: PathBuf,
     pub line_number: Option<usize>,
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub border_style: Option<BorderStyleOverride>,
 }
 #[derive(Debug, Default, Clone)]
 pub struct CommandToRun {
     pub path: PathBuf,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    pub border_style: Option<BorderStyleOverride>,
 }
 #[derive(Debug, Default, Clone)]
 pub struct MessageToPlugin {
@@ -931,6 +963,8 @@ pub struct FloatingPaneCoordinates {
     pub height: Option<PercentOrFixed>,
     pub pinned: Option<bool>,
     pub borderless: Option<bool>,
+    #[serde(default)]
+    pub border_style: Option<BorderStyleOverride>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OriginatingPlugin {
@@ -949,15 +983,24 @@ pub enum WebSharing {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NewPanePlacement {
-    NoPreference { borderless: Option<bool> },
-    Tiled { direction: Option<Direction>, borderless: Option<bool> },
+    NoPreference { borderless: Option<bool>, border_style: Option<BorderStyleOverride> },
+    Tiled {
+        direction: Option<Direction>,
+        borderless: Option<bool>,
+        border_style: Option<BorderStyleOverride>,
+    },
     Floating(Option<FloatingPaneCoordinates>),
     InPlace {
         pane_id_to_replace: Option<PaneId>,
         close_replaced_pane: bool,
         borderless: Option<bool>,
+        border_style: Option<BorderStyleOverride>,
     },
-    Stacked { pane_id_to_stack_under: Option<PaneId>, borderless: Option<bool> },
+    Stacked {
+        pane_id_to_stack_under: Option<PaneId>,
+        borderless: Option<bool>,
+        border_style: Option<BorderStyleOverride>,
+    },
 }
 type Context = BTreeMap<String, String>;
 #[derive(Debug, Clone, EnumDiscriminants, Display)]
@@ -1026,6 +1069,8 @@ pub enum PluginCommand {
     QuitZellij,
     PreviousSwapLayout,
     NextSwapLayout,
+    ApplyTiledSwapLayout(String),
+    ApplyFloatingSwapLayout(String),
     GoToTabName(String),
     FocusOrCreateTab(String),
     GoToTab(u32),
@@ -1118,6 +1163,7 @@ pub enum PluginCommand {
     ChangeFloatingPanesCoordinates(Vec<(PaneId, FloatingPaneCoordinates)>),
     TogglePaneBorderless(PaneId),
     SetPaneBorderless(PaneId, bool),
+    SetPaneBorderStyle(PaneId, BorderStyleOverride),
     OpenCommandPaneNearPlugin(CommandToRun, Context),
     OpenTerminalNearPlugin(FileToOpen),
     OpenTerminalFloatingNearPlugin(FileToOpen, Option<FloatingPaneCoordinates>),

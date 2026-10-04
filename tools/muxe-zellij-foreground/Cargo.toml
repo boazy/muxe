@@ -20,8 +20,8 @@ name = "muxe-zellij-fault-injector"
 path = "src/fault_injector.rs"
 
 [dependencies]
-zellij-server = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f" }
-zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "af38660c5884f50bb3726682fb92961326c4268f" }
+zellij-server = { git = "https://github.com/zellij-org/zellij.git", rev = "81f56e1aed4e17b822af5cb382a8f524e35f3eae" }
+zellij-utils = { git = "https://github.com/zellij-org/zellij.git", rev = "81f56e1aed4e17b822af5cb382a8f524e35f3eae" }
 
 [dev-dependencies]
 interprocess = { version = "2", default-features = false }

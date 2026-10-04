@@ -2,29 +2,30 @@
 // Regenerate with: cargo run --locked -p muxe-zellij-gen --
 // Raw input validates into a typed model; dispatch converts directly without JSON.
 
-pub const PINNED_ZELLIJ_REVISION: &str = "af38660c5884f50bb3726682fb92961326c4268f";
+pub const PINNED_ZELLIJ_REVISION: &str = "81f56e1aed4e17b822af5cb382a8f524e35f3eae";
 pub const PINNED_ZELLIJ_VERSION: &str = "0.46.0";
 
 pub const SOURCE_INPUT_SHA256: &[(&str, &str)] = &[
     ("zellij-client/src/cli_client.rs", "73d59993a56e4ea9dfe518de93a7c5ad74e8b3e98027bcef54944721f16897d8"),
-    ("zellij-server/src/panes/grid.rs", "ef99f9a55840ef91d453bce6050facfa8ae5ca2edee43f96c65929fac710d047"),
-    ("zellij-server/src/panes/terminal_pane.rs", "5f0903629b3eb662ef27a3be992c111c8241d23f502506536950509da4e75841"),
-    ("zellij-server/src/route.rs", "773583abd400674e7e64970f138655e83a35f53aabb8164b0cb40c755f47b5b3"),
-    ("zellij-tile/src/shim.rs", "219ecb24b870d9ae4fbf14ee87f09813d602150e5bb4f18c7f901c5ca3434adc"),
-    ("zellij-utils/src/data.rs", "03b38140c1e3dc097c4acabb9b80f6561205fefc0f7da8f29b4eba36000beb06"),
-    ("zellij-utils/src/input/actions.rs", "660f4cf4f3da51bd4cf7cc90871aed90300ba81c203b9528df1a6ff2af4fdee5"),
+    ("zellij-server/src/panes/grid.rs", "8c7f1d9f05aeb90d39b27bf8ba5bbf68b30718e72681ebd87825737aa34055c7"),
+    ("zellij-server/src/panes/terminal_pane.rs", "3e276cfed3e3a47582513b27b7315a50df622255ee37ee1fdb93e7eb24f2b161"),
+    ("zellij-server/src/route.rs", "b437c50bd1e9cb560edde0fbcb32c49209cffb15b5552353246087015591ab68"),
+    ("zellij-tile/src/shim.rs", "cbe16955111b4b10bc62ac0a5822859c98b9a87204c4dc3ed09849a99e311313"),
+    ("zellij-utils/src/data.rs", "429eeaf8d5d75a6884c1e41be511898bfb7ae7a5415ec2bee8f96669483c558f"),
+    ("zellij-utils/src/input/actions.rs", "0d0ebdaaf62f45ce09408231d20cf18d95b2f54187643864d2e7ee787e11bec9"),
     ("zellij-utils/src/input/command.rs", "bf3aec90d4b0379493b76b57d51ccf8d757f6463171b090b8eb5a62b6c462a98"),
-    ("zellij-utils/src/input/layout.rs", "868e1987b1824b42ae04ec5d6765b09a6516c86abb5239d6614b837e114400b3"),
+    ("zellij-utils/src/input/layout.rs", "d9744975fedf09f51e48d0d71a2a4ced44b7c3f61e89960bf28d09ded0ef57d7"),
     ("zellij-utils/src/input/mouse.rs", "69ca86fedf70fb2aaac97ed8de58e9d08579dd9a38a2cef0da64d2158f7d608f"),
-    ("zellij-utils/src/input/options.rs", "573517e549d61fe0e98c52b57ec9a1feac331c1fb4bb869b5b2ab39e0dd2a2b0"),
-    ("zellij-utils/src/plugin_api/action.proto", "0ce47a2b3a65735835c094ac13e96fa5c70db0e6993a71c6dc076f91a5dd20dc"),
-    ("zellij-utils/src/plugin_api/plugin_command.proto", "cd02e56acd6389bfee21be9b6a91a493178f2d948ab9847f4c3e84e1470c9da0"),
+    ("zellij-utils/src/input/options.rs", "80eb81a77d86eb141d676ae3640fbd78a43b722ca5055f923acd282e8d19165c"),
+    ("zellij-utils/src/plugin_api/action.proto", "8b0320c5a983758b2594ed4ce1b7b7ea5a8f95d990f468bdf7a82a07b8100d38"),
+    ("zellij-utils/src/plugin_api/plugin_command.proto", "161c1e65dd71aaf4704d9e437a7067d7f7c13b659488cbbd4d79a962301f51b5"),
     ("zellij-utils/src/position.rs", "344b13ced07f89c43d47753cb5b99bd895eab767e53e83e566f7a44254bba43d"),
 ];
 
 pub const MIRROR_TYPE_SOURCES: &[(&str, &str)] = &[
     ("Action", "zellij-utils/src/input/actions.rs"),
     ("BareKey", "zellij-utils/src/data.rs"),
+    ("BorderStyleOverride", "zellij-utils/src/data.rs"),
     ("ClientId", "zellij-utils/src/data.rs"),
     ("Column", "zellij-utils/src/position.rs"),
     ("CommandOrPlugin", "zellij-utils/src/data.rs"),
@@ -43,6 +44,7 @@ pub const MIRROR_TYPE_SOURCES: &[(&str, &str)] = &[
     ("LayoutInfo", "zellij-utils/src/data.rs"),
     ("LayoutMetadata", "zellij-utils/src/data.rs"),
     ("Line", "zellij-utils/src/position.rs"),
+    ("LineStyle", "zellij-utils/src/data.rs"),
     ("MouseEvent", "zellij-utils/src/input/mouse.rs"),
     ("MouseEventType", "zellij-utils/src/input/mouse.rs"),
     ("NewPanePlacement", "zellij-utils/src/data.rs"),
@@ -78,6 +80,10 @@ pub const MIRROR_TYPE_SOURCES: &[(&str, &str)] = &[
 ];
 
 pub const ACTION_VARIANTS: &[(&str, &[&str])] = &[
+    ("ApplyFloatingSwapLayout", &["name: String", ]),
+    ("ApplyFloatingSwapLayoutByTabId", &["id: u64", "name: String", ]),
+    ("ApplyTiledSwapLayout", &["name: String", ]),
+    ("ApplyTiledSwapLayoutByTabId", &["id: u64", "name: String", ]),
     ("AreFloatingPanesVisible", &["tab_id: Option < usize >", ]),
     ("BreakPane", &[]),
     ("BreakPaneLeft", &[]),
@@ -144,7 +150,7 @@ pub const ACTION_VARIANTS: &[(&str, &[&str])] = &[
     ("NewPane", &["direction: Option < Direction >", "pane_name: Option < String >", "start_suppressed: bool", ]),
     ("NewStackedPane", &["command: Option < RunCommandAction >", "pane_name: Option < String >", "near_current_pane: bool", "no_focus: bool", "tab_id: Option < usize >", ]),
     ("NewTab", &["tiled_layout: Option < TiledPaneLayout >", "floating_layouts: Vec < FloatingPaneLayout >", "swap_tiled_layouts: Option < Vec < SwapTiledLayout > >", "swap_floating_layouts: Option < Vec < SwapFloatingLayout > >", "tab_name: Option < String >", "should_change_focus_to_new_tab: bool", "cwd: Option < PathBuf >", "initial_panes: Option < Vec < CommandOrPlugin > >", "first_pane_unblock_condition: Option < UnblockCondition >", ]),
-    ("NewTiledPane", &["direction: Option < Direction >", "command: Option < RunCommandAction >", "pane_name: Option < String >", "near_current_pane: bool", "no_focus: bool", "borderless: Option < bool >", "tab_id: Option < usize >", ]),
+    ("NewTiledPane", &["direction: Option < Direction >", "command: Option < RunCommandAction >", "pane_name: Option < String >", "near_current_pane: bool", "no_focus: bool", "borderless: Option < bool >", "border_style: Option < BorderStyleOverride >", "tab_id: Option < usize >", ]),
     ("NewTiledPluginPane", &["plugin: RunPluginOrAlias", "pane_name: Option < String >", "skip_cache: bool", "cwd: Option < PathBuf >", "no_focus: bool", "tab_id: Option < usize >", ]),
     ("NextSwapLayout", &[]),
     ("NextSwapLayoutByTabId", &["id: u64", ]),
@@ -188,6 +194,7 @@ pub const ACTION_VARIANTS: &[(&str, &[&str])] = &[
     ("SelectCommandAtScrollPosition", &[]),
     ("SetDarkTheme", &[]),
     ("SetLightTheme", &[]),
+    ("SetPaneBorderStyle", &["pane_id: PaneId", "border_style: BorderStyleOverride", ]),
     ("SetPaneBorderless", &["pane_id: PaneId", "borderless: bool", ]),
     ("SetPaneColor", &["pane_id: PaneId", "fg: Option < String >", "bg: Option < String >", ]),
     ("SetPaneFrameStyle", &["PaneFrameStyle", ]),
@@ -232,6 +239,7 @@ pub const ACTION_VARIANTS: &[(&str, &[&str])] = &[
 
 pub const ACTION_CONVERTERS: &[(&str, &str)] = &[
     ("Action", "mirror"),
+    ("BorderStyleOverride", "mirror"),
     ("CommandOrPlugin", "mirror"),
     ("Direction", "mirror"),
     ("FloatingPaneCoordinates", "mirror"),
@@ -262,6 +270,8 @@ pub const ACTION_CONVERTER_HOLES: &[&str] = &[
 ];
 
 pub const PUBLIC_PLUGIN_FUNCTIONS: &[(&str, &str)] = &[
+    ("apply_floating_swap_layout", "exposed"),
+    ("apply_tiled_swap_layout", "exposed"),
     ("block_cli_pipe_input", "internal"),
     ("break_panes_to_new_tab", "exposed"),
     ("break_panes_to_tab_with_id", "exposed"),
@@ -428,6 +438,7 @@ pub const PUBLIC_PLUGIN_FUNCTIONS: &[(&str, &str)] = &[
     ("send_sigint_to_pane_id", "exposed"),
     ("send_sigkill_to_pane_id", "exposed"),
     ("set_floating_pane_pinned", "exposed"),
+    ("set_pane_border_style", "exposed"),
     ("set_pane_borderless", "exposed"),
     ("set_pane_color", "exposed"),
     ("set_pane_frame_style", "exposed"),
@@ -476,6 +487,8 @@ pub const PUBLIC_PLUGIN_FUNCTIONS: &[(&str, &str)] = &[
 ];
 
 pub const FUNCTION_POLICY_REASONS: &[(&str, &str)] = &[
+    ("apply_floating_swap_layout", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
+    ("apply_tiled_swap_layout", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
     ("block_cli_pipe_input", "bridge lifecycle, client targeting, permission, capture, or subscription primitive; never user-dispatched"),
     ("break_panes_to_new_tab", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
     ("break_panes_to_tab_with_id", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
@@ -642,6 +655,7 @@ pub const FUNCTION_POLICY_REASONS: &[(&str, &str)] = &[
     ("send_sigint_to_pane_id", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
     ("send_sigkill_to_pane_id", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
     ("set_floating_pane_pinned", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
+    ("set_pane_border_style", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
     ("set_pane_borderless", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
     ("set_pane_color", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
     ("set_pane_frame_style", "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"),
@@ -722,6 +736,8 @@ pub const VALIDATION_RULES: &[(&str, &str)] = &[
 ];
 
 pub const NATIVE_ZELLIJ_COMMANDS: &[(&str, &str, &str, &str)] = &[
+    ("apply-floating-swap-layout", "apply_floating_swap_layout", "()", "source-to-validated"),
+    ("apply-tiled-swap-layout", "apply_tiled_swap_layout", "()", "source-to-validated"),
     ("break-panes-to-new-tab", "break_panes_to_new_tab", "Option < usize >", "source-to-validated"),
     ("break-panes-to-tab-with-id", "break_panes_to_tab_with_id", "Option < usize >", "source-to-validated"),
     ("break-panes-to-tab-with-index", "break_panes_to_tab_with_index", "Option < usize >", "source-to-validated"),
@@ -842,6 +858,7 @@ pub const NATIVE_ZELLIJ_COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("send-sigint-to-pane-id", "send_sigint_to_pane_id", "()", "source-to-validated"),
     ("send-sigkill-to-pane-id", "send_sigkill_to_pane_id", "()", "source-to-validated"),
     ("set-floating-pane-pinned", "set_floating_pane_pinned", "()", "source-to-validated"),
+    ("set-pane-border-style", "set_pane_border_style", "()", "source-to-validated"),
     ("set-pane-borderless", "set_pane_borderless", "()", "source-to-validated"),
     ("set-pane-color", "set_pane_color", "()", "source-to-validated"),
     ("set-pane-frame-style", "set_pane_frame_style", "()", "source-to-validated"),
@@ -878,6 +895,8 @@ pub const NATIVE_ZELLIJ_COMMANDS: &[(&str, &str, &str, &str)] = &[
 ];
 
 pub const NATIVE_ZELLIJ_COMMAND_ARGUMENTS: &[(&str, &str, &str, &str)] = &[
+    ("apply-floating-swap-layout", "layout-name", "String", "raw-to-validated"),
+    ("apply-tiled-swap-layout", "layout-name", "String", "raw-to-validated"),
     ("break-panes-to-new-tab", "pane-ids", "Vec < raw::PaneId >", "raw-to-validated"),
     ("break-panes-to-new-tab", "new-tab-name", "Option < String >", "raw-to-validated"),
     ("break-panes-to-new-tab", "should-change-focus-to-new-tab", "bool", "raw-to-validated"),
@@ -1048,6 +1067,8 @@ pub const NATIVE_ZELLIJ_COMMAND_ARGUMENTS: &[(&str, &str, &str, &str)] = &[
     ("send-sigkill-to-pane-id", "pane-id", "raw::PaneId", "raw-to-validated"),
     ("set-floating-pane-pinned", "pane-id", "raw::PaneId", "raw-to-validated"),
     ("set-floating-pane-pinned", "should-be-pinned", "bool", "raw-to-validated"),
+    ("set-pane-border-style", "pane-id", "raw::PaneId", "raw-to-validated"),
+    ("set-pane-border-style", "border-style", "raw::BorderStyleOverride", "raw-to-validated"),
     ("set-pane-borderless", "pane-id", "raw::PaneId", "raw-to-validated"),
     ("set-pane-borderless", "borderless", "bool", "raw-to-validated"),
     ("set-pane-color", "pane-id", "raw::PaneId", "raw-to-validated"),
@@ -1219,6 +1240,7 @@ pub mod raw {
             near_current_pane: bool,
             no_focus: bool,
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
             tab_id: Option < usize >,
         },
         NewInPlacePane {
@@ -1344,6 +1366,12 @@ pub mod raw {
         ToggleMouseMode,
         PreviousSwapLayout,
         NextSwapLayout,
+        ApplyTiledSwapLayout {
+            name: String,
+        },
+        ApplyFloatingSwapLayout {
+            name: String,
+        },
         OverrideLayout {
             tabs: Vec < TabLayoutInfo >,
             retain_existing_terminal_panes: bool,
@@ -1489,6 +1517,10 @@ pub mod raw {
             pane_id: PaneId,
             borderless: bool,
         },
+        SetPaneBorderStyle {
+            pane_id: PaneId,
+            border_style: BorderStyleOverride,
+        },
         TogglePaneInGroup,
         ToggleGroupMarking,
         ScrollUpByPaneId {
@@ -1574,6 +1606,14 @@ pub mod raw {
         NextSwapLayoutByTabId {
             id: u64,
         },
+        ApplyTiledSwapLayoutByTabId {
+            id: u64,
+            name: String,
+        },
+        ApplyFloatingSwapLayoutByTabId {
+            id: u64,
+            name: String,
+        },
         MoveTabByTabId {
             id: u64,
             direction: Direction,
@@ -1606,7 +1646,17 @@ pub mod raw {
         Menu,
     }
 
-    pub type ClientId = u16;
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BorderStyleOverride {
+        pub all: Option < LineStyle >,
+        pub top: Option < LineStyle >,
+        pub right: Option < LineStyle >,
+        pub bottom: Option < LineStyle >,
+        pub left: Option < LineStyle >,
+        pub rounded_corners: Option < bool >,
+    }
+
+    pub type ClientId = u32;
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Column(pub usize, );
@@ -1623,6 +1673,7 @@ pub mod raw {
         pub path: PathBuf,
         pub args: Vec < String >,
         pub cwd: Option < PathBuf >,
+        pub border_style: Option < BorderStyleOverride >,
     }
 
     pub type Context = Vec < MapEntry < String, String > >;
@@ -1640,6 +1691,8 @@ pub mod raw {
         pub path: PathBuf,
         pub line_number: Option < usize >,
         pub cwd: Option < PathBuf >,
+        # [serde (default)]
+        pub border_style: Option < BorderStyleOverride >,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1650,6 +1703,8 @@ pub mod raw {
         pub height: Option < PercentOrFixed >,
         pub pinned: Option < bool >,
         pub borderless: Option < bool >,
+        # [serde (default)]
+        pub border_style: Option < BorderStyleOverride >,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1661,6 +1716,8 @@ pub mod raw {
         pub y: Option < PercentOrFixed >,
         pub pinned: Option < bool >,
         pub borderless: Option < bool >,
+        # [serde (default)]
+        pub border_style: Option < BorderStyleOverride >,
         pub run: Option < Run >,
         pub focus: Option < bool >,
         pub already_running: bool,
@@ -1771,6 +1828,15 @@ pub mod raw {
     pub struct Line(pub isize, );
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum LineStyle {
+        Single,
+        Double,
+        Heavy,
+        Dashed,
+        HeavyDashed,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct MouseEvent {
         pub event_type: MouseEventType,
         pub left: bool,
@@ -1799,20 +1865,24 @@ pub mod raw {
     pub enum NewPanePlacement {
         NoPreference {
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
         },
         Tiled {
             direction: Option < Direction >,
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
         },
         Floating(Option < FloatingPaneCoordinates >, ),
         InPlace {
             pane_id_to_replace: Option < PaneId >,
             close_replaced_pane: bool,
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
         },
         Stacked {
             pane_id_to_stack_under: Option < PaneId >,
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
         },
     }
 
@@ -2029,6 +2099,8 @@ pub mod raw {
         pub split_size: Option < SplitSize >,
         pub run: Option < Run >,
         pub borderless: Option < bool >,
+        # [serde (default)]
+        pub border_style: Option < BorderStyleOverride >,
         pub focus: Option < bool >,
         pub external_children_index: Option < usize >,
         pub children_are_stacked: bool,
@@ -2176,6 +2248,7 @@ pub mod validated {
             near_current_pane: bool,
             no_focus: bool,
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
             tab_id: Option < usize >,
         },
         NewInPlacePane {
@@ -2301,6 +2374,12 @@ pub mod validated {
         ToggleMouseMode,
         PreviousSwapLayout,
         NextSwapLayout,
+        ApplyTiledSwapLayout {
+            name: String,
+        },
+        ApplyFloatingSwapLayout {
+            name: String,
+        },
         OverrideLayout {
             tabs: Vec < TabLayoutInfo >,
             retain_existing_terminal_panes: bool,
@@ -2446,6 +2525,10 @@ pub mod validated {
             pane_id: PaneId,
             borderless: bool,
         },
+        SetPaneBorderStyle {
+            pane_id: PaneId,
+            border_style: BorderStyleOverride,
+        },
         TogglePaneInGroup,
         ToggleGroupMarking,
         ScrollUpByPaneId {
@@ -2531,6 +2614,14 @@ pub mod validated {
         NextSwapLayoutByTabId {
             id: u64,
         },
+        ApplyTiledSwapLayoutByTabId {
+            id: u64,
+            name: String,
+        },
+        ApplyFloatingSwapLayoutByTabId {
+            id: u64,
+            name: String,
+        },
         MoveTabByTabId {
             id: u64,
             direction: Direction,
@@ -2563,7 +2654,17 @@ pub mod validated {
         Menu,
     }
 
-    pub type ClientId = u16;
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+    pub struct BorderStyleOverride {
+        pub all: Option < LineStyle >,
+        pub top: Option < LineStyle >,
+        pub right: Option < LineStyle >,
+        pub bottom: Option < LineStyle >,
+        pub left: Option < LineStyle >,
+        pub rounded_corners: Option < bool >,
+    }
+
+    pub type ClientId = u32;
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
     pub struct Column(pub usize, );
@@ -2580,6 +2681,7 @@ pub mod validated {
         pub path: PathBuf,
         pub args: Vec < String >,
         pub cwd: Option < PathBuf >,
+        pub border_style: Option < BorderStyleOverride >,
     }
 
     pub type Context = BTreeMap < String, String >;
@@ -2597,6 +2699,8 @@ pub mod validated {
         pub path: PathBuf,
         pub line_number: Option < usize >,
         pub cwd: Option < PathBuf >,
+        # [serde (default)]
+        pub border_style: Option < BorderStyleOverride >,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -2607,6 +2711,8 @@ pub mod validated {
         pub height: Option < PercentOrFixed >,
         pub pinned: Option < bool >,
         pub borderless: Option < bool >,
+        # [serde (default)]
+        pub border_style: Option < BorderStyleOverride >,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -2618,6 +2724,8 @@ pub mod validated {
         pub y: Option < PercentOrFixed >,
         pub pinned: Option < bool >,
         pub borderless: Option < bool >,
+        # [serde (default)]
+        pub border_style: Option < BorderStyleOverride >,
         pub run: Option < Run >,
         pub focus: Option < bool >,
         pub already_running: bool,
@@ -2728,6 +2836,15 @@ pub mod validated {
     pub struct Line(pub isize, );
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+    pub enum LineStyle {
+        Single,
+        Double,
+        Heavy,
+        Dashed,
+        HeavyDashed,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
     pub struct MouseEvent {
         pub event_type: MouseEventType,
         pub left: bool,
@@ -2756,20 +2873,24 @@ pub mod validated {
     pub enum NewPanePlacement {
         NoPreference {
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
         },
         Tiled {
             direction: Option < Direction >,
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
         },
         Floating(Option < FloatingPaneCoordinates >, ),
         InPlace {
             pane_id_to_replace: Option < PaneId >,
             close_replaced_pane: bool,
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
         },
         Stacked {
             pane_id_to_stack_under: Option < PaneId >,
             borderless: Option < bool >,
+            border_style: Option < BorderStyleOverride >,
         },
     }
 
@@ -2986,6 +3107,8 @@ pub mod validated {
         pub split_size: Option < SplitSize >,
         pub run: Option < Run >,
         pub borderless: Option < bool >,
+        # [serde (default)]
+        pub border_style: Option < BorderStyleOverride >,
         pub focus: Option < bool >,
         pub external_children_index: Option < usize >,
         pub children_are_stacked: bool,
@@ -3018,6 +3141,12 @@ impl std::error::Error for ValidationError {}
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "command", content = "arguments", rename_all = "kebab-case", rename_all_fields = "kebab-case")]
 pub enum RawNativeCommand {
+    ApplyFloatingSwapLayout {
+        layout_name: String,
+    },
+    ApplyTiledSwapLayout {
+        layout_name: String,
+    },
     BreakPanesToNewTab {
         pane_ids: Vec < raw::PaneId >,
         new_tab_name: Option < String >,
@@ -3401,6 +3530,10 @@ pub enum RawNativeCommand {
         pane_id: raw::PaneId,
         should_be_pinned: bool,
     },
+    SetPaneBorderStyle {
+        pane_id: raw::PaneId,
+        border_style: raw::BorderStyleOverride,
+    },
     SetPaneBorderless {
         pane_id: raw::PaneId,
         borderless: bool,
@@ -3501,6 +3634,12 @@ pub enum RawNativeCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValidatedNativeCommand {
+    ApplyFloatingSwapLayout {
+        layout_name: String,
+    },
+    ApplyTiledSwapLayout {
+        layout_name: String,
+    },
     BreakPanesToNewTab {
         pane_ids: Vec < validated::PaneId >,
         new_tab_name: Option < String >,
@@ -3884,6 +4023,10 @@ pub enum ValidatedNativeCommand {
         pane_id: validated::PaneId,
         should_be_pinned: bool,
     },
+    SetPaneBorderStyle {
+        pane_id: validated::PaneId,
+        border_style: validated::BorderStyleOverride,
+    },
     SetPaneBorderless {
         pane_id: validated::PaneId,
         borderless: bool,
@@ -3986,6 +4129,12 @@ impl TryFrom<RawNativeCommand> for ValidatedNativeCommand {
     type Error = ValidationError;
     fn try_from(value: RawNativeCommand) -> Result<Self, Self::Error> {
         match value {
+            RawNativeCommand::ApplyFloatingSwapLayout { layout_name } => Ok(Self::ApplyFloatingSwapLayout {
+                layout_name: layout_name,
+            }),
+            RawNativeCommand::ApplyTiledSwapLayout { layout_name } => Ok(Self::ApplyTiledSwapLayout {
+                layout_name: layout_name,
+            }),
             RawNativeCommand::BreakPanesToNewTab { pane_ids, new_tab_name, should_change_focus_to_new_tab } => Ok(Self::BreakPanesToNewTab {
                 pane_ids: pane_ids.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
                 new_tab_name: new_tab_name,
@@ -4369,6 +4518,10 @@ impl TryFrom<RawNativeCommand> for ValidatedNativeCommand {
                 pane_id: pane_id.try_into()?,
                 should_be_pinned: should_be_pinned,
             }),
+            RawNativeCommand::SetPaneBorderStyle { pane_id, border_style } => Ok(Self::SetPaneBorderStyle {
+                pane_id: pane_id.try_into()?,
+                border_style: border_style.try_into()?,
+            }),
             RawNativeCommand::SetPaneBorderless { pane_id, borderless } => Ok(Self::SetPaneBorderless {
                 pane_id: pane_id.try_into()?,
                 borderless: borderless,
@@ -4471,6 +4624,12 @@ impl TryFrom<RawNativeCommand> for ValidatedNativeCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeCommandDispatch {
+    ApplyFloatingSwapLayout {
+        layout_name: String,
+    },
+    ApplyTiledSwapLayout {
+        layout_name: String,
+    },
     BreakPanesToNewTab {
         pane_ids: Vec < validated::PaneId >,
         new_tab_name: Option < String >,
@@ -4854,6 +5013,10 @@ pub enum NativeCommandDispatch {
         pane_id: validated::PaneId,
         should_be_pinned: bool,
     },
+    SetPaneBorderStyle {
+        pane_id: validated::PaneId,
+        border_style: validated::BorderStyleOverride,
+    },
     SetPaneBorderless {
         pane_id: validated::PaneId,
         borderless: bool,
@@ -4955,6 +5118,8 @@ pub enum NativeCommandDispatch {
 impl From<ValidatedNativeCommand> for NativeCommandDispatch {
     fn from(value: ValidatedNativeCommand) -> Self {
         match value {
+            ValidatedNativeCommand::ApplyFloatingSwapLayout { layout_name } => Self::ApplyFloatingSwapLayout { layout_name },
+            ValidatedNativeCommand::ApplyTiledSwapLayout { layout_name } => Self::ApplyTiledSwapLayout { layout_name },
             ValidatedNativeCommand::BreakPanesToNewTab { pane_ids, new_tab_name, should_change_focus_to_new_tab } => Self::BreakPanesToNewTab { pane_ids, new_tab_name, should_change_focus_to_new_tab },
             ValidatedNativeCommand::BreakPanesToTabWithId { pane_ids, tab_id, should_change_focus_to_target_tab } => Self::BreakPanesToTabWithId { pane_ids, tab_id, should_change_focus_to_target_tab },
             ValidatedNativeCommand::BreakPanesToTabWithIndex { pane_ids, tab_index, should_change_focus_to_new_tab } => Self::BreakPanesToTabWithIndex { pane_ids, tab_index, should_change_focus_to_new_tab },
@@ -5075,6 +5240,7 @@ impl From<ValidatedNativeCommand> for NativeCommandDispatch {
             ValidatedNativeCommand::SendSigintToPaneId { pane_id } => Self::SendSigintToPaneId { pane_id },
             ValidatedNativeCommand::SendSigkillToPaneId { pane_id } => Self::SendSigkillToPaneId { pane_id },
             ValidatedNativeCommand::SetFloatingPanePinned { pane_id, should_be_pinned } => Self::SetFloatingPanePinned { pane_id, should_be_pinned },
+            ValidatedNativeCommand::SetPaneBorderStyle { pane_id, border_style } => Self::SetPaneBorderStyle { pane_id, border_style },
             ValidatedNativeCommand::SetPaneBorderless { pane_id, borderless } => Self::SetPaneBorderless { pane_id, borderless },
             ValidatedNativeCommand::SetPaneColor { pane_id, fg, bg } => Self::SetPaneColor { pane_id, fg, bg },
             ValidatedNativeCommand::SetPaneFrameStyle { pane_frame_style } => Self::SetPaneFrameStyle { pane_frame_style },
@@ -5114,6 +5280,8 @@ impl From<ValidatedNativeCommand> for NativeCommandDispatch {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeCommandReturn {
+    ApplyFloatingSwapLayout(()),
+    ApplyTiledSwapLayout(()),
     BreakPanesToNewTab(Option < usize >),
     BreakPanesToTabWithId(Option < usize >),
     BreakPanesToTabWithIndex(Option < usize >),
@@ -5234,6 +5402,7 @@ pub enum NativeCommandReturn {
     SendSigintToPaneId(()),
     SendSigkillToPaneId(()),
     SetFloatingPanePinned(()),
+    SetPaneBorderStyle(()),
     SetPaneBorderless(()),
     SetPaneColor(()),
     SetPaneFrameStyle(()),
@@ -5389,13 +5558,14 @@ impl TryFrom<raw::Action> for validated::Action {
                 no_focus: no_focus,
                 tab_id: tab_id,
             }),
-            raw::Action::NewTiledPane { direction, command, pane_name, near_current_pane, no_focus, borderless, tab_id } => Ok(Self::NewTiledPane {
+            raw::Action::NewTiledPane { direction, command, pane_name, near_current_pane, no_focus, borderless, border_style, tab_id } => Ok(Self::NewTiledPane {
                 direction: direction.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
                 command: command.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
                 pane_name: pane_name,
                 near_current_pane: near_current_pane,
                 no_focus: no_focus,
                 borderless: borderless,
+                border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
                 tab_id: tab_id,
             }),
             raw::Action::NewInPlacePane { command, pane_name, near_current_pane, no_focus, pane_id_to_replace, close_replaced_pane, tab_id } => Ok(Self::NewInPlacePane {
@@ -5521,6 +5691,12 @@ impl TryFrom<raw::Action> for validated::Action {
             raw::Action::ToggleMouseMode => Ok(Self::ToggleMouseMode),
             raw::Action::PreviousSwapLayout => Ok(Self::PreviousSwapLayout),
             raw::Action::NextSwapLayout => Ok(Self::NextSwapLayout),
+            raw::Action::ApplyTiledSwapLayout { name } => Ok(Self::ApplyTiledSwapLayout {
+                name: name,
+            }),
+            raw::Action::ApplyFloatingSwapLayout { name } => Ok(Self::ApplyFloatingSwapLayout {
+                name: name,
+            }),
             raw::Action::OverrideLayout { tabs, retain_existing_terminal_panes, retain_existing_plugin_panes, apply_only_to_active_tab } => Ok(Self::OverrideLayout {
                 tabs: tabs.into_iter().map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).collect::<Result<_, ValidationError>>()?,
                 retain_existing_terminal_panes: retain_existing_terminal_panes,
@@ -5666,6 +5842,10 @@ impl TryFrom<raw::Action> for validated::Action {
                 pane_id: pane_id.try_into()?,
                 borderless: borderless,
             }),
+            raw::Action::SetPaneBorderStyle { pane_id, border_style } => Ok(Self::SetPaneBorderStyle {
+                pane_id: pane_id.try_into()?,
+                border_style: border_style.try_into()?,
+            }),
             raw::Action::TogglePaneInGroup => Ok(Self::TogglePaneInGroup),
             raw::Action::ToggleGroupMarking => Ok(Self::ToggleGroupMarking),
             raw::Action::ScrollUpByPaneId { pane_id } => Ok(Self::ScrollUpByPaneId {
@@ -5751,6 +5931,14 @@ impl TryFrom<raw::Action> for validated::Action {
             raw::Action::NextSwapLayoutByTabId { id } => Ok(Self::NextSwapLayoutByTabId {
                 id: id,
             }),
+            raw::Action::ApplyTiledSwapLayoutByTabId { id, name } => Ok(Self::ApplyTiledSwapLayoutByTabId {
+                id: id,
+                name: name,
+            }),
+            raw::Action::ApplyFloatingSwapLayoutByTabId { id, name } => Ok(Self::ApplyFloatingSwapLayoutByTabId {
+                id: id,
+                name: name,
+            }),
             raw::Action::MoveTabByTabId { id, direction } => Ok(Self::MoveTabByTabId {
                 id: id,
                 direction: direction.try_into()?,
@@ -5793,6 +5981,21 @@ impl TryFrom<raw::BareKey> for validated::BareKey {
     }
 }
 
+impl TryFrom<raw::BorderStyleOverride> for validated::BorderStyleOverride {
+    type Error = ValidationError;
+    fn try_from(value: raw::BorderStyleOverride) -> Result<Self, Self::Error> {
+        let raw::BorderStyleOverride { all, top, right, bottom, left, rounded_corners } = value;
+        Ok(Self {
+            all: all.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+            top: top.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+            right: right.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+            bottom: bottom.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+            left: left.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
+            rounded_corners: rounded_corners,
+        })
+    }
+}
+
 impl TryFrom<raw::Column> for validated::Column {
     type Error = ValidationError;
     fn try_from(value: raw::Column) -> Result<Self, Self::Error> {
@@ -5821,11 +6024,12 @@ impl TryFrom<raw::CommandOrPlugin> for validated::CommandOrPlugin {
 impl TryFrom<raw::CommandToRun> for validated::CommandToRun {
     type Error = ValidationError;
     fn try_from(value: raw::CommandToRun) -> Result<Self, Self::Error> {
-        let raw::CommandToRun { path, args, cwd } = value;
+        let raw::CommandToRun { path, args, cwd, border_style } = value;
         Ok(Self {
             path: path,
             args: args,
             cwd: cwd,
+            border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
         })
     }
 }
@@ -5845,11 +6049,12 @@ impl TryFrom<raw::Direction> for validated::Direction {
 impl TryFrom<raw::FileToOpen> for validated::FileToOpen {
     type Error = ValidationError;
     fn try_from(value: raw::FileToOpen) -> Result<Self, Self::Error> {
-        let raw::FileToOpen { path, line_number, cwd } = value;
+        let raw::FileToOpen { path, line_number, cwd, border_style } = value;
         Ok(Self {
             path: path,
             line_number: line_number,
             cwd: cwd,
+            border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
         })
     }
 }
@@ -5857,7 +6062,7 @@ impl TryFrom<raw::FileToOpen> for validated::FileToOpen {
 impl TryFrom<raw::FloatingPaneCoordinates> for validated::FloatingPaneCoordinates {
     type Error = ValidationError;
     fn try_from(value: raw::FloatingPaneCoordinates) -> Result<Self, Self::Error> {
-        let raw::FloatingPaneCoordinates { x, y, width, height, pinned, borderless } = value;
+        let raw::FloatingPaneCoordinates { x, y, width, height, pinned, borderless, border_style } = value;
         Ok(Self {
             x: x.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             y: y.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
@@ -5865,6 +6070,7 @@ impl TryFrom<raw::FloatingPaneCoordinates> for validated::FloatingPaneCoordinate
             height: height.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             pinned: pinned,
             borderless: borderless,
+            border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
         })
     }
 }
@@ -5872,7 +6078,7 @@ impl TryFrom<raw::FloatingPaneCoordinates> for validated::FloatingPaneCoordinate
 impl TryFrom<raw::FloatingPaneLayout> for validated::FloatingPaneLayout {
     type Error = ValidationError;
     fn try_from(value: raw::FloatingPaneLayout) -> Result<Self, Self::Error> {
-        let raw::FloatingPaneLayout { name, height, width, x, y, pinned, borderless, run, focus, already_running, pane_initial_contents, logical_position, default_fg, default_bg } = value;
+        let raw::FloatingPaneLayout { name, height, width, x, y, pinned, borderless, border_style, run, focus, already_running, pane_initial_contents, logical_position, default_fg, default_bg } = value;
         Ok(Self {
             name: name,
             height: height.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
@@ -5881,6 +6087,7 @@ impl TryFrom<raw::FloatingPaneLayout> for validated::FloatingPaneLayout {
             y: y.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             pinned: pinned,
             borderless: borderless,
+            border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             run: run.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             focus: focus,
             already_running: already_running,
@@ -6032,6 +6239,19 @@ impl TryFrom<raw::Line> for validated::Line {
     }
 }
 
+impl TryFrom<raw::LineStyle> for validated::LineStyle {
+    type Error = ValidationError;
+    fn try_from(value: raw::LineStyle) -> Result<Self, Self::Error> {
+        match value {
+            raw::LineStyle::Single => Ok(Self::Single),
+            raw::LineStyle::Double => Ok(Self::Double),
+            raw::LineStyle::Heavy => Ok(Self::Heavy),
+            raw::LineStyle::Dashed => Ok(Self::Dashed),
+            raw::LineStyle::HeavyDashed => Ok(Self::HeavyDashed),
+        }
+    }
+}
+
 impl TryFrom<raw::MouseEvent> for validated::MouseEvent {
     type Error = ValidationError;
     fn try_from(value: raw::MouseEvent) -> Result<Self, Self::Error> {
@@ -6068,24 +6288,28 @@ impl TryFrom<raw::NewPanePlacement> for validated::NewPanePlacement {
     type Error = ValidationError;
     fn try_from(value: raw::NewPanePlacement) -> Result<Self, Self::Error> {
         match value {
-            raw::NewPanePlacement::NoPreference { borderless } => Ok(Self::NoPreference {
+            raw::NewPanePlacement::NoPreference { borderless, border_style } => Ok(Self::NoPreference {
                 borderless: borderless,
+                border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             }),
-            raw::NewPanePlacement::Tiled { direction, borderless } => Ok(Self::Tiled {
+            raw::NewPanePlacement::Tiled { direction, borderless, border_style } => Ok(Self::Tiled {
                 direction: direction.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
                 borderless: borderless,
+                border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             }),
             raw::NewPanePlacement::Floating(field_0) => Ok(Self::Floating(
                 field_0.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             )),
-            raw::NewPanePlacement::InPlace { pane_id_to_replace, close_replaced_pane, borderless } => Ok(Self::InPlace {
+            raw::NewPanePlacement::InPlace { pane_id_to_replace, close_replaced_pane, borderless, border_style } => Ok(Self::InPlace {
                 pane_id_to_replace: pane_id_to_replace.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
                 close_replaced_pane: close_replaced_pane,
                 borderless: borderless,
+                border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             }),
-            raw::NewPanePlacement::Stacked { pane_id_to_stack_under, borderless } => Ok(Self::Stacked {
+            raw::NewPanePlacement::Stacked { pane_id_to_stack_under, borderless, border_style } => Ok(Self::Stacked {
                 pane_id_to_stack_under: pane_id_to_stack_under.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
                 borderless: borderless,
+                border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             }),
         }
     }
@@ -6426,7 +6650,7 @@ impl TryFrom<raw::TabMetadata> for validated::TabMetadata {
 impl TryFrom<raw::TiledPaneLayout> for validated::TiledPaneLayout {
     type Error = ValidationError;
     fn try_from(value: raw::TiledPaneLayout) -> Result<Self, Self::Error> {
-        let raw::TiledPaneLayout { children_split_direction, name, children, split_size, run, borderless, focus, external_children_index, children_are_stacked, is_expanded_in_stack, exclude_from_sync, run_instructions_to_ignore, hide_floating_panes, pane_initial_contents, default_fg, default_bg } = value;
+        let raw::TiledPaneLayout { children_split_direction, name, children, split_size, run, borderless, border_style, focus, external_children_index, children_are_stacked, is_expanded_in_stack, exclude_from_sync, run_instructions_to_ignore, hide_floating_panes, pane_initial_contents, default_fg, default_bg } = value;
         Ok(Self {
             children_split_direction: children_split_direction.try_into()?,
             name: name,
@@ -6434,6 +6658,7 @@ impl TryFrom<raw::TiledPaneLayout> for validated::TiledPaneLayout {
             split_size: split_size.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             run: run.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             borderless: borderless,
+            border_style: border_style.map(|item| -> Result<_, ValidationError> { Ok(item.try_into()?) }).transpose()?,
             focus: focus,
             external_children_index: external_children_index,
             children_are_stacked: children_are_stacked,
@@ -6578,13 +6803,14 @@ fn into_zellij_action(value: validated::Action) -> zellij_utils::input::actions:
             no_focus: no_focus,
             tab_id: tab_id,
         },
-        validated::Action::NewTiledPane { direction, command, pane_name, near_current_pane, no_focus, borderless, tab_id } => zellij_utils::input::actions::Action::NewTiledPane {
+        validated::Action::NewTiledPane { direction, command, pane_name, near_current_pane, no_focus, borderless, border_style, tab_id } => zellij_utils::input::actions::Action::NewTiledPane {
             direction: direction.map(|item| into_zellij_direction(item)),
             command: command.map(|item| into_zellij_run_command_action(item)),
             pane_name: pane_name,
             near_current_pane: near_current_pane,
             no_focus: no_focus,
             borderless: borderless,
+            border_style: border_style.map(|item| into_zellij_border_style_override(item)),
             tab_id: tab_id,
         },
         validated::Action::NewInPlacePane { command, pane_name, near_current_pane, no_focus, pane_id_to_replace, close_replaced_pane, tab_id } => zellij_utils::input::actions::Action::NewInPlacePane {
@@ -6710,6 +6936,12 @@ fn into_zellij_action(value: validated::Action) -> zellij_utils::input::actions:
         validated::Action::ToggleMouseMode => zellij_utils::input::actions::Action::ToggleMouseMode,
         validated::Action::PreviousSwapLayout => zellij_utils::input::actions::Action::PreviousSwapLayout,
         validated::Action::NextSwapLayout => zellij_utils::input::actions::Action::NextSwapLayout,
+        validated::Action::ApplyTiledSwapLayout { name } => zellij_utils::input::actions::Action::ApplyTiledSwapLayout {
+            name: name,
+        },
+        validated::Action::ApplyFloatingSwapLayout { name } => zellij_utils::input::actions::Action::ApplyFloatingSwapLayout {
+            name: name,
+        },
         validated::Action::OverrideLayout { tabs, retain_existing_terminal_panes, retain_existing_plugin_panes, apply_only_to_active_tab } => zellij_utils::input::actions::Action::OverrideLayout {
             tabs: tabs.into_iter().map(|item| into_zellij_tab_layout_info(item)).collect(),
             retain_existing_terminal_panes: retain_existing_terminal_panes,
@@ -6855,6 +7087,10 @@ fn into_zellij_action(value: validated::Action) -> zellij_utils::input::actions:
             pane_id: into_zellij_pane_id(pane_id),
             borderless: borderless,
         },
+        validated::Action::SetPaneBorderStyle { pane_id, border_style } => zellij_utils::input::actions::Action::SetPaneBorderStyle {
+            pane_id: into_zellij_pane_id(pane_id),
+            border_style: into_zellij_border_style_override(border_style),
+        },
         validated::Action::TogglePaneInGroup => zellij_utils::input::actions::Action::TogglePaneInGroup,
         validated::Action::ToggleGroupMarking => zellij_utils::input::actions::Action::ToggleGroupMarking,
         validated::Action::ScrollUpByPaneId { pane_id } => zellij_utils::input::actions::Action::ScrollUpByPaneId {
@@ -6940,6 +7176,14 @@ fn into_zellij_action(value: validated::Action) -> zellij_utils::input::actions:
         validated::Action::NextSwapLayoutByTabId { id } => zellij_utils::input::actions::Action::NextSwapLayoutByTabId {
             id: id,
         },
+        validated::Action::ApplyTiledSwapLayoutByTabId { id, name } => zellij_utils::input::actions::Action::ApplyTiledSwapLayoutByTabId {
+            id: id,
+            name: name,
+        },
+        validated::Action::ApplyFloatingSwapLayoutByTabId { id, name } => zellij_utils::input::actions::Action::ApplyFloatingSwapLayoutByTabId {
+            id: id,
+            name: name,
+        },
         validated::Action::MoveTabByTabId { id, direction } => zellij_utils::input::actions::Action::MoveTabByTabId {
             id: id,
             direction: into_zellij_direction(direction),
@@ -6980,6 +7224,19 @@ fn into_zellij_bare_key(value: validated::BareKey) -> zellij_utils::data::BareKe
 }
 
 #[allow(dead_code)]
+fn into_zellij_border_style_override(value: validated::BorderStyleOverride) -> zellij_utils::data::BorderStyleOverride {
+    let validated::BorderStyleOverride { all, top, right, bottom, left, rounded_corners } = value;
+    zellij_utils::data::BorderStyleOverride {
+        all: all.map(|item| into_zellij_line_style(item)),
+        top: top.map(|item| into_zellij_line_style(item)),
+        right: right.map(|item| into_zellij_line_style(item)),
+        bottom: bottom.map(|item| into_zellij_line_style(item)),
+        left: left.map(|item| into_zellij_line_style(item)),
+        rounded_corners: rounded_corners,
+    }
+}
+
+#[allow(dead_code)]
 fn into_zellij_column(value: validated::Column) -> zellij_utils::position::Column {
     let validated::Column(field_0) = value;
     zellij_utils::position::Column(field_0, )
@@ -7002,11 +7259,12 @@ fn into_zellij_command_or_plugin(value: validated::CommandOrPlugin) -> zellij_ut
 
 #[allow(dead_code)]
 fn into_zellij_command_to_run(value: validated::CommandToRun) -> zellij_utils::data::CommandToRun {
-    let validated::CommandToRun { path, args, cwd } = value;
+    let validated::CommandToRun { path, args, cwd, border_style } = value;
     zellij_utils::data::CommandToRun {
         path: path,
         args: args,
         cwd: cwd,
+        border_style: border_style.map(|item| into_zellij_border_style_override(item)),
     }
 }
 
@@ -7022,17 +7280,18 @@ fn into_zellij_direction(value: validated::Direction) -> zellij_utils::data::Dir
 
 #[allow(dead_code)]
 fn into_zellij_file_to_open(value: validated::FileToOpen) -> zellij_utils::data::FileToOpen {
-    let validated::FileToOpen { path, line_number, cwd } = value;
+    let validated::FileToOpen { path, line_number, cwd, border_style } = value;
     zellij_utils::data::FileToOpen {
         path: path,
         line_number: line_number,
         cwd: cwd,
+        border_style: border_style.map(|item| into_zellij_border_style_override(item)),
     }
 }
 
 #[allow(dead_code)]
 fn into_zellij_floating_pane_coordinates(value: validated::FloatingPaneCoordinates) -> zellij_utils::data::FloatingPaneCoordinates {
-    let validated::FloatingPaneCoordinates { x, y, width, height, pinned, borderless } = value;
+    let validated::FloatingPaneCoordinates { x, y, width, height, pinned, borderless, border_style } = value;
     zellij_utils::data::FloatingPaneCoordinates {
         x: x.map(|item| into_zellij_percent_or_fixed(item)),
         y: y.map(|item| into_zellij_percent_or_fixed(item)),
@@ -7040,12 +7299,13 @@ fn into_zellij_floating_pane_coordinates(value: validated::FloatingPaneCoordinat
         height: height.map(|item| into_zellij_percent_or_fixed(item)),
         pinned: pinned,
         borderless: borderless,
+        border_style: border_style.map(|item| into_zellij_border_style_override(item)),
     }
 }
 
 #[allow(dead_code)]
 fn into_zellij_floating_pane_layout(value: validated::FloatingPaneLayout) -> zellij_utils::input::layout::FloatingPaneLayout {
-    let validated::FloatingPaneLayout { name, height, width, x, y, pinned, borderless, run, focus, already_running, pane_initial_contents, logical_position, default_fg, default_bg } = value;
+    let validated::FloatingPaneLayout { name, height, width, x, y, pinned, borderless, border_style, run, focus, already_running, pane_initial_contents, logical_position, default_fg, default_bg } = value;
     zellij_utils::input::layout::FloatingPaneLayout {
         name: name,
         height: height.map(|item| into_zellij_percent_or_fixed(item)),
@@ -7054,6 +7314,7 @@ fn into_zellij_floating_pane_layout(value: validated::FloatingPaneLayout) -> zel
         y: y.map(|item| into_zellij_percent_or_fixed(item)),
         pinned: pinned,
         borderless: borderless,
+        border_style: border_style.map(|item| into_zellij_border_style_override(item)),
         run: run.map(|item| into_zellij_run(item)),
         focus: focus,
         already_running: already_running,
@@ -7187,6 +7448,17 @@ fn into_zellij_line(value: validated::Line) -> zellij_utils::position::Line {
 }
 
 #[allow(dead_code)]
+fn into_zellij_line_style(value: validated::LineStyle) -> zellij_utils::data::LineStyle {
+    match value {
+        validated::LineStyle::Single => zellij_utils::data::LineStyle::Single,
+        validated::LineStyle::Double => zellij_utils::data::LineStyle::Double,
+        validated::LineStyle::Heavy => zellij_utils::data::LineStyle::Heavy,
+        validated::LineStyle::Dashed => zellij_utils::data::LineStyle::Dashed,
+        validated::LineStyle::HeavyDashed => zellij_utils::data::LineStyle::HeavyDashed,
+    }
+}
+
+#[allow(dead_code)]
 fn into_zellij_mouse_event(value: validated::MouseEvent) -> zellij_utils::input::mouse::MouseEvent {
     let validated::MouseEvent { event_type, left, right, middle, wheel_up, wheel_down, wheel_left, wheel_right, shift, alt, ctrl, position } = value;
     zellij_utils::input::mouse::MouseEvent {
@@ -7217,24 +7489,28 @@ fn into_zellij_mouse_event_type(value: validated::MouseEventType) -> zellij_util
 #[allow(dead_code)]
 fn into_zellij_new_pane_placement(value: validated::NewPanePlacement) -> zellij_utils::data::NewPanePlacement {
     match value {
-        validated::NewPanePlacement::NoPreference { borderless } => zellij_utils::data::NewPanePlacement::NoPreference {
+        validated::NewPanePlacement::NoPreference { borderless, border_style } => zellij_utils::data::NewPanePlacement::NoPreference {
             borderless: borderless,
+            border_style: border_style.map(|item| into_zellij_border_style_override(item)),
         },
-        validated::NewPanePlacement::Tiled { direction, borderless } => zellij_utils::data::NewPanePlacement::Tiled {
+        validated::NewPanePlacement::Tiled { direction, borderless, border_style } => zellij_utils::data::NewPanePlacement::Tiled {
             direction: direction.map(|item| into_zellij_direction(item)),
             borderless: borderless,
+            border_style: border_style.map(|item| into_zellij_border_style_override(item)),
         },
         validated::NewPanePlacement::Floating(field_0) => zellij_utils::data::NewPanePlacement::Floating(
             field_0.map(|item| into_zellij_floating_pane_coordinates(item)),
         ),
-        validated::NewPanePlacement::InPlace { pane_id_to_replace, close_replaced_pane, borderless } => zellij_utils::data::NewPanePlacement::InPlace {
+        validated::NewPanePlacement::InPlace { pane_id_to_replace, close_replaced_pane, borderless, border_style } => zellij_utils::data::NewPanePlacement::InPlace {
             pane_id_to_replace: pane_id_to_replace.map(|item| into_zellij_pane_id(item)),
             close_replaced_pane: close_replaced_pane,
             borderless: borderless,
+            border_style: border_style.map(|item| into_zellij_border_style_override(item)),
         },
-        validated::NewPanePlacement::Stacked { pane_id_to_stack_under, borderless } => zellij_utils::data::NewPanePlacement::Stacked {
+        validated::NewPanePlacement::Stacked { pane_id_to_stack_under, borderless, border_style } => zellij_utils::data::NewPanePlacement::Stacked {
             pane_id_to_stack_under: pane_id_to_stack_under.map(|item| into_zellij_pane_id(item)),
             borderless: borderless,
+            border_style: border_style.map(|item| into_zellij_border_style_override(item)),
         },
     }
 }
@@ -7515,7 +7791,7 @@ fn into_zellij_tab_metadata(value: validated::TabMetadata) -> zellij_utils::data
 
 #[allow(dead_code)]
 fn into_zellij_tiled_pane_layout(value: validated::TiledPaneLayout) -> zellij_utils::input::layout::TiledPaneLayout {
-    let validated::TiledPaneLayout { children_split_direction, name, children, split_size, run, borderless, focus, external_children_index, children_are_stacked, is_expanded_in_stack, exclude_from_sync, run_instructions_to_ignore, hide_floating_panes, pane_initial_contents, default_fg, default_bg } = value;
+    let validated::TiledPaneLayout { children_split_direction, name, children, split_size, run, borderless, border_style, focus, external_children_index, children_are_stacked, is_expanded_in_stack, exclude_from_sync, run_instructions_to_ignore, hide_floating_panes, pane_initial_contents, default_fg, default_bg } = value;
     zellij_utils::input::layout::TiledPaneLayout {
         children_split_direction: into_zellij_split_direction(children_split_direction),
         name: name,
@@ -7523,6 +7799,7 @@ fn into_zellij_tiled_pane_layout(value: validated::TiledPaneLayout) -> zellij_ut
         split_size: split_size.map(|item| into_zellij_split_size(item)),
         run: run.map(|item| into_zellij_run(item)),
         borderless: borderless,
+        border_style: border_style.map(|item| into_zellij_border_style_override(item)),
         focus: focus,
         external_children_index: external_children_index,
         children_are_stacked: children_are_stacked,
@@ -7554,6 +7831,16 @@ fn from_zellij_pane_id(value: zellij_utils::data::PaneId) -> validated::PaneId {
         zellij_utils::data::PaneId::Terminal(id) => validated::PaneId::Terminal(id),
         zellij_utils::data::PaneId::Plugin(id) => validated::PaneId::Plugin(id),
     }
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_apply_floating_swap_layout(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ApplyFloatingSwapLayout(value)
+}
+
+#[allow(dead_code)]
+pub fn native_command_return_apply_tiled_swap_layout(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::ApplyTiledSwapLayout(value)
 }
 
 #[allow(dead_code)]
@@ -8157,6 +8444,11 @@ pub fn native_command_return_set_floating_pane_pinned(value: ()) -> NativeComman
 }
 
 #[allow(dead_code)]
+pub fn native_command_return_set_pane_border_style(value: ()) -> NativeCommandReturn {
+    NativeCommandReturn::SetPaneBorderStyle(value)
+}
+
+#[allow(dead_code)]
 pub fn native_command_return_set_pane_borderless(value: ()) -> NativeCommandReturn {
     NativeCommandReturn::SetPaneBorderless(value)
 }
@@ -8323,6 +8615,8 @@ pub fn native_command_return_write_to_pane_id(value: ()) -> NativeCommandReturn 
 
 pub fn dispatch_native_command(value: NativeCommandDispatch) -> NativeCommandReturn {
     match value {
+        NativeCommandDispatch::ApplyFloatingSwapLayout { layout_name } => native_command_return_apply_floating_swap_layout(zellij_tile::shim::apply_floating_swap_layout(&layout_name)),
+        NativeCommandDispatch::ApplyTiledSwapLayout { layout_name } => native_command_return_apply_tiled_swap_layout(zellij_tile::shim::apply_tiled_swap_layout(&layout_name)),
         NativeCommandDispatch::BreakPanesToNewTab { pane_ids, new_tab_name, should_change_focus_to_new_tab } => native_command_return_break_panes_to_new_tab(zellij_tile::shim::break_panes_to_new_tab(&pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect::<Vec<_>>(), new_tab_name, should_change_focus_to_new_tab)),
         NativeCommandDispatch::BreakPanesToTabWithId { pane_ids, tab_id, should_change_focus_to_target_tab } => native_command_return_break_panes_to_tab_with_id(zellij_tile::shim::break_panes_to_tab_with_id(&pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect::<Vec<_>>(), tab_id, should_change_focus_to_target_tab)),
         NativeCommandDispatch::BreakPanesToTabWithIndex { pane_ids, tab_index, should_change_focus_to_new_tab } => native_command_return_break_panes_to_tab_with_index(zellij_tile::shim::break_panes_to_tab_with_index(&pane_ids.into_iter().map(|item| into_zellij_pane_id(item)).collect::<Vec<_>>(), tab_index, should_change_focus_to_new_tab)),
@@ -8443,6 +8737,7 @@ pub fn dispatch_native_command(value: NativeCommandDispatch) -> NativeCommandRet
         NativeCommandDispatch::SendSigintToPaneId { pane_id } => native_command_return_send_sigint_to_pane_id(zellij_tile::shim::send_sigint_to_pane_id(into_zellij_pane_id(pane_id))),
         NativeCommandDispatch::SendSigkillToPaneId { pane_id } => native_command_return_send_sigkill_to_pane_id(zellij_tile::shim::send_sigkill_to_pane_id(into_zellij_pane_id(pane_id))),
         NativeCommandDispatch::SetFloatingPanePinned { pane_id, should_be_pinned } => native_command_return_set_floating_pane_pinned(zellij_tile::shim::set_floating_pane_pinned(into_zellij_pane_id(pane_id), should_be_pinned)),
+        NativeCommandDispatch::SetPaneBorderStyle { pane_id, border_style } => native_command_return_set_pane_border_style(zellij_tile::shim::set_pane_border_style(into_zellij_pane_id(pane_id), into_zellij_border_style_override(border_style))),
         NativeCommandDispatch::SetPaneBorderless { pane_id, borderless } => native_command_return_set_pane_borderless(zellij_tile::shim::set_pane_borderless(into_zellij_pane_id(pane_id), borderless)),
         NativeCommandDispatch::SetPaneColor { pane_id, fg, bg } => native_command_return_set_pane_color(zellij_tile::shim::set_pane_color(into_zellij_pane_id(pane_id), fg, bg)),
         NativeCommandDispatch::SetPaneFrameStyle { pane_frame_style } => native_command_return_set_pane_frame_style(zellij_tile::shim::set_pane_frame_style(into_zellij_pane_frame_style(pane_frame_style))),

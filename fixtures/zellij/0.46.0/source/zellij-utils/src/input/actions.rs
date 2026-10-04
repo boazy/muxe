@@ -165,6 +165,7 @@ pub enum Action {
         near_current_pane: bool,
         no_focus: bool,
         borderless: Option<bool>,
+        border_style: Option<BorderStyleOverride>,
         tab_id: Option<usize>,
     },
     /// Open a new pane in place of the focused one, suppressing it instead
@@ -284,6 +285,8 @@ pub enum Action {
     ToggleMouseMode,
     PreviousSwapLayout,
     NextSwapLayout,
+    ApplyTiledSwapLayout { name: String },
+    ApplyFloatingSwapLayout { name: String },
     /// Override the layout of the active tab
     OverrideLayout {
         tabs: Vec<TabLayoutInfo>,
@@ -402,6 +405,7 @@ pub enum Action {
     },
     TogglePaneBorderless { pane_id: PaneId },
     SetPaneBorderless { pane_id: PaneId, borderless: bool },
+    SetPaneBorderStyle { pane_id: PaneId, border_style: BorderStyleOverride },
     TogglePaneInGroup,
     ToggleGroupMarking,
     ScrollUpByPaneId { pane_id: PaneId },
@@ -430,5 +434,7 @@ pub enum Action {
     ToggleFloatingPanesByTabId { id: u64 },
     PreviousSwapLayoutByTabId { id: u64 },
     NextSwapLayoutByTabId { id: u64 },
+    ApplyTiledSwapLayoutByTabId { id: u64, name: String },
+    ApplyFloatingSwapLayoutByTabId { id: u64, name: String },
     MoveTabByTabId { id: u64, direction: Direction },
 }

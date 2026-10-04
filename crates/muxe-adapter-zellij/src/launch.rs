@@ -227,6 +227,7 @@ impl ZellijPaneLaunch {
                 near_current_pane: true,
                 no_focus: !self.focus,
                 borderless: None,
+                border_style: None,
                 tab_id: None,
             },
             ZellijPlacement::Floating {
@@ -244,6 +245,7 @@ impl ZellijPaneLaunch {
                     height: height.map(SizeSpec::into_mirror),
                     pinned: None,
                     borderless: None,
+                    border_style: None,
                 }),
                 near_current_pane: true,
                 no_focus: !self.focus,
