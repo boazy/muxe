@@ -9,8 +9,12 @@
 //! arbitrary processes, touches a default user socket, or passes green
 //! without a live handshake.
 
+#[path = "generated_executable.rs"]
+mod generated_executable;
 mod scoped_env;
+use generated_executable::write_executable_script;
 pub use scoped_env::{apply_scoped_env, ensure_scoped_dirs, scoped_env_vec};
+use std::io::Write as _;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1535,31 +1539,25 @@ impl OwnedZellijHost {
     }
 
     fn scoped_cli_wrapper_named(&self, scoped_root: &Path, name: &str) -> io::Result<PathBuf> {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-
         let path = self.workdir.join(name);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o700)
-            .open(&path)?;
-        file.write_all(b"#!/bin/sh\ncd ")?;
-        file.write_all(shell_quote(scoped_root.as_os_str()).as_encoded_bytes())?;
-        file.write_all(b" || exit 1\nexec /usr/bin/env -i")?;
-        let mut command = Command::new(&self.zellij_binary);
-        self.apply_host_scoped_env(&mut command, scoped_root);
-        for (name, value) in command.as_std().get_envs() {
-            let value =
-                value.ok_or_else(|| io::Error::other("scoped environment removes a value"))?;
+        write_executable_script(&path, |file| {
+            file.write_all(b"#!/bin/sh\ncd ")?;
+            file.write_all(shell_quote(scoped_root.as_os_str()).as_encoded_bytes())?;
+            file.write_all(b" || exit 1\nexec /usr/bin/env -i")?;
+            let mut command = Command::new(&self.zellij_binary);
+            self.apply_host_scoped_env(&mut command, scoped_root);
+            for (name, value) in command.as_std().get_envs() {
+                let value =
+                    value.ok_or_else(|| io::Error::other("scoped environment removes a value"))?;
+                file.write_all(b" ")?;
+                file.write_all(shell_quote(name).as_encoded_bytes())?;
+                file.write_all(b"=")?;
+                file.write_all(shell_quote(value).as_encoded_bytes())?;
+            }
             file.write_all(b" ")?;
-            file.write_all(shell_quote(name).as_encoded_bytes())?;
-            file.write_all(b"=")?;
-            file.write_all(shell_quote(value).as_encoded_bytes())?;
-        }
-        file.write_all(b" ")?;
-        file.write_all(shell_quote(self.zellij_binary.as_os_str()).as_encoded_bytes())?;
-        file.write_all(b" \"$@\"\n")?;
+            file.write_all(shell_quote(self.zellij_binary.as_os_str()).as_encoded_bytes())?;
+            file.write_all(b" \"$@\"\n")
+        })?;
         Ok(path)
     }
 
@@ -2788,7 +2786,6 @@ pub async fn await_activate(mut child: OwnedChild, tag: &str) -> io::Result<Stri
 #[cfg(all(test, unix))]
 mod scoped_spawn_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
 
     const MERGED_VARS: &str = "HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_RUNTIME_DIR TMPDIR \
          ZELLIJ_SOCKET_DIR ZELLIJ_CONFIG_FILE ZELLIJ_CONFIG_DIR ZELLIJ_DATA_DIR";
@@ -2900,11 +2897,81 @@ mod scoped_spawn_tests {
             },
         );
         let path = dir.join(name);
-        std::fs::write(&path, script).expect("write fake binary");
-        let mut permissions = std::fs::metadata(&path).expect("stat fake").permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).expect("chmod fake");
+        write_executable_script(&path, |file| file.write_all(script.as_bytes()))
+            .expect("write fake binary");
         path
+    }
+
+    #[tokio::test]
+    async fn census_executable_survives_an_unrelated_fork_during_creation() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let case = case_dir("inherited-writer");
+        let binary = case.path().join("census-cli");
+        let (mut parent, child) =
+            std::os::unix::net::UnixStream::pair().expect("owned fork barrier");
+        parent
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bounded fork readiness");
+        let mut forked = None;
+        let written = write_executable_script(&binary, |file| {
+            let writer_fd = file.as_raw_fd();
+            let writer_is_pipe = nix::sys::stat::fstat(&*file)
+                .map_err(io::Error::other)?
+                .st_mode
+                & nix::libc::S_IFMT
+                == nix::libc::S_IFIFO;
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", "exit 0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // Hold a real fork before exec. Only async-signal-safe syscalls
+            // run here; its inherited descriptors stay open until release.
+            unsafe {
+                command.pre_exec(move || {
+                    // Do not hold the writer's input pipe open: that would
+                    // block its EOF. A parent-owned executable inode stays
+                    // inherited in the unsafe implementation's before-proof.
+                    if writer_is_pipe {
+                        nix::libc::close(writer_fd);
+                    }
+                    let mut byte = 1_u8;
+                    if nix::libc::write(child.as_raw_fd(), (&raw const byte).cast(), 1) != 1
+                        || nix::libc::read(child.as_raw_fd(), (&raw mut byte).cast(), 1) != 1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            forked = Some(std::thread::spawn(move || command.spawn()));
+            let mut ready = [0];
+            parent.read_exact(&mut ready)?;
+            file.write_all(b"#!/bin/sh\nprintf 'CLIENT_ID\\n1\\n'\n")
+        });
+        let census = match written {
+            Ok(()) => match OwnedZellijHost::prepare(&binary, case.path(), "fork") {
+                Ok(host) => host.typed_clients("fork").await,
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        // Reap the exact fork even if writing or executing the census failed.
+        let release = io::Write::write_all(&mut parent, &[1]);
+        let child = forked
+            .expect("fork was requested")
+            .join()
+            .expect("fork worker");
+        let reaped = child.and_then(|mut child| child.wait());
+        release.expect("release owned fork");
+        reaped.expect("reap owned fork");
+        assert_eq!(
+            census.expect("census while unrelated child retains inherited descriptors"),
+            vec![muxe_core::ClientId::new("1")],
+        );
     }
 
     fn case_dir(name: &str) -> tempfile::TempDir {
@@ -3016,9 +3083,8 @@ mod scoped_spawn_tests {
             .expect("write census script");
         }
         script.push_str("*) echo 'unexpected extra census' >&2; exit 3 ;;\nesac\n");
-        std::fs::write(&binary, script).expect("write census CLI");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod census CLI");
+        write_executable_script(&binary, |file| file.write_all(script.as_bytes()))
+            .expect("write census CLI");
         let host = OwnedZellijHost::prepare(&binary, case, "census").expect("owned census host");
         (host, marker)
     }
@@ -3143,11 +3209,12 @@ mod scoped_spawn_tests {
         ] {
             let (result, count, reaped) =
                 exercise_bootstrap_readiness(&[("CLIENT_ID\n1\n", 0, false), current]).await;
+            let error = result.expect_err("invalid registered census");
+            assert_eq!(error.kind(), io::ErrorKind::Other, "{current:?}: {error:?}");
             assert_eq!(
-                result.expect_err("invalid registered census").kind(),
-                io::ErrorKind::Other
+                count, "2",
+                "registered census was not observed exactly once: {current:?}: {error:?}"
             );
-            assert_eq!(count, "2", "invalid registered observation was retried");
             assert!(reaped, "registered event peer never launched");
         }
     }
@@ -3326,21 +3393,17 @@ mod scoped_spawn_tests {
             .open(&ready)
             .expect("nonblocking owned handshake");
         let binary = case.path().join("hung-cli");
-        std::fs::write(
-            &binary,
-            format!(
-                "#!/bin/sh\n\
+        let script = format!(
+            "#!/bin/sh\n\
              echo 'census stdout proof'\n\
              echo 'hung census diagnostic' >&2\n\
              printf '%s\\n' \"$$\" > '{ready}'\n\
              exec /bin/cat '{blocked}'\n",
-                ready = shell_escape(&ready.to_string_lossy()),
-                blocked = shell_escape(&blocked.to_string_lossy()),
-            ),
-        )
-        .expect("hung census CLI");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod hung CLI");
+            ready = shell_escape(&ready.to_string_lossy()),
+            blocked = shell_escape(&blocked.to_string_lossy()),
+        );
+        write_executable_script(&binary, |file| file.write_all(script.as_bytes()))
+            .expect("hung census CLI");
         let marker = case.path().join("detached");
         let mut host =
             OwnedZellijHost::prepare(&binary, case.path(), "census").expect("owned host");
@@ -3798,11 +3861,7 @@ mod scoped_spawn_tests {
             &marker,
             "ok",
         );
-        // This tests the script's guard, not kernel shebang execution. Read the
-        // completed script through its interpreter; actual spawn-contract tests
-        // still execute the generated fake directly.
-        let mut command = Command::new("/bin/sh");
-        command.arg(&fake);
+        let mut command = Command::new(&fake);
         command
             .env_clear()
             .env("HOME", "/")
@@ -3833,20 +3892,16 @@ mod scoped_spawn_tests {
             std::fs::create_dir_all(&dir).expect("registry dir");
         }
         let script = case.path().join("registry-proof.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\n\
+        write_executable_script(&script, |file| {
+            file.write_all(
+                b"#!/bin/sh\n\
              set -u\n\
              : > \"$XDG_CONFIG_HOME/muxe/scope-proof-config\" || exit 3\n\
              : > \"$XDG_CACHE_HOME/muxe/scope-proof-cache\" || exit 3\n\
              [ -d \"$XDG_RUNTIME_DIR\" ] || exit 3\n",
-        )
+            )
+        })
         .expect("write proof script");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("stat proof")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&script, permissions).expect("chmod proof");
         let mut pairs = scoped_env_vec(&scoped);
         pairs.extend(host.host_env_overlay_vec());
         let mut command = Command::new("/bin/sh");

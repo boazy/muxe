@@ -13,6 +13,10 @@
 //! without a duplicate command module. `main.rs` must use `muxe::cli` rather
 //! than declaring its own `mod cli`.
 
+#[cfg(test)]
+#[path = "../tests/support/generated_executable.rs"]
+mod generated_executable;
+
 /// The public Muxe command tree (re-exported from `cli.rs`).
 #[path = "cli.rs"]
 pub mod cli;

@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+#[path = "../tests/support/generated_executable.rs"]
+mod generated_executable;
+
 mod config_check;
 mod init;
 
@@ -4346,13 +4350,13 @@ mod launcher_tests {
         )
         .expect("write recorded runtime schema");
         let binary = directory.path().join("herdr");
-        std::fs::write(
-            &binary,
-            "#!/bin/sh\nexec cat \"$(dirname \"$0\")/schema.json\"\n",
-        )
+        crate::generated_executable::write_executable_script(&binary, |writer| {
+            std::io::Write::write_all(
+                writer,
+                b"#!/bin/sh\nexec cat \"$(dirname \"$0\")/schema.json\"\n",
+            )
+        })
         .expect("write recorded schema executable");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
-            .expect("make recorded schema executable");
         muxe_adapter_herdr::HerdrRuntime::connect(muxe_adapter_herdr::HerdrAdapterConfig {
             socket_path: socket.to_path_buf(),
             herdr_binary: binary,

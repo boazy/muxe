@@ -1,6 +1,5 @@
 use std::{
     io,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -55,11 +54,12 @@ impl ProductionConnectFixture {
         let schema_binary = schema_temp.path().join("herdr");
         let schema_json = schema_temp.path().join("schema.json");
         std::fs::write(&schema_json, schema.to_string())?;
-        std::fs::write(
-            &schema_binary,
-            "#!/bin/sh\nif [ \"$1\" != api ] || [ \"$2\" != schema ] || [ \"$3\" != --json ] || [ \"$#\" != 3 ]; then\n  exit 64\nfi\nexec cat \"$(dirname \"$0\")/schema.json\"\n",
-        )?;
-        std::fs::set_permissions(&schema_binary, std::fs::Permissions::from_mode(0o700))?;
+        crate::generated_executable::write_executable_script(&schema_binary, |writer| {
+            std::io::Write::write_all(
+                writer,
+                b"#!/bin/sh\nif [ \"$1\" != api ] || [ \"$2\" != schema ] || [ \"$3\" != --json ] || [ \"$#\" != 3 ]; then\n  exit 64\nfi\nexec cat \"$(dirname \"$0\")/schema.json\"\n",
+            )
+        })?;
         let server = RecordedUnixServer::start(tempfile::tempdir()?, exchanges)?;
         let cache_dir = schema_temp.path().join("cache");
         Ok(Self {

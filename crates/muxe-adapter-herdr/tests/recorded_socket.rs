@@ -1,3 +1,6 @@
+#[path = "../../muxe/tests/support/generated_executable.rs"]
+mod generated_executable;
+
 mod support {
     pub mod production_connect;
     pub mod recorded_socket;

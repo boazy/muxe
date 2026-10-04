@@ -5188,14 +5188,13 @@ mod tests {
         let schema_path = home.path().join("herdr-api.schema.json");
         std::fs::write(&schema_path, schema).expect("stage pinned schema fixture");
         let script = home.path().join("herdr");
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\ncat '{}'\n", schema_path.display()),
-        )
+        crate::generated_executable::write_executable_script(&script, |writer| {
+            std::io::Write::write_all(
+                writer,
+                format!("#!/bin/sh\ncat '{}'\n", schema_path.display()).as_bytes(),
+            )
+        })
         .expect("stage schema script");
-        #[cfg(unix)]
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .expect("schema script is executable");
         (script, home)
     }
 

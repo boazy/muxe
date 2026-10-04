@@ -1467,17 +1467,17 @@ mod tests {
             sys::wait::{WaitPidFlag, waitpid},
             unistd::Pid,
         };
-        use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::TempDir::new().unwrap();
         let script = temp.path().join("herdr");
         let pid_file = temp.path().join("pid");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/pid\"\nexec sleep 3600\n",
-        )
+        crate::generated_executable::write_executable_script(&script, |writer| {
+            std::io::Write::write_all(
+                writer,
+                b"#!/bin/sh\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/pid\"\nexec sleep 3600\n",
+            )
+        })
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let worker = tokio::spawn({
             let script = script.clone();
             async move {

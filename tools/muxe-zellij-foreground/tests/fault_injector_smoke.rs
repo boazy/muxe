@@ -9,6 +9,9 @@
 //! Requires the `muxe-zellij-fault-injector` bin target (core manifest
 //! side); the binary path arrives via `CARGO_BIN_EXE`.
 
+#[path = "../../../crates/muxe/tests/support/generated_executable.rs"]
+mod generated_executable;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -30,17 +33,13 @@ fn case_root(name: &str) -> CaseDir {
 /// `$FAKE_EXIT`. Absolute path, owner-executable.
 fn fake_cli(root: &Path) -> PathBuf {
     let path = root.join("fake-zellij");
-    std::fs::write(
-        &path,
-        "#!/bin/sh\necho \"$@\" >> \"$ARGV_LOG\"\nexit \"$FAKE_EXIT\"\n",
-    )
+    generated_executable::write_executable_script(&path, |writer| {
+        std::io::Write::write_all(
+            writer,
+            b"#!/bin/sh\necho \"$@\" >> \"$ARGV_LOG\"\nexit \"$FAKE_EXIT\"\n",
+        )
+    })
     .expect("write fake cli");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod fake cli");
-    }
     path
 }
 

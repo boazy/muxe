@@ -1,6 +1,10 @@
+#[path = "support/generated_executable.rs"]
+mod generated_executable;
+use generated_executable::write_executable_script;
 #[path = "support/scoped_env.rs"]
 mod scoped_env;
 use scoped_env::{apply_scoped_env, ensure_scoped_dirs, scoped_env_vec};
+use std::io::Write as _;
 
 use std::{
     fmt::Write,
@@ -124,17 +128,13 @@ fn write_schema_binary(root: &Path) -> PathBuf {
     .expect("write fake Herdr schema");
     let observed_env = root.join("child-env-proof");
     let binary = root.join("herdr");
-    std::fs::write(
-        &binary,
-        format!(
-            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' \"$HOME\" \"$XDG_CONFIG_HOME\" \
+    let script = format!(
+        "#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' \"$HOME\" \"$XDG_CONFIG_HOME\" \
 \"$XDG_CACHE_HOME\" \"$XDG_RUNTIME_DIR\" \"$TMPDIR\" > '{}'\nexec cat \"$(dirname \"$0\")/schema.json\"\n",
-            observed_env.display()
-        ),
-    )
-    .expect("write fake Herdr executable");
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
-        .expect("make fake Herdr executable");
+        observed_env.display()
+    );
+    write_executable_script(&binary, |file| file.write_all(script.as_bytes()))
+        .expect("write fake Herdr executable");
     binary
 }
 

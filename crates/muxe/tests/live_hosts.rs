@@ -285,7 +285,7 @@ async fn bring_hosts(
     let (config_file, cache_dir) = init_shared_dirs(init_bin, &scoped_root).await?;
     let expected_bridge = OwnedZellijHost::installed_bridge_identity(install_bin).await?;
 
-    let mut host = OwnedZellijHost::prepare(zellij_binary, root.path(), case)?;
+    let host = OwnedZellijHost::prepare(zellij_binary, root.path(), case)?;
     // Receipt-owned pre-state before any startup: the real public
     // install writes stable bytes, receipt, and autoload KDL nodes, so
     // foreground startup loads the managed bridge and activation
@@ -293,13 +293,6 @@ async fn bring_hosts(
     // pre-state generation (old for upgrade rehearsal, target for smoke).
     install_zellij_integration(case, install_bin, &host, &scoped_root).await?;
     OwnedZellijHost::validate_prepared_bridge(&scoped_root, &expected_bridge)?;
-    let mut herdr = OwnedHerdrServer::start(herdr_binary, root.path(), &scoped_root, case).await?;
-    let discovery = herdr.discovery_key().to_owned();
-    if herdr.try_wait()?.is_some() {
-        return Err(io::Error::other(format!(
-            "{case}: herdr server exited on startup"
-        )));
-    }
 
     if let Some(binary) = ui_hotkey {
         use std::io::Write as _;
@@ -378,49 +371,10 @@ keybinds {{
     );
     host.run_permission_seed(seeder, &stable.display().to_string(), &scoped_root)
         .await?;
-    for (session, _) in sessions {
-        host.serve_foreground(
-            foreground,
-            bootstrap,
-            session,
-            &scoped_root,
-            &expected_bridge,
-        )
-        .await?;
-    }
-    if !host.has_server_child() {
-        return Err(io::Error::other(format!(
-            "{case}: zellij server children missing right after spawn"
-        )));
-    }
-    host.check_servers_alive()?;
-
+    let herdr = OwnedHerdrServer::start(herdr_binary, root.path(), &scoped_root, case).await?;
+    let discovery = herdr.discovery_key().to_owned();
     let workdir = host.workdir().to_path_buf();
-    let mut clients = Vec::new();
-    for (session, count) in sessions {
-        for index in 0..*count {
-            let typescript = workdir.join(format!("client-{session}-{index}.log"));
-            clients.push(
-                host.spawn_client(&format!("{case}-{session}-{index}"), session, &typescript)
-                    .await?,
-            );
-        }
-    }
-    for (session, count) in sessions {
-        host.finish_bootstrap_handoff(session, *count).await?;
-    }
-
-    let continuity = ContinuityGuard::watch_herdr(
-        &format!("{case}-herdr"),
-        muxe_adapter_herdr::HerdrAdapterConfig {
-            socket_path: herdr.socket().to_path_buf(),
-            herdr_binary: herdr_binary.to_path_buf(),
-            cache_dir: cache_dir.clone(),
-        },
-        discovery.clone(),
-    )
-    .await?;
-    Ok(Rig {
+    let mut rig = Rig {
         root,
         scoped_root,
         workdir,
@@ -429,10 +383,75 @@ keybinds {{
         herdr: Some(herdr),
         discovery,
         zellij: Some(host),
-        pty_clients: clients,
+        pty_clients: Vec::new(),
         brokers: Vec::new(),
-        continuity: Some(continuity),
-    })
+        continuity: None,
+    };
+    let startup = async {
+        let herdr = rig
+            .herdr
+            .as_mut()
+            .expect("startup retains its Herdr server");
+        if herdr.try_wait()?.is_some() {
+            return Err(io::Error::other(format!(
+                "{case}: herdr server exited on startup"
+            )));
+        }
+        let host = rig
+            .zellij
+            .as_mut()
+            .expect("startup retains its Zellij host");
+        for (session, _) in sessions {
+            host.serve_foreground(
+                foreground,
+                bootstrap,
+                session,
+                &rig.scoped_root,
+                &expected_bridge,
+            )
+            .await?;
+        }
+        if !host.has_server_child() {
+            return Err(io::Error::other(format!(
+                "{case}: zellij server children missing right after spawn"
+            )));
+        }
+        host.check_servers_alive()?;
+        for (session, count) in sessions {
+            for index in 0..*count {
+                let typescript = rig.workdir.join(format!("client-{session}-{index}.log"));
+                rig.pty_clients.push(
+                    host.spawn_client(&format!("{case}-{session}-{index}"), session, &typescript)
+                        .await?,
+                );
+            }
+        }
+        for (session, count) in sessions {
+            host.finish_bootstrap_handoff(session, *count).await?;
+        }
+        rig.continuity = Some(
+            ContinuityGuard::watch_herdr(
+                &format!("{case}-herdr"),
+                muxe_adapter_herdr::HerdrAdapterConfig {
+                    socket_path: herdr.socket().to_path_buf(),
+                    herdr_binary: herdr_binary.to_path_buf(),
+                    cache_dir: rig.cache_dir.clone(),
+                },
+                rig.discovery.clone(),
+            )
+            .await?,
+        );
+        Ok(())
+    }
+    .await;
+    match startup {
+        Ok(()) => Ok(rig),
+        Err(error) => {
+            let cleanup = rig.close(case).await;
+            Err(combine_body_and_cleanup(Err(error), cleanup)
+                .expect_err("startup failed before cleanup"))
+        }
+    }
 }
 
 /// Serves old brokers on every host through the installed binary and

@@ -4,7 +4,8 @@
 
 - *(bridge)* Request a fresh client census on timer ticks while an event subscription waits for registration under granted permissions.
 - *(ci)* Use the same pinned `cargo-codspeed` task to build and run benchmark comparisons.
-- *(ci)* Run the standalone scope-guard script through `/bin/sh` to avoid Linux executable-file-busy errors. Keep its environment isolation checks unchanged.
+- *(ci)* Generate executable fixtures in an isolated writer child and reap it before direct execution. Prevent concurrent forks from inheriting writable script descriptors, while keeping the scope guard's environment checks unchanged.
+- *(ci)* Reap owned hosts when real-host fixture startup fails, preserving the original error and host diagnostics before temporary directories are removed.
 - *(ci)* Set accepted bootstrap test sockets to blocking mode so macOS can drain render output. Preserve send errors and reap the helper before reporting failures.
 - *(ci)* Wait for missing initial Zellij client-list output within the existing startup deadline. Keep malformed output and missing post-detach observations fatal. Reap timed-out CLI children and retain their diagnostics.
 - *(ci)* Wait for missing Zellij client-list responses before and after initial bridge registration, within one bootstrap deadline. Keep observed membership and installation identity checks strict.

@@ -5,6 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+#[path = "../../muxe/tests/support/generated_executable.rs"]
+mod generated_executable;
+
 pub mod broker;
 pub mod client;
 pub mod config;

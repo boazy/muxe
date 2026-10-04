@@ -913,12 +913,10 @@ mod tests {
     fn write_fake_zellij(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::TempDir::with_prefix("muxe-pipe-").expect("unique temp dir");
         let exe = dir.path().join("zellij");
-        std::fs::write(&exe, script).expect("script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
+        crate::generated_executable::write_executable_script(&exe, |writer| {
+            std::io::Write::write_all(writer, script.as_bytes())
+        })
+        .expect("script");
         (dir, exe)
     }
     const ECHO_SCRIPT: &str = r#"#!/bin/sh

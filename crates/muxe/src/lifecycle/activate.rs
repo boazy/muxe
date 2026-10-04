@@ -6103,7 +6103,6 @@ mod tests {
         // A TempDir fixture executable stands in for the Zellij CLI: the real
         // Command path, argument vector, and failure detection run without
         // touching any live host.
-        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(
             temp.path(),
@@ -6112,15 +6111,17 @@ mod tests {
         .unwrap();
         let recorded = temp.path().join("args");
         let program = temp.path().join("zellij");
-        std::fs::write(
-            &program,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nif [ \"$2\" = \"bad\" ]; then exit 3; fi\nexit 0\n",
-                recorded.display()
-            ),
-        )
+        crate::generated_executable::write_executable_script(&program, |writer| {
+            std::io::Write::write_all(
+                writer,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nif [ \"$2\" = \"bad\" ]; then exit 3; fi\nexit 0\n",
+                    recorded.display()
+                )
+                .as_bytes(),
+            )
+        })
         .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let reloader = ZellijCliReloader {
             program: Some(program),
         };
@@ -6145,12 +6146,13 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let program = temp.path().join("zellij");
-        std::fs::write(
-            &program,
-            "#!/bin/sh\nprintf '%s\\n' '[{\"is_plugin\":true,\"plugin_url\":\"muxe\",\"exited\":false}]'\n",
-        )
+        crate::generated_executable::write_executable_script(&program, |writer| {
+            std::io::Write::write_all(
+                writer,
+                b"#!/bin/sh\nprintf '%s\\n' '[{\"is_plugin\":true,\"plugin_url\":\"muxe\",\"exited\":false}]'\n",
+            )
+        })
         .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let reloader = ZellijCliReloader {
             program: Some(program),
         };

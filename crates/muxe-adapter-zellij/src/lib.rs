@@ -9,12 +9,16 @@
 //! Configuration input arrives as [`NativeActionCandidate`](muxe_core::NativeActionCandidate)
 //! values in two namespaces: `native.zellij.action:{kebab-action}` for the
 //! low-level action surface dispatched through `run_action`, and
-//! `native.zellij.command:{kebab-command}` for the 153 exposed high-level plugin
+//! `native.zellij.command:{kebab-command}` for the exposed high-level plugin
 //! commands. Both parse into generated raw mirrors and validate through
 //! generated `TryFrom` conversions; pipe payloads are typed throughout with no
 //! JSON value bridge between crates.
 
 #![forbid(unsafe_code)]
+
+#[cfg(test)]
+#[path = "../../muxe/tests/support/generated_executable.rs"]
+mod generated_executable;
 
 mod adapter;
 mod capture;
