@@ -725,6 +725,12 @@ impl Bridge {
     }
 
     fn on_timer(&mut self, effects: &mut dyn HostEffects) {
+        // Request a fresh client census on timer while an event subscription
+        // remains pending under granted permissions (e.g. if the initial census
+        // response was unavailable or lost). Queries cease once registered.
+        if self.pending_subscribe && self.permission_gate == PermissionGate::Granted {
+            effects.list_clients();
+        }
         // Heartbeats renew the broker-side heartbeat lease; without them an
         // idle healthy bridge would be expired by the registry.
         self.emit_unsolicited(BridgeEvent::Heartbeat, effects);
@@ -1713,7 +1719,6 @@ mod tests {
         fn pipe_state(&self, cli_id: &str) -> Option<FakePipeState> {
             self.pipe_states.get(cli_id).copied()
         }
-
         fn take_list_response(&mut self) -> bool {
             std::mem::take(&mut self.list_response_pending)
         }
@@ -2250,6 +2255,178 @@ mod tests {
             );
         }
         assert_eq!(host.register_client_ids(EVENT_CLI), vec!["5".to_owned()]);
+    }
+
+    #[test]
+    fn timer_retries_pending_subscription_census_until_registered() {
+        let mut bridge = Bridge::default();
+        let mut host = FakeHost::new();
+        bridge.load(&mut host);
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Granted),
+            &mut host,
+        );
+        // Initial reply withheld
+        host.list_clients_ready = false;
+        bridge.pipe(subscribe_msg(), &mut host);
+        assert_eq!(bridge.active_registration(), None);
+
+        // Timer tick occurs; foreign census delivered on that query
+        host.list_clients_ready = true;
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        if host.take_list_response() {
+            bridge.update(
+                Event::ListClients(clients_for(99, PaneId::Terminal(2))),
+                &mut host,
+            );
+        }
+        assert_eq!(
+            bridge.active_registration(),
+            None,
+            "foreign anchor must not register"
+        );
+
+        // Next timer tick occurs; matching anchor census delivered on that query
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        if host.take_list_response() {
+            bridge.update(
+                Event::ListClients(clients_current(PaneId::Terminal(2))),
+                &mut host,
+            );
+        }
+        assert_eq!(
+            bridge.active_registration(),
+            Some(registration(7)),
+            "eventually registers on matching anchor"
+        );
+        assert_eq!(
+            host.register_client_ids(EVENT_CLI),
+            vec!["5".to_owned()],
+            "emitted Register frame on current event pipe"
+        );
+
+        // Queries cease once registered
+        let lists_at_register = host.lists;
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert_eq!(
+            host.lists, lists_at_register,
+            "queries stop after registration"
+        );
+    }
+
+    #[test]
+    fn timer_census_retry_obeys_permission_gating_and_no_subscription() {
+        let mut bridge = Bridge::default();
+        let mut host = FakeHost::new();
+        bridge.load(&mut host);
+
+        // 1. Granted + no subscription: consume Grant's initial query, timer must not query
+        host.list_clients_ready = true;
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Granted),
+            &mut host,
+        );
+        assert!(host.take_list_response(), "grant issued initial query");
+        let lists_after_grant = host.lists;
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert_eq!(
+            host.lists, lists_after_grant,
+            "no query when pending_subscribe is false"
+        );
+
+        // 2. Pending permission + subscribe: load requests permissions but status is pending
+        let mut bridge = Bridge::default();
+        let mut host = FakeHost::new();
+        bridge.load(&mut host);
+        host.list_clients_ready = true;
+        bridge.pipe(subscribe_msg(), &mut host);
+        assert_eq!(
+            host.lists, 0,
+            "subscribe cannot query while permission is pending"
+        );
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert_eq!(
+            host.lists, 0,
+            "timer cannot query while permission is pending"
+        );
+
+        // 3. Denied permission + subscribe: timer must not query
+        bridge.update(
+            Event::PermissionRequestResult(PermissionStatus::Denied),
+            &mut host,
+        );
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert_eq!(
+            host.lists, 0,
+            "timer cannot query when permission is Denied"
+        );
+        assert_eq!(bridge.active_registration(), None);
+    }
+
+    #[test]
+    fn replacement_subscription_requires_fresh_census_before_timer_stops() {
+        let (mut bridge, mut host) = boot();
+        assert_eq!(bridge.client_identity(), Some("5"));
+        assert_eq!(bridge.active_registration(), Some(registration(7)));
+
+        // Replacement subscription arrives on EVENT_CLI_TWO: clears registration;
+        // withhold immediate reply
+        host.list_clients_ready = false;
+        bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
+        assert_eq!(
+            bridge.active_registration(),
+            None,
+            "registration cleared on replacement"
+        );
+
+        // Old pipe receives nothing new
+        assert_eq!(host.register_client_ids(EVENT_CLI).len(), 1);
+
+        // Timer tick occurs; foreign census delivered on that query
+        host.list_clients_ready = true;
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        if host.take_list_response() {
+            bridge.update(
+                Event::ListClients(clients_for(99, PaneId::Terminal(2))),
+                &mut host,
+            );
+        }
+        assert_eq!(bridge.active_registration(), None);
+        assert!(host.register_client_ids(EVENT_CLI_TWO).is_empty());
+
+        // Next timer tick delivers matching anchor census
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        if host.take_list_response() {
+            bridge.update(
+                Event::ListClients(clients_current(PaneId::Terminal(2))),
+                &mut host,
+            );
+        }
+        assert_eq!(
+            bridge.active_registration(),
+            Some(registration(8)),
+            "registered after fresh anchor census"
+        );
+        assert_eq!(
+            host.register_client_ids(EVENT_CLI_TWO),
+            vec!["5".to_owned()],
+            "emitted Register frame on new event pipe"
+        );
+
+        // Old pipe remains unchanged after new registration
+        assert_eq!(
+            host.register_client_ids(EVENT_CLI).len(),
+            1,
+            "old pipe unchanged after new registration"
+        );
+
+        // Timer stops querying
+        let lists_at_register = host.lists;
+        bridge.update(Event::Timer(HEARTBEAT_SECS), &mut host);
+        assert_eq!(
+            host.lists, lists_at_register,
+            "timer stops querying once registered"
+        );
     }
 
     #[test]

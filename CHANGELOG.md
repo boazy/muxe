@@ -2,6 +2,7 @@
 
 ### 🐛 Bug Fixes
 
+- *(bridge)* Request a fresh client census on timer ticks while an event subscription waits for registration under granted permissions.
 - *(ci)* Use the same pinned `cargo-codspeed` task to build and run benchmark comparisons.
 - *(ci)* Run the standalone scope-guard script through `/bin/sh` to avoid Linux executable-file-busy errors. Keep its environment isolation checks unchanged.
 - *(ci)* Set accepted bootstrap test sockets to blocking mode so macOS can drain render output. Preserve send errors and reap the helper before reporting failures.
