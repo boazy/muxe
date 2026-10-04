@@ -46,15 +46,26 @@ pub fn short_tempdir(prefix: &str) -> io::Result<tempfile::TempDir> {
 /// window between spawn and the timeout arm. Pipe tails are bounded, so
 /// only small CLI outputs (status tables, not transcripts) belong here.
 pub async fn run_cli_bounded(tag: &str, command: &mut Command) -> io::Result<std::process::Output> {
+    run_cli_bounded_until(tag, command, tokio::time::Instant::now() + CLI_TIMEOUT).await
+}
+
+/// Bound the borrowed wait, not the future owning the child: deadline expiry
+/// must still explicitly reap it and collect both diagnostics pipes.
+async fn run_cli_bounded_until(
+    tag: &str,
+    command: &mut Command,
+    deadline: tokio::time::Instant,
+) -> io::Result<std::process::Output> {
     let mut child = OwnedChild::spawn(tag, command)?;
-    let outcome = tokio::time::timeout(CLI_TIMEOUT, child.wait()).await;
+    let deadline = deadline.min(tokio::time::Instant::now() + CLI_TIMEOUT);
+    let outcome = tokio::time::timeout_at(deadline, child.wait()).await;
     match outcome {
         Err(_) => {
             let diagnostics = child.terminate_and_reap().await?;
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "owned CLI '{tag}' exceeded CLI_TIMEOUT:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    "owned CLI '{tag}' exceeded its command/admission deadline:\n--- stdout ---\n{}\n--- stderr ---\n{}",
                     diagnostics.stdout_tail.lossy(),
                     diagnostics.stderr_tail.lossy(),
                 ),
@@ -751,6 +762,22 @@ struct BootstrapPeer {
     child: OwnedChild,
 }
 
+/// A successful CLI can unblock before it delivers its census. Only initial
+/// handoff admission may wait for that missing observation; it is not an empty set.
+enum ClientCensus {
+    Unavailable,
+    Observed(Vec<muxe_core::ClientId>),
+}
+
+impl std::fmt::Display for ClientCensus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("successful CLI returned no response"),
+            Self::Observed(members) => write!(formatter, "observed membership {members:?}"),
+        }
+    }
+}
+
 /// One owned Zellij host with isolated endpoints and retained server children.
 ///
 /// The pinned CLI daemonizes its server on Unix. The runner instead uses the
@@ -1249,12 +1276,12 @@ impl OwnedZellijHost {
     }
 
     async fn typed_clients(&self, session: &str) -> io::Result<Vec<muxe_core::ClientId>> {
-        Ok(self
-            .list_clients(session)
-            .await?
-            .into_iter()
-            .map(muxe_core::ClientId::new)
-            .collect())
+        match self.client_census(session).await? {
+            ClientCensus::Observed(members) => Ok(members),
+            ClientCensus::Unavailable => Err(io::Error::other(format!(
+                "list-clients on session '{session}' returned no census",
+            ))),
+        }
     }
 
     /// Builds the permission seeder command: the fixture peer plus the
@@ -1615,18 +1642,41 @@ impl OwnedZellijHost {
     /// (unknown table shape) instead of passing an empty set; an
     /// authoritatively empty session legitimately yields an empty set.
     pub async fn list_clients(&self, session: &str) -> io::Result<Vec<String>> {
+        Ok(self
+            .typed_clients(session)
+            .await?
+            .into_iter()
+            .map(muxe_core::ClientId::into_string)
+            .collect())
+    }
+
+    async fn client_census(&self, session: &str) -> io::Result<ClientCensus> {
+        self.client_census_until(session, tokio::time::Instant::now() + CLI_TIMEOUT)
+            .await
+    }
+
+    async fn client_census_until(
+        &self,
+        session: &str,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<ClientCensus> {
         let mut command = self.base_command();
         command
             .arg("--session")
             .arg(session)
             .arg("action")
             .arg("list-clients");
-        let output = run_cli_bounded(&format!("list-clients-{session}"), &mut command).await?;
+        let output =
+            run_cli_bounded_until(&format!("list-clients-{session}"), &mut command, deadline)
+                .await?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
                 "list-clients on session '{session}' failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )));
+        }
+        if output.stdout.is_empty() {
+            return Ok(ClientCensus::Unavailable);
         }
         let text = String::from_utf8_lossy(&output.stdout);
         let mut header_seen = false;
@@ -1637,7 +1687,7 @@ impl OwnedZellijHost {
                 Some("CLIENT_ID") => {
                     header_seen = true;
                 }
-                Some(id) => ids.push(id.to_owned()),
+                Some(id) => ids.push(muxe_core::ClientId::new(id)),
             }
         }
         if !header_seen {
@@ -1647,7 +1697,7 @@ impl OwnedZellijHost {
         }
         ids.sort();
         ids.dedup();
-        Ok(ids)
+        Ok(ClientCensus::Observed(ids))
     }
 
     /// Spawns one retained interactive client: a blocking `attach <session>`
@@ -1732,6 +1782,20 @@ impl OwnedZellijHost {
         session: &str,
         initial_clients: usize,
     ) -> io::Result<()> {
+        self.finish_bootstrap_handoff_until(
+            session,
+            initial_clients,
+            tokio::time::Instant::now() + STARTUP_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn finish_bootstrap_handoff_until(
+        &mut self,
+        session: &str,
+        initial_clients: usize,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<()> {
         let socket = self.session_socket_path(session);
         let Some(index) = self
             .bootstrap_peers
@@ -1748,21 +1812,44 @@ impl OwnedZellijHost {
             ..
         } = self.bootstrap_peers.remove(index);
         let outcome = async {
-            let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+            let mut last_census = None;
             let retained = loop {
-                let mut members = self.typed_clients(session).await?;
-                if members.len() == initial_clients + 1
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!(
+                        "bootstrap admission deadline elapsed; last census: {}",
+                        last_census.as_ref().map_or_else(|| "none received".to_owned(), ToString::to_string),
+                    )));
+                }
+                let census = self.client_census_until(session, deadline).await.map_err(|error| {
+                    io::Error::new(error.kind(), format!(
+                        "bootstrap pre-admission census failed: {error}; last census: {}",
+                        last_census.as_ref().map_or_else(|| "none received".to_owned(), ToString::to_string),
+                    ))
+                })?;
+                last_census = Some(census);
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!(
+                        "bootstrap admission deadline elapsed; last census: {}",
+                        last_census.expect("one completed census"),
+                    )));
+                }
+                if let Some(ClientCensus::Observed(members)) = &mut last_census
+                    && members.len() == initial_clients + 1
                     && let Some(index) = members.iter().position(|client| client == &bootstrap)
                 {
                     members.remove(index);
-                    break members;
+                    break std::mem::take(members);
                 }
-                if peer.try_wait()?.is_some() || tokio::time::Instant::now() >= deadline {
-                    return Err(io::Error::other(
-                        "bootstrap and requested distinct PTY clients never overlapped",
-                    ));
+                if peer.try_wait()?.is_some() {
+                    return Err(io::Error::other(format!(
+                        "bootstrap and requested distinct PTY clients never overlapped; last census: {}",
+                        last_census.expect("one completed census"),
+                    )));
                 }
-                tokio::time::sleep(POLL_INTERVAL).await;
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + POLL_INTERVAL),
+                )
+                .await;
             };
             eprintln!(
                 "[bootstrap] session '{session}': overlapping bootstrap {bootstrap} and retained {retained:?}",
@@ -2823,6 +2910,260 @@ mod scoped_spawn_tests {
         assert!(host.finish_bootstrap_handoff("absent", 1).await.is_err());
     }
 
+    /// A real CLI process yields one prescribed observation per call. The
+    /// bootstrap's stdin is the only way to publish the detach marker.
+    fn census_fixture(
+        case: &Path,
+        observations: &[(&str, i32, bool)],
+    ) -> (OwnedZellijHost, PathBuf) {
+        use std::fmt::Write as _;
+
+        let marker = case.join("detached");
+        let count = case.join("census-count");
+        let binary = case.join("census-cli");
+        let mut script = format!(
+            "#!/bin/sh\n\
+             count_file='{count}'\n\
+             count=0\n\
+             [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\n\
+             count=$((count + 1))\n\
+             printf '%s' \"$count\" > \"$count_file\" || exit 3\n\
+             case \"$count\" in\n",
+            count = shell_escape(&count.to_string_lossy()),
+        );
+        for (index, (stdout, status, detached)) in observations.iter().enumerate() {
+            writeln!(
+                script,
+                "{} ) [ {} -f '{}' ] || {{ echo 'detach crossed census boundary' >&2; exit 3; }}; \
+                 printf '%s' '{}'; exit {status} ;;",
+                index + 1,
+                if *detached { "" } else { "!" },
+                shell_escape(&marker.to_string_lossy()),
+                shell_escape(stdout),
+            )
+            .expect("write census script");
+        }
+        script.push_str("*) echo 'unexpected extra census' >&2; exit 3 ;;\nesac\n");
+        std::fs::write(&binary, script).expect("write census CLI");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod census CLI");
+        let host = OwnedZellijHost::prepare(&binary, case, "census").expect("owned census host");
+        (host, marker)
+    }
+
+    async fn exercise_census_handoff(
+        observations: &[(&str, i32, bool)],
+    ) -> (io::Result<()>, bool, String) {
+        let case = case_dir("census-handoff");
+        let (mut host, marker) = census_fixture(case.path(), observations);
+        retain_census_peer(&mut host, &marker, case.path());
+        let result = host.finish_bootstrap_handoff("census", 1).await;
+        let count =
+            std::fs::read_to_string(case.path().join("census-count")).expect("CLI call count");
+        (result, marker.is_file(), count)
+    }
+
+    fn retain_census_peer(host: &mut OwnedZellijHost, marker: &Path, root: &Path) {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("read -r handoff; [ \"$handoff\" = detach ] || exit 3; : > \"$1\"")
+            .arg("owned-bootstrap")
+            .arg(marker)
+            .current_dir(root);
+        apply_scoped_env(&mut command, root);
+        host.bootstrap_peers.push(BootstrapPeer {
+            socket: host.session_socket_path("census"),
+            client: muxe_core::ClientId::new("1"),
+            child: OwnedChild::spawn_with_open_stdin("census-bootstrap", &mut command)
+                .expect("retained peer"),
+        });
+    }
+
+    #[tokio::test]
+    async fn bootstrap_handoff_waits_for_observation_and_distinct_members() {
+        let (result, detached, count) = exercise_census_handoff(&[
+            ("", 0, false),
+            ("CLIENT_ID\n1\n1\n", 0, false),
+            ("CLIENT_ID\n1\n2\n", 0, false),
+            ("CLIENT_ID\n2\n", 0, true),
+        ])
+        .await;
+        result.expect("unavailable census must not reject initial admission");
+        assert!(detached, "admitted peer did not receive detach");
+        assert_eq!(
+            count, "4",
+            "all admission gates and post-detach census required"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_handoff_rejects_nonempty_malformed_or_failed_census() {
+        for observation in [
+            (" \n", 0, false),
+            ("not-a-census\n", 0, false),
+            ("", 1, false),
+        ] {
+            let (result, detached, count) = exercise_census_handoff(&[observation]).await;
+            assert!(result.is_err(), "invalid census admitted: {observation:?}");
+            assert!(!detached, "invalid census authorized detach");
+            assert_eq!(count, "1", "invalid census was retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_handoff_rejects_missing_post_detach_census() {
+        let (result, detached, count) =
+            exercise_census_handoff(&[("CLIENT_ID\n1\n2\n", 0, false), ("", 0, true)]).await;
+        assert_eq!(
+            result
+                .expect_err("post-detach census must remain strict")
+                .kind(),
+            io::ErrorKind::Other,
+        );
+        assert!(detached, "fixture never crossed the admission boundary");
+        assert_eq!(count, "2", "post-detach absence was retried");
+    }
+
+    #[tokio::test]
+    async fn client_census_distinguishes_unavailable_from_authoritative_empty() {
+        let case = case_dir("strict-census");
+        let (host, _) = census_fixture(case.path(), &[("", 0, false), ("CLIENT_ID\n", 0, false)]);
+        assert_eq!(
+            host.list_clients("census")
+                .await
+                .expect_err("strict census cannot accept absent output")
+                .kind(),
+            io::ErrorKind::Other,
+        );
+        assert_eq!(
+            host.list_clients("census")
+                .await
+                .expect("authoritative empty census"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_bootstrap_admission_never_launches_another_census_or_detaches() {
+        let case = case_dir("expired-census");
+        let (mut host, marker) = census_fixture(case.path(), &[("CLIENT_ID\n1\n2\n", 0, false)]);
+        retain_census_peer(&mut host, &marker, case.path());
+        // A query would now fail NotFound, so TimedOut proves admission checked
+        // its finite budget before trying to launch even an immediately valid CLI.
+        std::fs::remove_file(&host.zellij_binary).expect("disable owned census CLI");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let error = host
+            .finish_bootstrap_handoff_until("census", 1, deadline)
+            .await
+            .expect_err("expired admission must fail");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !case.path().join("census-count").exists(),
+            "expired admission queried the CLI"
+        );
+        assert!(!marker.exists(), "expired admission authorized detach");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_admission_deadline_reaps_hung_census_with_diagnostics() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let case = case_dir("hung-census");
+        let ready = case.path().join("ready-fifo");
+        let blocked = case.path().join("blocked-fifo");
+        for fifo in [&ready, &blocked] {
+            nix::unistd::mkfifo(
+                fifo,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .expect("owned handshake FIFO");
+        }
+        let mut handshake = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(&ready)
+            .expect("nonblocking owned handshake");
+        let binary = case.path().join("hung-cli");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+             echo 'census stdout proof'\n\
+             echo 'hung census diagnostic' >&2\n\
+             printf '%s\\n' \"$$\" > '{ready}'\n\
+             exec /bin/cat '{blocked}'\n",
+                ready = shell_escape(&ready.to_string_lossy()),
+                blocked = shell_escape(&blocked.to_string_lossy()),
+            ),
+        )
+        .expect("hung census CLI");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod hung CLI");
+        let marker = case.path().join("detached");
+        let mut host =
+            OwnedZellijHost::prepare(&binary, case.path(), "census").expect("owned host");
+        retain_census_peer(&mut host, &marker, case.path());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        let task = tokio::spawn(async move {
+            host.finish_bootstrap_handoff_until("census", 1, deadline)
+                .await
+        });
+        let wall_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut pid_bytes = Vec::new();
+        let mut buffer = [0; 32];
+        while !pid_bytes.contains(&b'\n') && std::time::Instant::now() < wall_deadline {
+            match handshake.read(&mut buffer) {
+                Ok(length) => pid_bytes.extend_from_slice(&buffer[..length]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("owned CLI handshake: {error}"),
+            }
+            // Keep the paused clock stationary until the real child reports
+            // readiness; this is a protocol handshake, not a timing sleep.
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let error = task
+            .await
+            .expect("owned handoff task")
+            .expect_err("hung CLI must expire");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let diagnostic = error.to_string();
+        for expected in ["census stdout proof", "hung census diagnostic"] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+        assert!(!marker.exists(), "deadline authorized detach");
+        let pid = nix::unistd::Pid::from_raw(
+            std::str::from_utf8(&pid_bytes)
+                .expect("child PID bytes")
+                .trim()
+                .parse()
+                .expect("child PID"),
+        );
+        assert_eq!(
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD),
+            "expired owned CLI was not reaped",
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_admission_failure_preserves_last_observed_client() {
+        let observed = muxe_core::ClientId::new("observed-client-7");
+        let pending = format!("CLIENT_ID\n{observed}\n");
+        let (result, detached, count) =
+            exercise_census_handoff(&[(&pending, 0, false), ("", 1, false)]).await;
+        let error = result.expect_err("command failure after pending census");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains(observed.as_str()), "{error}");
+        assert!(!detached, "pending census authorized detach");
+        assert_eq!(count, "2", "command failure retried");
+    }
+
     #[test]
     fn prepared_bridge_legacy_metadata_preserves_native_and_digest_authority() {
         use muxe::integration::{
@@ -3219,7 +3560,11 @@ mod scoped_spawn_tests {
             &marker,
             "ok",
         );
-        let mut command = Command::new(&fake);
+        // This tests the script's guard, not kernel shebang execution. Read the
+        // completed script through its interpreter; actual spawn-contract tests
+        // still execute the generated fake directly.
+        let mut command = Command::new("/bin/sh");
+        command.arg(&fake);
         command
             .env_clear()
             .env("HOME", "/")
