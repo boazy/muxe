@@ -102,10 +102,10 @@ arg "[mode]" default="build" help="Build benchmarks or run them with CodSpeed" {
   choices "build" "run"
 }
 '''
-tools = { "cargo:cargo-codspeed" = "5.0.1" }
+tools = { "cargo:cargo-codspeed" = "5.0.2" }
 run = '''
 case "$usage_mode" in
-  build) cargo codspeed build --locked ;;
+  build) cargo codspeed build -m simulation --locked ;;
   run) cargo codspeed run ;;
 esac
 '''
