@@ -3225,7 +3225,6 @@ async fn run_herdr_ui(menu: UiMenuCommand) -> Result<()> {
         muxe_adapter_herdr::HerdrRuntime::connect(herdr_launch_config(paths.cache_dir.clone())?)
             .await
             .wrap_err("could not establish the exact configured Herdr runtime")?;
-    let attach = ui_attach_request(&menu, &runtime).await?;
     // Coldstart first: no live broker means one is started (or the stale one
     // is activated) before attach. The verified socket replaces the direct
     // endpoint connect so UI never races broker startup.
@@ -3248,6 +3247,9 @@ async fn run_herdr_ui(menu: UiMenuCommand) -> Result<()> {
     )
     .await
     .wrap_err("could not establish the Herdr UI broker connection")?;
+    let token = pending_launch_token(&required_environment("MUXE_PENDING_LAUNCH_TOKEN")?)?;
+    await_ui_launch_commit(&mut client, token).await?;
+    let attach = ui_attach_request(&menu, &runtime, token).await?;
     let frame = client
         .request_frame(ClientRequest::AttachUi(attach))
         .await
@@ -3264,6 +3266,27 @@ async fn run_herdr_ui(menu: UiMenuCommand) -> Result<()> {
     let _ = muxe_ui::run_attached(frame, &mut control)
         .await
         .wrap_err("Herdr terminal UI terminated unexpectedly")?;
+    Ok(())
+}
+
+/// Waits for the launcher's placement commit, not for a host snapshot to become valid.
+/// Host lookup errors after commit remain terminal.
+async fn await_ui_launch_commit(
+    client: &mut BrokerClient,
+    token: PendingLaunchToken,
+) -> Result<()> {
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(u64::from(LAUNCH_TOKEN_LEASE_MILLIS)),
+        client.request(ClientRequest::WaitUiPlacement(
+            muxe_protocol::WaitUiPlacement { token },
+        )),
+    )
+    .await
+    .wrap_err("timed out waiting for the Herdr UI launch placement commit")?
+    .wrap_err("could not wait for the Herdr UI launch placement commit")?;
+    if !matches!(response, BrokerResponse::Acknowledged) {
+        bail!("broker refused the UI launch placement wait: {response:?}");
+    }
     Ok(())
 }
 
@@ -3321,9 +3344,12 @@ fn validated_wire_menu_root(root: &str) -> Result<MenuId> {
     Ok(MenuId::named(root))
 }
 
+/// Captures the UI caller only after `await_ui_launch_commit` succeeds. The pane's
+/// creation-time environment can name a temporary tab that no longer exists after the move.
 async fn ui_attach_request(
     menu: &UiMenuCommand,
     runtime: &muxe_adapter_herdr::HerdrRuntime,
+    token: PendingLaunchToken,
 ) -> Result<AttachUi> {
     let origin = UiOriginBootstrap {
         workspace: WorkspaceId::new(required_environment("MUXE_HERDR_ORIGIN_WORKSPACE_ID")?),
@@ -3332,7 +3358,6 @@ async fn ui_attach_request(
         cwd: optional_absolute_environment_path(&env_lookup, "MUXE_HERDR_ORIGIN_PANE_CWD")?
             .map(|path| path.to_string_lossy().into_owned()),
     };
-    let token = pending_launch_token(&required_environment("MUXE_PENDING_LAUNCH_TOKEN")?)?;
     // `pane.move` can close the temporary creation tab after this process inherited its
     // environment. `HERDR_PANE_ID` remains the UI process's stable host identity, while the
     // inherited workspace/tab tuple may therefore be stale. Resolve its current tuple by that

@@ -57,6 +57,7 @@ pub struct Broker {
     generic: Arc<GenericSupervisor>,
     cleanup: Arc<CleanupSupervisor>,
     execution_transitions: Arc<Notify>,
+    ui_launch_changed: Notify,
     diagnostics_tx: mpsc::UnboundedSender<BrokerDiagnostic>,
     diagnostics_rx: Mutex<Option<mpsc::UnboundedReceiver<BrokerDiagnostic>>>,
     token_source: Mutex<OsTokenSource>,
@@ -1071,6 +1072,7 @@ async fn cancel_deadline_owner(deadline: &ExecutionDeadline, owner: Option<Execu
 pub enum RequestResult {
     Immediate(BrokerResponse),
     WaitForAttachment(Box<PendingAttachment>),
+    WaitForPlacement(PendingLaunchToken),
 }
 
 pub struct PendingAttachment {
@@ -1126,6 +1128,7 @@ impl Broker {
             generic: Arc::new(GenericSupervisor::default()),
             cleanup: Arc::new(CleanupSupervisor::default()),
             execution_transitions: Arc::new(Notify::new()),
+            ui_launch_changed: Notify::new(),
             diagnostics_tx,
             diagnostics_rx: Mutex::new(Some(diagnostics_rx)),
             token_source: Mutex::new(OsTokenSource),
@@ -1170,6 +1173,7 @@ impl Broker {
             compatibility_rebuilds: Arc::new(CompatibilityRebuildSupervisor::default()),
             generic: Arc::new(GenericSupervisor::default()),
             execution_transitions: Arc::new(Notify::new()),
+            ui_launch_changed: Notify::new(),
             cleanup: Arc::new(CleanupSupervisor::default()),
             diagnostics_tx,
             diagnostics_rx: Mutex::new(Some(diagnostics_rx)),
@@ -2020,6 +2024,37 @@ impl Broker {
         Ok(self.live_identity().await? == *claimed)
     }
 
+    pub(crate) async fn wait_ui_placement(
+        &self,
+        token: PendingLaunchToken,
+    ) -> Result<(), BrokerError> {
+        loop {
+            let changed = self.ui_launch_changed.notified();
+            tokio::pin!(changed);
+            // Register before reading the predicate so commit cannot race the wait.
+            changed.as_mut().enable();
+            let expires_at = {
+                let state = self.state.lock().await;
+                if state.activation_sealed {
+                    return Err(BrokerError::ActivationInProgress);
+                }
+                let launch = state
+                    .gate
+                    .pending(token)
+                    .filter(|launch| launch.expires_at > Instant::now())
+                    .ok_or(GateError::UnknownToken)?;
+                if launch.placement_committed {
+                    return Ok(());
+                }
+                launch.expires_at
+            };
+            tokio::select! {
+                () = &mut changed => {}
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {}
+            }
+        }
+    }
+
     /// Dispatches one validated client request by peer role.
     ///
     /// # Errors
@@ -2035,7 +2070,9 @@ impl Broker {
         match request {
             ClientRequest::PrepareUiLaunch(request) => {
                 Self::require_role(role, muxe_protocol::PeerRole::Launcher)?;
-                self.prepare(request).await
+                let result = self.prepare(request).await;
+                self.ui_launch_changed.notify_waiters();
+                result
             }
             ClientRequest::RegisterPendingPane(request) => {
                 Self::require_role(role, muxe_protocol::PeerRole::Launcher)?;
@@ -2053,6 +2090,10 @@ impl Broker {
                 Self::require_role(role, muxe_protocol::PeerRole::Launcher)?;
                 self.abort(token).await?;
                 Ok(RequestResult::Immediate(BrokerResponse::Acknowledged))
+            }
+            ClientRequest::WaitUiPlacement(request) => {
+                Self::require_role(role, muxe_protocol::PeerRole::Ui)?;
+                Ok(RequestResult::WaitForPlacement(request.token))
             }
             ClientRequest::AttachUi(request) => {
                 Self::require_role(role, muxe_protocol::PeerRole::Ui)?;
@@ -3093,6 +3134,7 @@ impl Broker {
             }
             session
         };
+        self.ui_launch_changed.notify_waiters();
         #[cfg(test)]
         {
             let hook = self
@@ -3157,6 +3199,7 @@ impl Broker {
             let registration = state.gate.abort(token)?;
             (registration, session)
         };
+        self.ui_launch_changed.notify_waiters();
         self.fail_session(&session, CaptureReleaseReason::UiDismissed)
             .await;
         if let Some(registration) = registration {
@@ -3184,6 +3227,7 @@ impl Broker {
                 Some((session, registration))
             }
         };
+        self.ui_launch_changed.notify_waiters();
         let Some((session, registration)) = outcome else {
             return Ok(());
         };
@@ -7154,6 +7198,13 @@ menus:
         let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
         let token =
             prepared_registered_launch(&broker, "commit-first", Some("temporary-tab")).await;
+        let placement_wait = broker.wait_ui_placement(token);
+        tokio::pin!(placement_wait);
+        tokio::select! {
+            biased;
+            _ = &mut placement_wait => panic!("UI placement wait completed before commit"),
+            () = std::future::ready(()) => {}
+        }
         let barrier = Arc::new(Barrier::new(2));
         let commit_broker = Arc::clone(&broker);
         let commit_barrier = Arc::clone(&barrier);
@@ -7166,6 +7217,7 @@ menus:
         });
         barrier.wait().await;
         commit.await.expect("commit task completes");
+        placement_wait.await.expect("UI observes placement commit");
         {
             let state = broker.state.lock().await;
             assert!(state.gate.pending(token).is_some());
@@ -7198,6 +7250,41 @@ menus:
         drop(state);
         broker.confirm_gated_attachment(token, &session).await;
         assert_eq!(adapter.pending_releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ui_placement_wait_expires_and_wakes_on_abort() {
+        let (_adapter, broker, _binding, _directory) = scoped_two_client_fixture();
+        let prepared = broker
+            .prepare(muxe_protocol::PrepareUiLaunch {
+                modal_scope: muxe_protocol::ModalScopeId::new("expired-placement"),
+                root: muxe_protocol::MenuId::named("main"),
+                lease_millis: 20,
+            })
+            .await
+            .expect("launcher prepares a short lease");
+        let RequestResult::Immediate(BrokerResponse::LaunchPrepared { token: expired, .. }) =
+            prepared
+        else {
+            panic!("expected a prepared launch");
+        };
+        assert!(matches!(
+            broker.wait_ui_placement(expired).await,
+            Err(BrokerError::Gate(GateError::UnknownToken))
+        ));
+        let aborted = prepared_registered_launch(&broker, "aborted-placement", None).await;
+        let placement_wait = broker.wait_ui_placement(aborted);
+        tokio::pin!(placement_wait);
+        tokio::select! {
+            biased;
+            _ = &mut placement_wait => panic!("UI placement wait completed before abort"),
+            () = std::future::ready(()) => {}
+        }
+        broker.abort(aborted).await.expect("launcher aborts");
+        assert!(matches!(
+            placement_wait.await,
+            Err(BrokerError::Gate(GateError::UnknownToken))
+        ));
     }
 
     #[tokio::test]
@@ -9582,6 +9669,7 @@ colors:
             generic: Arc::new(GenericSupervisor::default()),
             cleanup: Arc::new(CleanupSupervisor::default()),
             execution_transitions: Arc::new(Notify::new()),
+            ui_launch_changed: Notify::new(),
             diagnostics_tx: mpsc::unbounded_channel().0,
             diagnostics_rx: Mutex::new(None),
             token_source: Mutex::new(OsTokenSource),

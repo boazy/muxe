@@ -1232,6 +1232,31 @@ impl Validate for AttachUi {
     }
 }
 
+/// Non-consuming wait for the UI's launch placement commit.
+/// After acknowledgment the UI captures its caller tuple; `AttachUi` still validates the
+/// token and exact pane identity. Waiting never extends the launch lease.
+#[derive(
+    Archive,
+    Deserialize,
+    Serialize,
+    SerdeSerialize,
+    SerdeDeserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+pub struct WaitUiPlacement {
+    pub token: PendingLaunchToken,
+}
+
+impl Validate for WaitUiPlacement {
+    fn validate(&self) -> Result<(), SemanticError> {
+        self.token.validate()
+    }
+}
+
 #[derive(
     Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -1327,6 +1352,7 @@ impl Validate for DetachUi {
 pub enum ClientRequest {
     PrepareUiLaunch(PrepareUiLaunch),
     RegisterPendingPane(RegisterPendingPane),
+    WaitUiPlacement(WaitUiPlacement),
     AttachUi(AttachUi),
     CommitUiLaunch(CommitUiLaunch),
     AbortUiLaunch(AbortUiLaunch),
@@ -1351,6 +1377,7 @@ impl ClientRequest {
             PeerRole::Ui => matches!(
                 self,
                 Self::AttachUi(_)
+                    | Self::WaitUiPlacement(_)
                     | Self::InvokeBinding(_)
                     | Self::MenuControl(_)
                     | Self::DetachUi(_)
@@ -1367,6 +1394,7 @@ impl Validate for ClientRequest {
             Self::PrepareUiLaunch(value) => value.validate(),
             Self::RegisterPendingPane(value) => value.validate(),
             Self::AttachUi(value) => value.validate(),
+            Self::WaitUiPlacement(value) => value.validate(),
             Self::CommitUiLaunch(value) => value.validate(),
             Self::AbortUiLaunch(value) => value.validate(),
             Self::InvokeBinding(value) => value.validate(),
@@ -1787,6 +1815,7 @@ fn archived_request_allowed_for(request: &ArchivedClientRequest, role: PeerRole)
         PeerRole::Ui => matches!(
             request,
             ArchivedClientRequest::AttachUi(_)
+                | ArchivedClientRequest::WaitUiPlacement(_)
                 | ArchivedClientRequest::InvokeBinding(_)
                 | ArchivedClientRequest::MenuControl(_)
                 | ArchivedClientRequest::DetachUi(_)
@@ -1901,6 +1930,9 @@ fn validate_archived_request(request: &ArchivedClientRequest) -> Result<(), Sema
         ArchivedClientRequest::CommitUiLaunch(value) => {
             validate_archived_nonce(&value.token.0, "PendingLaunchToken")?;
             validate_archived_identifier("HostPaneId", value.pane.0.as_str())
+        }
+        ArchivedClientRequest::WaitUiPlacement(value) => {
+            validate_archived_nonce(&value.token.0, "PendingLaunchToken")
         }
         ArchivedClientRequest::AbortUiLaunch(value) => {
             validate_archived_nonce(&value.token.0, "PendingLaunchToken")

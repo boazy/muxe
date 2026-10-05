@@ -1760,6 +1760,8 @@ struct ConnectionResources {
     /// The one gated `AttachUi` readiness waiter. Keeping the real handle lets
     /// disconnect abort and join it before taking attachment ownership.
     waiter: Option<JoinHandle<()>>,
+    /// Read-only placement wait; disconnect cancels it without claiming the launch token.
+    placement_waiter: Option<JoinHandle<()>>,
     #[cfg(test)]
     publication_hook: Option<Arc<crate::broker::WaitHook>>,
 }
@@ -1769,6 +1771,7 @@ struct ConnectionResources {
 #[derive(Clone, Debug)]
 enum UiAttachment {
     Idle,
+    WaitingPlacement,
     Pending {
         token: PendingLaunchToken,
         session: UiSessionId,
@@ -1788,6 +1791,7 @@ impl ConnectionResources {
             launcher_tokens: HashSet::new(),
             attachment: Arc::new(std::sync::Mutex::new(UiAttachment::Idle)),
             waiter: None,
+            placement_waiter: None,
             #[cfg(test)]
             publication_hook: None,
         }
@@ -1803,12 +1807,24 @@ impl ConnectionResources {
     fn attached_session(&self) -> Option<UiSessionId> {
         match self.attachment() {
             UiAttachment::Attached { session } => Some(session),
-            UiAttachment::Pending { .. } | UiAttachment::Idle | UiAttachment::Closed => None,
+            UiAttachment::Pending { .. }
+            | UiAttachment::WaitingPlacement
+            | UiAttachment::Idle
+            | UiAttachment::Closed => None,
         }
     }
 
     fn validate_request(&self, request: &ClientRequest) -> Result<(), &'static str> {
         match request {
+            ClientRequest::WaitUiPlacement(_) if self.role == PeerRole::Ui => {
+                if matches!(self.attachment(), UiAttachment::Idle)
+                    && self.placement_waiter.is_none()
+                {
+                    Ok(())
+                } else {
+                    Err("one UI connection may wait for placement only before attachment")
+                }
+            }
             ClientRequest::AttachUi(_) if self.role == PeerRole::Ui => match self.attachment() {
                 UiAttachment::Idle => Ok(()),
                 _ => Err("one UI connection may attach at most one session"),
@@ -2224,6 +2240,45 @@ fn serve_pending_attachment(
     }));
     Ok(())
 }
+fn serve_placement_wait(
+    broker: &Arc<Broker>,
+    outbox: &mpsc::Sender<WireMessage>,
+    resources: &mut ConnectionResources,
+    request_id: RequestId,
+    token: PendingLaunchToken,
+) {
+    let attachment = Arc::clone(&resources.attachment);
+    *attachment
+        .lock()
+        .expect("connection attachment is not poisoned") = UiAttachment::WaitingPlacement;
+    let broker = Arc::clone(broker);
+    let outbox = outbox.clone();
+    resources.placement_waiter = Some(tokio::spawn(async move {
+        let response = match broker.wait_ui_placement(token).await {
+            Ok(()) => BrokerResponse::Acknowledged,
+            Err(error) => BrokerResponse::Error(error_diagnostic(&error)),
+        };
+        {
+            let mut attachment = attachment
+                .lock()
+                .expect("connection attachment is not poisoned");
+            if !matches!(*attachment, UiAttachment::WaitingPlacement) {
+                return;
+            }
+            *attachment = if matches!(response, BrokerResponse::Acknowledged) {
+                UiAttachment::Idle
+            } else {
+                UiAttachment::Closed
+            };
+        }
+        let _ = outbox
+            .send(WireMessage::Response {
+                request_id,
+                response,
+            })
+            .await;
+    }));
+}
 
 /// Serves one validated client request frame: handshake gate, attachment gate,
 /// ownership check, broker dispatch, and the immediate or pending response.
@@ -2291,6 +2346,9 @@ async fn serve_request_frame(
         Ok(RequestResult::WaitForAttachment(pending)) => {
             serve_pending_attachment(broker, outbox, resources, &tracking, request_id, pending)?;
         }
+        Ok(RequestResult::WaitForPlacement(token)) => {
+            serve_placement_wait(broker, outbox, resources, request_id, token);
+        }
 
         Err(error) => {
             outbox
@@ -2306,6 +2364,10 @@ async fn serve_request_frame(
 }
 
 async fn disconnect_resources(broker: &Arc<Broker>, resources: &mut ConnectionResources) {
+    if let Some(waiter) = resources.placement_waiter.take() {
+        waiter.abort();
+        let _ = waiter.await;
+    }
     if let Some(waiter) = resources.waiter.take() {
         waiter.abort();
         let _ = waiter.await;
@@ -2329,7 +2391,7 @@ async fn disconnect_resources(broker: &Arc<Broker>, resources: &mut ConnectionRe
         UiAttachment::Attached { session } => {
             broker.disconnect(Some(&session)).await;
         }
-        UiAttachment::Idle | UiAttachment::Closed => {}
+        UiAttachment::WaitingPlacement | UiAttachment::Idle | UiAttachment::Closed => {}
     }
     for token in resources.launcher_tokens.drain() {
         let _ = broker.abort_on_launcher_disconnect(token).await;
@@ -2565,6 +2627,89 @@ mod tests {
             resources.validate_request(&request).is_err(),
             "detached UI cannot detach or be cleaned up a second time"
         );
+    }
+
+    #[tokio::test]
+    async fn placement_wait_keeps_connection_responsive_and_disconnect_preserves_launch() {
+        let (broker, _adapter, _directory) = ordering_broker(false, false);
+        let (events, _events_rx) = mpsc::channel(8);
+        let RequestResult::Immediate(BrokerResponse::LaunchPrepared { token, .. }) = broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::PrepareUiLaunch(launch_request()),
+                events.clone(),
+            )
+            .await
+            .expect("launcher prepares")
+        else {
+            panic!("expected launch token");
+        };
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::RegisterPendingPane(muxe_protocol::RegisterPendingPane {
+                    token,
+                    pane: HostPaneId::new("owned-ui-pane"),
+                    temporary_tab: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("launcher registers its pane");
+        let mut resources = ConnectionResources::new(PeerRole::Ui);
+        resources.handshaken = true;
+        let (outbox, mut responses) = mpsc::channel(8);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_request_frame(
+                &broker,
+                None,
+                &outbox,
+                &mut resources,
+                RequestId([34; 16]),
+                ClientRequest::WaitUiPlacement(muxe_protocol::WaitUiPlacement { token }),
+            ),
+        )
+        .await
+        .expect("waiting for placement must not block the connection reader")
+        .expect("UI begins its placement wait");
+        serve_request_frame(
+            &broker,
+            None,
+            &outbox,
+            &mut resources,
+            RequestId([35; 16]),
+            ClientRequest::Heartbeat,
+        )
+        .await
+        .expect("same connection remains responsive before placement");
+        assert!(matches!(
+            responses.recv().await,
+            Some(WireMessage::Response {
+                request_id,
+                response: BrokerResponse::Acknowledged,
+            }) if request_id == RequestId([35; 16])
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            disconnect_resources(&broker, &mut resources),
+        )
+        .await
+        .expect("disconnect cancels the placement wait without awaiting the lease");
+        assert!(matches!(
+            broker
+                .handle(
+                    PeerRole::Launcher,
+                    ClientRequest::CommitUiLaunch(muxe_protocol::CommitUiLaunch {
+                        token,
+                        pane: HostPaneId::new("owned-ui-pane"),
+                    }),
+                    events,
+                )
+                .await
+                .expect("read-only UI disconnect does not abort the launcher's token"),
+            RequestResult::Immediate(BrokerResponse::Acknowledged)
+        ));
     }
 
     #[tokio::test]
