@@ -493,6 +493,22 @@ Pre-generated completion scripts for Bash, Zsh, and Fish ship under `share/muxe/
 
 Copy or link the appropriate completion file to your shell's completion directory.
 
+## Benchmarks
+
+Run the configuration compiler, terminal parser, and UI session benchmarks locally:
+
+```sh
+cargo bench --locked -p muxe-core --bench compiler
+cargo bench --locked -p muxe-terminal-input --bench parser
+cargo bench --locked -p muxe-ui --bench session
+```
+
+The workspace's `divan` dependency is an alias for `codspeed-divan-compat`, CodSpeed's Divan-compatible fork. It retains the `divan::...` benchmark API and ordinary `cargo bench` execution; it is not the latest upstream Divan implementation.
+
+In CI, `mise run wasm-build` first builds the WebAssembly bridge, and the workflow exports its SHA-256 as `MUXE_WASM_SHA256`, which the whole-workspace release-profile benchmark build requires. After that prerequisite, `mise run bench-codspeed` builds the instrumented benchmarks and `mise run bench-codspeed run` executes them in CodSpeed's Simulation environment. CI uploads the results for comparisons against the main-branch baseline. A local run without a measurement environment checks the benchmark cases but does not provide CodSpeed performance measurements.
+
+These benchmarks cover CPU work in parsing, compilation, and UI session operations. They do not measure real-host IPC or startup latency.
+
 ## Live-host test gates
 
 Integration tests use isolated fixture processes under a fresh temporary directory per test. Tests never access default user sockets, configuration files, or processes.
