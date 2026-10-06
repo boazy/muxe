@@ -1,64 +1,129 @@
-## Unreleased
+## [0.2.0] - 2026-10-06
 
 ### 🐛 Bug Fixes
 
-- *(bench)* Instrument Divan-style parser, UI, and compiler benchmarks with CodSpeed and publish the main-branch baseline using OIDC. Keep compiler input setup and owned-output destruction outside the measured operations, with one shared representative configuration fixture.
-- *(ci)* Clarify workflow labels, task descriptions, live-host test documentation, and release diagnostics without changing execution behavior.
-- *(zellij)* Pin the upstream client-lifecycle fix at `81f56e1aed4e17b822af5cb382a8f524e35f3eae`. Prevent duplicate cleanup from retiring a newly attached client and preserve the SDK's 32-bit client IDs through typed bridge state and membership queries.
-- *(bridge)* Request a fresh client census on timer ticks while an event subscription waits for registration under granted permissions.
-- *(ci)* Use the same pinned `cargo-codspeed` task to build and run benchmark comparisons.
-- *(ci)* Generate executable fixtures in an isolated writer child and reap it before direct execution. Prevent concurrent forks from inheriting writable script descriptors, while keeping the scope guard's environment checks unchanged.
-- *(ci)* Reap owned hosts when real-host fixture startup fails, preserving the original error and host diagnostics before temporary directories are removed.
-- *(ci)* Set accepted bootstrap test sockets to blocking mode so macOS can drain render output. Preserve send errors and reap the helper before reporting failures.
-- *(ci)* Wait for missing initial Zellij client-list output within the existing startup deadline. Keep malformed output and missing post-detach observations fatal. Reap timed-out CLI children and retain their diagnostics.
-- *(ci)* Wait for missing Zellij client-list responses before and after initial bridge registration, within one bootstrap deadline. Keep observed membership and installation identity checks strict.
-- *(ci)* Wait for installation-matched bridge registration before Zellij fixture handoff, and retain the bootstrap client until all initial PTY clients attach without reusing its ID. Preserve legacy receipt support through the selected native record and receipt digest authority.
-- *(input)* Map parsed terminal key enums directly to core named keys, keeping Kitty wire-code decoding in the terminal parser and preserving key-binding behavior
-- *(ci)* Use existing Zellij adapter recovery before two-client smoke admission, discard stale epoch/generation coverage, and retain exact addressed origin checks with fail-fast post-admission loss and no request replay
-- *(ci)* Retry unavailable Zellij census queries within the original two-client admission deadline without accepting changed membership, and log both bounded CLI stderr tails before recovery or shutdown discards them
-- *(broker)* Require the selected host's registry authority for cold-start adoption, reuse, stale removal, and retirement; reject foreign persisted rows before mutation
-- *(activation)* Spawn targets from the typed journal unit instead of a registry label or socket filename
-- *(activation)* Keep bridge preflight, reload, and Ready proof under the selected host policy; accept unchanged bridge membership regardless of registry insertion order
-- *(zellij)* Reuse a receipt-backed loaded bridge on ordinary coldstart, reload only an absent bridge before spawn, refresh pane-origin census after host pane transitions, and defer activation target subscriptions until durable replacement reload
-- *(zellij)* Keep spawned brokers outside the launching pane's process group; document mode-specific root bindings that publish an observed prior mode before the first UI capture
-- *(cli)* Create and validate the cache root owner-only before audit logging; refuse unsafe existing directories
-- *(ui)* Honor menu-scoped inactivity timeouts and reject binding-scoped inactivity settings
-- *(broker)* Reconcile authenticated cold-start endpoints before spawning, preserving live registration ownership and refusing ambiguous recovery
-- *(ui)* Honor per-invocation theme and color-scheme overrides without changing the pinned menu-session choice
-- *(broker)* Reject requests for replaced host incarnations and rebuild native-binding availability after reconnect
-- *(activation)* Require exact target-incarnation Ready authority and replay crash recovery through ordered barriers
-- *(activation)* Apply Herdr's supported-version policy using the runtime's typed server version
-- *(integration)* Keep artifact digests typed through installation and recovery. Reject malformed journal digests before changing the journal or artifacts, preserving corrupt transactions for diagnosis.
-- *(zellij)* Retain typed client, pane, session, execution, and lease identities in adapter state and capture APIs. Keep archived UI session IDs typed through attachment and event routing without changing wire formats.
-- *(activation)* Use the existing host-neutral `ClientId` for both registered and observed readiness membership, preserving client text and lexical ordering through wire serialization.
-- *(zellij)* Give resume attempts and installed pipe-child epochs distinct types so freshness tags cannot be swapped across lifecycle domains.
-- *(zellij)* Bind uninstall configuration ownership to the recorded path
-- *(zellij)* Preserve receipt-owned configuration provenance across reinstalls
-- *(broker)* Propagate retirement and registry cleanup failures
-- *(herdr)* Close only the leased pending pane and retain uncertain cleanup ownership
-- *(herdr)* Retain typed pane IDs in Herdr post-dismissal queues, removing string round-trips while preserving close-event and confirmed-absence dispatch.
-- *(herdr)* Serialize unary requests and multi-step host transactions per runtime incarnation
-- *(config)* Reject unknown underscore-prefixed fields
-- *(config)* Serialize concurrent reloads before publishing newer contents
-- *(cli)* Persist payload-free native command failure events
-- *(zellij)* Preflight uninstall journal and artifact authority before mutation
-- *(zellij)* Filter Muxe-owned panes from eligible focus targets
-- *(broker)* Retain dispatch ownership through shutdown and release timed-out UI work
-- *(herdr)* Fix tab swaps when stable public tab numbers differ from row positions. Preserve number-based selectors, use the pinned host's insertion boundaries, and verify the resulting order by tab identity.
-- *(broker)* Publish Unix sockets atomically only after securing their owner-only permissions. Preserve existing endpoints on collision and keep strict startup identity checks.
+- *(muxe)* Honor Herdr split dimensions
+- Bound UTF-8 diagnostics and reject malformed colors
+- *(muxe)* Harden planned KDL config commits
+- *(muxe)* Validate receipt ownership before uninstall
+- *(muxe)* Bind uninstall ownership to receipt config paths
+- Propagate broker retirement failures
+- *(herdr)* Bind pending cleanup to its host incarnation
+- *(core)* Reject unknown underscore fields
+- *(paths)* Preserve exact configuration ownership spelling
+- *(broker)* Serialize concurrent config reloads
+- *(logging)* Persist native command failures
+- *(zellij)* Preserve receipt ownership on reinstall
+- *(zellij)* Preflight native uninstall authority
+- *(zellij)* Filter Muxe-owned panes from focus targets
+- *(ui)* Centralize status transitions
+- *(broker)* Retain attachment cleanup ownership
+- *(broker)* Honor dismissal policy during activation drain
+- *(core)* Lower and type-check CEL once with one evaluator
+- *(core)* Prove compiled themes satisfy the renderer contract
+- *(herdr)* Validate the emitted portable request at load time
+- *(zellij)* Type unresolved context values against the generated schema
+- *(core)* Accept CEL hexadecimal integers through the parsed AST
+- *(core)* Scan theme statements in one forward pass
+- *(input)* Apply configured lock modifiers when matching keys
+- *(input)* Decode Kitty event types for direct and tilde functional keys
+- *(broker)* Isolate slow UI event delivery
+- *(herdr)* Gate host operations on one adapter lifecycle state
+- *(zellij)* Capture session and active-tab metadata in origins
+- *(ui)* Arbitrate expired Escape deadlines deterministically
+- *(ui)* Degrade component render failures to a usable menu
+- *(core)* Give named and inline menus distinct validated identities
+- *(tooling)* Make host pins and schema digests the single source of truth
+- *(zellij)* Expire gate capture when broker traffic stops
+- *(ui)* Render through the ratatui crossterm backend
+- *(zellij)* Classify focus before adopting the origin pane
+- *(ui)* Count unsupported input as user activity
+- *(herdr)* Reject cache-normalized candidates before cache lookup
+- *(zellij)* Complete multi-request executions as one aggregate outcome
+- *(tooling)* Isolate completion-check staging per invocation
+- *(host)* Retire the broker after a bounded host-loss grace
+- *(ui)* Preserve breadcrumb tails on narrow surfaces
+- *(ui)* Apply resolved style to menu headings
+- *(ui)* Preserve terminal cleanup failures
+- *(host)* Separate discovery from Zellij incarnation
+- *(broker)* Apply per-session theme overrides
+- *(herdr)* Guard requests by live socket incarnation
+- *(herdr)* Serialize unary sends per runtime incarnation
+- *(broker)* Supervise reconnect compatibility rebuilds
+- *(ui)* Honor menu-scoped inactivity timeouts
+- *(lifecycle)* Make activation and startup recovery transactional
+- *(ci)* Restore covered startup and owner-only cache roots
+- *(zellij)* Retain bridge authority across activation and menu coldstart
+- *(ci)* Recover two-client smoke startup transport loss
+- *(input)* Map typed terminal keys directly to named keys
+- *(activation)* Use the typed Herdr server version
+- *(herdr)* Key post-dismissal requests by PaneId
+- *(integration)* Retain typed artifact digests across transactions
+- *(zellij)* Retain typed adapter and UI identities
+- *(zellij)* Type resume and pipe-child epochs
+- *(ci)* Retain Zellij bootstrap until bridge-ready handoff
+- *(lifecycle)* Separate persisted rows from immutable host-validated registry state
+- *(broker)* Publish owner-only sockets atomically
+- *(ci)* Activate pinned CodSpeed runner for comparisons
+- *(test)* Keep scoped bootstrap handoffs bounded and portable
+- *(ci)* Repair CodSpeed and host fixture gates
+- *(ci)* Bound bootstrap readiness census
+- *(bridge)* Refresh pending subscription census on timer
+- *(ci)* Isolate script writers and reap failed host startup
+- *(zellij)* Pin upstream client lifecycle correction
+- *(bench)* Isolate compiler measurements and share configuration fixture
+- *(herdr)* Wait for pane placement before capturing UI context
 
-### Miscellaneous Tasks
+### 📚 Documentation
 
-- *(broker)* Type cleanup task claims and key test gates by their existing identities, preserving retry/requeue ownership for pending panes and captures.
-- *(core)* Type modifier-set flags and preserve canonical key matching without raw integer mutation.
-- *(cli)* Parse nonzero activation handoffs once at the validated CLI boundary and pass typed IDs into both broker serve paths.
-- *(cli)* Preserve typed Herdr workspace, tab, and pane identities through launcher-origin selection and saved tuples.
-- *(core)* Resolve portable actions once into typed execution values across the broker and host adapters. Preserve OS command paths and retain typed Herdr pane and split directions through dispatch.
-- *(core)* Carry inline-menu identity as typed lowering metadata without serialized string markers or copied syntax trees.
-- *(theme)* Retain resolved colors and distinct theme and color-scheme identities. Reuse canonical color formatting and borrowed scalar values while preserving duplicate policies, deferred validation, and diagnostic precedence.
-- *(zellij)* Retain SDK terminal/plugin pane variants, distinct tab positions and stable tab IDs, and capture-lease identities through bridge focus and pending dismissal state.
-- *(lifecycle)* Convert persisted registry rows into immutable concrete host lifecycle state while preserving legacy rows, independent selected mutation authority, and exact live/snapshot/endpoint checks.
+- Clarify documentation precedence
+- Define isolated workspace cleanup policy
+- *(condition)* Document fallible entry points
+- *(input)* Document lock-modifier matching
+- *(herdr)* Record pinned keyboard capability limits
+- *(agents)* Require host-polymorphic behavior
+- Record remaining domain-boundary cutovers
+- *(ci)* Clarify workflow labels and release diagnostics
 
+### ⚡ Performance
+
+- *(ui)* Make template padding linear in produced output
+- *(ui)* Retain compact checked routing metadata
+
+### 🚜 Refactor
+
+- *(core)* Derive portable actions from schema
+- *(core)* Satisfy strict compiler lints
+- *(broker)* Centralize execution ownership
+- Simplify execution and test lifecycle helpers
+- *(launch)* Share canonical UI argv recognition across adapters
+- *(test)* Let owned host fixture apply activation environment
+- *(activation)* Select concrete host policy for bridge transactions
+- *(lifecycle)* Make coldstart and activation spawning host-owned
+- *(core)* Retain typed portable action resolution
+- *(broker)* Type cleanup task claims and gate keys
+- *(core)* Type core modifier flags and set operations
+- *(cli)* Pass typed handoff IDs from validated arguments
+- *(cli)* Retain typed launcher origin IDs
+- *(herdr)* Distinguish public tab numbers from row positions
+- *(core)* Lower inline menus with typed metadata
+- *(theme)* Retain resolved colors and typed catalog names
+- *(zellij)* Retain pane, tab and capture lease identities in bridge state
+
+### 🎨 Styling
+
+- Satisfy the strict clippy gate
+- *(herdr)* Satisfy the strict clippy gate
+- *(ui)* Satisfy the strict clippy gate
+
+### 🧪 Testing
+
+- *(ci)* Use owned bridge transaction roots
+
+### ⚙️ Miscellaneous Tasks
+
+- *(audit)* Add Jev host-polymorphism scanner
+- *(bench)* Measure divan benches with CodSpeed
 ## [0.1.4] - 2026-09-12
 
 ### 🚀 Features
@@ -86,6 +151,10 @@
 
 - Regenerate menu dump completions
 - Remove crate publishing on release
+
+### 💼 Other
+
+- V0.1.4
 ## [0.1.3] - 2026-09-11
 
 ### 🚀 Features
