@@ -751,6 +751,189 @@ async fn defers_focused_tab_creation_until_the_retained_ui_close_event() {
     drop(fixture);
 }
 
+/// A newer Herdr reports a higher binary protocol and adds fields the adapter does not know.
+/// Connection, origin capture, the retained event, and the dispatch must all still succeed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one production fixture covers the schema, envelope, nested-result, and event paths"
+)]
+#[tokio::test]
+async fn newer_protocol_server_with_unknown_fields_completes_the_production_lifecycle() {
+    let mut schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/herdr/herdr-api.schema.json"
+    ))
+    .expect("bundled fixture schema is valid JSON");
+    schema["protocol"] = json!(22);
+    schema["future_schema_field"] = json!({ "nested": true });
+
+    let mut snapshot = lifecycle_snapshot();
+    snapshot["future_snapshot_field"] = json!([1, 2, 3]);
+    snapshot["workspaces"][0]["future_workspace_field"] = json!("w");
+    snapshot["tabs"][0]["future_tab_field"] = json!({ "x": 1 });
+    for pane in snapshot["panes"].as_array_mut().expect("snapshot panes") {
+        pane["future_pane_field"] = json!({ "scroll": { "offset_from_bottom": 0 } });
+    }
+    snapshot["layouts"][0]["future_layout_field"] = json!(null);
+    snapshot["layouts"][0]["panes"][0]["rect"]["future_rect_field"] = json!(7);
+    let snapshot_exchange = || RecordedExchange {
+        method: "session.snapshot",
+        params: json!({}),
+        response: RecordedResponse::Envelope(json!({
+            "result": {
+                "type": "session_snapshot",
+                "snapshot": snapshot,
+                "future_result_field": "r",
+            },
+            "future_envelope_field": { "trace": "s" },
+        })),
+    };
+    let script = vec![
+        RecordedExchange {
+            method: "ping",
+            params: json!({}),
+            response: RecordedResponse::Envelope(json!({
+                "result": {
+                    "type": "pong",
+                    "protocol": 22,
+                    "version": "0.9.3",
+                    "capabilities": { "future_capability": { "enabled": true } },
+                },
+                "future_envelope_field": 1,
+            })),
+        },
+        RecordedExchange {
+            method: "events.subscribe",
+            params: json!({
+                "subscriptions": [
+                    { "type": "tab.focused" },
+                    { "type": "pane.closed" },
+                ],
+            }),
+            response: RecordedResponse::KeepOpen(json!({
+                "type": "subscription_started",
+                "future_ack_field": { "nested": [] },
+            })),
+        },
+        snapshot_exchange(),
+        snapshot_exchange(),
+        RecordedExchange {
+            method: "tab.create",
+            params: json!({
+                "workspace_id": "workspace-1",
+                "label": "logs",
+                "focus": true,
+                "cwd": null,
+            }),
+            response: RecordedResponse::Envelope(json!({
+                "result": {
+                    "type": "tab_created",
+                    "tab": {
+                        "tab_id": "logs-tab",
+                        "workspace_id": "workspace-1",
+                        "label": "logs",
+                        "number": 2,
+                        "focused": true,
+                        "pane_count": 1,
+                        "agent_status": "unknown",
+                        "future_tab_field": { "nested": 1 },
+                    },
+                    "root_pane": {
+                        "pane_id": "logs-pane",
+                        "tab_id": "logs-tab",
+                        "workspace_id": "workspace-1",
+                        "focused": true,
+                        "agent_status": "unknown",
+                        "revision": 0,
+                        "future_pane_field": [1],
+                    },
+                    "future_result_field": "r",
+                },
+                "future_envelope_field": "t",
+            })),
+        },
+    ];
+    let fixture = ProductionConnectFixture::start_scripted_with_schema(script, &schema)
+        .expect("owned forward-compatibility fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("a newer protocol at a supported release connects");
+    assert!(matches!(
+        adapter
+            .next_health_event()
+            .await
+            .expect("initial health event"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+
+    let origin = adapter
+        .capture_origin(lifecycle_capture_request())
+        .await
+        .expect("origin captures from a snapshot with unknown nested fields");
+    let execution = ExecutionId(72);
+    adapter
+        .dispatch_portable_after_ui_dismissal(PostDismissalPortableDispatchRequest {
+            execution,
+            action: ResolvedPortableAction::Tab(ResolvedTabAction::Create {
+                workspace_id: Some(WorkspaceId::new("workspace-1")),
+                name: Some("logs".to_owned()),
+                focus: None,
+                command: ResolvedCreateCommand::default(),
+            }),
+            origin,
+            ui_pane: PaneId::new("pane-2"),
+        })
+        .await
+        .expect("focused creation is armed while the UI pane is still live");
+    wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
+
+    fixture
+        .send_retained_event(json!({
+            "type": "pane_closed",
+            "pane_id": "pane-2",
+            "future_event_field": { "nested": "e" },
+        }))
+        .expect("retained subscription accepts the UI close event");
+    wait_for_lifecycle_requests(&fixture, 5, "tab.create after pane_closed").await;
+    assert_eq!(
+        fixture.requests().await.last().expect("creation request")["method"],
+        json!("tab.create")
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
+            .await
+            .expect("creation completion arrives")
+            .expect("adapter reports completion"),
+        AdapterHealthEvent::DispatchCompleted(DispatchCompletion::Succeeded {
+            execution: completed,
+        }) if completed == execution
+    ));
+    adapter
+        .shutdown()
+        .await
+        .expect("adapter stops its retained monitor");
+    drop(adapter);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn server_below_the_minimum_release_is_rejected_before_subscribing() {
+    let fixture = ProductionConnectFixture::start_scripted(vec![RecordedExchange {
+        method: "ping",
+        params: json!({}),
+        response: RecordedResponse::Result(json!({
+            "type": "pong",
+            "protocol": 20,
+            "version": "0.8.1",
+        })),
+    }])
+    .expect("owned below-minimum fixture starts");
+    let Err(error) = HerdrAdapter::connect(fixture.adapter_config()).await else {
+        panic!("a server below the minimum release must not connect");
+    };
+    assert_eq!(error.kind, AdapterErrorKind::Incompatible);
+    assert_request_methods(&fixture, &["ping"]).await;
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one production fixture exercises matching pane-close release, unrelated-entry retention, and immediate release after an already-absent pane snapshot"

@@ -1,8 +1,10 @@
 //! Direct Herdr socket adapter and schema compatibility boundary.
 //!
-//! The adapter keeps the Herdr JSON Schema dynamic at its boundary: configuration is checked
-//! against the bundled request schema, runtime drift is checked against the exact installed
-//! Herdr binary's schema, and the resolved request is checked again immediately before dispatch.
+//! The adapter keeps the Herdr JSON Schema dynamic at its boundary: configured native actions
+//! and every request are validated against the request schema of the exact installed Herdr
+//! binary, and the resolved request is checked again immediately before dispatch. The bundled
+//! generated metadata only maps native action types to Herdr methods and their transports.
+//! Compatibility is gated on a minimum live server release; see [`HerdrRelease`].
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +22,7 @@ mod schema;
 mod subscription;
 mod transport;
 mod validation;
+mod version;
 
 /// Optional configuration override used by this host adapter.
 pub const CONFIG_OVERRIDE_FILENAME: &str = "herdr.yml";
@@ -40,7 +43,7 @@ pub use launch::{
     move_prepared_ui_pane, open_command_pane, open_command_tab, pane_by_id, pane_by_identity,
     prepare_ui_pane,
 };
-pub use runtime::{HerdrAdapterConfig, HerdrRuntime, HerdrServerVersion};
+pub use runtime::{HerdrAdapterConfig, HerdrRuntime};
 pub use schema::{
     ApiSchema, MethodSchema, VALIDATOR_FORMAT_VERSION, ValidationCode, ValidationError,
     canonical_request_bytes_for_test as schema_canonical_request_bytes_for_test,
@@ -48,12 +51,13 @@ pub use schema::{
 pub use subscription::{EventSubscription, SubscriptionConfig, SubscriptionEvent};
 pub use transport::{DeliveryState, HerdrResponse, SocketError};
 pub use validation::{CandidateValidationError, fields_to_json, validate_candidate};
+pub use version::{HerdrRelease, HerdrServerVersion};
 
 /// Extracts the typed `pane.get` payload from Herdr's success envelope.
 ///
-/// Protocol 20 returns `{ "type": "pane_info", "pane": { ... } }`; keeping
-/// this unwrap at the transport boundary prevents callers from accidentally
-/// treating the envelope as pane metadata.
+/// Since the minimum supported release, Herdr returns
+/// `{ "type": "pane_info", "pane": { ... } }`; keeping this unwrap at the transport boundary
+/// prevents callers from accidentally treating the envelope as pane metadata.
 pub(crate) fn pane_info(
     result: &serde_json::Value,
 ) -> Option<&serde_json::Map<String, serde_json::Value>> {

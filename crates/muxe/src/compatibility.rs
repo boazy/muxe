@@ -5,6 +5,7 @@
 //! `wasm_sha256` remains the trusted local package identity; the pinned host
 //! API cannot attest the bytes it loaded.
 
+use muxe_adapter_herdr::HerdrRelease;
 use muxe_protocol::control::{CompatibilityRecord, HerdrCompatibility, ZellijCompatibility};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -15,10 +16,11 @@ use crate::integration::receipt::Sha256Digest;
 pub const ZELLIJ_MINIMUM: &str = "0.46.0";
 /// Latest-verified Zellij version for V1.
 pub const ZELLIJ_LATEST_VERIFIED: &str = "0.46.0";
-/// Minimum-supported Herdr version for V1.
-pub const HERDR_MINIMUM: &str = "0.8.2";
-/// Latest-verified Herdr version for V1.
-pub const HERDR_LATEST_VERIFIED: &str = "0.8.2";
+/// Minimum-supported Herdr release for V1: the adapter's live-server gate.
+pub const HERDR_MINIMUM: HerdrRelease = HerdrRelease::MINIMUM_SUPPORTED;
+/// Latest Herdr release verified against this build. It is reported only;
+/// Muxe accepts newer Herdr releases under every `version.check` policy.
+pub const HERDR_LATEST_VERIFIED: HerdrRelease = HerdrRelease::new(0, 9, 3);
 
 #[derive(Debug, Error)]
 pub enum CompatibilityError {
@@ -212,7 +214,7 @@ pub fn render_human(record: &NativeCompatibilityRecord) -> String {
     match &handoff.herdr {
         Some(herdr) => {
             lines.push(format!(
-                "Herdr protocol {} schema {} (fingerprint {})",
+                "Herdr bundled schema: protocol {} schema {} (fingerprint {})",
                 herdr.protocol_version,
                 herdr.schema_version,
                 hex_lower(&herdr.schema_fingerprint.0)
@@ -272,8 +274,8 @@ pub fn render_json(record: &NativeCompatibilityRecord) -> Value {
     });
     let herdr = handoff.herdr.as_ref().map(|herdr| {
         json!({
-            "minimum": HERDR_MINIMUM,
-            "latest_verified": HERDR_LATEST_VERIFIED,
+            "minimum": HERDR_MINIMUM.to_string(),
+            "latest_verified": HERDR_LATEST_VERIFIED.to_string(),
             "protocol": herdr.protocol_version,
             "schema_version": herdr.schema_version,
             "schema_fingerprint": hex_lower(&herdr.schema_fingerprint.0),

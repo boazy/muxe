@@ -4,7 +4,7 @@
 
 Muxe is a modal menu system for terminal multiplexers, inspired by `which-key`. When you press a configured hotkey in your multiplexer, Muxe opens a temporary menu bar that displays available keys, nested submenus, and actions.
 
-Muxe supports **Zellij** (version 0.46.0) and **Herdr** (version 0.8.2) as both the minimum-supported and latest-verified versions.
+Muxe supports **Zellij** 0.46.0 and **Herdr** 0.8.2 or newer. The latest verified Herdr release is 0.9.3. See [Compatibility](#compatibility) for the version policy.
 
 CI and lifecycle smoke tests require Zellij built from the exact source revision in [`pins/zellij.toml`](pins/zellij.toml): [`81f56e1aed4e17b822af5cb382a8f524e35f3eae`](https://github.com/zellij-org/zellij/commit/81f56e1aed4e17b822af5cb382a8f524e35f3eae). This revision fixes duplicate client cleanup and immediate client-ID reuse. Zellij still reports version `0.46.0`, so that version string alone does not establish that a binary contains the fix.
 
@@ -443,14 +443,45 @@ muxe compatibility
 muxe compatibility --json
 ```
 
-Muxe supports Zellij 0.46.0 and Herdr 0.8.2 as both the minimum-supported and latest-verified versions.
+This command reads metadata built into the binary. It does not probe running hosts or verify installed files.
 
-This command renders the embedded compatibility record; it does not probe running multiplexer hosts or verify installed disk files. The compatibility report records two bridge identifiers:
+| Multiplexer | Minimum supported | Latest verified |
+| ----------- | ----------------- | --------------- |
+| Zellij      | 0.46.0            | 0.46.0          |
+| Herdr       | 0.8.2             | 0.9.3           |
+
+### Herdr version policy
+
+Each time Muxe connects to a running Herdr server, it checks the release that the server reports and refuses a server older than 0.8.2. A preview build counts as its base release, so `0.9.3-preview.42` counts as 0.9.3. Muxe sets no upper bound on the Herdr release or on Herdr's binary protocol number. The `settings.host.version.check` setting does not change this policy. The latest verified Herdr release is informational.
+
+Muxe reads the installed request schema from the Herdr executable with `herdr api schema --json`. It validates each configured native action and each request against the installed request schema. Muxe ignores response and event fields that it does not use, but it still requires the fields that it reads.
+
+### Zellij version check during activation
+
+During `muxe activate`, the `settings.host.version.check` setting controls how Muxe treats a Zellij executable that is newer than the latest verified Zellij version. Menu connections do not apply this check.
+
+- `min` (default): Accept the host and log a warning.
+- `strict`: Reject the host.
+- `off`: Accept the host without a warning.
+
+No setting accepts a Zellij version older than the minimum supported version.
+
+```yaml
+settings:
+  host:
+    version: { check: strict }
+```
+
+### Report contents
+
+The report includes two bridge identifiers:
 
 - `hosts.zellij.bridge_build_id`: The deterministic build identifier shared by the native binary and the bridge registration handshake.
 - `packaged_wasm.sha256`: The expected SHA-256 digest used by installation and activation to verify bridge files.
 
-The JSON report forms the release compatibility contract. It records the pinned host version and source revision, generated action and protocol fingerprints, the bridge build ID, and the packaged-WASM SHA-256.
+The JSON report forms the release compatibility contract. It records the pinned Zellij version and source revision, generated action and protocol fingerprints, the bridge build ID, and the packaged-WASM SHA-256. It also records the Herdr minimum and latest verified releases.
+
+The Herdr `protocol`, `schema_version`, and schema fingerprint fields identify the Herdr API schema that this Muxe build was generated from. Activation and menu coldstart compare the whole record to identify which Muxe build a broker serves. These fields do not limit which Herdr server Muxe accepts.
 
 Origins now carry session and active-tab metadata: an upgraded native binary rejects a previously installed bridge fail-closed at the registration handshake, so refresh installed bridges with `muxe activate` after upgrading.
 

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use muxe_adapter_herdr::{HerdrAdapterConfig, generated::BUNDLED_PROTOCOL};
+use muxe_adapter_herdr::HerdrAdapterConfig;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -78,13 +78,14 @@ impl ProductionConnectFixture {
         vec![Self::ping_exchange(), Self::subscription_exchange()]
     }
 
+    /// The recorded pong of a Herdr 0.8.2 server, which speaks binary protocol 20.
     pub fn ping_exchange() -> RecordedExchange {
         RecordedExchange {
             method: "ping",
             params: json!({}),
             response: RecordedResponse::Result(json!({
                 "type": "pong",
-                "protocol": BUNDLED_PROTOCOL,
+                "protocol": 20,
                 "version": "0.8.2",
             })),
         }
@@ -99,7 +100,7 @@ impl ProductionConnectFixture {
                     { "type": "pane.closed" },
                 ],
             }),
-            response: RecordedResponse::KeepOpen(json!({ "subscribed": true })),
+            response: RecordedResponse::KeepOpen(json!({ "type": "subscription_started" })),
         }
     }
 

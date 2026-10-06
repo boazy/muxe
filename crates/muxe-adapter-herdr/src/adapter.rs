@@ -154,8 +154,8 @@ impl HerdrConfigValidator {
     ///
     /// # Errors
     ///
-    /// Returns [`AdapterError`] when the schema command, cache, protocol check,
-    /// or schema parser fails.
+    /// Returns [`AdapterError`] when the schema command, cache, or schema
+    /// parser fails.
     pub async fn load(binary: &Path, cache_dir: &Path) -> Result<Self, AdapterError> {
         let (schema, _) = crate::runtime::load_installed_schema(binary, cache_dir).await?;
         Ok(Self { schema })
@@ -2170,7 +2170,7 @@ impl HostAdapter for HerdrAdapter {
 
     async fn begin_capture(&self, _request: CaptureRequest) -> Result<CaptureLease, AdapterError> {
         Err(incompatible(
-            "Herdr protocol 20 has no host input-capture or restoration method; refusing to fabricate a capture lease",
+            "the Herdr socket API has no host input-capture or restoration method; refusing to fabricate a capture lease",
         ))
     }
 
@@ -2180,7 +2180,7 @@ impl HostAdapter for HerdrAdapter {
         _reason: CaptureReleaseReason,
     ) -> Result<(), AdapterError> {
         Err(incompatible(
-            "Herdr protocol 20 has no host input-capture restoration method",
+            "the Herdr socket API has no host input-capture restoration method",
         ))
     }
 
@@ -2422,7 +2422,7 @@ impl HostAdapter for HerdrAdapter {
     async fn cancel(&self, _execution: muxe_core::ExecutionId) -> Result<(), AdapterError> {
         Err(AdapterError::new(
             AdapterErrorKind::CancelUnsupported,
-            "Herdr protocol 20 has no cancellation request for unary operations",
+            "the Herdr socket API has no cancellation request for unary operations",
         ))
     }
 
@@ -3137,7 +3137,7 @@ fn portable_invocation(
             // never reach the single-request builder: dispatch routes them to their own paths.
             // The description already reported every unsupported form as `Err`, so reaching
             // here with `None` means dispatch misrouted a multi-request action.
-            incompatible("portable action form is unavailable in Herdr protocol 20")
+            incompatible("portable action form is unavailable in the Herdr socket API")
         })?;
     let invocation = build_portable_invocation(&description, action, origin)?;
     debug_assert_eq!(invocation.method, description.method);
@@ -3251,7 +3251,7 @@ fn build_portable_invocation(
         }),
         _ => Err(AdapterError::new(
             AdapterErrorKind::Incompatible,
-            "portable action form is unavailable in Herdr protocol 20",
+            "portable action form is unavailable in the Herdr socket API",
         )),
     }
 }
@@ -3576,16 +3576,16 @@ fn portable_request_description(
                 PortableRequestField { name: "mode", origin: Origin::Default(Scalar::String) },
             ],
         },
-        PortableRequestKind::TabFocus => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that protocol 20 does not expose as a typed action".to_owned()),
+        PortableRequestKind::TabFocus => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that the Herdr socket API does not expose as a typed action".to_owned()),
         PortableRequestKind::TabMove { index: false } => return Err("Herdr tab.move supports only a concrete insert index".to_owned()),
         PortableRequestKind::TabSwap { index: false } => return Err("Herdr tab:swap supports only an index; the schema offers tab.list plus tab.move, not directional tab targeting".to_owned()),
         PortableRequestKind::PaneFocus { cardinal: false } => return Err("Herdr pane.focus supports only cardinal directions".to_owned()),
         PortableRequestKind::PaneMove => return Err("Herdr pane.move requires an explicit tab/new-tab destination, not a portable index or direction".to_owned()),
         PortableRequestKind::PaneSwap { cardinal: false } => return Err("Herdr pane.swap supports only cardinal directions".to_owned()),
-        PortableRequestKind::PaneFullscreen => return Err("Herdr protocol 20 exposes no pane fullscreen method".to_owned()),
-        PortableRequestKind::PaneFloating => return Err("Herdr protocol 20 exposes no pane floating method".to_owned()),
-        PortableRequestKind::PaneFrame => return Err("Herdr protocol 20 exposes no pane frame method".to_owned()),
-        PortableRequestKind::Session => return Err("Herdr protocol 20 exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
+        PortableRequestKind::PaneFullscreen => return Err("the Herdr socket API exposes no pane fullscreen method".to_owned()),
+        PortableRequestKind::PaneFloating => return Err("the Herdr socket API exposes no pane floating method".to_owned()),
+        PortableRequestKind::PaneFrame => return Err("the Herdr socket API exposes no pane frame method".to_owned()),
+        PortableRequestKind::Session => return Err("the Herdr socket API exposes only read-only session.snapshot; it has no portable session lifecycle methods".to_owned()),
     };
     Ok(Some(description))
 }

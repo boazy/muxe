@@ -1,3 +1,9 @@
+## Unreleased
+
+### 🐛 Bug Fixes
+
+- *(herdr)* Accept any Herdr server at release 0.8.2 or newer instead of requiring binary protocol 20. Herdr has no upper version bound, and `settings.host.version.check` now applies only to Zellij. Herdr 0.9.3 is the latest verified release.
+
 ## [0.2.0] - 2026-10-06
 
 ### 🐛 Bug Fixes

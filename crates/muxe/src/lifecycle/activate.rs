@@ -826,7 +826,13 @@ impl LivePreflight<'_> {
             let config = config?;
             muxe_adapter_herdr::HerdrRuntime::connect(config)
                 .await
-                .map_err(|error| format!("Herdr host {discovery_key} is unreachable: {error}"))
+                .map_err(|error| {
+                    if error.kind == muxe_adapter_api::AdapterErrorKind::Incompatible {
+                        format!("Herdr host {discovery_key} is incompatible: {error}")
+                    } else {
+                        format!("Herdr host {discovery_key} is unreachable: {error}")
+                    }
+                })
         }
     }
 
@@ -1028,18 +1034,11 @@ struct ZellijActivation<'a> {
 
 impl HostPreflight for HerdrActivation<'_> {
     async fn validate_live_host(&self, live: &LivePreflight<'_>) -> Result<(), String> {
-        let discovery_key = self.0.discovery_key().as_str();
-        let policy = live.version_policy()?;
-        let runtime = live.herdr_runtime(discovery_key).await?;
-        let version = runtime.server_version().as_str();
-        live.check_version(
-            "herdr",
-            discovery_key,
-            version,
-            crate::compatibility::HERDR_MINIMUM,
-            crate::compatibility::HERDR_LATEST_VERIFIED,
-            policy,
-        )
+        // The runtime refuses a server below the adapter's minimum release.
+        // Herdr has no upper bound, so `settings.host.version.check` does not apply.
+        live.herdr_runtime(self.0.discovery_key().as_str())
+            .await
+            .map(drop)
     }
 }
 
@@ -10870,5 +10869,85 @@ mod tests {
                 .is_empty(),
             "repeated recovery after terminal cleanup is a no-op"
         );
+    }
+
+    /// Serves one fixed `ping` result on every connection to `socket`.
+    fn serve_herdr_pong(socket: &Path, version: &str, protocol: u64) -> JoinHandle<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = UnixListener::bind(socket).unwrap();
+        let version = version.to_owned();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut reader = BufReader::new(stream);
+                let mut line = Vec::new();
+                if reader.read_until(b'\n', &mut line).await.is_err() {
+                    continue;
+                }
+                let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                let response = serde_json::json!({
+                    "id": request["id"],
+                    "result": { "type": "pong", "protocol": protocol, "version": version },
+                });
+                let _ = reader
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn herdr_preflight_enforces_only_the_minimum_release_under_every_version_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/herdr/herdr-api.schema.json");
+        let herdr = temp.path().join("herdr");
+        crate::generated_executable::write_executable_script(&herdr, |writer| {
+            std::io::Write::write_all(
+                writer,
+                format!("#!/bin/sh\nexec cat '{}'\n", schema.display()).as_bytes(),
+            )
+        })
+        .unwrap();
+        let cases = [
+            ("0.9.4", 22, "strict", true),
+            ("1.0.0", 99, "strict", true),
+            ("0.9.4", 22, "min", true),
+            ("0.8.2", 20, "strict", true),
+            ("0.8.1", 20, "off", false),
+            ("0.8.1", 22, "strict", false),
+        ];
+        for (case, (version, protocol, policy, accepted)) in cases.into_iter().enumerate() {
+            let socket = temp.path().join(format!("h{case}.sock"));
+            let server = serve_herdr_pong(&socket, version, protocol);
+            let config_path = temp.path().join(format!("config{case}.yml"));
+            std::fs::write(
+                &config_path,
+                format!(
+                    "version: 1\nsettings:\n  host:\n    version: {{ check: {policy} }}\nmenus:\n  main:\n    bindings:\n      q: {{ label: quit, action: menu:quit }}\n"
+                ),
+            )
+            .unwrap();
+            let entry = RegisteredBroker::herdr(census_member(
+                socket.clone(),
+                "herdr",
+                &socket.display().to_string(),
+            ))
+            .unwrap();
+            let live = LivePreflight {
+                config_path,
+                cache_dir: temp.path().join(format!("cache{case}")),
+                herdr_binary: Some(herdr.clone()),
+                zellij_exe: None,
+                logger: None,
+            };
+            let outcome = HerdrActivation(&entry).validate_live_host(&live).await;
+            server.abort();
+            assert_eq!(
+                outcome.is_ok(),
+                accepted,
+                "Herdr {version} (protocol {protocol}) under {policy}: {outcome:?}"
+            );
+        }
     }
 }

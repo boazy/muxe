@@ -51,6 +51,9 @@ impl ResponseBarrier {
 #[derive(Clone, Debug)]
 pub enum RecordedResponse {
     Result(Value),
+    /// Replies with this complete response object after inserting the captured request ID, so
+    /// a test can add envelope fields beside `result` or `error`.
+    Envelope(Value),
     Error {
         code: String,
         message: String,
@@ -200,6 +203,23 @@ async fn respond_to_recorded_exchange(
     match response_kind {
         RecordedResponse::Result(result) | RecordedResponse::KeepOpen(result) => {
             let response = json!({ "id": id, "result": result });
+            reader
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await?;
+            reader.get_mut().flush().await?;
+            Ok(false)
+        }
+        RecordedResponse::Envelope(mut response) => {
+            response
+                .as_object_mut()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "recorded Herdr envelope must be a JSON object",
+                    )
+                })?
+                .insert("id".to_owned(), json!(id));
             reader
                 .get_mut()
                 .write_all(format!("{response}\n").as_bytes())

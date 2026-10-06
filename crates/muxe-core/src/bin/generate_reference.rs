@@ -347,6 +347,15 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
         "Native actions call operations specific to Zellij or Herdr. Their `type` begins with `native.`. When Muxe loads the configuration, it checks the action name and parameters for the terminal multiplexer where you opened the menu. Example: `native.zellij.command:close-focus`."
     )
     .unwrap();
+    writeln!(
+        output,
+        "\n### Herdr native actions\n\n\
+         Muxe takes the list of Herdr native action names from the Herdr API schema that this Muxe build was generated from. That schema comes from Herdr 0.8.2. Muxe validates the parameters of each action against the request schema of the installed Herdr executable. As a result:\n\n\
+         - A method that Herdr added after 0.8.2 has no native action name.\n\
+         - A method that the installed Herdr no longer provides fails validation. For example, Herdr 0.9.3 does not provide the `pane.graphics.*` methods, so `native.herdr.pane.graphics:set` is rejected.\n\
+         - A parameter that the installed Herdr accepts is valid even if Herdr 0.8.2 did not have it. For example, Herdr 0.9.3 closes a primary workspace that has linked worktrees only when `native.herdr.workspace:close` sets `close-group: true`. Otherwise Herdr rejects the request with `workspace_group_close_required`."
+    )
+    .unwrap();
 
     output
 }

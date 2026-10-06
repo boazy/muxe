@@ -1,6 +1,5 @@
 use std::{
     any::Any,
-    fmt,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -25,8 +24,9 @@ use tokio::{
 use crate::{
     ApiSchema, DeliveryState, EventSubscription, HerdrCache, HerdrResponse, SocketError,
     SubscriptionConfig,
-    generated::{BUNDLED_PROTOCOL, MethodMetadata, method_metadata},
+    generated::{MethodMetadata, method_metadata},
     transport::{EndpointContinuityToken, HerdrSocketClient},
+    version::{HerdrRelease, HerdrServerVersion},
 };
 
 /// Wall-clock bound for one `herdr api schema --json` invocation. Exceeding it fails
@@ -433,29 +433,6 @@ pub struct HerdrAdapterConfig {
     pub cache_dir: PathBuf,
 }
 
-/// The server version parsed directly from the establishing pong for one
-/// runtime epoch. Consumers never recover it by parsing the opaque live-server
-/// identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HerdrServerVersion(String);
-
-impl HerdrServerVersion {
-    fn parse(value: &str) -> Option<Self> {
-        (!value.is_empty()).then(|| Self(value.to_owned()))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for HerdrServerVersion {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IncarnationEpoch(u64);
 
@@ -503,15 +480,17 @@ pub struct HerdrRuntime {
     send_queue: Arc<SendQueue>,
 }
 impl HerdrRuntime {
-    /// Acquires one runtime schema from the configured executable, verifies protocol compatibility,
-    /// records its normalized cache key, and probes the exact server currently accepting at
-    /// `socket_path`. The resulting OS observation is not continuity authority.
+    /// Acquires one runtime request schema from the configured executable, records its normalized
+    /// cache key, and probes the exact server currently accepting at `socket_path`. The server must
+    /// report a release at or above [`HerdrRelease::MINIMUM_SUPPORTED`]; Herdr's numbered binary
+    /// protocol is not a compatibility bound. The resulting OS observation is not continuity
+    /// authority.
     ///
     /// # Errors
     ///
-    /// Returns `AdapterError` when the schema binary cannot be executed, the live
-    /// schema is incompatible, the cache cannot be updated, or the server cannot
-    /// be probed.
+    /// Returns `AdapterError` when the schema binary cannot be executed, the installed schema is
+    /// malformed, the cache cannot be updated, the server cannot be probed, or the server reports
+    /// a release below the supported minimum.
     pub async fn connect(config: HerdrAdapterConfig) -> Result<Self, AdapterError> {
         let (schema, schema_cache_hit) =
             load_installed_schema(&config.herdr_binary, &config.cache_dir).await?;
@@ -874,7 +853,8 @@ impl HerdrRequestAuthority for HerdrRuntime {
 }
 
 /// Loads and normalizes the exact installed Herdr request schema without
-/// opening the configured host socket.
+/// opening the configured host socket. The schema's binary-protocol number is
+/// cache-key metadata only, never a compatibility bound.
 pub(crate) async fn load_installed_schema(
     binary: &Path,
     cache_dir: &Path,
@@ -882,11 +862,6 @@ pub(crate) async fn load_installed_schema(
     let raw_schema = runtime_schema(binary).await?;
     let (protocol, schema_version) = ApiSchema::metadata(&raw_schema)
         .map_err(|error| incompatible(format!("installed Herdr API schema is invalid: {error}")))?;
-    if protocol != BUNDLED_PROTOCOL {
-        return Err(incompatible(format!(
-            "Herdr protocol {protocol} is incompatible with required protocol {BUNDLED_PROTOCOL}"
-        )));
-    }
     let (normalized_request, schema_cache_hit) = HerdrCache::new(cache_dir)
         .normalized_schema(protocol, schema_version, &raw_schema)
         .map_err(|error| {
@@ -1086,23 +1061,27 @@ fn identity_from_ping_result(
     if object.get("type").and_then(Value::as_str) != Some("pong") {
         return Err(incompatible("Herdr ping result has unexpected type"));
     }
+    // The binary-protocol number feeds only the opaque live identity below.
     let protocol = object
         .get("protocol")
         .and_then(Value::as_u64)
         .ok_or_else(|| incompatible("Herdr ping result lacks integer protocol"))?;
-    if protocol != BUNDLED_PROTOCOL {
+    let reported = object
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| incompatible("Herdr ping result lacks string version"))?;
+    let version = HerdrServerVersion::parse(reported).ok_or_else(|| {
+        incompatible(format!(
+            "Herdr server reports unrecognized version {reported:?}"
+        ))
+    })?;
+    if version.release() < HerdrRelease::MINIMUM_SUPPORTED {
         return Err(incompatible(format!(
-            "live Herdr protocol {protocol} is incompatible with required protocol {BUNDLED_PROTOCOL}"
+            "Herdr server {version} is older than the minimum supported Herdr {}",
+            HerdrRelease::MINIMUM_SUPPORTED
         )));
     }
-    let version = HerdrServerVersion::parse(
-        object
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-    )
-    .ok_or_else(|| incompatible("Herdr ping result lacks nonempty version"))?;
-    // Protocol 20 exposes no server nonce. The configured socket identifies
+    // Herdr's pong carries no server nonce. The configured socket identifies
     // discovery, while the observed-connect token contributes an opaque live
     // identity. Equality remains inconclusive; only inequality proves change.
     let identity = HostIdentity {
@@ -1169,21 +1148,18 @@ mod tests {
     }
 
     async fn answer_ping(listener: Arc<UnixListener>) {
+        answer_ping_with(listener, pong()).await;
+    }
+
+    async fn answer_ping_with(listener: Arc<UnixListener>, result: Value) {
         let (stream, _) = listener.accept().await.unwrap();
         let mut reader = BufReader::new(stream);
         let mut request = Vec::new();
         reader.read_until(b'\n', &mut request).await.unwrap();
-        let id = serde_json::from_slice::<Value>(&request).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let id = serde_json::from_slice::<Value>(&request).unwrap()["id"].clone();
+        let response = serde_json::json!({ "id": id, "result": result });
         reader
-            .write_all(
-                format!(
-                    "{{\"id\":\"{id}\",\"result\":{{\"type\":\"pong\",\"protocol\":{BUNDLED_PROTOCOL},\"version\":\"0.8.2\"}}}}\n"
-                )
-                .as_bytes(),
-            )
+            .write_all(format!("{response}\n").as_bytes())
             .await
             .unwrap();
     }
@@ -1205,8 +1181,9 @@ mod tests {
         endpoint
     }
 
+    /// The recorded pong of a Herdr 0.8.2 server, which speaks binary protocol 20.
     fn pong() -> Value {
-        serde_json::json!({ "type": "pong", "protocol": BUNDLED_PROTOCOL, "version": "0.8.2" })
+        serde_json::json!({ "type": "pong", "protocol": 20, "version": "0.8.2" })
     }
 
     #[tokio::test]
@@ -1215,14 +1192,68 @@ mod tests {
         let endpoint = capture_at(&temp.path().join("herdr.sock")).await;
         let (identity, version) =
             identity_from_ping_result("/owned/socket".to_owned(), &endpoint, &pong())
-                .expect("protocol 20 pong has type, version, and protocol");
+                .expect("a pong has type, version, and protocol");
 
         assert_eq!(identity.discovery_key.as_str(), "/owned/socket");
         assert_eq!(version.as_str(), "0.8.2");
         assert_eq!(
             identity.live_server_id.as_str(),
-            endpoint.live_server_id(BUNDLED_PROTOCOL, version.as_str())
+            endpoint.live_server_id(20, version.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn pong_gate_accepts_supported_releases_at_any_protocol_and_ignores_unknown_fields() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let endpoint = capture_at(&temp.path().join("herdr.sock")).await;
+        for (protocol, reported, release) in [
+            (20, "0.8.2", HerdrRelease::new(0, 8, 2)),
+            (22, "0.9.3", HerdrRelease::new(0, 9, 3)),
+            (20, "0.8.2-preview.42", HerdrRelease::new(0, 8, 2)),
+            (22, "0.9.3-preview.42", HerdrRelease::new(0, 9, 3)),
+            (23, "0.10.0", HerdrRelease::new(0, 10, 0)),
+            (999, "1.0.0", HerdrRelease::new(1, 0, 0)),
+        ] {
+            let result = serde_json::json!({
+                "type": "pong",
+                "protocol": protocol,
+                "version": reported,
+                "capabilities": { "future_capability": { "enabled": true } },
+                "future_field": [1, 2],
+            });
+            let (identity, version) =
+                identity_from_ping_result("/owned/socket".to_owned(), &endpoint, &result)
+                    .unwrap_or_else(|error| panic!("{reported} at protocol {protocol}: {error}"));
+            assert_eq!(version.as_str(), reported);
+            assert_eq!(version.release(), release);
+            assert_eq!(
+                identity.live_server_id.as_str(),
+                endpoint.live_server_id(protocol, reported),
+                "the protocol still distinguishes live identities"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pong_gate_rejects_releases_below_the_minimum_and_unrecognized_versions() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let endpoint = capture_at(&temp.path().join("herdr.sock")).await;
+        for reported in [
+            serde_json::json!("0.8.1"),
+            serde_json::json!("0.8.1-preview.9"),
+            serde_json::json!("0.7.5"),
+            serde_json::json!(""),
+            serde_json::json!("0.9"),
+            serde_json::json!("0.9.3.1"),
+            serde_json::json!("0.9.3-"),
+            serde_json::json!("server-a"),
+            serde_json::json!(93),
+        ] {
+            let result = serde_json::json!({ "type": "pong", "protocol": 22, "version": reported });
+            let error = identity_from_ping_result("/owned/socket".to_owned(), &endpoint, &result)
+                .expect_err("unsupported versions never establish an identity");
+            assert_eq!(error.kind, AdapterErrorKind::Incompatible, "{reported}");
+        }
     }
 
     #[tokio::test]
@@ -1241,7 +1272,10 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("herdr.sock");
         let listener_a = Arc::new(UnixListener::bind(&path).unwrap());
-        let server_a = tokio::spawn(answer_ping(Arc::clone(&listener_a)));
+        let server_a = tokio::spawn(answer_ping_with(
+            Arc::clone(&listener_a),
+            serde_json::json!({ "type": "pong", "protocol": 22, "version": "0.9.3" }),
+        ));
         let client = Arc::new(HerdrSocketClient::new(path.clone()));
         let (identity, expected, server_version) =
             establish_live_identity(client.as_ref()).await.unwrap();
