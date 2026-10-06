@@ -1317,19 +1317,9 @@ impl HerdrAdapter {
     }
 
     async fn observe_subscription_event(&self, mut event: Value) {
-        if event.get("type").and_then(Value::as_str) != Some("pane_closed") {
-            return;
-        }
-        let Some(pane) = event
-            .as_object_mut()
-            .and_then(|event| event.remove("pane_id"))
-        else {
+        let Some(pane) = take_closed_pane(&mut event) else {
             return;
         };
-        let Value::String(pane) = pane else {
-            return;
-        };
-        let pane = muxe_core::PaneId::new(pane);
         let queued = self.post_dismissal.lock().await.remove(&pane);
         if let Some(queued) = queued {
             self.start_post_dismissals(queued);
@@ -1388,6 +1378,26 @@ impl HerdrAdapter {
                     && record.temporary_tab == registration.temporary_tab
             })
             .ok_or_else(pending_cleanup_lease_stale)
+    }
+}
+
+/// Takes the pane ID out of one `pane_closed` subscription event.
+///
+/// Herdr wraps each event as `{ "event": <kind>, "data": { "type": <kind>, ... } }`. The kind must
+/// be `pane_closed` in both places and `data.pane_id` must be a string; unknown envelope and data
+/// fields are ignored.
+fn take_closed_pane(event: &mut Value) -> Option<muxe_core::PaneId> {
+    let event = event.as_object_mut()?;
+    if event.get("event").and_then(Value::as_str) != Some("pane_closed") {
+        return None;
+    }
+    let data = event.get_mut("data")?.as_object_mut()?;
+    if data.get("type").and_then(Value::as_str) != Some("pane_closed") {
+        return None;
+    }
+    match data.remove("pane_id")? {
+        Value::String(pane) => Some(muxe_core::PaneId::new(pane)),
+        _ => None,
     }
 }
 

@@ -3,6 +3,7 @@
 ### 🐛 Bug Fixes
 
 - *(herdr)* Accept any Herdr server at release 0.8.2 or newer instead of requiring binary protocol 20. Herdr has no upper version bound, and `settings.host.version.check` now applies only to Zellij. Herdr 0.9.3 is the latest verified release.
+- *(herdr)* Read `pane_closed` subscription events from Herdr's `{event, data}` envelope. An action deferred until the Muxe pane closes now runs on Herdr 0.8.2 and 0.9.3 servers.
 
 ## [0.2.0] - 2026-10-06
 

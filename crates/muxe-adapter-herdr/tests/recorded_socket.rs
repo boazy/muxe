@@ -95,6 +95,14 @@ fn lifecycle_snapshot() -> serde_json::Value {
     })
 }
 
+/// One `pane_closed` subscription event in Herdr's `{ event, data }` wire envelope.
+fn pane_closed_event(pane: &str) -> serde_json::Value {
+    json!({
+        "event": "pane_closed",
+        "data": { "type": "pane_closed", "pane_id": pane, "workspace_id": "workspace-1" },
+    })
+}
+
 fn lifecycle_capture_request() -> OriginCaptureRequest {
     OriginCaptureRequest {
         ui_session: UiSessionId::new("ui-lifecycle"),
@@ -717,7 +725,7 @@ async fn defers_focused_tab_creation_until_the_retained_ui_close_event() {
     );
 
     fixture
-        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .send_retained_event(pane_closed_event("pane-2"))
         .expect("retained subscription accepts the UI close event");
     wait_for_lifecycle_requests(&fixture, 5, "tab.create after pane_closed").await;
     let requests = fixture.requests().await;
@@ -885,12 +893,45 @@ async fn newer_protocol_server_with_unknown_fields_completes_the_production_life
         .await
         .expect("focused creation is armed while the UI pane is still live");
     wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
+    for non_trigger in [
+        json!({
+            "event": "pane_closed",
+            "data": { "type": "pane_focused", "pane_id": "pane-2", "workspace_id": "workspace-1" },
+        }),
+        json!({
+            "event": "pane_focused",
+            "data": { "type": "pane_closed", "pane_id": "pane-2", "workspace_id": "workspace-1" },
+        }),
+        json!({ "event": "pane_closed", "data": { "type": "pane_closed", "pane_id": 2 } }),
+        json!({ "event": "pane_closed", "data": "pane-2" }),
+    ] {
+        fixture
+            .send_retained_event(non_trigger)
+            .expect("retained subscription accepts a non-trigger event");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), fixture.wait_for_requests(5))
+            .await
+            .is_err(),
+        "mismatched or malformed pane-close events must not release the dispatch"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), adapter.next_health_event())
+            .await
+            .is_err(),
+        "non-trigger events neither complete the dispatch nor disturb adapter health"
+    );
 
     fixture
         .send_retained_event(json!({
-            "type": "pane_closed",
-            "pane_id": "pane-2",
-            "future_event_field": { "nested": "e" },
+            "event": "pane_closed",
+            "data": {
+                "type": "pane_closed",
+                "pane_id": "pane-2",
+                "workspace_id": "workspace-1",
+                "future_data_field": { "nested": "d" },
+            },
+            "future_envelope_field": { "nested": "e" },
         }))
         .expect("retained subscription accepts the UI close event");
     wait_for_lifecycle_requests(&fixture, 5, "tab.create after pane_closed").await;
@@ -1068,7 +1109,7 @@ async fn pane_close_dispatch_only_releases_matching_post_dismissal_requests() {
     wait_for_lifecycle_requests(&fixture, 6, "both UI-live snapshots").await;
 
     fixture
-        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .send_retained_event(pane_closed_event("pane-2"))
         .expect("retained subscription accepts the matching first-pane close event");
     wait_for_lifecycle_requests(&fixture, 7, "first tab.create after pane_closed").await;
     let requests = fixture.requests().await;
@@ -1101,7 +1142,7 @@ async fn pane_close_dispatch_only_releases_matching_post_dismissal_requests() {
     assert_eq!(creations.len(), 1, "the unrelated pane remains pending");
 
     fixture
-        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-1" }))
+        .send_retained_event(pane_closed_event("pane-1"))
         .expect("retained subscription accepts the matching second-pane close event");
     wait_for_lifecycle_requests(&fixture, 9, "second tab.create after pane_closed").await;
     let requests = fixture.requests().await;
@@ -1213,7 +1254,7 @@ async fn deferred_preflight_failure_emits_one_retained_terminal() {
     wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
 
     fixture
-        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .send_retained_event(pane_closed_event("pane-2"))
         .expect("retained subscription accepts the UI close event");
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), adapter.next_health_event())
@@ -1298,7 +1339,7 @@ async fn reports_unknown_outcome_when_command_tab_layout_closes_after_flush() {
 
     wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
     fixture
-        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .send_retained_event(pane_closed_event("pane-2"))
         .expect("retained subscription accepts the UI close event");
     wait_for_lifecycle_requests(&fixture, 5, "layout.apply after pane_closed").await;
     assert_eq!(
@@ -1432,7 +1473,7 @@ async fn command_split_move_lost_response(direction: Direction, wire_direction: 
 
     wait_for_lifecycle_requests(&fixture, 4, "the UI-live snapshot").await;
     fixture
-        .send_retained_event(json!({ "type": "pane_closed", "pane_id": "pane-2" }))
+        .send_retained_event(pane_closed_event("pane-2"))
         .expect("retained subscription accepts the UI close event");
     wait_for_lifecycle_requests(&fixture, 8, "split cleanup after the lost move response").await;
     assert_eq!(

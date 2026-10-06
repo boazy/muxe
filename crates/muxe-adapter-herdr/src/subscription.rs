@@ -157,6 +157,9 @@ mod tests {
     use super::*;
     use crate::{generated::BUNDLED_PROTOCOL, runtime::IncarnationEpoch};
 
+    /// One subscription line in Herdr's `{ event, data }` wire envelope.
+    const TAB_FOCUSED_EVENT: &str = r#"{"event":"tab_focused","data":{"type":"tab_focused","tab_id":"t1","workspace_id":"w1"}}"#;
+
     fn config() -> SubscriptionConfig {
         SubscriptionConfig {
             params: json!({"subscriptions": [{"type": "tab.focused"}]}),
@@ -220,7 +223,7 @@ mod tests {
                 .await
                 .unwrap();
             reader
-                .write_all(b"{\"type\":\"tab.focused\",\"tab_id\":\"t1\"}\n")
+                .write_all(format!("{TAB_FOCUSED_EVENT}\n").as_bytes())
                 .await
                 .unwrap();
         });
@@ -236,7 +239,7 @@ mod tests {
         );
         assert_eq!(
             subscription.next_event().await.unwrap(),
-            SubscriptionEvent::Event(json!({"type": "tab.focused", "tab_id": "t1"}))
+            SubscriptionEvent::Event(serde_json::from_str(TAB_FOCUSED_EVENT).unwrap())
         );
         server.await.unwrap();
     }
@@ -308,7 +311,7 @@ mod tests {
                 .unwrap();
             release_rx.await.unwrap();
             reader
-                .write_all(b"{\"type\":\"tab.focused\",\"tab_id\":\"t1\"}\n")
+                .write_all(format!("{TAB_FOCUSED_EVENT}\n").as_bytes())
                 .await
                 .unwrap();
             reader.write_all(b"{not-json}\n").await.unwrap();
@@ -328,7 +331,7 @@ mod tests {
         let (event, malformed) = waiting.await.unwrap();
         assert_eq!(
             event.unwrap(),
-            SubscriptionEvent::Event(json!({"type": "tab.focused", "tab_id": "t1"}))
+            SubscriptionEvent::Event(serde_json::from_str(TAB_FOCUSED_EVENT).unwrap())
         );
         assert!(matches!(
             malformed,
