@@ -1,10 +1,9 @@
-## Unreleased
+## [0.2.1] - 2026-10-07
 
 ### 🐛 Bug Fixes
 
-- *(herdr)* Accept any Herdr server at release 0.8.2 or newer instead of requiring binary protocol 20. Herdr has no upper version bound, and `settings.host.version.check` now applies only to Zellij. Herdr 0.9.3 is the latest verified release.
-- *(herdr)* Read `pane_closed` subscription events from Herdr's `{event, data}` envelope. An action deferred until the Muxe pane closes now runs on Herdr 0.8.2 and 0.9.3 servers.
-
+- *(herdr)* Gate compatibility on the minimum server release
+- *(herdr)* Decode subscription events from the event/data envelope
 ## [0.2.0] - 2026-10-06
 
 ### 🐛 Bug Fixes
@@ -131,6 +130,10 @@
 
 - *(audit)* Add Jev host-polymorphism scanner
 - *(bench)* Measure divan benches with CodSpeed
+
+### 💼 Other
+
+- V0.2.0
 ## [0.1.4] - 2026-09-12
 
 ### 🚀 Features
