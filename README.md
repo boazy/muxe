@@ -443,6 +443,8 @@ muxe activate
 - One Herdr broker is one unit.
 - All live Zellij brokers with the same canonical stable bridge identity form one atomic group.
 
+Preflight loads each selected host's effective configuration, including its override file. It applies host filters before validating included portable and native actions with that host's validator. These checks finish before any unit is drained.
+
 `muxe activate` ignores rows with unknown host labels and rejects malformed records for selected hosts. Schema-v2 and legacy rows without registration tokens remain supported.
 
 Units commit independently after global preflight. The final output reports each unit as committed, unchanged, rolled back, or failed. Run `muxe activate` from your shell before using the menu hotkey.

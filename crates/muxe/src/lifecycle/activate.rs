@@ -763,9 +763,9 @@ pub trait Preflight {
 /// Production preflight: fail-fast configuration and host checks before any
 /// unit mutates.
 ///
-/// Full per-adapter validation still happens at target startup with rollback;
-/// these gates reject an unreadable or invalid configuration, an unreachable
-/// or incompatible Herdr host, and an out-of-policy host version early.
+/// Global admission checks YAML syntax. Each selected host then validates its
+/// effective configuration with its concrete validator before any unit mutates.
+/// Target startup still validates the actual key capabilities with rollback.
 pub struct LivePreflight<'a> {
     /// Absolute Muxe configuration file the target brokers will serve.
     pub config_path: PathBuf,
@@ -782,31 +782,24 @@ pub struct LivePreflight<'a> {
 }
 
 impl LivePreflight<'_> {
-    fn compile_config(&self) -> Result<muxe_core::CompiledConfig, String> {
-        let yaml = std::fs::read_to_string(&self.config_path)
-            .map_err(|error| format!("cannot read {}: {error}", self.config_path.display()))?;
-        // Permissive key capabilities: preflight must never reject a form the
-        // target accepts. Host-specific action validation happens at target
-        // startup with rollback.
+    fn compile_config(
+        &self,
+        validator: &dyn muxe_core::ActionValidator,
+        override_filename: &'static str,
+    ) -> Result<muxe_core::CompiledConfig, String> {
+        // Actual key capabilities are checked again at target startup.
         let capabilities = muxe_core::KeyCapabilities {
             event_types: true,
             alternate_keys: true,
             all_keys_as_escape_codes: true,
         };
-        muxe_core::compile_yaml(
-            muxe_core::CompiledGeneration(1),
-            muxe_core::SourceId::new(self.config_path.display().to_string()),
-            yaml,
+        muxe_broker::load_effective_config(
+            &self.config_path,
+            override_filename,
             capabilities,
-            None,
+            validator,
         )
-        .map_err(|diagnostics| {
-            diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.message.clone())
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
+        .map_err(|error| error.to_string())
     }
 
     fn herdr_runtime(
@@ -861,12 +854,6 @@ impl LivePreflight<'_> {
         }
     }
 
-    fn version_policy(&self) -> Result<muxe_core::HostVersionCheck, String> {
-        self.compile_config()
-            .map_err(|error| format!("cannot read version policy: {error}"))
-            .map(|config| config.host.version_check)
-    }
-
     fn check_version(
         &self,
         host: &str,
@@ -903,7 +890,14 @@ impl LivePreflight<'_> {
 }
 impl Preflight for LivePreflight<'_> {
     async fn validate_config(&self) -> Result<(), String> {
-        self.compile_config().map(|_| ())
+        let yaml = std::fs::read_to_string(&self.config_path)
+            .map_err(|error| format!("cannot read {}: {error}", self.config_path.display()))?;
+        muxe_core::ConfigDocument::parse(
+            muxe_core::SourceId::new(self.config_path.display().to_string()),
+            yaml,
+        )
+        .map(|_| ())
+        .map_err(|diagnostic| diagnostic.message)
     }
 
     async fn validate_host<H: HostPreflight>(&self, host: &H) -> Result<(), String> {
@@ -1034,6 +1028,13 @@ struct ZellijActivation<'a> {
 
 impl HostPreflight for HerdrActivation<'_> {
     async fn validate_live_host(&self, live: &LivePreflight<'_>) -> Result<(), String> {
+        let binary = live.herdr_binary.as_ref().ok_or_else(|| {
+            "no Herdr executable is installed; cannot validate Herdr configuration".to_owned()
+        })?;
+        let validator = muxe_adapter_herdr::HerdrConfigValidator::load(binary, &live.cache_dir)
+            .await
+            .map_err(|error| format!("cannot load Herdr configuration validator: {error}"))?;
+        live.compile_config(&validator, muxe_adapter_herdr::CONFIG_OVERRIDE_FILENAME)?;
         // The runtime refuses a server below the adapter's minimum release.
         // Herdr has no upper bound, so `settings.host.version.check` does not apply.
         live.herdr_runtime(self.0.discovery_key().as_str())
@@ -1044,8 +1045,14 @@ impl HostPreflight for HerdrActivation<'_> {
 
 impl HostPreflight for ZellijActivation<'_> {
     async fn validate_live_host(&self, live: &LivePreflight<'_>) -> Result<(), String> {
+        let policy = live
+            .compile_config(
+                &muxe_adapter_zellij::ZellijValidator,
+                muxe_adapter_zellij::CONFIG_OVERRIDE_FILENAME,
+            )?
+            .host
+            .version_check;
         for entry in self.entries {
-            let policy = live.version_policy()?;
             let program = live.zellij_exe.as_ref().ok_or_else(|| {
                 "no Zellij executable is installed; cannot probe Zellij hosts".to_owned()
             })?;
@@ -10924,7 +10931,7 @@ mod tests {
             std::fs::write(
                 &config_path,
                 format!(
-                    "version: 1\nsettings:\n  host:\n    version: {{ check: {policy} }}\nmenus:\n  main:\n    bindings:\n      q: {{ label: quit, action: menu:quit }}\n"
+                    "version: 1\nsettings:\n  host:\n    version: {{ check: {policy} }}\nmenus:\n  main:\n    bindings:\n      q: {{ label: quit, action: menu:quit }}\n      u: {{ label: up, skip-hosts: [herdr], action: 'pane:split direction=up' }}\n      h: {{ label: agents, only-hosts: [herdr], action: 'native.herdr.agent:list' }}\n  foreign:\n    only-hosts: [zellij]\n    bindings:\n      p: {{ label: unsupported, action: 'pane:create' }}\n"
                 ),
             )
             .unwrap();
@@ -10941,7 +10948,11 @@ mod tests {
                 zellij_exe: None,
                 logger: None,
             };
-            let outcome = HerdrActivation(&entry).validate_live_host(&live).await;
+            let outcome = async {
+                live.validate_config().await?;
+                HerdrActivation(&entry).validate_live_host(&live).await
+            }
+            .await;
             server.abort();
             assert_eq!(
                 outcome.is_ok(),
@@ -10949,5 +10960,47 @@ mod tests {
                 "Herdr {version} (protocol {protocol}) under {policy}: {outcome:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn preflight_loads_selected_host_override_and_filters_native_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.yml");
+        std::fs::write(
+            &config_path,
+            "version: 1\nsettings:\n  host:\n    version: { check: strict }\nmenus:\n  main:\n    bindings:\n      h: { label: agents, only-hosts: [herdr], action: 'native.herdr.agent:list' }\n      r: { label: reload, action: 'config:reload' }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join(muxe_adapter_zellij::CONFIG_OVERRIDE_FILENAME),
+            "settings:\n  host:\n    version: { check: off }\nmenus:\n  main:\n    bindings:\n      u: { label: excluded, skip-hosts: [zellij], action: 'unknown-action' }\n",
+        )
+        .unwrap();
+        let live = LivePreflight {
+            config_path,
+            cache_dir: temp.path().join("cache"),
+            herdr_binary: None,
+            zellij_exe: None,
+            logger: None,
+        };
+        live.validate_config().await.unwrap();
+        let config = live
+            .compile_config(
+                &muxe_adapter_zellij::ZellijValidator,
+                muxe_adapter_zellij::CONFIG_OVERRIDE_FILENAME,
+            )
+            .unwrap();
+        assert_eq!(config.host.version_check, muxe_core::HostVersionCheck::Off);
+        let main = config
+            .menu(&muxe_core::MenuId::named(
+                muxe_core::MenuName::parse("main").unwrap(),
+            ))
+            .unwrap();
+        let labels: Vec<_> = main
+            .bindings
+            .iter()
+            .filter_map(|binding| binding.label.as_deref())
+            .collect();
+        assert_eq!(labels, ["reload"]);
     }
 }

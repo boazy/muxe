@@ -1890,6 +1890,26 @@ enum HerdrMenuSmoke {
     BareTabCreate,
 }
 
+async fn activate_herdr_smoke(rig: &Rig, target_bin: &Path, socket: &Path) -> io::Result<()> {
+    let mut command = tokio::process::Command::new(target_bin);
+    command.args(["activate", "--host", "herdr"]);
+    apply_scoped_env(&mut command, &rig.scoped_root);
+    command.env("HERDR_SOCKET_PATH", socket);
+    let output = run_cli_bounded("herdr-filter-activate", &mut command).await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "host-filtered Herdr activation failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )));
+    }
+    eprintln!(
+        "[herdr-filter-activate] {}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+    Ok(())
+}
+
 async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
     let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
     let target_version = installed_version(&target_bin).await?;
@@ -1900,7 +1920,7 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
     if matches!(scenario, HerdrMenuSmoke::BareTabCreate) {
         std::fs::write(
             &config_file,
-            "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      t: { label: tabs, action: 'menu:open tabs' }\n  tabs:\n    bindings:\n      t: { label: new tab, action: 'tab:create' }\n",
+            "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      t: { label: tabs, action: 'menu:open tabs' }\n      u: { label: up, skip-hosts: [herdr], action: 'pane:split direction=up' }\n  tabs:\n    bindings:\n      t: { label: new tab, action: 'tab:create' }\n  foreign:\n    only-hosts: [zellij]\n    bindings:\n      p: { label: unsupported, action: 'pane:create' }\n",
         )?;
     }
     let workdir = root.path().join("work");
@@ -1968,6 +1988,10 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
         let endpoint = broker.endpoint.clone();
         rig.brokers.push(broker);
         assert_broker_serving(&endpoint, "herdr-menu", &target_version).await?;
+        if matches!(scenario, HerdrMenuSmoke::BareTabCreate) {
+            let socket = server.socket().to_path_buf();
+            activate_herdr_smoke(&rig, &target_bin, &socket).await?;
+        }
         match scenario {
             HerdrMenuSmoke::StaysOpen => {
                 assert_herdr_menu_stays_open(&mut rig, &target_bin, &herdr_binary).await
