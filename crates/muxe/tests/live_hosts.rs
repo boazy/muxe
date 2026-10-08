@@ -1716,6 +1716,81 @@ async fn herdr_smoke_snapshot(
         .ok_or_else(|| io::Error::other(format!("missing snapshot object: {response}")))
 }
 
+fn herdr_created_tab_pane(
+    snapshot: &serde_json::Value,
+    origin: &muxe_adapter_herdr::FocusedPane,
+    initial_tabs: &BTreeSet<muxe_core::TabId>,
+    menu_pane: &muxe_core::PaneId,
+) -> Result<muxe_core::PaneId, String> {
+    let panes = snapshot
+        .get("panes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("snapshot lacks panes")?;
+    if panes.iter().any(|pane| {
+        pane.get("pane_id").and_then(serde_json::Value::as_str) == Some(menu_pane.as_str())
+    }) {
+        return Err("menu UI pane is still live".into());
+    }
+    let tabs = snapshot
+        .get("tabs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("snapshot lacks tabs")?;
+    let new_tabs: Vec<_> = tabs
+        .iter()
+        .filter(|tab| {
+            tab.get("tab_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !initial_tabs.contains(&muxe_core::TabId::new(id)))
+        })
+        .collect();
+    if new_tabs.len() != 1 {
+        return Err(format!(
+            "expected exactly one new tab, found {}",
+            new_tabs.len()
+        ));
+    }
+    let tab = new_tabs[0];
+    let new_tab = tab
+        .get("tab_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(muxe_core::TabId::new)
+        .ok_or("new tab lacks identity")?;
+    if tab.get("workspace_id").and_then(serde_json::Value::as_str)
+        != Some(origin.workspace.as_str())
+        || snapshot
+            .get("focused_workspace_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(origin.workspace.as_str())
+        || snapshot
+            .get("focused_tab_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(new_tab.as_str())
+    {
+        return Err("new tab is not focused in the origin workspace".into());
+    }
+    let pane = panes
+        .iter()
+        .find(|pane| {
+            pane.get("workspace_id").and_then(serde_json::Value::as_str)
+                == Some(origin.workspace.as_str())
+                && pane.get("tab_id").and_then(serde_json::Value::as_str) == Some(new_tab.as_str())
+                && pane.get("pane_id").and_then(serde_json::Value::as_str)
+                    == snapshot
+                        .get("focused_pane_id")
+                        .and_then(serde_json::Value::as_str)
+        })
+        .ok_or("new tab has no focused shell pane")?;
+    let pane_id = pane
+        .get("pane_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(muxe_core::PaneId::new)
+        .ok_or("new pane lacks identity")?;
+    eprintln!("[herdr-tab-create] UI gone; focused new tab {new_tab}, pane {pane_id}");
+    Ok(pane_id)
+}
+
 async fn assert_herdr_menu_creates_tab(
     rig: &mut Rig,
     target_bin: &Path,
@@ -1761,82 +1836,7 @@ async fn assert_herdr_menu_creates_tab(
                 let snapshot = herdr_smoke_snapshot(&runtime)
                     .await
                     .map_err(|error| error.to_string())?;
-                let check = || -> Result<muxe_core::PaneId, String> {
-                    let panes = snapshot
-                        .get("panes")
-                        .and_then(serde_json::Value::as_array)
-                        .ok_or("snapshot lacks panes")?;
-                    if panes.iter().any(|pane| {
-                        pane.get("pane_id").and_then(serde_json::Value::as_str)
-                            == Some(menu_pane.as_str())
-                    }) {
-                        return Err("menu UI pane is still live".into());
-                    }
-                    let tabs = snapshot
-                        .get("tabs")
-                        .and_then(serde_json::Value::as_array)
-                        .ok_or("snapshot lacks tabs")?;
-                    let new_tabs: Vec<_> = tabs
-                        .iter()
-                        .filter(|tab| {
-                            tab.get("tab_id")
-                                .and_then(serde_json::Value::as_str)
-                                .is_some_and(|id| {
-                                    !initial_tabs.contains(&muxe_core::TabId::new(id))
-                                })
-                        })
-                        .collect();
-                    if new_tabs.len() != 1 {
-                        return Err(format!(
-                            "expected exactly one new tab, found {}",
-                            new_tabs.len()
-                        ));
-                    }
-                    let tab = new_tabs[0];
-                    let new_tab = tab
-                        .get("tab_id")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .map(muxe_core::TabId::new)
-                        .ok_or("new tab lacks identity")?;
-                    if tab.get("workspace_id").and_then(serde_json::Value::as_str)
-                        != Some(origin.workspace.as_str())
-                        || snapshot
-                            .get("focused_workspace_id")
-                            .and_then(serde_json::Value::as_str)
-                            != Some(origin.workspace.as_str())
-                        || snapshot
-                            .get("focused_tab_id")
-                            .and_then(serde_json::Value::as_str)
-                            != Some(new_tab.as_str())
-                    {
-                        return Err("new tab is not focused in the origin workspace".into());
-                    }
-                    let pane = panes
-                        .iter()
-                        .find(|pane| {
-                            pane.get("workspace_id").and_then(serde_json::Value::as_str)
-                                == Some(origin.workspace.as_str())
-                                && pane.get("tab_id").and_then(serde_json::Value::as_str)
-                                    == Some(new_tab.as_str())
-                                && pane.get("pane_id").and_then(serde_json::Value::as_str)
-                                    == snapshot
-                                        .get("focused_pane_id")
-                                        .and_then(serde_json::Value::as_str)
-                        })
-                        .ok_or("new tab has no focused shell pane")?;
-                    let pane_id = pane
-                        .get("pane_id")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .map(muxe_core::PaneId::new)
-                        .ok_or("new pane lacks identity")?;
-                    eprintln!(
-                        "[herdr-tab-create] UI gone; focused new tab {new_tab}, pane {pane_id}"
-                    );
-                    Ok(pane_id)
-                };
-                check()
+                herdr_created_tab_pane(&snapshot, &origin, &initial_tabs, &menu_pane)
                     .map_err(|error| format!("{error}\n--- authoritative snapshot ---\n{snapshot}"))
             },
         )
@@ -2448,9 +2448,12 @@ async fn herdr_menu_stays_open() {
 }
 
 /// Run against either an installed release or a staged fixed installation:
-/// MUXE_LIVE_HOSTS_APPROVED=true MUXE_TARGET_INSTALLATION=/absolute/install
-/// MUXE_HERDR_BINARY=/absolute/herdr cargo test --locked -p muxe --test live_hosts
+///
+/// ```sh
+/// MUXE_LIVE_HOSTS_APPROVED=true MUXE_TARGET_INSTALLATION=/absolute/install \
+/// MUXE_HERDR_BINARY=/absolute/herdr cargo test --locked -p muxe --test live_hosts \
 /// -- --ignored --exact herdr_menu_bare_tab_create --nocapture
+/// ```
 #[tokio::test]
 #[ignore = "live Herdr: needs a staged install, Herdr binary, and MUXE_LIVE_HOSTS_APPROVED=true"]
 async fn herdr_menu_bare_tab_create() {
