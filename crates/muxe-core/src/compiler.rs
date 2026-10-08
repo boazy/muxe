@@ -18,7 +18,7 @@ use crate::config::{
     ConfigValueKind, HostSettings, HostVersionCheck, KeyboardProfile, ReloadSettings, ThemeAssets,
     ThemeSelection, merge_values,
 };
-use crate::context::{ContextReference, ContextType};
+use crate::context::{ContextReference, ContextType, OriginHostKind};
 use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceId, SourceSpan};
 use crate::execution::{
     AfterAction, ExecutionCapabilities, ExecutionMode, ExecutionPolicy, MenuControlAction,
@@ -147,9 +147,6 @@ pub(crate) fn compile_effective(
 
     let menus_value = required_field(&root, "menus")?;
     let raw_menus = mapping_fields(&menus_value.value, "`menus` must be an ordered mapping")?;
-    for menu in raw_menus {
-        reject_user_authored_inline_markers(&menu.value)?;
-    }
     if raw_menus.is_empty() {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
@@ -180,10 +177,40 @@ pub(crate) fn compile_effective(
         .keys()
         .map(|name| (name.as_str().to_owned(), name.clone()))
         .collect();
+    let mut excluded_menus = HashSet::new();
+    for menu in raw_menus {
+        if !matches_host_filters(&menu.value, action_validator)? {
+            excluded_menus.insert(
+                known_menus
+                    .get(&menu.name)
+                    .expect("named menus are validated above")
+                    .clone(),
+            );
+        }
+    }
+    let menus_value = required_field_mut(&mut root, "menus")?;
+    let raw_menus =
+        mapping_fields_mut(&mut menus_value.value, "`menus` must be an ordered mapping")?;
+    raw_menus.retain(|menu| {
+        !excluded_menus.contains(
+            known_menus
+                .get(&menu.name)
+                .expect("named menus are validated above"),
+        )
+    });
+    for menu in &mut *raw_menus {
+        filter_menu_bindings(
+            &mut menu.value,
+            &known_menus,
+            &excluded_menus,
+            action_validator,
+        )?;
+        reject_user_authored_inline_markers(&menu.value)?;
+    }
     let mut inline_counter = 0_u64;
     let mut inline_menus = Vec::new();
     let mut lowered_menus = Vec::with_capacity(raw_menus.len());
-    for menu in raw_menus {
+    for menu in &*raw_menus {
         let owner = known_menus
             .get(&menu.name)
             .expect("named menus are validated above");
@@ -203,6 +230,7 @@ pub(crate) fn compile_effective(
         global_settings,
         global_layout,
         known_menus: &known_menus,
+        excluded_menus: &excluded_menus,
         action_validator,
         next_binding: 0,
         diagnostics: Vec::new(),
@@ -911,6 +939,7 @@ struct MenuCompiler<'a> {
     global_settings: EffectiveSettings,
     global_layout: LayoutSettings,
     known_menus: &'a BTreeMap<String, MenuName>,
+    excluded_menus: &'a HashSet<MenuName>,
     action_validator: Option<&'a dyn ActionValidator>,
     next_binding: u64,
     diagnostics: Vec<ConfigDiagnostic>,
@@ -930,9 +959,18 @@ impl MenuCompiler<'_> {
                 return None;
             }
         };
-        if let Err(mut errors) =
-            validate_fields(value, &["title", "tags", "settings", "layout", "bindings"])
-        {
+        if let Err(mut errors) = validate_fields(
+            value,
+            &[
+                "title",
+                "tags",
+                "settings",
+                "layout",
+                "bindings",
+                "only-hosts",
+                "skip-hosts",
+            ],
+        ) {
             self.diagnostics.append(&mut errors);
             return None;
         }
@@ -992,7 +1030,7 @@ impl MenuCompiler<'_> {
         for (row, binding_field) in bindings.iter().enumerate() {
             let inline_target = menu.inline_targets.get(row).and_then(Option::as_ref);
             match self.compile_binding(binding_field, &settings, inline_target) {
-                Ok(binding) => {
+                Ok(Some(binding)) => {
                     if matches!(self.keyboard, KeyboardProfile::Vt100 { .. }) {
                         let key = binding.key.vt100_binding_key();
                         if let Some(first) = vt100_bindings.get(&key) {
@@ -1016,6 +1054,7 @@ impl MenuCompiler<'_> {
                     }
                     compiled.push(binding);
                 }
+                Ok(None) => {}
                 Err(mut errors) => self.diagnostics.append(&mut errors),
             }
         }
@@ -1035,11 +1074,30 @@ impl MenuCompiler<'_> {
         field: &ConfigField,
         menu_settings: &EffectiveSettings,
         inline_target: Option<&InlineMenuId>,
-    ) -> Result<CompiledBinding, Vec<ConfigDiagnostic>> {
+    ) -> Result<Option<CompiledBinding>, Vec<ConfigDiagnostic>> {
         validate_fields(
             &field.value,
-            &["label", "hidden", "action", "settings", "conditions"],
+            &[
+                "label",
+                "hidden",
+                "action",
+                "settings",
+                "conditions",
+                "only-hosts",
+                "skip-hosts",
+            ],
         )?;
+        // Resolve host-excluded named targets before binding validation, without rewriting
+        // compact actions or parsing them twice. Ordinary configs keep their diagnostic order.
+        let parsed_action = if self.excluded_menus.is_empty() {
+            None
+        } else {
+            let action_value = required_field(&field.value, "action")?;
+            let Some(parsed) = self.parse_action(&action_value.value, inline_target)? else {
+                return Ok(None);
+            };
+            Some(parsed)
+        };
         let key = CanonicalKey::parse_diagnostic(&field.name, field.name_span.clone())
             .map_err(|error| vec![error])?;
         let hidden = field
@@ -1062,7 +1120,14 @@ impl MenuCompiler<'_> {
             SettingsScope::Binding,
         )?;
         let action_value = required_field(&field.value, "action")?;
-        let (action, execution) = self.parse_action(&action_value.value, inline_target)?;
+        let (action, execution) = if let Some(parsed) = parsed_action {
+            parsed
+        } else {
+            let Some(parsed) = self.parse_action(&action_value.value, inline_target)? else {
+                return Ok(None);
+            };
+            parsed
+        };
         if !settings.execution_mode_explicit
             && matches!(
                 action.kind(),
@@ -1095,7 +1160,7 @@ impl MenuCompiler<'_> {
         )?;
         let id = BindingId::new(self.generation, self.next_binding);
         self.next_binding += 1;
-        Ok(CompiledBinding {
+        Ok(Some(CompiledBinding {
             id,
             key,
             label,
@@ -1108,14 +1173,14 @@ impl MenuCompiler<'_> {
                 repeat: settings.repeat,
             },
             conditions,
-        })
+        }))
     }
 
     fn parse_action(
         &self,
         value: &ConfigValue,
         inline_target: Option<&InlineMenuId>,
-    ) -> Result<(ActionSpec, Option<ExecutionCapabilities>), Vec<ConfigDiagnostic>> {
+    ) -> Result<Option<(ActionSpec, Option<ExecutionCapabilities>)>, Vec<ConfigDiagnostic>> {
         let (type_name, type_span, fields) = action_fields(value)?;
         let kind = ActionKind::parse(&type_name).ok_or_else(|| {
             vec![ConfigDiagnostic::error(
@@ -1141,11 +1206,14 @@ impl MenuCompiler<'_> {
                         value.span.clone(),
                     )]);
                 }
-                Ok((ActionSpec::Native(candidate), None))
+                Ok(Some((ActionSpec::Native(candidate), None)))
             }
             ActionKind::Portable(kind) => {
-                let (spec, baseline) =
-                    self.parse_portable(kind, &fields, &type_span, inline_target)?;
+                let Some((spec, baseline)) =
+                    self.parse_portable(kind, &fields, &type_span, inline_target)?
+                else {
+                    return Ok(None);
+                };
                 let ActionSpec::Portable(action) = &spec else {
                     unreachable!("portable parser returns a portable action");
                 };
@@ -1155,7 +1223,7 @@ impl MenuCompiler<'_> {
                     .transpose()
                     .map_err(|diagnostic| vec![diagnostic])?
                     .map_or(baseline, |validated| validated.execution);
-                Ok((spec, Some(capabilities)))
+                Ok(Some((spec, Some(capabilities))))
             }
         }
     }
@@ -1170,7 +1238,7 @@ impl MenuCompiler<'_> {
         fields: &[ActionField<'_>],
         span: &SourceSpan,
         inline_target: Option<&InlineMenuId>,
-    ) -> Result<(ActionSpec, ExecutionCapabilities), Vec<ConfigDiagnostic>> {
+    ) -> Result<Option<(ActionSpec, ExecutionCapabilities)>, Vec<ConfigDiagnostic>> {
         let schema = kind.schema();
         validate_portable_action_fields(schema, fields, span)?;
         let parsed = parse_portable_action_fields(schema, fields)?;
@@ -1184,6 +1252,9 @@ impl MenuCompiler<'_> {
                             target_span,
                         )]
                     })?;
+                    if self.excluded_menus.contains(name) {
+                        return Ok(None);
+                    }
                     MenuTarget::Named(name.clone())
                 } else {
                     let submenu_span = submenu.expect("schema requires menu or submenu");
@@ -1309,7 +1380,7 @@ impl MenuCompiler<'_> {
             ParsedPortableAction::SessionQuit {} => PortableAction::Session(SessionAction::Quit),
             ParsedPortableAction::SessionKill {} => PortableAction::Session(SessionAction::Kill),
         };
-        Ok((ActionSpec::Portable(action), schema.capabilities))
+        Ok(Some((ActionSpec::Portable(action), schema.capabilities)))
     }
 }
 fn positional_field(kind: &ActionKind, position: usize) -> Option<&'static str> {
@@ -2250,7 +2321,15 @@ impl Injection {
         let action = required_field(&field.value, "action")?;
         validate_fields(
             &action.value,
-            &["type", "bindings", "title", "tags", "settings"],
+            &[
+                "type",
+                "bindings",
+                "title",
+                "tags",
+                "settings",
+                "only-hosts",
+                "skip-hosts",
+            ],
         )?;
         let defaults = match expect_string(
             &required_field(&action.value, "type")?.value,
@@ -2403,6 +2482,147 @@ fn merge_defaults(target: &mut ConfigValue, defaults: &ConfigValue) {
             target.push(default.clone());
         }
     }
+}
+
+/// Applies host filters only after all merges and injections have produced the effective AST.
+fn matches_host_filters(
+    value: &ConfigValue,
+    action_validator: Option<&dyn ActionValidator>,
+) -> Result<bool, Vec<ConfigDiagnostic>> {
+    let only = value
+        .field("only-hosts")
+        .map(|field| host_filter_matches(&field.value, "only-hosts", action_validator))
+        .transpose()?
+        .unwrap_or(true);
+    let skip = value
+        .field("skip-hosts")
+        .map(|field| host_filter_matches(&field.value, "skip-hosts", action_validator))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(only && !skip)
+}
+
+fn host_filter_matches(
+    value: &ConfigValue,
+    name: &str,
+    action_validator: Option<&dyn ActionValidator>,
+) -> Result<bool, Vec<ConfigDiagnostic>> {
+    let ConfigValueKind::Sequence(hosts) = &value.kind else {
+        return Err(vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            format!("`{name}` must be a list of host names"),
+            value.span.clone(),
+        )]);
+    };
+    let validator = action_validator.ok_or_else(|| {
+        vec![ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            format!("`{name}` requires an active adapter validator"),
+            value.span.clone(),
+        )]
+    })?;
+    let mut matches = false;
+    for host in hosts {
+        let text = host.as_str().ok_or_else(|| {
+            vec![ConfigDiagnostic::error(
+                DiagnosticCode::InvalidValue,
+                format!("`{name}` values must be host names"),
+                host.span.clone(),
+            )]
+        })?;
+        let kind = text.parse::<OriginHostKind>().map_err(|_| {
+            vec![ConfigDiagnostic::error(
+                DiagnosticCode::InvalidValue,
+                format!("unknown host `{text}` in `{name}`"),
+                host.span.clone(),
+            )]
+        })?;
+        matches |= validator.matches_host(kind);
+    }
+    Ok(matches)
+}
+
+fn filter_menu_bindings(
+    menu: &mut ConfigValue,
+    known_menus: &BTreeMap<String, MenuName>,
+    excluded_menus: &HashSet<MenuName>,
+    action_validator: Option<&dyn ActionValidator>,
+) -> Result<(), Vec<ConfigDiagnostic>> {
+    let Some(bindings) = menu
+        .field_mut("bindings")
+        .and_then(|field| field.value.as_mapping_mut())
+    else {
+        // Shape validation belongs to compilation, and excluded menus never reach it.
+        return Ok(());
+    };
+    let mut result = Ok(());
+    bindings.retain_mut(|binding| {
+        if result.is_err() {
+            return true;
+        }
+        match retain_host_binding(
+            &mut binding.value,
+            known_menus,
+            excluded_menus,
+            action_validator,
+        ) {
+            Ok(retain) => retain,
+            Err(errors) => {
+                result = Err(errors);
+                true
+            }
+        }
+    });
+    result
+}
+
+fn retain_host_binding(
+    binding: &mut ConfigValue,
+    known_menus: &BTreeMap<String, MenuName>,
+    excluded_menus: &HashSet<MenuName>,
+    action_validator: Option<&dyn ActionValidator>,
+) -> Result<bool, Vec<ConfigDiagnostic>> {
+    if !matches_host_filters(binding, action_validator)? {
+        return Ok(false);
+    }
+    let Some(action) = binding.field_mut("action") else {
+        return Ok(true);
+    };
+    let excluded_target = |target: &str| {
+        known_menus
+            .get(target)
+            .is_some_and(|name| excluded_menus.contains(name))
+    };
+    let kind = action
+        .value
+        .field("type")
+        .and_then(|field| field.value.as_str())
+        .and_then(PortableActionKind::parse);
+    if kind != Some(PortableActionKind::MenuOpen) {
+        return Ok(true);
+    }
+    if action
+        .value
+        .field(ActionParameterName::Menu.as_str())
+        .and_then(|field| field.value.as_str())
+        .is_some_and(excluded_target)
+    {
+        return Ok(false);
+    }
+    if let Some(submenu) = action.value.field_mut("submenu")
+        && submenu.value.as_mapping().is_some()
+    {
+        if !matches_host_filters(&submenu.value, action_validator)? {
+            return Ok(false);
+        }
+        filter_menu_bindings(
+            &mut submenu.value,
+            known_menus,
+            excluded_menus,
+            action_validator,
+        )?;
+    }
+    Ok(true)
 }
 
 /// Rejects reserved user syntax before lowering. Typed lowering never injects this historical field.

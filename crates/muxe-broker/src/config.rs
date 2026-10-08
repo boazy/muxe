@@ -471,6 +471,10 @@ mod tests {
     }
 
     impl ActionValidator for ReloadAdapter {
+        fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+            host == muxe_core::OriginHostKind::Herdr
+        }
+
         fn validate_portable(
             &self,
             _action: &muxe_core::PortableAction,
@@ -820,6 +824,10 @@ mod tests {
 struct AdapterValidator<'a>(&'a dyn HostAdapter);
 
 impl ActionValidator for AdapterValidator<'_> {
+    fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+        self.0.matches_host(host)
+    }
+
     fn validate_portable(
         &self,
         action: &muxe_core::PortableAction,

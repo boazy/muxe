@@ -135,6 +135,10 @@ fn validated_from_raw(
 }
 
 impl ActionValidator for ZellijValidator {
+    fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+        host == muxe_core::OriginHostKind::Zellij
+    }
+
     fn validate_portable(
         &self,
         action: &PortableAction,

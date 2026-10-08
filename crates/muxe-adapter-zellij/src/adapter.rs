@@ -3553,6 +3553,10 @@ fn parse_pane_id(text: &str) -> Result<muxe_zellij_protocol::generated::raw::Pan
 }
 
 impl ActionValidator for ZellijAdapter {
+    fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+        host == muxe_core::OriginHostKind::Zellij
+    }
+
     fn validate_portable(
         &self,
         action: &PortableAction,

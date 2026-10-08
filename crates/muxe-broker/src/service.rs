@@ -3022,6 +3022,10 @@ mod tests {
         }
     }
     impl ActionValidator for SmokeAdapter {
+        fn matches_host(&self, host: OriginHostKind) -> bool {
+            host == OriginHostKind::Herdr
+        }
+
         fn validate_portable(
             &self,
             _action: &muxe_core::PortableAction,
@@ -3248,6 +3252,10 @@ mod tests {
         }
     }
     impl ActionValidator for OrderingAdapter {
+        fn matches_host(&self, host: OriginHostKind) -> bool {
+            host == OriginHostKind::Herdr
+        }
+
         fn validate_portable(
             &self,
             _action: &muxe_core::PortableAction,

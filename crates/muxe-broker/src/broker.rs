@@ -5220,6 +5220,10 @@ menus:
     }
 
     impl ActionValidator for CountingAdapter {
+        fn matches_host(&self, host: OriginHostKind) -> bool {
+            host == OriginHostKind::Herdr
+        }
+
         fn validate_portable(
             &self,
             _action: &muxe_core::PortableAction,
@@ -5434,6 +5438,10 @@ menus:
     }
 
     impl ActionValidator for ScopedTestAdapter {
+        fn matches_host(&self, host: OriginHostKind) -> bool {
+            host == OriginHostKind::Herdr
+        }
+
         fn validate_portable(
             &self,
             _action: &muxe_core::PortableAction,

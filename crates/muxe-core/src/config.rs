@@ -6,7 +6,7 @@ use std::time::Duration;
 use saphyr::{LoadableYamlNode, MarkedYamlOwned, ScalarOwned, ScanError, YamlDataOwned};
 
 use crate::action::{NativeActionCandidate, PortableAction};
-use crate::context::{ContextReference, ContextValue, OriginContext};
+use crate::context::{ContextReference, ContextValue, OriginContext, OriginHostKind};
 use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceId, SourceSpan};
 use crate::execution::ExecutionCapabilities;
 use crate::key::{CanonicalKey, KeyCapabilities, KeyEvent};
@@ -470,6 +470,12 @@ impl Default for ThemeSelection {
 /// exact action discriminator. They must validate again immediately before dispatch; load-time
 /// acceptance never replaces that check.
 pub trait ActionValidator: Send + Sync {
+    /// Matches a typed host name against this adapter's fixed host identity.
+    ///
+    /// Configuration filtering calls this before parsing excluded actions. Concrete adapters
+    /// implement the comparison; shared compilation never selects behavior by muxer kind.
+    fn matches_host(&self, host: OriginHostKind) -> bool;
+
     /// Validates one parsed portable action for this active host.
     ///
     /// # Errors
@@ -641,6 +647,9 @@ pub struct Compiler;
 
 impl Compiler {
     /// Compiles a merged host configuration.
+    ///
+    /// Host filters and native actions require the active host's `action_validator`.
+    /// Host-independent portable configurations may omit it.
     ///
     /// # Errors
     ///

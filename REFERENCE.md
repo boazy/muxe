@@ -6,7 +6,7 @@ Use actions in menu bindings to tell Muxe what to do when you press a key. Actio
 
 ## How Muxe handles actions
 
-When Muxe loads its configuration, it checks each action name, parameter, and value. It also checks whether Zellij or Herdr supports the requested operation. If an action is invalid or unsupported, Muxe reports an error and does not load that configuration.
+When Muxe loads its configuration, it checks each included action name, parameter, and value. It also checks whether Zellij or Herdr supports the requested operation. If an included action is invalid or unsupported, Muxe reports an error and does not load that configuration. Bindings and menus excluded by [host filters](README.md#host-filters) are not action-validated.
 
 Muxe remembers which session, tab, and pane were active when you opened the menu. In compact actions, references such as `$origin.pane.cwd` read values from that saved location. The mapping form writes the same reference as `{ $context: origin.pane.cwd }`.
 

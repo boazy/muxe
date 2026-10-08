@@ -2057,6 +2057,10 @@ fn literal_probe_value(
 }
 
 impl ActionValidator for HerdrConfigValidator {
+    fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+        host == muxe_core::OriginHostKind::Herdr
+    }
+
     fn validate_portable(
         &self,
         action: &PortableAction,
@@ -2094,6 +2098,10 @@ impl ActionValidator for HerdrConfigValidator {
 }
 
 impl ActionValidator for HerdrAdapter {
+    fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+        host == muxe_core::OriginHostKind::Herdr
+    }
+
     fn validate_portable(
         &self,
         action: &PortableAction,

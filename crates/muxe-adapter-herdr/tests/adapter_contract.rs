@@ -164,6 +164,10 @@ impl RecordedContractAdapter {
 }
 
 impl ActionValidator for RecordedContractAdapter {
+    fn matches_host(&self, host: OriginHostKind) -> bool {
+        host == OriginHostKind::Herdr
+    }
+
     fn validate_portable(
         &self,
         _action: &PortableAction,

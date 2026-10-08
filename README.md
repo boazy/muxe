@@ -149,6 +149,39 @@ Muxe recursively merges the active host override file into `config.yml`. Overrid
 
 Automatic configuration watching is enabled by default. A valid reload applies immediately to newly opened menus, while open menus retain their pinned configuration generation. If an edit produces invalid YAML or unsupported actions, Muxe logs the error and keeps the last valid configuration active.
 
+### Host filters
+
+Add `only-hosts` or `skip-hosts` to a binding or menu, including an inline submenu. Both fields take YAML lists of lowercase host names: `herdr` and `zellij`. Unknown names and non-list values are configuration errors.
+
+| Field | Include the item when… | If omitted | If the list is empty |
+|---|---|---|---|
+| `only-hosts` | The active host appears in the list. | Include on every host. | Exclude on every host. |
+| `skip-hosts` | The active host does not appear in the list. | Exclude no hosts. | Exclude no hosts. |
+
+If both fields are present, the host must pass `only-hosts` and not appear in `skip-hosts`. A menu's filters apply to the whole menu and its inline descendants. Bindings that open an excluded menu are also excluded; you do not need to repeat the menu's filters on those bindings. An excluded root menu cannot be opened.
+
+Muxe applies filters after host overrides and injections, before validating actions. Excluded bindings are absent from the menu and cannot match keys, so their unsupported actions do not prevent configuration loading.
+
+```yaml
+version: 1
+menus:
+  main:
+    bindings:
+      u:
+        label: split up
+        skip-hosts: [herdr]
+        action: pane:split direction=up
+      z:
+        label: Zellij tools
+        action: menu:open zellij-tools
+  zellij-tools:
+    only-hosts: [zellij]
+    bindings:
+      f:
+        label: toggle floating pane
+        action: pane:floating
+```
+
 ### Themes and color schemes
 
 Set `theme` and `color-scheme` to the corresponding filenames without `.yml`, under `$CONFIG_DIR/themes/` and `$CONFIG_DIR/color-schemes/`. Both default to `default`. The catalogs are independent: the same name can identify a theme and a color scheme. A scheme's `title` is display text, not its selection name.

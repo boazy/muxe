@@ -199,7 +199,7 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
     writeln!(output, "\n## How Muxe handles actions\n").unwrap();
     writeln!(
         output,
-        "When Muxe loads its configuration, it checks each action name, parameter, and value. It also checks whether Zellij or Herdr supports the requested operation. If an action is invalid or unsupported, Muxe reports an error and does not load that configuration."
+        "When Muxe loads its configuration, it checks each included action name, parameter, and value. It also checks whether Zellij or Herdr supports the requested operation. If an included action is invalid or unsupported, Muxe reports an error and does not load that configuration. Bindings and menus excluded by [host filters](README.md#host-filters) are not action-validated."
     )
     .unwrap();
     writeln!(

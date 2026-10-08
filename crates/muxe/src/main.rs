@@ -4830,6 +4830,10 @@ mod mixed_recovery_production_tests {
     }
 
     impl ActionValidator for RecoveryAdapter {
+        fn matches_host(&self, host: OriginHostKind) -> bool {
+            host == OriginHostKind::Zellij
+        }
+
         fn validate_portable(
             &self,
             _action: &muxe_core::PortableAction,

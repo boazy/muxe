@@ -1206,6 +1206,16 @@ mod tests {
         temp
     }
 
+    fn refuse_listener(listener: UnixListener) {
+        // A concurrent subprocess can retain an inherited descriptor until exec. Stop
+        // listening before closing our descriptor so the fixture is actually refused.
+        let socket = UnixStream::from(std::os::fd::OwnedFd::from(listener));
+        if let Err(error) = socket.shutdown(std::net::Shutdown::Both) {
+            // Darwin stops listening but reports ENOTCONN for an unconnected socket.
+            assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        }
+    }
+
     struct OkReloader;
 
     impl HostReloader for OkReloader {
@@ -1231,24 +1241,24 @@ mod tests {
         }
     }
 
-    struct GateAdapter {
+    struct GateAdapter<H: FixtureHost> {
         readiness: Mutex<Option<muxe_adapter_api::ActivationReadiness>>,
-        kind: muxe_adapter_api::HostKind,
+        host: H,
         discovery: HostDiscoveryKey,
         server: muxe_adapter_api::LiveServerIncarnationId,
         shutdown: AtomicBool,
         wake: tokio::sync::Notify,
     }
 
-    impl GateAdapter {
+    impl<H: FixtureHost> GateAdapter<H> {
         fn new(
-            kind: muxe_adapter_api::HostKind,
+            host: H,
             discovery: HostDiscoveryKey,
             server: muxe_adapter_api::LiveServerIncarnationId,
         ) -> Self {
             Self {
                 readiness: Mutex::new(None),
-                kind,
+                host,
                 discovery,
                 server,
                 shutdown: AtomicBool::new(false),
@@ -1257,7 +1267,11 @@ mod tests {
         }
     }
 
-    impl muxe_core::ActionValidator for GateAdapter {
+    impl<H: FixtureHost> muxe_core::ActionValidator for GateAdapter<H> {
+        fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+            self.host.matches_host(host)
+        }
+
         fn validate_portable(
             &self,
             _action: &muxe_core::PortableAction,
@@ -1281,12 +1295,12 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl muxe_adapter_api::HostAdapter for GateAdapter {
+    impl<H: FixtureHost> muxe_adapter_api::HostAdapter for GateAdapter<H> {
         async fn identity(
             &self,
         ) -> Result<muxe_adapter_api::HostIdentity, muxe_adapter_api::AdapterError> {
             Ok(muxe_adapter_api::HostIdentity {
-                kind: self.kind,
+                kind: self.host.adapter_kind(),
                 discovery_key: self.discovery.clone(),
                 live_server_id: self.server.clone(),
             })
@@ -1358,10 +1372,7 @@ mod tests {
             _request: muxe_adapter_api::OriginCaptureRequest,
         ) -> Result<muxe_core::OriginContext, muxe_adapter_api::AdapterError> {
             Ok(muxe_core::OriginContext {
-                host_kind: match self.kind {
-                    muxe_adapter_api::HostKind::Herdr => muxe_core::OriginHostKind::Herdr,
-                    muxe_adapter_api::HostKind::Zellij => muxe_core::OriginHostKind::Zellij,
-                },
+                host_kind: self.host.origin_kind(),
                 server_id: muxe_core::ServerId::new(self.server.as_str()),
                 client_id: None,
                 session_id: None,
@@ -1495,11 +1506,13 @@ mod tests {
     }
 
     /// Each fixture has one immutable host identity and owns its registry APIs.
-    trait FixtureHost: Copy {
+    trait FixtureHost: Copy + Send + Sync + 'static {
         fn owned_discovery(self) -> HostDiscoveryKey;
         fn stale_discovery(self) -> HostDiscoveryKey;
         fn protocol_kind(self) -> HostKind;
         fn adapter_kind(self) -> muxe_adapter_api::HostKind;
+        fn origin_kind(self) -> muxe_core::OriginHostKind;
+        fn matches_host(self, host: muxe_core::OriginHostKind) -> bool;
         fn bridge_identity(self, root: &Path) -> Option<BridgeIdentity>;
         fn input_host(self, root: &Path, discovery: &HostDiscoveryKey) -> ColdstartHost;
         fn unit_kind(
@@ -1538,6 +1551,12 @@ mod tests {
         }
         fn adapter_kind(self) -> muxe_adapter_api::HostKind {
             muxe_adapter_api::HostKind::Herdr
+        }
+        fn origin_kind(self) -> muxe_core::OriginHostKind {
+            muxe_core::OriginHostKind::Herdr
+        }
+        fn matches_host(self, host: muxe_core::OriginHostKind) -> bool {
+            host == muxe_core::OriginHostKind::Herdr
         }
         fn bridge_identity(self, _root: &Path) -> Option<BridgeIdentity> {
             None
@@ -1594,6 +1613,12 @@ mod tests {
         }
         fn adapter_kind(self) -> muxe_adapter_api::HostKind {
             muxe_adapter_api::HostKind::Zellij
+        }
+        fn origin_kind(self) -> muxe_core::OriginHostKind {
+            muxe_core::OriginHostKind::Zellij
+        }
+        fn matches_host(self, host: muxe_core::OriginHostKind) -> bool {
+            host == muxe_core::OriginHostKind::Zellij
         }
         fn bridge_identity(self, root: &Path) -> Option<BridgeIdentity> {
             Some(integration::bridge_identity(root).unwrap())
@@ -1674,7 +1699,7 @@ mod tests {
             std::fs::write(&config, yaml).unwrap();
             let discovery = host.owned_discovery();
             let adapter = Arc::new(GateAdapter::new(
-                host.adapter_kind(),
+                host,
                 discovery.clone(),
                 muxe_adapter_api::LiveServerIncarnationId::parse("server-test").unwrap(),
             ));
@@ -2161,7 +2186,7 @@ mod tests {
                     std::fs::Permissions::from_mode(0o600),
                 )
                 .unwrap();
-                drop(listener);
+                refuse_listener(listener);
             } else if scenario == "symlink" {
                 let target = fixture.root.path().join("foreign");
                 std::fs::write(&target, b"user-owned").unwrap();
@@ -2239,7 +2264,7 @@ mod tests {
             let socket = fixture.endpoint.socket();
             let listener = UnixListener::bind(socket).unwrap();
             std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-            drop(listener);
+            refuse_listener(listener);
             let observed = observe_stale_endpoint(socket).unwrap();
             let entries = fixture.registry.entries().unwrap();
             let result = fixture.registry.remove_exact_stale(
@@ -2267,7 +2292,7 @@ mod tests {
                         let rebound = UnixListener::bind(socket).unwrap();
                         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
                             .unwrap();
-                        drop(rebound);
+                        refuse_listener(rebound);
                     }
                     let current = observe_stale_endpoint(socket)
                         .map_err(|error| RegistryError::Conflict(error.to_string()))?;
@@ -2373,7 +2398,7 @@ mod tests {
         )
         .expect("gate config");
         let adapter = Arc::new(GateAdapter::new(
-            muxe_adapter_api::HostKind::Zellij,
+            ZellijFixtureHost,
             HostDiscoveryKey::parse("session-test").unwrap(),
             muxe_adapter_api::LiveServerIncarnationId::parse("server-test").unwrap(),
         ));

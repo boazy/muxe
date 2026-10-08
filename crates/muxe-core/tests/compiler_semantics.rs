@@ -1278,6 +1278,10 @@ fn same_spelling_catalog_names_preserve_domain_and_semantic_precedence() {
 struct DirectionalHostValidator;
 
 impl muxe_core::ActionValidator for DirectionalHostValidator {
+    fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+        host == muxe_core::OriginHostKind::Zellij
+    }
+
     fn validate_portable(
         &self,
         action: &muxe_core::PortableAction,
@@ -1315,6 +1319,10 @@ struct BatchHostValidator {
 }
 
 impl muxe_core::ActionValidator for BatchHostValidator {
+    fn matches_host(&self, host: muxe_core::OriginHostKind) -> bool {
+        host == muxe_core::OriginHostKind::Zellij
+    }
+
     fn validate_portable(
         &self,
         _action: &muxe_core::PortableAction,

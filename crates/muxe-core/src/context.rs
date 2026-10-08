@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use strum::{Display, EnumIter, IntoStaticStr};
+use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
 use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceSpan};
 
@@ -49,7 +49,7 @@ opaque_id!(WorktreeId, "Opaque host worktree identity.");
 opaque_id!(AgentId, "Opaque host agent identity.");
 opaque_id!(LinkHandlerId, "Opaque host link-handler identity.");
 
-#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
+#[derive(Clone, Copy, Debug, Display, EnumIter, EnumString, Eq, Hash, IntoStaticStr, PartialEq)]
 #[strum(serialize_all = "lowercase")]
 pub enum OriginHostKind {
     Zellij,
