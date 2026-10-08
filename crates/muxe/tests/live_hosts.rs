@@ -1600,13 +1600,12 @@ async fn prepare_herdr_menu_origin(
     Ok((socket, runtime, origin, typescript))
 }
 
-async fn assert_herdr_menu_stays_open(
-    rig: &mut Rig,
+async fn launch_herdr_smoke_menu(
+    rig: &Rig,
     target_bin: &Path,
-    herdr_binary: &Path,
-) -> io::Result<()> {
-    let (socket, runtime, origin, typescript) =
-        prepare_herdr_menu_origin(rig, herdr_binary).await?;
+    socket: &Path,
+    origin: &muxe_adapter_herdr::FocusedPane,
+) -> io::Result<muxe_core::PaneId> {
     let mut command = tokio::process::Command::new(target_bin);
     command.args([
         "menu",
@@ -1621,12 +1620,12 @@ async fn assert_herdr_menu_stays_open(
     ]);
     apply_scoped_env(&mut command, &rig.scoped_root);
     command
-        .env("HERDR_SOCKET_PATH", &socket)
+        .env("HERDR_SOCKET_PATH", socket)
         .env("HERDR_ACTIVE_WORKSPACE_ID", origin.workspace.as_str())
         .env("HERDR_ACTIVE_TAB_ID", origin.tab.as_str())
         .env("HERDR_ACTIVE_PANE_ID", origin.pane.as_str())
         .current_dir(&origin.cwd);
-    let output = command.output().await?;
+    let output = run_cli_bounded("herdr-menu-launcher", &mut command).await?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "smoke: Herdr menu launcher failed (status {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
@@ -1636,12 +1635,24 @@ async fn assert_herdr_menu_stays_open(
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pane = stdout
+    stdout
         .lines()
         .find_map(|line| line.strip_prefix("opened "))
-        .ok_or_else(|| io::Error::other(format!("smoke: launcher reported no pane: {stdout}")))?;
+        .filter(|pane| !pane.is_empty())
+        .map(muxe_core::PaneId::new)
+        .ok_or_else(|| io::Error::other(format!("smoke: launcher reported no pane: {stdout}")))
+}
+
+async fn assert_herdr_menu_stays_open(
+    rig: &mut Rig,
+    target_bin: &Path,
+    herdr_binary: &Path,
+) -> io::Result<()> {
+    let (socket, runtime, origin, typescript) =
+        prepare_herdr_menu_origin(rig, herdr_binary).await?;
+    let pane = launch_herdr_smoke_menu(rig, target_bin, &socket, &origin).await?;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let menu_pane = muxe_adapter_herdr::pane_by_id(&runtime, pane)
+    let menu_pane = muxe_adapter_herdr::pane_by_id(&runtime, pane.as_str())
         .await
         .map_err(|error| {
             let transcript = std::fs::read(&typescript).map_or_else(
@@ -1672,33 +1683,231 @@ async fn assert_herdr_menu_stays_open(
     Ok(())
 }
 
-async fn run_herdr_menu_smoke() -> io::Result<()> {
+async fn herdr_smoke_request(
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
+    method: &str,
+    params: serde_json::Value,
+) -> io::Result<serde_json::Value> {
+    match runtime
+        .invoke_response(method, params)
+        .await
+        .map_err(|error| io::Error::other(format!("herdr-tab-create: {method}: {error}")))?
+    {
+        muxe_adapter_herdr::HerdrResponse::Success(value) => Ok(value),
+        muxe_adapter_herdr::HerdrResponse::Error { code, message } => Err(io::Error::other(
+            format!("herdr-tab-create: {method} rejected with {code}: {message}"),
+        )),
+    }
+}
+
+async fn herdr_smoke_snapshot(
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
+) -> io::Result<serde_json::Value> {
+    let response = herdr_smoke_request(runtime, "session.snapshot", serde_json::json!({})).await?;
+    if response.get("type").and_then(serde_json::Value::as_str) != Some("session_snapshot") {
+        return Err(io::Error::other(format!(
+            "unexpected snapshot response: {response}"
+        )));
+    }
+    response
+        .get("snapshot")
+        .filter(|snapshot| snapshot.is_object())
+        .cloned()
+        .ok_or_else(|| io::Error::other(format!("missing snapshot object: {response}")))
+}
+
+async fn assert_herdr_menu_creates_tab(
+    rig: &mut Rig,
+    target_bin: &Path,
+    herdr_binary: &Path,
+) -> io::Result<()> {
+    let (socket, runtime, origin, typescript) =
+        prepare_herdr_menu_origin(rig, herdr_binary).await?;
+    let result = async {
+        let before = herdr_smoke_snapshot(&runtime).await?;
+        let initial_tabs: BTreeSet<muxe_core::TabId> = before
+            .get("tabs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| io::Error::other(format!("snapshot lacks tabs: {before}")))?
+            .iter()
+            .map(|tab| {
+                tab.get("tab_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(muxe_core::TabId::new)
+                    .ok_or_else(|| io::Error::other(format!("tab lacks identity: {tab}")))
+            })
+            .collect::<io::Result<_>>()?;
+        let menu_pane = launch_herdr_smoke_menu(rig, target_bin, &socket, &origin).await?;
+        // Allow the real terminal UI to attach and enter its input loop before
+        // sending the same two keys as the user's main -> tabs -> tab:create.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        muxe_adapter_herdr::pane_by_id(&runtime, menu_pane.as_str())
+            .await
+            .map_err(|error| io::Error::other(format!("menu exited before input: {error}")))?;
+        for _ in 0..2 {
+            herdr_smoke_request(
+                &runtime,
+                "pane.send_keys",
+                serde_json::json!({ "pane_id": menu_pane.as_str(), "keys": ["t"] }),
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        let new_pane = poll_until(
+            "bare tab:create to dismiss its UI and focus a new origin-workspace tab",
+            std::time::Duration::from_secs(10),
+            async || {
+                let snapshot = herdr_smoke_snapshot(&runtime)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let check = || -> Result<muxe_core::PaneId, String> {
+                    let panes = snapshot
+                        .get("panes")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or("snapshot lacks panes")?;
+                    if panes.iter().any(|pane| {
+                        pane.get("pane_id").and_then(serde_json::Value::as_str)
+                            == Some(menu_pane.as_str())
+                    }) {
+                        return Err("menu UI pane is still live".into());
+                    }
+                    let tabs = snapshot
+                        .get("tabs")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or("snapshot lacks tabs")?;
+                    let new_tabs: Vec<_> = tabs
+                        .iter()
+                        .filter(|tab| {
+                            tab.get("tab_id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|id| {
+                                    !initial_tabs.contains(&muxe_core::TabId::new(id))
+                                })
+                        })
+                        .collect();
+                    if new_tabs.len() != 1 {
+                        return Err(format!(
+                            "expected exactly one new tab, found {}",
+                            new_tabs.len()
+                        ));
+                    }
+                    let tab = new_tabs[0];
+                    let new_tab = tab
+                        .get("tab_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(muxe_core::TabId::new)
+                        .ok_or("new tab lacks identity")?;
+                    if tab.get("workspace_id").and_then(serde_json::Value::as_str)
+                        != Some(origin.workspace.as_str())
+                        || snapshot
+                            .get("focused_workspace_id")
+                            .and_then(serde_json::Value::as_str)
+                            != Some(origin.workspace.as_str())
+                        || snapshot
+                            .get("focused_tab_id")
+                            .and_then(serde_json::Value::as_str)
+                            != Some(new_tab.as_str())
+                    {
+                        return Err("new tab is not focused in the origin workspace".into());
+                    }
+                    let pane = panes
+                        .iter()
+                        .find(|pane| {
+                            pane.get("workspace_id").and_then(serde_json::Value::as_str)
+                                == Some(origin.workspace.as_str())
+                                && pane.get("tab_id").and_then(serde_json::Value::as_str)
+                                    == Some(new_tab.as_str())
+                                && pane.get("pane_id").and_then(serde_json::Value::as_str)
+                                    == snapshot
+                                        .get("focused_pane_id")
+                                        .and_then(serde_json::Value::as_str)
+                        })
+                        .ok_or("new tab has no focused shell pane")?;
+                    let pane_id = pane
+                        .get("pane_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(muxe_core::PaneId::new)
+                        .ok_or("new pane lacks identity")?;
+                    eprintln!(
+                        "[herdr-tab-create] UI gone; focused new tab {new_tab}, pane {pane_id}"
+                    );
+                    Ok(pane_id)
+                };
+                check()
+                    .map_err(|error| format!("{error}\n--- authoritative snapshot ---\n{snapshot}"))
+            },
+        )
+        .await?;
+        // A real shell must execute the probe, not merely leave an empty layout.
+        let marker = rig.workdir.join("new-tab-shell-proof");
+        let quoted_marker = marker.to_string_lossy().replace('\'', "'\\''");
+        herdr_smoke_request(
+            &runtime,
+            "pane.send_text",
+            serde_json::json!({
+                "pane_id": new_pane.as_str(),
+                "text": format!("printf '%s' muxe-live-tab-shell > '{quoted_marker}'"),
+            }),
+        )
+        .await?;
+        herdr_smoke_request(
+            &runtime,
+            "pane.send_keys",
+            serde_json::json!({ "pane_id": new_pane.as_str(), "keys": ["enter"] }),
+        )
+        .await?;
+        poll_until(
+            "new tab shell to execute its proof command",
+            std::time::Duration::from_secs(5),
+            async || match std::fs::read_to_string(&marker) {
+                Ok(value) if value == "muxe-live-tab-shell" => Ok(()),
+                other => Err(format!("shell proof not present: {other:?}")),
+            },
+        )
+        .await
+    }
+    .await;
+    result.map_err(|error| {
+        let transcript = std::fs::read(&typescript).map_or_else(
+            |read_error| format!("(transcript unreadable: {read_error})"),
+            |bytes| {
+                String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(16 * 1024)..])
+                    .into_owned()
+            },
+        );
+        io::Error::other(format!(
+            "{error}\n--- attached Herdr transcript ---\n{transcript}"
+        ))
+    })
+}
+
+#[derive(Clone, Copy)]
+enum HerdrMenuSmoke {
+    StaysOpen,
+    BareTabCreate,
+}
+
+async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
     let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
     let target_version = installed_version(&target_bin).await?;
     let herdr_binary = input_path("MUXE_HERDR_BINARY");
     let root = short_tempdir("muxe-live-herdr-menu-")?;
     let scoped_root = root.path().join("scoped");
     let (config_file, cache_dir) = init_shared_dirs(&target_bin, &scoped_root).await?;
+    if matches!(scenario, HerdrMenuSmoke::BareTabCreate) {
+        std::fs::write(
+            &config_file,
+            "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      t: { label: tabs, action: 'menu:open tabs' }\n  tabs:\n    bindings:\n      t: { label: new tab, action: 'tab:create' }\n",
+        )?;
+    }
     let workdir = root.path().join("work");
     std::fs::create_dir_all(&workdir)?;
-    let mut herdr =
+    let herdr =
         OwnedHerdrServer::start(&herdr_binary, root.path(), &scoped_root, "herdr-menu").await?;
     let discovery = herdr.discovery_key().to_owned();
-    if herdr.try_wait()?.is_some() {
-        return Err(io::Error::other(
-            "herdr-menu: Herdr server exited on startup",
-        ));
-    }
-    let continuity = ContinuityGuard::watch_herdr(
-        "herdr-menu",
-        muxe_adapter_herdr::HerdrAdapterConfig {
-            socket_path: herdr.socket().to_path_buf(),
-            herdr_binary: herdr_binary.clone(),
-            cache_dir: cache_dir.clone(),
-        },
-        discovery.clone(),
-    )
-    .await?;
     let mut rig = Rig {
         root,
         scoped_root,
@@ -1710,9 +1919,37 @@ async fn run_herdr_menu_smoke() -> io::Result<()> {
         zellij: None,
         pty_clients: Vec::new(),
         brokers: Vec::new(),
-        continuity: Some(continuity),
+        continuity: None,
     };
     let result = async {
+        if rig
+            .herdr
+            .as_mut()
+            .expect("owned server is retained")
+            .try_wait()?
+            .is_some()
+        {
+            return Err(io::Error::other(
+                "herdr-menu: Herdr server exited on startup",
+            ));
+        }
+        rig.continuity = Some(
+            ContinuityGuard::watch_herdr(
+                "herdr-menu",
+                muxe_adapter_herdr::HerdrAdapterConfig {
+                    socket_path: rig
+                        .herdr
+                        .as_ref()
+                        .expect("owned server is retained")
+                        .socket()
+                        .to_path_buf(),
+                    herdr_binary: herdr_binary.clone(),
+                    cache_dir: rig.cache_dir.clone(),
+                },
+                discovery.clone(),
+            )
+            .await?,
+        );
         let server = rig
             .herdr
             .as_ref()
@@ -1731,7 +1968,14 @@ async fn run_herdr_menu_smoke() -> io::Result<()> {
         let endpoint = broker.endpoint.clone();
         rig.brokers.push(broker);
         assert_broker_serving(&endpoint, "herdr-menu", &target_version).await?;
-        assert_herdr_menu_stays_open(&mut rig, &target_bin, &herdr_binary).await
+        match scenario {
+            HerdrMenuSmoke::StaysOpen => {
+                assert_herdr_menu_stays_open(&mut rig, &target_bin, &herdr_binary).await
+            }
+            HerdrMenuSmoke::BareTabCreate => {
+                assert_herdr_menu_creates_tab(&mut rig, &target_bin, &herdr_binary).await
+            }
+        }
     }
     .await;
     rig.finish("herdr-menu", result).await
@@ -2198,8 +2442,21 @@ async fn run_final_session_reload_failure() -> io::Result<()> {
 #[ignore = "live Herdr: needs a staged install, Herdr binary, and MUXE_LIVE_HOSTS_APPROVED=true"]
 async fn herdr_menu_stays_open() {
     require_live_approval();
-    if let Err(error) = run_herdr_menu_smoke().await {
+    if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::StaysOpen).await {
         panic!("Herdr menu smoke failed: {error}");
+    }
+}
+
+/// Run against either an installed release or a staged fixed installation:
+/// MUXE_LIVE_HOSTS_APPROVED=true MUXE_TARGET_INSTALLATION=/absolute/install
+/// MUXE_HERDR_BINARY=/absolute/herdr cargo test --locked -p muxe --test live_hosts
+/// -- --ignored --exact herdr_menu_bare_tab_create --nocapture
+#[tokio::test]
+#[ignore = "live Herdr: needs a staged install, Herdr binary, and MUXE_LIVE_HOSTS_APPROVED=true"]
+async fn herdr_menu_bare_tab_create() {
+    require_live_approval();
+    if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::BareTabCreate).await {
+        panic!("Herdr bare tab:create regression failed: {error}");
     }
 }
 

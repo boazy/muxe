@@ -98,6 +98,7 @@ impl ProductionConnectFixture {
                 "subscriptions": [
                     { "type": "tab.focused" },
                     { "type": "pane.closed" },
+                    { "type": "pane.exited" },
                 ],
             }),
             response: RecordedResponse::KeepOpen(json!({ "type": "subscription_started" })),

@@ -103,6 +103,14 @@ fn pane_closed_event(pane: &str) -> serde_json::Value {
     })
 }
 
+/// Natural process termination emits `pane_exited`, without a `pane_closed` event.
+fn pane_exited_event(pane: &str) -> serde_json::Value {
+    json!({
+        "event": "pane_exited",
+        "data": { "type": "pane_exited", "pane_id": pane, "workspace_id": "workspace-1" },
+    })
+}
+
 fn lifecycle_capture_request() -> OriginCaptureRequest {
     OriginCaptureRequest {
         ui_session: UiSessionId::new("ui-lifecycle"),
@@ -660,7 +668,7 @@ async fn pending_cleanup_preserves_its_lease_after_an_unrelated_rpc_failure() {
 }
 
 #[tokio::test]
-async fn defers_focused_tab_creation_until_the_retained_ui_close_event() {
+async fn defers_focused_tab_creation_until_the_retained_ui_exit_event() {
     let snapshot = lifecycle_snapshot();
     let mut script = ProductionConnectFixture::initial_handshake();
     script.push(ProductionConnectFixture::snapshot_exchange(&snapshot));
@@ -725,13 +733,13 @@ async fn defers_focused_tab_creation_until_the_retained_ui_close_event() {
     );
 
     fixture
-        .send_retained_event(pane_closed_event("pane-2"))
-        .expect("retained subscription accepts the UI close event");
-    wait_for_lifecycle_requests(&fixture, 5, "tab.create after pane_closed").await;
+        .send_retained_event(pane_exited_event("pane-2"))
+        .expect("retained subscription accepts the UI exit event");
+    wait_for_lifecycle_requests(&fixture, 5, "tab.create after pane_exited").await;
     let requests = fixture.requests().await;
     let creation = requests
         .last()
-        .expect("creation request follows pane_closed");
+        .expect("creation request follows pane_exited");
     assert_eq!(creation["method"], json!("tab.create"));
     assert_eq!(
         creation["params"],
@@ -815,6 +823,7 @@ async fn newer_protocol_server_with_unknown_fields_completes_the_production_life
                 "subscriptions": [
                     { "type": "tab.focused" },
                     { "type": "pane.closed" },
+                    { "type": "pane.exited" },
                 ],
             }),
             response: RecordedResponse::KeepOpen(json!({
@@ -902,6 +911,15 @@ async fn newer_protocol_server_with_unknown_fields_completes_the_production_life
             "event": "pane_focused",
             "data": { "type": "pane_closed", "pane_id": "pane-2", "workspace_id": "workspace-1" },
         }),
+        json!({
+            "event": "pane_exited",
+            "data": { "type": "pane_closed", "pane_id": "pane-2", "workspace_id": "workspace-1" },
+        }),
+        json!({
+            "event": "pane_closed",
+            "data": { "type": "pane_exited", "pane_id": "pane-2", "workspace_id": "workspace-1" },
+        }),
+        json!({ "event": "pane_exited", "data": { "type": "pane_exited", "pane_id": 2 } }),
         json!({ "event": "pane_closed", "data": { "type": "pane_closed", "pane_id": 2 } }),
         json!({ "event": "pane_closed", "data": "pane-2" }),
     ] {
@@ -913,7 +931,7 @@ async fn newer_protocol_server_with_unknown_fields_completes_the_production_life
         tokio::time::timeout(Duration::from_millis(100), fixture.wait_for_requests(5))
             .await
             .is_err(),
-        "mismatched or malformed pane-close events must not release the dispatch"
+        "mismatched or malformed pane-dismissal events must not release the dispatch"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(25), adapter.next_health_event())

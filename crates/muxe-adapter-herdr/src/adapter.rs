@@ -1317,7 +1317,7 @@ impl HerdrAdapter {
     }
 
     async fn observe_subscription_event(&self, mut event: Value) {
-        let Some(pane) = take_closed_pane(&mut event) else {
+        let Some(pane) = take_dismissed_pane(&mut event) else {
             return;
         };
         let queued = self.post_dismissal.lock().await.remove(&pane);
@@ -1381,20 +1381,21 @@ impl HerdrAdapter {
     }
 }
 
-/// Takes the pane ID out of one `pane_closed` subscription event.
+/// Takes the pane ID out of a `pane_closed` or `pane_exited` subscription event.
 ///
-/// Herdr wraps each event as `{ "event": <kind>, "data": { "type": <kind>, ... } }`. The kind must
-/// be `pane_closed` in both places and `data.pane_id` must be a string; unknown envelope and data
-/// fields are ignored.
-fn take_closed_pane(event: &mut Value) -> Option<muxe_core::PaneId> {
+/// Herdr emits `pane_exited` when the UI process ends naturally, without a `pane_closed` event.
+/// The envelope's `event` and `data.type` must agree; unknown fields are ignored.
+fn take_dismissed_pane(event: &mut Value) -> Option<muxe_core::PaneId> {
     let event = event.as_object_mut()?;
-    if event.get("event").and_then(Value::as_str) != Some("pane_closed") {
+    let kind = event.get("event")?.as_str()?;
+    if !matches!(kind, "pane_closed" | "pane_exited") {
+        return None;
+    }
+    let data = event.get("data")?.as_object()?;
+    if data.get("type").and_then(Value::as_str) != Some(kind) {
         return None;
     }
     let data = event.get_mut("data")?.as_object_mut()?;
-    if data.get("type").and_then(Value::as_str) != Some("pane_closed") {
-        return None;
-    }
     match data.remove("pane_id")? {
         Value::String(pane) => Some(muxe_core::PaneId::new(pane)),
         _ => None,
@@ -2774,6 +2775,7 @@ fn subscription_config() -> SubscriptionConfig {
             "subscriptions": [
                 { "type": "tab.focused" },
                 { "type": "pane.closed" },
+                { "type": "pane.exited" },
             ],
         }),
         subscribe_timeout: SUBSCRIBE_TIMEOUT,
