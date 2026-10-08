@@ -1,9 +1,23 @@
+## [0.2.2] - 2026-10-08
+
+### 🚀 Features
+
+- *(config)* Filter menus and bindings by host
+
+### 🐛 Bug Fixes
+
+- *(herdr)* Dispatch creation after natural menu exit
+- *(ci)* Satisfy strict lint for Herdr menu smoke
 ## [0.2.1] - 2026-10-07
 
 ### 🐛 Bug Fixes
 
 - *(herdr)* Gate compatibility on the minimum server release
 - *(herdr)* Decode subscription events from the event/data envelope
+
+### 💼 Other
+
+- V0.2.1
 ## [0.2.0] - 2026-10-06
 
 ### 🐛 Bug Fixes
