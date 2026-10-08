@@ -1,3 +1,8 @@
+## [0.2.3] - 2026-10-08
+
+### 🐛 Bug Fixes
+
+- *(activate)* Validate effective config with selected host
 ## [0.2.2] - 2026-10-08
 
 ### 🚀 Features
@@ -8,6 +13,10 @@
 
 - *(herdr)* Dispatch creation after natural menu exit
 - *(ci)* Satisfy strict lint for Herdr menu smoke
+
+### 💼 Other
+
+- V0.2.2
 ## [0.2.1] - 2026-10-07
 
 ### 🐛 Bug Fixes
