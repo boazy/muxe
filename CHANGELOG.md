@@ -1,8 +1,31 @@
+## [0.3.0] - 2026-10-09
+
+### 🚀 Features
+
+- *(themes)* Embed curated color palettes
+- *(ui)* Add built-in display themes and catalog
+
+### 🐛 Bug Fixes
+
+- *(core)* Preserve configured navigation bindings
+- *(broker)* Retain context and unfinished execution evidence
+- *(lifecycle)* Distinguish refused activation from restored hosts
+- *(runtime)* Render captured diagnostics and unknown outcomes
+- *(core)* Compare binding defaults by canonical key identity
+
+### 🧪 Testing
+
+- *(runtime)* Prove navigation on an owned Herdr terminal
+- *(themes)* Verify built-in catalog and document selection
 ## [0.2.3] - 2026-10-08
 
 ### 🐛 Bug Fixes
 
 - *(activate)* Validate effective config with selected host
+
+### 💼 Other
+
+- V0.2.3
 ## [0.2.2] - 2026-10-08
 
 ### 🚀 Features
