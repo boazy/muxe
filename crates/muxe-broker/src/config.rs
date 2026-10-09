@@ -8,8 +8,8 @@ use std::{
 use muxe_adapter_api::{AdapterCapabilities, HostAdapter};
 use muxe_core::{
     ActionValidation, ActionValidator, ColorSchemeName, CompileInput, CompiledConfig,
-    CompiledGeneration, Compiler, ConfigDiagnostic, ConfigDocument, KeyCapabilities,
-    ReloadSettings, SourceId, ThemeAssets, ThemeName,
+    CompiledGeneration, Compiler, ConfigDiagnostic, ConfigDiagnosticReport, ConfigDocument,
+    KeyCapabilities, ReloadSettings, SourceId, ThemeAssets, ThemeName,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -284,7 +284,7 @@ fn read_config_inputs(inputs: &ConfigInputs) -> Result<LoadedConfigInputs, Confi
         path: path.to_path_buf(),
         source: source_error,
     })?;
-    let base = ConfigDocument::parse(source, yaml).map_err(ConfigError::Diagnostic)?;
+    let base = parse_document(source, yaml.into()).map_err(ConfigError::Diagnostic)?;
     let host_override = match inputs.host_override() {
         Some(path) => read_optional_document(path)?,
         None => None,
@@ -307,6 +307,14 @@ fn compile_loaded_inputs(
     key_capabilities: KeyCapabilities,
     action_validator: &dyn ActionValidator,
 ) -> Result<CompiledConfig, ConfigError> {
+    let mut sources = BTreeMap::new();
+    for document in std::iter::once(&loaded.base)
+        .chain(loaded.host_override.iter())
+        .chain(loaded.theme_assets.themes.values())
+        .chain(loaded.theme_assets.color_schemes.values())
+    {
+        sources.insert(document.source.clone(), Arc::clone(&document.text));
+    }
     Compiler
         .compile(
             CompileInput {
@@ -318,7 +326,12 @@ fn compile_loaded_inputs(
             },
             Some(action_validator),
         )
-        .map_err(ConfigError::Diagnostics)
+        .map_err(|diagnostics| {
+            ConfigError::Diagnostics(ConfigDiagnosticReport {
+                diagnostics,
+                sources,
+            })
+        })
 }
 
 /// Reads an optional document, treating absence as empty.
@@ -341,9 +354,21 @@ fn read_optional_document(path: &Path) -> Result<Option<ConfigDocument>, ConfigE
             });
         }
     };
-    ConfigDocument::parse(SourceId::new(path.display().to_string()), yaml)
+    parse_document(SourceId::new(path.display().to_string()), yaml.into())
         .map(Some)
         .map_err(ConfigError::Diagnostic)
+}
+
+fn parse_document(
+    source: SourceId,
+    text: Arc<str>,
+) -> Result<ConfigDocument, ConfigDiagnosticReport> {
+    ConfigDocument::parse(source.clone(), Arc::clone(&text)).map_err(|diagnostic| {
+        ConfigDiagnosticReport {
+            diagnostics: vec![diagnostic],
+            sources: BTreeMap::from([(source, text)]),
+        }
+    })
 }
 
 #[expect(
@@ -406,7 +431,7 @@ fn load_asset_catalog<Name: Ord>(
             source,
         })?;
         let source = SourceId::new(path.display().to_string());
-        let document = ConfigDocument::parse(source, text).map_err(ConfigError::Diagnostic)?;
+        let document = parse_document(source, text.into()).map_err(ConfigError::Diagnostic)?;
         if documents.insert(name(stem), document).is_some() {
             return Err(ConfigError::DuplicateAsset(stem.to_owned()));
         }
@@ -866,8 +891,57 @@ pub enum ConfigError {
     GenerationExhausted,
     #[error("host capability query failed: {0}")]
     Adapter(#[from] muxe_adapter_api::AdapterError),
-    #[error("configuration parse failed: {0:?}")]
-    Diagnostic(ConfigDiagnostic),
-    #[error("configuration compilation failed: {0:?}")]
-    Diagnostics(Vec<ConfigDiagnostic>),
+    #[error("Muxe could not parse the configuration: {0}")]
+    Diagnostic(ConfigDiagnosticReport),
+    #[error("Muxe could not compile the configuration:\n{0}")]
+    Diagnostics(ConfigDiagnosticReport),
+}
+
+#[cfg(test)]
+mod diagnostic_display_tests {
+    use super::*;
+
+    #[test]
+    fn config_error_preserves_diagnostics_without_debug_dump() {
+        let diagnostic = ConfigDiagnostic::error(
+            muxe_core::DiagnosticCode::InvalidAction,
+            "unsupported action",
+            muxe_core::SourceSpan::new(SourceId::new("<captured-config>"), 2, 8),
+        )
+        .with_note("an action was excluded")
+        .with_help("check the host filter");
+        for error in [
+            ConfigError::Diagnostic(diagnostic.clone().into()),
+            ConfigError::Diagnostics(vec![diagnostic.clone(), diagnostic.clone()].into()),
+        ] {
+            let rendered = error.to_string();
+            assert!(rendered.contains(&diagnostic.to_string()));
+            assert!(!rendered.contains("ConfigDiagnostic {"));
+        }
+    }
+
+    #[test]
+    fn parse_error_renders_captured_text_after_source_file_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yml");
+        let captured: Arc<str> = Arc::from("menus: [unterminated\n");
+        fs::write(&path, captured.as_ref()).unwrap();
+        let error = parse_document(
+            SourceId::new(path.display().to_string()),
+            Arc::clone(&captured),
+        )
+        .map_err(ConfigError::Diagnostic)
+        .unwrap_err();
+        fs::write(&path, "version: 1\nmenus: {}\n").unwrap();
+        let ConfigError::Diagnostic(report) = &error else {
+            panic!("parse failure retains captured diagnostic");
+        };
+        assert!(Arc::ptr_eq(
+            report.sources.values().next().unwrap(),
+            &captured
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains("unterminated"), "{rendered}");
+        assert!(!rendered.contains("version: 1"), "{rendered}");
+    }
 }

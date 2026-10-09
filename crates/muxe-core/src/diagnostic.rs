@@ -1,3 +1,7 @@
+use std::collections::BTreeMap;
+use std::io::{self, Write};
+
+use ariadne::{Config, IndexType, Label, Report, ReportKind, sources};
 use std::fmt;
 use std::sync::Arc;
 
@@ -169,5 +173,226 @@ impl ConfigDiagnostic {
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help = Some(help.into());
         self
+    }
+}
+
+impl fmt::Display for ConfigDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} [{}]", self.message, self.code.as_str())?;
+        for label in &self.labels {
+            write!(
+                formatter,
+                "\n  --> {} (bytes {}..{})",
+                label.span.source, label.span.start, label.span.end
+            )?;
+            if !label.message.is_empty() {
+                write!(formatter, ": {}", label.message)?;
+            }
+        }
+        for note in &self.notes {
+            write!(formatter, "\n  note: {note}")?;
+        }
+        if let Some(help) = &self.help {
+            write!(formatter, "\n  help: {help}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Diagnostics and the immutable source text used to produce them.
+///
+/// Source IDs are labels, not filesystem paths. Rendering never reads files.
+#[derive(Clone, Debug, Default)]
+pub struct ConfigDiagnosticReport {
+    pub diagnostics: Vec<ConfigDiagnostic>,
+    pub sources: BTreeMap<SourceId, Arc<str>>,
+}
+
+impl From<ConfigDiagnostic> for ConfigDiagnosticReport {
+    fn from(diagnostic: ConfigDiagnostic) -> Self {
+        vec![diagnostic].into()
+    }
+}
+
+impl From<Vec<ConfigDiagnostic>> for ConfigDiagnosticReport {
+    fn from(diagnostics: Vec<ConfigDiagnostic>) -> Self {
+        Self {
+            diagnostics,
+            sources: BTreeMap::new(),
+        }
+    }
+}
+
+impl ConfigDiagnosticReport {
+    /// Renders captured excerpts, or source locations when text is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output error without discarding the original diagnostics.
+    pub fn write(&self, context: Option<&str>, output: &mut dyn Write) -> io::Result<()> {
+        for diagnostic in &self.diagnostics {
+            let usable = |label: &DiagnosticLabel| {
+                self.sources.get(&label.span.source).is_some_and(|text| {
+                    label.span.start <= label.span.end && label.span.end <= text.len()
+                })
+            };
+            let Some((primary_index, primary)) = diagnostic
+                .labels
+                .iter()
+                .enumerate()
+                .find(|(_, label)| usable(label))
+            else {
+                if let Some(context) = context {
+                    write!(output, "{context} configuration: ")?;
+                }
+                writeln!(output, "{diagnostic}")?;
+                continue;
+            };
+            let kind = match diagnostic.severity {
+                DiagnosticSeverity::Error => ReportKind::Error,
+                DiagnosticSeverity::Warning => ReportKind::Warning,
+            };
+            let code = context.map_or_else(
+                || diagnostic.code.as_str().to_owned(),
+                |context| format!("{context}/{}", diagnostic.code.as_str()),
+            );
+            let mut report = Report::build(
+                kind,
+                (
+                    primary.span.source.clone(),
+                    primary.span.start..primary.span.end,
+                ),
+            )
+            .with_config(
+                Config::default()
+                    .with_color(false)
+                    .with_index_type(IndexType::Byte),
+            )
+            .with_code(code)
+            .with_message(&diagnostic.message);
+            for (index, label) in diagnostic.labels.iter().enumerate() {
+                if usable(label) {
+                    let rendered =
+                        Label::new((label.span.source.clone(), label.span.start..label.span.end));
+                    report = if label.message.is_empty() && index == primary_index {
+                        report.with_label(rendered.with_message("here"))
+                    } else {
+                        report.with_label(rendered.with_message(&label.message))
+                    };
+                } else {
+                    report = report.with_note(format!(
+                        "{} (bytes {}..{}): {}",
+                        label.span.source, label.span.start, label.span.end, label.message,
+                    ));
+                }
+            }
+            for note in &diagnostic.notes {
+                report = report.with_note(note);
+            }
+            if let Some(help) = &diagnostic.help {
+                report = report.with_help(help);
+            }
+            report.finish().write(
+                sources(
+                    self.sources
+                        .iter()
+                        .map(|(id, text)| (id.clone(), text.as_ref())),
+                ),
+                &mut *output,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for ConfigDiagnosticReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Output<'a, 'b>(&'a mut fmt::Formatter<'b>);
+        impl Write for Output<'_, '_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let text = std::str::from_utf8(bytes).map_err(io::Error::other)?;
+                self.0
+                    .write_str(text)
+                    .map_err(|_| io::Error::other("diagnostic output failed"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        self.write(None, &mut Output(formatter))
+            .map_err(|_| fmt::Error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_less_display_preserves_all_structured_details() {
+        let diagnostic = ConfigDiagnostic::error(
+            DiagnosticCode::InvalidAction,
+            "unknown action",
+            SourceSpan::new(SourceId::new("<synthetic>"), 4, 9),
+        )
+        .with_label(
+            SourceSpan::new(SourceId::new("config.yml"), 12, 20),
+            "related binding",
+        )
+        .with_note("the binding cannot be compiled")
+        .with_help("choose a supported action");
+        let rendered = diagnostic.to_string();
+        for value in [
+            diagnostic.message.as_str(),
+            diagnostic.code.as_str(),
+            "<synthetic>",
+            "4..9",
+            "config.yml",
+            "12..20",
+            diagnostic.labels[1].message.as_str(),
+            diagnostic.notes[0].as_str(),
+            diagnostic.help.as_deref().unwrap(),
+        ] {
+            assert!(rendered.contains(value));
+        }
+    }
+
+    #[test]
+    fn captured_multi_source_reports_use_unicode_byte_offsets() {
+        let primary = SourceId::new("<primary>");
+        let secondary = SourceId::new("<secondary>");
+        let diagnostic = ConfigDiagnostic::error(
+            DiagnosticCode::InvalidValue,
+            "invalid value",
+            SourceSpan::new(primary.clone(), 4, 5),
+        )
+        .with_label(SourceSpan::new(secondary.clone(), 0, 1), "related value")
+        .with_label(
+            SourceSpan::new(SourceId::new("<unavailable>"), 9, 10),
+            "missing excerpt",
+        )
+        .with_note("retained note")
+        .with_help("retained help");
+        let report = ConfigDiagnosticReport {
+            diagnostics: vec![diagnostic],
+            sources: BTreeMap::from([
+                (primary, Arc::from("é: x\n")),
+                (secondary, Arc::from("y: z\n")),
+            ]),
+        };
+        let rendered = report.to_string();
+        for evidence in [
+            "<primary>:1:4",
+            "<secondary>:1:1",
+            "related value",
+            "<unavailable>",
+            "9..10",
+            "missing excerpt",
+            "retained note",
+            "retained help",
+        ] {
+            assert!(rendered.contains(evidence), "{rendered}");
+        }
     }
 }

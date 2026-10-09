@@ -2428,7 +2428,43 @@ async fn write_message(
 }
 
 fn error_diagnostic(error: &BrokerError) -> muxe_protocol::ProtocolDiagnostic {
-    let mut message = error.to_string();
+    let mut message = match error {
+        BrokerError::Configuration(config) => match config.as_ref() {
+            crate::ConfigError::Diagnostic(report) | crate::ConfigError::Diagnostics(report) => {
+                let mut summary = String::new();
+                for (index, diagnostic) in report.diagnostics.iter().enumerate() {
+                    if index > 0 {
+                        summary.push_str("; ");
+                    }
+                    write!(
+                        summary,
+                        "[{}] {}",
+                        diagnostic.code.as_str(),
+                        diagnostic.message
+                    )
+                    .expect("writing to a String cannot fail");
+                }
+                summary
+            }
+            _ => error.to_string(),
+        },
+        _ => error.to_string(),
+    };
+    // Rich local reports contain source excerpts and line breaks. Wire
+    // diagnostics are single-line text, including when an external cause
+    // supplies a control character.
+    if message.chars().any(char::is_control) {
+        message = message
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+    }
     muxe_protocol::truncate_utf8(&mut message, muxe_protocol::MAX_DIAGNOSTIC_LEN);
     muxe_protocol::ProtocolDiagnostic {
         code: match error {
@@ -2590,6 +2626,92 @@ mod tests {
     };
 
     use super::*;
+
+    fn decode_error_response(
+        diagnostic: muxe_protocol::ProtocolDiagnostic,
+    ) -> muxe_protocol::ProtocolDiagnostic {
+        let welcome = WireMessage::Welcome {
+            request_id: RequestId([1; 16]),
+            welcome: muxe_protocol::Welcome {
+                broker_version: "test".to_owned(),
+                live_server: LiveServerIdentity {
+                    host: HostKind::Herdr,
+                    discovery_key: "owned-frame".to_owned(),
+                    server_id: WireServerId::new("owned-server"),
+                },
+                accepted_frame_len: muxe_protocol::MAX_FRAME_LEN,
+            },
+        };
+        let response = WireMessage::Response {
+            request_id: RequestId([2; 16]),
+            response: BrokerResponse::Error(diagnostic),
+        };
+        let mut bytes = Prelude::rkyv(PeerRole::Ui, SchemaFingerprint::application())
+            .encode()
+            .to_vec();
+        for message in [welcome, response] {
+            let frame = encode_frame(&message).unwrap();
+            bytes.extend_from_slice(frame.prefix());
+            bytes.extend_from_slice(frame.payload());
+        }
+        let mut decoder = ConnectionDecoder::new(ConnectionPolicy::client(
+            PeerRole::Ui,
+            SchemaFingerprint::application(),
+        ));
+        let mut responses = Vec::new();
+        decoder
+            .push(&bytes, |frame| responses.push(frame.deserialize().unwrap()))
+            .unwrap();
+        decoder.finish().unwrap();
+        let WireMessage::Response {
+            response: BrokerResponse::Error(diagnostic),
+            ..
+        } = responses.pop().unwrap()
+        else {
+            panic!("decoder must deliver the broker error");
+        };
+        diagnostic
+    }
+
+    #[test]
+    fn configuration_errors_survive_the_public_wire_decoder() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yml");
+        let long_action = format!("unknown:{}", "é".repeat(muxe_protocol::MAX_DIAGNOSTIC_LEN));
+        for yaml in [
+            "menus: [unterminated\n".to_owned(),
+            "version: 1\ntheme: missing-theme\nmenus: {main: {bindings: {}}}\n".to_owned(),
+            format!(
+                "version: 1\nmenus:\n  main:\n    bindings:\n      a: {{action: '{long_action}'}}\n"
+            ),
+        ] {
+            std::fs::write(&config_path, yaml).unwrap();
+            let error = crate::load_effective_config(
+                &config_path,
+                "herdr.yml",
+                KeyCapabilities::default(),
+                &SmokeAdapter::new(),
+            )
+            .unwrap_err();
+            let (crate::ConfigError::Diagnostic(report) | crate::ConfigError::Diagnostics(report)) =
+                &error
+            else {
+                panic!("fixture must produce structured configuration diagnostics");
+            };
+            assert!(error.to_string().contains('\n'));
+            let code = report.diagnostics[0].code.as_str();
+            let diagnostic = decode_error_response(error_diagnostic(&BrokerError::Configuration(
+                Box::new(error),
+            )));
+            assert_eq!(
+                diagnostic.code,
+                muxe_protocol::DiagnosticCode::InvalidRequest
+            );
+            assert!(diagnostic.message.contains(code));
+            assert!(!diagnostic.message.chars().any(char::is_control));
+            assert!(diagnostic.message.len() <= muxe_protocol::MAX_DIAGNOSTIC_LEN);
+        }
+    }
 
     #[test]
     fn detached_response_closes_attachment_ownership() {

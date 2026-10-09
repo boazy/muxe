@@ -787,7 +787,13 @@ impl UiRuntime {
                 kind,
                 diagnostic.map_or_else(
                     || fallback.to_owned(),
-                    |diagnostic| diagnostic.message.clone(),
+                    |diagnostic| {
+                        if outcome == ExecutionOutcome::OutcomeUnknown {
+                            format!("{fallback}: {}", diagnostic.message)
+                        } else {
+                            diagnostic.message.clone()
+                        }
+                    },
                 ),
             );
             return UiCommand::Redraw;
@@ -2854,6 +2860,34 @@ pub(crate) mod tests {
                 .is_some(),
             "unrelated completion cannot clear pending"
         );
+    }
+
+    #[test]
+    fn detailed_completion_preserves_unknown_outcome_and_clears_pending() {
+        let (mut runtime, _, execution) = error_runtime();
+        let detail = "activation suspended an adapter with a queued request";
+        assert_eq!(
+            runtime
+                .handle_broker_event(
+                    &BrokerEvent::ExecutionCompleted {
+                        session: UiSessionId::new("ui"),
+                        execution,
+                        outcome: muxe_protocol::ExecutionOutcome::OutcomeUnknown,
+                        diagnostic: Some(muxe_protocol::ProtocolDiagnostic {
+                            code: muxe_protocol::DiagnosticCode::OutcomeUnknown,
+                            message: detail.to_owned(),
+                        }),
+                    },
+                    at(3),
+                )
+                .unwrap(),
+            UiCommand::Redraw
+        );
+        assert!(runtime.pending.is_none());
+        let status = runtime.status.as_ref().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(status.message.contains("unknown"));
+        assert!(status.message.contains(detail));
     }
 
     #[test]

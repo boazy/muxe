@@ -43,7 +43,8 @@ pub use context::{
     SessionId, SessionName, TabId, WorkspaceId, WorktreeId,
 };
 pub use diagnostic::{
-    ConfigDiagnostic, DiagnosticCode, DiagnosticLabel, DiagnosticSeverity, SourceId, SourceSpan,
+    ConfigDiagnostic, ConfigDiagnosticReport, DiagnosticCode, DiagnosticLabel, DiagnosticSeverity,
+    SourceId, SourceSpan,
 };
 pub use execution::{
     AfterAction, ExecutionCapabilities, ExecutionMode, ExecutionPolicy, MenuControl,

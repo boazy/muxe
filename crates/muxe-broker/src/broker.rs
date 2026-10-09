@@ -748,25 +748,29 @@ fn theme_selection_broker_error(error: muxe_core::ThemeSelectionError) -> Broker
     let config_error = match error {
         muxe_core::ThemeSelectionError::InvalidTheme { diagnostics, .. }
         | muxe_core::ThemeSelectionError::InvalidColorScheme { diagnostics, .. } => {
-            ConfigError::Diagnostics(diagnostics)
+            ConfigError::Diagnostics(diagnostics.into())
         }
         muxe_core::ThemeSelectionError::InvalidPair {
             error,
             theme,
             color_scheme,
             span,
-        } => ConfigError::Diagnostics(vec![ConfigDiagnostic::error(
-            muxe_core::DiagnosticCode::InvalidTheme,
-            format!("theme `{theme}` cannot pair with color scheme `{color_scheme}`: {error}"),
-            span,
-        )]),
-        muxe_core::ThemeSelectionError::StaleResolution => {
-            ConfigError::Diagnostics(vec![ConfigDiagnostic::error(
+        } => ConfigError::Diagnostics(
+            vec![ConfigDiagnostic::error(
+                muxe_core::DiagnosticCode::InvalidTheme,
+                format!("theme `{theme}` cannot pair with color scheme `{color_scheme}`: {error}"),
+                span,
+            )]
+            .into(),
+        ),
+        muxe_core::ThemeSelectionError::StaleResolution => ConfigError::Diagnostics(
+            vec![ConfigDiagnostic::error(
                 muxe_core::DiagnosticCode::InvalidTheme,
                 "theme resolution belongs to another generation",
                 fallback_span(),
-            )])
-        }
+            )]
+            .into(),
+        ),
         error @ (muxe_core::ThemeSelectionError::UnknownTheme { .. }
         | muxe_core::ThemeSelectionError::UnknownColorScheme { .. }) => {
             let code = match &error {
@@ -778,11 +782,14 @@ fn theme_selection_broker_error(error: muxe_core::ThemeSelectionError) -> Broker
                 }
                 _ => unreachable!("unknown selection error covered above"),
             };
-            ConfigError::Diagnostics(vec![ConfigDiagnostic::error(
-                code,
-                error.to_string(),
-                fallback_span(),
-            )])
+            ConfigError::Diagnostics(
+                vec![ConfigDiagnostic::error(
+                    code,
+                    error.to_string(),
+                    fallback_span(),
+                )]
+                .into(),
+            )
         }
     };
     BrokerError::Configuration(Box::new(config_error))
@@ -3400,9 +3407,9 @@ impl Broker {
             ActionSpec::Portable(action) => Some(action.resolve_context(&origin).map_err(
                 |error| match error {
                     muxe_core::PortableActionResolutionError::Context(error) => {
-                        BrokerError::ContextUnavailable(
-                            ContextUnavailableReason::MissingReference(error.reference),
-                        )
+                        BrokerError::ContextUnavailable(ContextUnavailableReason::MissingReference(
+                            error.reference,
+                        ))
                     }
                     muxe_core::PortableActionResolutionError::InvalidValue {
                         parameter,
@@ -3690,12 +3697,11 @@ impl Broker {
         origin: muxe_core::OriginContext,
         candidate: &muxe_core::NativeActionCandidate,
     ) -> Result<muxe_adapter_api::DispatchAccepted, BrokerError> {
-        let action = ResolvedNativeAction::from_origin(candidate, &origin)
-            .map_err(|error| {
-                BrokerError::ContextUnavailable(
-                    ContextUnavailableReason::MissingReference(error.reference),
-                )
-            })?;
+        let action = ResolvedNativeAction::from_origin(candidate, &origin).map_err(|error| {
+            BrokerError::ContextUnavailable(ContextUnavailableReason::MissingReference(
+                error.reference,
+            ))
+        })?;
         self.adapter
             .dispatch_native(muxe_adapter_api::NativeDispatchRequest {
                 execution: core_execution,
@@ -5748,8 +5754,11 @@ menus:
     #[tokio::test]
     async fn missing_native_context_retains_reference_without_host_dispatch() {
         let adapter = counting_adapter(false);
-        let (broker, _directory) =
-            counting_broker(&adapter, "<native context regression>", COUNTING_RELOAD_YAML);
+        let (broker, _directory) = counting_broker(
+            &adapter,
+            "<native context regression>",
+            COUNTING_RELOAD_YAML,
+        );
         let reference = muxe_core::ContextReference {
             path: muxe_core::ContextPath::OriginWorkspaceId,
         };
@@ -5994,8 +6003,7 @@ menus:
             COUNTING_AWAIT_FOCUS_YAML,
         );
         let (session, _events_rx) = attach_ready(&broker, "session-drain-ui").await;
-        let wire =
-            invoke_awaited_binding(&broker, &session, &binding, mpsc::channel(1).0).await;
+        let wire = invoke_awaited_binding(&broker, &session, &binding, mpsc::channel(1).0).await;
         let core = {
             let state = broker.state.lock().await;
             let record = state
@@ -9089,7 +9097,7 @@ menus:
             resolve_command_cwd(&relative, Some(&literal_relative)),
             Err(BrokerError::ContextUnavailable(
                 ContextUnavailableReason::RelativeWorkingDirectory(path)
-            )) if path == PathBuf::from("not-absolute")
+            )) if path == std::path::Path::new("not-absolute")
         ));
     }
 
@@ -10040,6 +10048,7 @@ colors:
         let ConfigError::Diagnostics(diagnostics) = error.as_ref() else {
             panic!("mixed theme/color-scheme failure carries source diagnostics");
         };
+        let diagnostics = &diagnostics.diagnostics;
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, muxe_core::DiagnosticCode::InvalidTheme);
         assert!(

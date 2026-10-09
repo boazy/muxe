@@ -1,11 +1,3 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::{self, Write},
-    path::Path,
-};
-
-use ariadne::{Config, IndexType, Label, Report, ReportKind, sources};
 use muxe_adapter_herdr::{
     CONFIG_OVERRIDE_FILENAME as HERDR_CONFIG_OVERRIDE_FILENAME, HerdrConfigValidator,
 };
@@ -13,13 +5,15 @@ use muxe_adapter_zellij::{
     CONFIG_OVERRIDE_FILENAME as ZELLIJ_CONFIG_OVERRIDE_FILENAME, ZellijValidator,
 };
 use muxe_broker::{ConfigError, load_effective_config};
-use muxe_core::{ActionValidator, ConfigDiagnostic, DiagnosticSeverity, KeyCapabilities};
+use muxe_core::{ActionValidator, KeyCapabilities};
+use std::{
+    io::{self, Write},
+    path::Path,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CheckError {
-    #[error("could not read diagnostic source {path}: {source}")]
-    Source { path: String, source: io::Error },
     #[error("could not render configuration diagnostics: {0}")]
     Render(#[from] io::Error),
 }
@@ -103,10 +97,10 @@ fn render_config_error(
     output: &mut dyn Write,
 ) -> Result<(), CheckError> {
     match error {
-        ConfigError::Diagnostic(diagnostic) => {
-            render_diagnostics(host_name, std::slice::from_ref(diagnostic), output)
+        ConfigError::Diagnostic(report) | ConfigError::Diagnostics(report) => {
+            report.write(Some(host_name), output)?;
+            Ok(())
         }
-        ConfigError::Diagnostics(diagnostics) => render_diagnostics(host_name, diagnostics, output),
         _ => {
             writeln!(output, "{host_name} configuration: {error}")?;
             Ok(())
@@ -114,125 +108,10 @@ fn render_config_error(
     }
 }
 
-fn render_diagnostics(
-    host_name: &str,
-    diagnostics: &[ConfigDiagnostic],
-    output: &mut dyn Write,
-) -> Result<(), CheckError> {
-    let source_text = diagnostic_sources(diagnostics)?;
-    for diagnostic in diagnostics {
-        let Some((primary_index, primary)) = diagnostic
-            .labels
-            .iter()
-            .enumerate()
-            .find(|(_, label)| source_text.contains_key(label.span.source.as_str()))
-        else {
-            render_source_less_diagnostic(host_name, diagnostic, output)?;
-            continue;
-        };
-        let kind = match diagnostic.severity {
-            DiagnosticSeverity::Error => ReportKind::Error,
-            DiagnosticSeverity::Warning => ReportKind::Warning,
-        };
-        let mut report = Report::build(
-            kind,
-            (
-                primary.span.source.as_str().to_owned(),
-                primary.span.start..primary.span.end,
-            ),
-        )
-        .with_config(
-            Config::default()
-                .with_color(false)
-                .with_index_type(IndexType::Byte),
-        )
-        .with_code(format!("{host_name}/{}", diagnostic.code.as_str()))
-        .with_message(diagnostic.message.clone());
-        for (index, label) in diagnostic
-            .labels
-            .iter()
-            .enumerate()
-            .filter(|(_, label)| source_text.contains_key(label.span.source.as_str()))
-        {
-            let rendered = Label::new((
-                label.span.source.as_str().to_owned(),
-                label.span.start..label.span.end,
-            ));
-            report = if label.message.is_empty() {
-                if index == primary_index {
-                    report.with_label(rendered.with_message("here"))
-                } else {
-                    report.with_label(rendered)
-                }
-            } else {
-                report.with_label(rendered.with_message(label.message.clone()))
-            };
-        }
-        for note in &diagnostic.notes {
-            report = report.with_note(note.clone());
-        }
-        if let Some(help) = &diagnostic.help {
-            report = report.with_help(help.clone());
-        }
-        report
-            .finish()
-            .write(sources(source_text.clone()), &mut *output)?;
-    }
-    Ok(())
-}
-
-fn render_source_less_diagnostic(
-    host_name: &str,
-    diagnostic: &ConfigDiagnostic,
-    output: &mut dyn Write,
-) -> Result<(), CheckError> {
-    writeln!(
-        output,
-        "{host_name} configuration {}: {}",
-        diagnostic.code.as_str(),
-        diagnostic.message
-    )?;
-    for note in &diagnostic.notes {
-        writeln!(output, "note: {note}")?;
-    }
-    if let Some(help) = &diagnostic.help {
-        writeln!(output, "help: {help}")?;
-    }
-    Ok(())
-}
-
-fn is_virtual_source(source: &str) -> bool {
-    source.starts_with('<') && source.ends_with('>')
-}
-
-fn diagnostic_sources(
-    diagnostics: &[ConfigDiagnostic],
-) -> Result<BTreeMap<String, String>, CheckError> {
-    let mut source_text = BTreeMap::new();
-    for diagnostic in diagnostics {
-        for label in &diagnostic.labels {
-            let path = label.span.source.as_str();
-            if source_text.contains_key(path) {
-                continue;
-            }
-            if is_virtual_source(path) {
-                continue;
-            }
-            let text = fs::read_to_string(path).map_err(|source| CheckError::Source {
-                path: path.to_owned(),
-                source,
-            })?;
-            source_text.insert(path.to_owned(), text);
-        }
-    }
-    Ok(source_text)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use muxe_core::{ConfigDiagnostic, DiagnosticCode, SourceId, SourceSpan};
     use tempfile::TempDir;
 
     use super::*;
@@ -326,28 +205,6 @@ mod tests {
             output.contains("first indistinguishable binding is here"),
             "{output}"
         );
-        assert!(!output.contains("<muxe built-in>"), "{output}");
-    }
-
-    #[test]
-    fn ariadne_uses_byte_offsets_for_non_ascii_source_text() {
-        let directory = tempfile::tempdir().expect("diagnostic source directory");
-        let path = directory.path().join("config.yml");
-        fs::write(&path, "é: x\n").expect("diagnostic source writes");
-        let diagnostic = ConfigDiagnostic::error(
-            DiagnosticCode::InvalidValue,
-            "invalid value",
-            SourceSpan::new(SourceId::new(path.display().to_string()), 4, 5),
-        );
-
-        let mut output = Vec::new();
-        render_diagnostics("zellij", &[diagnostic], &mut output).expect("diagnostic renders");
-        let output = String::from_utf8(output).expect("diagnostic is UTF-8");
-        assert!(
-            output.contains(&format!("{}:1:4", path.display())),
-            "{output}"
-        );
-        assert!(output.contains("here"), "{output}");
     }
 
     #[test]
