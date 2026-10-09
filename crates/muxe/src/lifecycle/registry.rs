@@ -59,11 +59,11 @@ pub enum RegistryError {
     },
     #[error("registry at {} uses unsupported schema version {version}", path.display())]
     UnsupportedVersion { path: PathBuf, version: u32 },
-    #[error("Zellij registry mutation is not authorized: {0}")]
+    #[error("Muxe cannot update the broker registry: {0}")]
     Unauthorized(String),
-    #[error("broker registry ownership conflict: {0}")]
+    #[error("broker registry identity conflict: {0}")]
     Conflict(String),
-    #[error("cannot mint broker registration identity: {0}")]
+    #[error("cannot generate a broker registration ID: {0}")]
     Entropy(String),
 }
 
@@ -125,9 +125,10 @@ impl BrokerEntry {
         match self.host_kind.as_str() {
             "herdr" => Ok(HostKind::Herdr),
             "zellij" => Ok(HostKind::Zellij),
-            _ => Err(RegistryError::Unauthorized(
-                "registry row carries an unknown host kind".to_owned(),
-            )),
+            _ => Err(RegistryError::Unauthorized(format!(
+                "registry entry contains an unknown host kind {:?}",
+                self.host_kind
+            ))),
         }
     }
 }
@@ -259,7 +260,7 @@ impl RegisteredBroker {
     /// Validates a concretely selected Zellij row while consuming its own identity.
     pub(crate) fn recorded_zellij(entry: BrokerEntry) -> Result<Self, RegistryError> {
         let identity = entry.bridge_identity.as_ref().ok_or_else(|| {
-            RegistryError::Unauthorized("Zellij entry lacks canonical bridge authority".to_owned())
+            RegistryError::Unauthorized("Zellij entry lacks the managed bridge location".to_owned())
         })?;
         validate_zellij_entry(&entry, identity, entry.handoff_id)?;
         Ok(Self::from_validated(entry, HostKind::Zellij))
@@ -330,7 +331,7 @@ impl BridgeMemberId {
     pub fn new(value: String) -> Result<Self, RegistryError> {
         if value.is_empty() || value.contains('\0') {
             return Err(RegistryError::Unauthorized(
-                "bridge member is empty or contains NUL".to_owned(),
+                "Zellij session name is empty or contains NUL".to_owned(),
             ));
         }
         Ok(Self(value))
@@ -362,17 +363,22 @@ impl MemberCensus {
         let mut members = Vec::new();
         for entry in entries {
             if entry.bridge_identity.as_ref() != Some(identity) {
-                return Err(RegistryError::Unauthorized(
-                    "registry entry carries another bridge identity".to_owned(),
-                ));
+                return Err(RegistryError::Unauthorized(format!(
+                    "registry entry contains a different managed bridge location (expected {identity}, received {:?})",
+                    entry.bridge_identity
+                )));
             }
             let member = entry.bridge_member.clone().ok_or_else(|| {
-                RegistryError::Unauthorized("Zellij entry lacks a typed bridge member".to_owned())
+                RegistryError::Unauthorized(
+                    "Zellij entry lacks its registered session name".to_owned(),
+                )
             })?;
             if member.as_str() != entry.discovery_key {
-                return Err(RegistryError::Unauthorized(
-                    "typed bridge member disagrees with discovery key".to_owned(),
-                ));
+                return Err(RegistryError::Unauthorized(format!(
+                    "the registered Zellij session name differs from the discovery key (session={}, discovery key={})",
+                    member.as_str(),
+                    entry.discovery_key
+                )));
             }
             members.push(member);
         }
@@ -381,7 +387,7 @@ impl MemberCensus {
         members.dedup();
         if members.len() != original_len {
             return Err(RegistryError::Unauthorized(
-                "bridge census contains duplicate logical members".to_owned(),
+                "the registered Zellij session list contains duplicates".to_owned(),
             ));
         }
         Ok(Self(members))
@@ -397,7 +403,7 @@ impl MemberCensus {
         members.dedup();
         if members.len() != original_len {
             return Err(RegistryError::Unauthorized(
-                "bridge census contains duplicate logical members".to_owned(),
+                "the registered Zellij session list contains duplicates".to_owned(),
             ));
         }
         Ok(Self(members))
@@ -706,7 +712,7 @@ impl Registry {
             || entry.discovery_key != capability.discovery_key
         {
             return Err(RegistryError::Unauthorized(
-                "target registration exceeds its exact member capability".to_owned(),
+                "the replacement broker registration differs from its authorized session, socket, discovery key, or handoff ID".to_owned(),
             ));
         }
         let _lock = RegistryLock::acquire(&self.lock_path)?;
@@ -719,7 +725,7 @@ impl Registry {
         });
         if !replaceable {
             return Err(RegistryError::Unauthorized(
-                "target capability cannot add a logical bridge member".to_owned(),
+                "the replacement broker cannot register a session absent from the existing bridge group".to_owned(),
             ));
         }
         file.brokers.retain(|known| known.socket != entry.socket);
@@ -746,7 +752,7 @@ impl Registry {
             || old_entry.discovery_key != capability.discovery_key
         {
             return Err(RegistryError::Unauthorized(
-                "old row exceeds the target capability's exact member".to_owned(),
+                "the previous broker's registry entry differs from the session or socket authorized for rollback".to_owned(),
             ));
         }
         let _lock = RegistryLock::acquire(&self.lock_path)?;
@@ -772,7 +778,7 @@ impl Registry {
             });
             if conflicting {
                 return Err(RegistryError::Unauthorized(
-                    "another registry incarnation occupies the journal member".to_owned(),
+                    "another broker registration occupies the session and socket recorded for rollback".to_owned(),
                 ));
             }
             file.brokers.push(old_entry.clone());
@@ -804,7 +810,7 @@ impl Registry {
     pub fn unregister_herdr(&self, registration: &Registration) -> Result<bool, RegistryError> {
         if registration.entry.host_kind != "herdr" {
             return Err(RegistryError::Unauthorized(
-                "non-Herdr cleanup requires a bridge-unit guard".to_owned(),
+                "removing a Zellij registration requires holding its bridge-group lock".to_owned(),
             ));
         }
         self.unregister_owned_inner(&registration.entry)
@@ -837,7 +843,9 @@ impl Registry {
     /// A successor's fresh token cannot match the old broker's cleanup token.
     fn unregister_owned_inner(&self, entry: &BrokerEntry) -> Result<bool, RegistryError> {
         let id = entry.registration_id.ok_or_else(|| {
-            RegistryError::Conflict("owned cleanup lacks registration identity".to_owned())
+            RegistryError::Conflict(
+                "cannot remove the owned broker entry without its registration ID".to_owned(),
+            )
         })?;
         let _lock = RegistryLock::acquire(&self.lock_path)?;
         let mut file = self.read()?;
@@ -883,7 +891,7 @@ impl Registry {
             || candidate.live_server.as_deref().is_none_or(str::is_empty)
         {
             return Err(RegistryError::Conflict(
-                "live candidate lacks exact process registration".to_owned(),
+                "the responding broker has no complete process/registration identity".to_owned(),
             ));
         }
         let _lock = RegistryLock::acquire(&self.lock_path)?;
@@ -899,7 +907,7 @@ impl Registry {
         let owner = owners.next().map(|(index, _)| index);
         if owners.next().is_some() {
             return Err(RegistryError::Conflict(
-                "ambiguous logical broker owner".to_owned(),
+                "more than one registry entry claims the same broker identity".to_owned(),
             ));
         }
         if let Some(index) = owner {
@@ -907,7 +915,7 @@ impl Registry {
             expected.socket.clone_from(&candidate.socket);
             if expected != candidate {
                 return Err(RegistryError::Conflict(
-                    "live endpoint differs from the exact recorded owner".to_owned(),
+                    "the responding broker's process/registration identity differs from its recorded registry entry".to_owned(),
                 ));
             }
         }
@@ -949,7 +957,7 @@ impl Registry {
         let file = self.read()?;
         if file.brokers != observed || !file.brokers.contains(entry) {
             return Err(RegistryError::Conflict(
-                "legacy registry owner changed before reuse".to_owned(),
+                "the older broker's registry entry changed before reuse".to_owned(),
             ));
         }
         revalidate()
@@ -973,7 +981,8 @@ impl Registry {
         let mut file = self.read()?;
         if file.brokers != observed || !file.brokers.contains(stale) {
             return Err(RegistryError::Conflict(
-                "stale registry observation changed before removal".to_owned(),
+                "the registry changed before the previously observed stale entry could be removed"
+                    .to_owned(),
             ));
         }
         revalidate()?;
@@ -1133,7 +1142,7 @@ fn validate_herdr_entry(entry: &BrokerEntry) -> Result<(), RegistryError> {
         || entry.handoff_id.is_some()
     {
         return Err(RegistryError::Unauthorized(
-            "Herdr registration carries Zellij bridge authority".to_owned(),
+            "the Herdr registry entry has a different host kind or contains Zellij bridge, session, or handoff fields".to_owned(),
         ));
     }
     Ok(())
@@ -1150,16 +1159,18 @@ fn validate_zellij_entry(
         || entry.handoff_id != handoff
     {
         return Err(RegistryError::Unauthorized(
-            "Zellij entry does not match its bridge authority".to_owned(),
+            "the Zellij registry entry has a different host kind, managed bridge location, or handoff ID than expected".to_owned(),
         ));
     }
     let member = entry.bridge_member.as_ref().ok_or_else(|| {
-        RegistryError::Unauthorized("Zellij entry lacks a typed bridge member".to_owned())
+        RegistryError::Unauthorized("Zellij entry lacks its registered session name".to_owned())
     })?;
     if member.as_str() != entry.discovery_key {
-        return Err(RegistryError::Unauthorized(
-            "typed bridge member disagrees with discovery key".to_owned(),
-        ));
+        return Err(RegistryError::Unauthorized(format!(
+            "the registered Zellij session name differs from the discovery key (session={}, discovery key={})",
+            member.as_str(),
+            entry.discovery_key
+        )));
     }
     Ok(())
 }

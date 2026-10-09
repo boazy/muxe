@@ -37,7 +37,7 @@ pub enum RetireError {
     Activate(#[from] ActivateError),
     #[error("--host current requires invocation from a managed host")]
     CurrentHostRequired,
-    #[error("auditable operation cannot proceed without its log record")]
+    #[error("could not write the required operation log: {0}")]
     Audit(#[from] crate::logging::LogError),
 }
 

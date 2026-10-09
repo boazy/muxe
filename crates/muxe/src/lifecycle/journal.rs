@@ -57,15 +57,15 @@ pub const RECOVERY_DEADLINE_SECS: u64 = 600;
 pub enum JournalError {
     #[error(transparent)]
     Fs(#[from] FsError),
-    #[error("activation journal at {} is corrupt: {source}", path.display())]
+    #[error("saved activation record at {} is corrupt: {source}", path.display())]
     Corrupt {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
-    #[error("activation journal at {} uses unsupported schema version {version}", path.display())]
+    #[error("saved activation record at {} uses unsupported schema version {version}", path.display())]
     UnsupportedVersion { path: PathBuf, version: u32 },
-    #[error("activation journal state is inconsistent: {0}")]
+    #[error("{0}")]
     Inconsistent(String),
     #[error("Muxe cannot acquire the cache lock while another operation holds it: {}", path.display())]
     CacheActive { path: PathBuf },
@@ -76,7 +76,7 @@ pub enum JournalError {
         source: nix::errno::Errno,
     },
     #[error(
-        "The Zellij activation journal is missing the canonical bridge identity or the complete list of participating sessions"
+        "The saved Zellij activation record is missing the managed bridge location or the complete list of participating sessions"
     )]
     MissingZellijAuthority,
 }
@@ -106,7 +106,7 @@ impl HerdrUnitId {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(JournalError::Inconsistent(
-                "Herdr unit identity is not 32 lowercase hexadecimal characters".to_owned(),
+                "Herdr activation target ID is not 32 lowercase hexadecimal characters".to_owned(),
             ));
         }
         Ok(Self(value))
@@ -198,7 +198,7 @@ pub fn acquire_unit_lock(cache_dir: &Path, unit: &UnitKind) -> Result<UnitLock, 
     match try_acquire_unit_lock(cache_dir, unit)? {
         UnitLockAttempt::Acquired(lock) => Ok(lock),
         UnitLockAttempt::Active => Err(JournalError::Inconsistent(format!(
-            "activation unit is already owned by another process at {}",
+            "another process holds the activation-target lock at {}",
             activation_dir(cache_dir)
                 .join(unit.journal_name())
                 .with_extension("lock")
@@ -230,7 +230,7 @@ pub fn try_acquire_unit_lock(
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     let file = options.open(&path).map_err(|source| {
         JournalError::Inconsistent(format!(
-            "cannot open activation unit lock at {}: {source}",
+            "cannot open the activation-target lock at {}: {source}",
             path.display()
         ))
     })?;
@@ -241,7 +241,7 @@ pub fn try_acquire_unit_lock(
         })),
         Err((_, error)) if error == nix::errno::Errno::EWOULDBLOCK => Ok(UnitLockAttempt::Active),
         Err((_, error)) => Err(JournalError::Inconsistent(format!(
-            "cannot acquire activation unit lock at {}: {error}",
+            "cannot acquire the activation-target lock at {}: {error}",
             path.display()
         ))),
     }
@@ -368,13 +368,13 @@ fn acquire_lock_path_blocking(path: &Path) -> Result<Flock<fs::File>, JournalErr
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     let file = options.open(path).map_err(|source| {
         JournalError::Inconsistent(format!(
-            "cannot open activation unit lock at {}: {source}",
+            "cannot open the activation-target lock at {}: {source}",
             path.display()
         ))
     })?;
     Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, error)| {
         JournalError::Inconsistent(format!(
-            "cannot acquire activation unit lock at {}: {error}",
+            "cannot acquire the activation-target lock at {}: {error}",
             path.display()
         ))
     })
@@ -472,7 +472,7 @@ impl ActivationMemberId {
     pub fn new(value: String) -> Result<Self, JournalError> {
         if value.is_empty() || value.chars().any(char::is_control) {
             return Err(JournalError::Inconsistent(
-                "activation member identity is empty or contains a control character".to_owned(),
+                "activation target name is empty or contains a control character".to_owned(),
             ));
         }
         Ok(Self(value))
@@ -506,7 +506,7 @@ impl MemberEndpoint {
             })
         {
             return Err(JournalError::Inconsistent(
-                "activation member endpoint is not an absolute normalized path".to_owned(),
+                "activation target socket is not an absolute normalized path".to_owned(),
             ));
         }
         Ok(Self(path))
@@ -627,7 +627,7 @@ impl TargetRetirementReceiptId {
         })
         .map_err(|error| {
             JournalError::Inconsistent(format!(
-                "cannot derive target retirement receipt identity: {error}"
+                "cannot generate the replacement broker's stop-confirmation file ID: {error}"
             ))
         })?;
         Ok(Self(fsutil::sha256_hex(&bytes)))
@@ -697,7 +697,7 @@ impl TargetRetirementIntent {
                 )?
         {
             return Err(JournalError::Inconsistent(
-                "target retirement intent does not match exact journal authority".to_owned(),
+                "the replacement broker's stop request differs from its saved activation, target, handoff, or process identity".to_owned(),
             ));
         }
         Ok(())
@@ -810,7 +810,7 @@ impl TransactionMember {
     ) -> Result<Self, JournalError> {
         if handoff_id.0 == [0; 16] {
             return Err(JournalError::Inconsistent(
-                "activation member has a zero handoff".to_owned(),
+                "activation target has an all-zero handoff ID".to_owned(),
             ));
         }
         let id = MemberTransactionId::derive(activation, &member);
@@ -946,7 +946,7 @@ impl ReadyMemberProof {
             || entry.server_pid == 0
         {
             return Err(JournalError::Inconsistent(
-                "Ready target lacks a unique process registration identity".to_owned(),
+                "the replacement broker's readiness record lacks a unique process/registration identity".to_owned(),
             ));
         }
         Ok(proof)
@@ -1089,7 +1089,7 @@ impl ReadyProof {
             || (zellij && journal.bridge_identity.is_none())
         {
             return Err(JournalError::Inconsistent(
-                "Ready proof lacks the exact target incarnation census".to_owned(),
+                "the readiness record does not contain the process/registration identity of every expected replacement broker".to_owned(),
             ));
         }
         Ok(())
@@ -1248,7 +1248,7 @@ impl ActivationJournal {
         };
         if journal.transaction.progress().members.is_empty() {
             return Err(JournalError::Inconsistent(
-                "journal has no members".to_owned(),
+                "the saved activation record has no broker targets".to_owned(),
             ));
         }
         Ok(journal)
@@ -1275,7 +1275,7 @@ impl ActivationJournal {
                     || artifacts.receipt_preimage.bridge_identity != identity
                 {
                     return Err(JournalError::Inconsistent(
-                        "bridge artifacts disagree with transaction authority".to_owned(),
+                        "the saved bridge files, digests, or installation records do not match this activation".to_owned(),
                     ));
                 }
                 self.bridge_identity = Some(identity);
@@ -1287,10 +1287,12 @@ impl ActivationJournal {
                 Ok(())
             }
             UnitKind::Zellij { .. } => Err(JournalError::Inconsistent(
-                "journal unit key disagrees with canonical bridge identity".to_owned(),
+                "the saved activation target ID differs from the managed bridge location"
+                    .to_owned(),
             )),
             UnitKind::Herdr { .. } => Err(JournalError::Inconsistent(
-                "cannot attach Zellij bridge authority to Herdr journal".to_owned(),
+                "a Herdr activation record cannot include a Zellij bridge location or session list"
+                    .to_owned(),
             )),
         }
     }
@@ -1315,7 +1317,7 @@ impl ActivationJournal {
             .find(|member| member.member() == discovery_key && member.handoff_id() == handoff)
             .ok_or_else(|| {
                 JournalError::Inconsistent(
-                    "broker identity and handoff do not name one transaction member".to_owned(),
+                    "the broker identity and handoff ID do not match exactly one saved activation target".to_owned(),
                 )
             })
     }
@@ -1339,7 +1341,7 @@ impl ActivationJournal {
             TransactionDirective::CleanupCommitted | TransactionDirective::CleanupRolledBack
         ) {
             return Err(JournalError::Inconsistent(
-                "terminal transactions accept cleanup only, not broker acknowledgements".to_owned(),
+                "a completed activation accepts cleanup only; broker acknowledgements cannot change its outcome".to_owned(),
             ));
         }
         let member = self
@@ -1348,7 +1350,8 @@ impl ActivationJournal {
             .find(|member| member.member() == discovery_key && member.handoff_id() == handoff)
             .ok_or_else(|| {
                 JournalError::Inconsistent(
-                    "broker acknowledgement does not name one transaction member".to_owned(),
+                    "the broker acknowledgement does not match exactly one saved activation target"
+                        .to_owned(),
                 )
             })?;
         match (directive, ack) {
@@ -1368,7 +1371,7 @@ impl ActivationJournal {
             }
             _ => {
                 return Err(JournalError::Inconsistent(
-                    "broker acknowledgement contradicts the durable transaction directive or intent"
+                    "the broker acknowledgement conflicts with the saved activation decision or requested operation"
                         .to_owned(),
                 ));
             }
@@ -1457,7 +1460,7 @@ impl ActivationJournal {
             TransactionDirective::Prepare | TransactionDirective::Activate
         ) {
             return Err(JournalError::Inconsistent(
-                "Ready has sealed its target; no new target registration is authorized".to_owned(),
+                "replacement broker identities have already been saved with the readiness decision; no new replacement registration is allowed".to_owned(),
             ));
         }
         self.target_restore_capability(discovery_key, endpoint, handoff)
@@ -1490,7 +1493,7 @@ impl ActivationJournal {
             });
         if !authorized {
             return Err(JournalError::Inconsistent(
-                "journal does not authorize this target member endpoint and handoff".to_owned(),
+                "the saved activation record does not authorize this replacement broker's socket and handoff ID".to_owned(),
             ));
         }
         Ok(TargetRegistrationCapability::new(
@@ -1525,7 +1528,7 @@ impl ActivationJournal {
         let progress = self.transaction.progress();
         if progress.members.is_empty() {
             return Err(JournalError::Inconsistent(
-                "journal has no members".to_owned(),
+                "the saved activation record has no broker targets".to_owned(),
             ));
         }
         let mut member_ids = std::collections::HashSet::new();
@@ -1540,7 +1543,7 @@ impl ActivationJournal {
                 || !handoffs.insert(member.handoff_id())
             {
                 return Err(JournalError::Inconsistent(
-                    "journal has invalid or duplicate member authority".to_owned(),
+                    "the saved activation record contains an invalid or duplicate broker target, socket, transaction ID, or handoff ID".to_owned(),
                 ));
             }
             match (member.target, member.target_retirement.as_ref()) {
@@ -1550,12 +1553,13 @@ impl ActivationJournal {
                 ) => intent.validate(self, member)?,
                 (TargetMemberProgress::RetireIntent | TargetMemberProgress::Retired, None) => {
                     return Err(JournalError::Inconsistent(
-                        "retiring target lacks exact durable retirement intent".to_owned(),
+                        "a replacement broker marked as stopping lacks its saved stop request"
+                            .to_owned(),
                     ));
                 }
                 (_, Some(_)) => {
                     return Err(JournalError::Inconsistent(
-                        "target retirement intent exists outside retirement progress".to_owned(),
+                        "a replacement broker has a saved stop request but is not marked as stopping or stopped".to_owned(),
                     ));
                 }
                 (_, None) => {}
@@ -1573,7 +1577,8 @@ impl ActivationJournal {
                     .ok_or(JournalError::MissingZellijAuthority)?;
                 if identity.unit() != *bridge_unit {
                     return Err(JournalError::Inconsistent(
-                        "journal bridge identity disagrees with unit".to_owned(),
+                        "the saved bridge location differs from the activation target ID"
+                            .to_owned(),
                     ));
                 }
                 let members = progress
@@ -1588,12 +1593,12 @@ impl ActivationJournal {
                         != *census
                 {
                     return Err(JournalError::Inconsistent(
-                        "journal member census or exact old rows disagree".to_owned(),
+                        "the saved session list or previous registry entries differ from the activation's broker targets".to_owned(),
                     ));
                 }
                 let bridge = progress.bridge.as_ref().ok_or_else(|| {
                     JournalError::Inconsistent(
-                        "Zellij transaction lacks bridge authority".to_owned(),
+                        "the saved Zellij activation record lacks its bridge files and reload progress".to_owned(),
                     )
                 })?;
                 let mut expected_rollback = bridge.artifacts.receipt_preimage.clone();
@@ -1616,7 +1621,7 @@ impl ActivationJournal {
                     || bridge.artifacts.receipt_rollback != expected_rollback
                 {
                     return Err(JournalError::Inconsistent(
-                        "journal bridge artifacts or exact receipt states disagree with authority"
+                        "the saved bridge files, digests, or previous, replacement, and rollback installation records do not match this activation"
                             .to_owned(),
                     ));
                 }
@@ -1632,7 +1637,7 @@ impl ActivationJournal {
                             .any(|(index, id)| completed[..index].contains(id));
                     if foreign || duplicate {
                         return Err(JournalError::Inconsistent(
-                            "journal reload progress is foreign or duplicated".to_owned(),
+                            "the saved bridge-reload progress includes an unknown or duplicate session".to_owned(),
                         ));
                     }
                 }
@@ -1648,7 +1653,7 @@ impl ActivationJournal {
                         });
                     if !unmutated && !complete {
                         return Err(JournalError::Inconsistent(
-                            "The journal's bridge-reload records do not exactly match the full list of participating sessions".to_owned(),
+                            "The saved bridge-reload records do not exactly match the full list of participating sessions".to_owned(),
                         ));
                     }
                 }
@@ -1660,7 +1665,7 @@ impl ActivationJournal {
                     || progress.bridge.is_some()
                 {
                     return Err(JournalError::Inconsistent(
-                        "Herdr transaction carries Zellij bridge authority".to_owned(),
+                        "the saved Herdr activation record includes Zellij bridge files, a bridge location, or session registrations".to_owned(),
                     ));
                 }
             }
@@ -1816,13 +1821,13 @@ impl ActivationJournal {
         };
         if !proof_valid {
             return Err(JournalError::Inconsistent(
-                "transaction phase lacks exact versioned Ready proof".to_owned(),
+                "the saved activation phase requires a readiness record with the expected schema and replacement broker identities".to_owned(),
             ));
         }
         let valid = valid && bridge_valid && rollback_target_barrier_valid;
         if !valid {
             return Err(JournalError::Inconsistent(
-                "transaction phase contains impossible member progress".to_owned(),
+                "the saved brokers' progress is not valid for the activation phase".to_owned(),
             ));
         }
         Ok(())
@@ -1879,7 +1884,7 @@ impl OldRetirementReceiptId {
         });
         let entry = entries.next().ok_or_else(|| {
             JournalError::Inconsistent(
-                "The journal does not contain the old broker's recorded identity. Muxe cannot verify that it stopped for this handoff".to_owned(),
+                "The saved activation record does not contain the existing broker's identity. Muxe cannot verify that it stopped for this handoff".to_owned(),
             )
         })?;
         if entries.next().is_some()
@@ -1890,7 +1895,7 @@ impl OldRetirementReceiptId {
             || entry.live_server.as_deref().is_none_or(str::is_empty)
         {
             return Err(JournalError::Inconsistent(
-                "The journal's recorded identity for the old broker is incomplete or matches more than one entry. Muxe cannot verify that it stopped for this handoff".to_owned(),
+                "The existing broker's saved identity is incomplete or matches more than one entry. Muxe cannot verify that it stopped for this handoff".to_owned(),
             ));
         }
         let receipt = OldRetirementReceipt {
@@ -1957,7 +1962,8 @@ pub fn has_old_retirement_receipt(
     })?;
     if actual != expected {
         return Err(JournalError::Inconsistent(
-            "old retirement receipt does not attest the exact journal incarnation".to_owned(),
+            "the existing broker's stop-confirmation file differs from its saved activation record"
+                .to_owned(),
         ));
     }
     Ok(true)
@@ -1980,13 +1986,14 @@ pub fn write_old_retirement_receipt(
         || !matches!(member.old, OldMemberProgress::CommitIntent)
     {
         return Err(JournalError::Inconsistent(
-            "old retirement requires durable exact commit intent".to_owned(),
+            "the existing broker cannot record its stop until the exact commit request has been saved".to_owned(),
         ));
     }
     let (id, receipt) = OldRetirementReceiptId::for_member(journal, member)?;
     if receipt.old_entry.live_server.as_deref() != Some(server_id.as_str()) {
         return Err(JournalError::Inconsistent(
-            "old retirement server differs from recorded old incarnation".to_owned(),
+            "the stopped broker's process identity differs from the saved existing broker identity"
+                .to_owned(),
         ));
     }
     let path = id.path(&activation_dir(cache_dir));
@@ -2031,12 +2038,12 @@ fn retirement_intent(member: &TransactionMember) -> Result<&TargetRetirementInte
         TargetMemberProgress::RetireIntent | TargetMemberProgress::Retired
     ) {
         return Err(JournalError::Inconsistent(
-            "target retirement receipt requested outside retirement progress".to_owned(),
+            "a replacement broker's stop-confirmation file was requested before the broker was marked as stopping".to_owned(),
         ));
     }
     member.target_retirement.as_ref().ok_or_else(|| {
         JournalError::Inconsistent(
-            "target retirement receipt lacks durable intent authority".to_owned(),
+            "the replacement broker's stop-confirmation file has no saved stop request".to_owned(),
         )
     })
 }
@@ -2068,7 +2075,8 @@ fn validate_target_retirement_receipt(
         || receipt.retirement != *expected
     {
         return Err(JournalError::Inconsistent(
-            "target retirement receipt does not attest exact journal authority".to_owned(),
+            "the replacement broker's stop-confirmation file differs from its saved stop request"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -2178,7 +2186,7 @@ pub fn acknowledge_remote_target_retirement(
 ) -> Result<PathBuf, JournalError> {
     if journal.directive() != TransactionDirective::RollBack {
         return Err(JournalError::Inconsistent(
-            "target retirement acknowledgement requires rollback".to_owned(),
+            "a replacement broker can acknowledge its stop only during rollback".to_owned(),
         ));
     }
     let index = journal
@@ -2187,13 +2195,14 @@ pub fn acknowledge_remote_target_retirement(
         .position(|member| member.member() == discovery_key && member.handoff_id() == handoff)
         .ok_or_else(|| {
             JournalError::Inconsistent(
-                "target retirement acknowledgement does not name one member".to_owned(),
+                "the replacement broker's stop acknowledgement does not match exactly one activation target".to_owned(),
             )
         })?;
     let member = journal.members()[index].clone();
     if member.target != TargetMemberProgress::RetireIntent {
         return Err(JournalError::Inconsistent(
-            "target retirement acknowledgement requires durable RetireIntent".to_owned(),
+            "the replacement broker's stop acknowledgement requires a saved stop request"
+                .to_owned(),
         ));
     }
     let intent = retirement_intent(&member)?;
@@ -2204,7 +2213,7 @@ pub fn acknowledge_remote_target_retirement(
         } if expected == server_id
     ) {
         return Err(JournalError::Inconsistent(
-            "target retirement acknowledgement has mismatched server authority".to_owned(),
+            "the replacement broker's stop acknowledgement reports a different process identity than the saved stop request".to_owned(),
         ));
     }
     let directory = activation_dir(cache_dir);

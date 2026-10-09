@@ -51,13 +51,13 @@ pub enum ControlError {
         #[source]
         source: std::io::Error,
     },
-    #[error("control IO failed: {0}")]
+    #[error("could not read or write the broker control connection: {0}")]
     Io(#[from] std::io::Error),
-    #[error("control frame decode failed: {0}")]
+    #[error("could not decode the broker control response: {0}")]
     Decode(#[from] muxe_protocol::control::ControlDecodeError),
     #[error("broker closed the control connection")]
     Closed,
-    #[error("The broker rejected {operation}: {diagnostic}")]
+    #[error("The broker rejected {}: {diagnostic}", operation_description(.operation))]
     Rejected {
         operation: &'static str,
         diagnostic: String,
@@ -69,7 +69,9 @@ pub enum ControlError {
     Encode(#[source] serde_json::Error),
     #[error("The control request exceeds the 64 KiB frame limit. The request was not sent")]
     RequestTooLarge,
-    #[error("This control peer does not support the required StatusAt readiness proof")]
+    #[error(
+        "the broker does not support checking client registrations at a shared time (StatusAt)"
+    )]
     UnsupportedStatusAt,
     #[error("broker response carried a mismatched request ID")]
     IdMismatch,
@@ -79,7 +81,7 @@ pub enum ControlError {
         actual: ControlResultKind,
     },
     #[error(
-        "The broker's StatusAt response does not contain the requested handoff ID and readiness proof epoch"
+        "the broker's readiness response differs from the requested handoff or readiness-check ID (handoff: expected {expected_handoff}, received {actual_handoff:?}; readiness-check ID: expected {expected_epoch:?}, received {actual_epoch:?})"
     )]
     ReadinessProofMismatch {
         expected_handoff: HandoffId,
@@ -89,7 +91,9 @@ pub enum ControlError {
     },
     #[error("control operation timed out")]
     Timeout,
-    #[error("broker control peer has wrong UID or lacks a process identity")]
+    #[error(
+        "the broker control connection belongs to another user or does not expose its process identity"
+    )]
     PeerIdentity,
     #[error("broker control endpoint is not an owner-only socket: {}", .0.display())]
     InvalidEndpoint(PathBuf),
@@ -146,13 +150,13 @@ impl ControlResultKind {
 impl std::fmt::Display for ControlResultKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Status => "Status",
-            Self::StatusAt => "StatusAt",
-            Self::Prepared => "Prepared",
-            Self::Committed => "Committed",
-            Self::Aborted => "Aborted",
-            Self::Retired => "Retired",
-            Self::Error => "Error",
+            Self::Status => "status report (Status)",
+            Self::StatusAt => "client registrations at the requested time (StatusAt)",
+            Self::Prepared => "replacement preparation confirmation (Prepared)",
+            Self::Committed => "activation confirmation (Committed)",
+            Self::Aborted => "cancellation confirmation (Aborted)",
+            Self::Retired => "confirmation that the broker stopped serving requests (Retired)",
+            Self::Error => "error response",
         })
     }
 }
@@ -165,6 +169,18 @@ fn operation_name(operation: &ControlOperation) -> &'static str {
         ControlOperation::Commit { .. } => "Commit",
         ControlOperation::Abort { .. } => "Abort",
         ControlOperation::Retire => "Retire",
+    }
+}
+
+fn operation_description(operation: &str) -> &str {
+    match operation {
+        "Status" => "the broker status request (Status)",
+        "StatusAt" => "the client registration check (StatusAt)",
+        "Prepare" => "replacement preparation (Prepare)",
+        "Commit" => "activation confirmation (Commit)",
+        "Abort" => "cancellation of replacement (Abort)",
+        "Retire" => "the request to stop serving work (Retire)",
+        _ => operation,
     }
 }
 

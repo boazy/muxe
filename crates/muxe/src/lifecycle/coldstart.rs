@@ -126,7 +126,7 @@ pub enum ColdstartError {
     #[error("could not access the owner-only broker registry: {0}")]
     Registry(#[from] RegistryError),
     /// Startup-lock acquisition failed with no winner to await.
-    #[error("could not serialize broker startup: {0}")]
+    #[error("could not complete broker startup: {0}")]
     Startup(String),
     /// Child process mechanics failed.
     #[error("could not start the broker child: {0}")]
@@ -141,7 +141,7 @@ pub enum ColdstartError {
     /// No verified broker answered before the readiness deadline.
     #[error("no verified broker answered before the readiness deadline")]
     StartupTimeout,
-    #[error("verified endpoint conflicts with registry authority: {0}")]
+    #[error("could not safely use the broker endpoint: {0}")]
     EndpointConflict(String),
     #[error(
         "The broker's older Status response includes a handoff ID but does not establish its activation phase. Muxe cannot safely attach the UI"
@@ -274,7 +274,12 @@ impl ColdstartPolicy for ZellijColdstart<'_> {
     fn unit_kind(&self, bridge: Option<&BridgeIdentity>) -> Result<UnitKind, ColdstartError> {
         Ok(UnitKind::Zellij {
             bridge_unit: bridge
-                .ok_or_else(|| ColdstartError::Startup("missing canonical bridge".to_owned()))?
+                .ok_or_else(|| {
+                    ColdstartError::Startup(
+                        "Zellij broker startup is missing the bridge installation directory"
+                            .to_owned(),
+                    )
+                })?
                 .unit(),
         })
     }
@@ -285,8 +290,11 @@ impl ColdstartPolicy for ZellijColdstart<'_> {
         _unit: &UnitKind,
         bridge: Option<&BridgeIdentity>,
     ) -> Result<Option<Self::Guard>, ColdstartError> {
-        let identity =
-            bridge.ok_or_else(|| ColdstartError::Startup("missing canonical bridge".to_owned()))?;
+        let identity = bridge.ok_or_else(|| {
+            ColdstartError::Startup(
+                "Zellij broker startup is missing the bridge installation directory".to_owned(),
+            )
+        })?;
         BridgeUnitGuard::try_acquire(cache_dir, identity.clone()).map_err(ColdstartError::Registry)
     }
 
@@ -366,11 +374,11 @@ impl ColdstartAttemptId {
     fn generate() -> Result<Self, ColdstartError> {
         let mut bytes = [0; 16];
         getrandom::getrandom(&mut bytes).map_err(|error| {
-            ColdstartError::Startup(format!("cannot mint startup claim: {error}"))
+            ColdstartError::Startup(format!("cannot generate a startup ownership ID: {error}"))
         })?;
-        (bytes != [0; 16])
-            .then_some(Self(bytes))
-            .ok_or_else(|| ColdstartError::Startup("startup claim was zero".to_owned()))
+        (bytes != [0; 16]).then_some(Self(bytes)).ok_or_else(|| {
+            ColdstartError::Startup("generated startup ownership ID was all zeros".to_owned())
+        })
     }
 }
 
@@ -410,7 +418,7 @@ fn read_spawn_intent(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(ColdstartError::EndpointConflict(format!(
-                "cannot inspect coldstart ownership at {}: {error}",
+                "cannot inspect the saved broker startup record at {}: {error}",
                 path.display()
             )));
         }
@@ -419,11 +427,11 @@ fn read_spawn_intent(
     let bytes = fsutil::read_owner_file(path)
         .map_err(|error| ColdstartError::EndpointConflict(error.to_string()))?;
     let intent: ColdstartSpawnIntent = serde_json::from_slice(&bytes).map_err(|error| {
-        ColdstartError::EndpointConflict(format!("invalid coldstart intent: {error}"))
+        ColdstartError::EndpointConflict(format!("invalid saved broker startup record: {error}"))
     })?;
     if intent.schema_version != 1 || &intent.unit != unit || intent.endpoint != endpoint.socket() {
         return Err(ColdstartError::EndpointConflict(
-            "coldstart intent belongs to another unit or endpoint".to_owned(),
+            "the saved broker startup record has an unsupported schema or belongs to a different activation target or socket".to_owned(),
         ));
     }
     Ok(Some(intent))
@@ -431,10 +439,13 @@ fn read_spawn_intent(
 
 fn publish_spawn_intent(path: &Path, intent: &ColdstartSpawnIntent) -> Result<(), ColdstartError> {
     let bytes = serde_json::to_vec(intent).map_err(|error| {
-        ColdstartError::Spawn(format!("cannot encode coldstart intent: {error}"))
+        ColdstartError::Spawn(format!("cannot encode the broker startup record: {error}"))
     })?;
-    fsutil::write_atomic_new(path, &bytes, "coldstart")
-        .map_err(|error| ColdstartError::Spawn(format!("cannot persist child ownership: {error}")))
+    fsutil::write_atomic_new(path, &bytes, "coldstart").map_err(|error| {
+        ColdstartError::Spawn(format!(
+            "cannot save the broker child ownership record: {error}"
+        ))
+    })
 }
 
 fn update_spawn_intent(path: &Path, intent: &ColdstartSpawnIntent) -> Result<(), ColdstartError> {
@@ -547,7 +558,7 @@ where
         {
             if intent.child.is_none() && recorded_process_is_dead(intent.owner.get())? {
                 return Err(ColdstartError::EndpointConflict(
-                    "prior starter died before recording its child".to_owned(),
+                    "the previous startup parent stopped before saving its child's process ID; Muxe cannot determine which process owns this endpoint".to_owned(),
                 ));
             }
             let active_pid = intent.child.unwrap_or(intent.owner);
@@ -610,7 +621,7 @@ where
         {
             stop_spawned(inputs.spawner, spawned.take());
             return Err(ColdstartError::EndpointConflict(
-                "live endpoint differs from the pending owned child".to_owned(),
+                "the responding broker's process ID differs from the child recorded by the pending startup".to_owned(),
             ));
         }
         let registry = Registry::open(inputs.cache_dir)?;
@@ -655,7 +666,7 @@ where
                     continue;
                 }
                 return Err(ColdstartError::EndpointConflict(
-                    "coldstart parent died before recording its child; preserve ambiguous ownership"
+                    "the startup parent stopped before saving its child's process ID; Muxe cannot determine which process owns this endpoint"
                         .to_owned(),
                 ));
             };
@@ -693,11 +704,13 @@ where
         if let Some(policy) = host.bridge() {
             let identity = bridge.as_ref().ok_or_else(|| {
                 ColdstartError::Startup(
-                    "Zellij coldstart lost its canonical bridge identity".to_owned(),
+                    "Zellij broker startup is missing the managed bridge location".to_owned(),
                 )
             })?;
             let reloader = inputs.reloader.ok_or_else(|| {
-                ColdstartError::Reload("no Zellij bridge reloader for coldstart".to_owned())
+                ColdstartError::Reload(
+                    "Zellij broker startup has no bridge reload handler".to_owned(),
+                )
             })?;
             policy.ensure_loaded(identity, reloader)?;
         }
@@ -772,7 +785,7 @@ where
             Ok(None)
         }
         Err(error) => Err(ColdstartError::Startup(format!(
-            "authenticated Status at {} failed: {error}",
+            "could not verify the responding broker's identity and status at {}: {error}",
             socket.display()
         ))),
     }
@@ -812,11 +825,11 @@ fn validate_status_identity<H: ColdstartPolicy>(
     {
         return Err(ColdstartError::IdentityMismatch {
             expected: format!(
-                "{expected_host:?}/{expected_discovery}/{expected_incarnation:?}/{:?}",
+                "host={expected_host:?}, discovery key={expected_discovery}, process identity={expected_incarnation:?}, bridge={:?}",
                 bridge.map(BridgeIdentity::unit)
             ),
             found: format!(
-                "{:?}/{}/{}/{:?}",
+                "host={:?}, discovery key={}, process identity={}, bridge={:?}",
                 status.live_server.host,
                 status.live_server.discovery_key,
                 status.live_server.server_id.as_str(),
@@ -856,7 +869,7 @@ fn validate_status_identity<H: ColdstartPolicy>(
     };
     if !attachable {
         return Err(ColdstartError::EndpointConflict(format!(
-            "broker is not attachable: {:?}/{:?}/handoff={}/target={}",
+            "the broker is not ready for a UI connection (lifecycle={}, activation phase={:?}, handoff present={}, replacement version present={})",
             status.lifecycle,
             status.phase,
             status.handoff_id.is_some(),
@@ -896,7 +909,7 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
         });
         let Some(known) = matching.next().filter(|_| matching.next().is_none()) else {
             return Err(ColdstartError::EndpointConflict(
-                "legacy peer lacks registration authority for adoption or relocation".to_owned(),
+                "the older broker does not report its registration identity; Muxe can reuse only its unchanged registry entry, not adopt or relocate it".to_owned(),
             ));
         };
         if known.socket != inputs.endpoint.socket()
@@ -908,7 +921,7 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
             || known.handoff_id != bridge.and(verified.status.handoff_id)
         {
             return Err(ColdstartError::EndpointConflict(
-                "legacy peer differs from its exact recorded endpoint".to_owned(),
+                "the older broker's socket, process identity, bridge location, or session differs from its unchanged registry entry".to_owned(),
             ));
         }
         registry.verify_existing(authority, entries, known, || {
@@ -957,7 +970,7 @@ fn ensure_no_activation_journal(cache_dir: &Path, unit: &UnitKind) -> Result<(),
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ColdstartError::Startup(format!(
-            "cannot inspect activation journal at {}: {error}",
+            "cannot inspect the saved activation record at {}: {error}",
             path.display()
         ))),
     }
@@ -1024,10 +1037,10 @@ fn observe_stale_endpoint(path: &Path) -> Result<StaleEndpointObservation, Colds
             })
         }
         Ok(_) => Err(ColdstartError::EndpointConflict(
-            "endpoint became live after Status refusal".to_owned(),
+            "a broker now accepts connections on the previously unresponsive socket".to_owned(),
         )),
         Err(error) => Err(ColdstartError::EndpointConflict(format!(
-            "endpoint {} cannot be proven absent/refused: {error}",
+            "cannot establish that socket {} is absent or has no listening broker: {error}",
             path.display()
         ))),
     }
@@ -1052,7 +1065,7 @@ fn child_socket_replaced(
         || metadata.permissions().mode() & 0o777 != 0o600
     {
         return Err(ColdstartError::EndpointConflict(
-            "starting child endpoint lost owner-only socket identity".to_owned(),
+            "the starting broker's endpoint is not a socket owned by the current user with permissions 0600".to_owned(),
         ));
     }
     Ok(match previous {
@@ -1080,14 +1093,14 @@ fn reconcile_absent_endpoint<S, C, R, H: ColdstartPolicy>(
             && entry.discovery_key == discovery
     }) {
         return Err(ColdstartError::EndpointConflict(
-            "recorded logical broker owns another endpoint".to_owned(),
+            "the registry records this broker identity at a different socket".to_owned(),
         ));
     }
     let mut at_endpoint = entries.iter().filter(|entry| entry.socket == socket);
     let stale = at_endpoint.next();
     if at_endpoint.next().is_some() {
         return Err(ColdstartError::EndpointConflict(
-            "multiple registry rows occupy the deterministic endpoint".to_owned(),
+            "more than one registry entry claims the expected broker socket".to_owned(),
         ));
     }
     let observation = observe_stale_endpoint(socket)?;
@@ -1111,7 +1124,7 @@ fn reconcile_absent_endpoint<S, C, R, H: ColdstartPolicy>(
             .is_some_and(|id| stale.live_server.as_deref() != Some(id.as_str()))
     {
         return Err(ColdstartError::EndpointConflict(
-            "stale row differs from the exact expected host, incarnation, or owner".to_owned(),
+            "the stale registry entry has missing registration details or differs from the expected host, process identity, bridge location, or session".to_owned(),
         ));
     }
     if !recorded_process_is_dead(stale.server_pid)? {

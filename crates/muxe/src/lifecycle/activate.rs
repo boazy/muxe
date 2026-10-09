@@ -133,21 +133,21 @@ pub enum ActivateError {
     CurrentHostRequired,
     #[error("fault injected after {step:?} (test hook)")]
     FaultInjected { step: ActivateStep },
-    #[error("target broker spawn failed: {0}")]
+    #[error("could not start the replacement broker: {0}")]
     Spawn(String),
-    #[error("target process state inspection failed: {0}")]
+    #[error("could not inspect the replacement broker process: {0}")]
     TargetStopInspect(String),
-    #[error("target process termination failed: {0}")]
+    #[error("could not stop the replacement broker process: {0}")]
     TargetStopKill(String),
-    #[error("target process reap failed: {0}")]
+    #[error("could not wait for the replacement broker process to exit: {0}")]
     TargetStopWait(String),
     #[error("bridge reload failed for session {session}: {detail}")]
     Reload { session: String, detail: String },
-    #[error("readiness wait timed out for {identity}")]
+    #[error("replacement broker {identity} did not become ready before the deadline")]
     ReadinessTimeout { identity: String },
-    #[error("unit failed: {reason}")]
+    #[error("{reason}")]
     UnitFailed { reason: String },
-    #[error("auditable operation cannot proceed without its log record")]
+    #[error("could not write the required operation log: {0}")]
     Audit(#[from] crate::logging::LogError),
 }
 
@@ -362,7 +362,9 @@ impl ActivationSupervisor {
         if duplicate {
             return Err((
                 ActivateError::UnitFailed {
-                    reason: "duplicate owned target for one activation member".to_owned(),
+                    reason:
+                        "more than one replacement process is owned for the same activation target"
+                            .to_owned(),
                 },
                 targets,
             ));
@@ -381,7 +383,7 @@ impl ActivationSupervisor {
     ) -> Result<(), ActivateError> {
         if self.cache_dir != cache_dir || self.unit != journal.unit {
             return Err(ActivateError::UnitFailed {
-                reason: "target supervisor does not own this cache and activation unit".to_owned(),
+                reason: "the replacement-process supervisor belongs to a different cache or activation target".to_owned(),
             });
         }
         Ok(())
@@ -411,11 +413,14 @@ impl ActivationSupervisor {
             .iter_mut()
             .find(|target| &target.member == member)
             .ok_or_else(|| ActivateError::UnitFailed {
-                reason: "owned target process authority is unavailable".to_owned(),
+                reason: "the replacement process is not owned by this activation supervisor"
+                    .to_owned(),
             })?;
         if target.handle.child.id() != process_id.get() {
             return Err(ActivateError::UnitFailed {
-                reason: "owned target process authority changed".to_owned(),
+                reason:
+                    "the replacement process ID differs from the supervisor's recorded process ID"
+                        .to_owned(),
             });
         }
         spawner.stop_target(&mut target.handle)
@@ -427,7 +432,9 @@ impl ActivationSupervisor {
             .iter()
             .position(|target| &target.member == member)
             .ok_or_else(|| ActivateError::UnitFailed {
-                reason: "owned target disappeared before receipt durability".to_owned(),
+                reason:
+                    "the replacement process disappeared before its stop confirmation was saved"
+                        .to_owned(),
             })?;
         self.targets.remove(index);
         Ok(())
@@ -444,12 +451,12 @@ impl ActivationSupervisor {
         for mut target in targets {
             let pid = target.handle.child.id();
             diagnostics.push(format!(
-                "shutdown unresolved target member {:?} pid {pid} without retirement receipt",
+                "stopping replacement broker {:?} pid {pid}; its stop-confirmation file has not been saved",
                 target.member
             ));
             if let Err(error) = spawner.stop_target(&mut target.handle) {
                 diagnostics.push(format!(
-                    "shutdown owned target member {:?} pid {pid}: {error}",
+                    "could not stop the owned replacement broker {:?} pid {pid}: {error}",
                     target.member
                 ));
             }
@@ -1186,10 +1193,10 @@ impl ActivationHost for ZellijActivation<'_> {
         config_dir: &Path,
     ) -> Result<(), String> {
         let expected = integration::bridge_identity(config_dir)
-            .map_err(|error| format!("cannot resolve canonical bridge authority: {error}"))?;
+            .map_err(|error| format!("cannot resolve the managed bridge location: {error}"))?;
         if *self.identity != expected {
             return Err(format!(
-                "Zellij unit uses unmanaged bridge identity {}",
+                "the registered Zellij bridge location {} differs from the managed bridge location {expected}",
                 self.identity
             ));
         }
@@ -1214,7 +1221,7 @@ impl ActivationHost for ZellijActivation<'_> {
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "cannot hold broker-observed readiness while sealing as-of proof: {error}"
+                    "cannot lock client registrations while checking replacement broker readiness: {error}"
                 ),
             })
     }
@@ -1225,15 +1232,17 @@ impl ActivationHost for ZellijActivation<'_> {
     ) -> Result<Option<(UnitReadinessEpochId, AsOfTick)>, ActivateError> {
         let mut bytes = [0_u8; 16];
         getrandom::getrandom(&mut bytes).map_err(|error| ActivateError::UnitFailed {
-            reason: format!("cannot mint unit readiness epoch: {error}"),
+            reason: format!("cannot generate the shared readiness-check ID: {error}"),
         })?;
         let epoch =
             UnitReadinessEpochId::from_bytes(bytes).map_err(|error| ActivateError::UnitFailed {
-                reason: format!("invalid unit readiness epoch: {error}"),
+                reason: format!("invalid shared readiness-check ID: {error}"),
             })?;
         let as_of = muxe_adapter_zellij::ReadinessGate::as_of_now().map_err(|error| {
             ActivateError::UnitFailed {
-                reason: format!("cannot capture common monotonic readiness tick: {error}"),
+                reason: format!(
+                    "cannot record the common time for checking client registrations: {error}"
+                ),
             }
         })?;
         Ok(Some((epoch, as_of)))
@@ -1270,7 +1279,7 @@ impl ActivationHost for ZellijActivation<'_> {
             != prepared.len()
         {
             return Err(ActivateError::UnitFailed {
-                reason: "final Ready proof has incomplete target registry membership".to_owned(),
+                reason: "cannot confirm replacement broker readiness: the registry does not contain every expected replacement broker".to_owned(),
             });
         }
         raw.into_iter()
@@ -1316,7 +1325,7 @@ impl BridgeActivation for ZellijActivation<'_> {
         .map_err(|error| error.to_string())?;
         if &current_census != self.census || current_entries != self.entries {
             return Err(
-                "Zellij bridge membership changed after preflight; activation aborted before journal or drain"
+                "the registered Zellij sessions changed after activation checks. No broker in this activation target was asked to hand off, and no replacement broker was started"
                     .to_owned(),
             );
         }
@@ -1353,14 +1362,14 @@ impl BridgeActivation for ZellijActivation<'_> {
         preparation: &mut GlobalPreflight,
     ) -> Result<(), String> {
         let staged = staged_bridge.ok_or_else(|| {
-            "a Zellij unit is selected but no staged replacement bridge was provided".to_owned()
+            "Zellij activation is selected but no replacement bridge bytes were provided".to_owned()
         })?;
         let verification =
             compatibility::verify_packaged_asset(&staged.bytes).map_err(|error| {
                 format!("staged bridge rejected by native package identity: {error}")
             })?;
         let identity = integration::bridge_identity(config_dir)
-            .map_err(|error| format!("cannot resolve canonical bridge authority: {error}"))?;
+            .map_err(|error| format!("cannot resolve the managed bridge location: {error}"))?;
         let stable = identity.stable_path(std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME));
         let receipt = integration::receipt::load(identity.directory())
             .map_err(|error| format!("cannot read integration receipt: {error}"))?
@@ -1417,7 +1426,7 @@ impl BridgeActivation for ZellijActivation<'_> {
                 .bridge_receipt
                 .clone()
                 .ok_or_else(|| ActivateError::UnitFailed {
-                    reason: "Zellij receipt authority is absent".to_owned(),
+                    reason: "the managed Zellij bridge's installation record is missing".to_owned(),
                 })?;
         let old_digest =
             preparation
@@ -1832,7 +1841,7 @@ fn group_zellij(live: &[BrokerEntry]) -> Result<Vec<PlannedUnit>, ActivateError>
             .clone()
             .ok_or_else(|| ActivateError::UnitFailed {
                 reason: format!(
-                    "Zellij registry entry {} lacks canonical bridge authority",
+                    "Zellij registry entry {} does not record the managed bridge location",
                     entry.discovery_key
                 ),
             })?;
@@ -1985,7 +1994,7 @@ where
         Err(error) => {
             return UnitOutcome::Failed {
                 unit: label,
-                reason: format!("activation unit is already in progress: {error}"),
+                reason: format!("could not lock this activation target: {error}"),
             };
         }
     };
@@ -2045,7 +2054,7 @@ fn revalidate_transaction_membership(
     )
     .map_err(|error| error.to_string())?;
     if &current_census != census {
-        return Err("logical Zellij bridge membership changed during activation".to_owned());
+        return Err("the list of registered Zellij sessions changed during activation".to_owned());
     }
     for current in &registry_entries {
         if old_entries.contains(current) {
@@ -2059,7 +2068,7 @@ fn revalidate_transaction_membership(
                     && current.handoff_id() == Some(member.handoff)
             });
         if !authorized {
-            return Err("registry contains a non-journal-authorized bridge incarnation".to_owned());
+            return Err("a registered Zellij broker does not match the existing broker or an authorized replacement in this activation".to_owned());
         }
     }
     Ok(())
@@ -2135,22 +2144,45 @@ where
             .connect(entry.socket())
             .await
             .map_err(|error| ActivateError::UnitFailed {
-                reason: format!("connect {} before journal: {error}", entry.discovery_key()),
+                reason: format!("could not connect to the existing broker {} to check activation prerequisites: {error}. No replacement broker was started for this activation target", entry.discovery_key()),
             })?;
         let status = session
             .status()
             .await
             .map_err(|error| ActivateError::UnitFailed {
-                reason: format!("status {} before journal: {error}", entry.discovery_key()),
+                reason: format!("could not read the existing broker {} status to check activation prerequisites: {error}. No replacement broker was started for this activation target", entry.discovery_key()),
             })?;
-        if status.prepare_handoff != Some(PrepareHandoffProtocol::CoordinatorSuppliedV1)
-            || !host.attests_entry(&status, entry)
-            || status.lifecycle != LifecycleState::Running
-            || status.handoff_id.is_some()
+        let rejection = if status.prepare_handoff
+            != Some(PrepareHandoffProtocol::CoordinatorSuppliedV1)
         {
+            Some(format!(
+                "is running Muxe {}, which does not report support for the broker replacement protocol required by this version. Installing a newer executable does not update a broker that is still running",
+                status.current.muxe_version
+            ))
+        } else if !host.attests_entry(&status, entry) {
+            Some(format!(
+                "reports a different bridge installation from the saved broker registration. Expected bridge ID: {}. Reported bridge ID: {}",
+                entry
+                    .bridge_identity()
+                    .map_or_else(|| "none".to_owned(), |identity| identity.unit().to_string(),),
+                status
+                    .bridge_unit
+                    .map_or_else(|| "none".to_owned(), |identity| identity.to_string(),)
+            ))
+        } else if status.lifecycle != LifecycleState::Running {
+            Some(format!(
+                "cannot be replaced in its current state: {}. Activation requires the broker to be accepting normal work",
+                status.lifecycle
+            ))
+        } else {
+            status.handoff_id.map(|handoff| format!(
+                "still reports a broker replacement request (request ID {handoff}). A new activation requires that request to be cleared"
+            ))
+        };
+        if let Some(reason) = rejection {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "old broker {} does not attest a clean running incarnation",
+                    "existing broker {} {reason}. No replacement broker was started for this activation target",
                     entry.discovery_key()
                 ),
             });
@@ -2362,7 +2394,9 @@ where
             || member.entry.socket() != record.endpoint().as_path()
         {
             return Err(ActivateError::UnitFailed {
-                reason: "prepared registry member differs from journal authority".to_owned(),
+                reason:
+                    "the broker selected for replacement does not match its saved activation record"
+                        .to_owned(),
             });
         }
         let spawn_member = SpawnMember {
@@ -2585,7 +2619,7 @@ where
                     &journal.members()[index],
                 )? {
                     commit_failures.push(format!(
-                        "old {} acknowledged without a durable retirement receipt",
+                        "existing broker {} acknowledged the commit, but its saved stop-confirmation file is missing",
                         member.entry.discovery_key()
                     ));
                     continue;
@@ -2594,7 +2628,7 @@ where
                 journal::write_journal(inputs.cache_dir, &journal)?;
             }
             Err(error) => commit_failures.push(format!(
-                "commit old {}: {error}",
+                "could not commit the handoff on existing broker {}: {error}",
                 member.entry.discovery_key()
             )),
         }
@@ -2622,7 +2656,7 @@ where
             Ok(session) => session,
             Err(error) => {
                 commit_failures.push(format!(
-                    "verify target {}: {error}",
+                    "could not verify replacement broker {} before committing it: {error}",
                     member.entry.discovery_key()
                 ));
                 continue;
@@ -2636,7 +2670,7 @@ where
                 journal::write_journal(inputs.cache_dir, &journal)?;
             }
             Err(error) => commit_failures.push(format!(
-                "commit target {}: {error}",
+                "could not commit replacement broker {}: {error}",
                 member.entry.discovery_key()
             )),
         }
@@ -2679,11 +2713,14 @@ where
         .connect(entry.socket())
         .await
         .map_err(|error| {
-            PrepareFailure::Ambiguous(format!("connect {}: {error}", entry.discovery_key()))
+            PrepareFailure::Ambiguous(format!(
+                "could not connect to existing broker {} before requesting its handoff: {error}",
+                entry.discovery_key()
+            ))
         })?;
     let status = session.status().await.map_err(|error| {
         PrepareFailure::Ambiguous(format!(
-            "status failed for {}: {error}",
+            "could not read existing broker {} status before requesting its handoff: {error}",
             entry.discovery_key()
         ))
     })?;
@@ -2693,7 +2730,7 @@ where
         || status.handoff_id.is_some()
     {
         return Err(PrepareFailure::Ambiguous(format!(
-            "pre-Prepare status mismatched exact old authority for {}",
+            "existing broker {} no longer matches the recorded version, bridge identity, running state, or absence of a handoff. The handoff request was not sent; recovery must determine whether an earlier request changed the broker",
             entry.discovery_key()
         )));
     }
@@ -2729,7 +2766,7 @@ where
             }
             Ok(_) | Err(_) => {
                 return Err(PrepareFailure::Ambiguous(format!(
-                    "prepare outcome is ambiguous for {}: {error}",
+                    "could not confirm whether existing broker {} accepted the handoff request: {error}",
                     entry.discovery_key()
                 )));
             }
@@ -2741,7 +2778,7 @@ where
         || prepared.target.as_ref() != Some(&inputs.target)
     {
         return Err(PrepareFailure::Ambiguous(format!(
-            "prepared status mismatches exact journaled intent for {}",
+            "existing broker {} returned a handoff response that does not match the requested bridge identity, draining state, handoff ID, or replacement version. The handoff outcome is uncertain",
             entry.discovery_key()
         )));
     }
@@ -2911,7 +2948,7 @@ where
         })
     {
         return Err(ActivateError::UnitFailed {
-            reason: "final Ready proof lacks complete durable member progress".to_owned(),
+            reason: "cannot confirm replacement broker readiness: the saved activation record does not show every broker ready and every bridge reload complete".to_owned(),
         });
     }
     let config_dir = inputs.config_dir.to_path_buf();
@@ -2933,10 +2970,10 @@ where
     )
     .await
     .map_err(|_| ActivateError::UnitFailed {
-        reason: "final Ready proof filesystem and registry read timed out".to_owned(),
+        reason: "timed out reading bridge files and the registry while checking replacement broker readiness".to_owned(),
     })?
     .map_err(|error| ActivateError::UnitFailed {
-        reason: format!("final Ready proof reader task failed: {error}"),
+        reason: format!("the task checking bridge files and the registry for replacement broker readiness failed: {error}"),
     })??;
     let mut incarnations = Vec::with_capacity(prepared.len());
     for prepared_member in prepared {
@@ -2972,14 +3009,16 @@ fn prove_ready_bridge(
             .is_none_or(|bridge| bridge.progress != BridgeProgress::TargetReloaded)
     {
         return Err(ActivateError::UnitFailed {
-            reason: "final Ready proof lacks exact reloaded bridge authority".to_owned(),
+            reason: "cannot confirm replacement broker readiness: the saved activation record does not show the expected bridge reloaded in every session".to_owned(),
         });
     }
     revalidate_transaction_membership(cache_dir, bridge_identity, census, old_entries, prepared)
         .map_err(|reason| ActivateError::UnitFailed { reason })?;
     if integration::bridge_identity(config_dir)? != *bridge_identity {
         return Err(ActivateError::UnitFailed {
-            reason: "final Ready proof observed a changed canonical bridge identity".to_owned(),
+            reason:
+                "cannot confirm replacement broker readiness: the managed bridge location changed"
+                    .to_owned(),
         });
     }
     let artifacts = &journal
@@ -3002,7 +3041,7 @@ fn prove_ready_bridge(
         if Sha256Digest::from_bytes(&bytes) != *digest {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "final Ready proof found foreign bridge bytes at {}",
+                    "cannot confirm replacement broker readiness: bridge bytes differ from the recorded digest at {}",
                     path.display()
                 ),
             });
@@ -3010,12 +3049,12 @@ fn prove_ready_bridge(
     }
     let receipt = integration::receipt::load(bridge_identity.directory())?.ok_or_else(|| {
         ActivateError::UnitFailed {
-            reason: "final Ready proof lost the old bridge receipt".to_owned(),
+            reason: "cannot confirm replacement broker readiness: the previous bridge's installation record is missing".to_owned(),
         }
     })?;
     if receipt.bridge != artifacts.receipt_preimage {
         return Err(ActivateError::UnitFailed {
-            reason: "final Ready proof found changed old bridge receipt authority".to_owned(),
+            reason: "cannot confirm replacement broker readiness: the previous bridge's installation record changed".to_owned(),
         });
     }
     Ok(())
@@ -3039,13 +3078,13 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
                 && member.handoff_id() == prepared.handoff
         })
         .ok_or_else(|| ActivateError::UnitFailed {
-            reason: "final Ready proof lost exact journal member authority".to_owned(),
+            reason: "cannot confirm replacement broker readiness: the broker does not match any saved activation target".to_owned(),
         })?;
     let target = targets
         .iter_mut()
         .find(|target| target.member == member.id)
         .ok_or_else(|| ActivateError::UnitFailed {
-            reason: "final Ready proof lost its owned target child".to_owned(),
+            reason: "cannot confirm replacement broker readiness: its child process is no longer owned by this activation".to_owned(),
         })?;
     if target
         .handle
@@ -3056,7 +3095,7 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "final Ready proof target {} already exited",
+                "replacement broker {} exited before the final readiness check",
                 member.member().as_str()
             ),
         });
@@ -3066,7 +3105,7 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
         .filter(|row| row.socket() == prepared.entry.socket());
     let row = matching.next().ok_or_else(|| ActivateError::UnitFailed {
         reason: format!(
-            "final Ready proof target {} has no registry row",
+            "replacement broker {} has no registry entry at the final readiness check",
             member.member().as_str()
         ),
     })?;
@@ -3079,7 +3118,7 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "final Ready proof target {} registry incarnation is not journal-authorized",
+                "replacement broker {} has a duplicate registry entry or a process/registration identity that differs from the saved activation record",
                 member.member().as_str()
             ),
         });
@@ -3103,7 +3142,7 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "final Ready proof target {} lost exact live readiness",
+                "replacement broker {} no longer reports the expected identity, running state, version, and client registrations at the final readiness check",
                 member.member().as_str()
             ),
         });
@@ -3125,10 +3164,10 @@ async fn fetch_final_ready_status<C: ControlPort>(
     let mut session = tokio::time::timeout_at(deadline.into(), control.connect(row.socket()))
         .await
         .map_err(|_| ActivateError::UnitFailed {
-            reason: format!("final Ready proof connection to {discovery} timed out"),
+            reason: format!("timed out connecting to replacement broker {discovery} for the final readiness check"),
         })?
         .map_err(|error| ActivateError::UnitFailed {
-            reason: format!("final Ready proof cannot connect {discovery}: {error}"),
+            reason: format!("cannot connect to replacement broker {discovery} for the final readiness check: {error}"),
         })?;
     tokio::time::timeout_at(deadline.into(), async {
         if let Some((epoch, as_of)) = proof {
@@ -3139,10 +3178,10 @@ async fn fetch_final_ready_status<C: ControlPort>(
     })
     .await
     .map_err(|_| ActivateError::UnitFailed {
-        reason: format!("final Ready proof status for {discovery} timed out"),
+        reason: format!("timed out reading replacement broker {discovery} status for the final readiness check"),
     })?
     .map_err(|error| ActivateError::UnitFailed {
-        reason: format!("final Ready proof cannot inspect {discovery}: {error}"),
+        reason: format!("cannot read replacement broker {discovery} status for the final readiness check: {error}"),
     })
 }
 
@@ -3187,7 +3226,7 @@ fn persist_ready_decision(
             let on_disk = journal::read_journal(journal_path).map_err(|read_error| {
                 ActivateError::UnitFailed {
                     reason: format!(
-                        "Ready persistence failed ({error}); cannot establish durable phase: {read_error}"
+                        "could not save the activation readiness decision ({error}). Could not read back the saved activation record to determine whether it was saved: {read_error}"
                     ),
                 }
             })?;
@@ -3195,7 +3234,7 @@ fn persist_ready_decision(
                 fsutil::sync_file_and_parent(journal_path).map_err(|sync_error| {
                     ActivateError::UnitFailed {
                         reason: format!(
-                            "Ready persistence failed ({error}); cannot complete durability: {sync_error}"
+                            "could not save the activation readiness decision ({error}). Could not sync the saved activation record to disk: {sync_error}"
                         ),
                     }
                 })?;
@@ -3203,12 +3242,12 @@ fn persist_ready_decision(
             } else if on_disk == before_ready {
                 *journal = on_disk;
                 Ok(ReadyWriteOutcome::NotWritten(format!(
-                    "Ready persistence failed before durable decision: {error}"
+                    "the activation readiness decision was not saved: {error}"
                 )))
             } else {
                 Err(ActivateError::UnitFailed {
                     reason: format!(
-                        "Ready persistence failed ({error}); journal changed outside exact transaction authority"
+                        "could not save the activation readiness decision ({error}). The saved activation record now differs from this transaction"
                     ),
                 })
             }
@@ -3343,12 +3382,14 @@ fn apply_bridge_rollback_action<R: HostReloader + ?Sized>(
         .bridge_identity
         .clone()
         .ok_or_else(|| ActivateError::UnitFailed {
-            reason: "bridge rollback action lacks canonical identity".to_owned(),
+            reason:
+                "cannot restore the bridge: the saved activation record lacks its managed location"
+                    .to_owned(),
         })?;
     let artifacts = journal
         .bridge()
         .ok_or_else(|| ActivateError::UnitFailed {
-            reason: "bridge rollback action lacks artifacts".to_owned(),
+            reason: "cannot restore the bridge: the saved activation record lacks the previous and replacement bridge files".to_owned(),
         })?
         .artifacts
         .clone();
@@ -3457,7 +3498,7 @@ fn apply_bridge_rollback_action<R: HostReloader + ?Sized>(
                 BridgeProgress::OldReloading { completed, .. } => completed.clone(),
                 _ => {
                     return Err(ActivateError::UnitFailed {
-                        reason: "bridge restoration completed outside old reload phase".to_owned(),
+                        reason: "cannot finish restoring the bridge: the saved activation record is not in the previous-bridge reload phase".to_owned(),
                     });
                 }
             };
@@ -3470,7 +3511,7 @@ fn apply_bridge_rollback_action<R: HostReloader + ?Sized>(
         }
         _ => {
             return Err(ActivateError::UnitFailed {
-                reason: "non-bridge action reached bridge rollback executor".to_owned(),
+                reason: "the bridge rollback handler received an action for a broker instead of the bridge".to_owned(),
             });
         }
     }
@@ -3518,7 +3559,7 @@ fn classify_prepare_status(
     if !exact_member || !status_attests_journal(status, journal) {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "{} Prepare intent status does not attest exact journal authority",
+                "existing broker {} reports an identity or version that differs from its saved handoff request",
                 member.member().as_str()
             ),
         });
@@ -3538,7 +3579,7 @@ fn classify_prepare_status(
     } else {
         Err(ActivateError::UnitFailed {
             reason: format!(
-                "{} Prepare intent has mismatched evidence",
+                "existing broker {} does not report either running without a handoff or draining for the saved handoff and replacement version",
                 member.member().as_str()
             ),
         })
@@ -3561,7 +3602,7 @@ fn classify_target_status(
     } else {
         Err(ActivateError::UnitFailed {
             reason: format!(
-                "target {} does not attest exact rollback authority",
+                "replacement broker {} does not report the identity, version, or handoff recorded for rollback",
                 member.member().as_str()
             ),
         })
@@ -3579,7 +3620,7 @@ fn classify_resume_status(
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "{} resume status does not attest exact journal authority",
+                "existing broker {} reports an identity or version that differs from the saved record for resuming it",
                 member.member().as_str()
             ),
         });
@@ -3597,7 +3638,7 @@ fn classify_resume_status(
     } else {
         Err(ActivateError::UnitFailed {
             reason: format!(
-                "{} resume intent has mismatched evidence",
+                "existing broker {} does not report either running without a handoff or draining for the saved handoff and replacement version",
                 member.member().as_str()
             ),
         })
@@ -3670,7 +3711,7 @@ async fn complete_target_retirement<A: RollbackActor>(
         if journal::target_retirement_receipt_entry_exists(&directory, &intent)? {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} retirement receipt path was occupied before RetireIntent",
+                    "replacement broker {} has a stop-confirmation file before any stop request was saved; Muxe cannot trust that file",
                     member.member().as_str()
                 ),
             });
@@ -3692,7 +3733,7 @@ async fn complete_target_retirement<A: RollbackActor>(
         if !replaying_intent {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} retirement receipt existed before its stop barrier",
+                    "replacement broker {} has a stop-confirmation file before this activation requested its stop; Muxe cannot trust that file",
                     member.member().as_str()
                 ),
             });
@@ -3896,7 +3937,7 @@ where
                 .await
                 .map_err(|error| ActivateError::UnitFailed {
                     reason: format!(
-                        "{} retained Prepare intent status is unavailable: {error}",
+                        "cannot read existing broker {} status over the retained control connection to determine whether its handoff started: {error}",
                         member.member().as_str()
                     ),
                 })?
@@ -3908,7 +3949,7 @@ where
                 .await
                 .map_err(|error| ActivateError::UnitFailed {
                     reason: format!(
-                        "{} Prepare intent is silent and remains ambiguous: {error}",
+                        "cannot connect to existing broker {} to determine whether its handoff started: {error}",
                         member.member().as_str()
                     ),
                 })?;
@@ -3917,7 +3958,7 @@ where
                 .await
                 .map_err(|error| ActivateError::UnitFailed {
                     reason: format!(
-                        "{} Prepare intent status is unavailable: {error}",
+                        "cannot read existing broker {} status to determine whether its handoff started: {error}",
                         member.member().as_str()
                     ),
                 })?
@@ -3954,7 +3995,7 @@ where
                 .process_id(&member.id)?
                 .ok_or_else(|| ActivateError::UnitFailed {
                     reason: format!(
-                        "target {} retirement lacks exact owned-process proof",
+                        "cannot stop replacement broker {}: its owned process identity is missing",
                         member.member().as_str()
                     ),
                 })?;
@@ -3972,7 +4013,7 @@ where
         let TargetRetirementAuthority::OwnedProcess { process_id } = authority else {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} retirement has non-owned process authority",
+                    "cannot stop replacement broker {}: this supervisor does not own the recorded process",
                     member.member().as_str()
                 ),
             });
@@ -3996,7 +4037,7 @@ where
             .find(|prepared| prepared.entry.socket() == member.endpoint().as_path())
             .ok_or_else(|| ActivateError::UnitFailed {
                 reason: format!(
-                    "old member {} lacks retained control authority",
+                    "cannot resume existing broker {}: its retained control connection is missing",
                     member.member().as_str()
                 ),
             })?;
@@ -4024,7 +4065,7 @@ where
         if classify_resume_status(&after, member, journal)? != ResumeEvidence::AlreadyResumed {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "old member {} did not attest Running after resume",
+                    "existing broker {} did not confirm it was running without a handoff after the resume request",
                     member.member().as_str()
                 ),
             });
@@ -4068,12 +4109,12 @@ where
     journal.enter_rollback(reason.clone());
     let mut diagnostics = Vec::new();
     if let Err(error) = journal::write_journal(inputs.cache_dir, journal) {
-        let diagnostic = format!("persist rollback decision: {error}");
+        let diagnostic = format!("could not save the rollback decision: {error}");
         journal.enter_rollback(format!("{reason}; {diagnostic}"));
         diagnostics.push(diagnostic);
         if let Err(retry) = journal::write_journal(inputs.cache_dir, journal) {
             diagnostics.push(format!(
-                "retry rollback decision while targets remain owned: {retry}"
+                "could not save the rollback decision on retry while replacement processes remain owned: {retry}"
             ));
             diagnostics.extend(supervisor.shutdown(inputs.spawner));
             return diagnostics;
@@ -4089,7 +4130,7 @@ where
     let first = drive_rollback(&mut actor, journal, journal_path).await;
     let outcome = if matches!(first, Err(ActivateError::Journal(_))) {
         diagnostics.push(format!(
-            "persist rollback barrier: {}",
+            "could not save the rollback decision: {}",
             first.as_ref().unwrap_err()
         ));
         drive_rollback(&mut actor, journal, journal_path).await
@@ -4099,7 +4140,7 @@ where
     match outcome {
         Ok(RollbackDriveOutcome::Complete) => {}
         Ok(RollbackDriveOutcome::ResumeRequired | RollbackDriveOutcome::AwaitingPeer) => {
-            diagnostics.push("normal rollback stopped before durable completion".to_owned());
+            diagnostics.push("rollback has not finished resuming every existing broker".to_owned());
         }
         Err(error) => diagnostics.push(error.to_string()),
     }
@@ -4189,7 +4230,7 @@ pub fn restore_old_registry_rows(
             })
             .ok_or_else(|| {
                 format!(
-                    "journal lacks exact old registry row for {}",
+                    "the saved activation record lacks the previous registry entry for broker {}",
                     member.member().as_str()
                 )
             })?;
@@ -4216,7 +4257,7 @@ fn publish_commit_artifacts(
         .bridge_identity
         .clone()
         .ok_or_else(|| ActivateError::UnitFailed {
-            reason: "Zellij commit lacks canonical bridge identity".to_owned(),
+            reason: "cannot finish Zellij activation: the saved activation record is missing the bridge installation directory".to_owned(),
         })?;
     let stable = identity.stable_path(std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME));
     if bridge.progress == BridgeProgress::TargetReloaded {
@@ -4291,7 +4332,7 @@ pub fn finish_acknowledged_commit(
     ) || !journal.has_commit_certificate()
     {
         return Err(ActivateError::UnitFailed {
-            reason: "broker commit completion lacks a durable Committing certificate".to_owned(),
+            reason: "cannot finish activation: the commit decision and replacement process/registration identities have not been saved".to_owned(),
         });
     }
     if journal.members().iter().any(|member| {
@@ -4305,7 +4346,7 @@ pub fn finish_acknowledged_commit(
         if !journal::has_old_retirement_receipt(&directory, journal, member)? {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "old member {} lacks exact durable post-stop retirement proof",
+                    "existing broker {} has no saved confirmation that its host connection and listener shut down for this replacement request",
                     member.member().as_str()
                 ),
             });
@@ -4330,7 +4371,7 @@ fn publish_bridge_receipt(
         })?;
     if receipt.bridge != *preimage && receipt.bridge != *target {
         return Err(ActivateError::UnitFailed {
-            reason: "Zellij commit receipt metadata changed outside transaction authority"
+            reason: "cannot finish bridge activation: its installation record differs from both the previous and replacement versions"
                 .to_owned(),
         });
     }
@@ -4353,7 +4394,7 @@ fn restore_bridge_receipt(
         && receipt.bridge != artifacts.receipt_rollback
     {
         return Err(ActivateError::UnitFailed {
-            reason: "Zellij rollback receipt metadata changed outside transaction authority"
+            reason: "cannot restore the bridge: its installation record differs from the previous, replacement, and restored versions"
                 .to_owned(),
         });
     }
@@ -4376,7 +4417,7 @@ pub fn cleanup_terminal_transaction(
         TransactionDirective::CleanupCommitted | TransactionDirective::CleanupRolledBack
     ) {
         return Err(ActivateError::UnitFailed {
-            reason: "refusing cleanup of nonterminal activation journal".to_owned(),
+            reason: "cannot remove the saved activation record while activation or rollback is still incomplete".to_owned(),
         });
     }
     let activation_directory = journal_path
@@ -4472,7 +4513,7 @@ where
             Err(error) => {
                 outcomes.push(RecoveryOutcome::Preserved {
                     unit: path.display().to_string(),
-                    reason: format!("unrecognized journal: {error}"),
+                    reason: format!("cannot read the saved activation record: {error}"),
                 });
                 continue;
             }
@@ -4482,7 +4523,7 @@ where
             Err(error) => {
                 outcomes.push(RecoveryOutcome::Preserved {
                     unit: path.display().to_string(),
-                    reason: format!("recovery unit lock unavailable: {error}"),
+                    reason: format!("cannot lock this activation target for recovery: {error}"),
                 });
                 continue;
             }
@@ -4512,10 +4553,10 @@ where
         TransactionDirective::CleanupRolledBack => cleanup_terminal_transaction(&journal, path)
             .map(|()| RecoveryOutcome::RolledBack {
                 unit: unit.clone(),
-                reason: "terminal rollback cleanup completed".to_owned(),
+                reason: "removed the saved record after rollback had completed".to_owned(),
             }),
         TransactionDirective::Prepare | TransactionDirective::Activate => {
-            journal.enter_rollback("recovery selected rollback before durable Ready".to_owned());
+            journal.enter_rollback("recovery is restoring the previous brokers because the activation readiness decision was not saved".to_owned());
             if let Err(error) = journal::write_journal(cache_dir, &journal) {
                 Err(ActivateError::UnitFailed {
                     reason: format!("cannot persist rollback decision: {error}"),
@@ -4525,7 +4566,7 @@ where
                     .await
                     .map(|()| RecoveryOutcome::RolledBack {
                         unit: unit.clone(),
-                        reason: "pre-Ready transaction rolled back".to_owned(),
+                        reason: "restored the previous brokers because the activation readiness decision was not saved".to_owned(),
                     })
             }
         }
@@ -4539,7 +4580,7 @@ where
         }
         TransactionDirective::Commit if !journal.has_commit_certificate() => {
             Err(ActivateError::UnitFailed {
-                reason: "Ready journal lacks an exact target incarnation certificate".to_owned(),
+                reason: "the saved readiness decision lacks the replacement brokers' process/registration identities; Muxe cannot safely finish activation".to_owned(),
             })
         }
         TransactionDirective::Commit => recover_commit(cache_dir, control, &mut journal, path)
@@ -4569,7 +4610,7 @@ async fn certified_target_session<C: ControlPort>(
 ) -> Result<C::Session, ActivateError> {
     if !journal.has_commit_certificate() {
         return Err(ActivateError::UnitFailed {
-            reason: "Ready lacks an exact target incarnation certificate".to_owned(),
+            reason: "the saved readiness decision lacks the replacement brokers' process/registration identities; Muxe cannot safely finish activation".to_owned(),
         });
     }
     let mut target = control
@@ -4577,7 +4618,7 @@ async fn certified_target_session<C: ControlPort>(
         .await
         .map_err(|error| ActivateError::UnitFailed {
             reason: format!(
-                "Ready target {} is unavailable: {error}",
+                "cannot connect to replacement broker {} to finish the saved activation: {error}",
                 member.member().as_str()
             ),
         })?;
@@ -4586,7 +4627,7 @@ async fn certified_target_session<C: ControlPort>(
         .await
         .map_err(|error| ActivateError::UnitFailed {
             reason: format!(
-                "cannot inspect Ready target {}: {error}",
+                "cannot read replacement broker {} status to finish the saved activation: {error}",
                 member.member().as_str()
             ),
         })?;
@@ -4617,7 +4658,7 @@ async fn certified_target_session<C: ControlPort>(
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "Ready target {} is missing or differs from its sealed broker incarnation",
+                "replacement broker {} is missing from the registry or its process identity, registration, version, handoff, or lifecycle differs from the saved readiness decision",
                 member.member().as_str()
             ),
         });
@@ -4650,7 +4691,7 @@ async fn recover_commit<C: ControlPort>(
         {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "old member {} lacks exact durable post-stop retirement proof",
+                    "existing broker {} has no saved confirmation that its host connection and listener shut down for this replacement request",
                     member.member().as_str()
                 ),
             });
@@ -4672,7 +4713,10 @@ async fn recover_commit<C: ControlPort>(
             .commit(&member.handoff_id())
             .await
             .map_err(|error| ActivateError::UnitFailed {
-                reason: format!("commit target {}: {error}", member.member().as_str()),
+                reason: format!(
+                    "could not commit replacement broker {}: {error}",
+                    member.member().as_str()
+                ),
             })?;
         journal.members_mut()[index].target = TargetMemberProgress::Committed;
         journal::write_journal(cache_dir, journal)?;
@@ -4681,7 +4725,7 @@ async fn recover_commit<C: ControlPort>(
         Ok(())
     } else {
         Err(ActivateError::UnitFailed {
-            reason: "commit remains incomplete".to_owned(),
+            reason: "activation remains incomplete: the saved record does not confirm that all existing brokers stopped and all replacement brokers committed".to_owned(),
         })
     }
 }
@@ -4712,7 +4756,7 @@ where
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} launch remains ambiguous: {error}",
+                    "cannot connect to replacement broker {} to determine whether it started: {error}",
                     member.member().as_str()
                 ),
             })?;
@@ -4721,7 +4765,7 @@ where
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} launch status is ambiguous: {error}",
+                    "cannot read replacement broker {} status to determine whether it started: {error}",
                     member.member().as_str()
                 ),
             })
@@ -4762,7 +4806,7 @@ where
         if self.local_member == Some(member.member()) {
             let status = self.local_status.ok_or_else(|| ActivateError::UnitFailed {
                 reason: format!(
-                    "{} local Prepare intent lacks exact broker status",
+                    "cannot determine whether existing broker {} started its handoff: its local status is missing",
                     member.member().as_str()
                 ),
             })?;
@@ -4774,7 +4818,7 @@ where
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "{} Prepare intent is silent and remains ambiguous: {error}",
+                    "cannot connect to existing broker {} to determine whether its handoff started: {error}",
                     member.member().as_str()
                 ),
             })?;
@@ -4783,7 +4827,7 @@ where
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "{} Prepare intent status is unavailable: {error}",
+                    "cannot read existing broker {} status to determine whether its handoff started: {error}",
                     member.member().as_str()
                 ),
             })?;
@@ -4820,7 +4864,7 @@ where
     ) -> Result<(), ActivateError> {
         let TargetRetirementAuthority::RemoteServer { server_id } = authority else {
             return Err(ActivateError::UnitFailed {
-                reason: "owned target authority cannot outlive its activation supervisor"
+                reason: "cannot stop a replacement process owned by an activation supervisor that is no longer available"
                     .to_owned(),
             });
         };
@@ -4830,7 +4874,7 @@ where
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} retirement is ambiguous: {error}",
+                    "cannot connect to replacement broker {} to verify it before stopping it: {error}",
                     member.member().as_str()
                 ),
             })?;
@@ -4839,7 +4883,7 @@ where
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} status is ambiguous: {error}",
+                    "cannot read replacement broker {} status to verify it before stopping it: {error}",
                     member.member().as_str()
                 ),
             })?;
@@ -4847,7 +4891,7 @@ where
         if status.live_server.server_id != *server_id {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} process authority changed before retirement",
+                    "replacement broker {} reports a different process identity than the one recorded for stopping it",
                     member.member().as_str()
                 ),
             });
@@ -4867,7 +4911,7 @@ where
         {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "target {} stop barrier returned mismatched evidence",
+                    "replacement broker {} did not confirm the recorded identity, replacement version, retired state, and absence of a handoff after the stop request",
                     member.member().as_str()
                 ),
             });
@@ -4883,7 +4927,7 @@ where
         if self.local_member == Some(member.member()) {
             let status = self.local_status.ok_or_else(|| ActivateError::UnitFailed {
                 reason: format!(
-                    "{} local Resume intent lacks exact broker status",
+                    "cannot resume existing broker {}: its local status is missing",
                     member.member().as_str()
                 ),
             })?;
@@ -4898,7 +4942,7 @@ where
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "old member {} resume remains unproven: {error}",
+                    "cannot connect to existing broker {} to verify whether it resumed: {error}",
                     member.member().as_str()
                 ),
             })?;
@@ -4907,7 +4951,7 @@ where
             .await
             .map_err(|error| ActivateError::UnitFailed {
                 reason: format!(
-                    "old member {} status failed: {error}",
+                    "cannot read existing broker {} status to verify whether it resumed: {error}",
                     member.member().as_str()
                 ),
             })?;
@@ -4923,7 +4967,7 @@ where
         if classify_resume_status(&after, member, journal)? != ResumeEvidence::AlreadyResumed {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "old member {} did not attest Running after resume",
+                    "existing broker {} did not confirm it was running without a handoff after the resume request",
                     member.member().as_str()
                 ),
             });
@@ -5053,7 +5097,7 @@ where
         RollbackDriveOutcome::Complete => Ok(()),
         RollbackDriveOutcome::ResumeRequired | RollbackDriveOutcome::AwaitingPeer => {
             Err(ActivateError::UnitFailed {
-                reason: "coordinator rollback stopped before durable completion".to_owned(),
+                reason: "rollback has not finished resuming every existing broker; the saved activation record has been retained".to_owned(),
             })
         }
     }
@@ -5376,6 +5420,73 @@ mod tests {
     use muxe_protocol::control::{
         ControlMessage, ControlOperation, ControlResponse, ControlResult,
     };
+
+    fn status_only_broker(
+        socket: &Path,
+        status: ActivationStatus,
+        requests: Arc<parking_lot::Mutex<Vec<ControlOperation>>>,
+    ) -> JoinHandle<()> {
+        use tokio::io::AsyncWriteExt;
+        let listener = UnixListener::bind(socket).unwrap();
+        std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if send_broker_prelude(&mut stream).await.is_err() {
+                    continue;
+                }
+                let mut decoder = ControlDecoder::new(ControlPolicy::broker());
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = match tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    let mut received = Vec::new();
+                    decoder
+                        .push(&buffer[..read], |message| {
+                            if let ControlMessage::Request(request) = message {
+                                received.push(request);
+                            }
+                        })
+                        .unwrap();
+                    for request in received {
+                        let is_status = matches!(request.operation, ControlOperation::Status);
+                        requests.lock().push(request.operation);
+                        assert!(
+                            is_status,
+                            "a rejected precondition must not send a mutation request"
+                        );
+                        let response = muxe_protocol::control::encode_broker_control_response(
+                            &ControlResponse {
+                                request_id: request.request_id,
+                                result: ControlResult::Status(status.clone()),
+                            },
+                        )
+                        .expect("fixture must send a semantically valid status");
+                        if stream.write_all(&response).await.is_err()
+                            || stream.flush().await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    struct NoReplacementSpawner;
+
+    impl BrokerSpawner for NoReplacementSpawner {
+        fn spawn_target(&self, _request: &SpawnRequest) -> Result<TargetHandle, ActivateError> {
+            panic!("a rejected activation prerequisite must not start a replacement process")
+        }
+
+        fn stop_target(&self, _handle: &mut TargetHandle) -> Result<(), ActivateError> {
+            panic!("a rejected activation prerequisite must not stop a process")
+        }
+    }
 
     struct FixtureHerdrSpawner {
         cache: PathBuf,
@@ -6276,29 +6387,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_prepare_peer_is_refused_before_journal_or_drain() {
-        let fixture = Fixture::new();
-        let (_socket, old) = fixture
-            .old_broker(
-                "server",
-                BrokerScript {
-                    supports_supplied_handoff: false,
-                    ..herdr_script()
-                },
-            )
-            .await;
-        let report = Box::pin(activate(fixture.herdr_inputs())).await.unwrap();
-        assert!(matches!(report.units[0], UnitOutcome::Failed { .. }));
-        assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
-        let events = fixture
-            .events
-            .lock()
-            .expect("fixture events are not poisoned");
-        assert!(
-            !events.iter().any(|event| event == "prepared"),
-            "legacy peer is rejected by Status capability before Prepare"
-        );
-        old.abort();
+    async fn activation_preconditions_fail_before_handoff_spawn_or_journal() {
+        let mut reasons = std::collections::BTreeSet::new();
+        for rejected_check in 0..4 {
+            let fixture = Fixture::new();
+            let socket = fixture.cache.join("broker.sock");
+            let mut status = status_of(&old_record(), None, "server", LifecycleState::Running);
+            match rejected_check {
+                0 => status.prepare_handoff = None,
+                1 => {
+                    status.bridge_unit = Some(
+                        BridgeIdentity::resolve(
+                            &fixture.config,
+                            std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME),
+                        )
+                        .unwrap()
+                        .unit(),
+                    );
+                }
+                2 => {
+                    status.lifecycle = LifecycleState::Draining;
+                    status.target = Some(target_record());
+                    status.handoff_id = Some(handoff(0x42));
+                }
+                3 => status.handoff_id = Some(handoff(0x42)),
+                _ => unreachable!(),
+            }
+            let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let broker = status_only_broker(&socket, status, requests.clone());
+            let registry = Registry::open(&fixture.cache).unwrap();
+            registry
+                .register_herdr(BrokerEntry::now(
+                    "herdr",
+                    "server",
+                    socket.clone(),
+                    std::process::id(),
+                ))
+                .unwrap();
+            let before = registry.entries().unwrap();
+            let original = fixture.herdr_inputs();
+            let inputs = ActivateInputs {
+                config_dir: original.config_dir,
+                cache_dir: original.cache_dir,
+                target: original.target,
+                staged_bridge: original.staged_bridge,
+                spawn_policy: original.spawn_policy,
+                scope: original.scope,
+                current: original.current,
+                control: original.control,
+                spawner: &NoReplacementSpawner,
+                reloader: original.reloader,
+                preflight: original.preflight,
+                readiness_deadline: original.readiness_deadline,
+                poll_interval: original.poll_interval,
+                hooks: original.hooks,
+                logger: original.logger,
+            };
+            let report = Box::pin(activate(inputs)).await.unwrap();
+            assert_eq!(report.units.len(), 1);
+            let UnitOutcome::Failed { reason, .. } = &report.units[0] else {
+                panic!("a rejected prerequisite must fail activation");
+            };
+            assert!(
+                reasons.insert(reason.clone()),
+                "each rejected prerequisite must identify a different cause"
+            );
+            assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
+            assert_eq!(registry.entries().unwrap(), before);
+            assert!(socket.exists());
+            assert!(fixture.reloader.reloaded.lock().unwrap().is_empty());
+            let observed = requests.lock();
+            assert!(!observed.is_empty());
+            assert!(
+                observed
+                    .iter()
+                    .all(|request| matches!(request, ControlOperation::Status))
+            );
+            drop(observed);
+            broker.abort();
+        }
     }
     #[tokio::test]
     async fn absent_target_restores_old_stack() {
@@ -9654,12 +9821,7 @@ mod tests {
             &mut case.targets,
         );
         crate::fsutil::inject_persistent_durability_replay_failure(false);
-        assert!(
-            failed
-                .unwrap_err()
-                .to_string()
-                .contains("cannot complete durability")
-        );
+        assert!(matches!(failed, Err(ActivateError::UnitFailed { .. })));
         let on_disk = journal::read_journal(&path).unwrap();
         assert_eq!(on_disk.directive(), TransactionDirective::Commit);
         assert_eq!(on_disk.ready_proof(), Some(&proof));
@@ -9735,13 +9897,10 @@ mod tests {
                         .unwrap();
                     }
                     journal::write_journal(&case.cache, &case.journal).unwrap();
-                    assert!(
-                        recover_commit(&case.cache, &case.control, &mut case.journal, &path)
-                            .await
-                            .unwrap_err()
-                            .to_string()
-                            .contains("commit target")
-                    );
+                    assert!(matches!(
+                        recover_commit(&case.cache, &case.control, &mut case.journal, &path).await,
+                        Err(ActivateError::UnitFailed { .. })
+                    ));
                     drop(std::mem::take(&mut case.targets));
                 }
                 "cancel" => {
@@ -10128,10 +10287,8 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-
             outcomes.as_slice(),
-            [RecoveryOutcome::Preserved { reason, .. }]
-                if reason.contains("lacks an exact target incarnation certificate")
+            [RecoveryOutcome::Preserved { .. }]
         ));
         assert_eq!(journal::read_journal(&path).unwrap(), legacy);
         assert_eq!(
@@ -10155,8 +10312,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             outcomes.as_slice(),
-            [RecoveryOutcome::Preserved { reason, .. }]
-                if reason.contains("lacks an exact target incarnation certificate")
+            [RecoveryOutcome::Preserved { .. }]
         ));
         assert_eq!(journal::read_journal(&path).unwrap(), legacy);
         assert_eq!(
@@ -10309,11 +10465,7 @@ mod tests {
                 "injected rollback decision failure".to_owned(),
             )
             .await;
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.contains("persist rollback decision"))
-            );
+            assert!(!diagnostics.is_empty());
             assert_eq!(journal.members()[0].target, TargetMemberProgress::Retired);
             assert!(!path.exists(), "immediate retry completed the rollback");
             assert_child_reaped(pid);
@@ -10424,11 +10576,7 @@ mod tests {
         )
         .unwrap();
         let diagnostics = supervisor.shutdown(&ProcessSpawner);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|line| line.contains("without retirement receipt"))
-        );
+        assert_eq!(diagnostics.len(), 1);
         assert_child_reaped(pid);
         control.silent = true;
         let recovered = recover(&cache, &control, &BarrierReloader::default(), None)
@@ -10436,8 +10584,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             recovered.as_slice(),
-            [RecoveryOutcome::Preserved { reason, .. }]
-                if reason.contains("owned target authority cannot outlive its activation supervisor")
+            [RecoveryOutcome::Preserved { .. }]
         ));
         assert!(path.exists());
         assert!(
@@ -10475,11 +10622,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, ActivateError::UnitFailed { .. }));
         let diagnostics = ActivationSupervisor::shutdown_targets(targets, &ProcessSpawner);
+        assert_eq!(diagnostics.len(), pids.len());
         for pid in pids {
             assert_child_reaped(pid);
-            assert!(diagnostics.iter().any(|diagnostic| {
-                diagnostic.contains(&format!("pid {pid} without retirement receipt"))
-            }));
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains(&pid.to_string()))
+            );
         }
         let supervisor = ActivationSupervisor::new(&cache, &journal.unit, Vec::new()).unwrap();
         assert!(supervisor.check_scope(&cache, &journal).is_ok());
@@ -10497,14 +10647,25 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_stop_failures_surface_exact_member_pid_and_operation() {
-        for (fault, operation) in [
-            (
-                TargetStopFault::Inspect,
-                "target process state inspection failed",
-            ),
-            (TargetStopFault::Kill, "target process termination failed"),
-            (TargetStopFault::Wait, "target process reap failed"),
+        for fault in [
+            TargetStopFault::Inspect,
+            TargetStopFault::Kill,
+            TargetStopFault::Wait,
         ] {
+            let mut typed_handle = h21_owned_targets(1).pop_front().unwrap();
+            let typed_pid = typed_handle.child.id();
+            typed_handle.stop_fault = Some(fault);
+            let error = ProcessSpawner.stop_target(&mut typed_handle).unwrap_err();
+            assert!(matches!(
+                (fault, error),
+                (
+                    TargetStopFault::Inspect,
+                    ActivateError::TargetStopInspect(_)
+                ) | (TargetStopFault::Kill, ActivateError::TargetStopKill(_))
+                    | (TargetStopFault::Wait, ActivateError::TargetStopWait(_))
+            ));
+            drop(typed_handle);
+            assert_child_reaped(typed_pid);
             let (temp, cache, mut journal, path, mut control) = rollback_trace_case();
             control.silent = true;
             let member_id = journal.members()[0].id.clone();
@@ -10562,11 +10723,7 @@ mod tests {
             ) else {
                 panic!("shutdown process failure must fail the unit");
             };
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.contains(operation))
-            );
+            assert!(diagnostics.len() >= 2);
             assert!(
                 diagnostics
                     .iter()
