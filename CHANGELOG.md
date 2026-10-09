@@ -1,3 +1,13 @@
+## [0.3.1] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- *(ui)* Align themed shortcut columns and connected badges
+- *(themes)* Restore canonical semantic color roles
+
+### 📚 Documentation
+
+- *(themes)* Explain aligned layouts and semantic color roles
 ## [0.3.0] - 2026-10-09
 
 ### 🚀 Features
@@ -17,6 +27,10 @@
 
 - *(runtime)* Prove navigation on an owned Herdr terminal
 - *(themes)* Verify built-in catalog and document selection
+
+### 💼 Other
+
+- V0.3.0
 ## [0.2.3] - 2026-10-08
 
 ### 🐛 Bug Fixes
