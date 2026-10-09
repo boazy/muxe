@@ -67,7 +67,7 @@ colors:
   menu.hotkey: bright_aqua
   menu.separator: fg3
   status.error: bright_red
-  status.pending: bright_orange
-  status.blocked: bright_yellow
-  status.reload: bright_blue
-  status.notice: bright_green
+  status.pending: bright_yellow
+  status.blocked: bright_orange
+  status.reload: bright_green
+  status.notice: bright_blue

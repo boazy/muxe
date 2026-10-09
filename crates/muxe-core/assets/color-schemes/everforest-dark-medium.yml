@@ -36,7 +36,7 @@ colors:
   menu.hotkey: blue
   menu.separator: grey2
   status.error: red
-  status.pending: orange
-  status.blocked: yellow
-  status.reload: blue
-  status.notice: green
+  status.pending: yellow
+  status.blocked: orange
+  status.reload: green
+  status.notice: blue

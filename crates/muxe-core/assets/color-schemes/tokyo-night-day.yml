@@ -84,11 +84,11 @@ palette:
 colors:
   base.text: fg
   base.background: bg
-  base.muted: fg
+  base.muted: fg_dark
   menu.hotkey: blue5
-  menu.separator: fg
-  status.error: fg
-  status.pending: fg
-  status.blocked: fg
-  status.reload: fg
-  status.notice: fg
+  menu.separator: fg_dark
+  status.error: red1
+  status.pending: yellow
+  status.blocked: orange
+  status.reload: green
+  status.notice: cyan

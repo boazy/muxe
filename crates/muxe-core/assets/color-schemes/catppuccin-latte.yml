@@ -52,7 +52,7 @@ colors:
   menu.hotkey: mauve
   menu.separator: subtext1
   status.error: red
-  status.pending: text
-  status.blocked: red
-  status.reload: text
-  status.notice: text
+  status.pending: yellow
+  status.blocked: peach
+  status.reload: green
+  status.notice: teal

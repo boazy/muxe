@@ -23,11 +23,11 @@ palette:
 colors:
   base.text: text
   base.background: base
-  base.muted: pine
+  base.muted: subtle
   menu.hotkey: pine
-  menu.separator: pine
-  status.error: text
-  status.pending: text
-  status.blocked: text
-  status.reload: pine
+  menu.separator: subtle
+  status.error: love
+  status.pending: gold
+  status.blocked: gold
+  status.reload: leaf
   status.notice: pine

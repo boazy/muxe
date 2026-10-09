@@ -109,11 +109,11 @@ palette:
 colors:
   base.text: lotusInk1
   base.background: lotusWhite3
-  base.muted: lotusBlue4
+  base.muted: lotusGray2
   menu.hotkey: lotusBlue4
-  menu.separator: lotusBlue4
-  status.error: lotusInk1
-  status.pending: lotusInk1
-  status.blocked: lotusInk1
-  status.reload: lotusInk1
-  status.notice: lotusBlue4
+  menu.separator: lotusGray2
+  status.error: lotusRed
+  status.pending: lotusYellow
+  status.blocked: lotusOrange
+  status.reload: lotusGreen
+  status.notice: lotusTeal3

@@ -114,6 +114,6 @@ colors:
   menu.separator: oldWhite
   status.error: waveRed
   status.pending: carpYellow
-  status.blocked: waveRed
+  status.blocked: surimiOrange
   status.reload: springGreen
   status.notice: springBlue

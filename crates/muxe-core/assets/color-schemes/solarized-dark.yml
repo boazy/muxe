@@ -21,11 +21,11 @@ palette:
 colors:
   base.text: base0
   base.background: base03
-  base.muted: base1
-  menu.hotkey: cyan
-  menu.separator: base1
-  status.error: base0
+  base.muted: base00
+  menu.hotkey: blue
+  menu.separator: base00
+  status.error: red
   status.pending: yellow
-  status.blocked: yellow
-  status.reload: cyan
-  status.notice: green
+  status.blocked: orange
+  status.reload: green
+  status.notice: cyan

@@ -67,7 +67,7 @@ colors:
   menu.hotkey: faded_blue
   menu.separator: fg3
   status.error: faded_red
-  status.pending: faded_orange
+  status.pending: faded_yellow
   status.blocked: faded_orange
-  status.reload: faded_blue
-  status.notice: fg1
+  status.reload: faded_green
+  status.notice: faded_blue

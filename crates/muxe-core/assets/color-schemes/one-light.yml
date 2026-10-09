@@ -62,7 +62,7 @@ colors:
   menu.hotkey: hue-3
   menu.separator: mono-2
   status.error: hue-5-2
-  status.pending: hue-6
-  status.blocked: hue-5-2
-  status.reload: syntax-fg
-  status.notice: syntax-fg
+  status.pending: hue-6-2
+  status.blocked: hue-6
+  status.reload: hue-4
+  status.notice: hue-1

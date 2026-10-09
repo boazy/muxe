@@ -89,6 +89,6 @@ colors:
   menu.separator: fg_dark
   status.error: red
   status.pending: yellow
-  status.blocked: red
+  status.blocked: orange
   status.reload: green
   status.notice: cyan

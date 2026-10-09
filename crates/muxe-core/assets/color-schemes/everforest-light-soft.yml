@@ -32,11 +32,11 @@ palette:
 colors:
   base.text: fg
   base.background: bg0
-  base.muted: fg
-  menu.hotkey: fg
-  menu.separator: fg
-  status.error: fg
-  status.pending: fg
-  status.blocked: fg
-  status.reload: fg
-  status.notice: fg
+  base.muted: statusline2
+  menu.hotkey: blue
+  menu.separator: statusline2
+  status.error: red
+  status.pending: yellow
+  status.blocked: orange
+  status.reload: green
+  status.notice: blue

@@ -24,8 +24,8 @@ colors:
   base.muted: nord9
   menu.hotkey: nord8
   menu.separator: nord9
-  status.error: nord4
+  status.error: nord11
   status.pending: nord13
-  status.blocked: nord13
-  status.reload: nord9
-  status.notice: nord14
+  status.blocked: nord12
+  status.reload: nord14
+  status.notice: nord8

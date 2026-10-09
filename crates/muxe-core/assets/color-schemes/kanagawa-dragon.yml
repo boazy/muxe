@@ -109,11 +109,11 @@ palette:
 colors:
   base.text: dragonWhite
   base.background: dragonBlack3
-  base.muted: oldWhite
+  base.muted: dragonGray2
   menu.hotkey: dragonBlue2
-  menu.separator: oldWhite
+  menu.separator: dragonGray2
   status.error: dragonRed
   status.pending: dragonYellow
-  status.blocked: dragonRed
+  status.blocked: dragonOrange
   status.reload: dragonGreen
   status.notice: dragonBlue2

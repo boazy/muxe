@@ -53,6 +53,6 @@ colors:
   menu.separator: subtext0
   status.error: red
   status.pending: yellow
-  status.blocked: red
+  status.blocked: peach
   status.reload: green
   status.notice: sky

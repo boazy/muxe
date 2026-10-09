@@ -19,13 +19,13 @@ palette:
   base2: "#eee8d5"
   base3: "#fdf6e3"
 colors:
-  base.text: base01
+  base.text: base00
   base.background: base3
-  base.muted: base01
-  menu.hotkey: base01
-  menu.separator: base01
-  status.error: base01
-  status.pending: base01
-  status.blocked: base01
-  status.reload: base01
-  status.notice: base01
+  base.muted: base0
+  menu.hotkey: blue
+  menu.separator: base0
+  status.error: red
+  status.pending: yellow
+  status.blocked: orange
+  status.reload: green
+  status.notice: cyan

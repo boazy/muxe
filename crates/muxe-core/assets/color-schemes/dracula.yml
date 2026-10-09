@@ -17,11 +17,11 @@ palette:
 colors:
   base.text: foreground
   base.background: background
-  base.muted: purple
+  base.muted: comment
   menu.hotkey: cyan
-  menu.separator: purple
+  menu.separator: comment
   status.error: red
-  status.pending: orange
-  status.blocked: yellow
-  status.reload: purple
-  status.notice: green
+  status.pending: yellow
+  status.blocked: orange
+  status.reload: green
+  status.notice: cyan

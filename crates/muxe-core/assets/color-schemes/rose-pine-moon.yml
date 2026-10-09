@@ -28,6 +28,6 @@ colors:
   menu.separator: subtle
   status.error: love
   status.pending: gold
-  status.blocked: love
+  status.blocked: gold
   status.reload: leaf
   status.notice: foam

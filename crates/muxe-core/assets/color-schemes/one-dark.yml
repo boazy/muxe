@@ -58,11 +58,11 @@ palette:
 colors:
   base.text: syntax-fg
   base.background: syntax-bg
-  base.muted: syntax-fg
+  base.muted: mono-2
   menu.hotkey: hue-2
-  menu.separator: syntax-fg
-  status.error: syntax-fg
+  menu.separator: mono-2
+  status.error: hue-5
   status.pending: hue-6-2
-  status.blocked: syntax-fg
+  status.blocked: hue-6
   status.reload: hue-4
   status.notice: hue-1
