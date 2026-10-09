@@ -1242,8 +1242,8 @@ impl Broker {
     /// # Errors
     ///
     /// Returns `BrokerError::ActivationDrainRefused` while a non-cancellable host
-    /// execution is in flight, `BrokerError::ActivationCleanupUnconfirmed` when
-    /// initiated host cleanup is not confirmed before the bounded deadline, or
+    /// execution has not been confirmed complete, `BrokerError::ActivationCleanupUnconfirmed`
+    /// when initiated host cleanup is not confirmed before the bounded deadline, or
     /// the first cancellation/detach failure (each of which reopens admission
     /// so the coordinator can retry).
     pub async fn drain_for_activation(&self) -> Result<(), BrokerError> {
@@ -1273,18 +1273,15 @@ impl Broker {
             let mut state = self.state.lock().await;
             let refused = state.executions.values().find_map(|record| {
                 (record.phase == ExecutionPhase::Adapter && !record.cancellable).then(|| {
-                    let owner = record.session.as_ref().map_or_else(
-                        || "detached".to_owned(),
-                        |session| session.as_str().to_owned(),
-                    );
-                    (owner, record.core.0)
+                    UnfinishedHostExecution {
+                        execution: record.core,
+                        session: record.session.clone(),
+                    }
                 })
             });
-            if let Some((owner, core)) = refused {
+            if let Some(execution) = refused {
                 state.activation_sealed = false;
-                return Err(BrokerError::ActivationDrainRefused(format!(
-                    "{owner} host execution {core} is non-cancellable and still in flight",
-                )));
+                return Err(BrokerError::ActivationDrainRefused(execution));
             }
             let adapter_executions = state
                 .executions
@@ -3402,8 +3399,10 @@ impl Broker {
         let resolved_action = match &binding.action {
             ActionSpec::Portable(action) => Some(action.resolve_context(&origin).map_err(
                 |error| match error {
-                    muxe_core::PortableActionResolutionError::Context(_) => {
-                        BrokerError::ContextUnavailable
+                    muxe_core::PortableActionResolutionError::Context(error) => {
+                        BrokerError::ContextUnavailable(
+                            ContextUnavailableReason::MissingReference(error.reference),
+                        )
                     }
                     muxe_core::PortableActionResolutionError::InvalidValue {
                         parameter,
@@ -3692,7 +3691,11 @@ impl Broker {
         candidate: &muxe_core::NativeActionCandidate,
     ) -> Result<muxe_adapter_api::DispatchAccepted, BrokerError> {
         let action = ResolvedNativeAction::from_origin(candidate, &origin)
-            .map_err(|_| BrokerError::ContextUnavailable)?;
+            .map_err(|error| {
+                BrokerError::ContextUnavailable(
+                    ContextUnavailableReason::MissingReference(error.reference),
+                )
+            })?;
         self.adapter
             .dispatch_native(muxe_adapter_api::NativeDispatchRequest {
                 execution: core_execution,
@@ -4859,12 +4862,14 @@ fn resolve_command_cwd<'a>(
     origin: &'a muxe_core::OriginContext,
     configured: Option<&'a muxe_core::CommandCwd>,
 ) -> Result<std::borrow::Cow<'a, std::path::Path>, BrokerError> {
-    let captured = || {
-        origin
-            .pane_cwd
-            .as_deref()
-            .filter(|cwd| cwd.is_absolute())
-            .ok_or(BrokerError::ContextUnavailable)
+    let captured = || match origin.pane_cwd.as_deref() {
+        Some(cwd) if cwd.is_absolute() => Ok(cwd),
+        Some(cwd) => Err(BrokerError::ContextUnavailable(
+            ContextUnavailableReason::RelativeWorkingDirectory(cwd.to_path_buf()),
+        )),
+        None => Err(BrokerError::ContextUnavailable(
+            ContextUnavailableReason::MissingWorkingDirectory,
+        )),
     };
     match configured {
         None => Ok(std::borrow::Cow::Borrowed(captured()?)),
@@ -4916,6 +4921,7 @@ mod tests {
 
     struct CountingAdapter {
         portable_dispatches: AtomicUsize,
+        native_dispatches: AtomicUsize,
         cancellable: AtomicBool,
         cancellations: AtomicUsize,
         ended_captures: AtomicUsize,
@@ -4958,6 +4964,7 @@ mod tests {
     fn counting_adapter(cancellable: bool) -> Arc<CountingAdapter> {
         Arc::new(CountingAdapter {
             portable_dispatches: AtomicUsize::new(0),
+            native_dispatches: AtomicUsize::new(0),
             cancellable: AtomicBool::new(cancellable),
             cancellations: AtomicUsize::new(0),
             ended_captures: AtomicUsize::new(0),
@@ -5370,6 +5377,7 @@ menus:
             &self,
             request: NativeDispatchRequest,
         ) -> Result<DispatchAccepted, AdapterError> {
+            self.native_dispatches.fetch_add(1, Ordering::SeqCst);
             Ok(DispatchAccepted {
                 correlation: ExecutionCorrelationId::new("native"),
                 execution: request.execution,
@@ -5728,8 +5736,50 @@ menus:
             )
             .await;
 
-        assert!(matches!(result, Err(BrokerError::ContextUnavailable)));
+        assert!(matches!(
+            result,
+            Err(BrokerError::ContextUnavailable(
+                ContextUnavailableReason::MissingReference(reference)
+            )) if reference.path == muxe_core::ContextPath::OriginWorkspaceId
+        ));
         assert_eq!(adapter.portable_dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_native_context_retains_reference_without_host_dispatch() {
+        let adapter = counting_adapter(false);
+        let (broker, _directory) =
+            counting_broker(&adapter, "<native context regression>", COUNTING_RELOAD_YAML);
+        let reference = muxe_core::ContextReference {
+            path: muxe_core::ContextPath::OriginWorkspaceId,
+        };
+        let value = muxe_core::ConfigValue::synthetic(muxe_core::ConfigValueKind::Context(
+            reference.clone(),
+        ));
+        let candidate = muxe_core::NativeActionCandidate {
+            type_name: "test.native".to_owned(),
+            type_span: value.span.clone(),
+            fields: vec![muxe_core::ConfigField {
+                name: "workspace".to_owned(),
+                name_span: value.span.clone(),
+                value,
+            }],
+        };
+        let failure = broker
+            .dispatch_native(
+                CoreExecutionId(1),
+                CountingAdapter::origin_without_cwd(),
+                &candidate,
+            )
+            .await
+            .expect_err("a native action cannot dispatch without its required context");
+        assert!(matches!(
+            failure,
+            BrokerError::ContextUnavailable(
+                ContextUnavailableReason::MissingReference(missing)
+            ) if missing == reference
+        ));
+        assert_eq!(adapter.native_dispatches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -5915,8 +5965,8 @@ menus:
 
         assert!(matches!(
             broker.drain_for_activation().await,
-            Err(BrokerError::ActivationDrainRefused(message))
-                if message.contains("detached host execution 1")
+            Err(BrokerError::ActivationDrainRefused(execution))
+                if execution.execution == core && execution.session.is_none()
         ));
         assert_eq!(
             adapter.cancellations.load(Ordering::SeqCst),
@@ -5933,6 +5983,40 @@ menus:
             !state.activation_sealed,
             "a refused drain returns the broker to usable admission"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_refusal_retains_session_owner_and_accepted_execution() {
+        let adapter = counting_adapter(false);
+        let (broker, binding, _directory) = counting_focus_broker(
+            &adapter,
+            "<session drain regression>",
+            COUNTING_AWAIT_FOCUS_YAML,
+        );
+        let (session, _events_rx) = attach_ready(&broker, "session-drain-ui").await;
+        let wire =
+            invoke_awaited_binding(&broker, &session, &binding, mpsc::channel(1).0).await;
+        let core = {
+            let state = broker.state.lock().await;
+            let record = state
+                .executions
+                .values()
+                .find(|record| record.wire == wire)
+                .expect("accepted execution is tracked");
+            assert_eq!(record.phase, ExecutionPhase::Adapter);
+            record.core
+        };
+        assert!(matches!(
+            broker.drain_for_activation().await,
+            Err(BrokerError::ActivationDrainRefused(execution))
+                if execution.execution == core && execution.session.as_ref() == Some(&session)
+        ));
+        assert_eq!(adapter.cancellations.load(Ordering::SeqCst), 0);
+        let state = broker.state.lock().await;
+        assert!(state.executions.contains_key(&core));
+        assert!(!state.activation_sealed);
+        drop(state);
+        assert!(broker.sessions.lock().await.contains_key(&session));
     }
     #[tokio::test]
     async fn reserved_dispatch_rejects_a_second_valid_invoke_before_acceptance() {
@@ -8995,13 +9079,17 @@ menus:
         let missing = CountingAdapter::origin_without_cwd();
         assert!(matches!(
             resolve_command_cwd(&missing, None),
-            Err(BrokerError::ContextUnavailable)
+            Err(BrokerError::ContextUnavailable(
+                ContextUnavailableReason::MissingWorkingDirectory
+            ))
         ));
         let mut relative = CountingAdapter::origin_without_cwd();
         relative.pane_cwd = Some(PathBuf::from("not-absolute"));
         assert!(matches!(
             resolve_command_cwd(&relative, Some(&literal_relative)),
-            Err(BrokerError::ContextUnavailable)
+            Err(BrokerError::ContextUnavailable(
+                ContextUnavailableReason::RelativeWorkingDirectory(path)
+            )) if path == PathBuf::from("not-absolute")
         ));
     }
 
@@ -11412,6 +11500,59 @@ menus:
     }
 }
 
+/// Adapter-owned work whose completion is unconfirmed and cancellation is unsupported.
+#[derive(Debug, Eq, PartialEq)]
+pub struct UnfinishedHostExecution {
+    pub execution: CoreExecutionId,
+    pub session: Option<UiSessionId>,
+}
+
+impl std::fmt::Display for UnfinishedHostExecution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.session {
+            Some(session) => write!(
+                formatter,
+                "Host execution ID {}, associated with UI session {}, has not been confirmed complete. It cannot be cancelled.",
+                self.execution.0,
+                session.as_str(),
+            ),
+            None => write!(
+                formatter,
+                "Detached host execution ID {} has not been confirmed complete. It cannot be cancelled.",
+                self.execution.0,
+            ),
+        }
+    }
+}
+
+/// Evidence explaining why an action could not use its captured host context.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ContextUnavailableReason {
+    MissingReference(muxe_core::ContextReference),
+    MissingWorkingDirectory,
+    RelativeWorkingDirectory(std::path::PathBuf),
+}
+
+impl std::fmt::Display for ContextUnavailableReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingReference(reference) => write!(
+                formatter,
+                "The captured host context does not contain the value required by {}.",
+                reference.path.as_str(),
+            ),
+            Self::MissingWorkingDirectory => formatter.write_str(
+                "Muxe needs an absolute working directory from the captured pane context, but none is available.",
+            ),
+            Self::RelativeWorkingDirectory(path) => write!(
+                formatter,
+                "Muxe needs an absolute working directory from the captured pane context, but the captured path is relative: {}.",
+                path.display(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum BrokerError {
     #[error("activation is in progress; this broker is not accepting new launches or executions")]
@@ -11433,8 +11574,8 @@ pub enum BrokerError {
     UnknownSession(UiSessionId),
     #[error("the active host cannot cancel this pending execution")]
     CancelUnsupported,
-    #[error("activation drain refused with a non-cancellable host execution in flight: {0}")]
-    ActivationDrainRefused(String),
+    #[error("{0}")]
+    ActivationDrainRefused(UnfinishedHostExecution),
     #[error("activation drain timed out waiting for broker-owned host cleanup: {0}")]
     ActivationCleanupUnconfirmed(String),
     #[error("a menu control is already pending for this execution")]
@@ -11449,8 +11590,8 @@ pub enum BrokerError {
     MismatchedExecution,
     #[error("{0}")]
     NativeCompatibility(String),
-    #[error("native action could not resolve against its immutable origin")]
-    ContextUnavailable,
+    #[error("{0}")]
+    ContextUnavailable(ContextUnavailableReason),
     #[error(
         "portable action parameter {parameter:?} is invalid after origin resolution: {message}"
     )]

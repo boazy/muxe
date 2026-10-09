@@ -3578,9 +3578,9 @@ impl ZellijAdapter {
     /// routing local close terminals through the close-waiter table.
     /// Suspend calls this BEFORE registration retirement so each queued slot
     /// settles exactly once here; the retire pass then only sees sent slots.
-    /// Shutdown reuses the same drain for the same reason: queued slots must
+    /// Shutdown reuses the same drain with its own diagnostic: queued slots must
     /// settle before the transport parks.
-    async fn drain_queued_for_suspend(&self) {
+    async fn drain_queued_requests(&self, diagnostic: &'static str) {
         enum PurgeRoute {
             Waiter(oneshot::Sender<DispatchCompletion>, DispatchCompletion),
             Broker(DispatchCompletion),
@@ -3611,10 +3611,7 @@ impl ZellijAdapter {
                 let error = || {
                     (
                         OutcomeRank::Unknown,
-                        AdapterError::new(
-                            AdapterErrorKind::OutcomeUnknown,
-                            "Zellij adapter suspended for activation with a queued request",
-                        ),
+                        AdapterError::new(AdapterErrorKind::OutcomeUnknown, diagnostic),
                     )
                 };
                 let terminal = match slot {
@@ -4311,7 +4308,10 @@ impl HostAdapter for ZellijAdapter {
         // retirement here settles by registration rather than by slot, but a
         // slot the purge already settled is `None` and `settle_slot` skips
         // it, so each request still resolves exactly once.
-        self.drain_queued_for_suspend().await;
+        self.drain_queued_requests(
+            "The action's outcome is unknown because activation suspended the Zellij adapter while one of its requests was still queued.",
+        )
+        .await;
         self.invalidate_all_registrations("Zellij adapter suspended before completion")
             .await;
         self.inner.register_epoch.lock().await.clear();
@@ -4506,7 +4506,10 @@ impl HostAdapter for ZellijAdapter {
                     .await;
             }
         }
-        self.drain_queued_for_suspend().await;
+        self.drain_queued_requests(
+            "The action's outcome is unknown because the Zellij adapter shut down while one of its requests was still queued.",
+        )
+        .await;
         for terminal in self
             .settle_matching_unknown(|_| true, "Zellij adapter shut down before completion")
             .await
@@ -5066,8 +5069,12 @@ while IFS= read -r line; do :; done
             .expect("purged waiter answers instead of hanging")
             .expect("waiter sender sends, not drops");
         match completion {
-            DispatchCompletion::OutcomeUnknown { execution: got, .. } => {
+            DispatchCompletion::OutcomeUnknown {
+                execution: got,
+                error,
+            } => {
                 assert_eq!(got, execution, "purge fails the exact queued execution");
+                assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
             }
             other => panic!("purged waiter must fail OutcomeUnknown, got {other:?}"),
         }
@@ -7213,8 +7220,11 @@ while IFS= read -r line; do :; done
         match next_event(&adapter).await {
             AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
                 execution: got,
-                ..
-            }) => assert_eq!(got, execution),
+                error,
+            }) => {
+                assert_eq!(got, execution);
+                assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+            }
             _ => panic!("accepted queued dispatch must settle outcome unknown"),
         }
         assert!(matches!(

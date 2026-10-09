@@ -66,7 +66,8 @@ impl QueueExecutionError {
                 format!("Herdr ordered transaction panicked internally: {message}")
             }
             Self::TypeMismatch => {
-                "Herdr send-queue owner produced an invalid internal result type".to_owned()
+                "The Herdr request-queue worker produced an invalid internal result type."
+                    .to_owned()
             }
         };
         AdapterError::new(AdapterErrorKind::Unavailable, message)
@@ -233,7 +234,7 @@ fn retired_before_send() -> ClassifiedInvokeError {
     ClassifiedInvokeError {
         error: AdapterError::new(
             AdapterErrorKind::Unavailable,
-            "Herdr runtime incarnation retired before the request was sent",
+            "The Herdr connection assigned to this request is no longer active. The request was not sent.",
         ),
         delivery: DeliveryState::NotSent,
         continuity_lost: false,
@@ -400,7 +401,7 @@ impl SendQueue {
         {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                format!("Herdr send-queue owner failed: {error}"),
+                format!("The Herdr request-queue worker stopped unexpectedly: {error}"),
             ));
         }
         Ok(())
@@ -750,7 +751,7 @@ impl HerdrRuntime {
             .map_err(|_| {
                 AdapterError::new(
                     AdapterErrorKind::Shutdown,
-                    "Herdr send-queue owner stopped before completing accepted work",
+                    "The Herdr request-queue worker stopped before completing work it had accepted.",
                 )
             })?
             .map_err(QueueExecutionError::into_adapter_error)
@@ -1184,6 +1185,24 @@ mod tests {
     /// The recorded pong of a Herdr 0.8.2 server, which speaks binary protocol 20.
     fn pong() -> Value {
         serde_json::json!({ "type": "pong", "protocol": 20, "version": "0.8.2" })
+    }
+
+    #[test]
+    fn retired_request_is_unavailable_without_delivery_or_new_continuity_loss() {
+        let failure = retired_before_send();
+        assert_eq!(failure.error.kind, AdapterErrorKind::Unavailable);
+        assert_eq!(failure.delivery, DeliveryState::NotSent);
+        assert!(!failure.continuity_lost);
+    }
+
+    #[tokio::test]
+    async fn lost_queue_completion_is_shutdown_not_a_claim_of_host_delivery() {
+        let (sender, receiver) = oneshot::channel::<Result<(), QueueExecutionError>>();
+        drop(sender);
+        let failure = HerdrRuntime::await_ordered(receiver)
+            .await
+            .expect_err("accepted work without a completion cannot report success");
+        assert_eq!(failure.kind, AdapterErrorKind::Shutdown);
     }
 
     #[tokio::test]

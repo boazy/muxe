@@ -1042,7 +1042,7 @@ impl HerdrAdapter {
         } else {
             Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Herdr retained event-subscription continuity is unavailable; host-bound operations are blocked until a new epoch completes compatibility validation",
+                "Muxe cannot verify continuity of its Herdr event subscription. Host operations are blocked until a new subscription passes compatibility checks.",
             ))
         }
     }
@@ -1063,7 +1063,7 @@ impl HerdrAdapter {
         ) {
             return Err(AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "captured Herdr origin belongs to a prior continuity epoch",
+                "The host context captured for this action does not match the current Herdr connection.",
             ));
         }
         Ok(authority)
@@ -2578,7 +2578,7 @@ impl HostAdapter for HerdrAdapter {
             };
             AdapterError::new(
                 kind,
-                "Herdr activation resume could not reserve coherent health publication",
+                "Muxe could not resume the Herdr adapter because it could not queue the adapter-health update.",
             )
         })?;
         let mut slot = self.shutdown_cancellable(self.resume_slot.lock()).await?;
@@ -2901,7 +2901,7 @@ async fn monitor_subscription(
             .expect("Herdr pending lease registry is not poisoned")
             .clear();
         adapter
-            .fail_post_dismissals("Herdr retained event-subscription continuity was lost")
+            .fail_post_dismissals("Muxe lost continuity of its Herdr event subscription.")
             .await;
         if !send_health_or_shutdown(
             &adapter,

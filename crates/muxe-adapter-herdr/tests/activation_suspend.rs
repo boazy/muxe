@@ -158,6 +158,62 @@ async fn suspend_proves_stream_release_and_resume_starts_a_fresh_epoch() {
 }
 
 #[tokio::test]
+async fn resume_health_queue_refusal_preserves_suspension_until_publication_is_possible() {
+    let mut script = ProductionConnectFixture::initial_handshake();
+    script.extend(ProductionConnectFixture::initial_handshake());
+    script.extend(ProductionConnectFixture::initial_handshake());
+    let fixture = ProductionConnectFixture::start_scripted(script)
+        .expect("owned health-queue fixture starts");
+    let adapter = HerdrAdapter::connect(fixture.adapter_config())
+        .await
+        .expect("adapter connects");
+    assert!(matches!(
+        adapter.next_health_event().await.expect("initial health"),
+        AdapterHealthEvent::Healthy { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(10), adapter.suspend_for_activation())
+        .await
+        .expect("suspend completes")
+        .expect("subscription is released");
+    assert!(matches!(
+        adapter.next_health_event().await.expect("suspend health"),
+        AdapterHealthEvent::Unhealthy { .. }
+    ));
+    assert_eq!(adapter.fill_health_queue_for_test(), 64);
+    let refusal = adapter
+        .resume_after_activation_abort()
+        .await
+        .expect_err("resume cannot install health without queue capacity");
+    assert_eq!(refusal.kind, AdapterErrorKind::Unavailable);
+    assert_eq!(
+        adapter
+            .identity()
+            .await
+            .expect_err("adapter stays suspended")
+            .kind,
+        AdapterErrorKind::Unavailable
+    );
+    let events = adapter.drain_health_queue_for_test().await;
+    assert_eq!(events.len(), 64);
+    assert!(
+        events
+            .iter()
+            .all(|event| matches!(event, AdapterHealthEvent::Unhealthy { .. }))
+    );
+
+    adapter
+        .resume_after_activation_abort()
+        .await
+        .expect("resume can publish health after queue capacity is restored");
+    assert!(matches!(
+        adapter.next_health_event().await.expect("resume health"),
+        AdapterHealthEvent::Reconnected { .. }
+    ));
+    adapter.shutdown().await.expect("owned adapter shuts down");
+    drop(fixture);
+}
+
+#[tokio::test]
 async fn failed_resume_leaves_the_adapter_unhealthy() {
     let fixture =
         ProductionConnectFixture::start_scripted(ProductionConnectFixture::initial_handshake())
