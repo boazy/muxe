@@ -589,7 +589,7 @@ Use these `$origin.` references to reuse information from the pane where you ope
 
 ## Key names
 
-Keys use the form `[selector:]modifier+…+key`. Most keys omit the selector. Use `alternate:` or `base:` only when you need to select one of those terminal key representations.
+Keys use the form `[selector:]modifier+…+key`. Omitting the selector is equivalent to `primary:`: `primary:left` and `left` define the same key. Use `alternate:` or `base:` only when you need to select one of those terminal key representations.
 
 Write modifiers in this order: `ctrl`, `alt`, `shift`, `super`, `hyper`, `meta`, `caps-lock`, `num-lock`.
 

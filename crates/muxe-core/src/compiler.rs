@@ -2518,11 +2518,20 @@ fn merge_defaults(target: &mut ConfigValue, defaults: &ConfigValue) {
                 if let (Some(bindings), Some(default_bindings)) =
                     (existing.value.as_mapping_mut(), default.value.as_mapping())
                 {
+                    // Compare canonical identities, including selector and modifiers.
+                    // Keep malformed fields for the later, host-filtered diagnostics.
+                    let mut keys: HashSet<CanonicalKey> = bindings
+                        .iter()
+                        .filter_map(|binding| CanonicalKey::parse(&binding.name).ok())
+                        .collect();
                     for binding in default_bindings {
-                        if !bindings
-                            .iter()
-                            .any(|existing| existing.name == binding.name)
-                        {
+                        let missing = match CanonicalKey::parse(&binding.name) {
+                            Ok(key) => keys.insert(key),
+                            Err(_) => !bindings
+                                .iter()
+                                .any(|existing| existing.name == binding.name),
+                        };
+                        if missing {
                             bindings.push(binding.clone());
                         }
                     }

@@ -93,6 +93,186 @@ inject:
 }
 
 #[test]
+fn primary_aliases_preserve_whole_bindings_and_unmatched_navigation_defaults() {
+    let config = compile(
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      primary:left: { label: left, action: config:reload }
+      primary:esc: { label: escape, action: config:reload }
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect("primary aliases replace the corresponding navigation defaults");
+    let main = config.menu(&id("main")).unwrap();
+    for (key, label) in [("left", "left"), ("esc", "escape")] {
+        let bindings = main
+            .bindings
+            .iter()
+            .filter(|binding| binding.key.canonical_string() == key)
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1);
+        let binding = bindings[0];
+        assert_eq!(binding.label.as_deref(), Some(label));
+        assert!(!binding.hidden);
+        assert_eq!(binding.conditions, muxe_core::BindingConditions::default());
+        assert!(matches!(
+            binding.action,
+            muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Config(
+                muxe_core::ConfigAction::Reload
+            ))
+        ));
+    }
+    for (key, action) in [
+        ("pgup", muxe_core::MenuAction::PagePrev),
+        ("right", muxe_core::MenuAction::PageNext),
+        ("pgdn", muxe_core::MenuAction::PageNext),
+    ] {
+        let binding = main
+            .bindings
+            .iter()
+            .find(|binding| binding.key.canonical_string() == key)
+            .unwrap();
+        assert!(binding.hidden);
+        assert!(binding.conditions.include.is_some());
+        assert!(binding.conditions.enable.is_some());
+        assert_eq!(
+            binding.action,
+            muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Menu(action))
+        );
+    }
+}
+
+#[test]
+fn defaults_injections_compare_canonical_identities_in_both_directions() {
+    let config = compile(
+        r"
+version: 1
+inject:
+  aliases:
+    select: { type: all }
+    action:
+      type: defaults
+      bindings:
+        primary:a: { hidden: true, action: menu:quit }
+        b: { hidden: true, action: menu:quit }
+        unicode+63: { label: first, action: config:reload }
+        primary:c: { hidden: true, action: menu:quit }
+menus:
+  main:
+    bindings:
+      a: { label: bare, action: config:reload }
+      primary:b: { label: primary, action: config:reload }
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect("defaults compare selectors and Unicode spellings canonically");
+    let main = config.menu(&id("main")).unwrap();
+    for (key, label) in [("a", "bare"), ("b", "primary"), ("c", "first")] {
+        let bindings = main
+            .bindings
+            .iter()
+            .filter(|binding| binding.key.canonical_string() == key)
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].label.as_deref(), Some(label));
+        assert!(!bindings[0].hidden);
+    }
+}
+
+#[test]
+fn navigation_defaults_keep_distinct_selectors_modifiers_and_identities() {
+    let config = compile(
+        r"
+version: 1
+keyboard:
+  mode: kitty
+  kitty: { alternate-keys: true }
+menus:
+  main:
+    bindings:
+      alternate:left: { label: alternate, action: config:reload }
+      base:left: { label: base, action: config:reload }
+      ctrl+left: { label: modified, action: config:reload }
+      up: { label: different, action: config:reload }
+",
+        None,
+        KeyCapabilities {
+            alternate_keys: true,
+            ..KeyCapabilities::default()
+        },
+    )
+    .expect("distinct canonical keys do not suppress navigation defaults");
+    let main = config.menu(&id("main")).unwrap();
+    for (key, label) in [
+        ("alternate:left", "alternate"),
+        ("base:left", "base"),
+        ("ctrl+left", "modified"),
+        ("up", "different"),
+    ] {
+        let binding = main
+            .bindings
+            .iter()
+            .find(|binding| binding.key.canonical_string() == key)
+            .unwrap();
+        assert_eq!(binding.label.as_deref(), Some(label));
+        assert!(!binding.hidden);
+    }
+    let left = main
+        .bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "left")
+        .unwrap();
+    assert!(left.hidden);
+    assert!(matches!(
+        left.action,
+        muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Menu(
+            muxe_core::MenuAction::PagePrev
+        ))
+    ));
+}
+
+#[test]
+fn defaults_preserve_invalid_configured_and_injected_key_diagnostics() {
+    for yaml in [
+        r"
+version: 1
+menus:
+  main:
+    bindings:
+      primary:not-a-key: { label: invalid, action: config:reload }
+",
+        r"
+version: 1
+inject:
+  invalid:
+    select: { type: all }
+    action:
+      type: defaults
+      bindings:
+        primary:not-a-key: { label: invalid, action: config:reload }
+menus:
+  main:
+    bindings: {}
+",
+    ] {
+        let errors = compile(yaml, None, KeyCapabilities::default())
+            .expect_err("malformed keys must reach binding validation");
+        let diagnostic = errors
+            .iter()
+            .find(|error| error.code == DiagnosticCode::InvalidKey)
+            .unwrap();
+        let span = &diagnostic.labels[0].span;
+        assert_eq!(span.source.as_str(), "config.yml");
+        assert_eq!(&yaml[span.start..span.end], "primary:not-a-key");
+    }
+}
+
+#[test]
 fn explicit_injection_override_wins_after_builtin_defaults() {
     let config = compile(
         r"

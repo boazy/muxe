@@ -285,7 +285,7 @@ menus:
       right: { label: right, action: 'pane:focus direction=right' }
   split:
     bindings:
-      left: { label: left, skip-hosts: [herdr], action: 'pane:split direction=left' }
+      primary:left: { label: left, skip-hosts: [herdr], action: 'pane:split direction=left' }
       right: { label: right, action: 'pane:split direction=right' }
 ";
     let herdr = compile(yaml, None, Some(&HerdrValidator)).unwrap();
@@ -343,6 +343,29 @@ menus:
         left.action,
         muxe_core::ActionSpec::Portable(PortableAction::Pane(PaneAction::Split { .. }))
     ));
+}
+
+#[test]
+fn invalid_binding_keys_are_diagnosed_only_after_host_filtering() {
+    let yaml = r"
+version: 1
+menus:
+  main:
+    bindings:
+      primary:not-a-key: { label: invalid, skip-hosts: [herdr], action: config:reload }
+";
+    let herdr = compile(yaml, None, Some(&HerdrValidator))
+        .expect("host-excluded malformed keys remain excluded");
+    assert!(labels(&herdr, "main").is_empty());
+    let zellij = compile(yaml, None, Some(&ZellijValidator))
+        .expect_err("included malformed keys must not be discarded during defaults merging");
+    let diagnostic = zellij
+        .iter()
+        .find(|error| error.code == DiagnosticCode::InvalidKey)
+        .unwrap();
+    let span = &diagnostic.labels[0].span;
+    assert_eq!(span.source.as_str(), "filters.yml");
+    assert_eq!(&yaml[span.start..span.end], "primary:not-a-key");
 }
 
 #[test]

@@ -265,7 +265,7 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
     writeln!(output, "\n## Key names\n").unwrap();
     writeln!(
         output,
-        "Keys use the form `[selector:]modifier+…+key`. Most keys omit the selector. Use `alternate:` or `base:` only when you need to select one of those terminal key representations."
+        "Keys use the form `[selector:]modifier+…+key`. Omitting the selector is equivalent to `primary:`: `primary:left` and `left` define the same key. Use `alternate:` or `base:` only when you need to select one of those terminal key representations."
     )
     .unwrap();
     writeln!(
