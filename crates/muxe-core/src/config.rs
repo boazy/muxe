@@ -551,7 +551,11 @@ impl fmt::Display for AttachmentViewError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingMenu(root) => {
-                write!(formatter, "requested root menu does not exist: {root:?}")
+                write!(
+                    formatter,
+                    "requested root menu does not exist: {}",
+                    root.display()
+                )
             }
             Self::Theme(error) => error.fmt(formatter),
         }

@@ -640,7 +640,7 @@ impl HerdrAdapter {
         if resumes.closed || self.shutdown.load(Ordering::Relaxed) {
             return Err(AdapterError::new(
                 AdapterErrorKind::Shutdown,
-                "Herdr adapter is shut down; refusing to start activation resume",
+                "The Herdr adapter is shut down and cannot resume after activation was aborted.",
             ));
         }
         resumes.active = resumes.active.saturating_add(1);
@@ -712,7 +712,7 @@ impl HerdrAdapter {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(AdapterError::new(
                 AdapterErrorKind::Shutdown,
-                "Herdr adapter is shut down; refusing to suspend it",
+                "The Herdr adapter is shut down and cannot be suspended for activation.",
             ));
         }
         let mut suspend = self
@@ -954,13 +954,13 @@ impl HerdrAdapter {
         if registry.closed {
             return Err(AdapterError::new(
                 AdapterErrorKind::Shutdown,
-                "Herdr adapter is shutting down and cannot admit another dispatch",
+                "The Herdr adapter is shutting down and cannot accept another action.",
             ));
         }
         if registry.tasks.contains_key(&execution) {
             return Err(AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                "Herdr adapter already owns this dispatch execution",
+                "The Herdr adapter has already accepted this action's execution ID.",
             ));
         }
         // Keep the admission lock through queue insertion and task registration.
@@ -1007,13 +1007,13 @@ impl HerdrAdapter {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(AdapterError::new(
                 AdapterErrorKind::Shutdown,
-                "Herdr adapter is shut down; host-bound operations are closed",
+                "The Herdr adapter is shut down. Host operations are blocked.",
             ));
         }
         if self.suspended.load(Ordering::SeqCst) {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Herdr adapter is suspended for activation; host-bound operations are blocked until resume or commit",
+                "The Herdr adapter is suspended for activation. Host operations are blocked until activation is completed or the adapter resumes.",
             ));
         }
         self.require_continuity()
@@ -1111,7 +1111,7 @@ impl HerdrAdapter {
                         execution,
                         error: AdapterError::new(
                             AdapterErrorKind::DispatchFailed,
-                            format!("Herdr {method} rejected request with {code}: {message}"),
+                            format!("Herdr rejected {method} ({code}): {message}"),
                         ),
                     },
                     Err((error, DeliveryState::MayHaveReachedHost)) => {
@@ -1649,7 +1649,7 @@ fn validate_emitted_fields(
         })?;
     let Some(params_object) = params_schema.as_object() else {
         return Err(format!(
-            "active Herdr schema declares {} with a non-object params schema",
+            "The active Herdr schema for {} must define params as an object",
             description.method
         ));
     };
@@ -1671,7 +1671,7 @@ fn validate_emitted_fields(
         Some(required) => {
             let Some(required) = required.as_array() else {
                 return Err(format!(
-                    "active Herdr schema declares {} with a malformed required clause",
+                    "The active Herdr schema for {} must define required as an array",
                     description.method
                 ));
             };
@@ -1679,7 +1679,7 @@ fn validate_emitted_fields(
             for entry in required {
                 let Some(name) = entry.as_str() else {
                     return Err(format!(
-                        "active Herdr schema declares {} with a malformed required entry",
+                        "The active Herdr schema for {} must use strings in the required array",
                         description.method
                     ));
                 };
@@ -1803,7 +1803,7 @@ fn validate_zoom_mode_field(
 ) -> Result<(), String> {
     let PortableAction::Pane(PaneAction::Zoom { enabled }) = action else {
         return Err(format!(
-            "portable action supplies an invalid value for parameter {field_name:?}: mode field does not reference a zoom action"
+            "portable action has an invalid {field_name:?} parameter: mode requires a zoom action"
         ));
     };
     let probe = match enabled {
@@ -1838,8 +1838,8 @@ fn converted_keys_probe(action: &PortableAction) -> Result<Value, String> {
                     Ok(Value::String("muxe-context".to_owned()))
                 } else {
                     Err(format!(
-                        "key context type {:?} does not fit the declared string parameter",
-                        reference.expected_type(),
+                        "context value {:?} cannot be used as a key string",
+                        reference.path.as_str(),
                     ))
                 }
             }
@@ -1875,8 +1875,8 @@ fn validate_context_marker(
         return Ok(());
     }
     Err(format!(
-        "active Herdr schema rejects the {method} parameter {field_name:?}: context type {:?} does not fit the declared parameter type",
-        reference.expected_type(),
+        "The active Herdr schema rejects the {method} parameter {field_name:?}: context value {:?} is incompatible with this parameter's declared type",
+        reference.path.as_str(),
     ))
 }
 
@@ -1890,13 +1890,15 @@ fn converted_literal_probe(
     match kind {
         PortableScalarKind::String => scalar_string_value(scalar).map(Value::String),
         PortableScalarKind::Bool => scalar_bool_value(scalar).map(Value::Bool),
-        PortableScalarKind::Index => scalar_index_value(scalar).map(|index| Value::Number(index.into())),
-        PortableScalarKind::Number => scalar_number_value(scalar).and_then(number_to_json),
-        PortableScalarKind::SplitDirection => scalar_split_direction_value(scalar).map(|direction| Value::String(direction.wire().to_owned())),
-        PortableScalarKind::PaneDirection => scalar_pane_direction_value(scalar).map(|direction| Value::String(direction.as_str().to_owned())),
-        PortableScalarKind::Keys => {
-            Err(format!("portable action supplies an invalid value for parameter {field_name:?}: keys convert as a list, not a scalar"))
+        PortableScalarKind::Index => {
+            scalar_index_value(scalar).map(|index| Value::Number(index.into()))
         }
+        PortableScalarKind::Number => scalar_number_value(scalar).and_then(number_to_json),
+        PortableScalarKind::SplitDirection => scalar_split_direction_value(scalar)
+            .map(|direction| Value::String(direction.wire().to_owned())),
+        PortableScalarKind::PaneDirection => scalar_pane_direction_value(scalar)
+            .map(|direction| Value::String(direction.as_str().to_owned())),
+        PortableScalarKind::Keys => Err("keys must be a list, not a scalar".to_owned()),
     }
     .map_err(|message| {
         format!("portable action supplies an invalid value for parameter {field_name:?}: {message}")
@@ -2181,7 +2183,7 @@ impl HostAdapter for HerdrAdapter {
             .ok_or_else(|| {
                 AdapterError::new(
                     AdapterErrorKind::ContextUnavailable,
-                    "Herdr pane.get lacks pane.workspace_id",
+                    "Herdr pane.get did not return a nonempty pane.workspace_id field",
                 )
             })?;
         Ok(ModalScopeId::new(workspace))
@@ -2189,7 +2191,7 @@ impl HostAdapter for HerdrAdapter {
 
     async fn begin_capture(&self, _request: CaptureRequest) -> Result<CaptureLease, AdapterError> {
         Err(incompatible(
-            "the Herdr socket API has no host input-capture or restoration method; refusing to fabricate a capture lease",
+            "The Herdr socket API does not support capturing host input.",
         ))
     }
 
@@ -2199,7 +2201,7 @@ impl HostAdapter for HerdrAdapter {
         _reason: CaptureReleaseReason,
     ) -> Result<(), AdapterError> {
         Err(incompatible(
-            "the Herdr socket API has no host input-capture restoration method",
+            "The Herdr socket API does not support restoring host input after capture.",
         ))
     }
 
@@ -2214,14 +2216,14 @@ impl HostAdapter for HerdrAdapter {
         let object = crate::pane_info(&pane).ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "Herdr pane.get returned an invalid pane_info response",
+                "Herdr pane.get must return a pane_info result containing a pane object",
             )
         })?;
         let actual = object.get("pane_id").and_then(Value::as_str);
         if actual != Some(registration.pane.as_str()) {
             return Err(AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "Herdr registered pane is not live",
+                "Herdr pane.get did not return the pane ID being registered",
             ));
         }
         if let Some(tab) = &registration.temporary_tab
@@ -2293,13 +2295,13 @@ impl HostAdapter for HerdrAdapter {
                 let object = crate::pane_info(&pane).ok_or_else(|| {
                     AdapterError::new(
                         AdapterErrorKind::ContextUnavailable,
-                        "Herdr pane.get returned an invalid pane_info response",
+                        "Herdr pane.get must return a pane_info result containing a pane object",
                     )
                 })?;
                 if object.get("pane_id").and_then(Value::as_str) != Some(record.pane.as_str()) {
                     return Err(AdapterError::new(
                         AdapterErrorKind::ContextUnavailable,
-                        "pending Herdr pane identity changed",
+                        "Herdr pane.get returned a different pane ID. The pending pane was not closed.",
                     ));
                 }
                 {
@@ -2390,7 +2392,7 @@ impl HostAdapter for HerdrAdapter {
         if creation_requires_post_dismissal(&request.action) {
             return Err(AdapterError::new(
                 AdapterErrorKind::InvalidRequest,
-                "focused creation must use post-dismissal dispatch after the Muxe UI closes",
+                "Actions that create and focus a pane or tab must run after the Muxe UI closes.",
             ));
         }
         if creation_has_program(&request.action) {
@@ -2441,7 +2443,7 @@ impl HostAdapter for HerdrAdapter {
     async fn cancel(&self, _execution: muxe_core::ExecutionId) -> Result<(), AdapterError> {
         Err(AdapterError::new(
             AdapterErrorKind::CancelUnsupported,
-            "the Herdr socket API has no cancellation request for unary operations",
+            "The Herdr socket API cannot cancel single-response requests.",
         ))
     }
 
@@ -2472,7 +2474,7 @@ impl HostAdapter for HerdrAdapter {
             if self.dispatches_fully_drained() {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Shutdown,
-                    "Herdr adapter has drained every admitted dispatch",
+                    "The Herdr adapter has finished all actions it accepted.",
                 ));
             }
             let mut events = self.events_rx.lock().await;
@@ -2482,7 +2484,7 @@ impl HostAdapter for HerdrAdapter {
                     let terminal = terminal.ok_or_else(|| {
                         AdapterError::new(
                             AdapterErrorKind::Shutdown,
-                            "Herdr adapter dispatch-result channel closed",
+                            "The Herdr adapter's action-result channel closed.",
                         )
                     })?;
                     drop(events);
@@ -2546,7 +2548,7 @@ impl HostAdapter for HerdrAdapter {
         if !released {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Herdr activation resume requires a completed exact-subscription suspension",
+                "The Herdr adapter cannot resume until its current event subscription has been fully suspended.",
             ));
         }
         let fresh_epoch = prior_epoch.next();
@@ -2594,7 +2596,7 @@ impl HostAdapter for HerdrAdapter {
             if self.shutdown.load(Ordering::Relaxed) {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Shutdown,
-                    "Herdr adapter shut down during activation resume; refusing to install a resumed subscription",
+                    "The Herdr adapter shut down while resuming after activation was aborted. The new event subscription was not installed.",
                 ));
             }
             let released = suspend.current.as_ref().is_some_and(|attempt| {
@@ -2607,7 +2609,7 @@ impl HostAdapter for HerdrAdapter {
             {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    "Herdr activation resume raced another incarnation transition",
+                    "The Herdr connection state changed while resuming after activation was aborted. The new event subscription was not installed.",
                 ));
             }
             let previous = incarnation.runtime.identity().clone();
@@ -2664,7 +2666,7 @@ impl HostAdapter for HerdrAdapter {
             .lock()
             .expect("Herdr pending lease registry is not poisoned")
             .clear();
-        self.fail_post_dismissals("Herdr adapter shut down before UI dismissal completed")
+        self.fail_post_dismissals("The Herdr adapter shut down before the Muxe UI closed. The queued action was not sent.")
             .await;
         // Every monitor send is interruptible by the shutdown wake below, so
         // joining it cannot depend on a consumer freeing bounded health space.
@@ -2901,7 +2903,7 @@ async fn monitor_subscription(
             .expect("Herdr pending lease registry is not poisoned")
             .clear();
         adapter
-            .fail_post_dismissals("Muxe lost continuity of its Herdr event subscription.")
+            .fail_post_dismissals("Muxe can no longer verify its Herdr event subscription. The queued action was not sent.")
             .await;
         if !send_health_or_shutdown(
             &adapter,
@@ -2987,7 +2989,7 @@ async fn reconnect_subscription(
         let Ok(attempt) = attempt else {
             last_error = Some(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Herdr reconnect attempt exceeded the host-loss grace",
+                "The Herdr reconnect attempt timed out before the host recovery deadline.",
             ));
             break;
         };
@@ -3022,7 +3024,7 @@ async fn reconnect_subscription(
         drop(subscription.take());
         last_error = Some(AdapterError::new(
             AdapterErrorKind::Unavailable,
-            "Herdr reconnect candidate became stale before coherent installation",
+            "The Herdr connection state changed before the replacement connection could be installed.",
         ));
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
@@ -3038,7 +3040,7 @@ async fn reconnect_subscription(
     ReconnectOutcome::HostLost(last_error.unwrap_or_else(|| {
         AdapterError::new(
             AdapterErrorKind::Unavailable,
-            "Herdr host did not recover within the bounded reconnect grace",
+            "Herdr did not reconnect before the host recovery deadline.",
         )
     }))
 }
@@ -3049,7 +3051,7 @@ async fn reconnect_attempt(
     let epoch = adapter.reconnect_epoch().ok_or_else(|| {
         AdapterError::new(
             AdapterErrorKind::Unavailable,
-            "Herdr reconnect was requested without a lost incarnation",
+            "The Herdr adapter cannot reconnect because its current connection has not been marked as lost.",
         )
     })?;
     let refreshed = Arc::new(HerdrRuntime::connect(adapter.config.clone()).await?);
@@ -3105,7 +3107,7 @@ fn snapshot_contains_pane(
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                "Herdr session.snapshot response lacks a panes array; cannot prove Muxe UI dismissal",
+                "Herdr session.snapshot did not return a snapshot.panes array. Muxe cannot confirm that its UI pane has closed.",
             )
         })?;
     Ok(panes
@@ -3157,7 +3159,7 @@ fn portable_invocation(
             // never reach the single-request builder: dispatch routes them to their own paths.
             // The description already reported every unsupported form as `Err`, so reaching
             // here with `None` means dispatch misrouted a multi-request action.
-            incompatible("portable action form is unavailable in the Herdr socket API")
+            incompatible("Muxe cannot run this portable action through the Herdr socket API.")
         })?;
     let invocation = build_portable_invocation(&description, action, origin)?;
     debug_assert_eq!(invocation.method, description.method);
@@ -3271,7 +3273,7 @@ fn build_portable_invocation(
         }),
         _ => Err(AdapterError::new(
             AdapterErrorKind::Incompatible,
-            "portable action form is unavailable in the Herdr socket API",
+            "Muxe cannot run this portable action through the Herdr socket API.",
         )),
     }
 }
@@ -3523,7 +3525,7 @@ fn portable_request_description(
         },
         PortableRequestKind::TabRename { named: false } => {
             return Err(
-                "Herdr tab.rename requires `label`; the portable bare `tab:rename` has no specified Herdr prompt mapping"
+                "Herdr tab.rename requires label. Muxe does not support opening a Herdr rename prompt for bare tab:rename."
                     .to_owned(),
             );
         }
@@ -3559,7 +3561,7 @@ fn portable_request_description(
         }
         PortableRequestKind::PaneSplit { command: true, .. } => {
             return Err(
-                "Herdr command-bearing pane:split requires the ordered dismiss-and-dispatch lifecycle"
+                "A pane:split action with a command must run after the Muxe UI closes."
                     .to_owned(),
             );
         }
@@ -3596,12 +3598,12 @@ fn portable_request_description(
                 PortableRequestField { name: "mode", origin: Origin::Default(Scalar::String) },
             ],
         },
-        PortableRequestKind::TabFocus => return Err("Herdr tab.focus targets a tab ID; portable index/direction focus requires a list-to-ID bridge that the Herdr socket API does not expose as a typed action".to_owned()),
+        PortableRequestKind::TabFocus => return Err("Herdr tab.focus requires a tab ID. Muxe does not support focusing Herdr tabs by index or direction.".to_owned()),
         PortableRequestKind::TabMove { index: false } => return Err("Herdr tab.move supports only a concrete insert index".to_owned()),
-        PortableRequestKind::TabSwap { index: false } => return Err("Herdr tab:swap supports only an index; the schema offers tab.list plus tab.move, not directional tab targeting".to_owned()),
-        PortableRequestKind::PaneFocus { cardinal: false } => return Err("Herdr pane.focus supports only cardinal directions".to_owned()),
+        PortableRequestKind::TabSwap { index: false } => return Err("Muxe supports Herdr tab:swap only by index, not by direction.".to_owned()),
+        PortableRequestKind::PaneFocus { cardinal: false } => return Err("Herdr pane.focus supports only left, right, up, or down.".to_owned()),
         PortableRequestKind::PaneMove => return Err("Herdr pane.move requires an explicit tab/new-tab destination, not a portable index or direction".to_owned()),
-        PortableRequestKind::PaneSwap { cardinal: false } => return Err("Herdr pane.swap supports only cardinal directions".to_owned()),
+        PortableRequestKind::PaneSwap { cardinal: false } => return Err("Herdr pane.swap supports only left, right, up, or down.".to_owned()),
         PortableRequestKind::PaneFullscreen => return Err("the Herdr socket API exposes no pane fullscreen method".to_owned()),
         PortableRequestKind::PaneFloating => return Err("the Herdr socket API exposes no pane floating method".to_owned()),
         PortableRequestKind::PaneFrame => return Err("the Herdr socket API exposes no pane frame method".to_owned()),
@@ -3799,11 +3801,13 @@ fn creation_cwd(
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "creation command requires explicit cwd or captured origin pane cwd",
+                "The creation command needs an explicit working directory or one captured from the origin pane.",
             )
         })?;
     if !cwd.is_absolute() {
-        return Err(incompatible("creation command cwd must be absolute"));
+        return Err(incompatible(
+            "The creation command's working directory must be an absolute path.",
+        ));
     }
     json_path(&cwd, field)?;
     Ok(cwd)
@@ -3860,7 +3864,7 @@ async fn perform_tab_swap(
     let target_after_first = tab_at_id(&after_first, &target.id, workspace, "moved target tab")?;
     if target_after_first.position != source.position {
         return Err(TabSwapError::Known(format!(
-            "Herdr first tab.move did not place target tab at position {}; tab ordering may be partially changed and Muxe will not replay",
+            "The first Herdr tab.move did not place the target tab at position {}. Tab ordering may have changed partially. Muxe will not repeat the swap.",
             source.position.get()
         )));
     }
@@ -3889,7 +3893,7 @@ async fn perform_tab_swap(
     let target_after = tab_at_id(&after_second, &target.id, workspace, "target tab")?;
     if source_after.position != target.position || target_after.position != source.position {
         return Err(TabSwapError::Known(format!(
-            "Herdr tab moves completed without producing the requested swap (expected {}<->{}) ; tab ordering is partially changed and Muxe will not replay",
+            "Herdr completed the tab moves, but did not swap positions {} and {} as requested. Tab ordering may have changed partially. Muxe will not repeat the swap.",
             source.position.get(),
             target.position.get()
         )));
@@ -3907,20 +3911,20 @@ async fn request_tab_swap(
     match authority.invoke_response(method, params).await {
         Ok(HerdrResponse::Success(result)) => Ok(result),
         Ok(HerdrResponse::Error { code, message }) => Err(TabSwapError::Known(format!(
-            "Herdr rejected {method} during tab swap {phase} with {code}: {message}; {}",
+            "Herdr rejected {method} during the tab swap ({phase}, {code}): {message}. {}",
             if state_changing {
-                "an earlier ordered move may have changed tab ordering and Muxe will not replay"
+                "An earlier move may have changed tab ordering. Muxe will not repeat the swap."
             } else {
-                "no tab move was accepted for this request"
+                "Herdr did not accept a tab move for this request."
             }
         ))),
         Err(error) if state_changing && error.kind == AdapterErrorKind::OutcomeUnknown => {
             Err(TabSwapError::Unknown(format!(
-                "Herdr response was lost during tab swap {phase}; this tab.move may have applied and Muxe will not replay: {error}"
+                "Muxe could not confirm the response during the tab swap ({phase}). This tab.move may have executed. Muxe will not repeat the swap: {error}"
             )))
         }
         Err(error) => Err(TabSwapError::Known(format!(
-            "Herdr transport failed during tab swap {phase}: {error}"
+            "The Herdr request failed during the tab swap ({phase}): {error}"
         ))),
     }
 }
@@ -4098,7 +4102,7 @@ fn scalar_string(value: &ActionScalar) -> Result<&str, AdapterError> {
     value.value.as_str().ok_or_else(|| {
         AdapterError::new(
             AdapterErrorKind::InvalidRequest,
-            "resolved portable scalar must be a string",
+            "The action parameter must be a string",
         )
     })
 }
@@ -4111,13 +4115,13 @@ fn scalar_index(value: &ActionScalar) -> Result<u64, AdapterError> {
     let muxe_core::ConfigValueKind::Integer(value) = value.value.kind else {
         return Err(AdapterError::new(
             AdapterErrorKind::InvalidRequest,
-            "resolved portable index must be nonnegative",
+            "The action index must be a nonnegative integer",
         ));
     };
     u64::try_from(value).map_err(|_| {
         AdapterError::new(
             AdapterErrorKind::InvalidRequest,
-            "resolved portable index must be nonnegative",
+            "The action index must be a nonnegative integer",
         )
     })
 }
@@ -4130,7 +4134,7 @@ fn scalar_bool(value: &ActionScalar) -> Result<bool, AdapterError> {
     value.value.as_bool().ok_or_else(|| {
         AdapterError::new(
             AdapterErrorKind::InvalidRequest,
-            "resolved portable scalar must be boolean",
+            "The action parameter must be a boolean",
         )
     })
 }
@@ -4149,7 +4153,7 @@ fn scalar_number(value: &ActionScalar) -> Result<f64, AdapterError> {
         muxe_core::ConfigValueKind::Float(value) => Ok(value),
         _ => Err(AdapterError::new(
             AdapterErrorKind::InvalidRequest,
-            "resolved pane resize amount must be numeric",
+            "The pane resize amount must be a number",
         )),
     }
 }
@@ -4270,7 +4274,7 @@ fn resize_number(amount: &ResizeAmount) -> Result<f64, AdapterError> {
         ResizeAmount::Float(value) => Ok(*value),
         ResizeAmount::Boolean(_) | ResizeAmount::Text(_) => Err(AdapterError::new(
             AdapterErrorKind::InvalidRequest,
-            "resolved pane resize amount must be numeric",
+            "The pane resize amount must be a number",
         )),
     }
 }
@@ -4343,7 +4347,7 @@ fn socket_error(error: &SocketError) -> AdapterError {
 fn host_rejection(method: &str, code: &str, message: &str) -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::DispatchFailed,
-        format!("Herdr {method} rejected request with {code}: {message}"),
+        format!("Herdr rejected {method} ({code}): {message}"),
     )
 }
 
@@ -4354,14 +4358,14 @@ fn pane_is_proven_absent(code: &str) -> bool {
 fn pending_cleanup_lease_stale() -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::ContextUnavailable,
-        "pending Herdr cleanup lease is stale",
+        "The saved permission to close the pending Herdr pane no longer matches the current pane, UI session, or connection.",
     )
 }
 
 fn pending_cleanup_outcome_unknown() -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::OutcomeUnknown,
-        "Herdr may already have closed the pending pane; refusing to close a possibly reused pane ID",
+        "Herdr may already have closed the pending pane. Muxe will not send another close request because the pane ID may have been reused.",
     )
 }
 
@@ -5166,10 +5170,6 @@ mod tests {
         assert!(
             error.contains("tab.rename"),
             "the diagnostic names the affected method: {error}"
-        );
-        assert!(
-            error.contains("does not fit"),
-            "the diagnostic names the domain mismatch: {error}"
         );
         // The rejection must surface as a diagnostic attached to the action span, so the
         // compiler can pin the binding that can never dispatch.

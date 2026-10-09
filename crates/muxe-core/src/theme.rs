@@ -483,9 +483,9 @@ impl fmt::Display for ThemeSelectionError {
                 formatter,
                 "theme `{theme}` cannot pair with color scheme `{color_scheme}`: {error}"
             ),
-            Self::StaleResolution => {
-                formatter.write_str("theme resolution belongs to another generation")
-            }
+            Self::StaleResolution => formatter.write_str(
+                "cannot apply the resolved theme: it belongs to a different configuration",
+            ),
         }
     }
 }
@@ -658,7 +658,7 @@ fn compile_theme_section(
     for template in section.templates.values() {
         if has_loader_backed_construct(template) {
             return Err(ThemePairError::new(
-                "theme templates cannot use loader-backed tags",
+                "theme templates cannot load other templates; `include`, `import`, `from`, and `extends` are not supported",
             ));
         }
         minijinja::Environment::new()

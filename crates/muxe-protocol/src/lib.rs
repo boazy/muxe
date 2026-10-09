@@ -29,6 +29,33 @@ pub use frame::{
 pub use text::truncate_utf8;
 pub use wire::*;
 
+impl BrokerResponse {
+    /// Names the response without exposing its payload in a user diagnostic.
+    #[must_use]
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::LaunchPrepared { .. } => "launch reservation",
+            Self::PendingPaneRegistered => "pane registration confirmation",
+            Self::AttachPending => "attachment waiting for launch completion",
+            Self::UiAttached { .. } => "UI attachment",
+            Self::InvocationAccepted { .. } => "execution acceptance",
+            Self::PendingControlCompleted { .. } => "menu-control completion",
+            Self::Detached => "UI detachment confirmation",
+            Self::Acknowledged => "acknowledgement",
+            Self::Error(_) => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 // Non-wire traits live here because wire.rs source participates in the protocol fingerprint.
 impl Ord for UiSessionId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {

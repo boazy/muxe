@@ -279,7 +279,7 @@ pub enum LaunchError {
         index: usize,
     },
     /// Menu without focus.
-    #[error("menu panes must take focus; menu open exposes no --no-focus")]
+    #[error("menu panes must take focus; menu open does not support --no-focus")]
     MenuRequiresFocus,
     /// Menu without a captured origin working directory.
     #[error("menu launches require the captured absolute origin working directory")]
@@ -349,19 +349,19 @@ pub fn normalize_placement(
         if width.is_some() {
             return Err(LaunchError::UnsupportedPlacement {
                 option: "--width",
-                reason: "pinned Zellij ignores dimensions on tiled panes",
+                reason: "Zellij ignores dimensions on tiled panes",
             });
         }
         if height.is_some() {
             return Err(LaunchError::UnsupportedPlacement {
                 option: "--height",
-                reason: "pinned Zellij ignores dimensions on tiled panes",
+                reason: "Zellij ignores dimensions on tiled panes",
             });
         }
         if position.is_some() {
             return Err(LaunchError::UnsupportedPlacement {
                 option: "--position",
-                reason: "pinned Zellij ignores coordinates on tiled panes",
+                reason: "Zellij ignores coordinates on tiled panes",
             });
         }
         return Ok(ZellijPlacement::Split { direction });

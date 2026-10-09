@@ -227,7 +227,7 @@ pub enum PortableError {
     },
     /// A config/schema marker cannot be accepted for the field's required type.
     #[error(
-        "portable {action} parameter '{parameter}' still carries an unresolved context reference"
+        "context reference in portable {action} parameter '{parameter}' is unresolved or incompatible with the parameter's required type"
     )]
     UnresolvedContext {
         /// Portable action discriminator.
@@ -263,7 +263,7 @@ fn scalar_index_u32(
             u32::try_from(*number).map_err(|_| PortableError::InvalidScalar {
                 action,
                 parameter,
-                reason: "index must be a non-negative integer fitting in u32",
+                reason: "index must be an integer from 0 to 4294967295",
             })
         }
         ConfigValueKind::Context(_) => Err(PortableError::UnresolvedContext { action, parameter }),
@@ -325,12 +325,12 @@ fn parse_origin_pane(text: &str) -> Option<raw::PaneId> {
 fn origin_pane(action: &'static str, origin: &OriginContext) -> Result<raw::PaneId, PortableError> {
     let pane = origin.pane_id.as_ref().ok_or(PortableError::Incompatible {
         action,
-        reason: "origin carries no pane; the target is context_unavailable",
+        reason: "the captured origin has no pane, so the action's target is unavailable",
     })?;
     parse_origin_pane(pane.as_str()).ok_or(PortableError::InvalidScalar {
         action,
         parameter: "origin.pane.id",
-        reason: "origin pane ID is not a pinned terminal_<n> or plugin_<n> identity",
+        reason: "origin pane ID must be terminal_<n>, plugin_<n>, or a bare number, where n is an integer from 0 to 4294967295",
     })
 }
 
@@ -414,7 +414,7 @@ fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
             if workspace_id.is_some() {
                 return Err(PortableError::Incompatible {
                     action: "tab:create",
-                    reason: "Zellij 0.46 has no workspace concept; omit workspace-id to use host NewTab",
+                    reason: "Zellij 0.46 does not support workspaces; omit workspace-id to create a tab",
                 });
             }
             if let Some(name) = name {
@@ -428,7 +428,7 @@ fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
             let Some(name) = name else {
                 return Err(PortableError::Incompatible {
                     action: "tab:rename",
-                    reason: "pinned RenameTab requires a name; no host prompt variant exists",
+                    reason: "Zellij requires a tab name and cannot prompt for one",
                 });
             };
             check_concrete_string("tab:rename", "name", name)
@@ -447,12 +447,12 @@ fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
             }
             muxe_core::IndexOrDirection::Index(_) => Err(PortableError::Incompatible {
                 action: "tab:move",
-                reason: "pinned MoveTab and MoveTabByTabId are directional; positional moves have no host primitive",
+                reason: "Zellij can move a tab by direction but cannot move it to a specified index",
             }),
         },
         TabAction::Swap(_) => Err(PortableError::Incompatible {
             action: "tab:swap",
-            reason: "no atomic pinned primitive swaps two tabs",
+            reason: "Zellij has no command that swaps two tabs atomically",
         }),
     }
 }
@@ -486,19 +486,19 @@ fn validate_pane_structure(pane: &PaneAction) -> Result<(), PortableError> {
             }
             muxe_core::IndexOrDirection::Index(_) => Err(PortableError::Incompatible {
                 action: "pane:move",
-                reason: "MovePaneByPaneId takes an optional direction, not a positional destination",
+                reason: "Zellij can move a pane by direction but cannot move it to a specified index",
             }),
         },
         PaneAction::Swap(_) => Err(PortableError::Incompatible {
             action: "pane:swap",
-            reason: "no pinned primitive swaps two panes",
+            reason: "Zellij has no command that swaps two panes",
         }),
         PaneAction::Resize { direction, amount } => {
             if let Some(amount) = amount {
                 check_marker("pane:resize", "amount", amount, &[], true)?;
                 return Err(PortableError::Incompatible {
                     action: "pane:resize",
-                    reason: "pinned Resize carries no magnitude; omit amount for one Increase step",
+                    reason: "Zellij cannot resize by a specified amount; omit amount for one increase step",
                 });
             }
             Cardinal::parse("pane:resize", direction).map(|_| ())
@@ -508,7 +508,7 @@ fn validate_pane_structure(pane: &PaneAction) -> Result<(), PortableError> {
         PaneAction::Floating { enabled } => check_toggle("pane:floating", enabled.as_ref()),
         PaneAction::Frame { .. } => Err(PortableError::Incompatible {
             action: "pane:frame",
-            reason: "no pane-targeted frame primitive exists; TogglePaneFrames acts on the focused menu pane",
+            reason: "Zellij cannot change frames for a specified pane; its frame toggle acts on the focused menu pane",
         }),
     }
 }
@@ -523,11 +523,11 @@ fn validate_session_structure(session: &SessionAction) -> Result<(), PortableErr
         SessionAction::Detach | SessionAction::Kill => Ok(()),
         SessionAction::Create => Err(PortableError::Incompatible {
             action: "session:create",
-            reason: "no one-to-one plugin API creates a session",
+            reason: "Zellij's plugin API has no command that creates a session",
         }),
         SessionAction::Quit => Err(PortableError::Incompatible {
             action: "session:quit",
-            reason: "quit_zellij terminates the server; it is not a portable session quit",
+            reason: "Zellij's quit command terminates the server and cannot implement portable session quit",
         }),
     }
 }
@@ -567,7 +567,7 @@ fn check_create_command(
         if command.program.is_none() && !cwd_without_program {
             return Err(PortableError::Incompatible {
                 action,
-                reason: "Zellij can apply cwd to a split only when program is supplied",
+                reason: "Zellij can set a split's working directory only when program is supplied",
             });
         }
     }
@@ -575,7 +575,7 @@ fn check_create_command(
         return Err(PortableError::InvalidScalar {
             action,
             parameter: "args",
-            reason: "args requires program",
+            reason: "args requires a program",
         });
     }
     Ok(())
@@ -629,7 +629,7 @@ fn check_toggle(action: &'static str, enabled: Option<&ActionScalar>) -> Result<
         scalar_bool(action, "enabled", scalar)?;
         return Err(PortableError::Incompatible {
             action,
-            reason: "the host exposes only a toggle; an explicit boolean cannot be honored idempotently",
+            reason: "Zellij can only toggle this setting; it cannot set enabled to an explicit true or false",
         });
     }
     Ok(())
@@ -646,7 +646,7 @@ fn check_tab_focus_direction(scalar: &ActionScalar) -> Result<(), PortableError>
             _ => Err(PortableError::InvalidScalar {
                 action: "tab:focus",
                 parameter: "direction",
-                reason: "expected one of next or previous for tab focus",
+                reason: "expected next or previous for tab focus",
             }),
         },
         ConfigValueKind::Context(_) => Err(PortableError::UnresolvedContext {
@@ -785,7 +785,7 @@ fn pinned_index(action: &'static str, index: u64) -> Result<u32, PortableError> 
     u32::try_from(index).map_err(|_| PortableError::InvalidScalar {
         action,
         parameter: "index",
-        reason: "index must be a non-negative integer fitting in u32",
+        reason: "index must be an integer from 0 to 4294967295",
     })
 }
 
@@ -804,7 +804,7 @@ fn map_tab_action(
             if workspace_id.is_some() {
                 return Err(PortableError::Incompatible {
                     action: "tab:create",
-                    reason: "Zellij 0.46 has no workspace concept; omit workspace-id to use host NewTab",
+                    reason: "Zellij 0.46 does not support workspaces; omit workspace-id to create a tab",
                 });
             }
             let (command, cwd) = map_create_command("tab:create", command)?;
@@ -825,19 +825,19 @@ fn map_tab_action(
             let Some(name) = name else {
                 return Err(PortableError::Incompatible {
                     action: "tab:rename",
-                    reason: "pinned RenameTab requires a name; no host prompt variant exists",
+                    reason: "Zellij requires a tab name and cannot prompt for one",
                 });
             };
             let Some(tab_index) = origin.tab_index else {
                 return Err(PortableError::Incompatible {
                     action: "tab:rename",
-                    reason: "origin carries no tab index; the rename target is context_unavailable",
+                    reason: "the captured origin has no tab index, so the tab to rename is unavailable",
                 });
             };
             let tab_index = u32::try_from(tab_index).map_err(|_| PortableError::InvalidScalar {
                 action: "tab:rename",
                 parameter: "origin.tab.index",
-                reason: "tab index must fit in u32",
+                reason: "tab index must be an integer from 0 to 4294967295",
             })?;
             Ok(wrap(raw::Action::RenameTab {
                 tab_index,
@@ -863,12 +863,12 @@ fn map_tab_action(
             })),
             ResolvedTabTarget::Index(_) => Err(PortableError::Incompatible {
                 action: "tab:move",
-                reason: "pinned MoveTab and MoveTabByTabId are directional; positional moves have no host primitive",
+                reason: "Zellij can move a tab by direction but cannot move it to a specified index",
             }),
         },
         ResolvedTabAction::Swap(_) => Err(PortableError::Incompatible {
             action: "tab:swap",
-            reason: "no atomic pinned primitive swaps two tabs",
+            reason: "Zellij has no command that swaps two tabs atomically",
         }),
     }
 }
@@ -911,7 +911,7 @@ fn map_create_command<'a>(
         return Err(PortableError::InvalidScalar {
             action,
             parameter: "args",
-            reason: "args requires program",
+            reason: "args requires a program",
         });
     };
     command_text(action, "program", program)?;
@@ -942,7 +942,7 @@ fn map_split(
     if command.is_none() && cwd.is_some() {
         return Err(PortableError::Incompatible {
             action: "pane:split",
-            reason: "Zellij can apply cwd to a split only when program is supplied",
+            reason: "Zellij can set a split's working directory only when program is supplied",
         });
     }
     if !focus {
@@ -1014,18 +1014,18 @@ fn map_pane_action(
             }
             ResolvedPaneTarget::Index(_) => Err(PortableError::Incompatible {
                 action: "pane:move",
-                reason: "MovePaneByPaneId takes an optional direction, not a positional destination",
+                reason: "Zellij can move a pane by direction but cannot move it to a specified index",
             }),
         },
         ResolvedPaneAction::Swap(_) => Err(PortableError::Incompatible {
             action: "pane:swap",
-            reason: "no pinned primitive swaps two panes",
+            reason: "Zellij has no command that swaps two panes",
         }),
         ResolvedPaneAction::Resize { direction, amount } => {
             if amount.is_some() {
                 return Err(PortableError::Incompatible {
                     action: "pane:resize",
-                    reason: "pinned Resize carries no magnitude; omit amount for one Increase step",
+                    reason: "Zellij cannot resize by a specified amount; omit amount for one increase step",
                 });
             }
             let cardinal = Cardinal::from_direction("pane:resize", *direction)?;
@@ -1050,7 +1050,7 @@ fn map_pane_action(
         }
         ResolvedPaneAction::Frame { .. } => Err(PortableError::Incompatible {
             action: "pane:frame",
-            reason: "no pane-targeted frame primitive exists; TogglePaneFrames acts on the focused menu pane",
+            reason: "Zellij cannot change frames for a specified pane; its frame toggle acts on the focused menu pane",
         }),
     }
 }
@@ -1074,7 +1074,7 @@ fn map_session_action(
                 .as_ref()
                 .ok_or(PortableError::Incompatible {
                     action: "session:kill",
-                    reason: "origin carries no session; the target is context_unavailable",
+                    reason: "the captured origin has no session name, so the action's target is unavailable",
                 })?;
             Ok(PortableMapping::HostAction {
                 commands: vec![RawNativeCommand::KillSessions {
@@ -1084,11 +1084,11 @@ fn map_session_action(
         }
         ResolvedSessionAction::Create => Err(PortableError::Incompatible {
             action: "session:create",
-            reason: "no one-to-one plugin API creates a session",
+            reason: "Zellij's plugin API has no command that creates a session",
         }),
         ResolvedSessionAction::Quit => Err(PortableError::Incompatible {
             action: "session:quit",
-            reason: "quit_zellij terminates the server; it is not a portable session quit",
+            reason: "Zellij's quit command terminates the server and cannot implement portable session quit",
         }),
     }
 }
@@ -1113,7 +1113,7 @@ fn map_toggle(
     if enabled.is_some() {
         return Err(PortableError::Incompatible {
             action,
-            reason: "the host exposes only a toggle; an explicit boolean cannot be honored idempotently",
+            reason: "Zellij can only toggle this setting; it cannot set enabled to an explicit true or false",
         });
     }
     Ok(wrap(build(origin_pane(action, origin)?)))
@@ -1325,13 +1325,13 @@ mod tests {
         )
         .expect_err("missing origin pane must not target the UI pane");
 
-        assert_eq!(
+        assert!(matches!(
             error,
             PortableError::Incompatible {
                 action: "pane:close",
-                reason: "origin carries no pane; the target is context_unavailable",
+                ..
             }
-        );
+        ));
     }
 
     #[test]
@@ -1408,13 +1408,13 @@ mod tests {
             let resolved = action
                 .resolve_context(&origin)
                 .expect("workspace input resolves");
-            assert_eq!(
+            assert!(matches!(
                 map_portable(&resolved, &origin),
                 Err(PortableError::Incompatible {
                     action: "tab:create",
-                    reason: "Zellij 0.46 has no workspace concept; omit workspace-id to use host NewTab",
+                    ..
                 })
-            );
+            ));
             assert!(validate_portable_structure(&action).is_err());
         }
     }
@@ -1720,14 +1720,14 @@ mod tests {
                 );
             } else {
                 for (action, name) in [(&action, "tab:focus"), (&pane, "pane:focus")] {
-                    assert_eq!(
+                    assert!(matches!(
                         map_portable(action, &origin),
                         Err(PortableError::InvalidScalar {
-                            action: name,
+                            action: actual,
                             parameter: "index",
-                            reason: "index must be a non-negative integer fitting in u32",
-                        })
-                    );
+                            ..
+                        }) if actual == name
+                    ));
                 }
             }
         }
@@ -1764,16 +1764,20 @@ mod tests {
                 command,
             });
             for (action, name) in [(&tab, "tab:create"), (&split, "pane:split")] {
-                let expected = PortableError::InvalidScalar {
-                    action: name,
-                    parameter,
-                    reason: "path cannot be represented as UTF-8 text",
-                };
-                assert_eq!(map_portable(action, &test_origin()), Err(expected.clone()));
-                assert_eq!(
-                    map_post_dismissal_creation(action, &test_origin()),
-                    Err(expected)
-                );
+                for error in [
+                    map_portable(action, &test_origin()).expect_err("non-UTF-8 creation must fail"),
+                    map_post_dismissal_creation(action, &test_origin())
+                        .expect_err("non-UTF-8 creation must fail after dismissal"),
+                ] {
+                    assert!(matches!(
+                        error,
+                        PortableError::InvalidScalar {
+                            action: actual_action,
+                            parameter: actual_parameter,
+                            ..
+                        } if actual_action == name && actual_parameter == parameter
+                    ));
+                }
             }
         }
     }
@@ -1787,20 +1791,20 @@ mod tests {
             command: ResolvedCreateCommand::default(),
         });
         assert!(!creation_requires_post_dismissal(&unfocused));
-        assert_eq!(
+        assert!(matches!(
             map_portable(&unfocused, &origin),
             Err(PortableError::Incompatible {
                 action: "pane:split",
-                reason: "Zellij cannot place an unfocused split against the captured origin while the Muxe UI remains open",
+                ..
             })
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             map_post_dismissal_creation(&unfocused, &origin),
             Err(PortableError::Incompatible {
                 action: "pane:split",
-                reason: "post-dismissal dispatch requires focus=true",
+                ..
             })
-        );
+        ));
         let cwd_only = ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
             direction: None,
             focus: Some(false),
@@ -1809,24 +1813,31 @@ mod tests {
                 ..ResolvedCreateCommand::default()
             },
         });
-        assert_eq!(
+        assert!(matches!(
             map_portable(&cwd_only, &origin),
             Err(PortableError::Incompatible {
                 action: "pane:split",
-                reason: "Zellij can apply cwd to a split only when program is supplied",
+                ..
             })
-        );
+        ));
         let focused = ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
             direction: Some(Direction::Next),
             focus: Some(true),
             command: ResolvedCreateCommand::default(),
         });
-        let error = PortableError::InvalidScalar {
-            action: "pane:split",
-            parameter: "direction",
-            reason: "expected one of left, right, up, or down",
-        };
-        assert_eq!(map_portable(&focused, &origin), Err(error.clone()));
-        assert_eq!(map_post_dismissal_creation(&focused, &origin), Err(error));
+        for error in [
+            map_portable(&focused, &origin).expect_err("invalid direction must fail"),
+            map_post_dismissal_creation(&focused, &origin)
+                .expect_err("invalid direction must fail after dismissal"),
+        ] {
+            assert!(matches!(
+                error,
+                PortableError::InvalidScalar {
+                    action: "pane:split",
+                    parameter: "direction",
+                    ..
+                }
+            ));
+        }
     }
 }

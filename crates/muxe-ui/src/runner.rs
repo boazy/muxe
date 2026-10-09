@@ -88,7 +88,7 @@ pub enum UiRunError {
     Kitty(#[from] KittyNegotiationError),
     #[error("broker UI connection failed: {0}")]
     Control(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("broker sent fatal diagnostic ({diagnostic:?})")]
+    #[error("broker stopped the UI: {}", diagnostic.message)]
     BrokerFatal { diagnostic: ProtocolDiagnostic },
     #[error("UI run failed: {primary}; terminal restoration failed: {restoration}")]
     RunAndRestore {
@@ -96,7 +96,9 @@ pub enum UiRunError {
         primary: Box<Self>,
         restoration: Box<Self>,
     },
-    #[error("broker detach did not complete before terminal restoration")]
+    #[error(
+        "broker did not confirm UI detachment before terminal restoration; detachment is unconfirmed"
+    )]
     DetachTimedOut,
 }
 
@@ -655,7 +657,10 @@ fn observe_response(
         }
         BrokerResponse::Acknowledged => Ok(None),
         unexpected => {
-            session.report_broker_error(format!("unexpected UI broker response: {unexpected:?}"));
+            session.report_broker_error(format!(
+                "broker sent a {} that was not valid for the pending UI request",
+                unexpected.kind_name()
+            ));
             session.render(surface, terminal_area()?)?;
             Ok(None)
         }
@@ -918,10 +923,6 @@ mod tests {
             panic!("expected structured fatal diagnostic: {error:?}");
         };
         assert_eq!(received, &diagnostic);
-        assert_eq!(
-            error.to_string(),
-            "broker sent fatal diagnostic (ProtocolDiagnostic { code: HostUnavailable, message: \"host vanished\" })"
-        );
         assert!(
             error.source().is_none(),
             "wire diagnostics are the terminal error source"

@@ -27,7 +27,7 @@ pub enum ParseError {
         type_name: String,
     },
     /// Unknown or non-exposed command or action name.
-    #[error("unknown Zellij native {kind} '{name}'")]
+    #[error("unknown or unsupported Zellij native {kind} '{name}'")]
     UnknownName {
         /// `action` or `command`.
         kind: &'static str,
@@ -160,7 +160,7 @@ fn pane_id_json(text: &str, field: &str) -> Result<Value, ParseError> {
             .map_err(|_| ParseError::InvalidArguments {
                 kind: "value",
                 name: field.to_owned(),
-                message: format!("invalid terminal pane ID '{text}'"),
+                message: format!("terminal pane ID '{text}' must have the form terminal_<n>, where n is an integer from 0 to 4294967295"),
             });
     }
     if let Some(number) = text.strip_prefix("plugin_") {
@@ -170,7 +170,7 @@ fn pane_id_json(text: &str, field: &str) -> Result<Value, ParseError> {
             .map_err(|_| ParseError::InvalidArguments {
                 kind: "value",
                 name: field.to_owned(),
-                message: format!("invalid plugin pane ID '{text}'"),
+                message: format!("plugin pane ID '{text}' must have the form plugin_<n>, where n is an integer from 0 to 4294967295"),
             });
     }
     text.parse::<u32>()
@@ -178,7 +178,7 @@ fn pane_id_json(text: &str, field: &str) -> Result<Value, ParseError> {
         .map_err(|_| ParseError::InvalidArguments {
             kind: "value",
             name: field.to_owned(),
-            message: format!("pane ID '{text}' is not terminal_<n>, plugin_<n>, or a bare number"),
+            message: format!("pane ID '{text}' must be terminal_<n>, plugin_<n>, or a bare number, where n is an integer from 0 to 4294967295"),
         })
 }
 
@@ -264,7 +264,7 @@ fn value_to_json(
             .ok_or_else(|| ParseError::InvalidArguments {
                 kind: "value",
                 name: key.to_owned(),
-                message: "non-finite number".to_owned(),
+                message: "number must be finite".to_owned(),
             }),
         ConfigValueKind::String(text) => {
             if let Some(converted) = typed_leaf(key, text, key)? {

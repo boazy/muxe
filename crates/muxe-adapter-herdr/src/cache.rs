@@ -61,7 +61,10 @@ impl HerdrCache {
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("Herdr cache parent is a symlink: {}", self.root.display()),
+                format!(
+                    "The parent directory of the Herdr cache at {} is a symbolic link",
+                    self.root.display()
+                ),
             ));
         }
         let mut builder = fs::DirBuilder::new();
@@ -478,7 +481,7 @@ fn validate_owner_directory(path: &Path) -> std::io::Result<()> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
-                    "Herdr cache root is not owner-only (0700): {}",
+                    "Herdr cache directory must have permissions 0700: {}",
                     path.display()
                 ),
             ));

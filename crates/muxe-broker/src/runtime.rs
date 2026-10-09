@@ -464,7 +464,7 @@ fn validate_owner_mode(
 pub enum RuntimeError {
     #[error("runtime socket path exceeds the Unix-domain limit: {0}")]
     SocketPathTooLong(PathBuf),
-    #[error("I/O at {path}: {source}")]
+    #[error("could not access broker runtime path {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("runtime endpoint is not a directory: {0}")]
     NotDirectory(PathBuf),
@@ -488,9 +488,11 @@ pub enum RuntimeError {
     LiveSocket(PathBuf),
     #[error("endpoint is not a Unix socket: {0}")]
     UnexpectedEndpointFile(PathBuf),
-    #[error("legacy or incomplete startup lock cannot prove exclusive ownership: {0}")]
+    #[error(
+        "cannot start the broker: startup lock {0} uses an older format or is incomplete, so exclusive startup ownership cannot be verified"
+    )]
     LegacyStartupLock(PathBuf),
-    #[error("startup lock pathname no longer names its opened inode: {0}")]
+    #[error("cannot start the broker: startup lock {0} was replaced after it was opened")]
     ReplacedStartupLock(PathBuf),
     #[error("broker startup is already in progress at {0}")]
     StartupInProgress(PathBuf),

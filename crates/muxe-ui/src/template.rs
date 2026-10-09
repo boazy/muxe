@@ -108,7 +108,9 @@ impl RenderedText {
 /// A template compilation or render failure.
 #[derive(Debug, Error)]
 pub enum TemplateError {
-    #[error("template `{0}` uses a forbidden loader-backed construct")]
+    #[error(
+        "template `{0}` tries to load another template; `include`, `import`, `from`, and `extends` are not supported"
+    )]
     ForbiddenLoaderBackedConstruct(&'static str),
     #[error("selected theme has no `{0}` template")]
     MissingTemplate(&'static str),

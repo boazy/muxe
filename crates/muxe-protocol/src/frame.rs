@@ -485,7 +485,7 @@ fn copy_from_input<const N: usize>(
 }
 
 fn archive_error(error: &RkyvError) -> DecodeError {
-    DecodeError::InvalidArchive(format!("{error:?}"))
+    DecodeError::InvalidArchive(error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -493,6 +493,25 @@ pub enum TruncationStage {
     Prelude(usize),
     LengthPrefix(usize),
     Payload { expected: u32, received: u32 },
+}
+
+impl std::fmt::Display for TruncationStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prelude(received) => write!(
+                formatter,
+                "protocol handshake: received {received} of {PRELUDE_LEN} bytes"
+            ),
+            Self::LengthPrefix(received) => write!(
+                formatter,
+                "frame length prefix: received {received} of {LENGTH_PREFIX_LEN} bytes"
+            ),
+            Self::Payload { expected, received } => write!(
+                formatter,
+                "frame payload: expected {expected} bytes, received {received}"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -520,7 +539,7 @@ pub enum DecodeError {
     EmptyFrame,
     #[error("frame length {declared} exceeds maximum {maximum}")]
     FrameTooLarge { declared: u32, maximum: u32 },
-    #[error("truncated {0:?}")]
+    #[error("connection closed during {0}")]
     Truncated(TruncationStage),
     #[error("invalid checked rkyv archive: {0}")]
     InvalidArchive(String),

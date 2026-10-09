@@ -191,7 +191,7 @@ pub enum ClientError {
     Decode(#[from] DecodeError),
     #[error("peer role {0:?} cannot be a broker client")]
     UnsupportedRole(PeerRole),
-    #[error("broker accepted a different live-server identity")]
+    #[error("broker accepted a different host or server identity than the client requested")]
     IdentityMismatch,
     #[error("broker closed the connection before a complete response")]
     ConnectionClosed,
@@ -199,11 +199,13 @@ pub enum ClientError {
     ExpectedWelcome,
     #[error("broker did not send a request response")]
     ExpectedResponse,
-    #[error("received response for unexpected request ID (expected {expected:?}, got {actual:?})")]
+    #[error("broker responded to a different request ID: expected {expected}, received {actual}")]
     UnexpectedResponse {
         expected: RequestId,
         actual: RequestId,
     },
-    #[error("expected broker event while no request was pending")]
+    #[error(
+        "broker sent a response when the client was waiting for an event and had no pending request"
+    )]
     ExpectedEvent,
 }

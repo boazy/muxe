@@ -28,20 +28,22 @@ const POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum ReadinessGateError {
-    #[error("readiness gate path is unsafe: {0}")]
+    #[error(
+        "unsafe Zellij readiness lock path: {0}. The cache must be an owned directory with mode 0700, its parent must be owned and not writable by group or others, and the lock must be an owned single regular file with mode 0600. Symbolic links are not allowed."
+    )]
     UnsafePath(PathBuf),
-    #[error("cannot access readiness gate at {path}: {source}")]
+    #[error("cannot access Zellij readiness lock at {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("readiness gate lock at {path} failed: {source}")]
+    #[error("cannot acquire Zellij readiness lock at {path}: {source}")]
     Lock {
         path: PathBuf,
         source: nix::errno::Errno,
     },
-    #[error("readiness gate at {0} remained contended past its deadline")]
+    #[error("timed out waiting for another process to release the Zellij readiness lock at {0}")]
     Contended(PathBuf),
     #[error("OS-wide monotonic clock is unavailable: {0}")]
     Clock(String),

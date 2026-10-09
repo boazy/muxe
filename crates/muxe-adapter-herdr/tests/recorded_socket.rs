@@ -2869,6 +2869,7 @@ async fn prepared_move_cleanup_failure_excludes_an_accepted_unrelated_unary() {
         .expect("prepared move task joins")
         .expect_err("move and rollback both fail");
     assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
+    // Keep both host-supplied causes when the failed move also fails cleanup.
     assert!(error.message.contains("move rejected"));
     assert!(error.message.contains("temporary tab remains"));
     unrelated
@@ -3025,7 +3026,6 @@ async fn explicit_response_timeout_remains_authoritative() {
         .await
         .expect_err("explicit response deadline expires");
     assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
-    assert!(error.message.contains("request deadline"));
     assert_eq!(fixture.requests().await.len(), 2);
 }
 

@@ -30,12 +30,12 @@ pub(crate) fn capture_origin_from_snapshot(
 ) -> Result<OriginContext, Box<AdapterError>> {
     let origin_hint = request.origin_hint.as_ref().ok_or_else(|| {
         Box::new(context_error(
-            "Herdr AttachUi did not provide the saved origin bootstrap tuple",
+            "The Herdr UI attachment request did not include the saved origin workspace, tab, and pane IDs",
         ))
     })?;
     let caller_identity = request.caller_identity.as_ref().ok_or_else(|| {
         Box::new(context_error(
-            "Herdr AttachUi did not provide the UI caller identity tuple",
+            "The Herdr UI attachment request did not include the UI caller's workspace, tab, and pane IDs",
         ))
     })?;
     if caller_identity.pane_id != request.ui_pane {
@@ -48,7 +48,7 @@ pub(crate) fn capture_origin_from_snapshot(
         HerdrResponse::Success(result) => result,
         HerdrResponse::Error { code, message } => {
             return Err(Box::new(context_error(format!(
-                "Herdr rejected session.snapshot with {code}: {message}"
+                "Herdr rejected session.snapshot ({code}): {message}"
             ))));
         }
     };
@@ -94,10 +94,10 @@ struct ValidatedPane {
 fn snapshot_from_result(result: &Value) -> Result<&Map<String, Value>, AdapterError> {
     let result = result
         .as_object()
-        .ok_or_else(|| context_error("Herdr session.snapshot response result is not an object"))?;
+        .ok_or_else(|| context_error("Herdr session.snapshot result is not an object"))?;
     if required_string(result, "type")? != "session_snapshot" {
         return Err(context_error(
-            "Herdr session.snapshot response has an unexpected result type",
+            "Herdr session.snapshot result must have type \"session_snapshot\"",
         ));
     }
     result

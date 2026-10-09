@@ -46,7 +46,7 @@ pub struct BridgeRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum RegistryError {
     /// Event arrived for an unknown or displaced registration.
-    #[error("stale registration for client '{client_id}'")]
+    #[error("no matching active Zellij bridge registration for client '{client_id}'")]
     Stale {
         /// Client that sent the event.
         client_id: ClientId,
@@ -58,13 +58,15 @@ pub enum RegistryError {
         client_id: ClientId,
     },
     /// The active registration failed its compatibility handshake.
-    #[error("incompatible registration for client '{client_id}'")]
+    #[error("Zellij bridge registration for client '{client_id}' failed the compatibility check")]
     Incompatible {
         /// Client whose registration cannot accept requests.
         client_id: ClientId,
     },
     /// A bridge reused an identity retired by an earlier registration epoch.
-    #[error("retired registration reused for client '{client_id}'")]
+    #[error(
+        "Zellij bridge for client '{client_id}' reused a registration ID that is no longer active"
+    )]
     RetiredRegistration {
         /// Client attempting to reuse the retired registration.
         client_id: ClientId,

@@ -57,13 +57,13 @@ impl CaptureState {
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum CaptureError {
     /// Another UI already owns or is acquiring capture.
-    #[error("client capture is busy")]
+    #[error("input capture is already active or being set up for this Zellij client")]
     Busy,
     /// No capture is active for this client.
     #[error("no active capture for client")]
     NotCaptured,
     /// The supplied lease no longer owns capture.
-    #[error("stale capture lease")]
+    #[error("the supplied lease no longer owns input capture for this Zellij client")]
     StaleLease,
 }
 

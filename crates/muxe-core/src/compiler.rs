@@ -278,7 +278,7 @@ fn validate_native_actions(
     let Some(action_validator) = action_validator else {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::NativeActionRejected,
-            "native actions require an active adapter validator",
+            "cannot validate native actions without a host adapter",
             candidates[0].type_span.clone(),
         )]);
     };
@@ -286,7 +286,11 @@ fn validate_native_actions(
     if validations.len() != candidates.len() {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::NativeActionRejected,
-            "adapter returned an incomplete native-action validation batch",
+            format!(
+                "host adapter checked {} native actions, but the configuration contains {}",
+                validations.len(),
+                candidates.len()
+            ),
             candidates[0].type_span.clone(),
         )]);
     }
@@ -1567,14 +1571,14 @@ fn validate_execution(
     if policy.mode == ExecutionMode::Await && !capabilities.awaitable && capabilities.detachable {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
-            "action cannot be awaited",
+            "action does not support execution mode `await`; use `settings.execution.mode: detach`",
             span,
         )]);
     }
     if policy.mode == ExecutionMode::Detach && !capabilities.detachable && capabilities.awaitable {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
-            "action cannot be detached",
+            "action does not support execution mode `detach`; use `settings.execution.mode: await`",
             span,
         )]);
     }
@@ -1930,9 +1934,32 @@ fn validate_key_capabilities(
         || (required.all_keys_as_escape_codes && !active.all_keys_as_escape_codes);
     unavailable
         .then(|| {
+            let mut message = String::from(
+                "binding requires keyboard features unavailable in the selected keyboard profile: ",
+            );
+            let mut first = true;
+            for (missing, name) in [
+                (required.event_types && !active.event_types, "event-types"),
+                (
+                    required.alternate_keys && !active.alternate_keys,
+                    "alternate-keys",
+                ),
+                (
+                    required.all_keys_as_escape_codes && !active.all_keys_as_escape_codes,
+                    "all-keys-as-escape-codes",
+                ),
+            ] {
+                if missing {
+                    if !first {
+                        message.push_str(", ");
+                    }
+                    message.push_str(name);
+                    first = false;
+                }
+            }
             vec![ConfigDiagnostic::error(
                 DiagnosticCode::KeyCapability,
-                "binding requires a disabled keyboard capability",
+                message,
                 span.clone(),
             )]
         })
@@ -2016,7 +2043,7 @@ fn action_fields(
         }
         _ => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidAction,
-            "action must be a compact string or tagged mapping",
+            "action must be a compact string or a mapping with a `type` field",
             value.span.clone(),
         )]),
     }
@@ -2247,7 +2274,7 @@ fn compact_scalar(token: &str, span: SourceSpan) -> Result<ConfigValue, Vec<Conf
     .map_err(|_| {
         vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
-            "compact scalar is not a valid YAML 1.2 core scalar",
+            "compact action argument is not a valid YAML 1.2 scalar value",
             span.clone(),
         )]
     })?;
@@ -2263,7 +2290,7 @@ fn compact_scalar(token: &str, span: SourceSpan) -> Result<ConfigValue, Vec<Conf
     ) {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
-            "compact actions accept scalar arguments only; use tagged mapping form for lists and mappings",
+            "compact actions accept only scalar arguments; use a mapping with a `type` field for list or mapping arguments",
             span,
         )]);
     }
@@ -2440,7 +2467,9 @@ impl Selector {
             "tags:contain" => Ok(Self::TagsContain(require(value)?)),
             _ => Err(vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidInjection,
-                "unknown injection selector",
+                format!(
+                    "unknown injection selector `{kind}`; use `all`, `id:exact`, `id:regex`, `title:exact`, `title:regex`, or `tags:contain`"
+                ),
                 span,
             )]),
         }
@@ -2578,7 +2607,7 @@ fn host_filter_matches(
     let validator = action_validator.ok_or_else(|| {
         vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
-            format!("`{name}` requires an active adapter validator"),
+            format!("cannot apply `{name}` without a host adapter to identify the current host"),
             value.span.clone(),
         )]
     })?;
@@ -3121,7 +3150,7 @@ fn scalar_text(value: &ConfigValue) -> Result<String, Vec<ConfigDiagnostic>> {
         _ => {
             return Err(vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidActionArguments,
-                "expected scalar",
+                "value must be a string, number, or boolean",
                 value.span.clone(),
             )]);
         }

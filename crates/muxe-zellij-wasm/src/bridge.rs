@@ -1231,7 +1231,7 @@ impl Bridge {
                 pending.channel_generation,
                 BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
-                    outcome: CommandOutcome::failed("bridge registration disappeared".to_owned()),
+                    outcome: CommandOutcome::failed("cannot execute the command queued for UI dismissal: this bridge is no longer registered".to_owned()),
                 },
                 effects,
             );
@@ -1473,7 +1473,9 @@ impl Bridge {
                 effects.focus_pane(pane.id);
                 CommandOutcome::succeeded()
             }
-            None => CommandOutcome::failed(format!("no eligible pane at manifest index {index}")),
+            None => CommandOutcome::failed(format!(
+                "cannot focus pane at index {index}: the active tab has no eligible pane at that index"
+            )),
         };
         self.release(cli_id, request_id, generation, effects);
         self.emit_for_request(

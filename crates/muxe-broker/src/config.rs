@@ -925,18 +925,22 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("could not enumerate configuration assets in {path}: {source}")]
+    #[error("could not list configuration assets in {path}: {source}")]
     ReadDirectory {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("configuration asset path has no valid UTF-8 .yml filename stem: {0}")]
+    #[error(
+        "configuration asset must have a .yml filename with a valid UTF-8 name before the extension: {0}"
+    )]
     AssetName(PathBuf),
-    #[error("configuration assets contain duplicate stem {0:?}")]
+    #[error(
+        "configuration assets contain more than one file named {0:?} before the .yml extension"
+    )]
     DuplicateAsset(String),
     #[error("configuration path has no parent directory: {0}")]
     AssetDirectory(PathBuf),
-    #[error("configuration generation overflowed")]
+    #[error("cannot reload configuration: the configuration version counter is exhausted")]
     GenerationExhausted,
     #[error("host capability query failed: {0}")]
     Adapter(#[from] muxe_adapter_api::AdapterError),

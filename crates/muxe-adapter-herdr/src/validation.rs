@@ -36,7 +36,10 @@ pub fn validate_candidate(
                 code: ValidationCode::UnsupportedConstruct,
                 instance_path: "#".to_owned(),
                 schema_path: "#/schemas/request".to_owned(),
-                detail: format!("Herdr method {:?} is an event stream", metadata.method),
+                detail: format!(
+                    "Herdr method {:?} returns an event stream and cannot be used as a native action",
+                    metadata.method
+                ),
             },
         });
     }
@@ -152,7 +155,7 @@ fn yaml_to_wire_name(name: &str) -> Result<String, ValidationError> {
             code: ValidationCode::AdditionalProperty,
             instance_path: format!("#/{name}"),
             schema_path: "#/schemas/request".to_owned(),
-            detail: "Herdr YAML parameter names must use kebab-case, not underscores".to_owned(),
+            detail: "Herdr YAML parameter names must use hyphens instead of underscores".to_owned(),
         });
     }
     Ok(name.replace('-', "_"))

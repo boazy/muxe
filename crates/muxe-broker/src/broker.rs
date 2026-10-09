@@ -173,11 +173,10 @@ enum CompatibilityAdmissionError {
 }
 
 const MAX_COMPATIBILITY_REBUILD_DESIRES: usize = 128;
-const COMPATIBILITY_REBUILD_PANIC_DIAGNOSTIC: &str =
-    "native compatibility validator worker terminated unexpectedly";
+const COMPATIBILITY_REBUILD_PANIC_DIAGNOSTIC: &str = "could not check whether native actions are compatible with the host: the validation worker stopped unexpectedly";
 
 const COMPATIBILITY_PENDING_DIAGNOSTIC: &str =
-    "native action compatibility validation is pending for the current host continuity epoch";
+    "native action is blocked while Muxe checks compatibility with the current host connection";
 
 fn compatibility_protocol_diagnostic(
     compatibility: &BindingCompatibility,
@@ -190,7 +189,7 @@ fn compatibility_protocol_diagnostic(
         )),
         BindingCompatibility::Blocked(diagnostics) => {
             let message = if diagnostics.is_empty() {
-                "native action compatibility validation failed without a diagnostic".to_owned()
+                "native action is blocked because the host compatibility check failed without an explanation".to_owned()
             } else {
                 diagnostics
                     .iter()
@@ -3284,7 +3283,8 @@ impl Broker {
                 capture,
                 CaptureReleaseReason::UiDismissed,
                 Some(format!(
-                    "UI session {session:?} detached during capture start"
+                    "UI session {} detached while Muxe was acquiring keyboard capture",
+                    session.as_str()
                 )),
             )
             .await;
@@ -3757,7 +3757,7 @@ impl Broker {
             let _ = child.start_kill();
             let _ = child.wait().await;
             return Err(BrokerError::GenericProcess(
-                "spawned command has no valid process-group leader identity".to_owned(),
+                "cannot supervise the started command: its process ID cannot identify a process group".to_owned(),
             ));
         };
         // This synchronous insertion and the reaper task are established before
@@ -3827,8 +3827,7 @@ impl Broker {
             .send(Some(GenericCancellation::UserRequested))
             .map_err(|_| {
                 BrokerError::GenericProcess(
-                    "generic command exited before its cancellation request was delivered"
-                        .to_owned(),
+                    "command exited before its cancellation request was delivered".to_owned(),
                 )
             })
     }
@@ -4696,10 +4695,9 @@ async fn terminate_generic_child(
             tokio::time::sleep(GENERIC_CANCEL_GRACE).await;
             let _ = signal_process_group(process_group, Signal::SIGKILL)?;
         }
-        child
-            .wait()
-            .await
-            .map_err(|error| format!("could not reap cancelled generic command: {error}"))
+        child.wait().await.map_err(|error| {
+            format!("could not collect the cancelled command's exit status: {error}")
+        })
     }
     #[cfg(not(unix))]
     {
@@ -4711,7 +4709,7 @@ async fn terminate_generic_child(
         child
             .wait()
             .await
-            .map_err(|error| format!("could not reap killed generic command: {error}"))
+            .map_err(|error| format!("could not collect the killed command's exit status: {error}"))
     }
 }
 
@@ -4742,7 +4740,7 @@ fn generic_exit_outcome(
             ExecutionOutcome::Failed,
             Some(diagnostic(
                 DiagnosticCode::ActionBlocked,
-                &format!("could not reap generic command: {error}"),
+                &format!("could not collect the command's exit status: {error}"),
             )),
         ),
     }
@@ -11566,49 +11564,53 @@ impl std::fmt::Display for ContextUnavailableReason {
 pub enum BrokerError {
     #[error("activation is in progress; this broker is not accepting new launches or executions")]
     ActivationInProgress,
-    #[error("configuration failed: {0}")]
+    #[error(transparent)]
     Configuration(Box<ConfigError>),
-    #[error("host adapter failed: {0}")]
+    #[error(transparent)]
     Adapter(Box<AdapterError>),
-    #[error("launch gate rejected request: {0}")]
+    #[error("cannot complete UI launch: {0}")]
     Gate(#[from] GateError),
     #[error("peer role {actual:?} cannot make this request; expected {expected:?}")]
     Role {
         expected: muxe_protocol::PeerRole,
         actual: muxe_protocol::PeerRole,
     },
-    #[error("requested root menu does not exist: {0:?}")]
+    #[error("requested root menu does not exist: {}", .0.display())]
     UnknownMenu(muxe_protocol::MenuId),
-    #[error("unknown UI session: {0:?}")]
+    #[error("UI session is no longer registered with this broker: {}", .0.as_str())]
     UnknownSession(UiSessionId),
     #[error("the active host cannot cancel this pending execution")]
     CancelUnsupported,
     #[error("{0}")]
     ActivationDrainRefused(UnfinishedHostExecution),
-    #[error("activation drain timed out waiting for broker-owned host cleanup: {0}")]
+    #[error(
+        "cannot replace the broker: timed out waiting for it to confirm host resource cleanup: {0}"
+    )]
     ActivationCleanupUnconfirmed(String),
     #[error("a menu control is already pending for this execution")]
     PendingControlInFlight,
     #[error("the UI already has an awaited execution in flight")]
     PendingExecutionInFlight,
-    #[error("binding belongs to a stale configuration generation")]
+    #[error(
+        "binding belongs to an older configuration; it cannot run with the current configuration"
+    )]
     StaleGeneration,
     #[error("binding action is UI-local and must not be dispatched to the broker")]
     LocalMenuAction,
-    #[error("adapter acknowledged a different execution identity")]
+    #[error("host adapter acknowledged a different execution ID than the one requested")]
     MismatchedExecution,
     #[error("{0}")]
     NativeCompatibility(String),
     #[error("{0}")]
     ContextUnavailable(ContextUnavailableReason),
     #[error(
-        "portable action parameter {parameter:?} is invalid after origin resolution: {message}"
+        "portable action parameter {parameter:?} is invalid after substituting captured host context: {message}"
     )]
     PortableResolution {
         parameter: &'static str,
         message: String,
     },
-    #[error("generic command supervision failed: {0}")]
+    #[error("could not run or supervise the command: {0}")]
     GenericProcess(String),
 }
 

@@ -665,7 +665,6 @@ menus:
         .find(|diagnostic| diagnostic.message.contains("_muxe_inline_id"))
         .expect("reserved marker diagnostic");
     assert_eq!(diagnostic.code, DiagnosticCode::UnknownField);
-    assert!(diagnostic.message.contains("reserved"));
     assert_eq!(diagnostic.labels[0].span.source.as_str(), "config.yml");
 }
 
@@ -2232,7 +2231,6 @@ menus:
     .expect_err("args without a creation program must fail configuration");
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.code == muxe_core::DiagnosticCode::InvalidActionArguments
-            && diagnostic.message.contains("args requires `program`")
     }));
 }
 

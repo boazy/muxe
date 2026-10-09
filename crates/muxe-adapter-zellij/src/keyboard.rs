@@ -67,7 +67,7 @@ pub fn map_canonical_key(key: &CanonicalKey) -> Result<MappedKey, KeyboardError>
     };
     if key.source != KeyIdentitySource::Primary {
         return Err(unsupported(
-            "alternate/base-layout identities need alternate-keys support, unavailable on Zellij",
+            "Zellij does not support key identities from an alternate or base keyboard layout",
         ));
     }
     let modifiers = key.modifiers;
@@ -81,7 +81,7 @@ pub fn map_canonical_key(key: &CanonicalKey) -> Result<MappedKey, KeyboardError>
     .any(|flag| modifiers.contains(flag))
     {
         return Err(unsupported(
-            "unknown modifier; hyper, meta, caps-lock, and num-lock have no pinned KeyModifier",
+            "Zellij does not support hyper, meta, caps-lock, or num-lock modifiers",
         ));
     }
     let mut set = BTreeSet::new();
@@ -128,9 +128,8 @@ fn map_text_key(
             bytes: bare_char.to_string().into_bytes(),
         }),
         (false, false, true, false) => {
-            let byte = control_byte(bare_char).ok_or_else(|| {
-                unsupported("ctrl maps only ASCII letters and [ to C0 control bytes")
-            })?;
+            let byte = control_byte(bare_char)
+                .ok_or_else(|| unsupported("ctrl can be encoded only with ASCII letters or ["))?;
             Ok(MappedKey {
                 bare: BareKey::Char(bare_char),
                 modifiers,
@@ -149,7 +148,7 @@ fn map_text_key(
         }
         (true, false, true, false) => {
             let byte = control_byte(bare_char).ok_or_else(|| {
-                unsupported("ctrl+shift maps only ASCII letters to C0 control bytes")
+                unsupported("ctrl+shift can be encoded only with ASCII letters or [")
             })?;
             Ok(MappedKey {
                 bare: BareKey::Char(bare_char),
@@ -158,7 +157,7 @@ fn map_text_key(
             })
         }
         _ => Err(unsupported(
-            "only bare, ctrl, alt, and ctrl+shift combinations have byte encodings on Zellij",
+            "Muxe can encode text keys for Zellij only without modifiers or with ctrl, alt, or ctrl+shift",
         )),
     }
 }
@@ -213,7 +212,7 @@ fn map_named_key(
     unsupported: impl Fn(&'static str) -> KeyboardError,
 ) -> Result<MappedKey, KeyboardError> {
     let (bare, sequence) = named_sequence(identity).ok_or_else(|| {
-        unsupported("keypad, media, modifier, and F13+ identities have no pinned representation")
+        unsupported("Muxe cannot encode keypad, media, modifier keys, or F13 and higher for Zellij")
     })?;
     if modifiers == Modifiers::empty() {
         return Ok(MappedKey {
@@ -223,10 +222,13 @@ fn map_named_key(
         });
     }
     let code = csi_modifier_code(modifiers).ok_or_else(|| {
-        unsupported("only ctrl, alt, and shift combine with special keys via CSI 1;<modifier>")
+        unsupported(
+            "Muxe can encode special keys for Zellij only with ctrl, alt, and shift modifiers",
+        )
     })?;
-    let bytes = csi_modified_sequence(&sequence, code)
-        .ok_or_else(|| unsupported("this special key has no CSI-modifiable sequence"))?;
+    let bytes = csi_modified_sequence(&sequence, code).ok_or_else(|| {
+        unsupported("Muxe cannot encode this special key with modifiers for Zellij")
+    })?;
     Ok(MappedKey {
         bare,
         modifiers: set,

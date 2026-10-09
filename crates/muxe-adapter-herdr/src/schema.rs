@@ -37,7 +37,7 @@ enum ParameterSchema {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{code} at {instance_path} against {schema_path}: {detail}")]
+#[error("{detail} (code {code}; value path {instance_path}; schema path {schema_path})")]
 pub struct ValidationError {
     pub code: ValidationCode,
     pub instance_path: String,
@@ -440,7 +440,7 @@ impl ApiSchema {
                 ValidationCode::Const,
                 instance_path,
                 schema_path,
-                "value does not equal schema const",
+                "value must equal the schema's const value",
             ));
         }
         if let Some(values) = object.get("enum") {
@@ -452,7 +452,7 @@ impl ApiSchema {
                     ValidationCode::Enum,
                     instance_path,
                     schema_path,
-                    "value is not one of the declared enum alternatives",
+                    "value must be one of the schema's enum values",
                 ));
             }
         }
@@ -1044,7 +1044,7 @@ impl ApiSchema {
                 ValidationCode::Reference,
                 "#",
                 schema_path,
-                format!("reference {reference:?} does not resolve"),
+                format!("JSON Schema reference {reference:?} does not point to an existing value"),
             )
         })
     }

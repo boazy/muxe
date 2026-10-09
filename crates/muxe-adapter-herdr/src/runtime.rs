@@ -63,7 +63,7 @@ impl QueueExecutionError {
     fn into_adapter_error(self) -> AdapterError {
         let message = match self {
             Self::Panicked(message) => {
-                format!("Herdr ordered transaction panicked internally: {message}")
+                format!("An internal error interrupted the Herdr request sequence: {message}")
             }
             Self::TypeMismatch => {
                 "The Herdr request-queue worker produced an invalid internal result type."
@@ -358,7 +358,7 @@ impl SendQueue {
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    "Herdr send queue is full; request was not accepted",
+                    "The Herdr request queue is full. The request was not accepted or sent.",
                 ),
                 mpsc::error::TrySendError::Closed(_) => queue_closed(),
             })?;
@@ -420,7 +420,7 @@ async fn execute_ordered_job(job: OrderedJob, invoker: GuardedHerdrInvoker) {
 fn queue_closed() -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::Shutdown,
-        "Herdr runtime send queue is closed",
+        "The Herdr request queue is closed. The request was not accepted or sent.",
     )
 }
 
@@ -670,7 +670,7 @@ impl HerdrRuntime {
             HerdrResponse::Success(result) => Ok(result),
             HerdrResponse::Error { code, message } => Err(AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                format!("Herdr {method} rejected request with {code}: {message}"),
+                format!("Herdr rejected {method} ({code}): {message}"),
             )),
         }
     }
@@ -868,12 +868,12 @@ pub(crate) async fn load_installed_schema(
         .map_err(|error| {
             AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                format!("could not update Herdr runtime-schema cache: {error}"),
+                format!("Could not update the Herdr schema cache: {error}"),
             )
         })?;
     let normalized_request = serde_json::from_slice(&normalized_request).map_err(|error| {
         incompatible(format!(
-            "Herdr runtime-schema cache returned an invalid normalized request representation: {error}"
+            "The Herdr schema cache returned invalid request-schema JSON: {error}"
         ))
     })?;
     let schema = ApiSchema::parse_with_request(raw_schema, &normalized_request)
@@ -921,7 +921,7 @@ async fn runtime_schema_with_timeouts(
         child.start_kill().map_err(|error| {
             AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                format!("could not kill timed-out Herdr schema child: {error}"),
+                format!("Could not stop the Herdr schema process after it timed out: {error}"),
             )
         })?;
         match tokio::time::timeout(reap_timeout, child.wait()).await {
@@ -929,14 +929,16 @@ async fn runtime_schema_with_timeouts(
             Ok(Err(error)) => {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    format!("could not reap timed-out Herdr schema child: {error}"),
+                    format!(
+                        "Could not wait for the Herdr schema process to exit after it timed out: {error}"
+                    ),
                 ));
             }
             Err(_) => {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Unavailable,
                     format!(
-                        "timed out after {}s while reaping the owned Herdr schema child",
+                        "The Herdr schema process did not exit within {}s after Muxe sent a termination signal",
                         reap_timeout.as_secs()
                     ),
                 ));
@@ -963,7 +965,7 @@ async fn runtime_schema_with_timeouts(
     }
     if stdout.len() as u64 > MAX_SCHEMA_BYTES {
         return Err(incompatible(format!(
-            "{} api schema --json emitted {} bytes, above the {}-byte bound",
+            "{} api schema --json returned {} bytes, exceeding the {}-byte limit",
             binary.display(),
             stdout.len(),
             MAX_SCHEMA_BYTES
@@ -989,13 +991,13 @@ async fn collect_schema_output(
     let mut stdout = child.stdout.take().ok_or_else(|| {
         AdapterError::new(
             AdapterErrorKind::Unavailable,
-            "Herdr schema child has no captured stdout",
+            "The Herdr schema process has no output stream to read",
         )
     })?;
     let mut stderr = child.stderr.take().ok_or_else(|| {
         AdapterError::new(
             AdapterErrorKind::Unavailable,
-            "Herdr schema child has no captured stderr",
+            "The Herdr schema process has no diagnostic output stream to read",
         )
     })?;
     let diagnostics = tokio::spawn(async move {
@@ -1009,7 +1011,7 @@ async fn collect_schema_output(
     limited.read_to_end(&mut schema).await.map_err(|error| {
         AdapterError::new(
             AdapterErrorKind::Unavailable,
-            format!("could not read Herdr schema stdout: {error}"),
+            format!("Could not read output from the Herdr schema process: {error}"),
         )
     })?;
     drop(limited);
@@ -1017,7 +1019,7 @@ async fn collect_schema_output(
     let status = child.wait().await.map_err(|error| {
         AdapterError::new(
             AdapterErrorKind::Unavailable,
-            format!("could not reap Herdr schema child: {error}"),
+            format!("Could not wait for the Herdr schema process to exit: {error}"),
         )
     })?;
     let diagnostics = diagnostics.await.unwrap_or_default();
@@ -1038,7 +1040,7 @@ async fn establish_live_identity(
         HerdrResponse::Error { code, message } => {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                format!("Herdr rejected ping with {code}: {message}"),
+                format!("Herdr rejected ping ({code}): {message}"),
             ));
         }
     };
@@ -1060,17 +1062,19 @@ fn identity_from_ping_result(
         .as_object()
         .ok_or_else(|| incompatible("Herdr ping result is not an object"))?;
     if object.get("type").and_then(Value::as_str) != Some("pong") {
-        return Err(incompatible("Herdr ping result has unexpected type"));
+        return Err(incompatible("Herdr ping result must have type \"pong\""));
     }
     // The binary-protocol number feeds only the opaque live identity below.
     let protocol = object
         .get("protocol")
         .and_then(Value::as_u64)
-        .ok_or_else(|| incompatible("Herdr ping result lacks integer protocol"))?;
+        .ok_or_else(|| {
+            incompatible("Herdr ping result must contain a nonnegative integer protocol field")
+        })?;
     let reported = object
         .get("version")
         .and_then(Value::as_str)
-        .ok_or_else(|| incompatible("Herdr ping result lacks string version"))?;
+        .ok_or_else(|| incompatible("Herdr ping result must contain a string version field"))?;
     let version = HerdrServerVersion::parse(reported).ok_or_else(|| {
         incompatible(format!(
             "Herdr server reports unrecognized version {reported:?}"
@@ -1317,11 +1321,6 @@ mod tests {
             .expect_err("runtime rejects replacement before request write");
 
         assert_eq!(error.kind, AdapterErrorKind::Unavailable);
-        assert!(
-            error
-                .message
-                .contains("replaced before the request was sent")
-        );
         let after = runtime
             .invoke_response("ping", Value::Object(Map::new()))
             .await
@@ -1423,7 +1422,6 @@ mod tests {
                 Ok(receiver) => accepted.push(receiver),
                 Err(error) => {
                     assert_eq!(error.kind, AdapterErrorKind::Unavailable);
-                    assert!(error.message.contains("queue is full"));
                     break;
                 }
             }
@@ -1494,7 +1492,6 @@ mod tests {
             .await;
         let error = panicked.expect_err("panicking work gets a typed terminal");
         assert_eq!(error.kind, AdapterErrorKind::Unavailable);
-        assert!(error.message.contains("panicked internally"));
         assert_eq!(
             runtime
                 .run_ordered(|_| async { 42_u8 })

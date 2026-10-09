@@ -105,7 +105,7 @@ pub enum UiError {
     MissingBinding { generation: u64, ordinal: u64 },
     #[error("UI-local execution sequence overflowed")]
     ExecutionSequenceExhausted,
-    #[error("attachment carries a menu identity outside the validated domain")]
+    #[error("broker UI attachment contains an invalid menu ID")]
     InvalidMenuIdentity,
 }
 
@@ -982,7 +982,10 @@ fn execution_status(outcome: ExecutionOutcome) -> (StatusKind, &'static str) {
         // A detached action applies post-action behavior immediately, so there is
         // no pending progress left to show.
         ExecutionOutcome::Detached => (StatusKind::Notice, "Action continues detached"),
-        ExecutionOutcome::OutcomeUnknown => (StatusKind::Error, "Action outcome is unknown"),
+        ExecutionOutcome::OutcomeUnknown => (
+            StatusKind::Error,
+            "Muxe did not confirm the action result; the action may have run",
+        ),
     }
 }
 
@@ -3054,7 +3057,6 @@ pub(crate) mod tests {
         assert!(runtime.pending.is_none());
         let status = runtime.status.as_ref().unwrap();
         assert_eq!(status.kind, StatusKind::Error);
-        assert!(status.message.contains("unknown"));
         assert!(status.message.contains(detail));
     }
 

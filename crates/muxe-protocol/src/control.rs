@@ -33,6 +33,15 @@ macro_rules! control_nonce {
 control_nonce!(ControlRequestId);
 control_nonce!(HandoffId);
 
+impl fmt::Display for HandoffId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 impl std::str::FromStr for HandoffId {
     type Err = ControlSemanticError;
 
@@ -96,7 +105,9 @@ impl AsOfTick {
     pub fn from_millis(value: u64) -> Result<Self, ControlSemanticError> {
         (value != 0)
             .then_some(Self(value))
-            .ok_or(ControlSemanticError::InvalidCompatibility)
+            .ok_or(ControlSemanticError::InvalidCompatibility(
+                "activation proof timestamp must be nonzero",
+            ))
     }
 
     #[must_use]
@@ -296,12 +307,21 @@ impl CompatibilityRecord {
                 .bridge_build_id
                 .is_some_and(SchemaFingerprint::is_zero)
             {
-                return Err(ControlSemanticError::InvalidCompatibility);
+                return Err(ControlSemanticError::InvalidCompatibility(
+                    "Zellij bridge build ID must be nonzero when supplied",
+                ));
             }
         }
         if let Some(herdr) = &self.herdr {
-            if herdr.protocol_version == 0 || herdr.schema_version == 0 {
-                return Err(ControlSemanticError::InvalidCompatibility);
+            if herdr.protocol_version == 0 {
+                return Err(ControlSemanticError::InvalidCompatibility(
+                    "Herdr protocol version must be nonzero",
+                ));
+            }
+            if herdr.schema_version == 0 {
+                return Err(ControlSemanticError::InvalidCompatibility(
+                    "Herdr schema version must be nonzero",
+                ));
             }
             validate_fingerprint(herdr.schema_fingerprint)?;
         }
@@ -447,7 +467,9 @@ impl ActivationStatus {
 
 fn validate_readiness(ready: &TargetReadiness) -> Result<(), ControlSemanticError> {
     if ready.registered_clients.len() > MAX_READINESS_CLIENTS {
-        return Err(ControlSemanticError::InvalidCompatibility);
+        return Err(ControlSemanticError::InvalidCompatibility(
+            "registered client list exceeds the 1024-client limit",
+        ));
     }
     for client in &ready.registered_clients {
         validate_control_text("readiness client", client)?;
@@ -456,11 +478,15 @@ fn validate_readiness(ready: &TargetReadiness) -> Result<(), ControlSemanticErro
     sorted.sort_unstable();
     sorted.dedup();
     if sorted.len() != ready.registered_clients.len() {
-        return Err(ControlSemanticError::InvalidCompatibility);
+        return Err(ControlSemanticError::InvalidCompatibility(
+            "registered client list contains duplicate client IDs",
+        ));
     }
     if let Some(member_ids) = &ready.member_ids {
         if member_ids.len() > MAX_READINESS_CLIENTS {
-            return Err(ControlSemanticError::InvalidCompatibility);
+            return Err(ControlSemanticError::InvalidCompatibility(
+                "current client list exceeds the 1024-client limit",
+            ));
         }
         for client in member_ids {
             validate_control_text("readiness member", client)?;
@@ -469,11 +495,15 @@ fn validate_readiness(ready: &TargetReadiness) -> Result<(), ControlSemanticErro
         sorted.sort_unstable();
         sorted.dedup();
         if sorted.len() != member_ids.len() {
-            return Err(ControlSemanticError::InvalidCompatibility);
+            return Err(ControlSemanticError::InvalidCompatibility(
+                "current client list contains duplicate client IDs",
+            ));
         }
     }
     if ready.proof_epoch.is_some_and(UnitReadinessEpochId::is_zero) {
-        return Err(ControlSemanticError::InvalidCompatibility);
+        return Err(ControlSemanticError::InvalidCompatibility(
+            "client registration proof ID must be nonzero when supplied",
+        ));
     }
     Ok(())
 }
@@ -558,6 +588,18 @@ pub enum LifecycleState {
     Retired,
 }
 
+impl fmt::Display for LifecycleState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Running => "running",
+            Self::Preparing => "preparing for replacement",
+            Self::Draining => "stopping new work for replacement",
+            Self::SupervisorOnly => "host connection stopped; activation supervisor still running",
+            Self::Retired => "marked for retirement",
+        })
+    }
+}
+
 impl ControlMessage {
     fn validate(&self, direction: ControlDirection) -> Result<(), ControlSemanticError> {
         match (direction, self) {
@@ -581,8 +623,15 @@ impl ControlRequest {
                 as_of,
             } => {
                 handoff_id.validate("handoff ID")?;
-                if epoch.is_zero() || as_of.millis() == 0 {
-                    return Err(ControlSemanticError::InvalidCompatibility);
+                if epoch.is_zero() {
+                    return Err(ControlSemanticError::InvalidCompatibility(
+                        "client registration proof ID must be nonzero",
+                    ));
+                }
+                if as_of.millis() == 0 {
+                    return Err(ControlSemanticError::InvalidCompatibility(
+                        "activation proof timestamp must be nonzero",
+                    ));
                 }
                 Ok(())
             }
@@ -871,11 +920,20 @@ fn validate_fingerprint(value: SchemaFingerprint) -> Result<(), ControlSemanticE
 }
 
 fn validate_live_server(value: &LiveServerIdentity) -> Result<(), ControlSemanticError> {
-    if value.discovery_key.is_empty()
-        || value.discovery_key.chars().any(char::is_control)
-        || value.server_id.as_str().is_empty()
-    {
-        return Err(ControlSemanticError::InvalidLiveServerIdentity);
+    if value.discovery_key.is_empty() {
+        return Err(ControlSemanticError::InvalidLiveServerIdentity(
+            "host discovery key must not be empty",
+        ));
+    }
+    if value.discovery_key.chars().any(char::is_control) {
+        return Err(ControlSemanticError::InvalidLiveServerIdentity(
+            "host discovery key must not contain control characters",
+        ));
+    }
+    if value.server_id.as_str().is_empty() {
+        return Err(ControlSemanticError::InvalidLiveServerIdentity(
+            "host server ID must not be empty",
+        ));
     }
     Ok(())
 }
@@ -903,25 +961,27 @@ fn copy_from_input<const N: usize>(
 pub enum ControlSemanticError {
     #[error("{0} must be nonzero")]
     ZeroNonce(&'static str),
-    #[error("handoff must be exactly 32 hexadecimal characters")]
+    #[error("handoff ID must be exactly 32 hexadecimal characters")]
     InvalidHandoffHex,
     #[error("schema fingerprint must be nonzero")]
     ZeroFingerprint,
-    #[error("invalid live server identity")]
-    InvalidLiveServerIdentity,
-    #[error("invalid compatibility record")]
-    InvalidCompatibility,
-    #[error("invalid canonical bridge unit identity")]
+    #[error("invalid host identity in activation message: {0}")]
+    InvalidLiveServerIdentity(&'static str),
+    #[error("invalid activation compatibility or client registration data: {0}")]
+    InvalidCompatibility(&'static str),
+    #[error("bridge unit ID must be exactly 64 lowercase hexadecimal characters")]
     InvalidBridgeUnit,
-    #[error("invalid broker registration authority")]
+    #[error("broker registration must include a nonzero process start timestamp")]
     InvalidRegistration,
-    #[error("cannot mint broker registration identity: {0}")]
+    #[error("cannot generate broker registration ID using operating-system randomness: {0}")]
     RegistrationEntropy(String),
-    #[error("invalid activation phase")]
+    #[error(
+        "activation status is inconsistent: lifecycle, phase, target, and handoff ID do not describe one valid activation state"
+    )]
     InvalidActivationPhase,
-    #[error("invalid {0}")]
+    #[error("{0} must not be empty or contain control characters")]
     InvalidText(&'static str),
-    #[error("control diagnostic exceeds bound: {0}")]
+    #[error("activation diagnostic exceeds the 4096-byte limit: {0} bytes")]
     DiagnosticTooLong(usize),
     #[error("control message is illegal for this connection direction")]
     WrongDirection,

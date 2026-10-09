@@ -69,12 +69,12 @@ impl EventSubscription {
         let metadata =
             method_metadata("events.subscribe").ok_or_else(|| SocketError::Protocol {
                 delivery: DeliveryState::NotSent,
-                message: "bundled Herdr metadata does not declare events.subscribe".to_owned(),
+                message: "The bundled Herdr method metadata does not define events.subscribe. The subscription request was not sent.".to_owned(),
             })?;
         if metadata.method != "events.subscribe" {
             return Err(SocketError::Protocol {
                 delivery: DeliveryState::NotSent,
-                message: "bundled events.subscribe metadata names the wrong method".to_owned(),
+                message: "The bundled events.subscribe metadata names a different method. The subscription request was not sent.".to_owned(),
             });
         }
         let id = runtime.client().next_id()?;
@@ -106,7 +106,7 @@ impl EventSubscription {
             crate::transport::HerdrResponse::Error { code, message } => {
                 Err(SocketError::Protocol {
                     delivery: DeliveryState::MayHaveReachedHost,
-                    message: format!("Herdr rejected events.subscribe with {code}: {message}"),
+                    message: format!("events.subscribe was rejected ({code}): {message}"),
                 })
             }
         }

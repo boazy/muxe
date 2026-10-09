@@ -459,29 +459,31 @@ impl LaunchGate {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum GateError {
-    #[error("operating system randomness is unavailable")]
+    #[error("cannot reserve a UI launch: operating-system randomness is unavailable")]
     EntropyUnavailable,
-    #[error("pending launch lease must be nonzero")]
+    #[error("UI launch reservation duration must be nonzero")]
     ZeroLease,
-    #[error("pending launch lease overflowed its deadline")]
+    #[error("UI launch reservation duration exceeds the clock's deadline range")]
     LeaseOverflow,
-    #[error("token source produced a duplicate or zero token")]
+    #[error("cannot reserve a UI launch: token source returned an already-used or all-zero token")]
     DuplicateToken,
-    #[error("unknown pending launch token")]
+    #[error("UI launch reservation has expired or its token is unknown")]
     UnknownToken,
-    #[error("pending launch belongs to another modal scope")]
+    #[error(
+        "UI launch reservation belongs to a different host input scope, where only one menu can be active"
+    )]
     ScopeMismatch,
-    #[error("modal scope is already owned")]
+    #[error("another menu already owns input in this host scope")]
     ScopeOccupied,
     #[error("pending pane registration is already in progress")]
     RegistrationInProgress,
     #[error("a different pane was registered or committed for this launch")]
     PaneMismatch,
-    #[error("the pending launch already has a different attached UI")]
+    #[error("a different UI is already attached to this launch reservation")]
     TokenAlreadyAttached,
     #[error("UI session is already attached")]
     DuplicateSession,
-    #[error("pending launch cannot commit before its UI has attached")]
+    #[error("cannot finish UI launch before its UI has attached")]
     UiNotAttached,
 }
 

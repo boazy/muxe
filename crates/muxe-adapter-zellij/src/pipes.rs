@@ -122,31 +122,35 @@ const LINE_QUEUE_DEPTH: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum PipeTransportError {
     /// The `zellij pipe` child could not be spawned.
-    #[error("could not spawn zellij pipe child: {reason}")]
+    #[error("could not start zellij pipe process: {reason}")]
     Spawn {
         /// Bounded reason.
         reason: String,
     },
     /// Writing a request line failed.
-    #[error("request pipe write failed: {reason}")]
+    #[error(
+        "could not finish writing to the Zellij request pipe; the request may have reached Zellij: {reason}"
+    )]
     Write {
         /// Bounded reason.
         reason: String,
     },
     /// Reading an event line failed or the child exited.
-    #[error("event pipe read failed: {reason}")]
+    #[error("could not read from the Zellij event pipe: {reason}")]
     Read {
         /// Bounded reason.
         reason: String,
     },
     /// A line exceeded the bounded frame length before any newline arrived.
-    #[error("pipe line exceeds bound ({actual} bytes)")]
+    #[error(
+        "Zellij pipe line exceeds the {MAX_PIPE_LINE_LEN}-byte limit ({actual} bytes received)"
+    )]
     Oversized {
         /// Observed length.
         actual: usize,
     },
     /// The previous child could not be reaped before replacement.
-    #[error("could not reap replaced zellij pipe child: {reason}")]
+    #[error("could not wait for the replaced zellij pipe process to exit: {reason}")]
     Reap {
         /// Bounded reason plus the retained stderr tail.
         reason: String,

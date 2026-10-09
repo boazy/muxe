@@ -192,7 +192,9 @@ pub(crate) async fn pane_by_id_with(
                 .filter_map(Value::as_object)
                 .find(|candidate| candidate.get("pane_id").and_then(Value::as_str) == Some(pane_id))
         })
-        .ok_or_else(|| invalid("Herdr explicit parent pane is not present in the live snapshot"))?;
+        .ok_or_else(|| {
+            invalid("The specified Herdr parent pane is not present in the live session snapshot")
+        })?;
     let workspace = WorkspaceId::new(required_id(pane, "workspace_id", "session.snapshot")?);
     let tab = TabId::new(required_id(pane, "tab_id", "session.snapshot")?);
     pane_from_snapshot(&snapshot, workspace, tab, PaneId::new(pane_id))
@@ -206,14 +208,14 @@ async fn session_snapshot(
     )?;
     if result.get("type").and_then(Value::as_str) != Some("session_snapshot") {
         return Err(invalid(
-            "Herdr session.snapshot result has an unexpected type",
+            "Herdr session.snapshot result must have type \"session_snapshot\"",
         ));
     }
     result
         .get("snapshot")
         .and_then(Value::as_object)
         .cloned()
-        .ok_or_else(|| invalid("Herdr session.snapshot result lacks snapshot"))
+        .ok_or_else(|| invalid("Herdr session.snapshot result must contain a snapshot object"))
 }
 
 #[expect(
@@ -244,7 +246,7 @@ fn pane_from_snapshot(
         })
         .map(PathBuf::from)
         .filter(|cwd| cwd.is_absolute())
-        .ok_or_else(|| invalid("Herdr pane tuple has no absolute captured working directory"))?;
+        .ok_or_else(|| invalid("The Herdr pane has no captured absolute working directory"))?;
     let (columns, rows) = snapshot
         .get("layouts")
         .and_then(Value::as_array)
@@ -271,7 +273,9 @@ fn pane_from_snapshot(
             Some((u16::try_from(columns).ok()?, u16::try_from(rows).ok()?))
         })
         .filter(|(columns, rows)| *columns > 0 && *rows > 0)
-        .ok_or_else(|| invalid("Herdr pane tuple has no positive live layout geometry"))?;
+        .ok_or_else(|| {
+            invalid("The Herdr pane has no live layout with positive row and column counts")
+        })?;
     Ok(FocusedPane {
         workspace,
         tab,
@@ -308,11 +312,13 @@ pub(crate) async fn open_command_pane_with(
     launch: CommandPaneLaunch,
 ) -> Result<CommandPanePlacement, AdapterError> {
     if !launch.cwd.is_absolute() {
-        return Err(invalid("Herdr command-pane cwd must be absolute"));
+        return Err(invalid(
+            "The Herdr command pane's working directory must be an absolute path",
+        ));
     }
     if launch.argv.first().is_none_or(String::is_empty) {
         return Err(invalid(
-            "Herdr command-pane argv requires a nonempty program",
+            "The Herdr command pane's argument list must begin with a nonempty program",
         ));
     }
     if !(launch.ratio.is_finite() && 0.0 < launch.ratio && launch.ratio < 1.0) {
@@ -342,7 +348,7 @@ pub(crate) async fn open_command_pane_with(
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                "Herdr layout.apply result lacks root object",
+                "Herdr layout.apply result must contain a root object",
             )
         })?;
     let prepared = PreparedUiPane {
@@ -381,7 +387,7 @@ pub(crate) async fn open_command_pane_with(
                 return Err(AdapterError::new(
                     combined_move_error_kind(&move_error, &cleanup_error),
                     format!(
-                        "Herdr command-pane move failed ({move_error}); closing its returned temporary tab also failed ({cleanup_error})"
+                        "The Herdr command-pane move request failed: {move_error}. Closing the temporary tab returned by Herdr also failed: {cleanup_error}"
                     ),
                 ));
             }
@@ -415,11 +421,13 @@ pub(crate) async fn open_command_tab_with(
     launch: CommandTabLaunch,
 ) -> Result<(), AdapterError> {
     if !launch.cwd.is_absolute() {
-        return Err(invalid("Herdr command-tab cwd must be absolute"));
+        return Err(invalid(
+            "The Herdr command tab's working directory must be an absolute path",
+        ));
     }
     if launch.argv.first().is_none_or(String::is_empty) {
         return Err(invalid(
-            "Herdr command-tab argv requires a nonempty program",
+            "The Herdr command tab's argument list must begin with a nonempty program",
         ));
     }
     let layout = invoke(
@@ -460,7 +468,9 @@ pub(crate) async fn prepare_ui_pane_with(
     launch: &UiPaneLaunch,
 ) -> Result<PreparedUiPane, AdapterError> {
     if !launch.cwd.is_absolute() {
-        return Err(invalid("Herdr UI launch cwd must be absolute"));
+        return Err(invalid(
+            "The Herdr UI launch working directory must be an absolute path",
+        ));
     }
     validate_ui_argv(&launch.argv)?;
     validate_bootstrap_env(&launch.bootstrap_env)?;
@@ -492,7 +502,7 @@ pub(crate) async fn prepare_ui_pane_with(
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                "Herdr layout.apply result lacks root object",
+                "Herdr layout.apply result must contain a root object",
             )
         })?;
     Ok(PreparedUiPane {
@@ -560,7 +570,7 @@ pub(crate) async fn move_prepared_ui_pane_with(
                 return Err(AdapterError::new(
                     combined_move_error_kind(&move_error, &cleanup_error),
                     format!(
-                        "Herdr UI pane move failed ({move_error}); closing its returned temporary tab also failed ({cleanup_error})"
+                        "The Herdr UI pane move request failed: {move_error}. Closing the temporary tab returned by Herdr also failed: {cleanup_error}"
                     ),
                 ));
             }
@@ -623,7 +633,9 @@ fn validate_bootstrap_env(env: &BTreeMap<String, String>) -> Result<(), AdapterE
     const OPTIONAL: &str = "MUXE_HERDR_ORIGIN_PANE_CWD";
     for key in REQUIRED {
         if env.get(key).is_none_or(String::is_empty) {
-            return Err(invalid(format!("Herdr UI launch lacks nonempty {key}")));
+            return Err(invalid(format!(
+                "Herdr UI launch requires a nonempty {key} environment variable"
+            )));
         }
     }
     if env
@@ -631,7 +643,7 @@ fn validate_bootstrap_env(env: &BTreeMap<String, String>) -> Result<(), AdapterE
         .is_some_and(|cwd| cwd.is_empty() || !PathBuf::from(cwd).is_absolute())
     {
         return Err(invalid(
-            "Herdr UI launch origin cwd must be an absolute path when present",
+            "The Herdr UI launch origin working directory must be an absolute path when provided",
         ));
     }
     if env
@@ -672,7 +684,7 @@ async fn invoke(
         HerdrResponse::Success(result) => Ok(result),
         HerdrResponse::Error { code, message } => Err(AdapterError::new(
             AdapterErrorKind::DispatchFailed,
-            format!("Herdr rejected {method} with {code}: {message}"),
+            format!("Herdr rejected {method} ({code}): {message}"),
         )),
     }
 }
@@ -699,7 +711,7 @@ fn layout_apply_result(value: &Value) -> Result<Map<String, Value>, AdapterError
     if result.get("type").and_then(Value::as_str) != Some("layout_apply") {
         return Err(AdapterError::new(
             AdapterErrorKind::DispatchFailed,
-            "Herdr layout.apply result has unexpected type",
+            "Herdr layout.apply result must have type \"layout_apply\"",
         ));
     }
     result
@@ -709,7 +721,7 @@ fn layout_apply_result(value: &Value) -> Result<Map<String, Value>, AdapterError
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                "Herdr layout.apply result lacks layout object",
+                "Herdr layout.apply result must contain a layout object",
             )
         })
 }
@@ -731,7 +743,7 @@ fn required_id(
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                format!("Herdr {method} result lacks nonempty {field}"),
+                format!("Herdr {method} result must contain a nonempty {field} string"),
             )
         })
 }
@@ -745,7 +757,7 @@ fn changed(value: &Value, method: &str) -> Result<(), AdapterError> {
     if result.get("type").and_then(Value::as_str) != Some("pane_move") {
         return Err(AdapterError::new(
             AdapterErrorKind::DispatchFailed,
-            format!("Herdr {method} result has unexpected type"),
+            format!("Herdr {method} result must have type \"pane_move\""),
         ));
     }
     let move_result = result
@@ -754,7 +766,7 @@ fn changed(value: &Value, method: &str) -> Result<(), AdapterError> {
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                format!("Herdr {method} result lacks move_result object"),
+                format!("Herdr {method} result must contain a move_result object"),
             )
         })?;
     (move_result.get("changed").and_then(Value::as_bool) == Some(true))
@@ -762,7 +774,7 @@ fn changed(value: &Value, method: &str) -> Result<(), AdapterError> {
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::DispatchFailed,
-                format!("Herdr {method} move_result did not report changed:true"),
+                format!("Herdr {method} did not confirm that the pane moved: move_result.changed must be true"),
             )
         })
 }

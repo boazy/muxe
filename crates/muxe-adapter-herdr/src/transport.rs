@@ -30,6 +30,15 @@ pub enum DeliveryState {
     MayHaveReachedHost,
 }
 
+impl DeliveryState {
+    const fn explanation(self) -> &'static str {
+        match self {
+            Self::NotSent => "The request was not sent.",
+            Self::MayHaveReachedHost => "The request may have executed; its outcome is unknown.",
+        }
+    }
+}
+
 /// The correlated outcome of one Herdr request.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HerdrResponse {
@@ -39,47 +48,51 @@ pub enum HerdrResponse {
 
 #[derive(Debug, Error)]
 pub enum SocketError {
-    #[error("Herdr method {method:?} is an event stream, not a unary request")]
+    #[error(
+        "Herdr method {method:?} returns an event stream and cannot be used for a single-response request. The request was not sent."
+    )]
     StreamingMethod { method: String },
-    #[error("serialized Herdr request exceeds {MAX_MESSAGE_BYTES} bytes")]
+    #[error("Herdr request exceeds the {MAX_MESSAGE_BYTES}-byte limit. The request was not sent.")]
     RequestTooLarge,
-    #[error("Herdr request ID sequence is exhausted")]
+    #[error("Herdr request IDs are exhausted. The request was not sent.")]
     RequestIdExhausted,
-    #[error("could not connect to Herdr socket {socket}")]
+    #[error("Could not connect to Herdr socket {socket}: {source}. The request was not sent.")]
     Connect {
         socket: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("could not write Herdr request")]
+    #[error("Could not send the Herdr request: {source}. {}", .delivery.explanation())]
     Write {
         delivery: DeliveryState,
         #[source]
         source: io::Error,
     },
-    #[error("Herdr closed the socket before a complete response line")]
+    #[error("Herdr closed the socket before sending a complete response. {}", .delivery.explanation())]
     EarlyEof { delivery: DeliveryState },
-    #[error("Herdr response exceeds {MAX_MESSAGE_BYTES} bytes")]
+    #[error("Herdr response exceeds the {MAX_MESSAGE_BYTES}-byte limit. {}", .delivery.explanation())]
     ResponseTooLarge { delivery: DeliveryState },
-    #[error("Herdr did not answer within the request deadline")]
+    #[error("Herdr did not answer within the request deadline. {}", .delivery.explanation())]
     Timeout { delivery: DeliveryState },
-    #[error("could not capture the Herdr endpoint identity at {socket}")]
+    #[error(
+        "Could not identify the Herdr server at socket {socket}: {source}. The request was not sent."
+    )]
     Endpoint {
         socket: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("Herdr endpoint at {socket} was replaced before the request was sent")]
+    #[error("The Herdr server at socket {socket} changed. The request was not sent.")]
     EndpointReplaced { socket: PathBuf },
-    #[error("Herdr runtime retired while the request was in flight")]
+    #[error("The Herdr connection assigned to this request is no longer active. {}", .delivery.explanation())]
     RuntimeRetired { delivery: DeliveryState },
-    #[error("could not read Herdr response")]
+    #[error("Could not read the Herdr response: {source}. {}", .delivery.explanation())]
     Read {
         delivery: DeliveryState,
         #[source]
         source: io::Error,
     },
-    #[error("Herdr response is not valid JSON")]
+    #[error("Could not process Herdr JSON: {source}. {}", .delivery.explanation())]
     InvalidJson {
         delivery: DeliveryState,
         #[source]

@@ -134,7 +134,7 @@ host_identity_id!(
 host_identity_id!(
     LiveServerIncarnationId,
     "Opaque identity of one live continuity incarnation.",
-    "live server incarnation"
+    "live server ID"
 );
 
 /// Identity of the exact live host server, not merely its discovery key.
@@ -684,7 +684,7 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
     ) -> Result<Option<ActivationReadiness>, AdapterError> {
         Err(AdapterError::new(
             AdapterErrorKind::Unsupported,
-            "this host adapter cannot attest an as-of activation readiness epoch",
+            "this host adapter cannot confirm activation readiness at the requested timestamp",
         ))
     }
 
