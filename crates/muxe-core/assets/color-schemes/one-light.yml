@@ -1,0 +1,68 @@
+# Canonical source: https://raw.githubusercontent.com/atom/one-light-syntax/d84579027410c576086dfca14d934c4bd74b0438/styles/colors.less
+# Adaptation: retain all named RGB colors; flatten nested names; map Muxe semantic roles.
+# Alpha roles are source-backed opaque composites over the original syntax-bg, not unmodified upstream hex.
+# Source expressions, alpha composites, comparative values and licenses: ../catalog.json
+title: "One Light"
+palette:
+  mono-1: "#383a42"
+  mono-2: "#696c77"
+  mono-3: "#a0a1a7"
+  hue-1: "#0184bc"
+  hue-2: "#4078f2"
+  hue-3: "#a626a4"
+  hue-4: "#50a14f"
+  hue-5: "#e45649"
+  hue-5-2: "#ca1243"
+  hue-6: "#986801"
+  hue-6-2: "#c18401"
+  syntax-fg: "#383a42"
+  syntax-bg: "#fafafa"
+  syntax-gutter: "#9d9d9f"
+  syntax-guide: "#d3d4d5"
+  syntax-accent: "#526fff"
+  syntax-text-color: "#383a42"
+  syntax-cursor-color: "#526fff"
+  syntax-selection-color: "#e5e5e6"
+  syntax-selection-flash-color: "#526fff"
+  syntax-background-color: "#fafafa"
+  syntax-wrap-guide-color: "#d3d4d5"
+  syntax-indent-guide-color: "#d3d4d5"
+  syntax-invisible-character-color: "#d3d4d5"
+  syntax-result-marker-color: "#d8defb"
+  syntax-result-marker-color-selected: "#526fff"
+  syntax-gutter-text-color: "#9d9d9f"
+  syntax-gutter-text-color-selected: "#383a42"
+  syntax-gutter-background-color: "#fafafa"
+  syntax-gutter-background-color-selected: "#e5e5e6"
+  syntax-color-renamed: "#52aeff"
+  syntax-color-added: "#2db448"
+  syntax-color-modified: "#f2a60d"
+  syntax-color-removed: "#ff1414"
+  syntax-color-variable: "#e45649"
+  syntax-color-constant: "#986801"
+  syntax-color-property: "#383a42"
+  syntax-color-value: "#383a42"
+  syntax-color-function: "#4078f2"
+  syntax-color-method: "#4078f2"
+  syntax-color-class: "#c18401"
+  syntax-color-keyword: "#a626a4"
+  syntax-color-tag: "#e45649"
+  syntax-color-attribute: "#986801"
+  syntax-color-import: "#a626a4"
+  syntax-color-snippet: "#50a14f"
+  syntax-cursor-line: "#f0f0f1"
+  syntax-deprecated-fg: "#000000"
+  syntax-deprecated-bg: "#f2a60d"
+  syntax-illegal-fg: "#ffffff"
+  syntax-illegal-bg: "#ff1414"
+colors:
+  base.text: syntax-fg
+  base.background: syntax-bg
+  base.muted: mono-2
+  menu.hotkey: hue-3
+  menu.separator: mono-2
+  status.error: hue-5-2
+  status.pending: hue-6
+  status.blocked: hue-5-2
+  status.reload: syntax-fg
+  status.notice: syntax-fg

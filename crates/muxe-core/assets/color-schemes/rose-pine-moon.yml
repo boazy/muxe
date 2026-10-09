@@ -1,0 +1,33 @@
+# Canonical source: https://raw.githubusercontent.com/rose-pine/neovim/ff483051a47e27d84bdef47703538df1ed9f4a47/lua/rose-pine/palette.lua
+# Adaptation: retain all named RGB colors; flatten nested names; map Muxe semantic roles.
+# Source expressions, alpha composites, comparative values and licenses: ../catalog.json
+title: "Rosé Pine Moon"
+palette:
+  _nc: "#1f1d30"
+  base: "#232136"
+  surface: "#2a273f"
+  overlay: "#393552"
+  muted: "#6e6a86"
+  subtle: "#908caa"
+  text: "#e0def4"
+  love: "#eb6f92"
+  gold: "#f6c177"
+  rose: "#ea9a97"
+  pine: "#3e8fb0"
+  foam: "#9ccfd8"
+  iris: "#c4a7e7"
+  leaf: "#95b1ac"
+  highlight_low: "#2a283e"
+  highlight_med: "#44415a"
+  highlight_high: "#56526e"
+colors:
+  base.text: text
+  base.background: base
+  base.muted: subtle
+  menu.hotkey: iris
+  menu.separator: subtle
+  status.error: love
+  status.pending: gold
+  status.blocked: love
+  status.reload: leaf
+  status.notice: foam

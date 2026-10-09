@@ -1,0 +1,58 @@
+# Canonical source: https://raw.githubusercontent.com/catppuccin/palette/07d02aa110ef9eb7e7427afca5c73ba9cf7f8ebd/palette.json
+# Adaptation: retain all named RGB colors; flatten nested names; map Muxe semantic roles.
+# Source expressions, alpha composites, comparative values and licenses: ../catalog.json
+title: "Catppuccin Latte"
+palette:
+  rosewater: "#dc8a78"
+  flamingo: "#dd7878"
+  pink: "#ea76cb"
+  mauve: "#8839ef"
+  red: "#d20f39"
+  maroon: "#e64553"
+  peach: "#fe640b"
+  yellow: "#df8e1d"
+  green: "#40a02b"
+  teal: "#179299"
+  sky: "#04a5e5"
+  sapphire: "#209fb5"
+  blue: "#1e66f5"
+  lavender: "#7287fd"
+  text: "#4c4f69"
+  subtext1: "#5c5f77"
+  subtext0: "#6c6f85"
+  overlay2: "#7c7f93"
+  overlay1: "#8c8fa1"
+  overlay0: "#9ca0b0"
+  surface2: "#acb0be"
+  surface1: "#bcc0cc"
+  surface0: "#ccd0da"
+  base: "#eff1f5"
+  mantle: "#e6e9ef"
+  crust: "#dce0e8"
+  ansiColors.black.normal: "#5c5f77"
+  ansiColors.black.bright: "#6c6f85"
+  ansiColors.red.normal: "#d20f39"
+  ansiColors.red.bright: "#de293e"
+  ansiColors.green.normal: "#40a02b"
+  ansiColors.green.bright: "#49af3d"
+  ansiColors.yellow.normal: "#df8e1d"
+  ansiColors.yellow.bright: "#eea02d"
+  ansiColors.blue.normal: "#1e66f5"
+  ansiColors.blue.bright: "#456eff"
+  ansiColors.magenta.normal: "#ea76cb"
+  ansiColors.magenta.bright: "#fe85d8"
+  ansiColors.cyan.normal: "#179299"
+  ansiColors.cyan.bright: "#2d9fa8"
+  ansiColors.white.normal: "#acb0be"
+  ansiColors.white.bright: "#bcc0cc"
+colors:
+  base.text: text
+  base.background: base
+  base.muted: subtext1
+  menu.hotkey: mauve
+  menu.separator: subtext1
+  status.error: red
+  status.pending: text
+  status.blocked: red
+  status.reload: text
+  status.notice: text

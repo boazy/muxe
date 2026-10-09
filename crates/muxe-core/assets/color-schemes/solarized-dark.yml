@@ -1,0 +1,31 @@
+# Canonical source: https://raw.githubusercontent.com/altercation/solarized/62f656a02f93c5190a8753159e34b385588d5ff3/xresources/solarized
+# Full palette and mapping decisions: ../catalog.json
+title: "Solarized Dark"
+palette:
+  yellow: "#b58900"
+  orange: "#cb4b16"
+  red: "#dc322f"
+  magenta: "#d33682"
+  violet: "#6c71c4"
+  blue: "#268bd2"
+  cyan: "#2aa198"
+  green: "#859900"
+  base03: "#002b36"
+  base02: "#073642"
+  base01: "#586e75"
+  base00: "#657b83"
+  base0: "#839496"
+  base1: "#93a1a1"
+  base2: "#eee8d5"
+  base3: "#fdf6e3"
+colors:
+  base.text: base0
+  base.background: base03
+  base.muted: base1
+  menu.hotkey: cyan
+  menu.separator: base1
+  status.error: base0
+  status.pending: yellow
+  status.blocked: yellow
+  status.reload: cyan
+  status.notice: green
