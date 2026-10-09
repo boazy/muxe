@@ -278,6 +278,17 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
         "\nFor a printable character, write the character itself. Use `unicode+<hex-scalar>` for other Unicode characters. Examples: `ctrl+c`, `alternate:alt+unicode+e9`, and `ctrl+f12`.\n"
     )
     .unwrap();
+    writeln!(output, "### Default navigation bindings\n").unwrap();
+    writeln!(
+        output,
+        "Muxe supplies `esc` to quit, `backspace` to return, and `left`/`pgup` and `right`/`pgdn` to change pages. Each default is added only when the menu does not define that key. Your binding replaces the whole default, including its visibility and page conditions. Host filters still apply to your binding; excluding it does not restore the default.\n"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "An injection with `type: defaults` also adds only missing bindings. An explicit `type: override` injection can replace existing bindings.\n"
+    )
+    .unwrap();
 
     writeln!(output, "### Lock modifier matching\n").unwrap();
     writeln!(

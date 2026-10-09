@@ -47,19 +47,19 @@ inject:
   Builtin.escape:
     select: { type: all }
     action:
-      type: override
+      type: defaults
       bindings:
         esc: { hidden: true, action: "menu:quit" }
   Builtin.backspace:
     select: { type: all }
     action:
-      type: override
+      type: defaults
       bindings:
         backspace: { hidden: true, action: "menu:return" }
   Builtin.pagination:
     select: { type: all }
     action:
-      type: override
+      type: defaults
       bindings:
         left:
           hidden: true
@@ -2477,7 +2477,24 @@ fn merge_defaults(target: &mut ConfigValue, defaults: &ConfigValue) {
     };
     for default in defaults {
         if let Some(existing) = target.iter_mut().find(|field| field.name == default.name) {
-            merge_defaults(&mut existing.value, &default.value);
+            if default.name == "bindings" {
+                // A binding is one definition. Filling fields of an existing
+                // binding can silently add hidden flags or page conditions.
+                if let (Some(bindings), Some(default_bindings)) =
+                    (existing.value.as_mapping_mut(), default.value.as_mapping())
+                {
+                    for binding in default_bindings {
+                        if !bindings
+                            .iter()
+                            .any(|existing| existing.name == binding.name)
+                        {
+                            bindings.push(binding.clone());
+                        }
+                    }
+                }
+            } else {
+                merge_defaults(&mut existing.value, &default.value);
+            }
         } else {
             target.push(default.clone());
         }

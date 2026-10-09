@@ -275,6 +275,77 @@ menus:
 }
 
 #[test]
+fn navigation_defaults_preserve_whole_host_filtered_bindings() {
+    let yaml = r"
+version: 1
+menus:
+  main:
+    bindings:
+      left: { label: left, action: 'pane:focus direction=left' }
+      right: { label: right, action: 'pane:focus direction=right' }
+  split:
+    bindings:
+      left: { label: left, skip-hosts: [herdr], action: 'pane:split direction=left' }
+      right: { label: right, action: 'pane:split direction=right' }
+";
+    let herdr = compile(yaml, None, Some(&HerdrValidator)).unwrap();
+    let zellij = compile(yaml, None, Some(&ZellijValidator)).unwrap();
+    for config in [&herdr, &zellij] {
+        for (menu, keys) in [("main", &["left", "right"][..]), ("split", &["right"][..])] {
+            for key in keys {
+                let binding = config
+                    .menu(&menu_id(menu))
+                    .unwrap()
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.key.canonical_string() == *key)
+                    .unwrap();
+                assert!(!binding.hidden);
+                assert_eq!(binding.conditions, muxe_core::BindingConditions::default());
+                assert!(matches!(
+                    binding.action,
+                    muxe_core::ActionSpec::Portable(PortableAction::Pane(_))
+                ));
+            }
+        }
+        let pgdn = config
+            .menu(&menu_id("main"))
+            .unwrap()
+            .bindings
+            .iter()
+            .find(|binding| binding.key.canonical_string() == "pgdn")
+            .unwrap();
+        assert!(pgdn.hidden);
+        assert!(pgdn.conditions.include.is_some());
+        assert!(matches!(
+            pgdn.action,
+            muxe_core::ActionSpec::Portable(PortableAction::Menu(muxe_core::MenuAction::PageNext))
+        ));
+    }
+    assert!(
+        !herdr
+            .menu(&menu_id("split"))
+            .unwrap()
+            .bindings
+            .iter()
+            .any(|binding| binding.key.canonical_string() == "left")
+    );
+    let left = zellij
+        .menu(&menu_id("split"))
+        .unwrap()
+        .bindings
+        .iter()
+        .find(|binding| binding.key.canonical_string() == "left")
+        .unwrap();
+    assert!(!left.hidden);
+    assert_eq!(left.conditions, muxe_core::BindingConditions::default());
+    assert!(matches!(
+        left.action,
+        muxe_core::ActionSpec::Portable(PortableAction::Pane(PaneAction::Split { .. }))
+    ));
+}
+
+#[test]
 fn included_actions_and_truly_unknown_menu_targets_still_fail() {
     let unsupported = "version: 1\nmenus:\n  main:\n    bindings:\n      x: { label: active, only-hosts: [herdr], action: 'pane:create' }\n";
     let errors = compile(unsupported, None, Some(&HerdrValidator)).unwrap_err();

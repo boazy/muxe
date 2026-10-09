@@ -93,6 +93,48 @@ inject:
 }
 
 #[test]
+fn explicit_injection_override_wins_after_builtin_defaults() {
+    let config = compile(
+        r"
+version: 1
+inject:
+  custom:
+    select: { type: all }
+    action:
+      type: override
+      bindings:
+        left: { label: custom, action: config:reload }
+menus:
+  main:
+    bindings:
+      left: { label: original, action: menu:quit }
+      esc: { label: escape, action: config:reload }
+      backspace: { label: back, action: config:reload }
+",
+        None,
+        KeyCapabilities::default(),
+    )
+    .unwrap();
+    let main = config.menu(&id("main")).unwrap();
+    for (key, label) in [("left", "custom"), ("esc", "escape"), ("backspace", "back")] {
+        let binding = main
+            .bindings
+            .iter()
+            .find(|binding| binding.key.canonical_string() == key)
+            .unwrap();
+        assert_eq!(binding.label.as_deref(), Some(label));
+        assert!(!binding.hidden);
+        assert_eq!(binding.conditions, muxe_core::BindingConditions::default());
+        assert!(matches!(
+            binding.action,
+            muxe_core::ActionSpec::Portable(muxe_core::PortableAction::Config(
+                muxe_core::ConfigAction::Reload
+            ))
+        ));
+    }
+}
+
+#[test]
 fn cycles_and_invalid_context_types_are_rejected_with_semantic_codes() {
     let cycle = compile(
         r"

@@ -595,6 +595,12 @@ Write modifiers in this order: `ctrl`, `alt`, `shift`, `super`, `hyper`, `meta`,
 
 For a printable character, write the character itself. Use `unicode+<hex-scalar>` for other Unicode characters. Examples: `ctrl+c`, `alternate:alt+unicode+e9`, and `ctrl+f12`.
 
+### Default navigation bindings
+
+Muxe supplies `esc` to quit, `backspace` to return, and `left`/`pgup` and `right`/`pgdn` to change pages. Each default is added only when the menu does not define that key. Your binding replaces the whole default, including its visibility and page conditions. Host filters still apply to your binding; excluding it does not restore the default.
+
+An injection with `type: defaults` also adds only missing bindings. An explicit `type: override` injection can replace existing bindings.
+
 ### Lock modifier matching
 
 Ordinary modifiers must match exactly. Each lock modifier in a binding is a requirement on the lock state the terminal reports: `caps-lock+left` matches only while Caps Lock is active. A binding with no lock modifier matches regardless of lock state, so `left` still matches when Caps Lock or Num Lock is active. Extra locks in the event do not disqualify a binding, while an extra ordinary modifier does. Lock modifiers on printable characters require all-keys-as-escape-codes mode.
