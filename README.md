@@ -92,6 +92,8 @@ Each archive contains a complete installation:
 muxe
 lib/muxe/muxe-zellij.wasm
 share/muxe/completions/
+share/muxe/theme-palettes/LICENSES.txt
+share/muxe/theme-palettes/catalog.json
 LICENSE
 ```
 
@@ -184,7 +186,7 @@ menus:
 
 ### Themes and color schemes
 
-Set `theme` and `color-scheme` to the corresponding filenames without `.yml`, under `$CONFIG_DIR/themes/` and `$CONFIG_DIR/color-schemes/`. Both default to `default`. The catalogs are independent: the same name can identify a theme and a color scheme. A scheme's `title` is display text, not its selection name.
+Set `theme` and `color-scheme` independently to a built-in name or to a filename without `.yml` under `$CONFIG_DIR/themes/` and `$CONFIG_DIR/color-schemes/`. Both default to the terminal-inheriting `default`. User files replace built-ins with the same name, including `default`. Run `muxe config themes` to list both catalogs without contacting a host. See [Themes and color schemes](docs/themes.md) for the built-in catalog, presentation choices, and palette sources. A scheme's `title` is display text, not its selection name.
 
 Palette values must be `#rgb` or `#rrggbb` literals. Semantic colors may reference palette entries or other semantic colors; a semantic name takes precedence when it also exists in the palette. Muxe rejects unknown references and alias cycles, including unused entries in the selected scheme. The built-in default scheme inherits terminal colors; user-defined semantic color values cannot use `inherit`.
 

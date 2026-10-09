@@ -2059,7 +2059,7 @@ fn write_herdr_smoke_config(scenario: HerdrMenuSmoke, config_file: &Path) -> io:
             "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      t: { label: tabs, action: 'menu:open tabs' }\n      u: { label: up, skip-hosts: [herdr], action: 'pane:split direction=up' }\n  tabs:\n    bindings:\n      t: { label: new tab, action: 'tab:create' }\n  foreign:\n    only-hosts: [zellij]\n    bindings:\n      p: { label: unsupported, action: 'pane:create' }\n"
         }
         HerdrMenuSmoke::Navigation => {
-            "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      s: { label: split, action: 'menu:open split' }\n      left: { label: ML, action: 'pane:focus direction=left' }\n      right: { label: MR, action: 'pane:focus direction=right' }\n  split:\n    bindings:\n      left: { label: SL-unavailable, skip-hosts: [herdr], action: 'pane:split direction=left' }\n      right: { label: SR, action: 'pane:split direction=right' }\n"
+            "version: 1\ntheme: brackets\ncolor-scheme: catppuccin-mocha\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      s: { label: split, action: 'menu:open split' }\n      left: { label: ML, action: 'pane:focus direction=left' }\n      right: { label: MR, action: 'pane:focus direction=right' }\n  split:\n    bindings:\n      left: { label: SL-unavailable, skip-hosts: [herdr], action: 'pane:split direction=left' }\n      right: { label: SR, action: 'pane:split direction=right' }\n"
         }
     };
     std::fs::write(config_file, yaml)
