@@ -37,6 +37,13 @@ use tokio::{
     task::JoinHandle,
 };
 
+fn control_error(diagnostic: String) -> ControlResult {
+    ControlResult::Error {
+        diagnostic,
+        prepare_refusal: None,
+    }
+}
+
 /// Activation state supplied by the executable that owns this broker process.
 ///
 /// An old broker starts [`ActivationBootstrap::Running`]. A target broker cannot bind until the
@@ -516,18 +523,17 @@ impl ActivationController {
                 ) || self.bridge_unit.is_none()
                 {
                     return (
-                        ControlResult::Error {
-                            diagnostic:
-                                "as-of readiness requires the exact gated Zellij target handoff"
-                                    .to_owned(),
-                        },
+                        control_error(
+                            "as-of readiness requires the exact gated Zellij target handoff"
+                                .to_owned(),
+                        ),
                         false,
                     );
                 }
                 (
                     match self.status_with(broker, Some((as_of, epoch))).await {
                         Ok(status) => ControlResult::StatusAt(status),
-                        Err(diagnostic) => ControlResult::Error { diagnostic },
+                        Err(diagnostic) => control_error(diagnostic),
                     },
                     false,
                 )
@@ -547,22 +553,16 @@ impl ActivationController {
                             | ActivationState::Retired
                     ) {
                         return (
-                            ControlResult::Error {
-                                diagnostic: "retire is invalid while activation is in progress"
-                                    .to_owned(),
-                            },
+                            control_error(
+                                "retire is invalid while activation is in progress".to_owned(),
+                            ),
                             false,
                         );
                     }
                     *state = ActivationState::Retired;
                 }
                 if let Err(error) = broker.drain_for_activation().await {
-                    return (
-                        ControlResult::Error {
-                            diagnostic: format!("could not drain broker-owned UI state: {error}"),
-                        },
-                        false,
-                    );
+                    return (control_error(error.to_string()), false);
                 }
                 (
                     self.status_result(broker, ControlResult::Retired).await,
@@ -582,14 +582,16 @@ impl ActivationController {
         if target_role {
             let status = match self.status(broker).await {
                 Ok(status) => status,
-                Err(diagnostic) => return (ControlResult::Error { diagnostic }, false),
+                Err(diagnostic) => {
+                    return (control_error(diagnostic), false);
+                }
             };
             let authorization = match self.recovery.lock().await.clone() {
                 Some(recovery) => recovery.authorize_target_commit(&handoff_id, &status).await,
                 None => Err("target Commit lacks owner journal authorization".to_owned()),
             };
             if let Err(diagnostic) = authorization {
-                return (ControlResult::Error { diagnostic }, false);
+                return (control_error(diagnostic), false);
             }
         }
         let state = self.state.lock().await.clone();
@@ -597,14 +599,16 @@ impl ActivationController {
             ActivationState::Draining { handoff, .. } if handoff == handoff_id => {
                 let status = match self.status(broker).await {
                     Ok(status) => status,
-                    Err(diagnostic) => return (ControlResult::Error { diagnostic }, false),
+                    Err(diagnostic) => {
+                        return (control_error(diagnostic), false);
+                    }
                 };
                 let authorization = match self.recovery.lock().await.clone() {
                     Some(recovery) => recovery.authorize_old_commit(&handoff_id, &status).await,
                     None => Err("old Commit lacks owner journal authorization".to_owned()),
                 };
                 if let Err(diagnostic) = authorization {
-                    return (ControlResult::Error { diagnostic }, false);
+                    return (control_error(diagnostic), false);
                 }
                 (ControlResult::Committed(status), true)
             }
@@ -621,11 +625,9 @@ impl ActivationController {
                     Some(OldRetirementProof {
                         handoff: current,
                         outcome: Err(diagnostic),
-                    }) if current == handoff => (ControlResult::Error { diagnostic }, false),
+                    }) if current == handoff => (control_error(diagnostic), false),
                     _ => (
-                        ControlResult::Error {
-                            diagnostic: "old retirement lacks a completed stop proof".to_owned(),
-                        },
+                        control_error("Muxe has no recorded confirmation that the old broker finished stopping for this handoff".to_owned()),
                         false,
                     ),
                 }
@@ -642,9 +644,7 @@ impl ActivationController {
                 false,
             ),
             _ => (
-                ControlResult::Error {
-                    diagnostic: "commit handoff does not match the prepared activation".to_owned(),
-                },
+                control_error("commit handoff does not match the prepared activation".to_owned()),
                 false,
             ),
         }
@@ -662,7 +662,7 @@ impl ActivationController {
         let state = self.state.lock().await.clone();
         if let ActivationState::SupervisorOnly { handoff: current } = state {
             if current != handoff {
-                return Err("old retirement handoff differs from completed stop".to_owned());
+                return Err("The requested handoff ID does not match the handoff for which the old broker confirmed it stopped".to_owned());
             }
             let proof = self
                 .old_retirement
@@ -670,7 +670,7 @@ impl ActivationController {
                 .await
                 .clone()
                 .filter(|recorded| recorded.handoff == handoff)
-                .ok_or_else(|| "old retirement lacks completed stop proof".to_owned())?;
+                .ok_or_else(|| "Muxe has no recorded confirmation that the old broker finished stopping for this handoff".to_owned())?;
             return Ok((None, proof.outcome));
         }
         if !matches!(
@@ -740,9 +740,9 @@ impl ActivationController {
             *self.state.lock().await = ActivationState::Running;
             broker.reopen_dispatch().await;
             return (
-                ControlResult::Error {
-                    diagnostic: format!("host adapter cannot suspend for activation: {error}"),
-                },
+                control_error(format!(
+                    "host adapter cannot suspend for activation: {error}"
+                )),
                 false,
             );
         }
@@ -765,7 +765,7 @@ impl ActivationController {
                 );
             }
         }
-        (ControlResult::Error { diagnostic }, false)
+        (control_error(diagnostic), false)
     }
 
     async fn handle_listener_drain_failure(
@@ -790,7 +790,7 @@ impl ActivationController {
                 "; host restore also failed, adapter remains unhealthy: {restore}"
             );
         }
-        (ControlResult::Error { diagnostic }, false)
+        (control_error(diagnostic), false)
     }
 
     /// Runs the old-broker Prepare transition: UI drain, host suspend, listener
@@ -810,15 +810,18 @@ impl ActivationController {
                 );
             }
             PrepareAdmission::Reject(diagnostic) => {
-                return (ControlResult::Error { diagnostic }, false);
+                return (control_error(diagnostic), false);
             }
             PrepareAdmission::Begin => {}
         }
         if let Err(error) = broker.drain_for_activation().await {
+            let prepare_refusal = matches!(&error, BrokerError::ActivationDrainRefused(_))
+                .then_some(muxe_protocol::control::PrepareRefusalEvidence::NoHostMutation);
             *self.state.lock().await = ActivationState::Running;
             return (
                 ControlResult::Error {
-                    diagnostic: format!("could not drain broker-owned UI state: {error}"),
+                    diagnostic: error.to_string(),
+                    prepare_refusal,
                 },
                 false,
             );
@@ -872,10 +875,9 @@ impl ActivationController {
                 ActivationState::Retired => AbortPlan::Stop,
                 _ => {
                     return (
-                        ControlResult::Error {
-                            diagnostic: "abort handoff does not match the prepared activation"
-                                .to_owned(),
-                        },
+                        control_error(
+                            "abort handoff does not match the prepared activation".to_owned(),
+                        ),
                         false,
                     );
                 }
@@ -896,11 +898,9 @@ impl ActivationController {
                 // live, so the adapter resume is skipped then.
                 if host_suspended && let Err(error) = broker.resume_host_after_abort().await {
                     return (
-                        ControlResult::Error {
-                            diagnostic: format!(
-                                "could not resume host subscription after activation abort: {error}; old endpoint remains drained"
-                            ),
-                        },
+                        control_error(format!(
+                            "could not resume host subscription after activation abort: {error}; old endpoint remains drained"
+                        )),
                         false,
                     );
                 }
@@ -911,11 +911,9 @@ impl ActivationController {
                         host_suspended: false,
                     };
                     return (
-                        ControlResult::Error {
-                            diagnostic: format!(
-                                "could not rebind old broker listener after activation abort: {error}; old endpoint remains drained"
-                            ),
-                        },
+                        control_error(format!(
+                            "could not rebind old broker listener after activation abort: {error}; old endpoint remains drained"
+                        )),
                         false,
                     );
                 }
@@ -939,7 +937,7 @@ impl ActivationController {
     ) -> ControlResult {
         match self.status(broker).await {
             Ok(status) => result(status),
-            Err(diagnostic) => ControlResult::Error { diagnostic },
+            Err(diagnostic) => control_error(diagnostic),
         }
     }
 
@@ -2049,12 +2047,12 @@ async fn serve_activation_connection_inner(
                         }
                         Ok((ticket, Err(diagnostic))) => {
                             tracing::warn!(%diagnostic, "old broker post-stop proof failed");
-                            result = ControlResult::Error { diagnostic };
+                            result = control_error(diagnostic);
                             ticket
                         }
                         Err(diagnostic) => {
                             tracing::warn!(%diagnostic, "old broker retirement barrier failed");
-                            result = ControlResult::Error { diagnostic };
+                            result = control_error(diagnostic);
                             None
                         }
                     }
@@ -4050,13 +4048,13 @@ mod tests {
             )
             .await;
         assert!(!stop, "a failed prepare never stops the old broker service");
-        let ControlResult::Error { diagnostic } = result else {
+        let ControlResult::Error {
+            prepare_refusal: None,
+            ..
+        } = result
+        else {
             panic!("prepare with an unsuspendable host must fail closed, got {result:?}");
         };
-        assert!(
-            diagnostic.contains("cannot suspend"),
-            "the error names the unsupported suspend, got {diagnostic:?}"
-        );
         assert_eq!(
             adapter.calls(),
             vec!["suspend".to_owned()],
@@ -4116,7 +4114,7 @@ mod tests {
             )
             .await;
         assert!(!stop, "a failed abort never stops the old broker service");
-        let ControlResult::Error { diagnostic } = result else {
+        let ControlResult::Error { diagnostic, .. } = result else {
             panic!("abort with a lost host must not claim rollback, got {result:?}");
         };
         assert!(

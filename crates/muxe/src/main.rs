@@ -500,6 +500,50 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
             muxe::lifecycle::UnitOutcome::RolledBack { unit, reason } => {
                 println!("rolled back {unit}: {reason}");
             }
+            muxe::lifecycle::UnitOutcome::NotApplied { unit, reason } => {
+                println!("Muxe could not activate {unit}.\n{reason}");
+                println!("No activation changes were applied to this unit.");
+            }
+            muxe::lifecycle::UnitOutcome::PrepareRefused {
+                member,
+                reason,
+                evidence,
+                restored_members,
+                restored_bridge,
+                rollback_diagnostics,
+                ..
+            } => {
+                println!("Muxe could not activate {}.\n{reason}", member.as_str());
+                if evidence == &Some(muxe_protocol::control::PrepareRefusalEvidence::NoHostMutation)
+                {
+                    println!("Prepare was refused before it applied any changes to this host.");
+                } else {
+                    println!(
+                        "The existing broker is active. Muxe cannot confirm whether Prepare made earlier changes to this host."
+                    );
+                }
+                if *restored_bridge {
+                    println!(
+                        "The prior bridge was restored and reloaded across all participating sessions."
+                    );
+                }
+                for restored in restored_members {
+                    println!("Prior host state restored for {}.", restored.as_str());
+                }
+                for diagnostic in rollback_diagnostics {
+                    println!("Rollback error: {diagnostic}");
+                }
+            }
+            muxe::lifecycle::UnitOutcome::RollbackFailed {
+                unit,
+                reason,
+                diagnostics,
+            } => {
+                println!("Muxe could not activate {unit}.\n{reason}");
+                for diagnostic in diagnostics {
+                    println!("Rollback error: {diagnostic}");
+                }
+            }
             muxe::lifecycle::UnitOutcome::Failed { unit, reason } => {
                 println!("failed {unit}: {reason}");
             }
@@ -726,6 +770,9 @@ fn activation_incomplete(units: &[muxe::lifecycle::UnitOutcome]) -> bool {
             unit,
             muxe::lifecycle::UnitOutcome::Failed { .. }
                 | muxe::lifecycle::UnitOutcome::RolledBack { .. }
+                | muxe::lifecycle::UnitOutcome::NotApplied { .. }
+                | muxe::lifecycle::UnitOutcome::PrepareRefused { .. }
+                | muxe::lifecycle::UnitOutcome::RollbackFailed { .. }
         )
     })
 }
@@ -1864,7 +1911,7 @@ impl JournalRecovery {
             || (status.lifecycle == muxe_protocol::control::LifecycleState::SupervisorOnly
                 && status.target.is_some())
         {
-            return Err("old retirement lacks exact Ready and draining handoff".to_owned());
+            return Err("Muxe cannot confirm the old broker's activation phase and readiness for this handoff, so it cannot safely stop that broker".to_owned());
         }
         let mut entries = journal.old_registry.iter().filter(|entry| {
             entry.socket == member.endpoint().as_path()
@@ -1872,7 +1919,7 @@ impl JournalRecovery {
         });
         let row = entries
             .next()
-            .ok_or_else(|| "old retirement lacks recorded broker incarnation".to_owned())?;
+            .ok_or_else(|| "The activation journal has no recorded identity for the old broker that Muxe was asked to stop".to_owned())?;
         if entries.next().is_some()
             || row.server_pid != std::process::id()
             || row.registration_id != self.registration_id
@@ -1883,7 +1930,7 @@ impl JournalRecovery {
             || row.bridge_identity != self.bridge_identity
             || row.bridge_member != self.bridge_member
         {
-            return Err("old retirement differs from recorded broker incarnation".to_owned());
+            return Err("The broker that Muxe was asked to stop does not match the old broker identity recorded in the activation journal".to_owned());
         }
         Ok(())
     }
@@ -2451,9 +2498,11 @@ async fn commit_herdr_ui_pane(
         .await;
     let registration_error = match registration {
         Ok(muxe_protocol::BrokerResponse::PendingPaneRegistered) => None,
-        Ok(muxe_protocol::BrokerResponse::Error(diagnostic)) => {
-            Some(format!("broker rejected pane registration: {diagnostic:?}"))
-        }
+        Ok(muxe_protocol::BrokerResponse::Error(diagnostic)) => Some(format!(
+            "The broker rejected registration of the UI pane: {}\nDiagnostic code: {}",
+            diagnostic.message,
+            diagnostic.code.as_str()
+        )),
         Ok(response) => Some(format!(
             "broker returned unexpected pane-registration response: {response:?}"
         )),
@@ -2465,7 +2514,7 @@ async fn commit_herdr_ui_pane(
         return Err(match cleanup {
             Ok(()) => color_eyre::eyre::eyre!("{error}"),
             Err(cleanup_error) => color_eyre::eyre::eyre!(
-                "{error}; closing the temporary tab also failed: {cleanup_error}"
+                "{error}\nCleanup error: closing the temporary tab failed: {cleanup_error}"
             ),
         });
     }
@@ -2487,7 +2536,9 @@ async fn commit_herdr_ui_pane(
         muxe_protocol::BrokerResponse::Acknowledged => {}
         muxe_protocol::BrokerResponse::Error(diagnostic) => {
             return Err(color_eyre::eyre::eyre!(
-                "broker rejected the placed UI pane commit: {diagnostic:?}"
+                "The broker rejected the UI pane commit: {}\nDiagnostic code: {}",
+                diagnostic.message,
+                diagnostic.code.as_str()
             ));
         }
         response => {
@@ -3459,6 +3510,40 @@ mod tests {
                 reason: "spawn refused".to_owned(),
             },
         ]));
+        for incomplete in [
+            Outcome::NotApplied {
+                unit: "refused".to_owned(),
+                reason: "fixture failure".to_owned(),
+            },
+            Outcome::PrepareRefused {
+                unit: "refused".to_owned(),
+                member: muxe::lifecycle::journal::ActivationMemberId::new("refused".to_owned())
+                    .unwrap(),
+                reason: "fixture failure".to_owned(),
+                evidence: None,
+                restored_members: Vec::new(),
+                restored_bridge: false,
+                rollback_diagnostics: Vec::new(),
+            },
+            Outcome::RollbackFailed {
+                unit: "refused".to_owned(),
+                reason: "fixture failure".to_owned(),
+                diagnostics: vec!["cleanup failed".to_owned()],
+            },
+        ] {
+            let units = [
+                Outcome::Committed {
+                    unit: "committed".to_owned(),
+                },
+                Outcome::Unchanged {
+                    unit: "unchanged".to_owned(),
+                },
+                incomplete,
+            ];
+            assert!(activation_incomplete(&units));
+            assert!(matches!(units[0], Outcome::Committed { .. }));
+            assert!(matches!(units[1], Outcome::Unchanged { .. }));
+        }
     }
     #[tokio::test]
     async fn journal_recovery_only_reports_no_journal_for_exact_not_found() {

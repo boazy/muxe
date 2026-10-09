@@ -531,7 +531,21 @@ pub enum ControlResult {
     Committed(ActivationStatus),
     Aborted(ActivationStatus),
     Retired(ActivationStatus),
-    Error { diagnostic: String },
+    Error {
+        diagnostic: String,
+        /// Present only when Prepare was refused before any host-state mutation.
+        /// Missing evidence from older brokers does not imply an untouched host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepare_refusal: Option<PrepareRefusalEvidence>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrepareRefusalEvidence {
+    /// The broker's unfinished-execution guard refused admission before
+    /// dismissing UI state, suspending the adapter, or releasing its listener.
+    NoHostMutation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,7 +607,7 @@ impl ControlResponse {
             | ControlResult::Committed(status)
             | ControlResult::Aborted(status)
             | ControlResult::Retired(status) => status.validate(),
-            ControlResult::Error { diagnostic } => {
+            ControlResult::Error { diagnostic, .. } => {
                 if diagnostic.len() > MAX_CONTROL_DIAGNOSTIC_LEN {
                     return Err(ControlSemanticError::DiagnosticTooLong(diagnostic.len()));
                 }
@@ -1051,6 +1065,7 @@ mod tests {
             request_id: ControlRequestId([1; 16]),
             result: ControlResult::Error {
                 diagnostic: "no".into(),
+                prepare_refusal: None,
             },
         });
         let response_for_broker = frame(PeerRole::ActivationCoordinator, &response);
@@ -1060,6 +1075,37 @@ mod tests {
                 ControlSemanticError::WrongDirection
             ))
         ));
+    }
+
+    #[test]
+    fn prepare_refusal_evidence_is_additive_and_absence_is_unknown() {
+        let legacy = serde_json::json!({"state": "error", "diagnostic": "refused"});
+        let result: ControlResult = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            result,
+            ControlResult::Error {
+                prepare_refusal: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&result).unwrap(), legacy);
+        let attested = serde_json::json!({
+            "state": "error", "diagnostic": "refused",
+            "prepare_refusal": "no_host_mutation",
+        });
+        assert!(matches!(
+            serde_json::from_value::<ControlResult>(attested).unwrap(),
+            ControlResult::Error {
+                prepare_refusal: Some(PrepareRefusalEvidence::NoHostMutation),
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_value::<ControlResult>(serde_json::json!({
+                "state": "error", "diagnostic": "refused", "prepare_refusal": "unknown_evidence",
+            }))
+            .is_err()
+        );
     }
 
     #[test]

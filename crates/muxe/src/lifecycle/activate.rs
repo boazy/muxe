@@ -28,9 +28,10 @@
 //! targets that already self-committed simply acknowledge); anything else
 //! restores the complete recorded old unit: targets are shut down over the
 //! wire, the verified bridge backup is restored and reloaded in every
-//! recorded session, and then old brokers resume. Rollback reports the
-//! original failure plus every rollback failure; the journal is preserved on
-//! any ambiguity.
+//! recorded session, and then old brokers resume. Outcomes distinguish a
+//! broker's explicit refusal before host mutation from confirmed restoration.
+//! The original failure and additional rollback failures remain separate;
+//! ambiguity preserves the journal.
 //!
 //! Split of responsibilities: the broker owns drain, supervision, and
 //! control-protocol serving (including the target-shutdown and old-reacquire
@@ -188,9 +189,7 @@ pub trait ControlSession {
         _epoch: UnitReadinessEpochId,
         _as_of: AsOfTick,
     ) -> Result<ActivationStatus, ControlError> {
-        Err(ControlError::Rejected {
-            diagnostic: "peer does not support an as-of readiness proof".to_owned(),
-        })
+        Err(ControlError::UnsupportedStatusAt)
     }
     async fn prepare(
         &mut self,
@@ -1548,9 +1547,33 @@ pub enum UnitOutcome {
     Unchanged {
         unit: String,
     },
+    /// Activation stopped before applying any changes to the selected hosts.
+    /// Transaction artifacts may still have required cleanup.
+    NotApplied {
+        unit: String,
+        reason: String,
+    },
+    /// Prepare did not complete; the old broker is confirmed active again.
+    /// Only explicit broker evidence establishes that no host mutation occurred.
+    /// Earlier members' confirmed restorations are reported separately.
+    PrepareRefused {
+        unit: String,
+        member: ActivationMemberId,
+        reason: String,
+        evidence: Option<muxe_protocol::control::PrepareRefusalEvidence>,
+        restored_members: Vec<ActivationMemberId>,
+        restored_bridge: bool,
+        rollback_diagnostics: Vec<String>,
+    },
     RolledBack {
         unit: String,
         reason: String,
+    },
+    /// The original activation failure and separate rollback failures.
+    RollbackFailed {
+        unit: String,
+        reason: String,
+        diagnostics: Vec<String>,
     },
     Failed {
         unit: String,
@@ -2057,7 +2080,10 @@ struct PreparedAuthority {
 }
 
 enum PrepareFailure {
-    Refused(String),
+    Refused {
+        reason: String,
+        evidence: Option<muxe_protocol::control::PrepareRefusalEvidence>,
+    },
     Ambiguous(String),
 }
 
@@ -2213,7 +2239,7 @@ where
             reason.clone(),
         )
         .await;
-        return Ok(rollback_outcome(label, reason, &diagnostics));
+        return Ok(rollback_outcome(label, reason, &journal, diagnostics));
     }
 
     let mut prepared = Vec::with_capacity(entries.len());
@@ -2236,7 +2262,7 @@ where
                 reason.clone(),
             )
             .await;
-            return Ok(rollback_outcome(label, reason, &diagnostics));
+            return Ok(rollback_outcome(label, reason, &journal, diagnostics));
         }
         let handoff = journal.members()[member_index].handoff_id();
         let old_record = journal.members()[member_index].old_record.clone();
@@ -2256,10 +2282,11 @@ where
                         reason.clone(),
                     )
                     .await;
-                    return Ok(rollback_outcome(label, reason, &diagnostics));
+                    return Ok(rollback_outcome(label, reason, &journal, diagnostics));
                 }
             }
-            Err(PrepareFailure::Refused(reason)) => {
+            Err(PrepareFailure::Refused { reason, evidence }) => {
+                let member = journal.members()[member_index].member().clone();
                 let diagnostics = rollback_transaction(
                     inputs,
                     unit,
@@ -2270,17 +2297,14 @@ where
                     reason.clone(),
                 )
                 .await;
-                return Ok(if diagnostics.is_empty() {
-                    UnitOutcome::RolledBack {
-                        unit: label,
-                        reason,
-                    }
-                } else {
-                    UnitOutcome::Failed {
-                        unit: label,
-                        reason: with_rollback(reason, &diagnostics),
-                    }
-                });
+                return Ok(prepare_refusal_outcome(
+                    label,
+                    member,
+                    reason,
+                    evidence,
+                    &journal,
+                    diagnostics,
+                ));
             }
             Err(PrepareFailure::Ambiguous(reason)) => {
                 return Ok(UnitOutcome::Failed {
@@ -2308,7 +2332,7 @@ where
             reason.clone(),
         )
         .await;
-        return Ok(rollback_outcome(label, reason, &diagnostics));
+        return Ok(rollback_outcome(label, reason, &journal, diagnostics));
     }
 
     let mut targets = Vec::with_capacity(prepared.len());
@@ -2331,7 +2355,7 @@ where
                 reason.clone(),
             )
             .await;
-            return Ok(rollback_outcome(label, reason, &diagnostics));
+            return Ok(rollback_outcome(label, reason, &journal, diagnostics));
         }
         let record = &journal.members()[index];
         if member.entry.discovery_key().as_str() != record.member().as_str()
@@ -2364,7 +2388,7 @@ where
                     reason.clone(),
                 )
                 .await;
-                return Ok(rollback_outcome(label, reason, &diagnostics));
+                return Ok(rollback_outcome(label, reason, &journal, diagnostics));
             }
         };
         match inputs.spawner.spawn_target(&SpawnRequest { program, args }) {
@@ -2386,7 +2410,7 @@ where
                         reason.clone(),
                     )
                     .await;
-                    return Ok(rollback_outcome(label, reason, &diagnostics));
+                    return Ok(rollback_outcome(label, reason, &journal, diagnostics));
                 }
             }
             Err(error) => {
@@ -2401,7 +2425,7 @@ where
                     reason.clone(),
                 )
                 .await;
-                return Ok(rollback_outcome(label, reason, &diagnostics));
+                return Ok(rollback_outcome(label, reason, &journal, diagnostics));
             }
         }
     }
@@ -2459,7 +2483,7 @@ where
             reason.clone(),
         )
         .await;
-        return Ok(rollback_outcome(label, reason, &diagnostics));
+        return Ok(rollback_outcome(label, reason, &journal, diagnostics));
     }
     let proof_deadline = Instant::now() + inputs.readiness_deadline;
     let readiness_guard = match host.readiness_guard(inputs.cache_dir, proof_deadline).await {
@@ -2476,7 +2500,7 @@ where
                 reason.clone(),
             )
             .await;
-            return Ok(rollback_outcome(label, reason, &diagnostics));
+            return Ok(rollback_outcome(label, reason, &journal, diagnostics));
         }
     };
     let proof_result = async {
@@ -2514,7 +2538,7 @@ where
                 reason.clone(),
             )
             .await;
-            return Ok(rollback_outcome(label, reason, &diagnostics));
+            return Ok(rollback_outcome(label, reason, &journal, diagnostics));
         }
     };
     // The certificate states a historical broker epoch. The gate may release
@@ -2538,7 +2562,7 @@ where
             reason.clone(),
         )
         .await;
-        return Ok(rollback_outcome(label, reason, &diagnostics));
+        return Ok(rollback_outcome(label, reason, &journal, diagnostics));
     }
     inputs.hooks.check(ActivateStep::ReadinessRecorded)?;
 
@@ -2682,10 +2706,18 @@ where
                     && status.lifecycle == LifecycleState::Running
                     && status.handoff_id.is_none() =>
             {
-                return Err(PrepareFailure::Refused(format!(
-                    "prepare refused for {} without mutation: {error}",
-                    entry.discovery_key()
-                )));
+                let evidence = match &error {
+                    ControlError::Rejected {
+                        operation: "Prepare",
+                        prepare_refusal,
+                        ..
+                    } => *prepare_refusal,
+                    _ => None,
+                };
+                return Err(PrepareFailure::Refused {
+                    reason: error.to_string(),
+                    evidence,
+                });
             }
             Ok(status)
                 if host.attests_entry(&status, entry)
@@ -3181,16 +3213,6 @@ fn persist_ready_decision(
                 })
             }
         }
-    }
-}
-
-/// Combines the triggering failure with every rollback diagnostic. Rollback
-/// failures never replace the original error; they extend it.
-fn with_rollback(reason: String, diagnostics: &[String]) -> String {
-    if diagnostics.is_empty() {
-        reason
-    } else {
-        format!("{reason}; rollback: {}", diagnostics.join("; "))
     }
 }
 
@@ -4085,14 +4107,55 @@ where
     diagnostics
 }
 
-fn rollback_outcome(unit: String, reason: String, diagnostics: &[String]) -> UnitOutcome {
-    if diagnostics.is_empty() {
+fn prepare_refusal_outcome(
+    unit: String,
+    member: ActivationMemberId,
+    reason: String,
+    evidence: Option<muxe_protocol::control::PrepareRefusalEvidence>,
+    journal: &ActivationJournal,
+    rollback_diagnostics: Vec<String>,
+) -> UnitOutcome {
+    UnitOutcome::PrepareRefused {
+        unit,
+        reason,
+        evidence,
+        restored_bridge: journal.bridge().is_some_and(|bridge| {
+            matches!(&bridge.progress, BridgeProgress::Restored { reloaded } if !reloaded.is_empty())
+        }),
+        restored_members: journal
+            .members()
+            .iter()
+            .filter(|record| record.old == OldMemberProgress::Resumed && record.member() != &member)
+            .map(|record| record.member().clone())
+            .collect(),
+        member,
+        rollback_diagnostics,
+    }
+}
+
+fn rollback_outcome(
+    unit: String,
+    reason: String,
+    journal: &ActivationJournal,
+    diagnostics: Vec<String>,
+) -> UnitOutcome {
+    if !diagnostics.is_empty() {
+        UnitOutcome::RollbackFailed {
+            unit,
+            reason,
+            diagnostics,
+        }
+    } else if journal
+        .members()
+        .iter()
+        .any(|member| member.old == OldMemberProgress::Resumed)
+        || journal.bridge().is_some_and(|bridge| {
+            matches!(&bridge.progress, BridgeProgress::Restored { reloaded } if !reloaded.is_empty())
+        })
+    {
         UnitOutcome::RolledBack { unit, reason }
     } else {
-        UnitOutcome::Failed {
-            unit,
-            reason: with_rollback(reason, diagnostics),
-        }
+        UnitOutcome::NotApplied { unit, reason }
     }
 }
 /// Restores exact prior Zellij registry rows under journal authority.
@@ -5078,6 +5141,7 @@ mod tests {
     struct BrokerScript {
         current: CompatibilityRecord,
         prepare_refusals: usize,
+        abort_refusals: usize,
         supports_supplied_handoff: bool,
         host: HostKind,
         bridge_unit: Option<muxe_protocol::BridgeUnitId>,
@@ -5154,6 +5218,7 @@ mod tests {
                         ControlOperation::StatusAt { .. } => ControlResult::Error {
                             diagnostic: "old fixture broker cannot attest target readiness"
                                 .to_owned(),
+                            prepare_refusal: None,
                         },
                         ControlOperation::Status => {
                             let mut status = script.status(
@@ -5184,6 +5249,7 @@ mod tests {
                                     .push("prepare-refused".to_owned());
                                 ControlResult::Error {
                                     diagnostic: "prepare refused: non-cancellable work".to_owned(),
+                                    prepare_refusal: None,
                                 }
                             } else {
                                 let handoff = handoff_id;
@@ -5221,11 +5287,18 @@ mod tests {
                             } else {
                                 ControlResult::Error {
                                     diagnostic: "handoff mismatch".to_owned(),
+                                    prepare_refusal: None,
                                 }
                             }
                         }
                         ControlOperation::Abort { handoff_id } => {
-                            if Some(handoff_id) == prepared_handoff {
+                            if script.abort_refusals != 0 {
+                                script.abort_refusals -= 1;
+                                ControlResult::Error {
+                                    diagnostic: "fixture abort refusal".to_owned(),
+                                    prepare_refusal: None,
+                                }
+                            } else if Some(handoff_id) == prepared_handoff {
                                 prepared_handoff = None;
                                 events
                                     .lock()
@@ -5240,6 +5313,7 @@ mod tests {
                             } else {
                                 ControlResult::Error {
                                     diagnostic: "handoff mismatch".to_owned(),
+                                    prepare_refusal: None,
                                 }
                             }
                         }
@@ -5515,6 +5589,7 @@ mod tests {
         BrokerScript {
             current: old_record(),
             prepare_refusals: 0,
+            abort_refusals: 0,
             supports_supplied_handoff: true,
             host: HostKind::Herdr,
             bridge_unit: None,
@@ -6019,9 +6094,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_refusal_cleans_up_rollback_journal() {
+    async fn legacy_prepare_error_and_running_status_do_not_prove_no_host_mutation() {
         let fixture = Fixture::new();
-        let (_socket, old) = fixture
+        let (socket, old) = fixture
             .old_broker(
                 "server",
                 BrokerScript {
@@ -6031,11 +6106,34 @@ mod tests {
             )
             .await;
         let first = Box::pin(activate(fixture.herdr_inputs())).await.unwrap();
-        assert!(matches!(first.units[0], UnitOutcome::RolledBack { .. }));
+        assert!(matches!(
+            &first.units[0],
+            UnitOutcome::PrepareRefused {
+                member,
+                evidence: None,
+                restored_bridge: false,
+                restored_members,
+                rollback_diagnostics,
+                ..
+            } if member.as_str() == "server"
+                && restored_members.is_empty()
+                && rollback_diagnostics.is_empty()
+        ));
         assert!(
             journal::list_journals(&fixture.cache).unwrap().is_empty(),
             "definite refusal reaches durable rollback cleanup"
         );
+        let status = fixture
+            .control
+            .connect(&socket)
+            .await
+            .unwrap()
+            .status()
+            .await
+            .unwrap();
+        assert_eq!(status.lifecycle, LifecycleState::Running);
+        assert_eq!(status.current, old_record());
+        assert!(status.handoff_id.is_none());
         let events = fixture
             .events
             .lock()
@@ -6047,7 +6145,134 @@ mod tests {
                 .count(),
             1
         );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event == "prepared" || event == "old-aborted")
+        );
         old.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned producer WASM; run with packaged activation fixtures"]
+    async fn group_prepare_refusal_reports_only_confirmed_restorations() {
+        for abort_refusals in [0, 1] {
+            let fixture = Fixture::new();
+            let stable = integration::stable_bridge_path(&fixture.config);
+            prepare_bridge_directory(&fixture);
+            let old_bytes = previous_producer_wasm_bytes();
+            let target_bytes = producer_wasm_bytes();
+            crate::fsutil::write_atomic(&stable, &old_bytes, "old-stable").unwrap();
+            store_bridge_receipt(&fixture, &stable, Sha256Digest::from_bytes(&old_bytes));
+            let identity = integration::bridge_identity(&fixture.config).unwrap();
+            let receipt_before = integration::receipt::load(identity.directory())
+                .unwrap()
+                .unwrap();
+            let mut entries = Vec::new();
+            let mut peers = Vec::new();
+            for (name, prepare_refusals, abort_refusals) in
+                [("session-a", 0, abort_refusals), ("session-b", 1, 0)]
+            {
+                let (socket, peer) = fixture
+                    .old_broker(
+                        name,
+                        BrokerScript {
+                            prepare_refusals,
+                            abort_refusals,
+                            host: HostKind::Zellij,
+                            bridge_unit: Some(identity.unit()),
+                            ..herdr_script()
+                        },
+                    )
+                    .await;
+                let mut entry = zellij_entry(socket, stable.clone());
+                entry.discovery_key = name.to_owned();
+                entry.bridge_member = Some(BridgeMemberId::new(name.to_owned()).unwrap());
+                entry.live_server = Some(name.to_owned());
+                Registry::open(&fixture.cache)
+                    .unwrap()
+                    .register(entry.clone())
+                    .unwrap();
+                entries.push(entry);
+                peers.push(peer);
+            }
+            let untouched_socket = entries[1].socket.clone();
+            let outcome = activate_unit_with_global_preflight(
+                &zellij_inputs(&fixture, &target_bytes),
+                &test_zellij_unit(stable.clone(), entries),
+            )
+            .await
+            .unwrap();
+            let UnitOutcome::PrepareRefused {
+                member,
+                restored_members,
+                restored_bridge: true,
+                rollback_diagnostics,
+                ..
+            } = outcome
+            else {
+                panic!("refused member must not be described as restored");
+            };
+            assert_eq!(member.as_str(), "session-b");
+            assert_eq!(
+                restored_members
+                    .iter()
+                    .map(ActivationMemberId::as_str)
+                    .collect::<Vec<_>>(),
+                if abort_refusals == 0 {
+                    vec!["session-a"]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert_eq!(rollback_diagnostics.is_empty(), abort_refusals == 0);
+            let status = fixture
+                .control
+                .connect(&untouched_socket)
+                .await
+                .unwrap()
+                .status()
+                .await
+                .unwrap();
+            assert_eq!(status.lifecycle, LifecycleState::Running);
+            assert_eq!(status.current, old_record());
+            assert!(status.handoff_id.is_none());
+            assert_eq!(std::fs::read(&stable).unwrap(), old_bytes);
+            let mut expected_receipt = receipt_before;
+            expected_receipt.bridge.previous_digest = Some(Sha256Digest::from_bytes(&target_bytes));
+            assert_eq!(
+                integration::receipt::load(identity.directory())
+                    .unwrap()
+                    .unwrap(),
+                expected_receipt
+            );
+            assert_group_refusal_recovery_journal(&fixture.cache, abort_refusals);
+            for peer in peers {
+                peer.abort();
+            }
+        }
+    }
+
+    fn assert_group_refusal_recovery_journal(cache: &Path, abort_refusals: usize) {
+        let journals = journal::list_journals(cache).unwrap();
+        if abort_refusals == 0 {
+            assert!(journals.is_empty());
+        } else {
+            let persisted = journals[0].1.as_ref().unwrap();
+            assert_eq!(persisted.directive(), TransactionDirective::RollBack);
+            assert!(matches!(
+                persisted.bridge().unwrap().progress,
+                BridgeProgress::Restored { .. }
+            ));
+            assert_eq!(persisted.members()[0].old, OldMemberProgress::ResumeIntent);
+            assert_eq!(persisted.members()[1].old, OldMemberProgress::Pending);
+            assert!(
+                persisted
+                    .members()
+                    .iter()
+                    .all(|member| member.target == TargetMemberProgress::Absent)
+            );
+        }
     }
 
     #[tokio::test]
@@ -6548,6 +6773,7 @@ mod tests {
                                         }
                                         _ => ControlResult::Error {
                                             diagnostic: "unsupported fixture operation".to_owned(),
+                                            prepare_refusal: None,
                                         },
                                     };
                                     pending.push((request.request_id, result));
@@ -6981,14 +7207,14 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct BarrierReloader {
-        attempts: Arc<Mutex<Vec<String>>>,
-        fail_session: Arc<Mutex<Option<String>>>,
+        attempts: Arc<parking_lot::Mutex<Vec<String>>>,
+        fail_session: Arc<parking_lot::Mutex<Option<String>>>,
     }
 
     impl HostReloader for BarrierReloader {
         fn reload_bridge(&self, session: &str, _bridge_url: &str) -> Result<(), ActivateError> {
-            self.attempts.lock().unwrap().push(session.to_owned());
-            if self.fail_session.lock().unwrap().as_deref() == Some(session) {
+            self.attempts.lock().push(session.to_owned());
+            if self.fail_session.lock().as_deref() == Some(session) {
                 return Err(ActivateError::Reload {
                     session: session.to_owned(),
                     detail: "injected old reload failure".to_owned(),
@@ -7330,6 +7556,37 @@ mod tests {
         h21_actor_with_target_count(cache, reloader, 2)
     }
 
+    #[test]
+    fn restored_bridge_still_requires_complete_reload_evidence() {
+        let mut case = h21_bridge_case();
+        case.journal.members_mut()[0].target = TargetMemberProgress::Absent;
+        case.journal.members_mut()[1].target = TargetMemberProgress::Absent;
+        case.journal.bridge_mut().unwrap().progress = BridgeProgress::Restored {
+            reloaded: vec![case.journal.members()[0].id.clone()],
+        };
+        assert!(matches!(
+            case.journal.validate(),
+            Err(JournalError::Inconsistent(_))
+        ));
+    }
+
+    #[test]
+    fn missing_bridge_authority_refuses_journal_validation() {
+        let mut case = h21_bridge_case();
+        let original = case.journal.bridge_identity.take().unwrap();
+        assert!(matches!(
+            case.journal.validate(),
+            Err(JournalError::MissingZellijAuthority)
+        ));
+        case.journal.bridge_identity = Some(original);
+        case.journal.member_census = None;
+        assert!(matches!(
+            case.journal.validate(),
+            Err(JournalError::MissingZellijAuthority)
+        ));
+        assert!(case.journal_path.exists());
+    }
+
     #[tokio::test]
     async fn target_stop_failure_blocks_bridge_reload_and_old_resume_until_retry() {
         let mut case = h21_bridge_case();
@@ -7343,7 +7600,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&case.stable).unwrap(), case.target_bytes);
-        assert!(reloader.attempts.lock().unwrap().is_empty());
+        assert!(reloader.attempts.lock().is_empty());
         assert!(actor.resumes.is_empty());
         let persisted = journal::read_journal(&case.journal_path).unwrap();
         assert_eq!(
@@ -7611,7 +7868,7 @@ mod tests {
     async fn final_reload_failure_blocks_all_old_resumes_and_retry_converges() {
         let mut case = h21_bridge_case();
         let reloader = BarrierReloader::default();
-        *reloader.fail_session.lock().unwrap() = Some("session-b".to_owned());
+        *reloader.fail_session.lock() = Some("session-b".to_owned());
         let mut actor = h21_actor(&case.cache, reloader.clone());
 
         assert!(
@@ -7626,7 +7883,7 @@ mod tests {
             case.target_bytes
         );
         assert_eq!(
-            reloader.attempts.lock().unwrap().as_slice(),
+            reloader.attempts.lock().as_slice(),
             ["session-a", "session-b"]
         );
         assert!(matches!(
@@ -7638,7 +7895,7 @@ mod tests {
             BridgeProgress::OldReloading { .. }
         ));
 
-        *reloader.fail_session.lock().unwrap() = None;
+        *reloader.fail_session.lock() = None;
         assert_eq!(
             drive_rollback(&mut actor, &mut case.journal, &case.journal_path)
                 .await
@@ -7646,7 +7903,7 @@ mod tests {
             RollbackDriveOutcome::Complete
         );
         assert_eq!(
-            reloader.attempts.lock().unwrap().as_slice(),
+            reloader.attempts.lock().as_slice(),
             ["session-a", "session-b", "session-b"]
         );
         assert_eq!(actor.resumes, ["session-a", "session-b"]);
@@ -7671,7 +7928,7 @@ mod tests {
             std::fs::read(&bridge_case.stable).unwrap(),
             bridge_case.old_bytes
         );
-        assert!(bridge_reloader.attempts.lock().unwrap().is_empty());
+        assert!(bridge_reloader.attempts.lock().is_empty());
         assert!(bridge_actor.resumes.is_empty());
         assert!(matches!(
             journal::read_journal(&bridge_case.journal_path)
@@ -7710,7 +7967,7 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(receipt_reloader.attempts.lock().unwrap().is_empty());
+        assert!(receipt_reloader.attempts.lock().is_empty());
         assert!(receipt_actor.resumes.is_empty());
         assert!(matches!(
             journal::read_journal(&receipt_case.journal_path)
@@ -7758,9 +8015,10 @@ mod tests {
             rollback_outcome(
                 "zellij:test".to_owned(),
                 "activation failed".to_owned(),
-                &[error.to_string()],
+                &case.journal,
+                vec![error.to_string()],
             ),
-            UnitOutcome::Failed { .. }
+            UnitOutcome::RollbackFailed { .. }
         ));
 
         actor.resume_failure = None;
@@ -8296,8 +8554,11 @@ mod tests {
             }
             let mut status = self.scripted_status()?;
             if status.handoff_id != Some(*handoff) {
-                return Err(ControlError::Rejected {
-                    diagnostic: "scripted as-of handoff differs".to_owned(),
+                return Err(ControlError::ReadinessProofMismatch {
+                    expected_handoff: *handoff,
+                    actual_handoff: status.handoff_id,
+                    expected_epoch: epoch,
+                    actual_epoch: status.ready.as_ref().and_then(|ready| ready.proof_epoch),
                 });
             }
             let timing = self.control.as_of_expiry.lock().unwrap();
@@ -8313,8 +8574,11 @@ mod tests {
             let ready = status
                 .ready
                 .as_mut()
-                .ok_or_else(|| ControlError::Rejected {
-                    diagnostic: "scripted as-of readiness is absent".to_owned(),
+                .ok_or(ControlError::ReadinessProofMismatch {
+                    expected_handoff: *handoff,
+                    actual_handoff: status.handoff_id,
+                    expected_epoch: epoch,
+                    actual_epoch: None,
                 })?;
             ready.proof_epoch = Some(epoch);
             Ok(status)
@@ -10290,16 +10554,29 @@ mod tests {
                 "old status unavailable".to_owned(),
             )
             .await;
-            let UnitOutcome::Failed { reason, .. } = rollback_outcome(
+            let UnitOutcome::RollbackFailed { diagnostics, .. } = rollback_outcome(
                 "herdr".to_owned(),
                 "old status unavailable".to_owned(),
-                &diagnostics,
+                &journal,
+                diagnostics,
             ) else {
                 panic!("shutdown process failure must fail the unit");
             };
-            assert!(reason.contains(operation), "{reason}");
-            assert!(reason.contains(&format!("{member_id:?}")), "{reason}");
-            assert!(reason.contains(&format!("pid {pid}")), "{reason}");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains(operation))
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains(&format!("{member_id:?}")))
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains(&format!("pid {pid}")))
+            );
             assert_child_reaped(pid);
             assert_eq!(
                 journal::read_journal(&path).unwrap().directive(),

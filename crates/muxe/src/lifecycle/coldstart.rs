@@ -143,7 +143,9 @@ pub enum ColdstartError {
     StartupTimeout,
     #[error("verified endpoint conflicts with registry authority: {0}")]
     EndpointConflict(String),
-    #[error("legacy control Status with a handoff is ambiguous and cannot admit UI")]
+    #[error(
+        "The broker's older Status response includes a handoff ID but does not establish its activation phase. Muxe cannot safely attach the UI"
+    )]
     LegacyActivationAmbiguous,
 }
 

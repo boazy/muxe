@@ -1430,6 +1430,23 @@ pub enum DiagnosticCode {
     ProtocolViolation = 9,
 }
 
+impl DiagnosticCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::LaunchAborted => "launch_aborted",
+            Self::StaleGeneration => "stale_generation",
+            Self::ContextUnavailable => "context_unavailable",
+            Self::ActionBlocked => "action_blocked",
+            Self::ActivationInProgress => "activation_in_progress",
+            Self::HostUnavailable => "host_unavailable",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::ProtocolViolation => "protocol_violation",
+        }
+    }
+}
+
 #[derive(
     Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Clone, Debug, PartialEq, Eq,
 )]

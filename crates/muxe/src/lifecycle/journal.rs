@@ -67,9 +67,17 @@ pub enum JournalError {
     UnsupportedVersion { path: PathBuf, version: u32 },
     #[error("activation journal state is inconsistent: {0}")]
     Inconsistent(String),
-    #[error("cache lifetime is active at {path}")]
+    #[error("Muxe cannot acquire the cache lock while another operation holds it: {}", path.display())]
     CacheActive { path: PathBuf },
-    #[error("Zellij activation journal lacks canonical bridge identity or exact member census")]
+    #[error("Muxe could not acquire the cache lock at {}: {source}", path.display())]
+    CacheLock {
+        path: PathBuf,
+        #[source]
+        source: nix::errno::Errno,
+    },
+    #[error(
+        "The Zellij activation journal is missing the canonical bridge identity or the complete list of participating sessions"
+    )]
     MissingZellijAuthority,
 }
 
@@ -338,16 +346,16 @@ fn acquire_cache_lock(cache_dir: &Path, mode: FlockArg) -> Result<CacheLease, Jo
             path.display()
         ))
     })?;
-    let file = Flock::lock(file, mode).map_err(|(_, error)| match mode {
-        FlockArg::LockExclusiveNonblock | FlockArg::LockExclusive => {
-            JournalError::CacheActive { path: path.clone() }
-        }
-        _ => JournalError::Inconsistent(format!(
-            "cannot acquire cache lifetime lock at {}: {error}",
-            path.display()
-        )),
-    })?;
+    let file = Flock::lock(file, mode).map_err(|(_, error)| cache_lock_error(path, error))?;
     Ok(CacheLease { _file: file })
+}
+
+fn cache_lock_error(path: PathBuf, source: nix::errno::Errno) -> JournalError {
+    if source == nix::errno::Errno::EWOULDBLOCK {
+        JournalError::CacheActive { path }
+    } else {
+        JournalError::CacheLock { path, source }
+    }
 }
 
 fn acquire_lock_path_blocking(path: &Path) -> Result<Flock<fs::File>, JournalError> {
@@ -1640,7 +1648,7 @@ impl ActivationJournal {
                         });
                     if !unmutated && !complete {
                         return Err(JournalError::Inconsistent(
-                            "restored bridge lacks exact reload census coverage".to_owned(),
+                            "The journal's bridge-reload records do not exactly match the full list of participating sessions".to_owned(),
                         ));
                     }
                 }
@@ -1871,7 +1879,7 @@ impl OldRetirementReceiptId {
         });
         let entry = entries.next().ok_or_else(|| {
             JournalError::Inconsistent(
-                "old retirement lacks its recorded broker incarnation".to_owned(),
+                "The journal does not contain the old broker's recorded identity. Muxe cannot verify that it stopped for this handoff".to_owned(),
             )
         })?;
         if entries.next().is_some()
@@ -1882,7 +1890,7 @@ impl OldRetirementReceiptId {
             || entry.live_server.as_deref().is_none_or(str::is_empty)
         {
             return Err(JournalError::Inconsistent(
-                "old retirement has ambiguous or incomplete broker incarnation".to_owned(),
+                "The journal's recorded identity for the old broker is incomplete or matches more than one entry. Muxe cannot verify that it stopped for this handoff".to_owned(),
             ));
         }
         let receipt = OldRetirementReceipt {
@@ -2342,6 +2350,7 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn fixture_record(version: &str) -> CompatibilityRecord {
         CompatibilityRecord {
@@ -2821,6 +2830,51 @@ mod tests {
             cache_lock_path(&first).unwrap(),
             cache_lock_path(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn cache_lock_contention_blocks_purge_and_shared_participants() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = temp.path().join("cache");
+        let shared = acquire_cache_lease(&cache).unwrap();
+        let another_shared = acquire_cache_lease(&cache).unwrap();
+        let expected_path = cache_lock_path(&cache).unwrap();
+        assert!(matches!(
+            acquire_cache_purge_lock(&cache),
+            Err(JournalError::CacheActive { path }) if path == expected_path
+        ));
+        drop(shared);
+        drop(another_shared);
+        let exclusive = acquire_cache_purge_lock(&cache).unwrap();
+        assert!(matches!(
+            acquire_cache_lease(&cache),
+            Err(JournalError::CacheActive { path }) if path == expected_path
+        ));
+        drop(exclusive);
+        assert!(acquire_cache_lease(&cache).is_ok());
+    }
+
+    #[test]
+    fn cache_lock_noncontention_errors_retain_the_os_cause() {
+        let path = PathBuf::from("/cache-lock");
+        for cause in [
+            nix::errno::Errno::EBADF,
+            nix::errno::Errno::ENOLCK,
+            nix::errno::Errno::EINTR,
+        ] {
+            let error = cache_lock_error(path.clone(), cause);
+            assert!(matches!(
+                &error,
+                JournalError::CacheLock { path: actual, source }
+                    if actual == &path && *source == cause
+            ));
+            assert!(std::error::Error::source(&error).is_some());
+        }
+        assert!(matches!(
+            cache_lock_error(path.clone(), nix::errno::Errno::EWOULDBLOCK),
+            JournalError::CacheActive { path: actual } if actual == path
+        ));
     }
 
     #[test]

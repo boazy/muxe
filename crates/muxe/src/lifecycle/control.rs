@@ -8,8 +8,10 @@
 //! connection, so the schema fingerprint field stays zero.
 //!
 //! Request IDs are unique 128-bit nonces; responses must echo the request ID.
-//! A broker `Error` result, an ID mismatch, a malformed frame, or a timeout
-//! fails the operation without any coordinator-side mutation.
+//! Encoding and frame-limit failures occur before any request bytes are sent.
+//! Only a received broker `Error` result is a remote rejection. A response type
+//! mismatch and missing readiness proof are separate failures; neither proves
+//! that the broker left its state unchanged.
 
 use std::{
     fs::{self, File},
@@ -55,12 +57,36 @@ pub enum ControlError {
     Decode(#[from] muxe_protocol::control::ControlDecodeError),
     #[error("broker closed the control connection")]
     Closed,
-    #[error("broker rejected the operation: {diagnostic}")]
-    Rejected { diagnostic: String },
+    #[error("The broker rejected {operation}: {diagnostic}")]
+    Rejected {
+        operation: &'static str,
+        diagnostic: String,
+        prepare_refusal: Option<muxe_protocol::control::PrepareRefusalEvidence>,
+    },
+    #[error("Invalid handoff ID: expected 32 hexadecimal characters")]
+    InvalidHandoffId,
+    #[error("Muxe could not encode the control request. The request was not sent: {0}")]
+    Encode(#[source] serde_json::Error),
+    #[error("The control request exceeds the 64 KiB frame limit. The request was not sent")]
+    RequestTooLarge,
+    #[error("This control peer does not support the required StatusAt readiness proof")]
+    UnsupportedStatusAt,
     #[error("broker response carried a mismatched request ID")]
     IdMismatch,
-    #[error("broker sent an unexpected {0} result")]
-    UnexpectedResult(&'static str),
+    #[error("The broker did not return the expected {expected} response. Received: {actual}")]
+    UnexpectedResult {
+        expected: ControlResultKind,
+        actual: ControlResultKind,
+    },
+    #[error(
+        "The broker's StatusAt response does not contain the requested handoff ID and readiness proof epoch"
+    )]
+    ReadinessProofMismatch {
+        expected_handoff: HandoffId,
+        actual_handoff: Option<HandoffId>,
+        expected_epoch: muxe_protocol::UnitReadinessEpochId,
+        actual_epoch: Option<muxe_protocol::UnitReadinessEpochId>,
+    },
     #[error("control operation timed out")]
     Timeout,
     #[error("broker control peer has wrong UID or lacks a process identity")]
@@ -82,6 +108,73 @@ impl ControlError {
                 if source.kind() == std::io::ErrorKind::NotFound
         )
     }
+}
+
+/// The response variant observed on the control connection, without its payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlResultKind {
+    Status,
+    StatusAt,
+    Prepared,
+    Committed,
+    Aborted,
+    Retired,
+    Error,
+}
+
+impl ControlResultKind {
+    fn of(result: &ControlResult) -> Self {
+        match result {
+            ControlResult::Status(_) => Self::Status,
+            ControlResult::StatusAt(_) => Self::StatusAt,
+            ControlResult::Prepared(_) => Self::Prepared,
+            ControlResult::Committed(_) => Self::Committed,
+            ControlResult::Aborted(_) => Self::Aborted,
+            ControlResult::Retired(_) => Self::Retired,
+            ControlResult::Error { .. } => Self::Error,
+        }
+    }
+
+    fn unexpected(self, result: &ControlResult) -> ControlError {
+        ControlError::UnexpectedResult {
+            expected: self,
+            actual: Self::of(result),
+        }
+    }
+}
+
+impl std::fmt::Display for ControlResultKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Status => "Status",
+            Self::StatusAt => "StatusAt",
+            Self::Prepared => "Prepared",
+            Self::Committed => "Committed",
+            Self::Aborted => "Aborted",
+            Self::Retired => "Retired",
+            Self::Error => "Error",
+        })
+    }
+}
+
+fn operation_name(operation: &ControlOperation) -> &'static str {
+    match operation {
+        ControlOperation::Status => "Status",
+        ControlOperation::StatusAt { .. } => "StatusAt",
+        ControlOperation::Prepare { .. } => "Prepare",
+        ControlOperation::Commit { .. } => "Commit",
+        ControlOperation::Abort { .. } => "Abort",
+        ControlOperation::Retire => "Retire",
+    }
+}
+
+/// Encodes and bounds a request before any bytes are written to the peer.
+fn encode_request(message: &impl serde::Serialize) -> Result<Vec<u8>, ControlError> {
+    let payload = serde_json::to_vec(message).map_err(ControlError::Encode)?;
+    if payload.len() > MAX_CONTROL_FRAME_LEN as usize {
+        return Err(ControlError::RequestTooLarge);
+    }
+    Ok(payload)
 }
 
 /// Generates a unique 128-bit request nonce.
@@ -114,21 +207,15 @@ fn new_request_id(counter: &AtomicU64) -> ControlRequestId {
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::Rejected`] when `hex` is not 32 hexadecimal characters.
+/// Returns [`ControlError::InvalidHandoffId`] when `hex` is not 32 hexadecimal characters.
 pub fn handoff_from_hex(hex: &str) -> Result<HandoffId, ControlError> {
     if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(ControlError::Rejected {
-            diagnostic: "malformed handoff ID".to_owned(),
-        });
+        return Err(ControlError::InvalidHandoffId);
     }
     let mut raw = [0u8; 16];
     for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(chunk).map_err(|_| ControlError::Rejected {
-            diagnostic: "malformed handoff ID".to_owned(),
-        })?;
-        raw[index] = u8::from_str_radix(text, 16).map_err(|_| ControlError::Rejected {
-            diagnostic: "malformed handoff ID".to_owned(),
-        })?;
+        let text = std::str::from_utf8(chunk).map_err(|_| ControlError::InvalidHandoffId)?;
+        raw[index] = u8::from_str_radix(text, 16).map_err(|_| ControlError::InvalidHandoffId)?;
     }
     Ok(HandoffId(raw))
 }
@@ -270,7 +357,7 @@ impl ControlClient {
     pub async fn status(&mut self) -> Result<ActivationStatus, ControlError> {
         match self.round_trip(ControlOperation::Status).await? {
             ControlResult::Status(status) => Ok(status),
-            _ => Err(ControlError::UnexpectedResult("non-status")),
+            result => Err(ControlResultKind::Status.unexpected(&result)),
         }
     }
 
@@ -316,9 +403,13 @@ impl ControlClient {
             {
                 Ok(status)
             }
-            _ => Err(ControlError::UnexpectedResult(
-                "missing exact as-of readiness proof",
-            )),
+            ControlResult::StatusAt(status) => Err(ControlError::ReadinessProofMismatch {
+                expected_handoff: handoff_id,
+                actual_handoff: status.handoff_id,
+                expected_epoch: epoch,
+                actual_epoch: status.ready.and_then(|ready| ready.proof_epoch),
+            }),
+            result => Err(ControlResultKind::StatusAt.unexpected(&result)),
         }
     }
 
@@ -340,7 +431,7 @@ impl ControlClient {
             .await?
         {
             ControlResult::Prepared(status) => Ok(status),
-            _ => Err(ControlError::UnexpectedResult("non-prepared")),
+            result => Err(ControlResultKind::Prepared.unexpected(&result)),
         }
     }
 
@@ -358,7 +449,7 @@ impl ControlClient {
             .await?
         {
             ControlResult::Committed(status) => Ok(status),
-            _ => Err(ControlError::UnexpectedResult("non-committed")),
+            result => Err(ControlResultKind::Committed.unexpected(&result)),
         }
     }
 
@@ -373,7 +464,7 @@ impl ControlClient {
             .await?
         {
             ControlResult::Aborted(status) => Ok(status),
-            _ => Err(ControlError::UnexpectedResult("non-aborted")),
+            result => Err(ControlResultKind::Aborted.unexpected(&result)),
         }
     }
 
@@ -385,7 +476,7 @@ impl ControlClient {
     pub async fn retire(&mut self) -> Result<ActivationStatus, ControlError> {
         match self.round_trip(ControlOperation::Retire).await? {
             ControlResult::Retired(status) => Ok(status),
-            _ => Err(ControlError::UnexpectedResult("non-retired")),
+            result => Err(ControlResultKind::Retired.unexpected(&result)),
         }
     }
 
@@ -394,21 +485,13 @@ impl ControlClient {
         operation: ControlOperation,
     ) -> Result<ControlResult, ControlError> {
         let request_id = new_request_id(&self.counter);
+        let operation_name = operation_name(&operation);
         let message = ControlMessage::Request(ControlRequest {
             request_id,
             operation,
         });
-        let payload = serde_json::to_vec(&message).map_err(|_| ControlError::Rejected {
-            diagnostic: "cannot encode control request".to_owned(),
-        })?;
-        if payload.len() > MAX_CONTROL_FRAME_LEN as usize {
-            return Err(ControlError::Rejected {
-                diagnostic: "control request exceeds frame cap".to_owned(),
-            });
-        }
-        let len = u32::try_from(payload.len()).map_err(|_| ControlError::Rejected {
-            diagnostic: "control request exceeds frame cap".to_owned(),
-        })?;
+        let payload = encode_request(&message)?;
+        let len = u32::try_from(payload.len()).map_err(|_| ControlError::RequestTooLarge)?;
         timeout(OPERATION_TIMEOUT, async {
             self.stream.write_all(&len.to_be_bytes()).await?;
             self.stream.write_all(&payload).await?;
@@ -430,9 +513,14 @@ impl ControlClient {
                         return Err(ControlError::IdMismatch);
                     }
                     return match candidate.result {
-                        ControlResult::Error { diagnostic } => {
-                            Err(ControlError::Rejected { diagnostic })
-                        }
+                        ControlResult::Error {
+                            diagnostic,
+                            prepare_refusal,
+                        } => Err(ControlError::Rejected {
+                            operation: operation_name,
+                            diagnostic,
+                            prepare_refusal,
+                        }),
                         result => Ok(result),
                     };
                 }
@@ -628,7 +716,10 @@ mod tests {
         let mut client = ControlClient::connect(&socket).await.unwrap();
         assert!(matches!(
             client.status_at(handoff, epoch, as_of).await,
-            Err(ControlError::UnexpectedResult(_))
+            Err(ControlError::UnexpectedResult {
+                expected: ControlResultKind::StatusAt,
+                actual: ControlResultKind::Status,
+            })
         ));
         legacy.await.unwrap();
 
@@ -726,6 +817,7 @@ mod tests {
             async move {
                 serve_once(&socket, |_| ControlResult::Error {
                     diagnostic: "activation_in_progress".to_owned(),
+                    prepare_refusal: None,
                 })
                 .await;
             }
@@ -733,8 +825,11 @@ mod tests {
         wait_for_socket(&socket).await;
         let mut client = ControlClient::connect(&socket).await.unwrap();
         let error = client.status().await.unwrap_err();
-        assert!(matches!(error, ControlError::Rejected { .. }));
-        assert!(error.to_string().contains("activation_in_progress"));
+        assert!(matches!(
+            error,
+            ControlError::Rejected { operation: "Status", diagnostic, prepare_refusal: None }
+                if diagnostic == "activation_in_progress"
+        ));
         server.await.unwrap();
     }
 
@@ -757,16 +852,160 @@ mod tests {
         let mut client = ControlClient::connect(&socket).await.unwrap();
         assert!(matches!(
             client.status().await,
-            Err(ControlError::UnexpectedResult(_))
+            Err(ControlError::UnexpectedResult {
+                expected: ControlResultKind::Status,
+                actual: ControlResultKind::Retired,
+            })
         ));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_operations_retain_expected_and_received_response_kinds() {
+        for expected in [
+            ControlResultKind::Prepared,
+            ControlResultKind::Committed,
+            ControlResultKind::Aborted,
+            ControlResultKind::Retired,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = temp.path().join("control.sock");
+            let server = tokio::spawn({
+                let socket = socket.clone();
+                async move {
+                    serve_once(&socket, |_| ControlResult::Status(test_status())).await;
+                }
+            });
+            wait_for_socket(&socket).await;
+            let mut client = ControlClient::connect(&socket).await.unwrap();
+            let handoff = HandoffId([3; 16]);
+            let result = match expected {
+                ControlResultKind::Prepared => client.prepare(current_record(), handoff).await,
+                ControlResultKind::Committed => client.commit(handoff).await,
+                ControlResultKind::Aborted => client.abort(handoff).await,
+                ControlResultKind::Retired => client.retire().await,
+                _ => unreachable!("only lifecycle acknowledgements are in this table"),
+            };
+            assert!(matches!(
+                result,
+                Err(ControlError::UnexpectedResult { expected: observed, actual: ControlResultKind::Status })
+                    if observed == expected
+            ));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn status_at_proof_failures_retain_missing_and_mismatched_values() {
+        let handoff = HandoffId([3; 16]);
+        let epoch = muxe_protocol::UnitReadinessEpochId::from_bytes([4; 16]).unwrap();
+        let foreign_epoch = muxe_protocol::UnitReadinessEpochId::from_bytes([5; 16]).unwrap();
+        let as_of = muxe_protocol::AsOfTick::from_millis(100).unwrap();
+        for (actual_handoff, actual_epoch, has_ready) in [
+            (None, Some(epoch), true),
+            (Some(HandoffId([6; 16])), Some(epoch), true),
+            (Some(handoff), None, false),
+            (Some(handoff), None, true),
+            (Some(handoff), Some(foreign_epoch), true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = temp.path().join("control.sock");
+            let server = tokio::spawn({
+                let socket = socket.clone();
+                async move {
+                    serve_once(&socket, |_| {
+                        let mut status = test_status();
+                        status.phase = muxe_protocol::control::ActivationPhase::Legacy;
+                        status.handoff_id = actual_handoff;
+                        if has_ready {
+                            status.ready = Some(muxe_protocol::TargetReadiness {
+                                registered_clients: Vec::new(),
+                                member_clients: 0,
+                                member_ids: Some(Vec::new()),
+                                proof_epoch: actual_epoch,
+                            });
+                        }
+                        ControlResult::StatusAt(status)
+                    })
+                    .await;
+                }
+            });
+            wait_for_socket(&socket).await;
+            let mut client = ControlClient::connect(&socket).await.unwrap();
+            assert!(matches!(
+                client.status_at(handoff, epoch, as_of).await,
+                Err(ControlError::ReadinessProofMismatch {
+                    expected_handoff,
+                    actual_handoff: observed_handoff,
+                    expected_epoch,
+                    actual_epoch: observed_epoch,
+                }) if expected_handoff == handoff
+                    && expected_epoch == epoch
+                    && observed_handoff == actual_handoff
+                    && observed_epoch == actual_epoch
+            ));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected_locally_before_any_request_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut prelude = [0; muxe_protocol::frame::PRELUDE_LEN];
+        peer.read_exact(&mut prelude).await.unwrap();
+        assert_eq!(
+            prelude,
+            Prelude::control(PeerRole::ActivationCoordinator).encode()
+        );
+        let mut target = current_record();
+        target.muxe_version = "a".repeat(MAX_CONTROL_FRAME_LEN as usize);
+        assert!(matches!(
+            client.prepare(target, HandoffId([3; 16])).await,
+            Err(ControlError::RequestTooLarge)
+        ));
+        let mut byte = [0];
+        assert!(
+            timeout(Duration::from_millis(30), peer.read(&mut byte))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn encoding_failure_is_local_and_retains_the_serializer_cause() {
+        struct Unencodable;
+        impl serde::Serialize for Unencodable {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("fixture serialization failure"))
+            }
+        }
+        let error = encode_request(&Unencodable).unwrap_err();
+        assert!(matches!(&error, ControlError::Encode(_)));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
     fn handoff_hex_round_trip() {
         let id = handoff_from_hex(&"ab".repeat(16)).unwrap();
         assert_eq!(id.0, [0xab; 16]);
-        assert!(handoff_from_hex("short").is_err());
+        for invalid in [
+            "short",
+            "gggggggggggggggggggggggggggggggg",
+            "éééééééééééééééé",
+        ] {
+            assert!(matches!(
+                handoff_from_hex(invalid),
+                Err(ControlError::InvalidHandoffId)
+            ));
+        }
     }
 
     #[test]

@@ -253,7 +253,10 @@ mod tests {
             match self {
                 Self::Closed => ControlError::Closed,
                 Self::Timeout => ControlError::Timeout,
-                Self::Malformed => ControlError::UnexpectedResult("non-retired"),
+                Self::Malformed => ControlError::UnexpectedResult {
+                    expected: crate::lifecycle::control::ControlResultKind::Retired,
+                    actual: crate::lifecycle::control::ControlResultKind::Status,
+                },
                 Self::Permission => {
                     ControlError::Io(io::Error::from(io::ErrorKind::PermissionDenied))
                 }
@@ -518,11 +521,11 @@ mod tests {
 
     #[tokio::test]
     async fn retire_failures_are_errors_and_retain_record() {
-        for (failure, diagnostic) in [
-            (Failure::Closed, "closed"),
-            (Failure::Timeout, "timed out"),
-            (Failure::Malformed, "unexpected"),
-            (Failure::Permission, "permission denied"),
+        for failure in [
+            Failure::Closed,
+            Failure::Timeout,
+            Failure::Malformed,
+            Failure::Permission,
         ] {
             let temp = tempfile::TempDir::new().unwrap();
             std::fs::set_permissions(
@@ -541,10 +544,25 @@ mod tests {
             })
             .await
             .expect_err("a failed retire must not report absence");
-            assert!(
-                error.to_string().contains(diagnostic),
-                "missing diagnostic in {error}"
-            );
+            match failure {
+                Failure::Closed => {
+                    assert!(matches!(error, RetireError::Control(ControlError::Closed)));
+                }
+                Failure::Timeout => {
+                    assert!(matches!(error, RetireError::Control(ControlError::Timeout)));
+                }
+                Failure::Malformed => assert!(matches!(
+                    error,
+                    RetireError::Control(ControlError::UnexpectedResult {
+                        expected: crate::lifecycle::control::ControlResultKind::Retired,
+                        actual: crate::lifecycle::control::ControlResultKind::Status,
+                    })
+                )),
+                Failure::Permission => assert!(
+                    matches!(error, RetireError::Control(ControlError::Io(source))
+                    if source.kind() == io::ErrorKind::PermissionDenied)
+                ),
+            }
             assert_eq!(Registry::open(&cache).unwrap().entries().unwrap().len(), 1);
         }
     }
