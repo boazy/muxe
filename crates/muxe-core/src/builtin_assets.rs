@@ -1,0 +1,127 @@
+// Embedded asset text is parsed once by the core catalog, never per binding or render.
+pub(crate) const THEMES: &[(&str, &str)] = &[
+    ("brackets", include_str!("../assets/themes/brackets.yml")),
+    ("dots", include_str!("../assets/themes/dots.yml")),
+    ("rail", include_str!("../assets/themes/rail.yml")),
+    ("chevron", include_str!("../assets/themes/chevron.yml")),
+];
+
+pub(crate) const COLOR_SCHEMES: &[(&str, &str)] = &[
+    (
+        "catppuccin-latte",
+        include_str!("../assets/color-schemes/catppuccin-latte.yml"),
+    ),
+    (
+        "catppuccin-frappe",
+        include_str!("../assets/color-schemes/catppuccin-frappe.yml"),
+    ),
+    (
+        "catppuccin-macchiato",
+        include_str!("../assets/color-schemes/catppuccin-macchiato.yml"),
+    ),
+    (
+        "catppuccin-mocha",
+        include_str!("../assets/color-schemes/catppuccin-mocha.yml"),
+    ),
+    ("nord", include_str!("../assets/color-schemes/nord.yml")),
+    (
+        "dracula",
+        include_str!("../assets/color-schemes/dracula.yml"),
+    ),
+    (
+        "solarized-dark",
+        include_str!("../assets/color-schemes/solarized-dark.yml"),
+    ),
+    (
+        "solarized-light",
+        include_str!("../assets/color-schemes/solarized-light.yml"),
+    ),
+    (
+        "gruvbox-dark",
+        include_str!("../assets/color-schemes/gruvbox-dark.yml"),
+    ),
+    (
+        "gruvbox-dark-hard",
+        include_str!("../assets/color-schemes/gruvbox-dark-hard.yml"),
+    ),
+    (
+        "gruvbox-light",
+        include_str!("../assets/color-schemes/gruvbox-light.yml"),
+    ),
+    (
+        "gruvbox-light-hard",
+        include_str!("../assets/color-schemes/gruvbox-light-hard.yml"),
+    ),
+    (
+        "tokyo-night",
+        include_str!("../assets/color-schemes/tokyo-night.yml"),
+    ),
+    (
+        "tokyo-night-storm",
+        include_str!("../assets/color-schemes/tokyo-night-storm.yml"),
+    ),
+    (
+        "tokyo-night-moon",
+        include_str!("../assets/color-schemes/tokyo-night-moon.yml"),
+    ),
+    (
+        "tokyo-night-day",
+        include_str!("../assets/color-schemes/tokyo-night-day.yml"),
+    ),
+    (
+        "rose-pine",
+        include_str!("../assets/color-schemes/rose-pine.yml"),
+    ),
+    (
+        "rose-pine-moon",
+        include_str!("../assets/color-schemes/rose-pine-moon.yml"),
+    ),
+    (
+        "rose-pine-dawn",
+        include_str!("../assets/color-schemes/rose-pine-dawn.yml"),
+    ),
+    (
+        "everforest-dark-hard",
+        include_str!("../assets/color-schemes/everforest-dark-hard.yml"),
+    ),
+    (
+        "everforest-dark-medium",
+        include_str!("../assets/color-schemes/everforest-dark-medium.yml"),
+    ),
+    (
+        "everforest-dark-soft",
+        include_str!("../assets/color-schemes/everforest-dark-soft.yml"),
+    ),
+    (
+        "everforest-light-hard",
+        include_str!("../assets/color-schemes/everforest-light-hard.yml"),
+    ),
+    (
+        "everforest-light-medium",
+        include_str!("../assets/color-schemes/everforest-light-medium.yml"),
+    ),
+    (
+        "everforest-light-soft",
+        include_str!("../assets/color-schemes/everforest-light-soft.yml"),
+    ),
+    (
+        "one-dark",
+        include_str!("../assets/color-schemes/one-dark.yml"),
+    ),
+    (
+        "one-light",
+        include_str!("../assets/color-schemes/one-light.yml"),
+    ),
+    (
+        "kanagawa-wave",
+        include_str!("../assets/color-schemes/kanagawa-wave.yml"),
+    ),
+    (
+        "kanagawa-dragon",
+        include_str!("../assets/color-schemes/kanagawa-dragon.yml"),
+    ),
+    (
+        "kanagawa-lotus",
+        include_str!("../assets/color-schemes/kanagawa-lotus.yml"),
+    ),
+];

@@ -205,7 +205,8 @@ jobs:
           }
           rm -rf "$RUNNER_TEMP/target-install"
           mkdir -p "$RUNNER_TEMP/target-install/lib/muxe" \
-            "$RUNNER_TEMP/target-install/share/muxe/completions"
+            "$RUNNER_TEMP/target-install/share/muxe/completions" \
+            "$RUNNER_TEMP/target-install/share/muxe/theme-palettes"
           cp "$bin" "$RUNNER_TEMP/target-install/muxe"
           chmod 755 "$RUNNER_TEMP/target-install/muxe"
           cp dist-wasm/muxe-zellij.wasm "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm"
@@ -214,6 +215,10 @@ jobs:
             share/muxe/completions/muxe.fish \
             "$RUNNER_TEMP/target-install/share/muxe/completions/"
           cp LICENSE "$RUNNER_TEMP/target-install/LICENSE"
+          cp crates/muxe-core/assets/LICENSES.txt crates/muxe-core/assets/catalog.json \
+            "$RUNNER_TEMP/target-install/share/muxe/theme-palettes/"
+          cmp crates/muxe-core/assets/LICENSES.txt "$RUNNER_TEMP/target-install/share/muxe/theme-palettes/LICENSES.txt"
+          cmp crates/muxe-core/assets/catalog.json "$RUNNER_TEMP/target-install/share/muxe/theme-palettes/catalog.json"
           test "$(file_digest "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm")" = "$expected"
           echo "Staged installation with WebAssembly SHA-256: $expected"
       - name: Test installation with Herdr and Zellij
@@ -421,7 +426,8 @@ jobs:
           }
           rm -rf "$RUNNER_TEMP/target-install"
           mkdir -p "$RUNNER_TEMP/target-install/lib/muxe" \
-            "$RUNNER_TEMP/target-install/share/muxe/completions"
+            "$RUNNER_TEMP/target-install/share/muxe/completions" \
+            "$RUNNER_TEMP/target-install/share/muxe/theme-palettes"
           cp "$bin" "$RUNNER_TEMP/target-install/muxe"
           chmod 755 "$RUNNER_TEMP/target-install/muxe"
           cp dist-wasm/muxe-zellij.wasm "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm"
@@ -430,6 +436,10 @@ jobs:
             share/muxe/completions/muxe.fish \
             "$RUNNER_TEMP/target-install/share/muxe/completions/"
           cp LICENSE "$RUNNER_TEMP/target-install/LICENSE"
+          cp crates/muxe-core/assets/LICENSES.txt crates/muxe-core/assets/catalog.json \
+            "$RUNNER_TEMP/target-install/share/muxe/theme-palettes/"
+          cmp crates/muxe-core/assets/LICENSES.txt "$RUNNER_TEMP/target-install/share/muxe/theme-palettes/LICENSES.txt"
+          cmp crates/muxe-core/assets/catalog.json "$RUNNER_TEMP/target-install/share/muxe/theme-palettes/catalog.json"
           test "$(file_digest "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm")" = "$expected"
           echo "Staged installation with WebAssembly SHA-256: $expected"
       - name: Test installation with Herdr and Zellij

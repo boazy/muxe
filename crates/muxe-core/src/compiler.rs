@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use regex::Regex;
@@ -615,8 +615,50 @@ fn compile_layout(
     }
     Ok(layout)
 }
-fn compile_theme_catalog(assets: &ThemeAssets) -> CompiledThemeCatalog {
-    let mut themes: BTreeMap<_, _> = assets
+pub(crate) fn compile_theme_catalog(assets: &ThemeAssets) -> CompiledThemeCatalog {
+    static EMBEDDED: LazyLock<CompiledThemeCatalog> = LazyLock::new(|| {
+        let document = |kind: &str, name: &str, text: &'static str| {
+            ConfigDocument::parse(
+                SourceId::new(format!("<muxe built-in {kind}/{name}>")),
+                Arc::<str>::from(text),
+            )
+            .expect("embedded assets have valid YAML")
+        };
+        let mut themes: BTreeMap<_, _> = crate::builtin_assets::THEMES
+            .iter()
+            .map(|&(name, text)| {
+                let document = document("themes", name, text);
+                (
+                    ThemeName::new(name),
+                    (parse_theme_document(&document), document.root.span.clone()),
+                )
+            })
+            .collect();
+        let mut color_schemes: BTreeMap<_, _> = crate::builtin_assets::COLOR_SCHEMES
+            .iter()
+            .map(|&(name, text)| {
+                let document = document("color-schemes", name, text);
+                (
+                    ColorSchemeName::new(name),
+                    (
+                        parse_color_scheme_document(&document),
+                        document.root.span.clone(),
+                    ),
+                )
+            })
+            .collect();
+        let span = SourceSpan::new(SourceId::new("<muxe built-in>"), 0, 0);
+        themes.insert(
+            ThemeName::new("default"),
+            (Ok(default_theme()), span.clone()),
+        );
+        color_schemes.insert(
+            ColorSchemeName::new("default"),
+            (Ok(default_color_scheme()), span),
+        );
+        CompiledThemeCatalog::new(themes, color_schemes)
+    });
+    let themes = assets
         .themes
         .iter()
         .map(|(name, document)| {
@@ -626,7 +668,7 @@ fn compile_theme_catalog(assets: &ThemeAssets) -> CompiledThemeCatalog {
             )
         })
         .collect();
-    let mut color_schemes: BTreeMap<_, _> = assets
+    let color_schemes = assets
         .color_schemes
         .iter()
         .map(|(name, document)| {
@@ -639,14 +681,7 @@ fn compile_theme_catalog(assets: &ThemeAssets) -> CompiledThemeCatalog {
             )
         })
         .collect();
-    let default_span = SourceSpan::new(SourceId::new("<muxe built-in>"), 0, 0);
-    themes
-        .entry(ThemeName::new("default"))
-        .or_insert_with(|| (Ok(default_theme()), default_span.clone()));
-    color_schemes
-        .entry(ColorSchemeName::new("default"))
-        .or_insert_with(|| (Ok(default_color_scheme()), default_span));
-    CompiledThemeCatalog::new(themes, color_schemes)
+    EMBEDDED.with_overrides(CompiledThemeCatalog::new(themes, color_schemes))
 }
 
 fn compile_theme_pair(

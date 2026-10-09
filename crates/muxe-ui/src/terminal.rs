@@ -311,6 +311,8 @@ pub struct SurfacePadding {
 pub struct SurfaceFrame<'a> {
     pub title: &'a str,
     pub title_style: ratatui::style::Style,
+    /// Base style applied to the entire viewport before component spans.
+    pub surface_style: ratatui::style::Style,
     pub breadcrumb: &'a RenderedText,
     pub padding: SurfacePadding,
     pub plan: &'a GridPlan,
@@ -676,6 +678,7 @@ impl<W: Write> TerminalSurface<W> {
 /// same areas.
 fn render_surface(frame_context: &mut ratatui::Frame<'_>, frame: SurfaceFrame<'_>, area: Rect) {
     let buffer = frame_context.buffer_mut();
+    buffer.set_style(area, frame.surface_style);
     buffer.set_stringn(
         area.x,
         area.y,
@@ -727,6 +730,16 @@ fn render_surface(frame_context: &mut ratatui::Frame<'_>, frame: SurfaceFrame<'_
         status: frame.status,
     }
     .render(grid_area, buffer);
+    // Normalize unsupported colors before the backend diff. Crossterm's suppressed
+    // paired-color command can otherwise emit ESC[;m, which resets unrelated attributes.
+    if crossterm::style::Colored::ansi_color_disabled_memoized() {
+        buffer.set_style(
+            area,
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Reset)
+                .bg(ratatui::style::Color::Reset),
+        );
+    }
 }
 
 impl<W: Write> Drop for TerminalSurface<W> {
@@ -963,6 +976,7 @@ mod tests {
                 SurfaceFrame {
                     title: "Child",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1302,6 +1316,184 @@ mod tests {
     }
 
     #[test]
+    fn surface_base_style_fills_resized_viewports_without_overwriting_span_colors() {
+        use ratatui::{
+            Terminal,
+            backend::TestBackend,
+            style::{Color, Style},
+        };
+
+        let _byte_capture = BYTE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = crossterm::style::Colored::ansi_color_disabled_memoized();
+        crossterm::style::Colored::set_ansi_color_disabled(false);
+        let _restore = AnsiColorGateRestore(previous);
+        let background = Color::Rgb(24, 24, 32);
+        let base = Style::default()
+            .fg(Color::Rgb(220, 220, 230))
+            .bg(background);
+        let mut terminal = Terminal::new(TestBackend::new(12, 4)).expect("test terminal");
+        let empty = RenderedText::plain_fallback("");
+        let plan = GridPlan {
+            columns: 0,
+            row_gap: 0,
+            rows_per_page: 0,
+            page_count: 1,
+            has_pager: false,
+            pages: vec![crate::GridPage { columns: vec![] }],
+            slots: vec![],
+        };
+        for width in [12, 6, 18] {
+            let area = Rect::new(0, 0, width, 4);
+            terminal.backend_mut().resize(width, 4);
+            terminal.resize(area).expect("resize");
+            terminal
+                .draw(|context| {
+                    render_surface(
+                        context,
+                        SurfaceFrame {
+                            title: "表 Menu",
+                            title_style: Style::default().fg(Color::Red),
+                            surface_style: base,
+                            breadcrumb: &empty,
+                            padding: SurfacePadding::default(),
+                            plan: &plan,
+                            cells: &[],
+                            page: 0,
+                            pager: None,
+                            status: None,
+                        },
+                        area,
+                    );
+                })
+                .expect("paint");
+            let buffer = terminal.backend().buffer();
+            for row in 0..area.height {
+                let mut column = 0;
+                while column < width {
+                    let cell = &buffer[(column, row)];
+                    assert_eq!(
+                        cell.bg, background,
+                        "every visible glyph or gap retains the base background"
+                    );
+                    // Ratatui resets hidden continuation cells; the leading cell owns the
+                    // complete wide glyph and its physical background.
+                    let glyph_width = UnicodeWidthStr::width(cell.symbol()).max(1);
+                    column =
+                        column.saturating_add(u16::try_from(glyph_width).expect("cell width fits"));
+                }
+            }
+            assert_eq!(buffer[(0, 0)].fg, Color::Red);
+            assert_eq!(buffer[(width - 1, 3)].fg, base.fg.expect("base foreground"));
+        }
+    }
+
+    #[test]
+    fn no_color_suppresses_palette_colors_but_preserves_key_attributes_and_markers() {
+        use crate::CellTemplate;
+        use muxe_core::{ColorSchemeName, ThemeAssets, ThemeName};
+
+        let _byte_capture = BYTE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = crossterm::style::Colored::ansi_color_disabled_memoized();
+        crossterm::style::Colored::set_ansi_color_disabled(true);
+        let _restore = AnsiColorGateRestore(previous);
+        let theme = ThemeAssets::default()
+            .compile_catalog()
+            .resolve(
+                &ThemeName::new("brackets"),
+                &ColorSchemeName::new("catppuccin-latte"),
+            )
+            .expect("embedded light pair");
+        let renderer = TemplateRenderer::new(&theme).expect("renderer");
+        let cells = [renderer
+            .render_cell(CellTemplate {
+                key: "g",
+                title: "Git",
+                disabled: false,
+                blocked: false,
+                max_title_width: 20,
+            })
+            .expect("cell")];
+        let empty = RenderedText::plain_fallback("");
+        let plan = GridPlan {
+            columns: 1,
+            row_gap: 0,
+            rows_per_page: 1,
+            page_count: 1,
+            has_pager: false,
+            pages: vec![crate::GridPage {
+                columns: vec![crate::GridColumn {
+                    offset: 0,
+                    width: 20,
+                }],
+            }],
+            slots: vec![crate::GridSlot {
+                source_index: 0,
+                page: 0,
+                column: 0,
+                row: 0,
+            }],
+        };
+        let area = Rect::new(0, 0, 20, 3);
+        let mut surface = TerminalSurface::for_test(Vec::new(), area).expect("surface");
+        surface
+            .render(
+                SurfaceFrame {
+                    title: "Menu",
+                    title_style: renderer.title_style(),
+                    surface_style: renderer.surface_style(),
+                    breadcrumb: &empty,
+                    padding: SurfacePadding::default(),
+                    plan: &plan,
+                    cells: &cells,
+                    page: 0,
+                    pager: None,
+                    status: None,
+                },
+                area,
+            )
+            .expect("render");
+        let bytes = surface
+            .terminal
+            .as_mut()
+            .expect("stored terminal")
+            .backend_mut()
+            .writer_mut();
+        let text = String::from_utf8_lossy(bytes);
+        assert!(
+            !text.contains("[38;") && !text.contains("[48;"),
+            "NO_COLOR suppresses RGB output"
+        );
+        let key_position = text.find('g').expect("shortcut emitted");
+        let mut effective_bold = false;
+        for sequence in text[..key_position].split("\x1b[").skip(1) {
+            let Some(end) =
+                sequence.find(|character: char| !character.is_ascii_digit() && character != ';')
+            else {
+                continue;
+            };
+            if sequence.as_bytes()[end] != b'm' {
+                continue;
+            }
+            for parameter in sequence[..end].split(';') {
+                match parameter.parse::<u16>().unwrap_or(0) {
+                    0 | 22 => effective_bold = false,
+                    1 => effective_bold = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            effective_bold,
+            "shortcut is effectively bold, not reset after a bold command"
+        );
+        assert!(text.contains('[') && text.contains('g') && text.contains("Git"));
+    }
+
+    #[test]
     fn render_emits_sgr_for_styled_cells_and_leaves_plain_cells_bare() {
         use ratatui::style::{Color as RatatuiColor, Modifier, Style as RatatuiStyle};
 
@@ -1363,6 +1555,7 @@ mod tests {
             title_style: RatatuiStyle::default()
                 .fg(RatatuiColor::Green)
                 .add_modifier(Modifier::BOLD),
+            surface_style: ratatui::style::Style::default(),
             breadcrumb: &breadcrumb,
             padding: SurfacePadding::default(),
             plan: &plan,
@@ -1443,6 +1636,7 @@ mod tests {
         let frame = SurfaceFrame {
             title: "",
             title_style: ratatui::style::Style::default(),
+            surface_style: ratatui::style::Style::default(),
             breadcrumb: &breadcrumb,
             padding: SurfacePadding::default(),
             plan: &plan,
@@ -1506,6 +1700,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1550,6 +1745,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &narrow_plan,
@@ -1618,6 +1814,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1642,6 +1839,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1717,6 +1915,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1742,6 +1941,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1791,6 +1991,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1811,6 +2012,7 @@ mod tests {
             SurfaceFrame {
                 title: "",
                 title_style: ratatui::style::Style::default(),
+                surface_style: ratatui::style::Style::default(),
                 breadcrumb: &breadcrumb,
                 padding: SurfacePadding::default(),
                 plan: &grown_plan,
@@ -1861,6 +2063,7 @@ mod tests {
             SurfaceFrame {
                 title: "",
                 title_style: ratatui::style::Style::default(),
+                surface_style: ratatui::style::Style::default(),
                 breadcrumb: &breadcrumb,
                 padding: SurfacePadding::default(),
                 plan: &plan,
@@ -1925,6 +2128,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,
@@ -1950,6 +2154,7 @@ mod tests {
                 SurfaceFrame {
                     title: "",
                     title_style: ratatui::style::Style::default(),
+                    surface_style: ratatui::style::Style::default(),
                     breadcrumb: &breadcrumb,
                     padding: SurfacePadding::default(),
                     plan: &plan,

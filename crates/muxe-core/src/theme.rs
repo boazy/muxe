@@ -413,8 +413,8 @@ pub struct CompiledTheme {
 /// parsing it. The broker can therefore reject a malformed attach override without filesystem I/O.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledThemeCatalog {
-    themes: BTreeMap<ThemeName, ThemeAsset<Theme>>,
-    color_schemes: BTreeMap<ColorSchemeName, ThemeAsset<ColorScheme>>,
+    themes: Arc<BTreeMap<ThemeName, Arc<ThemeAsset<Theme>>>>,
+    color_schemes: Arc<BTreeMap<ColorSchemeName, Arc<ThemeAsset<ColorScheme>>>>,
     origin: Arc<()>,
 }
 
@@ -501,16 +501,43 @@ impl CompiledThemeCatalog {
         >,
     ) -> Self {
         Self {
-            themes: themes
-                .into_iter()
-                .map(|(name, (parsed, span))| (name, ThemeAsset { parsed, span }))
-                .collect(),
-            color_schemes: color_schemes
-                .into_iter()
-                .map(|(name, (parsed, span))| (name, ThemeAsset { parsed, span }))
-                .collect(),
+            themes: Arc::new(
+                themes
+                    .into_iter()
+                    .map(|(name, (parsed, span))| (name, Arc::new(ThemeAsset { parsed, span })))
+                    .collect(),
+            ),
+            color_schemes: Arc::new(
+                color_schemes
+                    .into_iter()
+                    .map(|(name, (parsed, span))| (name, Arc::new(ThemeAsset { parsed, span })))
+                    .collect(),
+            ),
             origin: Arc::new(()),
         }
+    }
+    /// Lists all selectable display-theme names, including user replacements.
+    pub fn theme_names(&self) -> impl Iterator<Item = &ThemeName> {
+        self.themes.keys()
+    }
+
+    /// Lists all selectable color-scheme names, including user replacements.
+    pub fn color_scheme_names(&self) -> impl Iterator<Item = &ColorSchemeName> {
+        self.color_schemes.keys()
+    }
+
+    pub(crate) fn with_overrides(&self, overrides: Self) -> Self {
+        let mut catalog = self.clone();
+        if !overrides.themes.is_empty() {
+            Arc::make_mut(&mut catalog.themes).extend(Arc::unwrap_or_clone(overrides.themes));
+        }
+        if !overrides.color_schemes.is_empty() {
+            Arc::make_mut(&mut catalog.color_schemes)
+                .extend(Arc::unwrap_or_clone(overrides.color_schemes));
+        }
+        // Resolution proofs belong to this generation, even when all assets are embedded.
+        catalog.origin = overrides.origin;
+        catalog
     }
 
     pub(crate) fn origin_token(&self) -> Arc<()> {
@@ -1167,6 +1194,15 @@ mod tests {
             has_loader_backed_construct(&late_loader),
             "a late loader keyword must still be detected"
         );
+    }
+
+    #[test]
+    fn embedded_catalog_storage_is_shared_but_resolution_origins_are_generation_scoped() {
+        let first = crate::ThemeAssets::default().compile_catalog();
+        let second = crate::ThemeAssets::default().compile_catalog();
+        assert!(Arc::ptr_eq(&first.themes, &second.themes));
+        assert!(Arc::ptr_eq(&first.color_schemes, &second.color_schemes));
+        assert!(!Arc::ptr_eq(&first.origin, &second.origin));
     }
 
     #[test]

@@ -41,6 +41,7 @@ use muxe::cli::{
 enum NativeCommandOperation {
     Init,
     ConfigCheck,
+    ConfigThemes,
     Compatibility,
     Purge,
     MenuOpen,
@@ -57,7 +58,10 @@ impl NativeCommandOperation {
     const fn from_command(command: &Command) -> Option<Self> {
         match command {
             Command::Init => Some(Self::Init),
-            Command::Config(_) => Some(Self::ConfigCheck),
+            Command::Config(config) => Some(match config.command {
+                ConfigSubcommand::Check => Self::ConfigCheck,
+                ConfigSubcommand::Themes => Self::ConfigThemes,
+            }),
             Command::Compatibility(_) => Some(Self::Compatibility),
             Command::Purge(_) => Some(Self::Purge),
             Command::Menu(menu) => match menu.command {
@@ -84,6 +88,7 @@ impl NativeCommandOperation {
         match self {
             Self::Init => "init",
             Self::ConfigCheck => "config-check",
+            Self::ConfigThemes => "config-themes",
             Self::Compatibility => "compatibility",
             Self::Purge => "purge",
             Self::MenuOpen => "menu-open",
@@ -162,6 +167,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Config(command) => match command.command {
             ConfigSubcommand::Check => Box::pin(check_configuration()).await,
+            ConfigSubcommand::Themes => {
+                let paths = muxe::paths::resolve()?;
+                let catalog = muxe_broker::config::load_theme_catalog(&paths.config_file())?;
+                println!("Themes:");
+                for name in catalog.theme_names() {
+                    println!("  {name}");
+                }
+                println!("Color schemes:");
+                for name in catalog.color_scheme_names() {
+                    println!("  {name}");
+                }
+                Ok(())
+            }
         },
         Command::Compatibility(command) => compatibility(&command),
         Command::Purge(command) => purge(&command),

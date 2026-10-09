@@ -371,6 +371,22 @@ fn parse_document(
     })
 }
 
+/// Discovers embedded and user assets without loading a configuration or contacting a host.
+/// User files replace embedded assets by their complete filename stem, including `default`.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when a user asset cannot be read or parsed as YAML.
+#[expect(
+    clippy::result_large_err,
+    reason = "discovery shares the configuration loader's public cold-path error"
+)]
+pub fn load_theme_catalog(
+    config_path: &Path,
+) -> Result<muxe_core::CompiledThemeCatalog, ConfigError> {
+    Ok(load_theme_assets(config_path)?.compile_catalog())
+}
+
 #[expect(
     clippy::result_large_err,
     reason = "ConfigError is a public cold-path error API shared with the native binary; boxing diagnostic variants churns consumers for no frame-size gain"
@@ -648,6 +664,39 @@ mod tests {
 
     fn unavailable() -> AdapterError {
         AdapterError::new(AdapterErrorKind::Unavailable, "not used by config reload")
+    }
+
+    #[test]
+    fn catalog_discovery_needs_no_config_file_and_lists_user_names_with_precedence() {
+        let directory = tempfile::tempdir().expect("isolated asset tree");
+        let base = directory.path().join("not-installed.yml");
+        let embedded = load_theme_catalog(&base).expect("embedded catalog without installation");
+        assert_eq!(embedded.theme_names().count(), 5);
+        assert_eq!(embedded.color_scheme_names().count(), 31);
+        let themes = directory.path().join("themes");
+        fs::create_dir(&themes).expect("user theme directory");
+        fs::write(themes.join("brackets.yml"), "unknown: true\n").expect("replacement");
+        fs::write(themes.join("personal.yml"), "menu: {}\n").expect("personal asset");
+        let catalog = load_theme_catalog(&base).expect("source-tracked catalog");
+        assert!(
+            catalog
+                .theme_names()
+                .any(|name| name.as_str() == "personal")
+        );
+        assert_eq!(catalog.theme_names().count(), 6);
+        assert!(
+            catalog
+                .resolve(
+                    &ThemeName::new("brackets"),
+                    &ColorSchemeName::new("default")
+                )
+                .is_err()
+        );
+        assert!(
+            catalog
+                .resolve(&ThemeName::new("dots"), &ColorSchemeName::new("default"))
+                .is_ok()
+        );
     }
 
     #[test]

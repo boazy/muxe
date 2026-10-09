@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod action;
+mod builtin_assets;
 mod compiler;
 mod condition;
 mod config;

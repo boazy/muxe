@@ -79,11 +79,17 @@ _muxe() {
             muxe__subcmd__config,help)
                 cmd="muxe__subcmd__config__subcmd__help"
                 ;;
+            muxe__subcmd__config,themes)
+                cmd="muxe__subcmd__config__subcmd__themes"
+                ;;
             muxe__subcmd__config__subcmd__help,check)
                 cmd="muxe__subcmd__config__subcmd__help__subcmd__check"
                 ;;
             muxe__subcmd__config__subcmd__help,help)
                 cmd="muxe__subcmd__config__subcmd__help__subcmd__help"
+                ;;
+            muxe__subcmd__config__subcmd__help,themes)
+                cmd="muxe__subcmd__config__subcmd__help__subcmd__themes"
                 ;;
             muxe__subcmd__help,activate)
                 cmd="muxe__subcmd__help__subcmd__activate"
@@ -129,6 +135,9 @@ _muxe() {
                 ;;
             muxe__subcmd__help__subcmd__config,check)
                 cmd="muxe__subcmd__help__subcmd__config__subcmd__check"
+                ;;
+            muxe__subcmd__help__subcmd__config,themes)
+                cmd="muxe__subcmd__help__subcmd__config__subcmd__themes"
                 ;;
             muxe__subcmd__help__subcmd__integration,install)
                 cmd="muxe__subcmd__help__subcmd__integration__subcmd__install"
@@ -483,7 +492,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__config)
-            opts="-h -V --help --version check help"
+            opts="-h -V --help --version check themes help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -511,7 +520,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__config__subcmd__help)
-            opts="check help"
+            opts="check themes help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -541,6 +550,34 @@ _muxe() {
         muxe__subcmd__config__subcmd__help__subcmd__help)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__config__subcmd__help__subcmd__themes)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__config__subcmd__themes)
+            opts="-h -V --help --version"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -651,7 +688,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__help__subcmd__config)
-            opts="check"
+            opts="check themes"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -665,6 +702,20 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__help__subcmd__config__subcmd__check)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__help__subcmd__config__subcmd__themes)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

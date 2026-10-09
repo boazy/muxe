@@ -304,7 +304,8 @@ jobs:
           version="$RELEASE_VERSION"
           root="muxe-v${version}-${{ matrix.asset }}"
           rm -rf "$root" "${root}.tar.gz"
-          mkdir -p "$root/lib/muxe" "$root/share/muxe/completions"
+          mkdir -p "$root/lib/muxe" "$root/share/muxe/completions" \
+            "$root/share/muxe/theme-palettes"
           cp "$BIN" "$root/muxe"
           chmod 755 "$root/muxe"
           cp "$WASM_PATH" "$root/lib/muxe/muxe-zellij.wasm"
@@ -313,6 +314,8 @@ jobs:
             share/muxe/completions/muxe.fish \
             "$root/share/muxe/completions/"
           cp LICENSE "$root/LICENSE"
+          cp crates/muxe-core/assets/LICENSES.txt crates/muxe-core/assets/catalog.json \
+            "$root/share/muxe/theme-palettes/"
           tar -czf "${root}.tar.gz" "$root"
           echo "ARCHIVE=${root}.tar.gz" >> "$GITHUB_ENV"
       - name: Upload archive and compatibility report
@@ -391,6 +394,8 @@ jobs:
             test -f "verify-tmp/$name/share/muxe/completions/_muxe"
             test -f "verify-tmp/$name/share/muxe/completions/muxe.fish"
             test -f "verify-tmp/$name/LICENSE"
+            cmp crates/muxe-core/assets/LICENSES.txt "verify-tmp/$name/share/muxe/theme-palettes/LICENSES.txt"
+            cmp crates/muxe-core/assets/catalog.json "verify-tmp/$name/share/muxe/theme-palettes/catalog.json"
             digest="$(file_digest "verify-tmp/$name/lib/muxe/muxe-zellij.wasm")"
             if [ -z "$first_digest" ]; then
               first_digest="$digest"

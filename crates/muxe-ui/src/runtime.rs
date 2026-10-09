@@ -53,6 +53,7 @@ pub enum InvocationDisposition {
 pub struct PreparedMenu {
     pub title: String,
     pub title_style: RatatuiStyle,
+    pub surface_style: RatatuiStyle,
     pub breadcrumbs: RenderedText,
     pub padding: SurfacePadding,
     pub plan: GridPlan,
@@ -69,6 +70,7 @@ impl PreparedMenu {
         SurfaceFrame {
             title: &self.title,
             title_style: self.title_style,
+            surface_style: self.surface_style,
             breadcrumb: &self.breadcrumbs,
             padding: self.padding,
             plan: &self.plan,
@@ -1172,6 +1174,7 @@ fn render_menu_pass(
                 PreparedMenu {
                     title: title.to_owned(),
                     title_style: renderer.title_style(),
+                    surface_style: renderer.surface_style(),
                     breadcrumbs,
                     padding,
                     plan,

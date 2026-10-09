@@ -165,6 +165,12 @@ impl TemplateRenderer {
         self.styles.get("title").copied().unwrap_or_default()
     }
 
+    /// Returns the `default` style for the complete menu surface, including empty cells.
+    #[must_use]
+    pub(crate) fn surface_style(&self) -> RatatuiStyle {
+        self.styles.get("default").copied().unwrap_or_default()
+    }
+
     fn from_sources<'a>(
         template_source: impl Fn(&str) -> Option<&'a str>,
         styles: BTreeMap<String, RatatuiStyle>,
@@ -334,7 +340,7 @@ pub fn escape_markup_text(value: &str) -> Result<String, TemplateError> {
 
     for character in value.chars() {
         match character {
-            '[' | ']' => {
+            '[' | ']' | '\\' => {
                 output
                     .write_all(b"\\")
                     .map_err(|_| TemplateError::OutputTooLarge)?;
@@ -481,7 +487,7 @@ fn parse_style_markup(rendered: &str, styles: &BTreeMap<String, RatatuiStyle>) -
     let mut characters = rendered.chars().peekable();
 
     while let Some(character) = characters.next() {
-        if character == '\\' && matches!(characters.peek(), Some('[' | ']')) {
+        if character == '\\' && matches!(characters.peek(), Some('[' | ']' | '\\')) {
             text.push(characters.next().expect("peeked character"));
             continue;
         }
@@ -572,8 +578,8 @@ fn pad_filter(
     if pad_width == 0 {
         return Err(filter_error("padding string has zero display width"));
     }
-    let value = truncate_to_width(value, width);
-    let missing = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
+    let value = truncate_markup_to_width(value, width);
+    let missing = width.saturating_sub(markup_display_width(&value));
     let padding = repeat_to_width(&pad, missing)?;
     let mut output = String::with_capacity(value.len() + padding.len());
     if left {
@@ -593,7 +599,16 @@ fn ellipsis_filter(value: &str, width: usize) -> Result<String, MiniError> {
     if width > MAX_COMPONENT_BYTES {
         return Err(filter_error("ellipsis width exceeds the component limit"));
     }
-    let output = ellipsize(value, width);
+    let value = sanitize_single_line(value);
+    let output = if markup_display_width(&value) <= width {
+        value
+    } else if width == 0 {
+        String::new()
+    } else {
+        let mut output = truncate_markup_to_width(&value, width - 1);
+        output.push('…');
+        output
+    };
     if output.len() > MAX_COMPONENT_BYTES {
         return Err(filter_error("ellipsis output exceeds the component limit"));
     }
@@ -608,6 +623,30 @@ fn style_filter(value: &str, name: &str) -> Result<String, MiniError> {
     Ok(output)
 }
 
+fn truncate_markup_to_width(value: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0;
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        let escaped = character == '\\' && matches!(characters.peek(), Some('[' | ']' | '\\'));
+        let visible = if escaped {
+            characters.next().expect("peeked escape target")
+        } else {
+            character
+        };
+        let character_width = UnicodeWidthChar::width(visible).unwrap_or(0);
+        if used + character_width > width {
+            break;
+        }
+        if escaped {
+            output.push('\\');
+        }
+        output.push(visible);
+        used += character_width;
+    }
+    output
+}
+
 fn truncate_to_width(value: &str, width: usize) -> String {
     let mut output = String::new();
     let mut used = 0;
@@ -620,6 +659,20 @@ fn truncate_to_width(value: &str, width: usize) -> String {
         used += character_width;
     }
     output
+}
+
+/// Escape prefixes are one-column ASCII characters before one-column ASCII targets;
+/// excluding them retains `UnicodeWidthStr`'s context-sensitive width without decoding/copying.
+fn markup_display_width(value: &str) -> usize {
+    let mut prefixes = 0;
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' && matches!(characters.peek(), Some('[' | ']' | '\\')) {
+            characters.next();
+            prefixes += 1;
+        }
+    }
+    UnicodeWidthStr::width(value).saturating_sub(prefixes)
 }
 
 /// Measures display width for the padding fill path.

@@ -35,18 +35,20 @@ pub enum Command {
     Ui(UiCommand),
 }
 
-/// Commands that validate Muxe configuration.
+/// Commands that inspect and validate Muxe configuration.
 #[derive(Debug, Args)]
 pub struct ConfigCommand {
     #[command(subcommand)]
     pub command: ConfigSubcommand,
 }
 
-/// Configuration validation subcommands.
+/// Configuration inspection and validation subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ConfigSubcommand {
     /// Check the base configuration with each host override.
     Check,
+    /// List embedded and user display themes and color schemes.
+    Themes,
 }
 
 /// Commands that start a configured menu.

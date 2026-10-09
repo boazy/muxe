@@ -448,6 +448,15 @@ pub struct ThemeAssets {
     pub color_schemes: BTreeMap<ColorSchemeName, ConfigDocument>,
 }
 
+impl ThemeAssets {
+    /// Compiles the embedded catalog with full-name user asset replacements.
+    /// Invalid entries retain their diagnostics until selected.
+    #[must_use]
+    pub fn compile_catalog(&self) -> CompiledThemeCatalog {
+        crate::compiler::compile_theme_catalog(self)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThemeSelection {
     pub theme: ThemeName,

@@ -1,0 +1,57 @@
+# Presentation uses semantic colors only; pair with any color scheme.
+common:
+  styles:
+    default:
+      foreground: base.text
+      background: base.background
+    muted:
+      foreground: base.muted
+      background: base.background
+menu:
+  styles:
+    title:
+      foreground: base.text
+      background: base.background
+      bold: true
+    hotkey:
+      foreground: menu.hotkey
+      background: base.background
+      bold: true
+    arrow:
+      foreground: menu.separator
+      background: base.background
+    disabled:
+      foreground: base.muted
+      background: base.background
+    crumb:
+      foreground: base.muted
+      background: base.background
+    error:
+      foreground: status.error
+      background: base.background
+      bold: true
+    pending:
+      foreground: status.pending
+      background: base.background
+      bold: true
+    blocked:
+      foreground: status.blocked
+      background: base.background
+      bold: true
+    reload:
+      foreground: status.reload
+      background: base.background
+    notice:
+      foreground: status.notice
+      background: base.background
+  templates:
+    cell: >-
+      {% if blocked %}[blocked]! [/blocked]{% elif disabled %}[disabled]- [/disabled]{% endif %}{% if disabled %}[disabled]│ {{ key }} │ {{ title }}[/disabled]{% else %}[arrow]│ [/arrow][hotkey]{{ key }}[/hotkey][arrow] │ [/arrow][default]{{ title }}[/default]{% endif %}
+    breadcrumbs: >-
+      {% for c in crumbs %}{% if loop.last %}[title]{{ c }}[/title]{% else %}[crumb]{{ c }}[/crumb][arrow] ─ [/arrow]{% endif %}{% endfor %}
+    pagination.full: >-
+      {% if prev_key %}[arrow]‹ [/arrow][hotkey]{{ prev_key }}[/hotkey][arrow] │ [/arrow]{% endif %}[title]{{ pages.current }}/{{ pages.count }}[/title]{% if next_key %}[arrow] │ [/arrow][hotkey]{{ next_key }}[/hotkey][arrow] ›[/arrow]{% endif %}
+    pagination.short: >-
+      [title]{{ pages.current }}/{{ pages.count }}[/title]
+    status: >-
+      {% if level == 'error' %}[error]Error: {{ message }}[/error]{% elif level == 'pending' %}[pending]Pending: {{ message }}[/pending]{% elif level == 'blocked' %}[blocked]Blocked: {{ message }}[/blocked]{% elif level == 'reload' %}[reload]Reload: {{ message }}[/reload]{% else %}[notice]Notice: {{ message }}[/notice]{% endif %}
