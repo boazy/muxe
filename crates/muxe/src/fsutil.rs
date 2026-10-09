@@ -94,7 +94,7 @@ fn fail_at_tagged_durability_boundary(
 
 #[derive(Debug, Error)]
 pub enum FsError {
-    #[error("could not {operation} {}", path.display())]
+    #[error("error while {operation} {}: {source}", path.display())]
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -111,7 +111,9 @@ pub enum FsError {
     },
     #[error("refusing to use non-regular file {}", path.display())]
     NotRegularFile { path: PathBuf },
-    #[error("refusing to use {} with mode {:o}: expected owner-only {:o}", path.display(), actual, expected)]
+    #[error("expected a directory at {}", path.display())]
+    NotDirectory { path: PathBuf },
+    #[error("cannot use {} with permissions {:o}; expected permissions {:o}, accessible only to its owner", path.display(), actual, expected)]
     BadMode {
         path: PathBuf,
         actual: u32,
@@ -196,7 +198,7 @@ fn validate_ancestor_owned(directory: &Path) -> Result<(), FsError> {
     let metadata = fs::symlink_metadata(directory)
         .map_err(|source| io_error("checking ancestor directory", directory, source))?;
     if !metadata.file_type().is_dir() {
-        return Err(FsError::NotRegularFile {
+        return Err(FsError::NotDirectory {
             path: directory.to_path_buf(),
         });
     }

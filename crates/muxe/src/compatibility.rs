@@ -24,13 +24,17 @@ pub const HERDR_LATEST_VERIFIED: HerdrRelease = HerdrRelease::new(0, 9, 3);
 
 #[derive(Debug, Error)]
 pub enum CompatibilityError {
-    #[error("Herdr bundled protocol {0} does not fit the compatibility record")]
+    #[error(
+        "the bundled Herdr protocol version {0} exceeds the range supported by Muxe's compatibility record"
+    )]
     HerdrProtocolOutOfRange(u64),
-    #[error("Herdr bundled schema version {0} does not fit the compatibility record")]
+    #[error(
+        "the bundled Herdr schema version {0} exceeds the range supported by Muxe's compatibility record"
+    )]
     HerdrSchemaOutOfRange(u64),
-    #[error("Herdr bundled request-schema digest is not a valid non-zero 32-byte hash")]
+    #[error("this Muxe build contains an invalid Herdr request-schema SHA-256 checksum")]
     HerdrDigestMalformed,
-    #[error("build supplied an invalid native packaged-WASM SHA-256")]
+    #[error("this Muxe build contains an invalid SHA-256 checksum for its packaged Zellij bridge")]
     PackagedWasmDigestMalformed,
 }
 /// Decodes the generator-produced Herdr request-schema digest into a typed fingerprint.
@@ -155,11 +159,13 @@ pub struct NativeAssetVerification {
 
 #[derive(Debug, Error)]
 pub enum AssetVerificationError {
-    #[error("native packaged bridge is unavailable: {reason}")]
+    #[error("the Zellij bridge bundled with this Muxe build is unavailable: {reason}")]
     Unavailable { reason: &'static str },
-    #[error("embedded native compatibility is invalid: {0}")]
+    #[error("this Muxe build contains invalid host compatibility information: {0}")]
     Embedded(#[from] CompatibilityError),
-    #[error("packaged bridge digest mismatch: expected {expected}, found {found}")]
+    #[error(
+        "the packaged Zellij bridge does not match this Muxe build: expected SHA-256 checksum {expected}, found {found}"
+    )]
     DigestMismatch { expected: String, found: String },
 }
 

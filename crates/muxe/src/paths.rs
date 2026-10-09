@@ -33,7 +33,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum PathError {
     #[error(
-        "no validated configuration base: set XDG_CONFIG_HOME/XDG_CACHE_HOME to absolute paths or provide a home directory"
+        "cannot locate the configuration and cache directories; set HOME to your home directory, or set XDG_CONFIG_HOME and XDG_CACHE_HOME to absolute paths"
     )]
     NoValidatedBase,
     #[error("could not resolve the current directory while normalizing {path}: {source}")]
@@ -44,11 +44,11 @@ pub enum PathError {
     },
     #[error("Zellij configuration path {path} must be absolute")]
     RelativePath { path: PathBuf },
-    #[error("Zellij configuration path {path} must not contain `.` in persisted ownership")]
+    #[error("the saved Zellij configuration path {path} must not contain a `.` path component")]
     DotComponent { path: PathBuf },
     #[error("Zellij configuration path {path} must not contain `..`")]
     ParentTraversal { path: PathBuf },
-    #[error("could not {operation} bridge authority at {path}: {source}")]
+    #[error("could not {operation} the bridge installation path {path}: {source}")]
     BridgeIo {
         operation: &'static str,
         path: PathBuf,
@@ -57,13 +57,19 @@ pub enum PathError {
     },
     #[error("refusing non-directory or symlinked bridge integration directory {path}")]
     UnsafeBridgeDirectory { path: PathBuf },
-    #[error("refusing symlinked or non-regular stable bridge leaf {path}")]
+    #[error(
+        "the installed bridge at {path} must be a regular file, not a directory or symbolic link"
+    )]
     UnsafeBridgeLeaf { path: PathBuf },
     #[error("bridge integration directory {path} changed while resolving")]
     BridgeDirectoryChanged { path: PathBuf },
-    #[error("bridge integration directory {path} is not owner-only")]
+    #[error(
+        "the bridge installation directory {path} must have permissions 700, accessible only to its owner"
+    )]
     BridgeDirectoryNotOwnerOnly { path: PathBuf },
-    #[error("refusing unsafe bridge ancestor directory {path}")]
+    #[error(
+        "cannot use bridge parent directory {path}: it must be a real directory owned by the current user and not writable by other users"
+    )]
     UnsafeBridgeAncestor { path: PathBuf },
 }
 

@@ -171,16 +171,16 @@ impl Receipt {
                 let legacy = raw
                     .bridge
                     .canonical_path
-                    .ok_or_else(|| "v1 receipt lacks bridge.canonical_path".to_owned())?;
+                    .ok_or_else(|| "the legacy installation record is missing the bridge file path (bridge.canonical_path)".to_owned())?;
                 if legacy.file_name() != Some(std::ffi::OsStr::new(BRIDGE_FILE_NAME)) {
                     return Err(format!(
-                        "v1 bridge.canonical_path {} does not name the expected bridge leaf",
+                        "the legacy installation record points to {}, which is not the expected bridge file",
                         legacy.display()
                     ));
                 }
                 let legacy_parent = legacy.parent().ok_or_else(|| {
                     format!(
-                        "v1 bridge.canonical_path {} has no integration directory",
+                        "the legacy bridge file path {} has no installation directory",
                         legacy.display()
                     )
                 })?;
@@ -190,13 +190,13 @@ impl Receipt {
                 )
                 .map_err(|error| {
                     format!(
-                        "cannot validate v1 bridge.canonical_path {}: {error}",
+                        "cannot validate the bridge file path {} from the legacy installation record: {error}",
                         legacy.display()
                     )
                 })?;
                 if legacy_identity != expected {
                     return Err(format!(
-                        "v1 bridge.canonical_path {} does not name the receipt-owned bridge",
+                        "the bridge file path {} in the legacy installation record points to a different installation",
                         legacy.display()
                     ));
                 }
@@ -205,8 +205,8 @@ impl Receipt {
             RECEIPT_SCHEMA_VERSION => raw
                 .bridge
                 .bridge_identity
-                .ok_or_else(|| "v2 receipt lacks bridge.bridge_identity".to_owned())?,
-            version => return Err(format!("unsupported receipt schema version {version}")),
+                .ok_or_else(|| "the installation record is missing its bridge directory identity (bridge.bridge_identity)".to_owned())?,
+            version => return Err(format!("unsupported installation record format version {version}")),
         };
         let receipt = Self {
             schema_version: RECEIPT_SCHEMA_VERSION,
@@ -249,12 +249,13 @@ impl Receipt {
     }
 
     fn validate(&self, directory: &Path) -> Result<(), String> {
-        let expected =
-            BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))
-                .map_err(|error| format!("cannot validate receipt bridge identity: {error}"))?;
+        let expected = BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))
+            .map_err(|error| {
+            format!("cannot resolve the bridge directory named by the installation record: {error}")
+        })?;
         if self.bridge.bridge_identity != expected {
             return Err(format!(
-                "bridge identity {} does not match receipt-owned bridge {}",
+                "the installation record identifies bridge directory {}, but the current installation directory is {}",
                 self.bridge.bridge_identity, expected
             ));
         }
@@ -263,7 +264,7 @@ impl Receipt {
         for record in &self.configs {
             if !records.insert((&record.config_path, record.node)) {
                 return Err(format!(
-                    "duplicate ownership record for {} in {}",
+                    "the installation record lists the {} configuration block more than once in {}",
                     record.node.as_str(),
                     record.config_path
                 ));
@@ -276,36 +277,35 @@ impl Receipt {
                 (Disposition::Updated, Some(previous_text), Some(previous_semantic)) => {
                     if previous_semantic.trim().is_empty() {
                         return Err(format!(
-                            "{} updated provenance has empty previous semantic state",
+                            "the saved original configuration for {} is empty, so Muxe cannot restore it safely",
                             record.node.as_str()
                         ));
                     }
                     let canonical = kdl::validate_previous_node(record.node, previous_text)
                         .map_err(|detail| {
                             format!(
-                                "{} updated provenance has invalid previous text: {detail}",
+                                "the saved original configuration text for {} is invalid: {detail}",
                                 record.node.as_str()
                             )
                         })?;
                     if canonical != *previous_semantic {
                         return Err(format!(
-                            "{} updated provenance previous semantic state does not match previous text",
+                            "the saved original configuration text for {} does not match its recorded contents",
                             record.node.as_str()
                         ));
                     }
                 }
                 (Disposition::Updated, _, _) => {
                     return Err(format!(
-                        "{} updated provenance lacks complete previous text and semantic state",
+                        "the installation record is missing the original configuration text or contents needed to restore {}",
                         record.node.as_str()
                     ));
                 }
                 (Disposition::Created | Disposition::Observed, None, None) => {}
                 (Disposition::Created | Disposition::Observed, _, _) => {
                     return Err(format!(
-                        "{} {:?} provenance claims previous updated state",
-                        record.node.as_str(),
-                        record.disposition
+                        "the installation record includes original configuration contents for {}, even though Muxe did not replace that block",
+                        record.node.as_str()
                     ));
                 }
             }
@@ -352,15 +352,15 @@ struct RawNodeRecord {
 pub enum ReceiptError {
     #[error(transparent)]
     Fs(#[from] FsError),
-    #[error("receipt at {} is not valid JSON: {source}", path.display())]
+    #[error("the installation record at {} is not valid JSON: {source}", path.display())]
     Corrupt {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
-    #[error("receipt at {} is semantically corrupt: {detail}", path.display())]
+    #[error("the installation record at {} contains invalid data: {detail}", path.display())]
     Invalid { path: PathBuf, detail: String },
-    #[error("receipt at {} uses unsupported schema version {version}", path.display())]
+    #[error("the installation record at {} uses unsupported format version {version}", path.display())]
     UnsupportedVersion { path: PathBuf, version: u32 },
 }
 

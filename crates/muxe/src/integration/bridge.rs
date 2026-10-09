@@ -49,7 +49,7 @@ pub enum BridgeError {
     #[error(transparent)]
     Fs(#[from] FsError),
     #[error(
-        "refusing to overwrite unrecognized bridge bytes at {path}: found digest {found}, receipt records {expected}"
+        "cannot overwrite the bridge file at {path}: its SHA-256 checksum is {found}, but the installation record expects {expected}"
     )]
     ForeignBytes {
         path: PathBuf,
@@ -57,13 +57,13 @@ pub enum BridgeError {
         expected: String,
     },
     #[error(
-        "bridge destination at {path} holds unrecognized bytes with digest {found} and no receipt exists; resolve the file before retrying"
+        "cannot overwrite the bridge file at {path}: no installation record exists for it. Its SHA-256 checksum is {found}"
     )]
     UntrackedBytes { path: PathBuf, found: String },
     #[error("staged bridge digest changed after write: expected {expected}, found {found}")]
     StagedDigestChanged { expected: String, found: String },
     #[error(
-        "rollback copy at {path} is protected: recorded digest {recorded} does not match {found}; resolve it before retrying"
+        "cannot replace the backup bridge at {path}: its SHA-256 checksum is {found}, but the saved record expects {recorded}"
     )]
     PreviousProtected {
         path: PathBuf,

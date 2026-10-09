@@ -47,7 +47,9 @@ pub enum PurgeError {
     Path(#[from] PathError),
     #[error(transparent)]
     Registry(#[from] RegistryError),
-    #[error("could not scan receipt-listed Zellij reference in {path}: {detail}")]
+    #[error(
+        "could not check the Zellij configuration at {path} for references to the installed Muxe bridge: {detail}"
+    )]
     ReferenceScan { path: PathBuf, detail: String },
     #[error("muxe purge requires at least one of --config or --cache")]
     NoTarget,
@@ -55,9 +57,13 @@ pub enum PurgeError {
     NonInteractiveWithoutYes,
     #[error("purge declined; nothing was removed")]
     Declined,
-    #[error("refusing --cache while activation journal {journal} is live or needs recovery")]
+    #[error(
+        "cannot remove the cache while activation is unfinished or needs recovery; its saved record is at {journal}"
+    )]
     ActivationJournalLive { journal: PathBuf },
-    #[error("refusing --cache while activation owns cache lifetime lock {path}")]
+    #[error(
+        "cannot remove the cache while another Muxe activation holds the cache lock at {path}; wait for it to finish"
+    )]
     CacheLeaseActive { path: PathBuf },
     #[error(transparent)]
     Journal(#[from] JournalError),

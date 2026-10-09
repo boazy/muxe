@@ -53,7 +53,7 @@ pub enum IntegrationLockError {
     #[error(transparent)]
     Fs(#[from] FsError),
     #[error(
-        "cannot resolve canonical integration directory {}: {source}",
+        "cannot resolve the bridge installation directory {}: {source}",
         directory.display()
     )]
     Canonical {
@@ -67,7 +67,7 @@ pub enum IntegrationLockError {
         #[source]
         source: nix::errno::Errno,
     },
-    #[error("integration lock at {} is already held", path.display())]
+    #[error("another Muxe install or uninstall operation holds the bridge installation lock at {}; wait for it to finish before retrying", path.display())]
     Active { path: PathBuf },
 }
 
@@ -163,18 +163,18 @@ pub enum IntegrationError {
     #[error("cannot resolve Zellij configuration: {0}")]
     ConfigDiscovery(String),
     #[error(
-        "--zellij-config {} is not a receipt-owned Zellij configuration path; refusing uninstall without mutation",
+        "cannot uninstall using --zellij-config {} because the installation record does not list that configuration path; no uninstall changes were applied",
         path.display()
     )]
     ConfigOverrideUnowned { path: PathBuf },
     #[error(
-        "activation journal for this bridge is still live; resolve activation before uninstalling"
+        "cannot change the bridge installation while activation is unfinished; its saved record is at {}. Complete activation before changing the installation", journal.display()
     )]
     ActivationJournalLive { journal: PathBuf },
     #[error(transparent)]
     ActivationJournal(#[from] JournalError),
     #[error(
-        "interrupted install journal at {} must be resolved before uninstalling",
+        "cannot uninstall while an interrupted installation still has a saved record at {}; rerun `muxe integration install zellij` with the original configuration options to recover that installation first",
         journal.display()
     )]
     InstallJournalLive { journal: PathBuf },
@@ -183,11 +183,13 @@ pub enum IntegrationError {
     #[cfg(test)]
     #[error("fault injected after bridge removal (test hook)")]
     UninstallFaultInjected,
-    #[error("interrupted install journal is inconsistent: {0}")]
+    #[error("the saved record for the interrupted installation is inconsistent: {0}")]
     InconsistentJournal(String),
-    #[error("compatibility record unavailable: {0}")]
+    #[error("could not read this Muxe build's compatibility information: {0}")]
     Compat(String),
-    #[error("auditable operation cannot proceed without its log record")]
+    #[error(
+        "cannot continue installation or removal because the audit log could not be written: {0}"
+    )]
     Audit(#[from] crate::logging::LogError),
 }
 
@@ -913,7 +915,9 @@ fn journal_path(directory: &Path) -> PathBuf {
 
 fn write_journal(directory: &Path, journal: &InstallJournal) -> Result<(), IntegrationError> {
     let bytes = serde_json::to_vec_pretty(journal).map_err(|source| {
-        IntegrationError::InconsistentJournal(format!("cannot encode install journal: {source}"))
+        IntegrationError::InconsistentJournal(format!(
+            "cannot encode the installation recovery record: {source}"
+        ))
     })?;
     fsutil::ensure_owner_dir(directory)?;
     fsutil::write_atomic(&journal_path(directory), &bytes, "install-journal")?;
@@ -925,12 +929,12 @@ fn read_journal(directory: &Path) -> Result<InstallJournal, IntegrationError> {
     let bytes = fsutil::read_owner_file(&path)?;
     let journal: InstallJournal = serde_json::from_slice(&bytes).map_err(|source| {
         IntegrationError::InconsistentJournal(format!(
-            "interrupted install journal is corrupt: {source}"
+            "the installation recovery record is not valid JSON: {source}"
         ))
     })?;
     if journal.schema_version != INSTALL_JOURNAL_SCHEMA_VERSION {
         return Err(IntegrationError::InconsistentJournal(format!(
-            "unsupported install journal schema {}",
+            "unsupported installation recovery record format version {}",
             journal.schema_version
         )));
     }
@@ -1020,7 +1024,7 @@ fn resume_with(
                 })?;
                 if Sha256Digest::from_bytes(&bytes) != journal.packaged_digest {
                     return Err(IntegrationError::InconsistentJournal(
-                        "staged bridge digest does not match the journal".to_owned(),
+                        "the temporary replacement bridge's checksum does not match the saved installation record".to_owned(),
                     ));
                 }
                 Some(staged_path)
@@ -1053,7 +1057,9 @@ fn validated_staging(
     journal: &InstallJournal,
 ) -> Result<PathBuf, IntegrationError> {
     let name = journal.staged_name.clone().ok_or_else(|| {
-        IntegrationError::InconsistentJournal("journal lacks the staged file name".to_owned())
+        IntegrationError::InconsistentJournal(
+            "the installation recovery record is missing the temporary bridge filename".to_owned(),
+        )
     })?;
     if name.is_empty()
         || name.contains('/')
@@ -1062,7 +1068,7 @@ fn validated_staging(
         || Path::new(&name).file_name().and_then(|base| base.to_str()) != Some(name.as_str())
     {
         return Err(IntegrationError::InconsistentJournal(
-            "journal staging name is not a plain filename".to_owned(),
+            "the temporary bridge filename in the installation recovery record is empty or contains a path separator".to_owned(),
         ));
     }
     Ok(directory.join(name))
@@ -1104,7 +1110,7 @@ fn adopt_or_clean_staging(
             adopted = Some(path);
         } else {
             return Err(IntegrationError::InconsistentJournal(format!(
-                "staging file {} does not match the journaled bridge digest",
+                "the temporary bridge file {} does not match the checksum in the saved installation record",
                 path.display()
             )));
         }
@@ -1131,7 +1137,10 @@ fn resume_with_staged(
     let mut manual_snippet = None;
     if journal.apply_config {
         let config_path = journal.config_path.clone().ok_or_else(|| {
-            IntegrationError::InconsistentJournal("journal lacks the config path".to_owned())
+            IntegrationError::InconsistentJournal(
+                "the installation recovery record is missing the Zellij configuration path"
+                    .to_owned(),
+            )
         })?;
         match kdl::verify_records(config_path.as_path(), &journal.pending) {
             Ok(()) => {}
@@ -1167,7 +1176,7 @@ fn resume_with_staged(
                     return rollback_kdl_and_journal(directory, &journal, logger, &reason);
                 }
                 return Err(IntegrationError::InconsistentJournal(format!(
-                    "journaled KDL nodes do not match the configuration: {reason}"
+                    "the recorded Zellij configuration blocks do not match the current configuration: {reason}"
                 )));
             }
         }
@@ -1177,7 +1186,7 @@ fn resume_with_staged(
                 return rollback_kdl_and_journal(directory, &journal, logger, &reason);
             }
             return Err(IntegrationError::InconsistentJournal(format!(
-                "journaled KDL nodes do not match the configuration: {reason}"
+                "the recorded Zellij configuration blocks do not match the current configuration: {reason}"
             )));
         }
     }
@@ -1216,14 +1225,14 @@ fn check_prior_receipt(
         .map(|receipt| &receipt.bridge.installed_digest);
     if current != journal.prior_digest.as_ref() {
         return Err(IntegrationError::InconsistentJournal(
-            "receipt changed outside the transaction".to_owned(),
+            "the installation record's bridge checksum changed after installation began".to_owned(),
         ));
     }
     if let Some(receipt) = receipt.as_ref() {
         let identity = BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))?;
         if receipt.bridge.bridge_identity != identity {
             return Err(IntegrationError::InconsistentJournal(
-                "receipt bridge identity mismatch".to_owned(),
+                "the installation record identifies a different bridge directory".to_owned(),
             ));
         }
     }
@@ -1241,7 +1250,7 @@ fn verify_pre_swap_bridge_state(
     match (receipt, fs::read(&stable)) {
         (None, Err(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         (None, Ok(_)) => Err(IntegrationError::InconsistentJournal(
-            "unreceipted stable bridge exists while staged bridge is missing".to_owned(),
+            "the temporary replacement bridge is missing, but an installed bridge exists without an installation record".to_owned(),
         )),
         (Some(receipt), Ok(bytes))
             if Sha256Digest::from_bytes(&bytes) == receipt.bridge.installed_digest =>
@@ -1249,11 +1258,11 @@ fn verify_pre_swap_bridge_state(
             Ok(())
         }
         (Some(_), Ok(_)) => Err(IntegrationError::InconsistentJournal(
-            "stable bridge changed while staged bridge is missing".to_owned(),
+            "the temporary replacement bridge is missing, and the installed bridge no longer matches its recorded checksum".to_owned(),
         )),
         (Some(_), Err(error)) if error.kind() == io::ErrorKind::NotFound => {
             Err(IntegrationError::InconsistentJournal(
-                "receipted stable bridge is missing while staged bridge is missing".to_owned(),
+                "both the temporary replacement bridge and the bridge listed in the installation record are missing".to_owned(),
             ))
         }
         (_, Err(source)) => Err(IntegrationError::Fs(fsutil::io_error(
@@ -1312,16 +1321,19 @@ fn rollback_kdl_and_journal(
     verify_pre_swap_bridge_state(directory, journal)?;
     if journal.apply_config {
         let config_path = journal.config_path.clone().ok_or_else(|| {
-            IntegrationError::InconsistentJournal("journal lacks the config path".to_owned())
+            IntegrationError::InconsistentJournal(
+                "the installation recovery record is missing the Zellij configuration path"
+                    .to_owned(),
+            )
         })?;
         kdl::verify_records(config_path.as_path(), &journal.pending).map_err(|reason| {
             IntegrationError::InconsistentJournal(format!(
-                "cannot restore KDL ({context}): {reason}"
+                "cannot restore the Zellij configuration ({context}): {reason}"
             ))
         })?;
         rollback_pending_nodes(config_path.as_path(), &journal.pending).map_err(|reason| {
             IntegrationError::InconsistentJournal(format!(
-                "cannot restore KDL ({context}): {reason}"
+                "cannot restore the Zellij configuration ({context}): {reason}"
             ))
         })?;
     }
@@ -1396,7 +1408,7 @@ fn commit_resumed(
             if staged.is_none() {
                 if journal.phase == InstallPhase::BridgeCommitted {
                     return Err(IntegrationError::InconsistentJournal(
-                        "bridge-committed journal has no stable or staged bridge".to_owned(),
+                        "the installation record says the bridge was installed, but neither the installed file nor its temporary replacement exists".to_owned(),
                     ));
                 }
                 remove_journal(directory)?;
@@ -1699,7 +1711,7 @@ fn refuse_when_activation_live(
         {
             return Err(IntegrationError::ActivationJournal(
                 JournalError::Inconsistent(format!(
-                    "activation journal at {} does not match its typed unit name",
+                    "the activation record at {} does not match the host or bridge installation identified by its filename",
                     path.display()
                 )),
             ));

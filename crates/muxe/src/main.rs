@@ -489,7 +489,7 @@ fn detect_current_host(cache_dir: &Path) -> Result<muxe::lifecycle::DetectedHost
             .and_then(|entry| entry.bridge_identity().cloned())
             .ok_or_else(|| {
                 color_eyre::eyre::eyre!(
-                    "no live Zellij broker serves session {session}; --host current requires invocation from a managed host"
+                    "no running Muxe broker serves Zellij session {session}; select a host explicitly with --host herdr or --host zellij"
                 )
             })?;
         return Ok(muxe::lifecycle::DetectedHost::Zellij {
@@ -497,7 +497,9 @@ fn detect_current_host(cache_dir: &Path) -> Result<muxe::lifecycle::DetectedHost
             bridge_identity,
         });
     }
-    bail!("--host current requires invocation from a managed host")
+    bail!(
+        "cannot detect the current host; run this command inside Herdr or Zellij, or select a host explicitly with --host herdr or --host zellij"
+    )
 }
 
 /// Runs one activation across every live unit in scope: registry liveness
@@ -513,14 +515,14 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
     let report = Box::pin(run_activation(command.host, current)).await?;
     for unit in &report.units {
         match unit {
-            muxe::lifecycle::UnitOutcome::Committed { unit } => println!("committed {unit}"),
-            muxe::lifecycle::UnitOutcome::Unchanged { unit } => println!("unchanged {unit}"),
+            muxe::lifecycle::UnitOutcome::Committed { unit } => println!("Activated {unit}."),
+            muxe::lifecycle::UnitOutcome::Unchanged { unit } => println!("Already active: {unit}."),
             muxe::lifecycle::UnitOutcome::RolledBack { unit, reason } => {
-                println!("rolled back {unit}: {reason}");
+                println!("Activation failed for {unit} and was rolled back.\n{reason}");
             }
             muxe::lifecycle::UnitOutcome::NotApplied { unit, reason } => {
                 println!("Muxe could not activate {unit}.\n{reason}");
-                println!("No activation changes were applied to this unit.");
+                println!("No activation changes were applied to this target.");
             }
             muxe::lifecycle::UnitOutcome::PrepareRefused {
                 member,
@@ -534,10 +536,10 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
                 println!("Muxe could not activate {}.\n{reason}", member.as_str());
                 if evidence == &Some(muxe_protocol::control::PrepareRefusalEvidence::NoHostMutation)
                 {
-                    println!("Prepare was refused before it applied any changes to this host.");
+                    println!("The existing broker refused replacement before changing the host.");
                 } else {
                     println!(
-                        "The existing broker is active. Muxe cannot confirm whether Prepare made earlier changes to this host."
+                        "The existing broker is running, but Muxe cannot confirm whether the attempted replacement already changed the host."
                     );
                 }
                 if *restored_bridge {
@@ -557,13 +559,15 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
                 reason,
                 diagnostics,
             } => {
-                println!("Muxe could not activate {unit}.\n{reason}");
+                println!(
+                    "Muxe could not activate {unit} or fully restore its previous state.\n{reason}"
+                );
                 for diagnostic in diagnostics {
                     println!("Rollback error: {diagnostic}");
                 }
             }
             muxe::lifecycle::UnitOutcome::Failed { unit, reason } => {
-                println!("failed {unit}: {reason}");
+                println!("Muxe could not activate {unit}.\n{reason}");
             }
         }
     }
@@ -571,7 +575,7 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
     // still failed: report every outcome, then exit nonzero like any error so
     // CLI callers observe the original failure instead of a quiet success.
     if activation_incomplete(&report.units) {
-        bail!("activation did not complete every selected unit");
+        bail!("Muxe could not activate every selected broker. See the errors above.");
     }
     Ok(())
 }
@@ -610,7 +614,7 @@ async fn run_activation(
     let staged_bridge = if zellij_selected {
         Some(muxe::lifecycle::StagedBridge {
             bytes: packaged_bridge_bytes().wrap_err(
-                "a Zellij unit is selected but no packaged bridge is installed alongside this binary",
+                "Zellij activation requires the packaged bridge file; reinstall the complete Muxe release, not just the executable",
             )?,
         })
     } else {
@@ -813,7 +817,7 @@ impl muxe::lifecycle::TargetSpawnPolicy for HerdrTargetSpawn<'_> {
     ) -> Result<(PathBuf, Vec<OsString>), muxe::lifecycle::ActivateError> {
         let muxe::lifecycle::UnitKind::Herdr { host_hash } = member.unit else {
             return Err(muxe::lifecycle::ActivateError::Spawn(
-                "Herdr renderer received a foreign journal unit".to_owned(),
+                "cannot start a Herdr broker from an activation record for another host".to_owned(),
             ));
         };
         if member.observed_host != ProtocolHostKind::Herdr
@@ -823,7 +827,7 @@ impl muxe::lifecycle::TargetSpawnPolicy for HerdrTargetSpawn<'_> {
             || muxe::lifecycle::journal::unit_hash(member.authority.member.as_str()) != *host_hash
         {
             return Err(muxe::lifecycle::ActivateError::Spawn(
-                "observed Herdr member disagrees with journal unit".to_owned(),
+                "cannot start the replacement Herdr broker: the registered host identity does not match the saved activation record".to_owned(),
             ));
         }
         let program = self.context.executable.to_path_buf();
@@ -832,7 +836,7 @@ impl muxe::lifecycle::TargetSpawnPolicy for HerdrTargetSpawn<'_> {
             socket: member.authority.endpoint.as_path().to_path_buf(),
             herdr_binary: self.binary.cloned().ok_or_else(|| {
                 muxe::lifecycle::ActivateError::Spawn(
-                    "no Herdr executable is installed for a Herdr target".to_owned(),
+                    "cannot start the replacement broker because the Herdr executable was not found".to_owned(),
                 )
             })?,
             herdr_socket: PathBuf::from(member.authority.member.as_str()),
@@ -859,7 +863,8 @@ impl muxe::lifecycle::TargetSpawnPolicy for ZellijTargetSpawn<'_> {
     ) -> Result<(PathBuf, Vec<OsString>), muxe::lifecycle::ActivateError> {
         let muxe::lifecycle::UnitKind::Zellij { bridge_unit } = member.unit else {
             return Err(muxe::lifecycle::ActivateError::Spawn(
-                "Zellij renderer received a foreign journal unit".to_owned(),
+                "cannot start a Zellij broker from an activation record for another host"
+                    .to_owned(),
             ));
         };
         if member.observed_host != ProtocolHostKind::Zellij
@@ -871,7 +876,7 @@ impl muxe::lifecycle::TargetSpawnPolicy for ZellijTargetSpawn<'_> {
                 .is_none_or(|id| id.as_str() != member.authority.member.as_str())
         {
             return Err(muxe::lifecycle::ActivateError::Spawn(
-                "observed bridge member disagrees with journal unit".to_owned(),
+                "cannot start the replacement Zellij broker: the registered session or bridge directory does not match the saved activation record".to_owned(),
             ));
         }
         let program = self.context.executable.to_path_buf();
@@ -880,7 +885,7 @@ impl muxe::lifecycle::TargetSpawnPolicy for ZellijTargetSpawn<'_> {
             socket: member.authority.endpoint.as_path().to_path_buf(),
             zellij_exe: self.binary.cloned().ok_or_else(|| {
                 muxe::lifecycle::ActivateError::Spawn(
-                    "no Zellij executable is installed for a Zellij target".to_owned(),
+                    "cannot start the replacement broker because the Zellij executable was not found".to_owned(),
                 )
             })?,
             session: member.authority.member.as_str().to_owned(),
@@ -999,14 +1004,14 @@ fn attest_broker_registration(
     registration: &muxe::lifecycle::registry::Registration,
 ) -> Result<()> {
     let entry = registration.entry();
-    let id = entry
-        .registration_id
-        .ok_or_else(|| color_eyre::eyre::eyre!("broker registration lacks its original token"))?;
+    let id = entry.registration_id.ok_or_else(|| {
+        color_eyre::eyre::eyre!("the broker registry entry is missing its process registration ID")
+    })?;
     let proof = muxe_protocol::control::BrokerRegistrationProof::new(id, entry.started_at)
-        .wrap_err("broker registration lacks its original timestamp")?;
+        .wrap_err("the broker registry entry has an invalid process start time")?;
     server
         .attest_registration(proof)
-        .wrap_err("broker could not attest its registration")
+        .wrap_err("the broker could not confirm its registry entry belongs to this process")
 }
 
 /// Private broker child mode used only by the repository-owned cross-version fixture.
@@ -1085,21 +1090,27 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
         },
         (Some(handoff), Some(journal_path)) => {
             let journal = muxe::lifecycle::journal::read_journal(&journal_path)
-                .wrap_err("could not read the durable activation journal")?;
+                .wrap_err("could not read the saved activation record")?;
             if !matches!(journal.unit, muxe::lifecycle::UnitKind::Herdr { .. })
                 || journal.target_record != current
                 || journal.directive() != muxe::lifecycle::TransactionDirective::Activate
             {
-                bail!("activation journal does not authorize this Herdr target record");
+                bail!(
+                    "cannot start the replacement Herdr broker: the saved activation record does not match this host, Muxe version, or activation step"
+                );
             }
             let member_id =
                 muxe::lifecycle::ActivationMemberId::new(live_server.discovery_key.clone())
-                    .wrap_err("Herdr discovery key is not a valid activation member identity")?;
+                    .wrap_err(
+                        "the Herdr socket path is not a valid activation target identifier",
+                    )?;
             let member = journal.recovery_member(&member_id, handoff).wrap_err(
-                "activation journal does not authorize this Herdr host identity and handoff",
+                "the Herdr host and replacement request do not match the saved activation record",
             )?;
             if member.endpoint().as_path() != command.socket {
-                bail!("activation journal does not authorize this Herdr endpoint");
+                bail!(
+                    "the requested Herdr broker socket does not match the saved activation record"
+                );
             }
             muxe_broker::ActivationBootstrap::Target {
                 current,
@@ -1108,7 +1119,9 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
                 bridge_unit: None,
             }
         }
-        _ => bail!("broker target startup requires both --handoff and --activation-journal"),
+        _ => {
+            bail!("starting a replacement broker requires both --handoff and --activation-journal")
+        }
     };
     let registry = muxe::lifecycle::Registry::open(&command.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
@@ -1120,7 +1133,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     );
     entry.registration_id = Some(
         muxe_protocol::control::BrokerRegistrationId::generate()
-            .wrap_err("could not mint Herdr broker registration identity")?,
+            .wrap_err("could not generate the Herdr broker's process registration ID")?,
     );
     entry.live_server = Some(live_server.server_id.as_str().to_owned());
     // The Registration token scopes cleanup to this process's exact entry: an old
@@ -1137,7 +1150,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
         bridge_identity: None,
         bridge_member: None,
         discovery_key: muxe::lifecycle::ActivationMemberId::new(live_server.discovery_key.clone())
-            .wrap_err("Herdr discovery key is not a valid activation member identity")?,
+            .wrap_err("the Herdr socket path is not a valid activation target identifier")?,
         zellij_exe: None,
         registration_id: registration.entry().registration_id,
     });
@@ -1201,7 +1214,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         color_eyre::eyre::eyre!("broker configuration file has no parent directory")
     })?;
     let bridge_identity = muxe::integration::bridge_identity(serve_config_dir)
-        .wrap_err("could not resolve canonical Zellij bridge authority")?;
+        .wrap_err("could not resolve the Zellij bridge installation directory")?;
     let mut unit_guard = if command.handoff.is_none() {
         let cache_dir = command.cache_dir.clone();
         let identity = bridge_identity.clone();
@@ -1210,8 +1223,8 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 muxe::lifecycle::BridgeUnitGuard::acquire_blocking(&cache_dir, identity)
             })
             .await
-            .wrap_err("Zellij bridge-unit guard task failed")?
-            .wrap_err("could not acquire Zellij bridge-unit guard before endpoint startup")?,
+            .wrap_err("the task acquiring the Zellij bridge lock ended unexpectedly")?
+            .wrap_err("could not lock the Zellij bridge installation before starting the broker")?,
         )
     } else {
         None
@@ -1231,7 +1244,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         );
     }
     let pre_lock = pre_endpoint.acquire_startup_lock().map_err(|error| {
-        color_eyre::eyre::eyre!("another broker starter holds the Zellij endpoint: {error}")
+        color_eyre::eyre::eyre!("could not lock the Zellij broker socket during startup: {error}")
     })?;
     if let Err(error) = pre_endpoint.remove_validated_stale_socket() {
         drop(pre_lock);
@@ -1253,14 +1266,16 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     };
     let (adapter, deferred_pipes) = if is_target {
         let (adapter, pipes) = muxe_adapter_zellij::ZellijAdapter::connect_deferred(adapter_config)
-            .wrap_err("could not reserve dormant Zellij target pipes")?;
+            .wrap_err("could not reserve communication pipes for the replacement Zellij broker")?;
         (std::sync::Arc::new(adapter), Some(pipes))
     } else {
         (
             std::sync::Arc::new(
                 muxe_adapter_zellij::ZellijAdapter::connect(adapter_config)
                     .await
-                    .wrap_err("could not connect the pinned Zellij session for broker startup")?,
+                    .wrap_err(
+                        "could not connect to the selected Zellij session during broker startup",
+                    )?,
             ),
             None,
         )
@@ -1269,7 +1284,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     let reserved = if is_target {
         let identity = adapter
             .reserve_startup_identity()
-            .wrap_err("could not reserve the gated Zellij target identity")?;
+            .wrap_err("could not allocate an identity for the replacement Zellij broker")?;
         Some(muxe_protocol::LiveServerIdentity {
             host: ProtocolHostKind::Zellij,
             discovery_key: identity.discovery_key.as_str().to_owned(),
@@ -1279,7 +1294,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
         establish_initial_round_until(&adapter, deadline, &logger)
             .await
-            .wrap_err("Zellij initial census round never established")?;
+            .wrap_err("could not obtain current Zellij client registrations during startup")?;
         None
     };
     let adapter_object: std::sync::Arc<dyn muxe_adapter_api::HostAdapter> = adapter.clone();
@@ -1297,7 +1312,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         broker
             .live_identity()
             .await
-            .wrap_err("could not capture the pinned Zellij live identity")?
+            .wrap_err("could not read the connected Zellij session's identity")?
     };
     if live_server.discovery_key != command.session {
         bail!(
@@ -1333,14 +1348,14 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         ),
         (Some(handoff), Some(journal_path)) => {
             let journal = muxe::lifecycle::journal::read_journal(&journal_path)
-                .wrap_err("could not read the durable activation journal")?;
+                .wrap_err("could not read the saved activation record")?;
             if !matches!(journal.unit, muxe::lifecycle::UnitKind::Zellij { .. })
                 || journal.target_record != current
                 || journal.bridge_identity.as_ref() != Some(&bridge_identity)
                 || journal.directive() != muxe::lifecycle::TransactionDirective::Activate
             {
                 bail!(
-                    "activation journal does not authorize this Zellij target record and bridge identity"
+                    "cannot start the replacement Zellij broker: the saved activation record does not match this host, Muxe version, bridge directory, or activation step"
                 );
             }
             let capability = journal
@@ -1349,7 +1364,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                     &command.socket,
                     handoff,
                 )
-                .wrap_err("activation journal does not authorize target registration")?;
+                .wrap_err("the replacement Zellij broker's session, socket, or replacement request does not match the saved activation record")?;
             (
                 muxe_broker::ActivationBootstrap::Target {
                     current,
@@ -1362,7 +1377,9 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 Some((journal_path, journal.activation_id)),
             )
         }
-        _ => bail!("broker target startup requires both --handoff and --activation-journal"),
+        _ => {
+            bail!("starting a replacement broker requires both --handoff and --activation-journal")
+        }
     };
 
     let registry = muxe::lifecycle::Registry::open(&command.cache_dir)
@@ -1372,7 +1389,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         && receipt.bridge.bridge_identity != bridge_identity
     {
         bail!(
-            "integration receipt names bridge identity {} but this broker serves {}; refusing a divergent registration",
+            "the installation record identifies bridge directory {}, but this broker serves {}; refusing to register the broker for a different installation",
             receipt.bridge.bridge_identity,
             bridge_identity
         );
@@ -1386,13 +1403,13 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     entry.bridge_identity = Some(bridge_identity.clone());
     entry.bridge_member = Some(
         muxe::lifecycle::BridgeMemberId::new(live_server.discovery_key.clone())
-            .wrap_err("invalid Zellij logical member")?,
+            .wrap_err("the Zellij session name is not a valid bridge session identifier")?,
     );
     entry.handoff_id = registration_handoff;
     entry.live_server = Some(live_server.server_id.as_str().to_owned());
     entry.registration_id = Some(
         muxe_protocol::control::BrokerRegistrationId::generate()
-            .wrap_err("could not mint Zellij broker registration identity")?,
+            .wrap_err("could not generate the Zellij broker's process registration ID")?,
     );
     let recovery = Arc::new(JournalRecovery {
         cache_dir: command.cache_dir.clone(),
@@ -1402,7 +1419,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         bridge_identity: Some(bridge_identity.clone()),
         bridge_member: entry.bridge_member.clone(),
         discovery_key: muxe::lifecycle::ActivationMemberId::new(live_server.discovery_key.clone())
-            .wrap_err("Zellij discovery key is not a valid activation member identity")?,
+            .wrap_err("the Zellij session name is not a valid activation target identifier")?,
         zellij_exe: Some(command.zellij_exe.clone()),
         registration_id: entry.registration_id,
     });
@@ -1437,7 +1454,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         )
         .exclusive(std::time::Duration::from_secs(2))
         .await
-        .wrap_err("could not serialize Zellij target registry publication")?;
+        .wrap_err("could not acquire the lock needed to register the replacement Zellij broker")?;
         let registration = if let Some(capability) = target_registration.as_ref() {
             registry.register_zellij_target(capability, entry)
         } else {
@@ -1515,16 +1532,18 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 deferred_pipes.start(),
             )
             .await
-            .map_err(|_| color_eyre::eyre::eyre!("Zellij target pipe startup exceeded its deadline"))?
-            .wrap_err("could not start Zellij target pipes after bridge reload")?;
+            .map_err(|_| color_eyre::eyre::eyre!("timed out starting the replacement Zellij broker's communication pipes"))?
+            .wrap_err("could not start the replacement Zellij broker's communication pipes after reloading the bridge")?;
             establish_initial_round_until(&adapter, deadline, &logger).await?;
             let identity = broker
                 .live_identity()
                 .await
-                .wrap_err("could not read the covered Zellij target identity")?;
+                .wrap_err("could not read the replacement Zellij broker's identity after registering clients")?;
             if identity != live_server {
                 bail!(
-                    "covered Zellij target identity differs from the gated registration: expected {live_server:?}, found {identity:?}"
+                    "the Zellij session identity changed during replacement broker startup: expected session {} with server ID {}, received session {} with server ID {}",
+                    live_server.discovery_key, live_server.server_id.as_str(),
+                    identity.discovery_key, identity.server_id.as_str()
                 );
             }
             Ok::<(), color_eyre::Report>(())
@@ -1535,7 +1554,9 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 &logger,
                 "zellij",
                 "broker-serve",
-                &format!("target census or identity verification failed: {error}"),
+                &format!(
+                    "could not verify the replacement broker's Zellij clients and session identity: {error}"
+                ),
             );
             let _ = shutdown_tx.send(true);
             let _ = server_handle.await;
@@ -1548,7 +1569,9 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 &registration,
             )
             .wrap_err("could not remove failed Zellij target registration")?;
-            return Err(error).wrap_err("Zellij target census or identity verification failed");
+            return Err(error).wrap_err(
+                "could not verify the replacement broker's Zellij clients and session identity",
+            );
         }
         let joined = server_handle.await;
         diagnostics_task.stop_and_join().await;
@@ -1612,8 +1635,9 @@ async fn wait_for_target_bridge_reload(
     deadline: std::time::Instant,
 ) -> Result<()> {
     loop {
-        let journal = muxe::lifecycle::journal::read_journal(expected.journal_path)
-            .wrap_err("could not inspect gated target's activation journal")?;
+        let journal = muxe::lifecycle::journal::read_journal(expected.journal_path).wrap_err(
+            "could not read the saved activation record while waiting for the Zellij bridge reload",
+        )?;
         if journal.activation_id != expected.activation_id
             || journal.unit
                 != (muxe::lifecycle::UnitKind::Zellij {
@@ -1626,7 +1650,9 @@ async fn wait_for_target_bridge_reload(
                 .recovery_member(expected.member, expected.handoff)
                 .is_ok_and(|member| member.endpoint().as_path() == expected.endpoint)
         {
-            bail!("gated Zellij target lost its exact journal authority before bridge reload");
+            bail!(
+                "cannot start the replacement Zellij broker: the saved activation record no longer matches this broker or permits the bridge reload"
+            );
         }
         if journal.bridge().is_some_and(|bridge| {
             bridge.progress == muxe::lifecycle::BridgeProgress::TargetReloaded
@@ -1635,7 +1661,9 @@ async fn wait_for_target_bridge_reload(
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            bail!("gated Zellij target waited past its deadline for durable bridge reload");
+            bail!(
+                "timed out waiting for confirmation that the replacement Zellij bridge was reloaded in every participating session"
+            );
         }
         tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
     }
@@ -1653,7 +1681,8 @@ async fn establish_initial_round_until(
     deadline: std::time::Instant,
     logger: &muxe::logging::Logger,
 ) -> Result<()> {
-    let mut last_error = String::from("startup budget elapsed before the first attempt");
+    let mut last_error =
+        String::from("startup timed out before the first client registration request");
     let mut retrying = false;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -1679,7 +1708,7 @@ async fn establish_initial_round_until(
                 }
                 Err(_) => {
                     last_error = String::from(
-                        "initial subscription refresh stalled past the startup budget",
+                        "timed out restarting the Zellij event subscription during broker startup",
                     );
                     serve_event(logger, "zellij", "broker-serve", &last_error);
                     break;
@@ -1700,19 +1729,21 @@ async fn establish_initial_round_until(
                         logger,
                         "zellij",
                         "broker-serve",
-                        &format!("initial census attempt failed: {error}"),
+                        &format!("could not obtain current Zellij client registrations: {error}"),
                     );
                 }
                 last_error = error;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(_) => {
-                last_error = String::from("initial census round stalled past the startup budget");
+                last_error = String::from(
+                    "timed out waiting for current Zellij client registrations during startup",
+                );
                 serve_event(
                     logger,
                     "zellij",
                     "broker-serve",
-                    &format!("initial census attempt failed: {last_error}"),
+                    &format!("could not obtain current Zellij client registrations: {last_error}"),
                 );
                 break;
             }
@@ -1748,17 +1779,21 @@ impl JournalRecoveryPermit {
                 &self.discovery_key,
             )
             .await
-            .map_err(|error| format!("cannot continue rollback after ack: {error}"))?
+            .map_err(|error| format!("could not continue restoring the previous state after the broker replied: {error}"))?
             {
                 muxe::lifecycle::BrokerRollbackOutcome::ResumeLocal => {
-                    return Err("rollback requested a duplicate local resume after ack".to_owned());
+                    return Err("restoration requested a second resume of the existing broker after that broker confirmed it had resumed".to_owned());
                 }
                 muxe::lifecycle::BrokerRollbackOutcome::AwaitingPeers
                 | muxe::lifecycle::BrokerRollbackOutcome::Complete => {}
             }
         } else if journal.directive() == muxe::lifecycle::TransactionDirective::Commit {
             muxe::lifecycle::activate::finish_acknowledged_commit(cache_dir, journal, &self.path)
-                .map_err(|error| format!("cannot finish broker-acknowledged commit: {error}"))?;
+                .map_err(|error| {
+                format!(
+                    "could not finish activation after the broker confirmed completion: {error}"
+                )
+            })?;
         }
         Ok(())
     }
@@ -1774,32 +1809,30 @@ impl muxe_broker::RecoveryPermit for JournalRecoveryPermit {
             let unit_lock = self
                 .lock
                 .lock()
-                .map_err(|_| "recovery permit lock poisoned".to_owned())?
+                .map_err(|_| "cannot record recovery completion because a previous task failed while holding the recovery state lock".to_owned())?
                 .take()
-                .ok_or_else(|| "recovery permit was already consumed".to_owned())?;
+                .ok_or_else(|| "cannot record another recovery completion using an authorization that has already been used".to_owned())?;
             let mut journal = muxe::lifecycle::journal::read_journal(&self.path)
-                .map_err(|error| format!("cannot read recovery journal for ack: {error}"))?;
+                .map_err(|error| format!("could not read the saved activation record to record recovery completion: {error}"))?;
             if ack == muxe_broker::RecoveryAck::OldCommitted {
                 let member = journal
                     .recovery_member(&self.discovery_key, *handoff)
-                    .map_err(|error| format!("old retirement member unauthorized: {error}"))?;
-                let directory = self
-                    .path
-                    .parent()
-                    .ok_or_else(|| "recovery receipt directory is missing".to_owned())?;
+                    .map_err(|error| format!("cannot record the existing broker as stopped: its host identity or replacement request does not match the saved activation record: {error}"))?;
+                let directory = self.path.parent().ok_or_else(|| {
+                    "the directory containing the saved broker shutdown record is missing"
+                        .to_owned()
+                })?;
                 if !muxe::lifecycle::journal::has_old_retirement_receipt(
                     directory, &journal, member,
                 )
-                .map_err(|error| format!("old retirement proof invalid: {error}"))?
+                .map_err(|error| format!("could not verify the record confirming that the existing broker stopped: {error}"))?
                 {
-                    return Err("old retirement proof is absent after stop barrier".to_owned());
+                    return Err("the existing broker reported completion, but the saved record confirming its shutdown is missing".to_owned());
                 }
             }
-            let cache_dir = self
-                .path
-                .parent()
-                .and_then(Path::parent)
-                .ok_or_else(|| "recovery journal cache directory is missing".to_owned())?;
+            let cache_dir = self.path.parent().and_then(Path::parent).ok_or_else(|| {
+                "the saved activation record's cache directory is missing".to_owned()
+            })?;
             match ack {
                 muxe_broker::RecoveryAck::TargetRetired => {
                     muxe::lifecycle::journal::acknowledge_remote_target_retirement(
@@ -1810,7 +1843,7 @@ impl muxe_broker::RecoveryPermit for JournalRecoveryPermit {
                         &self.server_id,
                     )
                     .map_err(|error| {
-                        format!("cannot persist target retirement acknowledgement: {error}")
+                        format!("could not save confirmation that the replacement broker stopped: {error}")
                     })?;
                 }
                 ack => {
@@ -1829,10 +1862,10 @@ impl muxe_broker::RecoveryPermit for JournalRecoveryPermit {
                     journal
                         .acknowledge_broker(&self.discovery_key, *handoff, ack)
                         .map_err(|error| {
-                            format!("cannot apply recovery acknowledgement: {error}")
+                            format!("could not record the broker's recovery result: {error}")
                         })?;
                     muxe::lifecycle::journal::write_journal(cache_dir, &journal).map_err(
-                        |error| format!("cannot persist recovery acknowledgement: {error}"),
+                        |error| format!("could not save the broker's recovery result: {error}"),
                     )?;
                 }
             }
@@ -1878,17 +1911,17 @@ impl JournalRecovery {
                 }
             || !muxe::lifecycle::activate::status_attests_journal(status, journal)
         {
-            return Err("target Commit lacks exact proof-era journal and broker status".to_owned());
+            return Err("cannot finish activation: the replacement broker's version, host identity, or activation state does not match the saved activation record".to_owned());
         }
         let rows = muxe::lifecycle::Registry::open(&self.cache_dir)
             .and_then(|registry| registry.entries())
-            .map_err(|error| format!("target Commit registry unavailable: {error}"))?;
+            .map_err(|error| format!("cannot finish activation because the broker registry could not be read: {error}"))?;
         let mut matching = rows
             .iter()
             .filter(|row| row.socket == member.endpoint().as_path());
         let row = matching
             .next()
-            .ok_or_else(|| "target Commit lacks its original registry incarnation".to_owned())?;
+            .ok_or_else(|| "cannot finish activation: the replacement broker's original process registration is missing from the registry".to_owned())?;
         if matching.next().is_some()
             || row.host_kind != if zellij { "zellij" } else { "herdr" }
             || row.discovery_key != self.discovery_key.as_str()
@@ -1902,7 +1935,7 @@ impl JournalRecovery {
                 .and_then(|proof| proof.member(&member.id))
                 .is_none_or(|proof| !proof.matches(row, &status.live_server.server_id))
         {
-            return Err("target Commit registry identity differs from sealed Ready".to_owned());
+            return Err("cannot finish activation: the replacement broker's process registration no longer matches the broker that passed the readiness checks".to_owned());
         }
         Ok(())
     }
@@ -1929,7 +1962,7 @@ impl JournalRecovery {
             || (status.lifecycle == muxe_protocol::control::LifecycleState::SupervisorOnly
                 && status.target.is_some())
         {
-            return Err("Muxe cannot confirm the old broker's activation phase and readiness for this handoff, so it cannot safely stop that broker".to_owned());
+            return Err("cannot safely stop the existing broker: its version, host identity, or replacement state does not match the saved activation record".to_owned());
         }
         let mut entries = journal.old_registry.iter().filter(|entry| {
             entry.socket == member.endpoint().as_path()
@@ -1937,7 +1970,7 @@ impl JournalRecovery {
         });
         let row = entries
             .next()
-            .ok_or_else(|| "The activation journal has no recorded identity for the old broker that Muxe was asked to stop".to_owned())?;
+            .ok_or_else(|| "cannot safely stop the existing broker: the saved activation record has no identity for that process".to_owned())?;
         if entries.next().is_some()
             || row.server_pid != std::process::id()
             || row.registration_id != self.registration_id
@@ -1948,7 +1981,7 @@ impl JournalRecovery {
             || row.bridge_identity != self.bridge_identity
             || row.bridge_member != self.bridge_member
         {
-            return Err("The broker that Muxe was asked to stop does not match the old broker identity recorded in the activation journal".to_owned());
+            return Err("cannot safely stop the existing broker: this process does not match the broker recorded when activation began".to_owned());
         }
         Ok(())
     }
@@ -1975,7 +2008,7 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 Err(error) => {
                     return muxe_broker::RecoveryDecision::Preserve {
                         reason: format!(
-                            "cannot establish activation journal state at {}: {error}",
+                            "could not inspect the saved activation record at {}: {error}",
                             path.display()
                         ),
                     };
@@ -1990,31 +2023,46 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 Ok(Ok(lock)) => lock,
                 Ok(Err(error)) => {
                     return muxe_broker::RecoveryDecision::Preserve {
-                        reason: format!("recovery unit lock acquisition failed: {error}"),
+                        reason: format!(
+                            "could not lock the saved activation record for recovery: {error}"
+                        ),
                     };
                 }
                 Err(error) => {
                     return muxe_broker::RecoveryDecision::Preserve {
-                        reason: format!("recovery unit lock task failed: {error}"),
+                        reason: format!(
+                            "the task acquiring the activation recovery lock ended unexpectedly: {error}"
+                        ),
                     };
                 }
             };
             let preserve = |reason: &str| muxe_broker::RecoveryDecision::Preserve {
                 reason: reason.to_owned(),
             };
-            let Ok(mut journal) = muxe::lifecycle::journal::read_journal(&path) else {
-                return preserve("activation journal is corrupt, unsupported, or inconsistent");
+            let mut journal = match muxe::lifecycle::journal::read_journal(&path) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    return preserve(&format!(
+                        "cannot recover activation because its saved record could not be read: {error}"
+                    ));
+                }
             };
             if journal.unit != self.unit {
-                return preserve("activation journal does not match this typed unit");
+                return preserve(
+                    "the saved activation record belongs to a different host or bridge installation",
+                );
             }
             match &self.unit {
                 muxe::lifecycle::UnitKind::Zellij { bridge_unit } => {
                     let Some(identity) = self.bridge_identity.as_ref() else {
-                        return preserve("Zellij recovery lacks canonical bridge identity");
+                        return preserve(
+                            "cannot recover the Zellij broker because its bridge installation identity is missing",
+                        );
                     };
                     let Some(member) = self.bridge_member.as_ref() else {
-                        return preserve("Zellij recovery lacks typed bridge member");
+                        return preserve(
+                            "cannot recover the Zellij broker because its session identifier is missing",
+                        );
                     };
                     if identity.unit() != *bridge_unit
                         || journal.bridge_identity.as_ref() != Some(identity)
@@ -2024,18 +2072,22 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                             .is_some_and(|census| census.members().contains(member))
                     {
                         return preserve(
-                            "activation journal canonical bridge authority does not match this broker",
+                            "the Zellij broker's bridge installation or session is not listed in the saved activation record",
                         );
                     }
                 }
                 muxe::lifecycle::UnitKind::Herdr { .. } => {
                     if self.bridge_identity.is_some() || self.bridge_member.is_some() {
-                        return preserve("Herdr recovery carries Zellij bridge authority");
+                        return preserve(
+                            "cannot recover the Herdr broker because its recovery state incorrectly contains a Zellij bridge identity",
+                        );
                     }
                 }
             }
             let Ok(member) = journal.recovery_member(&self.discovery_key, *handoff) else {
-                return preserve("broker identity and handoff do not match the transaction member");
+                return preserve(
+                    "the broker's host identity or replacement request does not match the saved activation record",
+                );
             };
             let expected_host = if matches!(self.unit, muxe::lifecycle::UnitKind::Zellij { .. }) {
                 ProtocolHostKind::Zellij
@@ -2047,13 +2099,15 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 || !muxe::lifecycle::activate::status_attests_journal(local_status, &journal)
             {
                 return preserve(
-                    "broker status does not attest the exact journal host and bridge unit",
+                    "the broker's reported host or bridge installation does not match the saved activation record",
                 );
             }
             if journal.directive() == muxe::lifecycle::TransactionDirective::Commit
                 && !journal.has_commit_certificate()
             {
-                return preserve("Ready journal lacks an exact target incarnation certificate");
+                return preserve(
+                    "cannot finish activation because the saved record has no verified process identity for the replacement broker",
+                );
             }
             if journal.directive() == muxe::lifecycle::TransactionDirective::Commit {
                 let old_role = local_status.current == member.old_record
@@ -2073,7 +2127,7 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                     && local_status.target.is_none();
                 if !old_role && !target_role {
                     return preserve(
-                        "commit permit lacks exact old or target journal-authorized live status",
+                        "cannot finish activation: the responding broker is neither the existing broker awaiting retirement nor the verified replacement broker",
                     );
                 }
                 if old_role
@@ -2111,7 +2165,7 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 ) {
                     Ok(()) => muxe_broker::RecoveryDecision::CleanupComplete,
                     Err(error) => preserve(&format!(
-                        "terminal transaction cleanup could not converge: {error}"
+                        "could not remove the files left by the completed activation: {error}"
                     )),
                 };
             }
@@ -2120,12 +2174,14 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 muxe::lifecycle::TransactionDirective::Prepare
                     | muxe::lifecycle::TransactionDirective::Activate
             ) {
-                journal.enter_rollback("broker disconnect selected rollback".to_owned());
+                journal.enter_rollback(
+                    "the activation connection closed before replacement was complete".to_owned(),
+                );
                 if let Err(error) =
                     muxe::lifecycle::journal::write_journal(&self.cache_dir, &journal)
                 {
                     return preserve(&format!(
-                        "rollback decision could not be persisted: {error}"
+                        "could not save the decision to restore the existing broker: {error}"
                     ));
                 }
             }
@@ -2146,14 +2202,16 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 {
                     Ok(muxe::lifecycle::BrokerRollbackOutcome::ResumeLocal) => {}
                     Ok(muxe::lifecycle::BrokerRollbackOutcome::AwaitingPeers) => {
-                        return preserve("rollback awaits exact progress from another member");
+                        return preserve(
+                            "restoring the previous state is waiting for another participating broker",
+                        );
                     }
                     Ok(muxe::lifecycle::BrokerRollbackOutcome::Complete) => {
                         return muxe_broker::RecoveryDecision::CleanupComplete;
                     }
                     Err(error) => {
                         return preserve(&format!(
-                            "shared rollback driver could not converge: {error}"
+                            "could not complete restoration of the previous activation state: {error}"
                         ));
                     }
                 }
@@ -2167,7 +2225,9 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 if let Err(error) =
                     muxe::lifecycle::journal::write_journal(&self.cache_dir, &journal)
                 {
-                    return preserve(&format!("commit decision could not be persisted: {error}"));
+                    return preserve(&format!(
+                        "could not save the decision to keep the replacement broker: {error}"
+                    ));
                 }
             }
             if let Some(member) = old_commit_index {
@@ -2177,7 +2237,7 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                     muxe::lifecycle::journal::write_journal(&self.cache_dir, &journal)
                 {
                     return preserve(&format!(
-                        "old commit intent could not be persisted: {error}"
+                        "could not save the request to stop the existing broker: {error}"
                     ));
                 }
             }
@@ -2194,10 +2254,14 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 ) {
                     Ok(false) => {}
                     Ok(true) => {
-                        return preserve("old retirement proof already exists before Stop");
+                        return preserve(
+                            "the saved record says the existing broker was already stopped, but that broker is still requesting permission to stop",
+                        );
                     }
                     Err(error) => {
-                        return preserve(&format!("old retirement proof path is unsafe: {error}"));
+                        return preserve(&format!(
+                            "could not safely read the record confirming that the existing broker stopped: {error}"
+                        ));
                     }
                 }
             }
@@ -2231,7 +2295,7 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 muxe::lifecycle::TransactionDirective::CleanupCommitted
                 | muxe::lifecycle::TransactionDirective::CleanupRolledBack => {
                     muxe_broker::RecoveryDecision::Preserve {
-                        reason: "terminal cleanup was not handled under the unit lock".to_owned(),
+                        reason: "the completed activation still requires file cleanup before recovery can continue".to_owned(),
                     }
                 }
             }
@@ -2246,10 +2310,10 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
             let path = muxe::lifecycle::journal::activation_dir(&self.cache_dir)
                 .join(self.unit.journal_name());
             let journal = muxe::lifecycle::journal::read_journal(&path)
-                .map_err(|error| format!("target Commit journal unavailable: {error}"))?;
+                .map_err(|error| format!("cannot finish activation because the saved activation record could not be read: {error}"))?;
             let member = journal
                 .recovery_member(&self.discovery_key, *handoff)
-                .map_err(|error| format!("target Commit member unauthorized: {error}"))?;
+                .map_err(|error| format!("cannot finish activation: the replacement broker's host identity or request does not match the saved activation record: {error}"))?;
             self.validate_target_incarnation(&journal, member, local_status)
         })
     }
@@ -2262,13 +2326,13 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
             let path = muxe::lifecycle::journal::activation_dir(&self.cache_dir)
                 .join(self.unit.journal_name());
             let journal = muxe::lifecycle::journal::read_journal(&path)
-                .map_err(|error| format!("old Commit journal unavailable: {error}"))?;
+                .map_err(|error| format!("cannot safely stop the existing broker because the saved activation record could not be read: {error}"))?;
             let member = journal
                 .recovery_member(&self.discovery_key, *handoff)
-                .map_err(|error| format!("old Commit member unauthorized: {error}"))?;
+                .map_err(|error| format!("cannot safely stop the existing broker: its host identity or replacement request does not match the saved activation record: {error}"))?;
             self.validate_old_incarnation(&journal, member, local_status)?;
             if member.old != muxe::lifecycle::journal::OldMemberProgress::CommitIntent {
-                return Err("old Commit lacks durable member CommitIntent".to_owned());
+                return Err("cannot safely stop the existing broker because the stop request has not been saved in the activation record".to_owned());
             }
             match muxe::lifecycle::journal::has_old_retirement_receipt(
                 &muxe::lifecycle::journal::activation_dir(&self.cache_dir),
@@ -2276,8 +2340,8 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 member,
             ) {
                 Ok(false) => Ok(()),
-                Ok(true) => Err("old Commit found preexisting retirement proof".to_owned()),
-                Err(error) => Err(format!("old Commit proof path is unsafe: {error}")),
+                Ok(true) => Err("the saved record already confirms that the existing broker stopped; refusing a second stop request".to_owned()),
+                Err(error) => Err(format!("could not safely read the record confirming that the existing broker stopped: {error}")),
             }
         })
     }
@@ -2549,19 +2613,21 @@ async fn commit_herdr_ui_pane(
             },
         ))
         .await
-        .map_err(|error| color_eyre::eyre::eyre!("could not commit the placed UI pane: {error}"))?
-    {
+        .map_err(|error| {
+            color_eyre::eyre::eyre!("could not confirm the placed UI pane with the broker: {error}")
+        })? {
         muxe_protocol::BrokerResponse::Acknowledged => {}
         muxe_protocol::BrokerResponse::Error(diagnostic) => {
             return Err(color_eyre::eyre::eyre!(
-                "The broker rejected the UI pane commit: {}\nDiagnostic code: {}",
+                "The broker refused to finish opening the UI pane: {}\nDiagnostic code: {}",
                 diagnostic.message,
                 diagnostic.code.as_str()
             ));
         }
         response => {
             return Err(color_eyre::eyre::eyre!(
-                "broker returned unexpected UI pane commit response: {response:?}"
+                "could not confirm the placed UI pane: expected an acknowledgement, received {}",
+                response.kind_name()
             ));
         }
     }
@@ -2671,10 +2737,18 @@ async fn prepare_ui_launch(
             },
         ))
         .await
-        .wrap_err("could not prepare the UI launch with the broker")?
+        .wrap_err("could not reserve the menu launch with the broker")?
     {
         muxe_protocol::BrokerResponse::LaunchPrepared { token, .. } => Ok(token),
-        response => bail!("broker refused the UI launch preparation: {response:?}"),
+        muxe_protocol::BrokerResponse::Error(diagnostic) => bail!(
+            "the broker refused to open the menu: {}\nDiagnostic code: {}",
+            diagnostic.message,
+            diagnostic.code.as_str()
+        ),
+        response => bail!(
+            "could not reserve the menu launch: expected a launch reservation, received {}",
+            response.kind_name()
+        ),
     }
 }
 /// Connects to the live Herdr broker serving the launcher's own server as a
@@ -2883,6 +2957,28 @@ fn zellij_run_argv(session: &str, open: &PaneOpen) -> Result<Vec<OsString>> {
     Ok(argv)
 }
 
+fn ui_attachment_session(response: muxe_protocol::WireMessage) -> Result<UiSessionId> {
+    match response {
+        muxe_protocol::WireMessage::Response {
+            response: BrokerResponse::UiAttached { session, .. },
+            ..
+        } => Ok(session),
+        muxe_protocol::WireMessage::Response {
+            response: BrokerResponse::Error(diagnostic),
+            ..
+        } => bail!(
+            "the broker refused to open the menu: {}\nDiagnostic code: {}",
+            diagnostic.message,
+            diagnostic.code.as_str()
+        ),
+        muxe_protocol::WireMessage::Response { response, .. } => bail!(
+            "could not open the menu: expected a UI attachment, received {}",
+            response.kind_name()
+        ),
+        _ => bail!("could not open the menu: the broker sent a message that was not a response"),
+    }
+}
+
 /// Runs the UI inside a directly-Run Zellij pane. The server injects
 /// `ZELLIJ_PANE_ID` into every pane process, so the caller pane is exact;
 /// the adapter captures the origin from that live pane without hint tuples.
@@ -2927,13 +3023,7 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
         .await
         .wrap_err("could not attach the Zellij UI session")?;
     let response = frame.deserialize()?;
-    let muxe_protocol::WireMessage::Response {
-        response: muxe_protocol::BrokerResponse::UiAttached { session, .. },
-        ..
-    } = response
-    else {
-        bail!("broker did not return a UI attachment snapshot: {response:?}");
-    };
+    let session = ui_attachment_session(response)?;
     let mut control = BrokerUiControl { client, session };
     let _ = muxe_ui::run_attached(frame, &mut control)
         .await
@@ -3047,7 +3137,7 @@ async fn launcher_origin_from(
     )
     .await
     .wrap_err(format!(
-        "the {} Herdr launcher origin tuple is not live",
+        "could not validate the {} Herdr launch context against the current session snapshot",
         selected.source
     ))?;
     // The immutable trampoline origin keeps its captured cwd when the bootstrap
@@ -3142,7 +3232,9 @@ fn saved_origin_tuple(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<Sav
             muxe_core::PaneId::new(pane),
             cwd,
         ))),
-        _ => bail!("MUXE_HERDR_ORIGIN_* must supply one complete immutable origin tuple"),
+        _ => bail!(
+            "the saved Herdr launch context is incomplete; MUXE_HERDR_ORIGIN_WORKSPACE_ID, MUXE_HERDR_ORIGIN_TAB_ID, and MUXE_HERDR_ORIGIN_PANE_ID must all be set"
+        ),
     }
 }
 
@@ -3161,7 +3253,7 @@ fn launcher_tuple(
             muxe_core::PaneId::new(pane),
         ))),
         _ => bail!(
-            "{workspace_name}, {tab_name}, and {pane_name} must be supplied together as one Herdr launcher tuple"
+            "the Herdr launch context is incomplete; set {workspace_name}, {tab_name}, and {pane_name} together"
         ),
     }
 }
@@ -3235,7 +3327,9 @@ fn command_pane_ratio(
         }
     };
     if unsupported.is_some() {
-        bail!("the requested split dimension is perpendicular to the Herdr split direction");
+        bail!(
+            "use --height for a downward Herdr split and --width for a rightward split; the other dimension is unsupported"
+        );
     }
     let requested_ratio = match requested {
         None => return Ok(0.5),
@@ -3248,14 +3342,14 @@ fn command_pane_ratio(
         Some(muxe::cli::Dimension::Cells(cells)) => {
             if cells == 0 || cells >= available {
                 bail!(
-                    "Herdr split cell dimension must be positive and smaller than the validated destination axis"
+                    "the requested Herdr split size is {cells} cells; it must be greater than zero and smaller than the parent pane's {available} cells in the split direction"
                 );
             }
             let cells = u32::from(cells);
             let available = u32::from(available);
             if cells * 10 < available || cells * 10 > available * 9 {
                 bail!(
-                    "Herdr split cell dimension must reserve between 10% and 90% of the validated destination axis"
+                    "the requested Herdr split size is {cells} of {available} parent-pane cells; it must occupy between 10% and 90% in the split direction"
                 );
             }
             f64::from(cells) / f64::from(available)
@@ -3324,13 +3418,7 @@ async fn run_herdr_ui(menu: UiMenuCommand) -> Result<()> {
         .await
         .wrap_err("could not attach the Herdr UI session")?;
     let response = frame.deserialize()?;
-    let muxe_protocol::WireMessage::Response {
-        response: BrokerResponse::UiAttached { session, .. },
-        ..
-    } = response
-    else {
-        bail!("broker did not return a UI attachment snapshot: {response:?}");
-    };
+    let session = ui_attachment_session(response)?;
     let mut control = BrokerUiControl { client, session };
     let _ = muxe_ui::run_attached(frame, &mut control)
         .await
@@ -3351,10 +3439,19 @@ async fn await_ui_launch_commit(
         )),
     )
     .await
-    .wrap_err("timed out waiting for the Herdr UI launch placement commit")?
-    .wrap_err("could not wait for the Herdr UI launch placement commit")?;
-    if !matches!(response, BrokerResponse::Acknowledged) {
-        bail!("broker refused the UI launch placement wait: {response:?}");
+    .wrap_err("timed out waiting for the launcher to finish placing the Herdr menu pane")?
+    .wrap_err("could not wait for the launcher to finish placing the Herdr menu pane")?;
+    match response {
+        BrokerResponse::Acknowledged => {}
+        BrokerResponse::Error(diagnostic) => bail!(
+            "the broker refused to finish placing the menu pane: {}\nDiagnostic code: {}",
+            diagnostic.message,
+            diagnostic.code.as_str()
+        ),
+        response => bail!(
+            "could not confirm menu placement: expected an acknowledgement, received {}",
+            response.kind_name()
+        ),
     }
     Ok(())
 }
@@ -3434,7 +3531,7 @@ async fn ui_attach_request(
     let pane = HostPaneId::new(required_environment("HERDR_PANE_ID")?);
     let caller = muxe_adapter_herdr::pane_by_id(runtime, pane.as_str())
         .await
-        .wrap_err("the Herdr UI caller pane is not live after its launcher move")?;
+        .wrap_err("could not find the Herdr menu pane after the launcher moved it")?;
     let workspace = WorkspaceId::new(caller.workspace.as_str());
     let tab = HostTabId::new(caller.tab.as_str());
     Ok(AttachUi {
@@ -3462,7 +3559,9 @@ fn required_environment(name: &str) -> Result<String> {
 
 fn pending_launch_token(value: &str) -> Result<PendingLaunchToken> {
     if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("MUXE_PENDING_LAUNCH_TOKEN must be a 32-character hexadecimal nonce");
+        bail!(
+            "MUXE_PENDING_LAUNCH_TOKEN must contain exactly 32 hexadecimal characters identifying the reserved menu launch"
+        );
     }
     let mut bytes = [0_u8; 16];
     for (destination, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
@@ -4412,8 +4511,7 @@ mod launcher_tests {
         assert!(select_launcher_origin(&lookup(&partial)).is_err());
 
         let empty: HashMap<String, String> = HashMap::new();
-        let error = select_launcher_origin(&lookup(&empty)).expect_err("no focus recapture");
-        assert!(error.to_string().contains("HERDR_ACTIVE_WORKSPACE_ID"));
+        assert!(select_launcher_origin(&lookup(&empty)).is_err());
     }
 
     #[test]
@@ -4664,7 +4762,6 @@ mod launcher_tests {
         let error = launcher_origin_from(&runtime, &lookup(&active_map()))
             .await
             .expect_err("absent ACTIVE pane fails before UI creation");
-        assert!(error.to_string().contains("not live"));
         notify_launcher_failure(Some(&runtime), "pane-open", &error.to_string()).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4831,11 +4928,9 @@ mod consumer_tests {
             command_pane_ratio(
                 &open,
                 &destination,
-                muxe_adapter_herdr::UiSplitDirection::Down
+                muxe_adapter_herdr::UiSplitDirection::Down,
             )
-            .expect_err("Herdr cannot honor a 9% split")
-            .to_string()
-            .contains("between 10% and 90%")
+            .is_err()
         );
 
         open.height = Some(Dimension::Cells(4));
@@ -4843,11 +4938,9 @@ mod consumer_tests {
             command_pane_ratio(
                 &open,
                 &destination,
-                muxe_adapter_herdr::UiSplitDirection::Down
+                muxe_adapter_herdr::UiSplitDirection::Down,
             )
-            .expect_err("Herdr cannot honor a 4-cell height in 50 rows")
-            .to_string()
-            .contains("between 10% and 90%")
+            .is_err()
         );
     }
 

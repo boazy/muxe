@@ -449,13 +449,13 @@ Preflight loads each selected host's effective configuration, including its over
 
 `muxe activate` ignores rows with unknown host labels and rejects malformed records for selected hosts. Schema-v2 and legacy rows without registration tokens remain supported.
 
-Units commit independently after global preflight. The final output reports each unit as committed, unchanged, rolled back, or failed. Run `muxe activate` from your shell before using the menu hotkey.
+Activation targets finish independently after the configuration and host checks. The final output identifies targets that were activated, were already active, could not complete activation, or required restoration of their previous state. A failure returns a nonzero exit status even when restoration succeeds. Run `muxe activate` from your shell before using the menu hotkey.
 
 When a menu launch needs a broker, Muxe checks the unit's activation journal before probing the normal endpoint. It verifies `Status` and peer credentials on the same control connection, then rechecks the socket identity before consulting the registry. Muxe reuses, adopts, or relocates only the authenticated registration. Its token, process ID, and start time bind cleanup to that exact row; a legacy peer without a token may reuse only its unchanged row. A durable startup claim prevents concurrent launchers from starting competing children. Muxe removes a stale row only after a registry-locked recheck proves that the exact process is dead and the endpoint is absent or refused. Pending activation and ambiguous endpoints fail closed.
 
 Only a running ordinary or `TargetCommitted` broker with matching host identity may serve an attachment. A `TargetGated` broker and a legacy peer with an ambiguous handoff are not attachable.
 
-The `control-json-v1` protocol is additive: unknown fields are ignored and new status fields may be absent. Activation still requires the old broker to advertise `CoordinatorSuppliedV1`; a legacy broker without this Prepare capability is refused before drain or journal creation.
+The `control-json-v1` protocol accepts additional fields and allows newer status fields to be absent. Before replacing an existing broker, activation checks that the broker supports coordinator-assigned replacement requests (`CoordinatorSuppliedV1`), reports the expected bridge identity, is running, and has no replacement already in progress. A failed check identifies the specific condition and any relevant status value. These checks run before Muxe creates a new activation record or asks that broker to stop accepting work. Installing a new executable does not update a broker process that is still running.
 
 New activation journals use schema v5. Schemas v3 and v4 remain readable for rollback before Ready. Earlier Ready journals lack exact target-incarnation proof and remain preserved instead of authorizing a commit. Corrupt or unsupported journals are also preserved for diagnosis.
 

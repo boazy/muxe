@@ -32,7 +32,7 @@ pub enum InitError {
     MissingParent(PathBuf),
     #[error("expected a directory at {0}")]
     NotDirectory(PathBuf),
-    #[error("I/O while {operation} {path}: {source}")]
+    #[error("error while {operation} {path}: {source}")]
     Io {
         operation: &'static str,
         path: PathBuf,

@@ -40,7 +40,7 @@ pub enum KdlError {
     Fs(#[from] FsError),
     #[error("cannot parse Zellij configuration at {}: {detail}", path.display())]
     Unparseable { path: PathBuf, detail: String },
-    #[error("ambiguous duplicate `{node}` nodes in {}: resolve manually", path.display())]
+    #[error("the Zellij configuration at {} has more than one `{node}` block; Muxe cannot determine which block to edit", path.display())]
     Ambiguous {
         path: std::path::PathBuf,
         node: &'static str,
@@ -49,7 +49,7 @@ pub enum KdlError {
     UnsafePath { path: PathBuf },
     #[error("Zellij configuration at {} changed concurrently; retry", path.display())]
     ConcurrentChange { path: PathBuf },
-    #[error("candidate configuration failed to parse: {detail}")]
+    #[error("the proposed Zellij configuration changes are invalid: {detail}")]
     CandidateRejected { detail: String },
 }
 
@@ -139,21 +139,21 @@ pub(crate) fn validate_previous_node(node: ManagedNode, text: &str) -> Result<St
         parse_original(Path::new("<receipt>"), text).map_err(|error| error.to_string())?;
     if document.nodes().len() != 1 {
         return Err(format!(
-            "{} previous text must contain exactly one top-level node",
+            "the saved original {} configuration must contain exactly one top-level block",
             node.as_str()
         ));
     }
     let managed = &document.nodes()[0];
     if managed.name().value() != MUXE_NODE {
         return Err(format!(
-            "{} previous text does not name `{MUXE_NODE}`",
+            "the saved original {} configuration does not name the `{MUXE_NODE}` block",
             node.as_str()
         ));
     }
     let span = managed.span();
     if span.offset() != 0 || span.offset() + span.len() != text.len() {
         return Err(format!(
-            "{} previous text contains bytes outside the `{MUXE_NODE}` node",
+            "the saved original {} configuration contains extra text outside the `{MUXE_NODE}` block",
             node.as_str()
         ));
     }
