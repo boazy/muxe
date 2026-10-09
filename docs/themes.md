@@ -29,16 +29,20 @@ User assets live in `$CONFIG_DIR/themes/<name>.yml` and `$CONFIG_DIR/color-schem
 | Name | Example | Presentation |
 | --- | --- | --- |
 | `default` | `g      → Git` | Existing padded-key arrow presentation. |
-| `brackets` | `[g] Git` | Compact ASCII keycap punctuation. |
-| `dots` | `g ..... Git` | Five subdued dot leaders, separated from the complete shortcut and label. |
-| `rail` | `│ g │ Git` | Unicode vertical rules grouping shortcut and label. |
-| `chevron` | ` g › Git` | Content-sized, reversed-color key badge and Unicode chevron. |
+| `brackets` | `[g] Git` | ASCII keycaps with a shared shortcut width. |
+| `dots` | `g ... Git` | Subdued dot leaders that fill the gap before each label. |
+| `rail` | `│ g │ Git` | Aligned Unicode rules around the shortcut column. |
+| `chevron` | ` g  Git` | Reversed-color key badges joined to Nerd Font Powerline tips. |
 
-The four additional themes retain complete shortcut text before the label. Dots have a fixed five-dot leader with a space at either end, so punctuation shortcuts remain identifiable without colors or attributes. They do not align every label into a shared column. Grid packing and clipping remain controlled by the existing layout settings. At widths smaller than a shortcut plus its decoration, the surface clips the row; no presentation can guarantee a complete shortcut in an arbitrarily narrow viewport.
+The four non-default themes align labels within each grid column. They use the widest shortcut that passes the current menu's visibility conditions; hidden, excluded, and unshown bindings do not widen the shortcut column. Brackets, Rail, and Chevron pad shorter shortcuts with spaces. Dots fills that space with leaders, with at least three dots and a space at each end to keep punctuation shortcuts identifiable.
 
-New themes mark disabled bindings with `- ` and blocked bindings with `! `. Status lines identify their state with `Error:`, `Pending:`, `Blocked:`, `Reload:`, or `Notice:`. Keys remain bold while ordinary labels use regular weight. The final breadcrumb identifies the current location. Muxe has no persistent selected-row highlight; Chevron's badge is shortcut decoration, not a moving focus indicator.
+Each theme reserves two columns before the shortcut for a state marker, so disabled and blocked rows keep the same alignment as enabled rows. Shortcut widths use terminal display columns, including wide Unicode characters. Grid packing and clipping still follow the layout settings. A viewport narrower than a shortcut and its decoration clips the row.
 
-Rail and Chevron use ordinary Unicode characters, not private-use glyphs or icon fonts. Choose `brackets` or `dots` when a terminal font or its character-width conventions do not render these glyphs correctly. This is an explicit presentation choice, not automatic terminal capability detection.
+Custom cell templates can use `key_width` for the shared shortcut width and `key_padding` for the difference between that width and the current key's display width. For example, `{{ key | rpad(key_width) }}` pads a shortcut without cutting it. The renderer never supplies a `key_width` smaller than the current key.
+
+Non-default themes mark disabled bindings with `- ` and blocked bindings with `! `. Status lines identify their state with `Error:`, `Pending:`, `Blocked:`, `Reload:`, or `Notice:`. Enabled keys remain bold while ordinary labels use regular weight. The final breadcrumb identifies the current location. Muxe has no persistent selected-row highlight; Chevron's badge decorates the shortcut rather than indicating focus.
+
+Non-default themes may use Nerd Font glyphs. Configure your terminal to use a Nerd Font for Chevron, which uses the Powerline right divider (`U+E0B0`). Its tip matches the badge background for both enabled and disabled bindings. Brackets and Dots remain ASCII, and Rail uses ordinary Unicode rules. The default theme has no Nerd Font requirement. Muxe does not detect the terminal's font automatically.
 
 `NO_COLOR` suppresses color output while retaining attributes such as bold. Textual punctuation and state markers remain meaningful even if a terminal also ignores attributes.
 
@@ -69,13 +73,20 @@ The catalog contains thirty explicit color schemes plus the terminal-inheriting 
 
 Each scheme retains the complete chosen upstream named palette, including entries unused by Muxe. Nested names are flattened without dropping their parent namespace. Semantic mappings are written explicitly in each asset's `colors` section:
 
-- `base.text`, `base.background`, and `base.muted` provide surface and secondary text.
-- `menu.hotkey` and `menu.separator` distinguish shortcuts and punctuation.
-- `status.error`, `status.pending`, `status.blocked`, `status.reload`, and `status.notice` color status text.
+| Semantic role | Assignment |
+| --- | --- |
+| `base.text` / `base.background` | The upstream primary foreground and selected surface. |
+| `base.muted` / `menu.separator` | Subdued secondary colors, distinct from primary text. These roles may share a color. |
+| `menu.hotkey` | An accent that distinguishes shortcuts from labels and separators. |
+| `status.error` | Red or rose. |
+| `status.pending` | Yellow or gold. |
+| `status.blocked` | Orange, ochre, or gold. It may share the pending color when the palette has no suitable orange. |
+| `status.reload` | Green. |
+| `status.notice` | Blue or cyan. |
 
 Palette names and semantic names share the existing lookup namespace; a semantic name takes precedence. Palette values are literal `#rgb` or `#rrggbb` values. Semantic mappings may refer to palette entries or other semantic names. Unknown aliases and cycles are rejected, including unused entries. `inherit` is reserved for the embedded default scheme; in configuration style fields it remains an ordinary alias name.
 
-Semantic assignments target at least 4.5:1 sRGB text contrast against the selected background. They can use a more readable existing source color than an upstream comment or status accent. The complete source palette is still retained; status prefixes and attributes preserve meaning when a neutral foreground replaces an accent. This does not assert contrast for inherited terminal colors, whose values Muxe does not know.
+Assignments preserve the palette's hierarchy and status hues. A lower-contrast accent is not silently replaced with primary text. The catalog records each foreground's sRGB contrast against its background, including Chevron's reversed badge, and flags ratios below the 4.5:1 normal-text reference. This reference is not a universal requirement or an accessibility guarantee: some canonical light-theme accents and secondary colors fall below it. Status prefixes and state markers preserve meaning without color. Terminal font rendering, dimming, and inherited terminal colors are not covered by these measurements.
 
 One Dark and One Light retain all 51 color-bearing variables from their official Less files, including aliases and six alpha roles. Muxe's assets are RGB-only, so alpha roles are composited over that variant's original `syntax-bg`. Metadata preserves the raw upstream expression, reference-compiled RGBA value, compositing background, formula, and resulting RGB. These composites are source-backed adaptations, not unchanged upstream hex literals. Non-color configuration parameters and `NONE` sentinels are retained as metadata rather than treated as RGB swatches.
 
