@@ -3,6 +3,7 @@ use muxe_ui::{
     BreadcrumbTemplate, CellTemplate, PaginationTemplate, StatusTemplate, TemplateRenderer,
 };
 use ratatui::style::Modifier;
+use unicode_width::UnicodeWidthStr;
 
 #[test]
 fn every_embedded_presentation_renders_every_component_with_every_scheme() {
@@ -21,6 +22,7 @@ fn every_embedded_presentation_renders_every_component_with_every_scheme() {
                         disabled,
                         blocked,
                         max_title_width: 80,
+                        key_width: 20,
                     })
                     .expect("cell renders");
                 assert!(
@@ -87,28 +89,164 @@ fn every_embedded_presentation_renders_every_component_with_every_scheme() {
 }
 
 #[test]
-fn bracket_and_dot_presentations_match_their_documented_shape() {
+fn presentations_align_labels_and_separators_across_key_widths_and_states() {
     let catalog = ThemeAssets::default().compile_catalog();
-    for (name, expected) in [
-        ("brackets", "[g] Git"),
-        ("dots", "g ..... Git"),
-        ("rail", "│ g │ Git"),
-        ("chevron", " g › Git"),
-    ] {
+    let keys = ["g", "界", "e\u{301}", "👩‍💻", "ctrl+\\", "Ctrl-Shift-[Left]"];
+    let key_width = keys
+        .iter()
+        .map(|key| UnicodeWidthStr::width(*key))
+        .max()
+        .unwrap();
+    for name in ["brackets", "dots", "rail", "chevron"] {
+        let theme = catalog
+            .resolve(
+                &ThemeName::new(name),
+                &ColorSchemeName::new("catppuccin-latte"),
+            )
+            .expect("pair");
+        let renderer = TemplateRenderer::new(&theme).expect("renderer");
+        let mut label_column = None;
+        let mut separator_column = None;
+        for key in keys {
+            for (disabled, blocked, marker) in [
+                (false, false, "  "),
+                (true, false, "- "),
+                (true, true, "! "),
+            ] {
+                let cell = renderer
+                    .render_cell(CellTemplate {
+                        key,
+                        title: "Label",
+                        disabled,
+                        blocked,
+                        max_title_width: 40,
+                        key_width,
+                    })
+                    .expect("cell");
+                assert!(
+                    cell.plain.starts_with(marker),
+                    "{name}: reserved marker gutter"
+                );
+                assert!(
+                    cell.plain.contains(key),
+                    "{name}: complete key is preserved"
+                );
+                let label = cell.plain.find("Label").expect("label");
+                let column = UnicodeWidthStr::width(&cell.plain[..label]);
+                assert_eq!(
+                    *label_column.get_or_insert(column),
+                    column,
+                    "{name}: labels align"
+                );
+                let separator = match name {
+                    "brackets" => cell.plain.rfind(']').unwrap(),
+                    "dots" => cell.plain.rfind('.').unwrap(),
+                    "rail" => cell.plain.rfind('│').unwrap(),
+                    "chevron" => cell.plain.rfind('\u{e0b0}').unwrap(),
+                    _ => unreachable!(),
+                };
+                let column = UnicodeWidthStr::width(&cell.plain[..separator]);
+                assert_eq!(
+                    *separator_column.get_or_insert(column),
+                    column,
+                    "{name}: separators align"
+                );
+                if !disabled {
+                    assert!(cell.spans.iter().any(|span| span.text.contains(key)
+                        && span.style.add_modifier.contains(Modifier::BOLD)));
+                }
+                assert!(
+                    !cell
+                        .spans
+                        .iter()
+                        .find(|span| span.text.contains("Label"))
+                        .unwrap()
+                        .style
+                        .add_modifier
+                        .contains(Modifier::BOLD),
+                    "labels have normal weight"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn chevron_badge_edge_connects_to_enabled_and_disabled_backgrounds() {
+    let catalog = ThemeAssets::default().compile_catalog();
+    for scheme in catalog.color_scheme_names() {
+        let theme = catalog
+            .resolve(&ThemeName::new("chevron"), scheme)
+            .expect("pair");
+        let renderer = TemplateRenderer::new(&theme).expect("renderer");
+        for (disabled, blocked) in [(false, false), (true, false), (true, true)] {
+            let cell = renderer
+                .render_cell(CellTemplate {
+                    key: "ctrl+g",
+                    title: "Label",
+                    disabled,
+                    blocked,
+                    max_title_width: 40,
+                    key_width: 8,
+                })
+                .expect("badge");
+            let edge = cell
+                .spans
+                .iter()
+                .find(|span| span.text.contains('\u{e0b0}'))
+                .expect("Powerline edge");
+            let badge = cell
+                .spans
+                .iter()
+                .find(|span| span.text.contains("ctrl+g"))
+                .expect("shortcut badge");
+            let label = cell
+                .spans
+                .iter()
+                .find(|span| span.text.contains("Label"))
+                .unwrap();
+            assert_eq!(edge.style.fg, badge.style.bg, "edge continues the badge");
+            assert_eq!(edge.style.bg, label.style.bg, "edge joins the surface");
+            assert_eq!(
+                badge.style.fg, label.style.bg,
+                "badge uses inverse foreground"
+            );
+        }
+    }
+}
+
+#[test]
+fn undersized_alignment_hints_preserve_complete_literal_and_unicode_keys() {
+    let catalog = ThemeAssets::default().compile_catalog();
+    for name in ["brackets", "dots", "rail", "chevron"] {
         let theme = catalog
             .resolve(&ThemeName::new(name), &ColorSchemeName::new("default"))
-            .expect("terminal inheriting pair");
-        let cell = TemplateRenderer::new(&theme)
-            .expect("renderer")
-            .render_cell(CellTemplate {
-                key: "g",
-                title: "Git",
-                disabled: false,
-                blocked: false,
-                max_title_width: 40,
-            })
-            .expect("cell");
-        assert_eq!(cell.plain, expected);
+            .expect("pair");
+        let renderer = TemplateRenderer::new(&theme).expect("renderer");
+        for key in [
+            "ctrl+[",
+            "ctrl+]",
+            "ctrl+\\",
+            "ctrl+shift+left",
+            "👩‍💻",
+            "e\u{301}",
+        ] {
+            let cell = renderer
+                .render_cell(CellTemplate {
+                    key,
+                    title: "Label",
+                    disabled: false,
+                    blocked: false,
+                    max_title_width: 40,
+                    key_width: 1,
+                })
+                .expect("cell");
+            assert!(
+                cell.plain.contains(key),
+                "{name}: width hints cannot truncate {key}"
+            );
+            assert!(cell.plain.ends_with("Label"));
+        }
     }
 }
 
@@ -122,7 +260,7 @@ fn dotted_leaders_keep_punctuation_keys_identifiable_in_a_wide_viewport() {
         .resolve(&ThemeName::new("dots"), &ColorSchemeName::new("default"))
         .expect("pair");
     let renderer = TemplateRenderer::new(&theme).expect("renderer");
-    for key in [".", "[", "]", "\\"] {
+    for key in [".", "[", "]", "\\", "ctrl+\\", "界"] {
         for disabled in [false, true] {
             let cell = renderer
                 .render_cell(CellTemplate {
@@ -131,6 +269,7 @@ fn dotted_leaders_keep_punctuation_keys_identifiable_in_a_wide_viewport() {
                     disabled,
                     blocked: false,
                     max_title_width: 40,
+                    key_width: 8,
                 })
                 .expect("punctuation renders as data");
             assert!(cell.plain.chars().all(|character| !character.is_control()));
@@ -161,10 +300,11 @@ fn dotted_leaders_keep_punctuation_keys_identifiable_in_a_wide_viewport() {
                 tokens[offset], key,
                 "shortcut remains an identifiable token"
             );
+            assert!(tokens[offset + 1].chars().all(|character| character == '.'));
             assert_eq!(
-                tokens[offset + 1],
-                ".....",
-                "leaders remain separate from the shortcut"
+                UnicodeWidthStr::width(tokens[offset + 1]),
+                8 - UnicodeWidthStr::width(key) + 3,
+                "leaders fill the remaining key width plus a three-cell minimum"
             );
             assert_eq!(
                 tokens[offset + 2],
@@ -191,6 +331,7 @@ fn default_padding_preserves_literal_escape_tokens_at_the_visible_key_boundary()
                 disabled: false,
                 blocked: false,
                 max_title_width: 40,
+                key_width: 0,
             })
             .expect("default cell");
         assert_eq!(cell.plain, format!("{key} → Label"));

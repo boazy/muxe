@@ -20,6 +20,15 @@ menu:
     arrow:
       foreground: menu.separator
       background: base.background
+    badge_edge:
+      foreground: menu.hotkey
+      background: base.background
+    disabled_badge:
+      foreground: base.background
+      background: base.muted
+    disabled_badge_edge:
+      foreground: base.muted
+      background: base.background
     disabled:
       foreground: base.muted
       background: base.background
@@ -46,7 +55,7 @@ menu:
       background: base.background
   templates:
     cell: >-
-      {% if blocked %}[blocked]! [/blocked]{% elif disabled %}[disabled]- [/disabled]{% endif %}{% if disabled %}[disabled] {{ key }} › {{ title }}[/disabled]{% else %}[hotkey] {{ key }} [/hotkey][arrow]› [/arrow][default]{{ title }}[/default]{% endif %}
+      {% if blocked %}[blocked]! [/blocked]{% elif disabled %}[disabled]- [/disabled]{% else %}  {% endif %}{% if disabled %}[disabled_badge] {{ key | rpad(key_width) }} [/disabled_badge][disabled_badge_edge][/disabled_badge_edge][disabled] {{ title }}[/disabled]{% else %}[hotkey] {{ key | rpad(key_width) }} [/hotkey][badge_edge][/badge_edge][default] {{ title }}[/default]{% endif %}
     breadcrumbs: >-
       {% for c in crumbs %}{% if loop.last %}[title]{{ c }}[/title]{% else %}[crumb]{{ c }}[/crumb][arrow] › [/arrow]{% endif %}{% endfor %}
     pagination.full: >-

@@ -46,7 +46,7 @@ menu:
       background: base.background
   templates:
     cell: >-
-      {% if blocked %}[blocked]! [/blocked]{% elif disabled %}[disabled]- [/disabled]{% endif %}{% if disabled %}[disabled]│ {{ key }} │ {{ title }}[/disabled]{% else %}[arrow]│ [/arrow][hotkey]{{ key }}[/hotkey][arrow] │ [/arrow][default]{{ title }}[/default]{% endif %}
+      {% if blocked %}[blocked]! [/blocked]{% elif disabled %}[disabled]- [/disabled]{% else %}  {% endif %}{% if disabled %}[disabled]│ {{ key | rpad(key_width) }} │ {{ title }}[/disabled]{% else %}[arrow]│ [/arrow][hotkey]{{ key | rpad(key_width) }}[/hotkey][arrow] │ [/arrow][default]{{ title }}[/default]{% endif %}
     breadcrumbs: >-
       {% for c in crumbs %}{% if loop.last %}[title]{{ c }}[/title]{% else %}[crumb]{{ c }}[/crumb][arrow] ─ [/arrow]{% endif %}{% endfor %}
     pagination.full: >-

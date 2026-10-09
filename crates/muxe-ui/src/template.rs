@@ -25,6 +25,9 @@ pub struct CellTemplate<'a> {
     pub disabled: bool,
     pub blocked: bool,
     pub max_title_width: usize,
+    /// Shared display width of visible shortcuts before grid packing.
+    /// Rendering clamps this to the current sanitized key's width, so keys are never cut.
+    pub key_width: usize,
 }
 
 /// Values available to the breadcrumbs template.
@@ -200,16 +203,25 @@ impl TemplateRenderer {
 
     /// Renders a sanitized, title-limited cell before layout measures its visible text.
     ///
+    /// The cell context includes `key_width`, clamped to the sanitized key's display width,
+    /// and `key_padding`, the remaining columns up to that shared width. Templates can pad
+    /// the key or fill the gap with leaders without truncating the shortcut.
+    ///
     /// # Errors
     ///
     /// Returns [`TemplateError::OutputTooLarge`] when the escaped input or rendered component
     /// exceeds the component byte limit, or [`TemplateError::Render`] when `MiniJinja` rendering
     /// fails.
     pub fn render_cell(&self, cell: CellTemplate<'_>) -> Result<RenderedText, TemplateError> {
+        let key = sanitize_single_line(cell.key);
+        let actual_key_width = UnicodeWidthStr::width(key.as_str());
+        let key_width = cell.key_width.max(actual_key_width);
         self.render(
             "cell",
             context! {
-                key => escape_markup_text(&sanitize_single_line(cell.key))?,
+                key => escape_markup_text(&key)?,
+                key_width => key_width,
+                key_padding => key_width - actual_key_width,
                 title => escape_markup_text(&ellipsize(cell.title, cell.max_title_width))?,
                 disabled => cell.disabled,
                 blocked => cell.blocked,
@@ -573,19 +585,27 @@ fn pad_filter(
     if width > MAX_COMPONENT_BYTES {
         return Err(filter_error("padding width exceeds the component limit"));
     }
-    let pad = pad.unwrap_or_else(|| " ".into());
-    let pad_width = UnicodeWidthStr::width(pad.as_str());
+    let pad = pad.map_or(std::borrow::Cow::Borrowed(" "), std::borrow::Cow::Owned);
+    let pad_width = UnicodeWidthStr::width(pad.as_ref());
     if pad_width == 0 {
         return Err(filter_error("padding string has zero display width"));
     }
-    let value = truncate_markup_to_width(value, width);
-    let missing = width.saturating_sub(markup_display_width(&value));
-    let padding = repeat_to_width(&pad, missing)?;
+    let value_width = markup_display_width(value);
+    let truncated;
+    let (value, value_width) = if value_width <= width {
+        (value, value_width)
+    } else {
+        truncated = truncate_markup_to_width(value, width);
+        let truncated_width = markup_display_width(&truncated);
+        (truncated.as_str(), truncated_width)
+    };
+    let missing = width.saturating_sub(value_width);
+    let padding = repeat_to_width(pad.as_ref(), missing)?;
     let mut output = String::with_capacity(value.len() + padding.len());
     if left {
         output.push_str(&padding);
     }
-    output.push_str(&value);
+    output.push_str(value);
     if !left {
         output.push_str(&padding);
     }
@@ -903,6 +923,7 @@ mod tests {
                 disabled: false,
                 blocked: false,
                 max_title_width: 24,
+                key_width: 0,
             })
             .expect("normal style renders");
         assert_eq!(rendered.plain, "Open");
@@ -927,6 +948,7 @@ mod tests {
                 disabled: false,
                 blocked: true,
                 max_title_width: 24,
+                key_width: 0,
             })
             .expect("cell renders");
         let second = renderer
@@ -936,6 +958,7 @@ mod tests {
                 disabled: false,
                 blocked: false,
                 max_title_width: 24,
+                key_width: 0,
             })
             .expect("same environment renders again");
         assert_eq!(first.plain, "! a      → open");
@@ -955,6 +978,7 @@ mod tests {
                 disabled: false,
                 blocked: false,
                 max_title_width: 24,
+                key_width: 0,
             })
             .expect("cell renders");
         assert_eq!(cell.plain, "[hotkey]x[/hotkey] line one");
@@ -1076,6 +1100,7 @@ mod tests {
                 disabled: false,
                 blocked: false,
                 max_title_width: MAX_COMPONENT_BYTES + 1,
+                key_width: 0,
             })
             .expect_err("oversized component must fail");
         assert!(matches!(error, TemplateError::OutputTooLarge));

@@ -87,6 +87,16 @@ pub fn sanitize_single_line(value: &str) -> String {
         .collect()
 }
 
+/// Measures the same visible value as `sanitize_single_line`, without copying normal keys.
+pub(crate) fn single_line_display_width(value: &str) -> usize {
+    let line = value.split(['\n', '\r']).next().unwrap_or_default();
+    if line.chars().any(char::is_control) {
+        UnicodeWidthStr::width(sanitize_single_line(line).as_str())
+    } else {
+        UnicodeWidthStr::width(line)
+    }
+}
+
 /// Truncates a single-line value to a display width, using an ellipsis when necessary.
 #[must_use]
 pub fn ellipsize(value: &str, max_width: usize) -> String {

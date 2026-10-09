@@ -1060,7 +1060,10 @@ fn render_visible_cells(
     max_title_width: usize,
     availability: &[BindingAvailabilityOverlay],
 ) -> Result<(Vec<RenderedText>, Vec<DegradedComponent>), UiError> {
-    let mut cells = Vec::new();
+    let mut visible = Vec::with_capacity(menu.bindings.len());
+    // Evaluate visibility once, then measure the shared shortcut column before rendering.
+    // This width follows page conditions but does not depend on the later grid packing.
+    let mut key_width = 0;
     let mut degraded = Vec::new();
     for binding in menu.bindings.iter() {
         let state = evaluate_archived_binding_state(binding, pages)?;
@@ -1087,7 +1090,14 @@ fn render_visible_cells(
             disabled: !state.enabled || blocked,
             blocked,
             max_title_width,
+            key_width: 0,
         };
+        key_width = key_width.max(crate::layout::single_line_display_width(cell.key));
+        visible.push(cell);
+    }
+    let mut cells = Vec::with_capacity(visible.len());
+    for mut cell in visible {
+        cell.key_width = key_width;
         match renderer.render_cell(cell) {
             Ok(cell_output) => cells.push(cell_output),
             // Evaluation failed on a load-valid template (undefined variable,
@@ -1638,7 +1648,10 @@ pub(crate) mod tests {
     }
 
     fn default_theme_wire() -> CompiledThemeWire {
-        let theme = compiled_default_theme();
+        compiled_theme_wire(compiled_default_theme())
+    }
+
+    fn compiled_theme_wire(theme: muxe_core::CompiledTheme) -> CompiledThemeWire {
         CompiledThemeWire {
             common: theme_section(&theme.theme.common),
             menu: theme_section(&theme.theme.menu),
@@ -1946,6 +1959,158 @@ pub(crate) mod tests {
             locks: LockState::NONE,
             keypad: None,
         }))
+    }
+
+    fn alignment_bindings() -> Vec<muxe_protocol::BindingViewWire> {
+        use muxe_protocol::ConditionIrWire as Ir;
+        let mut blocked = binding(3, "界", "Label", BindingConditionsWire::default(), None);
+        blocked.state.blocked = true;
+        blocked.diagnostic = Some(muxe_protocol::ProtocolDiagnostic {
+            code: muxe_protocol::DiagnosticCode::ActionBlocked,
+            message: "Action is unavailable".into(),
+        });
+        let mut hidden = binding(
+            6,
+            "ctrl+alt+shift+left",
+            "Hidden",
+            BindingConditionsWire::default(),
+            None,
+        );
+        hidden.hidden = true;
+        vec![
+            binding(1, "g", "Label", BindingConditionsWire::default(), None),
+            binding(
+                2,
+                "ctrl+g",
+                "Label",
+                BindingConditionsWire {
+                    enable: Some(Ir::Bool(false)),
+                    ..BindingConditionsWire::default()
+                },
+                None,
+            ),
+            blocked,
+            binding(
+                4,
+                "ctrl+\\",
+                "Label",
+                BindingConditionsWire::default(),
+                None,
+            ),
+            binding(
+                5,
+                "ctrl+shift+left",
+                "Label",
+                BindingConditionsWire {
+                    show: Some(Ir::Greater(
+                        Box::new(Ir::PagesCurrent),
+                        Box::new(Ir::Integer(1)),
+                    )),
+                    ..BindingConditionsWire::default()
+                },
+                None,
+            ),
+            hidden,
+            binding(
+                7,
+                "ctrl+alt+shift+right",
+                "Excluded",
+                BindingConditionsWire {
+                    include: Some(Ir::Bool(false)),
+                    ..BindingConditionsWire::default()
+                },
+                None,
+            ),
+            binding(
+                8,
+                "ctrl+alt+shift+down",
+                "Unshown",
+                BindingConditionsWire {
+                    show: Some(Ir::Bool(false)),
+                    ..BindingConditionsWire::default()
+                },
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn themed_runtime_aligns_visible_shortcuts_across_states_pages_and_resize() {
+        use muxe_core::{ColorSchemeName, ThemeAssets, ThemeName};
+
+        let catalog = ThemeAssets::default().compile_catalog();
+        for name in ["brackets", "dots", "rail", "chevron"] {
+            let theme = catalog
+                .resolve(&ThemeName::new(name), &ColorSchemeName::new("default"))
+                .expect("theme");
+            let expected = TemplateRenderer::new(&theme)
+                .expect("renderer")
+                .render_cell(CellTemplate {
+                    key: "g",
+                    title: "Label",
+                    disabled: false,
+                    blocked: false,
+                    max_title_width: 24,
+                    key_width: 6,
+                })
+                .expect("reference cell");
+            let expected_column =
+                UnicodeWidthStr::width(&expected.plain[..expected.plain.find("Label").unwrap()]);
+            let mut runtime = UiRuntime::attach(profiled_attachment_with_theme(
+                alignment_bindings(),
+                compiled_theme_wire(theme),
+            ))
+            .expect("attachment");
+            let narrow = Rect::new(0, 0, 32, 4);
+            let first = runtime.prepare(narrow).expect("first page");
+            assert_eq!(
+                first.cells.len(),
+                4,
+                "hidden, excluded and unshown bindings do not render"
+            );
+            assert!(first.plan.page_count > 1);
+            assert!(first.cells[0].plain.starts_with("  "));
+            assert!(first.cells[1].plain.starts_with("- "));
+            assert!(first.cells[2].plain.starts_with("! "));
+            for cell in &first.cells {
+                let column =
+                    UnicodeWidthStr::width(&cell.plain[..cell.plain.find("Label").unwrap()]);
+                assert_eq!(
+                    column, expected_column,
+                    "{name}: only visible shortcuts set width"
+                );
+            }
+            runtime.current_page = 1;
+            let second = runtime.prepare(narrow).expect("second page");
+            assert_eq!(second.page, 1);
+            assert_eq!(
+                second.cells.len(),
+                5,
+                "page-conditioned shortcut becomes visible"
+            );
+            for cell in &second.cells {
+                let column =
+                    UnicodeWidthStr::width(&cell.plain[..cell.plain.find("Label").unwrap()]);
+                assert_eq!(
+                    column,
+                    expected_column + 9,
+                    "{name}: page conditions recompute width"
+                );
+            }
+            let wide = runtime.prepare(Rect::new(0, 0, 140, 3)).expect("resize");
+            assert_eq!(wide.page, 0);
+            assert_eq!(wide.plan.page_count, 1);
+            assert!(wide.plan.columns > 1);
+            assert_eq!(wide.cells.len(), 4);
+            for cell in &wide.cells {
+                let column =
+                    UnicodeWidthStr::width(&cell.plain[..cell.plain.find("Label").unwrap()]);
+                assert_eq!(
+                    column, expected_column,
+                    "{name}: resize restores the visible width"
+                );
+            }
+        }
     }
     #[test]
     fn broker_availability_events_overlay_the_pinned_attachment_without_replacing_it() {

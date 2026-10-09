@@ -1391,7 +1391,7 @@ mod tests {
 
     #[test]
     fn no_color_suppresses_palette_colors_but_preserves_key_attributes_and_markers() {
-        use crate::CellTemplate;
+        use crate::{Cell, CellTemplate, GridRect, arrange_cells};
         use muxe_core::{ColorSchemeName, ThemeAssets, ThemeName};
 
         let _byte_capture = BYTE_CAPTURE
@@ -1400,97 +1400,98 @@ mod tests {
         let previous = crossterm::style::Colored::ansi_color_disabled_memoized();
         crossterm::style::Colored::set_ansi_color_disabled(true);
         let _restore = AnsiColorGateRestore(previous);
-        let theme = ThemeAssets::default()
-            .compile_catalog()
-            .resolve(
-                &ThemeName::new("brackets"),
-                &ColorSchemeName::new("catppuccin-latte"),
-            )
-            .expect("embedded light pair");
-        let renderer = TemplateRenderer::new(&theme).expect("renderer");
-        let cells = [renderer
-            .render_cell(CellTemplate {
-                key: "g",
-                title: "Git",
-                disabled: false,
-                blocked: false,
-                max_title_width: 20,
-            })
-            .expect("cell")];
-        let empty = RenderedText::plain_fallback("");
-        let plan = GridPlan {
-            columns: 1,
-            row_gap: 0,
-            rows_per_page: 1,
-            page_count: 1,
-            has_pager: false,
-            pages: vec![crate::GridPage {
-                columns: vec![crate::GridColumn {
-                    offset: 0,
-                    width: 20,
-                }],
-            }],
-            slots: vec![crate::GridSlot {
-                source_index: 0,
-                page: 0,
-                column: 0,
-                row: 0,
-            }],
-        };
-        let area = Rect::new(0, 0, 20, 3);
-        let mut surface = TerminalSurface::for_test(Vec::new(), area).expect("surface");
-        surface
-            .render(
-                SurfaceFrame {
-                    title: "Menu",
-                    title_style: renderer.title_style(),
-                    surface_style: renderer.surface_style(),
-                    breadcrumb: &empty,
-                    padding: SurfacePadding::default(),
-                    plan: &plan,
-                    cells: &cells,
-                    page: 0,
-                    pager: None,
-                    status: None,
-                },
-                area,
-            )
-            .expect("render");
-        let bytes = surface
-            .terminal
-            .as_mut()
-            .expect("stored terminal")
-            .backend_mut()
-            .writer_mut();
-        let text = String::from_utf8_lossy(bytes);
-        assert!(
-            !text.contains("[38;") && !text.contains("[48;"),
-            "NO_COLOR suppresses RGB output"
-        );
-        let key_position = text.find('g').expect("shortcut emitted");
-        let mut effective_bold = false;
-        for sequence in text[..key_position].split("\x1b[").skip(1) {
-            let Some(end) =
-                sequence.find(|character: char| !character.is_ascii_digit() && character != ';')
-            else {
-                continue;
-            };
-            if sequence.as_bytes()[end] != b'm' {
-                continue;
-            }
-            for parameter in sequence[..end].split(';') {
-                match parameter.parse::<u16>().unwrap_or(0) {
-                    0 | 22 => effective_bold = false,
-                    1 => effective_bold = true,
-                    _ => {}
+        let catalog = ThemeAssets::default().compile_catalog();
+        for name in ["brackets", "dots", "rail", "chevron"] {
+            let theme = catalog
+                .resolve(
+                    &ThemeName::new(name),
+                    &ColorSchemeName::new("catppuccin-latte"),
+                )
+                .expect("embedded light pair");
+            let renderer = TemplateRenderer::new(&theme).expect("renderer");
+            let cells = [
+                ("g", false, false, "Enabled"),
+                ("ctrl+g", true, false, "Disabled"),
+                ("界", true, true, "Blocked"),
+            ]
+            .map(|(key, disabled, blocked, title)| {
+                renderer
+                    .render_cell(CellTemplate {
+                        key,
+                        title,
+                        disabled,
+                        blocked,
+                        max_title_width: 20,
+                        key_width: 6,
+                    })
+                    .expect("cell")
+            });
+            assert!(cells[0].plain.starts_with("  "));
+            assert!(cells[1].plain.starts_with("- "));
+            assert!(cells[2].plain.starts_with("! "));
+            let layout_cells = cells
+                .iter()
+                .map(|cell| Cell { text: &cell.plain })
+                .collect::<Vec<_>>();
+            let plan = arrange_cells(&layout_cells, GridRect { width: 40, rows: 3 }, 0, 3);
+            let empty = RenderedText::plain_fallback("");
+            let area = Rect::new(0, 0, 40, 4);
+            let mut surface = TerminalSurface::for_test(Vec::new(), area).expect("surface");
+            surface
+                .render(
+                    SurfaceFrame {
+                        title: "Menu",
+                        title_style: renderer.title_style(),
+                        surface_style: renderer.surface_style(),
+                        breadcrumb: &empty,
+                        padding: SurfacePadding::default(),
+                        plan: &plan,
+                        cells: &cells,
+                        page: 0,
+                        pager: None,
+                        status: None,
+                    },
+                    area,
+                )
+                .expect("render");
+            let bytes = surface
+                .terminal
+                .as_mut()
+                .expect("stored terminal")
+                .backend_mut()
+                .writer_mut();
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !text.contains("[38;") && !text.contains("[48;"),
+                "{name}: NO_COLOR suppresses RGB output"
+            );
+            let key_position = text.find('g').expect("shortcut emitted");
+            let mut effective_bold = false;
+            for sequence in text[..key_position].split("\x1b[").skip(1) {
+                let Some(end) = sequence
+                    .find(|character: char| !character.is_ascii_digit() && character != ';')
+                else {
+                    continue;
+                };
+                if sequence.as_bytes()[end] != b'm' {
+                    continue;
+                }
+                for parameter in sequence[..end].split(';') {
+                    match parameter.parse::<u16>().unwrap_or(0) {
+                        0 | 22 => effective_bold = false,
+                        1 => effective_bold = true,
+                        _ => {}
+                    }
                 }
             }
+            assert!(
+                effective_bold,
+                "{name}: enabled key remains effectively bold"
+            );
+            for token in ["Enabled", "Disabled", "Blocked", "ctrl+g", "界", "-", "!"] {
+                assert!(text.contains(token), "{name}: accessible token {token}");
+            }
         }
-        assert!(
-            effective_bold,
-            "shortcut is effectively bold, not reset after a bold command"
-        );
-        assert!(text.contains('[') && text.contains('g') && text.contains("Git"));
     }
 
     #[test]
