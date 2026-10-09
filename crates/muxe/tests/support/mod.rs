@@ -695,6 +695,7 @@ pub async fn spawn_herdr_client(
         let mut command = Command::new("script");
         command
             .arg("-q")
+            .arg("-F")
             .arg(typescript)
             .arg("sh")
             .arg("-c")
@@ -702,7 +703,7 @@ pub async fn spawn_herdr_client(
         command
     } else {
         let mut command = Command::new("script");
-        command.arg("-qec").arg(shell).arg(typescript);
+        command.arg("-qefc").arg(shell).arg(typescript);
         command
     };
     apply_scoped_env(&mut command, scoped_root);

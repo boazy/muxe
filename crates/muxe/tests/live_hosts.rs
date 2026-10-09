@@ -1884,10 +1884,152 @@ async fn assert_herdr_menu_creates_tab(
     })
 }
 
+async fn wait_herdr_menu_labels(
+    transcript: &Path,
+    start: usize,
+    required: &[&str],
+    excluded: &[&str],
+) -> io::Result<()> {
+    poll_until(
+        "owned terminal menu labels",
+        std::time::Duration::from_secs(5),
+        async || {
+            let text = std::fs::read_to_string(transcript).map_err(|error| error.to_string())?;
+            let text = text.get(start..).unwrap_or("");
+            if required.iter().all(|label| text.contains(label))
+                && excluded.iter().all(|label| !text.contains(label))
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "menu labels not observed in owned terminal:\n{text}"
+                ))
+            }
+        },
+    )
+    .await
+}
+
+async fn wait_herdr_focus_after_dismissal(
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
+    menu: &muxe_core::PaneId,
+    expected: &muxe_core::PaneId,
+) -> io::Result<()> {
+    poll_until(
+        "arrow dismisses UI and focuses sibling",
+        std::time::Duration::from_secs(5),
+        async || {
+            let focused = muxe_adapter_herdr::focused_pane(runtime)
+                .await
+                .map_err(|error| error.to_string())?;
+            if focused.pane == *expected
+                && muxe_adapter_herdr::pane_by_id(runtime, menu.as_str())
+                    .await
+                    .is_err()
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected {}, focused {}",
+                    expected.as_str(),
+                    focused.pane.as_str()
+                ))
+            }
+        },
+    )
+    .await
+}
+
+async fn assert_herdr_navigation(
+    rig: &mut Rig,
+    target_bin: &Path,
+    herdr_binary: &Path,
+) -> io::Result<()> {
+    let (socket, runtime, left, typescript) = prepare_herdr_menu_origin(rig, herdr_binary).await?;
+    let result = async {
+        herdr_smoke_request(
+            &runtime,
+            "pane.split",
+            serde_json::json!({
+                "target_pane_id": left.pane.as_str(), "direction": "right",
+                "focus": true, "cwd": left.cwd,
+            }),
+        )
+        .await?;
+        let right = muxe_adapter_herdr::focused_pane(&runtime)
+            .await
+            .map_err(io::Error::other)?;
+        for (origin, key, expected) in [(&right, "left", &left.pane), (&left, "right", &right.pane)]
+        {
+            let start =
+                usize::try_from(std::fs::metadata(&typescript)?.len()).map_err(io::Error::other)?;
+            let menu = launch_herdr_smoke_menu(rig, target_bin, &socket, origin).await?;
+            wait_herdr_menu_labels(&typescript, start, &["ML", "MR"], &[]).await?;
+            herdr_smoke_request(
+                &runtime,
+                "pane.send_keys",
+                serde_json::json!({"pane_id": menu.as_str(), "keys": [key]}),
+            )
+            .await?;
+            wait_herdr_focus_after_dismissal(&runtime, &menu, expected).await?;
+        }
+        let start =
+            usize::try_from(std::fs::metadata(&typescript)?.len()).map_err(io::Error::other)?;
+        let menu = launch_herdr_smoke_menu(rig, target_bin, &socket, &right).await?;
+        wait_herdr_menu_labels(&typescript, start, &["MR"], &[]).await?;
+        herdr_smoke_request(
+            &runtime,
+            "pane.send_keys",
+            serde_json::json!({"pane_id": menu.as_str(), "keys": ["s"]}),
+        )
+        .await?;
+        wait_herdr_menu_labels(&typescript, start, &["SR"], &["SL-unavailable"]).await?;
+        herdr_smoke_request(
+            &runtime,
+            "pane.send_keys",
+            serde_json::json!({"pane_id": menu.as_str(), "keys": ["right"]}),
+        )
+        .await?;
+        poll_until(
+            "split right dismisses UI and creates focused pane",
+            std::time::Duration::from_secs(5),
+            async || {
+                let focused = muxe_adapter_herdr::focused_pane(&runtime)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if focused.pane != left.pane
+                    && focused.pane != right.pane
+                    && focused.pane != menu
+                    && muxe_adapter_herdr::pane_by_id(&runtime, menu.as_str())
+                        .await
+                        .is_err()
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "right split has not completed: focused {}",
+                        focused.pane.as_str()
+                    ))
+                }
+            },
+        )
+        .await
+    }
+    .await;
+    result.map_err(|error| {
+        let transcript = std::fs::read_to_string(&typescript)
+            .unwrap_or_else(|read_error| format!("transcript unavailable: {read_error}"));
+        io::Error::other(format!(
+            "{error}\n--- owned Herdr terminal ---\n{transcript}"
+        ))
+    })
+}
+
 #[derive(Clone, Copy)]
 enum HerdrMenuSmoke {
     StaysOpen,
     BareTabCreate,
+    Navigation,
 }
 
 async fn activate_herdr_smoke(rig: &Rig, target_bin: &Path, socket: &Path) -> io::Result<()> {
@@ -1910,6 +2052,19 @@ async fn activate_herdr_smoke(rig: &Rig, target_bin: &Path, socket: &Path) -> io
     Ok(())
 }
 
+fn write_herdr_smoke_config(scenario: HerdrMenuSmoke, config_file: &Path) -> io::Result<()> {
+    let yaml = match scenario {
+        HerdrMenuSmoke::StaysOpen => return Ok(()),
+        HerdrMenuSmoke::BareTabCreate => {
+            "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      t: { label: tabs, action: 'menu:open tabs' }\n      u: { label: up, skip-hosts: [herdr], action: 'pane:split direction=up' }\n  tabs:\n    bindings:\n      t: { label: new tab, action: 'tab:create' }\n  foreign:\n    only-hosts: [zellij]\n    bindings:\n      p: { label: unsupported, action: 'pane:create' }\n"
+        }
+        HerdrMenuSmoke::Navigation => {
+            "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      s: { label: split, action: 'menu:open split' }\n      left: { label: ML, action: 'pane:focus direction=left' }\n      right: { label: MR, action: 'pane:focus direction=right' }\n  split:\n    bindings:\n      left: { label: SL-unavailable, skip-hosts: [herdr], action: 'pane:split direction=left' }\n      right: { label: SR, action: 'pane:split direction=right' }\n"
+        }
+    };
+    std::fs::write(config_file, yaml)
+}
+
 async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
     let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
     let target_version = installed_version(&target_bin).await?;
@@ -1917,12 +2072,7 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
     let root = short_tempdir("muxe-live-herdr-menu-")?;
     let scoped_root = root.path().join("scoped");
     let (config_file, cache_dir) = init_shared_dirs(&target_bin, &scoped_root).await?;
-    if matches!(scenario, HerdrMenuSmoke::BareTabCreate) {
-        std::fs::write(
-            &config_file,
-            "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      t: { label: tabs, action: 'menu:open tabs' }\n      u: { label: up, skip-hosts: [herdr], action: 'pane:split direction=up' }\n  tabs:\n    bindings:\n      t: { label: new tab, action: 'tab:create' }\n  foreign:\n    only-hosts: [zellij]\n    bindings:\n      p: { label: unsupported, action: 'pane:create' }\n",
-        )?;
-    }
+    write_herdr_smoke_config(scenario, &config_file)?;
     let workdir = root.path().join("work");
     std::fs::create_dir_all(&workdir)?;
     let herdr =
@@ -1998,6 +2148,9 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
             }
             HerdrMenuSmoke::BareTabCreate => {
                 assert_herdr_menu_creates_tab(&mut rig, &target_bin, &herdr_binary).await
+            }
+            HerdrMenuSmoke::Navigation => {
+                assert_herdr_navigation(&mut rig, &target_bin, &herdr_binary).await
             }
         }
     }
@@ -2484,6 +2637,15 @@ async fn herdr_menu_bare_tab_create() {
     require_live_approval();
     if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::BareTabCreate).await {
         panic!("Herdr bare tab:create regression failed: {error}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live Herdr: needs a staged install, Herdr binary, and MUXE_LIVE_HOSTS_APPROVED=true"]
+async fn herdr_navigation_bindings_are_visible_and_dispatch() {
+    require_live_approval();
+    if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::Navigation).await {
+        panic!("Herdr navigation regression failed: {error}");
     }
 }
 
