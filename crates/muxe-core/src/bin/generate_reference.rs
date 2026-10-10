@@ -361,10 +361,32 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
     writeln!(
         output,
         "\n### Herdr native actions\n\n\
-         Muxe takes the list of Herdr native action names from the Herdr API schema that this Muxe build was generated from. That schema comes from Herdr 0.8.2. Muxe validates the parameters of each action against the request schema of the installed Herdr executable. As a result:\n\n\
-         - A method that Herdr added after 0.8.2 has no native action name.\n\
+         Most Herdr native action names come from the Herdr 0.8.2 API schema used to generate this Muxe build. Muxe validates their parameters against the installed Herdr executable's request schema. Configured-command invocation is a Muxe extension, described below. For generated actions:\n\n\
+         - A method added after Herdr 0.8.2 has no generated native action name.\n\
          - A method that the installed Herdr no longer provides fails validation. For example, Herdr 0.9.3 does not provide the `pane.graphics.*` methods, so `native.herdr.pane.graphics:set` is rejected.\n\
          - A parameter that the installed Herdr accepts is valid even if Herdr 0.8.2 did not have it. For example, Herdr 0.9.3 closes a primary workspace that has linked worktrees only when `native.herdr.workspace:close` sets `close-group: true`. Otherwise Herdr rejects the request with `workspace_group_close_required`."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "\n#### Invoke a configured Herdr command\n\n\
+         `native.herdr.command:invoke` invokes a custom command already defined in Herdr's `[[keys.command]]` configuration. Its required `binding` parameter is a literal keybinding label, such as `prefix+shift+u`. Muxe resolves that label from the endpoint's current command manifest; do not put an opaque command ID in your configuration.\n\n\
+         Put the Muxe binding in `herdr.yml` to make it available only on Herdr:\n\n\
+         ```yaml\n\
+         menus:\n\
+         \x20 main:\n\
+         \x20   bindings:\n\
+         \x20     u:\n\
+         \x20       label: OMP usage\n\
+         \x20       action:\n\
+         \x20         type: native.herdr.command:invoke\n\
+         \x20         binding: prefix+shift+u\n\
+         \x20       settings:\n\
+         \x20         after_action: quit\n\
+         ```\n\n\
+         Herdr uses the configured command's original program, action type, and popup dimensions. A `type = \"popup\"` command therefore opens the same popup as its Herdr shortcut. With `after_action: quit`, Muxe closes its menu after Herdr acknowledges the invocation; the popup remains open until its program exits.\n\n\
+         This extension requires stable endpoint generation 1 and the advertised `command.invoke` method, verified with Herdr 0.9.3. It is not supplied by the generated 0.8.2 method catalog. Lookup uses an inactive client connection without changing terminal geometry or capturing input. Invocation targets the pane where Muxe opened, not whichever pane later acquired focus.\n\n\
+         A missing or ambiguous binding fails without invoking a command. Muxe resolves a fresh command ID for each invocation and does not retry after an unconfirmed send. If the command may already have executed, Muxe reports that uncertainty."
     )
     .unwrap();
 
