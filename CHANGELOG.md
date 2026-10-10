@@ -1,3 +1,23 @@
+## [0.3.2] - 2026-10-10
+
+### 🚀 Features
+
+- *(herdr)* Invoke configured commands from native bindings
+
+### 🐛 Bug Fixes
+
+- *(runtime)* Explain broker and adapter failures without internal shorthand
+- *(lifecycle)* Explain activation and recovery failures
+- *(cli)* Explain activation results and user-facing failures
+
+### 📚 Documentation
+
+- *(herdr)* Document configured-command bindings
+
+### 🧪 Testing
+
+- *(herdr)* Handle reset after read-only retirement
+- *(lifecycle)* Assert bridge preflight outcomes without wording pins
 ## [0.3.1] - 2026-10-09
 
 ### 🐛 Bug Fixes
@@ -8,6 +28,10 @@
 ### 📚 Documentation
 
 - *(themes)* Explain aligned layouts and semantic color roles
+
+### 💼 Other
+
+- V0.3.1
 ## [0.3.0] - 2026-10-09
 
 ### 🚀 Features
