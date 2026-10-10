@@ -33,13 +33,17 @@ use tokio::task::JoinHandle;
 use crate::{
     ApiSchema, CandidateValidationError, ComparisonKey, DeliveryState, EventSubscription,
     HerdrAdapterConfig, HerdrCache, HerdrResponse, HerdrRuntime, SocketError, SubscriptionConfig,
-    SubscriptionEvent, fields_to_json,
+    SubscriptionEvent,
+    commands::CommandBinding,
+    fields_to_json,
     generated::{BUNDLED_REQUEST_SCHEMA_SHA256, method_metadata},
     runtime::{
         ClassifiedInvokeError, GuardedHerdrInvoker, HerdrRequestAuthority, IncarnationEpoch,
         IncarnationLease, OrderedReceiver, PreparedInvocation,
     },
-    validate_candidate,
+    validation::{
+        CONFIGURED_COMMAND_NATIVE_TYPE, ValidatedNativeAction, validate_native_candidate,
+    },
 };
 
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -351,6 +355,21 @@ impl IncarnationTransactionAuthority {
         }
         self.invoker
             .invoke_prepared(&self.lease, invocation)
+            .await
+            .map_err(|error| self.classify(error))
+    }
+
+    async fn invoke_configured_command_with_delivery(
+        &self,
+        binding: &CommandBinding,
+        origin: &muxe_core::OriginContext,
+    ) -> Result<HerdrResponse, (AdapterError, DeliveryState)> {
+        if let Some(hook) = &self.request_connect_wait_hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+        self.invoker
+            .invoke_configured_command(&self.lease, binding, origin)
             .await
             .map_err(|error| self.classify(error))
     }
@@ -1144,6 +1163,54 @@ impl HerdrAdapter {
 
     #[expect(
         clippy::result_large_err,
+        reason = "ordered dispatch preserves the adapter's shared error type"
+    )]
+    fn dispatch_configured_command(
+        &self,
+        authority: IncarnationAuthority,
+        execution: muxe_core::ExecutionId,
+        binding: CommandBinding,
+        origin: muxe_core::OriginContext,
+    ) -> Result<DispatchAccepted, AdapterError> {
+        authority.verify_endpoint_file()?;
+        let results = self.dispatch_results_tx.clone();
+        self.admit_dispatch_task(execution, move || {
+            let receiver = authority.try_run_ordered(move |direct| async move {
+                match direct
+                    .invoke_configured_command_with_delivery(&binding, &origin)
+                    .await
+                {
+                    Ok(HerdrResponse::Success(_)) => DispatchCompletion::Succeeded { execution },
+                    Ok(HerdrResponse::Error { code, message }) => DispatchCompletion::Failed {
+                        execution,
+                        error: AdapterError::new(
+                            AdapterErrorKind::DispatchFailed,
+                            format!("Herdr rejected command.invoke ({code}): {message}"),
+                        ),
+                    },
+                    Err((error, DeliveryState::MayHaveReachedHost)) => {
+                        DispatchCompletion::OutcomeUnknown { execution, error }
+                    }
+                    Err((error, DeliveryState::NotSent)) => {
+                        DispatchCompletion::Failed { execution, error }
+                    }
+                }
+            })?;
+            Ok(tokio::spawn(async move {
+                let completion = HerdrRuntime::await_ordered(receiver)
+                    .await
+                    .unwrap_or_else(|error| DispatchCompletion::Failed { execution, error });
+                let _ = results.send(DispatchTerminal {
+                    execution,
+                    completion,
+                });
+            }))
+        })?;
+        Ok(self.post_dismissal_accepted(execution))
+    }
+
+    #[expect(
+        clippy::result_large_err,
         reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
     )]
     fn dispatch_tab_swap(
@@ -1427,6 +1494,14 @@ fn validate_native_batch_cached(
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
+    // The extension is not bundled raw-method metadata. Keep mixed batches out
+    // of that cache, but validate every member with the same concrete authority.
+    if candidates
+        .iter()
+        .any(|candidate| candidate.type_name == CONFIGURED_COMMAND_NATIVE_TYPE)
+    {
+        return validate_native_batch_uncached(schema, candidates);
+    }
     let structural = candidates
         .iter()
         .copied()
@@ -1439,7 +1514,7 @@ fn validate_native_batch_cached(
                 diagnostics.push(native_diagnostic(candidate, &error.to_string()));
                 continue;
             }
-            if let Err(error) = validate_candidate(schema, candidate) {
+            if let Err(error) = validate_native_candidate(schema, candidate) {
                 diagnostics.push(native_candidate_diagnostic(candidate, &error));
             }
         }
@@ -1462,7 +1537,7 @@ fn validate_native_batch_cached(
         let mut diagnostics = Vec::new();
         for (candidate, outcome) in candidates.iter().zip(&outcomes) {
             if !outcome {
-                match validate_candidate(schema, candidate) {
+                match validate_native_candidate(schema, candidate) {
                     Ok(_) => diagnostics.push(native_diagnostic(
                         candidate,
                         "Herdr compatibility cache disagrees with the immutable runtime schema",
@@ -1486,7 +1561,7 @@ fn validate_native_batch_cached(
     let mut outcomes = Vec::with_capacity(candidates.len());
     let mut diagnostics = Vec::new();
     for candidate in candidates {
-        match validate_candidate(schema, candidate) {
+        match validate_native_candidate(schema, candidate) {
             Ok(_) => outcomes.push(true),
             Err(error) => {
                 outcomes.push(false);
@@ -1507,6 +1582,27 @@ fn validate_native_batch_cached(
             };
             candidates.len()
         ])
+    } else {
+        Err(diagnostics)
+    }
+}
+
+fn validate_native_batch_uncached(
+    schema: &ApiSchema,
+    candidates: &[&NativeActionCandidate],
+) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
+    let mut validations = Vec::with_capacity(candidates.len());
+    let mut diagnostics = Vec::new();
+    for candidate in candidates {
+        match validate_native_candidate(schema, candidate) {
+            Ok(_) => validations.push(ActionValidation {
+                execution: ExecutionCapabilities::ASYNCHRONOUS,
+            }),
+            Err(error) => diagnostics.push(native_candidate_diagnostic(candidate, &error)),
+        }
+    }
+    if diagnostics.is_empty() {
+        Ok(validations)
     } else {
         Err(diagnostics)
     }
@@ -2079,23 +2175,7 @@ impl ActionValidator for HerdrConfigValidator {
         &self,
         candidates: &[&NativeActionCandidate],
     ) -> Result<Vec<ActionValidation>, Vec<ConfigDiagnostic>> {
-        let mut validations = Vec::with_capacity(candidates.len());
-        let mut diagnostics = Vec::new();
-        for candidate in candidates {
-            match validate_candidate(&self.schema, candidate) {
-                Ok(_) => validations.push(ActionValidation {
-                    execution: ExecutionCapabilities::ASYNCHRONOUS,
-                }),
-                Err(error) => {
-                    diagnostics.push(native_candidate_diagnostic(candidate, &error));
-                }
-            }
-        }
-        if diagnostics.is_empty() {
-            Ok(validations)
-        } else {
-            Err(diagnostics)
-        }
+        validate_native_batch_uncached(&self.schema, candidates)
     }
 }
 
@@ -2418,13 +2498,25 @@ impl HostAdapter for HerdrAdapter {
         request: NativeDispatchRequest,
     ) -> Result<DispatchAccepted, AdapterError> {
         let authority = self.require_current_origin(&request.origin)?;
-        let metadata = validate_candidate(authority.runtime.schema(), &request.action.candidate)
-            .map_err(|error| {
-                incompatible(format!(
-                    "active Herdr schema rejects native action: {}",
-                    error.error
-                ))
-            })?;
+        let validated =
+            validate_native_candidate(authority.runtime.schema(), &request.action.candidate)
+                .map_err(|error| {
+                    incompatible(format!(
+                        "active Herdr schema rejects native action: {}",
+                        error.error
+                    ))
+                })?;
+        let metadata = match validated {
+            ValidatedNativeAction::Direct(metadata) => metadata,
+            ValidatedNativeAction::ConfiguredCommand(binding) => {
+                return self.dispatch_configured_command(
+                    authority,
+                    request.execution,
+                    binding,
+                    request.origin,
+                );
+            }
+        };
         let params = fields_to_json(&request.action.candidate.fields)
             .map(Value::Object)
             .map_err(|error| {
@@ -4970,6 +5062,212 @@ mod tests {
         mutate(&mut raw);
         ApiSchema::parse(raw).expect("mutated schema parses")
     }
+
+    fn configured_command_schema() -> Arc<ApiSchema> {
+        Arc::new(mutated_schema(|raw| {
+            raw["schemas"]["request"]["oneOf"]
+                .as_array_mut()
+                .expect("request method catalog")
+                .push(json!({
+                    "type": "object",
+                    "properties": {
+                        "method": { "const": "command.invoke" },
+                        "params": {
+                            "type": "object",
+                            "properties": { "command_id": { "type": "string" } },
+                            "required": ["command_id"],
+                            "additionalProperties": false,
+                        },
+                    },
+                    "required": ["method", "params"],
+                }));
+        }))
+    }
+
+    fn configured_command_candidate(value: ConfigValueKind) -> NativeActionCandidate {
+        NativeActionCandidate {
+            type_name: CONFIGURED_COMMAND_NATIVE_TYPE.to_owned(),
+            type_span: SourceSpan::new(SourceId::new("command.yml"), 10, 20),
+            fields: vec![muxe_core::ConfigField {
+                name: "binding".to_owned(),
+                name_span: SourceSpan::new(SourceId::new("command.yml"), 30, 37),
+                value: ConfigValue {
+                    kind: value,
+                    span: SourceSpan::new(SourceId::new("command.yml"), 40, 54),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn configured_command_compiles_literal_mapping_without_raw_binding_parameter() {
+        let schema = configured_command_schema();
+        let validator = HerdrConfigValidator {
+            schema: Arc::clone(&schema),
+        };
+        let yaml = "version: 1\nmenus:\n  main:\n    bindings:\n      u:\n        label: Show OMP Usage\n        settings: { after_action: quit }\n        action:\n          type: native.herdr.command:invoke\n          binding: prefix+shift+u\n";
+        muxe_core::compile_yaml(
+            muxe_core::CompiledGeneration(1),
+            SourceId::new("command.yml"),
+            yaml,
+            muxe_core::KeyCapabilities::default(),
+            Some(&validator),
+        )
+        .expect("concrete extension compiles without exposing binding to the raw schema");
+        let candidate =
+            configured_command_candidate(ConfigValueKind::String("prefix+shift+u".to_owned()));
+        assert!(
+            schema
+                .validate_method("command.invoke", &json!({ "binding": "prefix+shift+u" }))
+                .is_err()
+        );
+        let ValidatedNativeAction::ConfiguredCommand(binding) =
+            validate_native_candidate(&schema, &candidate).expect("extension validation")
+        else {
+            panic!("configured binding must not become a direct method");
+        };
+        assert_eq!(binding.as_str(), "prefix+shift+u");
+        assert_eq!(
+            validator.validate_native_batch(&[&candidate]).unwrap()[0].execution,
+            ExecutionCapabilities::ASYNCHRONOUS,
+        );
+        assert!(
+            crate::validate_candidate(&schema, &candidate).is_err(),
+            "direct generated native API stays unchanged"
+        );
+    }
+
+    #[test]
+    fn configured_command_rejects_invalid_selectors_at_their_source_field() {
+        let schema = configured_command_schema();
+        for value in [
+            ConfigValueKind::Null,
+            ConfigValueKind::Boolean(true),
+            ConfigValueKind::Context(
+                ContextReference::parse(
+                    "origin.selection.text",
+                    SourceSpan::new(SourceId::new("command.yml"), 40, 54),
+                )
+                .unwrap(),
+            ),
+            ConfigValueKind::String(String::new()),
+            ConfigValueKind::String("prefix+\nshift+u".to_owned()),
+        ] {
+            let candidate = configured_command_candidate(value);
+            let error = validate_native_candidate(&schema, &candidate)
+                .err()
+                .expect("invalid selector refused");
+            assert_eq!(error.field.as_deref(), Some("binding"));
+            assert!(matches!(
+                error.error.code,
+                crate::ValidationCode::Type | crate::ValidationCode::Pattern
+            ));
+            let diagnostic = native_candidate_diagnostic(&candidate, &error);
+            assert_eq!(diagnostic.code, DiagnosticCode::NativeActionRejected);
+            assert_eq!(diagnostic.labels[0].span, candidate.fields[0].value.span);
+        }
+        let mut candidate =
+            configured_command_candidate(ConfigValueKind::String("prefix+shift+u".to_owned()));
+        for name in [
+            "binding-label",
+            "command_id",
+            "command-id",
+            "bindings",
+            "binding\n",
+        ] {
+            candidate.fields[0].name = name.to_owned();
+            let error = validate_native_candidate(&schema, &candidate)
+                .err()
+                .unwrap();
+            assert_eq!(error.error.code, crate::ValidationCode::AdditionalProperty);
+            assert_eq!(
+                native_candidate_diagnostic(&candidate, &error).labels[0].span,
+                candidate.fields[0].value.span
+            );
+        }
+        candidate.fields[0].name = "binding".to_owned();
+        candidate.fields.push(candidate.fields[0].clone());
+        assert_eq!(
+            validate_native_candidate(&schema, &candidate)
+                .err()
+                .unwrap()
+                .error
+                .code,
+            crate::ValidationCode::AdditionalProperty
+        );
+        candidate.fields.clear();
+        let error = validate_native_candidate(&schema, &candidate)
+            .err()
+            .unwrap();
+        assert_eq!(error.error.code, crate::ValidationCode::Required);
+        assert_eq!(
+            native_candidate_diagnostic(&candidate, &error).labels[0].span,
+            candidate.type_span
+        );
+    }
+
+    #[test]
+    fn configured_command_batch_and_snapshot_never_trust_raw_comparison_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = HerdrCache::new(temp.path());
+        let schema = configured_command_schema();
+        let valid =
+            configured_command_candidate(ConfigValueKind::String("prefix+shift+u".to_owned()));
+        let invalid = configured_command_candidate(ConfigValueKind::Boolean(true));
+        let mut direct = valid.clone();
+        direct.type_name = "native.herdr.agent:list".to_owned();
+        direct.fields.clear();
+        let batch = [&direct, &invalid, &valid];
+        let key = ComparisonKey {
+            bundled_schema_hash: BUNDLED_REQUEST_SCHEMA_SHA256.to_owned(),
+            runtime_schema_hash: schema.canonical_request_sha256().to_owned(),
+            configured_requests_hash: crate::validated_requests_hash(&batch).unwrap(),
+        };
+        cache.comparison_store(&key, &[true, true, true]).unwrap();
+        let static_validator = HerdrConfigValidator {
+            schema: Arc::clone(&schema),
+        };
+        let expected = static_validator.validate_native_batch(&batch).unwrap_err();
+        let cached = validate_native_batch_cached(&schema, &cache, &batch).unwrap_err();
+        assert_eq!(cached, expected);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].labels[0].span, invalid.fields[0].value.span);
+        let snapshot = HerdrNativeCompatibilityValidator { schema, cache };
+        assert!(matches!(
+            snapshot.validate_native(&invalid),
+            NativeCompatibilityOutcome::Blocked(_)
+        ));
+        assert!(matches!(
+            snapshot.validate_native(&valid),
+            NativeCompatibilityOutcome::Compatible(ActionValidation {
+                execution: ExecutionCapabilities::ASYNCHRONOUS
+            })
+        ));
+    }
+
+    #[test]
+    fn configured_command_requires_installed_method_and_remains_herdr_only() {
+        let candidate =
+            configured_command_candidate(ConfigValueKind::String("prefix+shift+u".to_owned()));
+        let error = validate_native_candidate(&bundled_schema(), &candidate)
+            .err()
+            .unwrap();
+        assert_eq!(error.error.code, crate::ValidationCode::MissingMethod);
+        assert_eq!(
+            native_candidate_diagnostic(&candidate, &error).labels[0].span,
+            candidate.type_span
+        );
+        let validator = HerdrConfigValidator {
+            schema: configured_command_schema(),
+        };
+        assert!(validator.matches_host(OriginHostKind::Herdr));
+        assert!(!validator.matches_host(OriginHostKind::Zellij));
+        let mut foreign = candidate;
+        foreign.type_name = "native.zellij.command:invoke".to_owned();
+        assert!(validate_native_candidate(&validator.schema, &foreign).is_err());
+    }
+
+    include!("configured_command_tests.rs");
 
     #[test]
     fn command_bindings_reject_missing_host_helpers_at_load_time() {

@@ -24,9 +24,19 @@ use tokio::{
 use crate::{
     ApiSchema, DeliveryState, EventSubscription, HerdrCache, HerdrResponse, SocketError,
     SubscriptionConfig,
-    generated::{MethodMetadata, method_metadata},
-    transport::{EndpointContinuityToken, HerdrSocketClient},
+    commands::{self, CommandBinding},
+    generated::{MethodMetadata, MethodTransport, method_metadata},
+    transport::{CommandRequestGuard, EndpointContinuityToken, HerdrSocketClient},
     version::{HerdrRelease, HerdrServerVersion},
+};
+
+// Concrete extension gated by the installed schema, not generated 0.8.2 metadata.
+const COMMAND_INVOKE_METADATA: MethodMetadata = MethodMetadata {
+    method: "command.invoke",
+    native_type: "native.herdr.command:invoke",
+    params_ref: "#/schemas/request/$defs/CommandInvokeParams",
+    params_type: "CommandInvokeParams",
+    transport: MethodTransport::Unary,
 };
 
 /// Wall-clock bound for one `herdr api schema --json` invocation. Exceeding it fails
@@ -78,6 +88,7 @@ pub(crate) type OrderedReceiver<T> = oneshot::Receiver<Result<T, QueueExecutionE
 pub(crate) struct PreparedInvocation {
     metadata: &'static MethodMetadata,
     params: Value,
+    command_authority: Option<commands::CommandManifestAuthority>,
 }
 
 struct QueueLifecycle {
@@ -146,7 +157,11 @@ impl GuardedHerdrInvoker {
         params: Value,
     ) -> Result<PreparedInvocation, AdapterError> {
         let metadata = checked_metadata(&self.schema, method, &params)?;
-        Ok(PreparedInvocation { metadata, params })
+        Ok(PreparedInvocation {
+            metadata,
+            params,
+            command_authority: None,
+        })
     }
 
     pub(crate) async fn invoke_prepared(
@@ -189,44 +204,155 @@ impl GuardedHerdrInvoker {
         }
         let lifecycle = Arc::clone(&self.lifecycle);
         let retirement = lifecycle.subscribe();
-        let result = match timeout {
-            Some(timeout) => {
-                self.client
-                    .unary_on_expected_token_guarded_with_timeout(
-                        invocation.metadata,
-                        invocation.params,
-                        &lease.expected,
-                        timeout,
-                        retirement,
-                        move || {
-                            lifecycle.retire();
-                        },
-                    )
-                    .await
-            }
-            None => {
-                self.client
-                    .unary_on_expected_token_guarded(
-                        invocation.metadata,
-                        invocation.params,
-                        &lease.expected,
-                        retirement,
-                        move || {
-                            lifecycle.retire();
-                        },
-                    )
-                    .await
+        let result = if let Some(authority) = &invocation.command_authority {
+            let on_replacement = || {
+                self.lifecycle.retire();
+            };
+            let write = |stream: &tokio::net::UnixStream, bytes: &[u8]| {
+                let open = self
+                    .lifecycle
+                    .admission_open
+                    .lock()
+                    .expect("Herdr send-queue admission lock is not poisoned");
+                if !*open {
+                    return Err(SocketError::RuntimeRetired {
+                        delivery: DeliveryState::NotSent,
+                    });
+                }
+                lease.expected.verify_socket_file(self.client.socket())?;
+                authority.continuity().verify_socket_file()?;
+                stream
+                    .try_write(bytes)
+                    .map_err(|source| SocketError::Write {
+                        delivery: DeliveryState::NotSent,
+                        source,
+                    })
+            };
+            let guard = CommandRequestGuard {
+                binary: authority.continuity(),
+                api_expected: &lease.expected,
+                api_socket: self.client.socket(),
+                write: &write,
+                on_replacement: &on_replacement,
+            };
+            self.client
+                .unary_on_expected_token_guarded_command(
+                    invocation.metadata,
+                    invocation.params,
+                    &lease.expected,
+                    retirement,
+                    &guard,
+                    timeout,
+                )
+                .await
+        } else {
+            match timeout {
+                Some(timeout) => {
+                    self.client
+                        .unary_on_expected_token_guarded_with_timeout(
+                            invocation.metadata,
+                            invocation.params,
+                            &lease.expected,
+                            timeout,
+                            retirement,
+                            move || {
+                                lifecycle.retire();
+                            },
+                        )
+                        .await
+                }
+                None => {
+                    self.client
+                        .unary_on_expected_token_guarded(
+                            invocation.metadata,
+                            invocation.params,
+                            &lease.expected,
+                            retirement,
+                            move || {
+                                lifecycle.retire();
+                            },
+                        )
+                        .await
+                }
             }
         };
-        result.map_err(|error| {
-            let continuity_lost = matches!(error, SocketError::EndpointReplaced { .. })
-                && !self.replacement_reported.swap(true, Ordering::AcqRel);
-            ClassifiedInvokeError {
-                error: socket_error(&error),
-                delivery: error.delivery(),
-                continuity_lost,
+        result.map_err(|error| self.classify_socket_error(&error))
+    }
+
+    fn classify_socket_error(&self, error: &SocketError) -> ClassifiedInvokeError {
+        let continuity_lost = matches!(
+            error,
+            SocketError::EndpointReplaced { .. } | SocketError::EndpointReplacedAfterSend { .. }
+        ) && !self.replacement_reported.swap(true, Ordering::AcqRel);
+        ClassifiedInvokeError {
+            error: socket_error(error),
+            delivery: error.delivery(),
+            continuity_lost,
+        }
+    }
+
+    pub(crate) async fn invoke_configured_command(
+        &self,
+        lease: &IncarnationLease,
+        binding: &CommandBinding,
+        origin: &muxe_core::OriginContext,
+    ) -> Result<HerdrResponse, ClassifiedInvokeError> {
+        commands::validate_origin(origin).map_err(|error| ClassifiedInvokeError {
+            error,
+            delivery: DeliveryState::NotSent,
+            continuity_lost: false,
+        })?;
+        if !self.lifecycle.is_open() {
+            return Err(retired_before_send());
+        }
+        if self.expected.proven_replacement(&lease.expected) {
+            self.lifecycle.retire();
+            return Err(ClassifiedInvokeError {
+                error: socket_error(&SocketError::EndpointReplaced {
+                    socket: self.client.socket().to_path_buf(),
+                }),
+                delivery: DeliveryState::NotSent,
+                continuity_lost: !self.replacement_reported.swap(true, Ordering::AcqRel),
+            });
+        }
+        let resolved = commands::resolve(
+            &self.client,
+            &lease.expected,
+            binding,
+            self.lifecycle.subscribe(),
+        )
+        .await
+        .map_err(|error| {
+            let replaced = matches!(error, SocketError::EndpointReplaced { .. });
+            if replaced {
+                self.lifecycle.retire();
             }
-        })
+            ClassifiedInvokeError {
+                delivery: error.delivery(),
+                continuity_lost: replaced
+                    && !self.replacement_reported.swap(true, Ordering::AcqRel),
+                error: socket_error(&error),
+            }
+        })?;
+        let (params, authority) = resolved.into_request(origin);
+        self.schema
+            .validate_method(COMMAND_INVOKE_METADATA.method, &params)
+            .map_err(|error| ClassifiedInvokeError {
+                error: incompatible(format!(
+                    "active Herdr schema rejects command.invoke: {error}"
+                )),
+                delivery: DeliveryState::NotSent,
+                continuity_lost: false,
+            })?;
+        self.invoke_prepared(
+            lease,
+            PreparedInvocation {
+                metadata: &COMMAND_INVOKE_METADATA,
+                params,
+                command_authority: Some(authority),
+            },
+        )
+        .await
     }
 }
 
@@ -716,7 +842,11 @@ impl HerdrRuntime {
         params: Value,
     ) -> Result<PreparedInvocation, AdapterError> {
         let metadata = self.checked_metadata(method, &params)?;
-        Ok(PreparedInvocation { metadata, params })
+        Ok(PreparedInvocation {
+            metadata,
+            params,
+            command_authority: None,
+        })
     }
 
     pub(crate) async fn run_ordered<T, F, Fut>(&self, operation: F) -> Result<T, AdapterError>
@@ -1197,6 +1327,324 @@ mod tests {
         assert_eq!(failure.error.kind, AdapterErrorKind::Unavailable);
         assert_eq!(failure.delivery, DeliveryState::NotSent);
         assert!(!failure.continuity_lost);
+    }
+
+    async fn command_invoker(
+        path: &Path,
+    ) -> (
+        UnixListener,
+        UnixListener,
+        GuardedHerdrInvoker,
+        IncarnationLease,
+    ) {
+        let listener = UnixListener::bind(path).unwrap();
+        let client = Arc::new(HerdrSocketClient::new(path));
+        let binary = UnixListener::bind(client.command_socket().unwrap()).unwrap();
+        let expected = client.observed_token().await.unwrap();
+        drop(listener.accept().await.unwrap());
+        let lease = IncarnationLease {
+            epoch: IncarnationEpoch::INITIAL,
+            expected: expected.clone(),
+        };
+        let invoker = GuardedHerdrInvoker {
+            client,
+            schema: Arc::new(commands::fixture::schema()),
+            expected,
+            lifecycle: QueueLifecycle::new(),
+            replacement_reported: Arc::new(AtomicBool::new(false)),
+        };
+        (listener, binary, invoker, lease)
+    }
+
+    #[tokio::test]
+    async fn configured_command_uses_fresh_manifest_ids_on_the_captured_json_target() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (api, binary, invoker, lease) = command_invoker(&temp.path().join("herdr.sock")).await;
+        let server = tokio::spawn(async move {
+            for command_id in ["opaque-first", "opaque-after-reload"] {
+                let (mut discovery, _) = binary.accept().await.unwrap();
+                commands::fixture::accept_inactive_hello(&mut discovery).await;
+                commands::fixture::write_control(
+                    &mut discovery,
+                    "endpoint.welcome.v1",
+                    &commands::fixture::welcome(),
+                )
+                .await;
+                commands::fixture::write_control(
+                    &mut discovery,
+                    "shell.snapshot.v1",
+                    &commands::fixture::snapshot(command_id),
+                )
+                .await;
+                let (mut mutation, _) = api.accept().await.unwrap();
+                let request = commands::fixture::read_request(&mut mutation).await;
+                assert_eq!(request["method"], "command.invoke");
+                assert_eq!(
+                    request["params"],
+                    serde_json::json!({
+                    "command_id":command_id,"workspace_id":"captured-workspace",
+                    "tab_id":"captured-tab","pane_id":"captured-pane"})
+                );
+                assert!(!request.to_string().contains("must-not-be-forwarded-secret"));
+                commands::fixture::write_response(
+                    &mut mutation,
+                    &serde_json::json!({"id":request["id"],"result":{"type":"ok"}}),
+                )
+                .await;
+                let mut extra = Vec::new();
+                discovery.read_to_end(&mut extra).await.unwrap();
+                assert!(
+                    extra.is_empty(),
+                    "inactive discovery channel never sends a mutating RPC"
+                );
+            }
+        });
+        let binding = CommandBinding::parse("prefix+shift+u").unwrap();
+        for _ in 0..2 {
+            let result = invoker
+                .invoke_configured_command(&lease, &binding, &commands::fixture::origin())
+                .await;
+            assert!(
+                matches!(result, Ok(HerdrResponse::Success(value)) if value == serde_json::json!({"type":"ok"}))
+            );
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_command_requires_installed_schema_before_sending_json_mutation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (_api, binary, mut invoker, lease) =
+            command_invoker(&temp.path().join("herdr.sock")).await;
+        invoker.schema = test_schema();
+        let server = tokio::spawn(async move {
+            let (mut discovery, _) = binary.accept().await.unwrap();
+            commands::fixture::accept_inactive_hello(&mut discovery).await;
+            commands::fixture::write_control(
+                &mut discovery,
+                "endpoint.welcome.v1",
+                &commands::fixture::welcome(),
+            )
+            .await;
+            commands::fixture::write_control(
+                &mut discovery,
+                "shell.snapshot.v1",
+                &commands::fixture::snapshot("opaque"),
+            )
+            .await;
+            let mut extra = Vec::new();
+            discovery.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty());
+        });
+        let failure = invoker
+            .invoke_configured_command(
+                &lease,
+                &CommandBinding::parse("prefix+shift+u").unwrap(),
+                &commands::fixture::origin(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.delivery, DeliveryState::NotSent);
+        assert_eq!(failure.error.kind, AdapterErrorKind::Incompatible);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_command_preserves_stale_manifest_host_error_without_retry() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (api, binary, invoker, lease) = command_invoker(&temp.path().join("herdr.sock")).await;
+        let server = tokio::spawn(async move {
+            let (mut discovery, _) = binary.accept().await.unwrap();
+            commands::fixture::accept_inactive_hello(&mut discovery).await;
+            commands::fixture::write_control(
+                &mut discovery,
+                "endpoint.welcome.v1",
+                &commands::fixture::welcome(),
+            )
+            .await;
+            commands::fixture::write_control(
+                &mut discovery,
+                "shell.snapshot.v1",
+                &commands::fixture::snapshot("opaque-stale"),
+            )
+            .await;
+            let (mut mutation, _) = api.accept().await.unwrap();
+            let request = commands::fixture::read_request(&mut mutation).await;
+            commands::fixture::write_response(&mut mutation, &serde_json::json!({
+                "id":request["id"],"error":{"code":"command_not_found","message":"manifest is stale"}
+            })).await;
+            let mut extra = Vec::new();
+            discovery.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty());
+        });
+        let result = invoker
+            .invoke_configured_command(
+                &lease,
+                &CommandBinding::parse("prefix+shift+u").unwrap(),
+                &commands::fixture::origin(),
+            )
+            .await;
+        assert!(matches!(result, Ok(HerdrResponse::Error { code, message })
+            if code == "command_not_found" && message == "manifest is stale"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_command_replacement_retires_and_reports_continuity_once() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("herdr.sock");
+        let (_original, _binary, invoker, lease) = command_invoker(&path).await;
+        std::fs::remove_file(&path).unwrap();
+        let _replacement = UnixListener::bind(&path).unwrap();
+        let binding = CommandBinding::parse("prefix+shift+u").unwrap();
+        let first = invoker
+            .invoke_configured_command(&lease, &binding, &commands::fixture::origin())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(first.delivery, DeliveryState::NotSent);
+        assert!(first.continuity_lost);
+        assert!(!invoker.lifecycle.is_open());
+        let second = invoker
+            .invoke_configured_command(&lease, &binding, &commands::fixture::origin())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(second.delivery, DeliveryState::NotSent);
+        assert!(!second.continuity_lost);
+    }
+
+    #[tokio::test]
+    async fn configured_command_retirement_before_rpc_is_unavailable_not_unknown() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (_api, listener, invoker, lease) =
+            command_invoker(&temp.path().join("herdr.sock")).await;
+        let lifecycle = Arc::clone(&invoker.lifecycle);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            commands::fixture::accept_inactive_hello(&mut stream).await;
+            commands::fixture::write_control(
+                &mut stream,
+                "endpoint.welcome.v1",
+                &commands::fixture::welcome(),
+            )
+            .await;
+            lifecycle.retire();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert!(bytes.is_empty());
+        });
+        let failure = invoker
+            .invoke_configured_command(
+                &lease,
+                &CommandBinding::parse("prefix+shift+u").unwrap(),
+                &commands::fixture::origin(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.delivery, DeliveryState::NotSent);
+        assert_eq!(failure.error.kind, AdapterErrorKind::Unavailable);
+        assert!(!failure.continuity_lost);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_command_unacknowledged_send_is_consumer_visible_unknown() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (api, listener, invoker, lease) =
+            command_invoker(&temp.path().join("herdr.sock")).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            commands::fixture::accept_inactive_hello(&mut stream).await;
+            commands::fixture::write_control(
+                &mut stream,
+                "endpoint.welcome.v1",
+                &commands::fixture::welcome(),
+            )
+            .await;
+            commands::fixture::write_control(
+                &mut stream,
+                "shell.snapshot.v1",
+                &commands::fixture::snapshot("opaque"),
+            )
+            .await;
+            let (mut api_stream, _) = api.accept().await.unwrap();
+            let request = commands::fixture::read_request(&mut api_stream).await;
+            assert_eq!(request["params"]["pane_id"], "captured-pane");
+            // Closing after consuming the request cannot prove it did not execute.
+        });
+        let failure = invoker
+            .invoke_configured_command(
+                &lease,
+                &CommandBinding::parse("prefix+shift+u").unwrap(),
+                &commands::fixture::origin(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.delivery, DeliveryState::MayHaveReachedHost);
+        assert_eq!(failure.error.kind, AdapterErrorKind::OutcomeUnknown);
+        assert!(!failure.continuity_lost);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_command_either_endpoint_replaced_after_rpc_is_unknown() {
+        for rebind_binary in [false, true] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (api, listener, invoker, lease) =
+                command_invoker(&temp.path().join("herdr.sock")).await;
+            let path = if rebind_binary {
+                invoker.client.command_socket().unwrap()
+            } else {
+                invoker.client.socket().to_path_buf()
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                commands::fixture::accept_inactive_hello(&mut stream).await;
+                commands::fixture::write_control(
+                    &mut stream,
+                    "endpoint.welcome.v1",
+                    &commands::fixture::welcome(),
+                )
+                .await;
+                commands::fixture::write_control(
+                    &mut stream,
+                    "shell.snapshot.v1",
+                    &commands::fixture::snapshot("opaque"),
+                )
+                .await;
+                let (mut api_stream, _) = api.accept().await.unwrap();
+                let request = commands::fixture::read_request(&mut api_stream).await;
+                assert_eq!(request["method"], "command.invoke");
+                std::fs::remove_file(&path).unwrap();
+                let _replacement = UnixListener::bind(&path).unwrap();
+                let mut extra = Vec::new();
+                api_stream.read_to_end(&mut extra).await.unwrap();
+                assert!(
+                    extra.is_empty(),
+                    "no retries after the unacknowledged command"
+                );
+            });
+            let failure = invoker
+                .invoke_configured_command(
+                    &lease,
+                    &CommandBinding::parse("prefix+shift+u").unwrap(),
+                    &commands::fixture::origin(),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(failure.delivery, DeliveryState::MayHaveReachedHost);
+            assert_eq!(failure.error.kind, AdapterErrorKind::OutcomeUnknown);
+            assert!(failure.error.to_string().contains("may have executed"));
+            assert!(!failure.error.to_string().contains("was not sent"));
+            assert!(failure.continuity_lost);
+            assert!(!invoker.lifecycle.is_open());
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

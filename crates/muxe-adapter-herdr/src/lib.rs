@@ -14,6 +14,7 @@ mod generated_executable;
 
 mod adapter;
 mod cache;
+mod commands;
 pub mod generated;
 mod launch;
 mod origin;

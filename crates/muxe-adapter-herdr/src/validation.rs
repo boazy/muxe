@@ -5,6 +5,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::{
     ApiSchema, ValidationCode, ValidationError,
+    commands::CommandBinding,
     generated::{MethodMetadata, MethodTransport, metadata_for_native_type},
 };
 
@@ -12,6 +13,84 @@ use crate::{
 pub struct CandidateValidationError {
     pub field: Option<String>,
     pub error: ValidationError,
+}
+
+pub(crate) const CONFIGURED_COMMAND_NATIVE_TYPE: &str = "native.herdr.command:invoke";
+
+pub(crate) enum ValidatedNativeAction {
+    Direct(&'static MethodMetadata),
+    ConfiguredCommand(CommandBinding),
+}
+
+/// The concrete adapter's native authority includes the configured-command
+/// extension without pretending its selector is a raw JSON-RPC parameter.
+pub(crate) fn validate_native_candidate(
+    schema: &ApiSchema,
+    candidate: &NativeActionCandidate,
+) -> Result<ValidatedNativeAction, CandidateValidationError> {
+    if candidate.type_name != CONFIGURED_COMMAND_NATIVE_TYPE {
+        return validate_candidate(schema, candidate).map(ValidatedNativeAction::Direct);
+    }
+    let mut binding = None;
+    for field in &candidate.fields {
+        if field.name != "binding" {
+            return Err(extension_error(
+                Some(&field.name),
+                ValidationCode::AdditionalProperty,
+                "configured command invocation accepts only the literal binding selector"
+                    .to_owned(),
+            ));
+        }
+        if binding.is_some() {
+            return Err(extension_error(
+                Some("binding"),
+                ValidationCode::AdditionalProperty,
+                "configured command invocation requires exactly one binding selector".to_owned(),
+            ));
+        }
+        let ConfigValueKind::String(value) = &field.value.kind else {
+            return Err(extension_error(
+                Some("binding"),
+                ValidationCode::Type,
+                "configured command binding must be a literal string, not a context reference"
+                    .to_owned(),
+            ));
+        };
+        binding = Some(CommandBinding::parse(value).map_err(|error| {
+            extension_error(Some("binding"), ValidationCode::Pattern, error.to_string())
+        })?);
+    }
+    let binding = binding.ok_or_else(|| {
+        extension_error(
+            Some("binding"),
+            ValidationCode::Required,
+            "configured command invocation requires a binding selector".to_owned(),
+        )
+    })?;
+    if schema.method("command.invoke").is_none() {
+        return Err(extension_error(
+            None,
+            ValidationCode::MissingMethod,
+            "installed Herdr schema does not advertise command.invoke".to_owned(),
+        ));
+    }
+    Ok(ValidatedNativeAction::ConfiguredCommand(binding))
+}
+
+fn extension_error(
+    field: Option<&str>,
+    code: ValidationCode,
+    detail: String,
+) -> CandidateValidationError {
+    CandidateValidationError {
+        field: field.map(str::to_owned),
+        error: ValidationError {
+            code,
+            instance_path: field.map_or_else(|| "#".to_owned(), |field| format!("#/{field}")),
+            schema_path: "#/muxe/extensions/configured-command".to_owned(),
+            detail,
+        },
+    }
 }
 
 /// Validates one native action candidate against the live schema and the bundled metadata.

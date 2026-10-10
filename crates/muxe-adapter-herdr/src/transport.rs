@@ -84,6 +84,18 @@ pub enum SocketError {
     },
     #[error("The Herdr server at socket {socket} changed. The request was not sent.")]
     EndpointReplaced { socket: PathBuf },
+    #[error(
+        "The Herdr server at socket {socket} changed after request transmission. The request may have executed; its outcome is unknown."
+    )]
+    EndpointReplacedAfterSend { socket: PathBuf },
+    #[error(
+        "Could not identify Herdr socket {socket} after request transmission: {source}. The request may have executed; its outcome is unknown."
+    )]
+    EndpointUnavailableAfterSend {
+        socket: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("The Herdr connection assigned to this request is no longer active. {}", .delivery.explanation())]
     RuntimeRetired { delivery: DeliveryState },
     #[error("Could not read the Herdr response: {source}. {}", .delivery.explanation())]
@@ -115,6 +127,9 @@ impl SocketError {
             | Self::Connect { .. }
             | Self::Endpoint { .. }
             | Self::EndpointReplaced { .. } => DeliveryState::NotSent,
+            Self::EndpointReplacedAfterSend { .. } | Self::EndpointUnavailableAfterSend { .. } => {
+                DeliveryState::MayHaveReachedHost
+            }
             Self::Write { delivery, .. }
             | Self::EarlyEof { delivery }
             | Self::ResponseTooLarge { delivery }
@@ -194,6 +209,59 @@ impl EndpointContinuityToken {
             protocol,
             version,
         )
+    }
+}
+
+/// The binary client endpoint, observed on the same process as the API peer.
+/// Retain its explicit path as well as its token so symlink/path rebinds are checked.
+pub(crate) struct CommandEndpointContinuity {
+    socket: PathBuf,
+    expected: EndpointContinuityToken,
+}
+
+impl CommandEndpointContinuity {
+    pub(crate) fn verify_socket_file(&self) -> Result<(), SocketError> {
+        self.expected.verify_socket_file(&self.socket)
+    }
+}
+
+type CommandWrite<'a> = dyn Fn(&UnixStream, &[u8]) -> Result<usize, SocketError> + Sync + 'a;
+
+pub(crate) struct CommandRequestGuard<'a> {
+    pub(crate) binary: &'a CommandEndpointContinuity,
+    pub(crate) api_expected: &'a EndpointContinuityToken,
+    pub(crate) api_socket: &'a Path,
+    pub(crate) write: &'a CommandWrite<'a>,
+    pub(crate) on_replacement: &'a (dyn Fn() + Sync),
+}
+
+impl CommandRequestGuard<'_> {
+    fn classify(&self, error: SocketError, delivery: DeliveryState) -> SocketError {
+        match error {
+            SocketError::EndpointReplaced { socket } => {
+                (self.on_replacement)();
+                if delivery == DeliveryState::MayHaveReachedHost {
+                    SocketError::EndpointReplacedAfterSend { socket }
+                } else {
+                    SocketError::EndpointReplaced { socket }
+                }
+            }
+            SocketError::Endpoint { socket, source }
+                if delivery == DeliveryState::MayHaveReachedHost =>
+            {
+                SocketError::EndpointUnavailableAfterSend { socket, source }
+            }
+            SocketError::Write { source, .. } => SocketError::Write { delivery, source },
+            SocketError::RuntimeRetired { .. } => SocketError::RuntimeRetired { delivery },
+            other => other,
+        }
+    }
+
+    fn verify(&self, delivery: DeliveryState) -> Result<(), SocketError> {
+        self.api_expected
+            .verify_socket_file(self.api_socket)
+            .and_then(|()| self.binary.verify_socket_file())
+            .map_err(|error| self.classify(error, delivery))
     }
 }
 
@@ -303,12 +371,12 @@ impl HerdrSocketClient {
         F: Fn(),
     {
         self.unary_on_expected_token_guarded_deadline(
-            metadata,
-            params,
+            (metadata, params),
             expected,
             ResponseDeadline::Unbounded,
             retirement,
             on_replacement,
+            None,
         )
         .await
     }
@@ -328,29 +396,49 @@ impl HerdrSocketClient {
         F: Fn(),
     {
         self.unary_on_expected_token_guarded_deadline(
-            metadata,
-            params,
+            (metadata, params),
             expected,
             ResponseDeadline::Bounded(timeout),
             retirement,
             on_replacement,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn unary_on_expected_token_guarded_command(
+        &self,
+        metadata: &MethodMetadata,
+        params: Value,
+        expected: &EndpointContinuityToken,
+        retirement: watch::Receiver<bool>,
+        guard: &CommandRequestGuard<'_>,
+        timeout: Option<Duration>,
+    ) -> Result<HerdrResponse, SocketError> {
+        self.unary_on_expected_token_guarded_deadline(
+            (metadata, params),
+            expected,
+            timeout.map_or(ResponseDeadline::Unbounded, ResponseDeadline::Bounded),
+            retirement,
+            || (guard.on_replacement)(),
+            Some(guard),
         )
         .await
     }
 
     async fn unary_on_expected_token_guarded_deadline<F>(
         &self,
-        metadata: &MethodMetadata,
-        params: Value,
+        request: (&MethodMetadata, Value),
         expected: &EndpointContinuityToken,
         deadline: ResponseDeadline,
         mut retirement: watch::Receiver<bool>,
         on_replacement: F,
+        command: Option<&CommandRequestGuard<'_>>,
     ) -> Result<HerdrResponse, SocketError>
     where
         F: Fn(),
     {
-        let request = self.prepare_unary(metadata, &params)?;
+        let request = self.prepare_unary(request.0, &request.1)?;
         if *retirement.borrow() {
             return Err(SocketError::RuntimeRetired {
                 delivery: DeliveryState::NotSent,
@@ -385,7 +473,7 @@ impl HerdrSocketClient {
                 delivery: DeliveryState::NotSent,
             });
         }
-        Self::exchange_guarded(stream, request, deadline, retirement).await
+        Self::exchange_guarded(stream, request, deadline, retirement, command).await
     }
 
     #[cfg(test)]
@@ -414,6 +502,55 @@ impl HerdrSocketClient {
             });
         }
         Ok(stream)
+    }
+
+    pub(crate) fn command_socket(&self) -> Result<PathBuf, SocketError> {
+        let stem = self.socket.file_stem().and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .ok_or_else(|| SocketError::Protocol {
+                delivery: DeliveryState::NotSent,
+                message: "The explicit Herdr API socket must have a nonempty UTF-8 filename stem to derive its client endpoint.".to_owned(),
+            })?;
+        Ok(self
+            .socket
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(format!("{stem}-client.sock")))
+    }
+
+    /// Connect only the explicitly derived binary endpoint belonging to the
+    /// already observed API server. Equal UID alone is never authority.
+    pub(crate) async fn connect_command_endpoint(
+        &self,
+        expected: &EndpointContinuityToken,
+    ) -> Result<(UnixStream, CommandEndpointContinuity), SocketError> {
+        expected.verify_socket_file(&self.socket)?;
+        if expected.peer.pid.is_none() {
+            return Err(SocketError::Protocol {
+                delivery: DeliveryState::NotSent,
+                message: "Herdr configured commands require an observable API peer process ID; same-user socket ownership is insufficient.".to_owned(),
+            });
+        }
+        let binary_client = Self::new(self.command_socket()?);
+        let (stream, actual) = binary_client.observed_connect().await?;
+        let socket = binary_client.socket;
+        expected.verify_socket_file(&self.socket)?;
+        if actual.peer.pid.is_none() {
+            return Err(SocketError::Protocol {
+                delivery: DeliveryState::NotSent,
+                message: "Herdr configured commands require an observable client-endpoint peer process ID.".to_owned(),
+            });
+        }
+        if actual.peer != expected.peer {
+            return Err(SocketError::EndpointReplaced { socket });
+        }
+        Ok((
+            stream,
+            CommandEndpointContinuity {
+                socket,
+                expected: actual,
+            },
+        ))
     }
 
     /// One observed connect. The socket path is stat'ed before and after
@@ -513,8 +650,9 @@ impl HerdrSocketClient {
         request: PreparedUnary,
         deadline: ResponseDeadline,
         mut retirement: watch::Receiver<bool>,
+        command: Option<&CommandRequestGuard<'_>>,
     ) -> Result<HerdrResponse, SocketError> {
-        write_line_guarded(&mut stream, &request.line, &mut retirement).await?;
+        write_line_guarded(&mut stream, &request.line, &mut retirement, command).await?;
         let response = async {
             let mut reader = BufReader::new(stream);
             let response_line = read_response_line(&mut reader).await?;
@@ -528,35 +666,22 @@ impl HerdrSocketClient {
             reject_trailing_data(&mut reader).await?;
             Ok(outcome)
         };
-        match deadline {
-            ResponseDeadline::Unbounded => {
-                tokio::select! {
-                    biased;
-                    changed = retirement.changed() => {
-                        let _ = changed;
-                        Err(SocketError::RuntimeRetired {
-                            delivery: DeliveryState::MayHaveReachedHost,
-                        })
-                    }
-                    result = response => result,
-                }
+        let timeout = async {
+            match deadline {
+                ResponseDeadline::Unbounded => std::future::pending::<()>().await,
+                ResponseDeadline::Bounded(timeout) => tokio::time::sleep(timeout).await,
             }
-            ResponseDeadline::Bounded(timeout) => {
-                tokio::select! {
-                    biased;
-                    changed = retirement.changed() => {
-                        let _ = changed;
-                        Err(SocketError::RuntimeRetired {
-                            delivery: DeliveryState::MayHaveReachedHost,
-                        })
-                    }
-                    result = tokio::time::timeout(timeout, response) => {
-                        result.map_err(|_| SocketError::Timeout {
-                            delivery: DeliveryState::MayHaveReachedHost,
-                        })?
-                    }
-                }
-            }
+        };
+        tokio::select! {
+            biased;
+            _ = retirement.changed() => Err(SocketError::RuntimeRetired {
+                delivery: DeliveryState::MayHaveReachedHost,
+            }),
+            () = timeout => Err(SocketError::Timeout {
+                delivery: DeliveryState::MayHaveReachedHost,
+            }),
+            error = command_continuity_loss(command) => Err(error),
+            result = response => result,
         }
     }
 
@@ -640,9 +765,45 @@ async fn write_line_guarded(
     stream: &mut UnixStream,
     line: &[u8],
     retirement: &mut watch::Receiver<bool>,
+    command: Option<&CommandRequestGuard<'_>>,
 ) -> Result<(), SocketError> {
     let mut sent = 0;
     while sent < line.len() {
+        if let Some(command) = command {
+            tokio::select! {
+                biased;
+                _ = retirement.changed() => return Err(SocketError::RuntimeRetired {
+                    delivery: delivery_after(sent),
+                }),
+                ready = stream.writable() => ready.map_err(|source| SocketError::Write {
+                    delivery: delivery_after(sent), source,
+                })?,
+            }
+            if *retirement.borrow() {
+                return Err(SocketError::RuntimeRetired {
+                    delivery: delivery_after(sent),
+                });
+            }
+            command.verify(delivery_after(sent))?;
+            let written = (command.write)(stream, &line[sent..])
+                .map_err(|error| command.classify(error, delivery_after(sent)));
+            match written {
+                Ok(0) => {
+                    return Err(SocketError::Write {
+                        delivery: delivery_after(sent),
+                        source: io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Herdr socket accepted zero bytes",
+                        ),
+                    });
+                }
+                Ok(written) => sent += written,
+                Err(SocketError::Write { source, .. })
+                    if source.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            continue;
+        }
         let write = tokio::select! {
             biased;
             changed = retirement.changed() => {
@@ -684,6 +845,19 @@ async fn write_line_guarded(
             delivery: DeliveryState::MayHaveReachedHost,
             source,
         }),
+    }
+}
+
+async fn command_continuity_loss(command: Option<&CommandRequestGuard<'_>>) -> SocketError {
+    let Some(command) = command else {
+        return std::future::pending().await;
+    };
+    let mut interval = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        interval.tick().await;
+        if let Err(error) = command.verify(DeliveryState::MayHaveReachedHost) {
+            return error;
+        }
     }
 }
 
@@ -852,6 +1026,227 @@ mod tests {
     fn listen(temp: &TempDir) -> (UnixListener, PathBuf) {
         let path = temp.path().join("herdr.sock");
         (UnixListener::bind(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn configured_endpoint_path_uses_only_the_explicit_api_stem() {
+        use std::os::unix::ffi::OsStringExt;
+        for (api, binary) in [
+            ("/owned/herdr.sock", "/owned/herdr-client.sock"),
+            ("/owned/custom-api", "/owned/custom-api-client.sock"),
+            ("/owned/name.api", "/owned/name-client.sock"),
+        ] {
+            assert_eq!(
+                HerdrSocketClient::new(api).command_socket().unwrap(),
+                Path::new(binary)
+            );
+        }
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"/owned/\xff.sock".to_vec()));
+        let error = HerdrSocketClient::new(invalid)
+            .command_socket()
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            SocketError::Protocol {
+                delivery: DeliveryState::NotSent,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn response_key_presence_rejects_explicit_null_arms() {
+        for value in [
+            json!({"id":"request","result":{"type":"ok"},"error":null}),
+            json!({"id":"request","result":null,"error":{"code":"x","message":"y"}}),
+            json!({"id":"request","result":null,"error":null}),
+            json!({"id":"request","result":null}),
+            json!({"id":"request","error":null}),
+        ] {
+            assert!(parse_response(&value, "request").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_endpoint_requires_a_known_api_peer_pid() {
+        let temp = TempDir::new().unwrap();
+        let (api, path) = listen(&temp);
+        let client = HerdrSocketClient::new(path);
+        let _binary = UnixListener::bind(client.command_socket().unwrap()).unwrap();
+        let mut expected = client.observed_token().await.unwrap();
+        drop(api.accept().await.unwrap());
+        expected.peer.pid = None;
+        let error = client
+            .connect_command_endpoint(&expected)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            SocketError::Protocol {
+                delivery: DeliveryState::NotSent,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("process ID"));
+    }
+
+    #[tokio::test]
+    async fn command_json_partial_write_is_unknown_and_is_not_retried() {
+        let temp = TempDir::new().unwrap();
+        let (api, path) = listen(&temp);
+        let client = HerdrSocketClient::new(path);
+        let binary_listener = UnixListener::bind(client.command_socket().unwrap()).unwrap();
+        let expected = client.observed_token().await.unwrap();
+        drop(api.accept().await.unwrap());
+        let (_binary_stream, binary) = client.connect_command_endpoint(&expected).await.unwrap();
+        let _binary_peer = binary_listener.accept().await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = api.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"{", "only one partial JSON packet reaches the API");
+        });
+        let partial_written = std::sync::atomic::AtomicBool::new(false);
+        let write = |stream: &UnixStream, bytes: &[u8]| {
+            if partial_written.load(Ordering::Relaxed) {
+                return Err(SocketError::Write {
+                    delivery: DeliveryState::NotSent,
+                    source: io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "injected JSON partial-write failure",
+                    ),
+                });
+            }
+            let count = stream
+                .try_write(&bytes[..1])
+                .map_err(|source| SocketError::Write {
+                    delivery: DeliveryState::NotSent,
+                    source,
+                })?;
+            if count > 0 {
+                partial_written.store(true, Ordering::Relaxed);
+            }
+            Ok(count)
+        };
+        let guard = CommandRequestGuard {
+            binary: &binary,
+            api_expected: &expected,
+            api_socket: client.socket(),
+            write: &write,
+            on_replacement: &|| {},
+        };
+        let metadata = MethodMetadata {
+            method: "command.invoke",
+            native_type: "native.herdr.command:invoke",
+            params_ref: "#/schemas/request/$defs/CommandInvokeParams",
+            params_type: "CommandInvokeParams",
+            transport: MethodTransport::Unary,
+        };
+        let (_retirement, receiver) = watch::channel(false);
+        let error = client
+            .unary_on_expected_token_guarded_command(
+                &metadata,
+                json!({"command_id":"opaque","pane_id":"captured-pane"}),
+                &expected,
+                receiver,
+                &guard,
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.delivery(), DeliveryState::MayHaveReachedHost);
+        server.await.unwrap();
+    }
+
+    /// Runs only as the retained child of the foreign-peer regression below.
+    #[test]
+    #[ignore = "owned subprocess fixture; requires explicit TempDir endpoint"]
+    fn foreign_peer_endpoint_child() {
+        let root = PathBuf::from(std::env::var_os("MUXE_TEST_FOREIGN_ROOT").expect("owned root"));
+        let path =
+            PathBuf::from(std::env::var_os("MUXE_TEST_FOREIGN_SOCKET").expect("owned endpoint"));
+        assert!(path.starts_with(&root));
+        assert!(root.is_dir());
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        println!("owned binary endpoint ready");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut bytes).unwrap();
+        assert!(
+            bytes.is_empty(),
+            "foreign peer received endpoint hello or RPC bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_endpoint_rejects_a_different_process_with_the_same_uid() {
+        let temp = TempDir::new().unwrap();
+        let (api, path) = listen(&temp);
+        let client = HerdrSocketClient::new(path);
+        let expected = client.observed_token().await.unwrap();
+        drop(api.accept().await.unwrap());
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transport::tests::foreign_peer_endpoint_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MUXE_TEST_FOREIGN_ROOT", temp.path())
+            .env("MUXE_TEST_FOREIGN_SOCKET", client.command_socket().unwrap())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut line = String::new();
+            loop {
+                if output.read_line(&mut line).await? == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "owned child exited before readiness",
+                    ));
+                }
+                if line.contains("owned binary endpoint ready") {
+                    return Ok::<(), io::Error>(());
+                }
+                line.clear();
+            }
+        })
+        .await;
+        if !matches!(ready, Ok(Ok(()))) {
+            let reason = format!("{ready:?}");
+            let _ = child.start_kill();
+            let diagnostics = child.wait_with_output().await.unwrap();
+            panic!(
+                "owned child readiness failed: {reason}; stderr: {}",
+                String::from_utf8_lossy(&diagnostics.stderr)
+            );
+        }
+        let error = client
+            .connect_command_endpoint(&expected)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, SocketError::EndpointReplaced { .. }),
+            "{error}"
+        );
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .expect("owned child exits after rejected connection")
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     async fn read_request(stream: UnixStream) -> (BufReader<UnixStream>, String) {
