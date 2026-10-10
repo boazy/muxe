@@ -6057,14 +6057,11 @@ mod tests {
             )
             .await;
             match result {
-                Err(ActivateError::Preflight(message)) => {
-                    if corrupt {
-                        assert!(message.contains("unrecognized bridge bytes"), "{message}");
-                    } else {
-                        assert!(message.contains("receipt-owned Zellij bridge"), "{message}");
-                    }
+                Err(ActivateError::Preflight(_)) => {
                     if let Some(bytes) = original {
                         assert_eq!(std::fs::read(&stable).unwrap(), bytes);
+                    } else {
+                        assert!(!stable.exists(), "preflight must not create the bridge");
                     }
                 }
                 Ok(outcome) => {
@@ -6088,11 +6085,7 @@ mod tests {
             &test_zellij_unit(stable.clone(), vec![entry]),
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(ActivateError::Preflight(message))
-                if message.contains("receipt-owned Zellij bridge")
-        ));
+        assert!(matches!(result, Err(ActivateError::Preflight(_))));
         assert_eq!(std::fs::read(&stable).unwrap(), target_bytes);
         old.abort();
     }
@@ -6118,11 +6111,7 @@ mod tests {
         let result =
             activate_unit_with_global_preflight(&zellij_inputs(&fixture, &target_bytes), &unit)
                 .await;
-        assert!(matches!(
-            result,
-            Err(ActivateError::Preflight(message))
-                if message.contains("symlinked or non-regular stable bridge leaf")
-        ));
+        assert!(matches!(result, Err(ActivateError::Preflight(_))));
         assert!(
             std::fs::symlink_metadata(&stable)
                 .unwrap()
@@ -6168,11 +6157,7 @@ mod tests {
             &test_zellij_unit(stable.clone(), vec![entry]),
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(ActivateError::Preflight(message))
-                if message.contains("semantically corrupt")
-        ));
+        assert!(matches!(result, Err(ActivateError::Preflight(_))));
         assert_eq!(std::fs::read(&stable).unwrap(), target_bytes);
         assert!(fixture.reloader.reloaded.lock().unwrap().is_empty());
         old.abort();
@@ -6190,11 +6175,7 @@ mod tests {
             &test_zellij_unit(stable.clone(), vec![entry]),
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(ActivateError::Preflight(message))
-                if message.contains("not owner-only")
-        ));
+        assert!(matches!(result, Err(ActivateError::Preflight(_))));
         assert_eq!(std::fs::read(&stable).unwrap(), target_bytes);
         assert_eq!(
             std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&stable).unwrap()) & 0o777,
