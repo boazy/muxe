@@ -1532,7 +1532,10 @@ mod tests {
             .await;
             lifecycle.retire();
             let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes).await.unwrap();
+            if let Err(error) = stream.read_to_end(&mut bytes).await {
+                // Linux can reset when retirement closes with the welcome unread.
+                assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+            }
             assert!(bytes.is_empty());
         });
         let failure = invoker
