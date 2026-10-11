@@ -267,9 +267,21 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
         If Herdr acknowledges creation but returns malformed placement evidence, Muxe reports an unknown outcome: the command may already be running. Inspect the host before deciding whether to repeat it. Muxe does not automatically repeat the request.\n\n\
         Herdr's popup has no public pane ID or pane lifecycle events. Its program exits naturally, or `native.herdr.popup:close` closes the active popup. \
         Overlay terminals have ordinary pane IDs and can be closed with Herdr pane APIs. Zellij closes its command panes on command exit.\n\n\
-        `pane:open` accepts only the parameters in its table. Size, position, environment overrides, and explicit parent-pane selection are not portable action parameters. \
-        The CLI `muxe pane open --pane-type popup -- program arg...` also exposes host-supported sizing. Herdr popup accepts `--width`/`--height` as cells or percentages, but no `--position` or `--no-focus`. \
-        Herdr overlay does not support dimensions, position, or `--no-focus`. Zellij floating placement supports dimensions and position, but not `--no-focus` or an explicit parent. Unsupported options fail rather than being ignored.\n\n\
+        `pane:open` accepts literal `width` and `height` as positive terminal cells or integer percentages from 1% to 100%. Omitted dimensions retain host defaults. \
+        Position, environment overrides, and explicit parent-pane selection are not portable action parameters.\n\n\
+        Herdr popup dimensions include the outer border. Percentages floor against the rendered terminal area; outer sizes clamp to at least 6 columns by 4 rows and at most that area. \
+        The inner PTY has two fewer rows; it has four columns at the minimum six-column outer width, and otherwise three fewer columns than the outer popup. Herdr overlay dimensions are unsupported. \
+        Herdr rightward splits accept only width, downward splits only height, with percentages from 10% to 90% or cell counts occupying the same range of the saved parent's live split axis. \
+        Divider/layout rounding can affect the final split terminal geometry.\n\n\
+        Zellij overlay/popup percentages floor against the floating viewport, and sizes extending beyond its edge are clipped. Tiled splits reject dimensions instead of silently ignoring them. \
+        Portable actions retain host-managed floating position. Explicit Zellij dimensions do not imply a universal minimum terminal size.\n\n\
+        The pinned Zellij SDK omits coordinates from `NewFloatingPane` creation. Muxe creates once with the original command and target, \
+        then requests the supported coordinate update for the exact terminal returned by the matching `ActionComplete`. \
+        A brief default-size frame can appear. Dispatch completion acknowledges that the update was requested, not final geometry; \
+        missing or unexpected created-pane identity produces an unknown outcome without guessing a pane or repeating creation.\n\n\
+        The CLI `muxe pane open --pane-type popup --width 80% --height 70% -- program arg...` uses the same lexical cells/percentage grammar. \
+        CLI placement-specific validation and host clamping remain unchanged. Herdr popup has no `--position` or `--no-focus`; overlay supports neither dimensions nor those options. \
+        Zellij floating CLI placement supports position as well as dimensions, but not `--no-focus` or an explicit parent. Unsupported options fail rather than being ignored.\n\n\
         Evidence: [Herdr plugin API](https://herdr.dev/docs/socket-api/#plugin-apis), \
         the checked-in `fixtures/herdr/herdr-api.schema.json` (`PluginPaneOpenParams`), and \
         pinned Zellij `fixtures/zellij/0.46.0/action-inventory.rs` (`NewTiledPane`/`NewFloatingPane`).").unwrap();

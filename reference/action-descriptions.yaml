@@ -76,9 +76,11 @@ actions:
       program: Executable name or path. Required; cannot be empty.
       args: Exact arguments passed to the executable, including empty arguments.
       cwd: Working directory of the command. A relative path is resolved against the saved origin pane's working directory.
-      pane-type: Terminal representation. Defaults to `split`. Size and position are not parameters of this action; the CLI exposes supported sizing options.
+      pane-type: Terminal representation. Defaults to `split`. Supported dimensions depend on the selected host and representation.
       direction: Split direction. Omit for overlays and popups.
       focus: Whether to focus the new terminal. `$origin.` references are not supported.
+      width: Requested outer width as positive terminal cells or an integer percentage from 1% to 100%. Literal only; omit for host defaults. See the host note for supported split axes and narrower bounds.
+      height: Requested outer height as positive terminal cells or an integer percentage from 1% to 100%. Literal only; omit for host defaults. The host can clamp or round the final terminal geometry.
 
   pane:create:
     summary: Requests a new pane without specifying its position.

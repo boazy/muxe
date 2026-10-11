@@ -88,7 +88,7 @@ pub enum SizeSpec {
 }
 
 impl SizeSpec {
-    const fn into_mirror(self) -> raw::PercentOrFixed {
+    pub(crate) const fn into_mirror(self) -> raw::PercentOrFixed {
         match self {
             Self::Cells(cells) => raw::PercentOrFixed::Fixed(cells as usize),
             Self::Percent(percent) => raw::PercentOrFixed::Percent(percent as usize),

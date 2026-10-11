@@ -263,14 +263,16 @@ Starts an exact executable command inside a split, overlay, or popup terminal. M
 | `program` | string or `$origin.` reference | required | — | Executable name or path. Required; cannot be empty. |
 | `args` | list of strings or `$origin.` references | optional | empty list | Exact arguments passed to the executable, including empty arguments. |
 | `cwd` | path or `$origin.` reference | optional | working directory of the pane where the menu was opened | Working directory of the command. A relative path is resolved against the saved origin pane's working directory. |
-| `pane-type` | `split`, `overlay`, or `popup` | optional | `split` | Terminal representation. Defaults to `split`. Size and position are not parameters of this action; the CLI exposes supported sizing options. |
+| `pane-type` | `split`, `overlay`, or `popup` | optional | `split` | Terminal representation. Defaults to `split`. Supported dimensions depend on the selected host and representation. |
 | `direction` | direction or `$origin.` reference | optional | host-dependent; see host note | Split direction. Omit for overlays and popups. |
 | `focus` | boolean | optional | true | Whether to focus the new terminal. `$origin.` references are not supported. |
+| `width` | positive terminal cells or a percentage from 1% to 100% | optional | host-dependent; see host note | Requested outer width as positive terminal cells or an integer percentage from 1% to 100%. Literal only; omit for host defaults. See the host note for supported split axes and narrower bounds. |
+| `height` | positive terminal cells or a percentage from 1% to 100% | optional | host-dependent; see host note | Requested outer height as positive terminal cells or an integer percentage from 1% to 100%. Literal only; omit for host defaults. The host can clamp or round the final terminal geometry. |
 
 > [!WARNING]
-> **Zellij:** All split directions are supported; omitted direction lets Zellij choose. Overlay and popup both use a real floating command pane, not a session-modal popup. `focus: false` is unsupported.
+> **Zellij:** All split directions are supported; omitted direction lets Zellij choose. Tiled splits reject width/height. Overlay and popup both use a real floating command pane and accept width/height as positive cells or 1%-100%; percentages floor against the viewport and overflow is clipped. `focus: false` is unsupported.
 >
-> **Herdr:** Right/down splits (default down) need no plugin. Overlay and popup require the explicitly linked `muxe.command-panes` plugin; both focus the new terminal. A popup is session-modal and has no public pane ID. Omit direction for overlays/popups.
+> **Herdr:** Right/down splits (default down) need no plugin: right accepts width only, down height only. Split percentages are 10%-90%; cells must occupy 10%-90% of the saved parent's live split axis. Overlay rejects dimensions. Popup accepts both positive-cell or 1%-100% dimensions as outer sizes, floored and clamped by the host. Overlay and popup require the explicitly linked `muxe.command-panes` plugin and focus the new terminal. Popup is session-modal with no public pane ID. Omit direction for overlays/popups.
 
 ### `pane:create`
 
@@ -601,7 +603,15 @@ If Herdr acknowledges creation but returns malformed placement evidence, Muxe re
 
 Herdr's popup has no public pane ID or pane lifecycle events. Its program exits naturally, or `native.herdr.popup:close` closes the active popup. Overlay terminals have ordinary pane IDs and can be closed with Herdr pane APIs. Zellij closes its command panes on command exit.
 
-`pane:open` accepts only the parameters in its table. Size, position, environment overrides, and explicit parent-pane selection are not portable action parameters. The CLI `muxe pane open --pane-type popup -- program arg...` also exposes host-supported sizing. Herdr popup accepts `--width`/`--height` as cells or percentages, but no `--position` or `--no-focus`. Herdr overlay does not support dimensions, position, or `--no-focus`. Zellij floating placement supports dimensions and position, but not `--no-focus` or an explicit parent. Unsupported options fail rather than being ignored.
+`pane:open` accepts literal `width` and `height` as positive terminal cells or integer percentages from 1% to 100%. Omitted dimensions retain host defaults. Position, environment overrides, and explicit parent-pane selection are not portable action parameters.
+
+Herdr popup dimensions include the outer border. Percentages floor against the rendered terminal area; outer sizes clamp to at least 6 columns by 4 rows and at most that area. The inner PTY has two fewer rows; it has four columns at the minimum six-column outer width, and otherwise three fewer columns than the outer popup. Herdr overlay dimensions are unsupported. Herdr rightward splits accept only width, downward splits only height, with percentages from 10% to 90% or cell counts occupying the same range of the saved parent's live split axis. Divider/layout rounding can affect the final split terminal geometry.
+
+Zellij overlay/popup percentages floor against the floating viewport, and sizes extending beyond its edge are clipped. Tiled splits reject dimensions instead of silently ignoring them. Portable actions retain host-managed floating position. Explicit Zellij dimensions do not imply a universal minimum terminal size.
+
+The pinned Zellij SDK omits coordinates from `NewFloatingPane` creation. Muxe creates once with the original command and target, then requests the supported coordinate update for the exact terminal returned by the matching `ActionComplete`. A brief default-size frame can appear. Dispatch completion acknowledges that the update was requested, not final geometry; missing or unexpected created-pane identity produces an unknown outcome without guessing a pane or repeating creation.
+
+The CLI `muxe pane open --pane-type popup --width 80% --height 70% -- program arg...` uses the same lexical cells/percentage grammar. CLI placement-specific validation and host clamping remain unchanged. Herdr popup has no `--position` or `--no-focus`; overlay supports neither dimensions nor those options. Zellij floating CLI placement supports position as well as dimensions, but not `--no-focus` or an explicit parent. Unsupported options fail rather than being ignored.
 
 Evidence: [Herdr plugin API](https://herdr.dev/docs/socket-api/#plugin-apis), the checked-in `fixtures/herdr/herdr-api.schema.json` (`PluginPaneOpenParams`), and pinned Zellij `fixtures/zellij/0.46.0/action-inventory.rs` (`NewTiledPane`/`NewFloatingPane`).
 

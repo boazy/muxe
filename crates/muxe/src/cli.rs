@@ -1,6 +1,7 @@
 use std::{ffi::OsString, path::PathBuf, str::FromStr};
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use muxe_core::Dimension;
 
 /// The native Muxe command line.
 #[derive(Debug, Parser)]
@@ -195,31 +196,6 @@ impl FromStr for ParentPane {
             Self::Current
         } else {
             Self::Id(value.into())
-        })
-    }
-}
-
-/// A terminal-cell count or a percentage of the containing terminal area.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Dimension {
-    Cells(u16),
-    Percent(u16),
-}
-
-impl FromStr for Dimension {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (number, percent) = value
-            .strip_suffix('%')
-            .map_or((value, false), |number| (number, true));
-        let number = number
-            .parse()
-            .map_err(|_| "dimension must be terminal cells or a percentage".to_owned())?;
-        Ok(if percent {
-            Self::Percent(number)
-        } else {
-            Self::Cells(number)
         })
     }
 }

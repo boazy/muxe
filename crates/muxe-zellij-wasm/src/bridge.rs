@@ -115,6 +115,9 @@ pub trait HostEffects {
     fn switch_mode(&mut self, mode: InputMode);
     /// Focuses one host pane by ID.
     fn focus_pane(&mut self, pane: PaneId);
+    /// Requests placement for a specifically identified floating terminal.
+    /// The pinned SDK enqueues this update; it does not acknowledge geometry.
+    fn place_floating_pane(&mut self, pane: PaneId, coordinates: FloatingPaneCoordinates);
     /// Fills bytes from OS randomness; false when unavailable.
     fn fill_random(&mut self, bytes: &mut [u8]) -> bool;
     /// Arms a one-shot host timer delivering `Timer` after secs.
@@ -163,6 +166,10 @@ impl HostEffects for ShimEffects {
 
     fn focus_pane(&mut self, pane: PaneId) {
         focus_pane_with_id(pane, false, false);
+    }
+
+    fn place_floating_pane(&mut self, pane: PaneId, coordinates: FloatingPaneCoordinates) {
+        change_floating_panes_coordinates(vec![(pane, coordinates)]);
     }
 
     fn fill_random(&mut self, bytes: &mut [u8]) -> bool {
@@ -339,6 +346,8 @@ struct PendingAction {
     request_id: RequestId,
     execution: ExecutionId,
     channel_generation: ChannelGeneration,
+    floating_coordinates:
+        Option<muxe_zellij_protocol::generated::validated::FloatingPaneCoordinates>,
 }
 
 struct PendingPostDismissal {
@@ -412,7 +421,17 @@ impl Bridge {
             Event::PaneUpdate(manifest) => self.on_pane_update(&manifest, effects),
             Event::TabUpdate(tabs) => self.on_tab_update(&tabs),
             Event::SessionUpdate(sessions, _) => self.on_session_update(&sessions),
-            Event::ActionComplete(_, _, context) => self.on_action_complete(&context, effects),
+            Event::ActionComplete(action, pane, context) => {
+                self.on_action_complete(
+                    matches!(
+                        action,
+                        zellij_utils::input::actions::Action::NewFloatingPane { .. }
+                    ),
+                    pane,
+                    &context,
+                    effects,
+                );
+            }
             Event::Timer(_) => self.on_timer(effects),
             Event::PermissionRequestResult(status) => match status {
                 PermissionStatus::Granted => {
@@ -717,6 +736,8 @@ impl Bridge {
 
     fn on_action_complete(
         &mut self,
+        floating_creation: bool,
+        pane: Option<PaneId>,
         context: &BTreeMap<String, String>,
         effects: &mut dyn HostEffects,
     ) {
@@ -724,12 +745,29 @@ impl Bridge {
             return;
         };
         if let Some(pending) = self.pending_actions.remove(correlation) {
+            let outcome = match (pending.floating_coordinates, pane) {
+                (Some(coordinates), Some(pane @ PaneId::Terminal(_))) if floating_creation => {
+                    // Consume correlation before the effect: duplicates cannot resize
+                    // again. Only the host's actual created terminal is ever targeted.
+                    effects.place_floating_pane(
+                        pane,
+                        muxe_zellij_protocol::generated::floating_pane_coordinates_for_host(
+                            coordinates,
+                        ),
+                    );
+                    CommandOutcome::succeeded()
+                }
+                (Some(_), _) => CommandOutcome::outcome_unknown(
+                    "Zellij did not identify the created terminal; placement was not requested. Check existing panes before repeating the command.",
+                ),
+                (None, _) => CommandOutcome::succeeded(),
+            };
             self.emit_for_request(
                 pending.request_id,
                 pending.channel_generation,
                 BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
-                    outcome: CommandOutcome::succeeded(),
+                    outcome,
                 },
                 effects,
             );
@@ -897,7 +935,9 @@ impl Bridge {
                 pending.channel_generation,
                 BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
-                    outcome: CommandOutcome::failed("bridge unloading".to_owned()),
+                    outcome: CommandOutcome::outcome_unknown(
+                        "bridge unloaded before command completion; inspect panes before repeating",
+                    ),
                 },
                 effects,
             );
@@ -933,6 +973,9 @@ impl Bridge {
         self.cancel_capture_for_restore(None, effects);
         self.clear_capture_ui();
         self.pending_actions.clear();
+        // Unsent creations belong to the displaced event channel too. Never
+        // mint a new-registration correlation for an old request ID.
+        self.pending_post_dismissals.clear();
         self.registration = None;
         self.channel_generation = Some(subscription.channel_generation());
         self.last_request_id = None;
@@ -1135,6 +1178,7 @@ impl Bridge {
             ReadyDispatch::Async {
                 dispatch,
                 execution: correlated,
+                floating_coordinates,
             } => {
                 self.pending_actions.insert(
                     correlated,
@@ -1142,6 +1186,7 @@ impl Bridge {
                         request_id,
                         execution,
                         channel_generation: generation,
+                        floating_coordinates,
                     },
                 );
                 // run_action queues host dispatch on another thread and
@@ -1269,6 +1314,7 @@ impl Bridge {
             ReadyDispatch::Async {
                 dispatch,
                 execution: correlated,
+                floating_coordinates,
             } => {
                 self.pending_actions.insert(
                     correlated,
@@ -1276,6 +1322,7 @@ impl Bridge {
                         request_id: pending.request_id,
                         execution: pending.execution,
                         channel_generation: pending.channel_generation,
+                        floating_coordinates,
                     },
                 );
                 let _ = execute_sync(dispatch);
@@ -1553,7 +1600,9 @@ impl Bridge {
                 pending.channel_generation,
                 BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
-                    outcome: CommandOutcome::failed("bridge retiring".to_owned()),
+                    outcome: CommandOutcome::outcome_unknown(
+                        "bridge retired before command completion; inspect panes before repeating",
+                    ),
                 },
                 effects,
             );
@@ -1675,6 +1724,7 @@ mod tests {
         pipe_states: BTreeMap<String, FakePipeState>,
         modes: Vec<InputMode>,
         focused: Vec<PaneId>,
+        placements: Vec<(PaneId, FloatingPaneCoordinates)>,
         timers: u32,
         lists: u32,
         effect_order: Vec<&'static str>,
@@ -1695,6 +1745,7 @@ mod tests {
                 pipe_states: BTreeMap::new(),
                 modes: Vec::new(),
                 focused: Vec::new(),
+                placements: Vec::new(),
                 timers: 0,
                 lists: 0,
                 effect_order: Vec::new(),
@@ -1787,6 +1838,9 @@ mod tests {
         }
         fn focus_pane(&mut self, pane: PaneId) {
             self.focused.push(pane);
+        }
+        fn place_floating_pane(&mut self, pane: PaneId, coordinates: FloatingPaneCoordinates) {
+            self.placements.push((pane, coordinates));
         }
         fn fill_random(&mut self, bytes: &mut [u8]) -> bool {
             match self.random.pop_front() {
@@ -2179,6 +2233,111 @@ mod tests {
                 }),
             ) if execution == exec(42) && outcome.status == muxe_zellij_protocol::CommandStatus::Succeeded
         ));
+    }
+
+    #[test]
+    fn replaced_subscription_discards_old_unsent_creation_before_request_id_reuse() {
+        use muxe_zellij_protocol::generated::raw;
+        let creation = |width| RawNativeCommand::RunAction {
+            action: raw::Action::NewFloatingPane {
+                command: Some(raw::RunCommandAction {
+                    command: "/bin/printf".into(),
+                    args: vec![format!("creation-{width}")],
+                    cwd: Some("/saved/origin".into()),
+                    direction: None,
+                    hold_on_close: false,
+                    hold_on_start: false,
+                    originating_plugin: None,
+                    use_terminal_title: false,
+                }),
+                pane_name: None,
+                coordinates: Some(raw::FloatingPaneCoordinates {
+                    x: None,
+                    y: None,
+                    width: Some(raw::PercentOrFixed::Fixed(width)),
+                    height: Some(raw::PercentOrFixed::Fixed(20)),
+                    pinned: None,
+                    borderless: None,
+                    border_style: None,
+                }),
+                near_current_pane: false,
+                no_focus: false,
+                tab_id: None,
+            },
+            context: Vec::new(),
+        };
+        let request = |execution, width| BridgeRequest::Dispatch {
+            execution,
+            request: ZellijDispatchRequest::PostDismissalCreation {
+                ui_pane: "terminal_7".to_owned(),
+                origin_pane: "terminal_2".to_owned(),
+                command: creation(width),
+            },
+        };
+        let (mut bridge, mut host) = boot();
+        bridge.update(
+            Event::PaneUpdate(manifest([(0, vec![pane_info(7, 10, 0, 10, 10)])])),
+            &mut host,
+        );
+        bridge.focused_pane = Some(PaneId::Terminal(7));
+        bridge.pipe(request_msg(request(exec(42), 80)), &mut host);
+        assert_eq!(bridge.pending_post_dismissals.len(), 1);
+        assert!(bridge.pending_actions.is_empty());
+        assert_eq!(host.pipe_state(REQUEST_CLI), Some(FakePipeState::Released));
+
+        bridge.pipe(subscribe_msg_for(EVENT_CLI_TWO), &mut host);
+        assert!(bridge.pending_post_dismissals.is_empty());
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(7))),
+            &mut host,
+        );
+        assert_eq!(bridge.active_registration(), Some(registration(8)));
+        bridge.pipe(
+            request_msg_for(registration(8), RequestId::INITIAL, request(exec(43), 90)),
+            &mut host,
+        );
+        assert_eq!(bridge.pending_post_dismissals.len(), 1);
+        bridge.update(
+            Event::PaneUpdate(manifest([(0, vec![pane_info(2, 10, 0, 10, 10)])])),
+            &mut host,
+        );
+        bridge.update(
+            Event::ListClients(clients_current(PaneId::Terminal(2))),
+            &mut host,
+        );
+        assert!(bridge.pending_post_dismissals.is_empty());
+        assert_eq!(bridge.pending_actions.len(), 1);
+        let context = |registration| {
+            BTreeMap::from([(
+                crate::dispatcher::EXECUTION_CONTEXT_KEY.to_owned(),
+                format!("{registration}:{}", RequestId::INITIAL),
+            )])
+        };
+        bridge.on_action_complete(
+            true,
+            Some(PaneId::Terminal(42)),
+            &context(registration(7)),
+            &mut host,
+        );
+        assert!(host.placements.is_empty());
+        assert_eq!(bridge.pending_actions.len(), 1);
+        bridge.on_action_complete(
+            true,
+            Some(PaneId::Terminal(43)),
+            &context(registration(8)),
+            &mut host,
+        );
+        assert_eq!(host.placements.len(), 1);
+        assert_eq!(host.placements[0].0, PaneId::Terminal(43));
+        assert_eq!(
+            host.placements[0].1.width,
+            Some(zellij_utils::input::layout::PercentOrFixed::Fixed(90))
+        );
+        assert!(bridge.pending_actions.is_empty());
+        assert!(host.events().into_iter().any(|(_, event)| matches!(
+            event, PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, outcome })
+                if execution == exec(43) && outcome.status == muxe_zellij_protocol::CommandStatus::Succeeded
+        )));
     }
 
     /// The emitted Register must survive the real wire path: the pinned host
@@ -3856,8 +4015,123 @@ mod tests {
         assert_eq!(host.focused, vec![PaneId::Terminal(4)]);
     }
 
+    fn pending_floating_placement(bridge: &mut Bridge) -> BTreeMap<String, String> {
+        use muxe_zellij_protocol::generated::{raw, validated};
+        let coordinates =
+            validated::FloatingPaneCoordinates::try_from(raw::FloatingPaneCoordinates {
+                x: None,
+                y: None,
+                width: Some(raw::PercentOrFixed::Percent(80)),
+                height: Some(raw::PercentOrFixed::Percent(70)),
+                pinned: None,
+                borderless: None,
+                border_style: None,
+            })
+            .unwrap();
+        let correlation = "placement-1".to_owned();
+        bridge.pending_actions.insert(
+            correlation.clone(),
+            PendingAction {
+                request_id: RequestId::INITIAL,
+                execution: exec(9),
+                channel_generation: ChannelGeneration::INITIAL,
+                floating_coordinates: Some(coordinates),
+            },
+        );
+        BTreeMap::from([(
+            crate::dispatcher::EXECUTION_CONTEXT_KEY.to_owned(),
+            correlation,
+        )])
+    }
+
     #[test]
-    fn retire_restores_and_fails_pending() {
+    fn floating_placement_consumes_the_correlated_created_terminal_once() {
+        let (mut bridge, mut host) = boot();
+        let context = pending_floating_placement(&mut bridge);
+        bridge.on_action_complete(
+            true,
+            Some(PaneId::Terminal(42)),
+            &BTreeMap::new(),
+            &mut host,
+        );
+        assert!(host.placements.is_empty());
+        assert_eq!(bridge.pending_actions.len(), 1);
+        bridge.on_action_complete(true, Some(PaneId::Terminal(42)), &context, &mut host);
+        assert_eq!(host.placements.len(), 1);
+        assert_eq!(host.placements[0].0, PaneId::Terminal(42));
+        assert!(bridge.pending_actions.is_empty());
+        bridge.on_action_complete(true, Some(PaneId::Terminal(99)), &context, &mut host);
+        assert_eq!(host.placements.len(), 1);
+        assert_eq!(
+            host.events()
+                .into_iter()
+                .filter(|(_, event)| matches!(
+                    event,
+                    PipeEventKind::Response(BridgeResponse::DispatchCompleted { .. })
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn uncertain_created_pane_never_resizes_or_leaves_pending_ownership() {
+        for (floating, pane) in [
+            (true, None),
+            (true, Some(PaneId::Plugin(42))),
+            (false, Some(PaneId::Terminal(42))),
+        ] {
+            let (mut bridge, mut host) = boot();
+            let context = pending_floating_placement(&mut bridge);
+            bridge.on_action_complete(floating, pane, &context, &mut host);
+            assert!(host.placements.is_empty());
+            assert!(bridge.pending_actions.is_empty());
+            assert!(host.events().into_iter().any(|(_, event)| matches!(
+                event, PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, outcome })
+                    if execution == exec(9) && outcome.status == muxe_zellij_protocol::CommandStatus::OutcomeUnknown
+            )));
+        }
+    }
+
+    #[test]
+    fn teardown_of_dispatched_creation_is_unknown_and_late_completion_cannot_resize() {
+        for unload in [false, true] {
+            let (mut bridge, mut host) = boot();
+            let context = pending_floating_placement(&mut bridge);
+            if unload {
+                bridge.update(Event::BeforeClose, &mut host);
+            } else {
+                bridge.pipe(request_msg(BridgeRequest::Retire), &mut host);
+            }
+            let terminals = |host: &FakeHost| {
+                host.events()
+                    .into_iter()
+                    .filter_map(|(_, event)| {
+                        if let PipeEventKind::Response(BridgeResponse::DispatchCompleted {
+                            execution,
+                            outcome,
+                        }) = event
+                        {
+                            Some((execution, outcome.status))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                terminals(&host),
+                [(exec(9), muxe_zellij_protocol::CommandStatus::OutcomeUnknown)]
+            );
+            assert!(bridge.pending_actions.is_empty());
+            bridge.on_action_complete(true, Some(PaneId::Terminal(42)), &context, &mut host);
+            assert!(host.placements.is_empty());
+            assert_eq!(terminals(&host).len(), 1);
+        }
+    }
+
+    #[test]
+    fn retire_restores_and_marks_dispatched_pending_unknown() {
         let (mut bridge, mut host) = boot();
         bridge.update(Event::ModeUpdate(mode_info(InputMode::Normal)), &mut host);
         bridge.pipe(
@@ -3882,16 +4156,16 @@ mod tests {
         host.modes.clear();
         bridge.pipe(request_msg(BridgeRequest::Retire), &mut host);
         // Guarded restore ran (still Locked, owned lease) and the pending
-        // async completion failed instead of dangling.
+        // dispatched async completion became unknown instead of dangling.
         assert_eq!(host.modes.as_slice(), [InputMode::Normal]);
-        let failed = host.events().into_iter().any(|(_, event)| {
+        let unknown = host.events().into_iter().any(|(_, event)| {
             matches!(
                 event,
-                PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, .. })
-                    if execution == exec(9)
+                PipeEventKind::Response(BridgeResponse::DispatchCompleted { execution, outcome })
+                    if execution == exec(9) && outcome.status == muxe_zellij_protocol::CommandStatus::OutcomeUnknown
             )
         });
-        assert!(failed);
+        assert!(unknown);
         assert_eq!(bridge.capture_state(), (None, None));
     }
 

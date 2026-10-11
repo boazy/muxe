@@ -20,6 +20,7 @@ use crate::config::{
 };
 use crate::context::{ContextReference, ContextType, OriginHostKind};
 use crate::diagnostic::{ConfigDiagnostic, DiagnosticCode, SourceId, SourceSpan};
+use crate::dimension::Dimension;
 use crate::execution::{
     AfterAction, ExecutionCapabilities, ExecutionMode, ExecutionPolicy, MenuControlAction,
     TimeoutAction,
@@ -1371,6 +1372,8 @@ impl MenuCompiler<'_> {
                 pane_type,
                 direction,
                 focus,
+                width,
+                height,
             } => {
                 if program
                     .value
@@ -1401,6 +1404,8 @@ impl MenuCompiler<'_> {
                     ),
                     direction,
                     focus,
+                    width,
+                    height,
                 })
             }
             ParsedPortableAction::PaneCreate {} => PortableAction::Pane(PaneAction::Create),
@@ -1654,6 +1659,7 @@ enum ParsedActionValue {
     Mapping(BTreeMap<String, ActionScalar>),
     MenuName { value: String, span: SourceSpan },
     MenuMapping(SourceSpan),
+    Dimension(Dimension),
 }
 
 struct ParsedActionFields(BTreeMap<ActionParameterName, ParsedActionValue>);
@@ -1663,6 +1669,13 @@ impl ParsedActionFields {
         self.0.remove(&name).map(|value| match value {
             ParsedActionValue::Scalar(value) => value,
             _ => unreachable!("schema type for {name} is scalar"),
+        })
+    }
+
+    fn take_dimension(&mut self, name: ActionParameterName) -> Option<Dimension> {
+        self.0.remove(&name).map(|value| match value {
+            ParsedActionValue::Dimension(value) => value,
+            _ => unreachable!("schema type for {name} is a dimension"),
         })
     }
 
@@ -1745,6 +1758,9 @@ macro_rules! parsed_value_type {
     (PaneType) => {
         ActionScalar
     };
+    (Dimension) => {
+        Dimension
+    };
     (Scalar) => {
         ActionScalar
     };
@@ -1792,6 +1808,9 @@ macro_rules! take_parsed_value {
     };
     ($fields:expr, $parameter:ident, PaneType) => {
         $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, Dimension) => {
+        $fields.take_dimension(ActionParameterName::$parameter)
     };
     ($fields:expr, $parameter:ident, Scalar) => {
         $fields.take_scalar(ActionParameterName::$parameter)
@@ -1874,6 +1893,21 @@ macro_rules! define_parsed_portable_actions {
 
 portable_action_definitions!(define_parsed_portable_actions);
 
+fn action_dimension(value: &ConfigValue, label: &str) -> Result<Dimension, Vec<ConfigDiagnostic>> {
+    let dimension = match &value.kind {
+        ConfigValueKind::Integer(cells) => u16::try_from(*cells).ok().map(Dimension::Cells),
+        ConfigValueKind::String(text) => text.parse::<Dimension>().ok(),
+        _ => None,
+    };
+    dimension.filter(|dimension| dimension.is_valid_size()).ok_or_else(|| vec![
+        ConfigDiagnostic::error(
+            DiagnosticCode::InvalidActionArguments,
+            format!("{label} must be positive terminal cells or an integer percentage from 1% to 100%; context references are not supported"),
+            value.span.clone(),
+        ),
+    ])
+}
+
 fn parse_portable_action_fields(
     schema: PortableActionSchema,
     fields: &[ActionField<'_>],
@@ -1938,6 +1972,9 @@ fn parse_portable_action_fields(
                         )]);
                     }
                     ParsedActionValue::Scalar(ActionScalar::new(field.value.clone().into_owned()))
+                }
+                ActionParameterType::Dimension => {
+                    ParsedActionValue::Dimension(action_dimension(&field.value, &label)?)
                 }
                 ActionParameterType::Scalar => {
                     ParsedActionValue::Scalar(action_scalar(&field.value, &label)?)

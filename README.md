@@ -429,9 +429,13 @@ action:
   type: pane:open
   pane-type: popup
   program: htop
+  width: 80%
+  height: 70%
 ```
 
-The corresponding CLI is `muxe pane open --pane-type popup -- htop`. Herdr popups are session-modal; Zellij maps `popup` and `overlay` to ordinary floating command panes. See the [action reference](REFERENCE.md#executable-pane-lifecycle) for supported options and lifecycle behavior.
+The corresponding CLI is `muxe pane open --pane-type popup --width 80% --height 70% -- htop`. Dimensions accept positive cells or integer percentages. Host borders, viewport limits, and rounding affect the resulting inner terminal size. Herdr popups are session-modal; Zellij maps `popup` and `overlay` to ordinary floating command panes. Herdr overlays and Zellij tiled splits reject dimensions. See the [action reference](REFERENCE.md#executable-pane-lifecycle) for split-axis bounds and host sizing behavior.
+
+Zellij's pinned SDK omits floating coordinates from creation requests. Muxe creates the pane once, then requests placement for the exact terminal identified by the matching host completion. A brief default-size frame can appear before the update. Dispatch completion means the coordinate update was requested, not that the host acknowledged final geometry; a missing created-pane identity leaves the outcome unknown and is never retried.
 
 To remove the persistent link, run `herdr plugin unlink muxe.command-panes` against the same Herdr server before deleting the installation. Existing commands are not stopped by unlinking.
 

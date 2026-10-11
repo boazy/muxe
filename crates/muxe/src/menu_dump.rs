@@ -373,6 +373,15 @@ fn push_tab_action_fields<'a>(
     }
 }
 
+fn dimension_node(dimension: muxe_core::Dimension) -> JsonNode<'static> {
+    match dimension {
+        muxe_core::Dimension::Cells(cells) => JsonNode::Integer(i64::from(cells)),
+        muxe_core::Dimension::Percent(percent) => {
+            JsonNode::String(Cow::Owned(format!("{percent}%")))
+        }
+    }
+}
+
 fn push_pane_action_fields<'a>(
     fields: &mut Vec<(Cow<'a, str>, JsonNode<'a>)>,
     action: &'a PaneAction,
@@ -385,6 +394,8 @@ fn push_pane_action_fields<'a>(
             program,
             args,
             cwd,
+            width,
+            height,
         } => {
             fields.push(field(
                 "pane-type",
@@ -401,6 +412,11 @@ fn push_pane_action_fields<'a>(
                 JsonNode::Array(args.iter().map(scalar_node).collect()),
             ));
             fields.push(field("cwd", optional_scalar_node(cwd.as_ref())));
+            fields.push(field("width", width.map_or(JsonNode::Null, dimension_node)));
+            fields.push(field(
+                "height",
+                height.map_or(JsonNode::Null, dimension_node),
+            ));
         }
         PaneAction::Create | PaneAction::Close => {}
         PaneAction::Split {
@@ -645,6 +661,8 @@ menus:
           pane-type: popup
           program: echo
           args: ["", "a b", "$HOME"]
+          width: 80%
+          height: 12
 "#,
             KeyCapabilities::default(),
             None,
@@ -659,6 +677,8 @@ menus:
         assert_eq!(action["program"], "echo");
         assert_eq!(action["args"], serde_json::json!(["", "a b", "$HOME"]));
         assert_eq!(action["focus"], true);
+        assert_eq!(action["width"], "80%");
+        assert_eq!(action["height"], 12);
     }
 
     #[test]

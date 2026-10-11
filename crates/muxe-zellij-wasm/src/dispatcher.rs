@@ -31,6 +31,10 @@ pub enum ReadyDispatch {
         dispatch: NativeCommandDispatch,
         /// Broker execution ID for correlation.
         execution: String,
+        /// Placement omitted by the pinned `NewFloatingPane` protobuf encoder.
+        /// Applied once to the actual pane returned by `ActionComplete`.
+        floating_coordinates:
+            Option<muxe_zellij_protocol::generated::validated::FloatingPaneCoordinates>,
     },
 }
 
@@ -43,13 +47,24 @@ pub fn prepare(command: RawNativeCommand, execution: &str) -> Result<ReadyDispat
     let validated = ValidatedNativeCommand::try_from(command).map_err(|error| error.to_string())?;
     match validated {
         ValidatedNativeCommand::RunAction {
-            action,
+            mut action,
             mut context,
         } => {
+            // The pinned SDK deliberately drops NewFloatingPane.coordinates.
+            // Preserve the command/target/hold flags; lower placement separately
+            // only after the host identifies the pane this creation affected.
+            let floating_coordinates = match &mut action {
+                muxe_zellij_protocol::generated::validated::Action::NewFloatingPane {
+                    coordinates,
+                    ..
+                } => coordinates.take(),
+                _ => None,
+            };
             context.insert(EXECUTION_CONTEXT_KEY.to_owned(), execution.to_owned());
             Ok(ReadyDispatch::Async {
                 dispatch: NativeCommandDispatch::RunAction { action, context },
                 execution: execution.to_owned(),
+                floating_coordinates,
             })
         }
         other => Ok(ReadyDispatch::Sync(NativeCommandDispatch::from(other))),
@@ -81,6 +96,81 @@ mod tests {
     use muxe_zellij_protocol::generated::raw;
 
     #[test]
+    fn floating_lowering_retains_only_placement_and_preserves_creation() {
+        let command = raw::RunCommandAction {
+            command: "/bin/printf".into(),
+            args: vec!["%s".into(), "one argument".into()],
+            cwd: Some("/saved/origin".into()),
+            direction: None,
+            hold_on_close: false,
+            hold_on_start: false,
+            originating_plugin: None,
+            use_terminal_title: false,
+        };
+        let coordinates = raw::FloatingPaneCoordinates {
+            x: None,
+            y: None,
+            width: Some(raw::PercentOrFixed::Percent(80)),
+            height: Some(raw::PercentOrFixed::Fixed(20)),
+            pinned: None,
+            borderless: None,
+            border_style: None,
+        };
+        let ReadyDispatch::Async {
+            dispatch: NativeCommandDispatch::RunAction { action, .. },
+            floating_coordinates: Some(placement),
+            ..
+        } = prepare(
+            RawNativeCommand::RunAction {
+                action: raw::Action::NewFloatingPane {
+                    command: Some(command),
+                    pane_name: None,
+                    coordinates: Some(coordinates),
+                    near_current_pane: false,
+                    no_focus: false,
+                    tab_id: None,
+                },
+                context: Vec::new(),
+            },
+            "creation-1",
+        )
+        .unwrap()
+        else {
+            panic!("floating creation must retain a second-stage placement");
+        };
+        let muxe_zellij_protocol::generated::validated::Action::NewFloatingPane {
+            command: Some(command),
+            coordinates,
+            near_current_pane,
+            no_focus,
+            tab_id,
+            ..
+        } = action
+        else {
+            panic!("creation action changed");
+        };
+        assert!(coordinates.is_none());
+        assert!(!near_current_pane);
+        assert!(!no_focus);
+        assert!(tab_id.is_none());
+        assert_eq!(command.command, std::path::Path::new("/bin/printf"));
+        assert_eq!(command.args, ["%s", "one argument"]);
+        assert_eq!(
+            command.cwd.as_deref(),
+            Some(std::path::Path::new("/saved/origin"))
+        );
+        assert!(!command.hold_on_close);
+        assert_eq!(
+            placement.width,
+            Some(muxe_zellij_protocol::generated::validated::PercentOrFixed::Percent(80))
+        );
+        assert_eq!(
+            placement.height,
+            Some(muxe_zellij_protocol::generated::validated::PercentOrFixed::Fixed(20))
+        );
+    }
+
+    #[test]
     fn run_action_completes_async_with_correlation() {
         let command = RawNativeCommand::RunAction {
             action: raw::Action::CloseFocus,
@@ -90,8 +180,10 @@ mod tests {
             ReadyDispatch::Async {
                 execution,
                 dispatch,
+                floating_coordinates,
             } => {
                 assert_eq!(execution, "exec-1");
+                assert!(floating_coordinates.is_none());
                 assert!(matches!(dispatch, NativeCommandDispatch::RunAction { .. }));
                 if let NativeCommandDispatch::RunAction { context, .. } = dispatch {
                     assert_eq!(completion_execution(&context), Some("exec-1"));

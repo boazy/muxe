@@ -1788,6 +1788,10 @@ impl ZellijAdapter {
                     OutcomeRank::Failed,
                     AdapterError::new(AdapterErrorKind::DispatchFailed, outcome.detail),
                 ),
+                muxe_zellij_protocol::CommandStatus::OutcomeUnknown => record.note_failure(
+                    OutcomeRank::Unknown,
+                    AdapterError::new(AdapterErrorKind::OutcomeUnknown, outcome.detail),
+                ),
             };
             if !done {
                 return;
@@ -5711,6 +5715,79 @@ while IFS= read -r line; do :; done
     }
 
     #[tokio::test]
+    async fn bridge_unknown_dominates_batch_failure_and_consumes_ownership() {
+        for unknown_first in [false, true] {
+            let request = ScriptedChannel::new();
+            let event = ScriptedChannel::new();
+            let adapter = test_adapter(&request, &event);
+            push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+            await_registered(&adapter, &[ClientId::new("client-1")]).await;
+            assert!(matches!(
+                next_event(&adapter).await,
+                AdapterHealthEvent::Healthy { .. }
+            ));
+            let execution = ExecutionId(101);
+            adapter
+                .dispatch_to_client(
+                    execution,
+                    ClientId::new("client-1"),
+                    two_request_batch(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let first = decode_request_line(&poll_outbound(&request).await).unwrap();
+            push_request_released(&event, first.request_id);
+            let second = decode_request_line(&poll_outbound(&request).await).unwrap();
+            let outcomes = if unknown_first {
+                [
+                    CommandOutcome::outcome_unknown("created terminal identity unavailable"),
+                    CommandOutcome::failed("known command failure"),
+                ]
+            } else {
+                [
+                    CommandOutcome::failed("known command failure"),
+                    CommandOutcome::outcome_unknown("created terminal identity unavailable"),
+                ]
+            };
+            let [first_outcome, second_outcome] = outcomes;
+            push_dispatch_completion(&event, first.request_id, execution, first_outcome);
+            push_request_released(&event, second.request_id);
+            push_dispatch_completion(&event, second.request_id, execution, second_outcome);
+            let AdapterHealthEvent::DispatchCompleted(DispatchCompletion::OutcomeUnknown {
+                execution: got,
+                error,
+            }) = next_event(&adapter).await
+            else {
+                panic!("unknown must dominate a known failure");
+            };
+            assert_eq!(got, execution);
+            assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+            assert!(
+                !adapter
+                    .inner
+                    .live_executions
+                    .lock()
+                    .await
+                    .contains_key(&execution)
+            );
+            // A duplicate late terminal cannot settle or report this owner again.
+            push_dispatch_completion(
+                &event,
+                second.request_id,
+                execution,
+                CommandOutcome::succeeded(),
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), adapter.next_health_event())
+                    .await
+                    .is_err()
+            );
+            adapter.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn mixed_batch_with_write_failure_publishes_one_unknown_terminal() {
         let request = ScriptedChannel::new();
         let event = ScriptedChannel::new();
@@ -6456,6 +6533,47 @@ while IFS= read -r line; do :; done
         }
         assert!(request.take_outbound().is_empty());
         adapter.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn same_version_different_bridge_protocol_is_rejected_before_dispatch() {
+        let request = ScriptedChannel::new();
+        let event = ScriptedChannel::new();
+        let adapter = test_adapter(&request, &event);
+        push_register(&event, "client-1", [7; 16], env!("CARGO_PKG_VERSION"));
+        await_registered(&adapter, &[ClientId::new("client-1")]).await;
+        assert!(matches!(
+            next_event(&adapter).await,
+            AdapterHealthEvent::Healthy { .. }
+        ));
+        let mut incompatible = register_event([9; 16], Some(bridge_build_id()));
+        let PipeEventKind::Event(BridgeEvent::Register { registration }) = &mut incompatible.event
+        else {
+            panic!("registration fixture");
+        };
+        assert_eq!(
+            registration.identity.muxe_version,
+            env!("CARGO_PKG_VERSION")
+        );
+        // Leave version, source pin, generated actions and build ID untouched:
+        // a different wire contract alone must close the dispatch gate.
+        registration.identity.protocol_fingerprint[0] ^= 1;
+        event.push_line(encode_event_line(&incompatible).unwrap());
+        await_incompatible_registration(&adapter, &ClientId::new("client-1"), registration_id(9))
+            .await;
+        let error = adapter
+            .dispatch_native(NativeDispatchRequest {
+                execution: ExecutionId(8),
+                action: muxe_adapter_api::ResolvedNativeAction {
+                    candidate: candidate(),
+                },
+                origin: current_test_origin(&adapter),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, AdapterErrorKind::Incompatible);
+        assert!(request.take_outbound().is_empty());
+        adapter.shutdown().await.unwrap();
     }
 
     #[tokio::test]

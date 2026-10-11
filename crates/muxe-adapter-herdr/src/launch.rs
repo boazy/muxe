@@ -5,7 +5,7 @@ use std::{
 
 use muxe_adapter_api::launch::is_ui_argv;
 use muxe_adapter_api::{AdapterError, AdapterErrorKind};
-use muxe_core::{PaneId, TabId, WorkspaceId};
+use muxe_core::{Dimension, ExecutablePaneType, PaneId, TabId, WorkspaceId};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -100,6 +100,134 @@ pub struct CommandTabLaunch {
     pub cwd: PathBuf,
     pub argv: Vec<String>,
     pub focus: bool,
+}
+
+/// Converts a CLI or portable popup dimension through the pinned Herdr schema.
+/// Cell bounds remain host-owned for the CLI; portable validation requires positive cells.
+///
+/// # Errors
+///
+/// Returns an adapter error for percentages outside the host's 1%-100% grammar.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the shared boundary error; boxing this pure converter would add allocation"
+)]
+pub fn popup_size(
+    dimension: Dimension,
+) -> Result<crate::generated::request_types::PopupSize, AdapterError> {
+    use crate::generated::request_types::PopupSize;
+    match dimension {
+        Dimension::Cells(cells) => Ok(PopupSize::Integer(cells)),
+        Dimension::Percent(percent) => format!("{percent}%")
+            .parse()
+            .map(PopupSize::String)
+            .map_err(|_| invalid("popup percentages must be between 1% and 100%")),
+    }
+}
+
+/// Validates portable-only dimension bounds without introducing position fields.
+/// An unresolved existing direction postpones the split-axis check until dispatch.
+pub(crate) fn validate_portable_dimensions(
+    pane_type: ExecutablePaneType,
+    direction: Option<UiSplitDirection>,
+    width: Option<Dimension>,
+    height: Option<Dimension>,
+) -> Result<(), &'static str> {
+    match pane_type {
+        ExecutablePaneType::Overlay if width.is_some() || height.is_some() => {
+            return Err("Herdr executable overlays do not support width or height; use popup");
+        }
+        ExecutablePaneType::Split => {
+            if width.is_some() && height.is_some() {
+                return Err(
+                    "Herdr splits support only width for rightward splits or height for downward splits",
+                );
+            }
+            if matches!(direction, Some(UiSplitDirection::Down)) && width.is_some()
+                || matches!(direction, Some(UiSplitDirection::Right)) && height.is_some()
+            {
+                return Err(
+                    "Herdr splits support only width for rightward splits or height for downward splits",
+                );
+            }
+        }
+        _ => {}
+    }
+    for (dimension, message) in [
+        (
+            width,
+            "pane:open width must be positive cells or an integer percentage from 1% to 100%",
+        ),
+        (
+            height,
+            "pane:open height must be positive cells or an integer percentage from 1% to 100%",
+        ),
+    ] {
+        if dimension.is_some_and(|value| !value.is_valid_size()) {
+            return Err(message);
+        }
+        if pane_type == ExecutablePaneType::Split
+            && matches!(dimension, Some(Dimension::Percent(percent)) if !(10..=90).contains(&percent))
+        {
+            return Err("Herdr split percentages must be between 10% and 90%");
+        }
+    }
+    Ok(())
+}
+
+/// Returns the pinned host ratio for an exact CLI/portable new-pane size.
+///
+/// # Errors
+///
+/// Returns an adapter error for the unsupported axis or sizes outside 10%-90%
+/// of the saved parent pane's live split axis.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the shared boundary error; boxing the ratio validator would add allocation"
+)]
+pub fn command_pane_ratio(
+    width: Option<Dimension>,
+    height: Option<Dimension>,
+    destination: &FocusedPane,
+    direction: UiSplitDirection,
+) -> Result<f64, AdapterError> {
+    let (requested, unsupported, available) = match direction {
+        UiSplitDirection::Down => (height, width, destination.rows),
+        UiSplitDirection::Right => (width, height, destination.columns),
+    };
+    if unsupported.is_some() {
+        return Err(invalid(
+            "use --height for a downward Herdr split and --width for a rightward split; the other dimension is unsupported",
+        ));
+    }
+    let requested_ratio = match requested {
+        None => return Ok(0.5),
+        Some(Dimension::Percent(percent)) if (10..=90).contains(&percent) => {
+            f64::from(percent) / 100.0
+        }
+        Some(Dimension::Percent(_)) => {
+            return Err(invalid(
+                "Herdr split percentage must be between 10% and 90%",
+            ));
+        }
+        Some(Dimension::Cells(cells)) => {
+            if cells == 0 || cells >= available {
+                return Err(invalid(format!(
+                    "the requested Herdr split size is {cells} cells; it must be greater than zero and smaller than the parent pane's {available} cells in the split direction"
+                )));
+            }
+            let cells = u32::from(cells);
+            let available = u32::from(available);
+            if cells * 10 < available || cells * 10 > available * 9 {
+                return Err(invalid(format!(
+                    "the requested Herdr split size is {cells} of {available} parent-pane cells; it must occupy between 10% and 90% in the split direction"
+                )));
+            }
+            f64::from(cells) / f64::from(available)
+        }
+    };
+    // The host assigns ratio to the old first child; the requested size names the new second child.
+    Ok(1.0 - requested_ratio)
 }
 /// Persistent Herdr plugin used only for real executable overlays and popups.
 pub const COMMAND_PANE_PLUGIN_ID: &str = "muxe.command-panes";
@@ -994,6 +1122,160 @@ fn invalid(message: impl Into<String>) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_conversion_reuses_cli_grammar_without_global_cell_bounds() {
+        for (dimension, expected) in [
+            (Dimension::Percent(80), json!("80%")),
+            (Dimension::Percent(100), json!("100%")),
+            (Dimension::Cells(12), json!(12)),
+            // The old CLI forwards zero cells to Herdr; only portable input rejects it.
+            (Dimension::Cells(0), json!(0)),
+        ] {
+            assert_eq!(
+                serde_json::to_value(popup_size(dimension).unwrap()).unwrap(),
+                expected
+            );
+        }
+        assert!(popup_size(Dimension::Percent(0)).is_err());
+        assert!(popup_size(Dimension::Percent(101)).is_err());
+    }
+
+    #[test]
+    fn split_dimensions_use_new_child_axis_and_live_parent_bounds() {
+        let parent = FocusedPane {
+            workspace: WorkspaceId::new("workspace"),
+            tab: TabId::new("tab"),
+            pane: PaneId::new("pane"),
+            cwd: PathBuf::from("/tmp"),
+            columns: 100,
+            rows: 40,
+        };
+        for (direction, width, height, ratio) in [
+            (
+                UiSplitDirection::Right,
+                Some(Dimension::Percent(80)),
+                None,
+                0.2,
+            ),
+            (
+                UiSplitDirection::Down,
+                None,
+                Some(Dimension::Cells(12)),
+                0.7,
+            ),
+            (
+                UiSplitDirection::Right,
+                Some(Dimension::Cells(10)),
+                None,
+                0.9,
+            ),
+            (
+                UiSplitDirection::Right,
+                Some(Dimension::Cells(90)),
+                None,
+                0.1,
+            ),
+        ] {
+            assert!(
+                (command_pane_ratio(width, height, &parent, direction).unwrap() - ratio).abs()
+                    < f64::EPSILON
+            );
+        }
+        for value in [
+            Dimension::Cells(0),
+            Dimension::Cells(9),
+            Dimension::Cells(91),
+            Dimension::Cells(100),
+            Dimension::Percent(9),
+            Dimension::Percent(91),
+        ] {
+            assert!(
+                command_pane_ratio(Some(value), None, &parent, UiSplitDirection::Right).is_err()
+            );
+        }
+        assert!(
+            command_pane_ratio(
+                Some(Dimension::Percent(80)),
+                Some(Dimension::Percent(70)),
+                &parent,
+                UiSplitDirection::Right
+            )
+            .is_err()
+        );
+        assert!(
+            command_pane_ratio(
+                Some(Dimension::Cells(20)),
+                None,
+                &parent,
+                UiSplitDirection::Down
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn portable_dimension_placement_rejects_unsupported_axes_before_bounds() {
+        assert!(
+            validate_portable_dimensions(
+                ExecutablePaneType::Popup,
+                None,
+                Some(Dimension::Percent(80)),
+                Some(Dimension::Percent(70))
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_portable_dimensions(
+                ExecutablePaneType::Overlay,
+                None,
+                Some(Dimension::Cells(0)),
+                None
+            ),
+            validate_portable_dimensions(
+                ExecutablePaneType::Overlay,
+                None,
+                Some(Dimension::Cells(20)),
+                None
+            ),
+        );
+        assert!(
+            validate_portable_dimensions(
+                ExecutablePaneType::Split,
+                Some(UiSplitDirection::Down),
+                Some(Dimension::Percent(80)),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate_portable_dimensions(
+                ExecutablePaneType::Split,
+                Some(UiSplitDirection::Right),
+                Some(Dimension::Percent(10)),
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_portable_dimensions(
+                ExecutablePaneType::Split,
+                None,
+                Some(Dimension::Percent(100)),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate_portable_dimensions(
+                ExecutablePaneType::Popup,
+                None,
+                Some(Dimension::Percent(0)),
+                None
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn live_pane_missing_cwd_is_not_classified_as_a_vanished_origin() {

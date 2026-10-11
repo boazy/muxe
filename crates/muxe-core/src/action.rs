@@ -6,6 +6,7 @@ use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 use crate::config::{ConfigField, ConfigValue, ConfigValueKind, ContextResolutionError};
 use crate::context::{ContextValue, OriginContext, SessionName, WorkspaceId};
 use crate::diagnostic::SourceSpan;
+use crate::dimension::Dimension;
 use crate::execution::{ExecutionCapabilities, ExecutionMode};
 use crate::key::CanonicalKey;
 
@@ -94,6 +95,10 @@ pub enum ActionParameterName {
     Direction,
     #[strum(serialize = "pane-type")]
     PaneType,
+    #[strum(serialize = "width")]
+    Width,
+    #[strum(serialize = "height")]
+    Height,
     #[strum(serialize = "amount")]
     Amount,
     #[strum(serialize = "enabled")]
@@ -140,6 +145,8 @@ pub enum ActionParameterType {
     Direction,
     #[strum(serialize = "`split`, `overlay`, or `popup`")]
     PaneType,
+    #[strum(serialize = "positive terminal cells or a percentage from 1% to 100%")]
+    Dimension,
     #[strum(serialize = "number or `$origin.` reference")]
     Scalar,
 }
@@ -542,6 +549,8 @@ macro_rules! portable_action_definitions {
                 pane_type as PaneType: PaneType [default = Split];
                 direction as Direction: Direction [default = HostDependent];
                 focus as Focus: Boolean [default = True];
+                width as Width: Dimension [default = HostDependent];
+                height as Height: Dimension [default = HostDependent];
             ],
             constraints: [],
         }
@@ -889,6 +898,8 @@ pub enum PaneAction {
         program: ActionScalar,
         args: Vec<ActionScalar>,
         cwd: Option<ActionScalar>,
+        width: Option<Dimension>,
+        height: Option<Dimension>,
     },
     Create,
     Split {
@@ -1143,6 +1154,8 @@ pub enum ResolvedPaneAction {
         program: CommandWord,
         args: Vec<CommandWord>,
         cwd: Option<CommandCwd>,
+        width: Option<Dimension>,
+        height: Option<Dimension>,
     },
     Create,
     Split {
@@ -1300,6 +1313,8 @@ impl PortableAction {
                 program,
                 args,
                 cwd,
+                width,
+                height,
             }) => R::Pane(ResolvedPaneAction::Open {
                 pane_type: *pane_type,
                 direction: direction
@@ -1316,6 +1331,8 @@ impl PortableAction {
                     .as_ref()
                     .map(|value| resolve_cwd(value, origin, "pane.cwd"))
                     .transpose()?,
+                width: *width,
+                height: *height,
             }),
             Self::Pane(PaneAction::Create) => R::Pane(ResolvedPaneAction::Create),
             Self::Pane(PaneAction::Split {

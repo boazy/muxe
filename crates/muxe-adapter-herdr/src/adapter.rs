@@ -1633,6 +1633,8 @@ fn portable_compile_validation(
         pane_type,
         direction,
         focus,
+        width,
+        height,
         ..
     }) = action
     {
@@ -1644,6 +1646,20 @@ fn portable_compile_validation(
                 _ => None,
             }),
         )?;
+        let axis = match direction {
+            None => Some(crate::UiSplitDirection::Down),
+            Some(value) => match &value.value.kind {
+                ConfigValueKind::String(value) if value == "right" => {
+                    Some(crate::UiSplitDirection::Right)
+                }
+                ConfigValueKind::String(value) if value == "down" => {
+                    Some(crate::UiSplitDirection::Down)
+                }
+                _ => None,
+            },
+        };
+        crate::launch::validate_portable_dimensions(*pane_type, axis, *width, *height)
+            .map_err(str::to_owned)?;
     }
     if let Some(methods) = command_creation_methods(action) {
         return validate_required_methods(schema, methods);
@@ -3834,6 +3850,8 @@ async fn perform_pane_open(
         program,
         args,
         cwd,
+        width,
+        height,
     } = action
     else {
         unreachable!("perform_pane_open accepts only pane:open")
@@ -3844,6 +3862,17 @@ async fn perform_pane_open(
         *focus,
     )
     .map_err(incompatible)?;
+    let split_axis = (*pane_type == muxe_core::ExecutablePaneType::Split)
+        .then(|| direction.unwrap_or(muxe_core::Direction::Down))
+        .map(split_direction)
+        .transpose()
+        .map_err(direction_request_error)?;
+    crate::launch::validate_portable_dimensions(*pane_type, split_axis, *width, *height).map_err(
+        |message| {
+            incompatible(message)
+                .with_safe_diagnostic(HerdrExecutionDiagnostic::DimensionsInvalid.safe())
+        },
+    )?;
     let workspace = origin
         .workspace_id
         .clone()
@@ -3862,21 +3891,27 @@ async fn perform_pane_open(
     })?;
     let argv = creation_argv(Some(program), args, "pane.program", "pane.args")?;
     match pane_type {
-        muxe_core::ExecutablePaneType::Split => crate::launch::open_command_pane_with(
-            authority,
-            crate::CommandPaneLaunch {
-                origin: destination.clone(),
-                destination,
-                cwd,
-                argv,
-                direction: split_direction(direction.unwrap_or(muxe_core::Direction::Down))
-                    .map_err(direction_request_error)?,
-                ratio: 0.5,
-                focus: focus.unwrap_or(true),
-            },
-        )
-        .await
-        .map(|_| ()),
+        muxe_core::ExecutablePaneType::Split => {
+            let direction = split_axis.expect("split axis was validated");
+            let ratio = crate::command_pane_ratio(*width, *height, &destination, direction)
+                .map_err(|error| {
+                    error.with_safe_diagnostic(HerdrExecutionDiagnostic::DimensionsInvalid.safe())
+                })?;
+            crate::launch::open_command_pane_with(
+                authority,
+                crate::CommandPaneLaunch {
+                    origin: destination.clone(),
+                    destination,
+                    cwd,
+                    argv,
+                    direction,
+                    ratio,
+                    focus: focus.unwrap_or(true),
+                },
+            )
+            .await
+            .map(|_| ())
+        }
         muxe_core::ExecutablePaneType::Overlay | muxe_core::ExecutablePaneType::Popup => {
             crate::launch::open_plugin_command_pane_with(
                 authority,
@@ -3889,8 +3924,8 @@ async fn perform_pane_open(
                     } else {
                         crate::PluginCommandPaneType::Overlay
                     },
-                    width: None,
-                    height: None,
+                    width: width.map(crate::popup_size).transpose()?,
+                    height: height.map(crate::popup_size).transpose()?,
                 },
             )
             .await

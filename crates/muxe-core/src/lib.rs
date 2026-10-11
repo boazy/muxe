@@ -12,6 +12,7 @@ mod condition;
 mod config;
 mod context;
 mod diagnostic;
+mod dimension;
 mod execution;
 mod key;
 mod menu;
@@ -47,6 +48,7 @@ pub use diagnostic::{
     ConfigDiagnostic, ConfigDiagnosticReport, DiagnosticCode, DiagnosticLabel, DiagnosticSeverity,
     SourceId, SourceSpan,
 };
+pub use dimension::Dimension;
 pub use execution::{
     AfterAction, ExecutionCapabilities, ExecutionMode, ExecutionPolicy, MenuControl,
     MenuControlAction, TimeoutAction,

@@ -61,3 +61,49 @@ pub fn assert_pinned_revision() {
         "unconverted Zellij action types must fail closed, never ship"
     );
 }
+
+/// Converts validated placement metadata for the pinned coordinate-update shim.
+#[must_use]
+pub fn floating_pane_coordinates_for_host(
+    coordinates: validated::FloatingPaneCoordinates,
+) -> zellij_utils::data::FloatingPaneCoordinates {
+    into_zellij_floating_pane_coordinates(coordinates)
+}
+
+#[cfg(test)]
+mod host_boundary_tests {
+    use super::*;
+    use zellij_utils::{
+        data::{PaneId, PluginCommand},
+        input::layout::PercentOrFixed,
+        plugin_api::generated_api::api::plugin_command::PluginCommand as ProtobufPluginCommand,
+    };
+
+    #[test]
+    fn targeted_coordinate_update_preserves_exact_terminal_and_both_dimensions() {
+        let raw_placement = raw::FloatingPaneCoordinates {
+            x: None,
+            y: None,
+            width: Some(raw::PercentOrFixed::Percent(80)),
+            height: Some(raw::PercentOrFixed::Fixed(20)),
+            pinned: None,
+            borderless: None,
+            border_style: None,
+        };
+        let placement = validated::FloatingPaneCoordinates::try_from(raw_placement).unwrap();
+        let command = PluginCommand::ChangeFloatingPanesCoordinates(vec![(
+            PaneId::Terminal(42),
+            floating_pane_coordinates_for_host(placement),
+        )]);
+        let encoded: ProtobufPluginCommand = command.try_into().unwrap();
+        let decoded: PluginCommand = encoded.try_into().unwrap();
+        let PluginCommand::ChangeFloatingPanesCoordinates(placements) = decoded else {
+            panic!("placement update changed");
+        };
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].0, PaneId::Terminal(42));
+        assert_eq!(placements[0].1.width, Some(PercentOrFixed::Percent(80)));
+        assert_eq!(placements[0].1.height, Some(PercentOrFixed::Fixed(20)));
+        assert!(placements[0].1.x.is_none() && placements[0].1.y.is_none());
+    }
+}

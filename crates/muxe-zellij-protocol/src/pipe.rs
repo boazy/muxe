@@ -200,11 +200,13 @@ pub type PipeEventKind = muxe_protocol::BridgeOutput<BridgeResponse, BridgeEvent
 /// payloads encode `request_id` as JSON `null`.
 pub type PipeEvent = BridgeEventEnvelope<ChannelGeneration, PipeEventKind>;
 
-/// Typed synchronous outcome for one dispatched native command.
+/// Typed dispatch outcome for one native command.
 ///
 /// `ActionComplete` semantics apply: success means Zellij finished dispatching
-/// the action, not that an arbitrary resulting operation succeeded. There is no
-/// general failure value on this path; fallible returns surface as [`CommandStatus::Failed`].
+/// the action, not that an arbitrary resulting operation succeeded. Floating
+/// placement updates only acknowledge requesting the update, not final geometry.
+/// Fallible returns surface as [`CommandStatus::Failed`]; an applied creation
+/// without a usable returned terminal identity is [`CommandStatus::OutcomeUnknown`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandOutcome {
     /// Success or failure of host dispatch.
@@ -216,10 +218,12 @@ pub struct CommandOutcome {
 /// Dispatch result discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandStatus {
-    /// Zellij accepted and synchronously dispatched the command.
+    /// Host dispatch completed, or a floating placement update was requested.
     Succeeded,
     /// A fallible shim return carried `Err`; `detail` holds the bounded message.
     Failed,
+    /// Creation may have applied, but its returned pane cannot be safely placed.
+    OutcomeUnknown,
 }
 
 impl CommandOutcome {
@@ -240,6 +244,13 @@ impl CommandOutcome {
             status: CommandStatus::Failed,
             detail: text,
         }
+    }
+
+    /// An applied action cannot be confirmed or safely completed.
+    pub fn outcome_unknown(detail: impl Into<String>) -> Self {
+        let mut outcome = Self::failed(detail);
+        outcome.status = CommandStatus::OutcomeUnknown;
+        outcome
     }
 }
 
@@ -756,6 +767,21 @@ mod tests {
         assert_eq!(outcome.detail, "e".repeat(MAX_DETAIL_LEN - 1));
         assert_eq!(outcome.status, CommandStatus::Failed);
         assert_eq!(CommandOutcome::succeeded().status, CommandStatus::Succeeded);
+    }
+
+    #[test]
+    fn uncertain_placement_outcome_roundtrips_without_becoming_failed() {
+        let outcome = CommandOutcome::outcome_unknown("terminal identity unavailable");
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        let decoded: CommandOutcome = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.status, CommandStatus::OutcomeUnknown);
+        assert_eq!(decoded, outcome);
+        assert_eq!(
+            CommandOutcome::outcome_unknown("é".repeat(MAX_DETAIL_LEN))
+                .detail
+                .len(),
+            MAX_DETAIL_LEN,
+        );
     }
 
     #[test]

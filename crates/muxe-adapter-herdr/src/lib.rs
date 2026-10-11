@@ -41,6 +41,7 @@ pub enum HerdrExecutionDiagnostic {
     HostRejected,
     TransportFailed,
     CleanupFailed,
+    DimensionsInvalid,
 }
 
 impl HerdrExecutionDiagnostic {
@@ -80,6 +81,9 @@ impl HerdrExecutionDiagnostic {
             Self::CleanupFailed => {
                 "Execution cleanup failed; inspect Herdr for retained command or menu panes."
             }
+            Self::DimensionsInvalid => {
+                "Herdr executable-pane dimensions are invalid or unsupported for the selected placement; check the split axis, size bounds, and parent geometry."
+            }
         })
     }
 }
@@ -101,9 +105,9 @@ pub use launch::{
     COMMAND_PANE_ARGV_ENV, COMMAND_PANE_ENTRYPOINT, COMMAND_PANE_PLUGIN_ID, CommandPaneLaunch,
     CommandPanePlacement, CommandTabLaunch, FocusedPane, PluginCommandPaneLaunch,
     PluginCommandPanePlacement, PluginCommandPaneType, PreparedUiPane, UiPaneLaunch,
-    UiPanePlacement, UiSplitDirection, close_transient_tab, focused_pane, move_prepared_ui_pane,
-    open_command_pane, open_command_tab, open_plugin_command_pane, pane_by_id, pane_by_identity,
-    prepare_ui_pane,
+    UiPanePlacement, UiSplitDirection, close_transient_tab, command_pane_ratio, focused_pane,
+    move_prepared_ui_pane, open_command_pane, open_command_tab, open_plugin_command_pane,
+    pane_by_id, pane_by_identity, popup_size, prepare_ui_pane,
 };
 pub use runtime::{HerdrAdapterConfig, HerdrRuntime};
 pub use schema::{

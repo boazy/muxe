@@ -2128,6 +2128,21 @@ async fn wait_missing_plugin_log(log_path: &Path) -> io::Result<()> {
     .await
 }
 
+async fn dismiss_owned_herdr_welcome(rig: &mut Rig, typescript: &Path) -> io::Result<()> {
+    // Fresh HOME's welcome opens host settings; neither screen is a menu key target.
+    rig.pty_clients
+        .last_mut()
+        .expect("owned Herdr client")
+        .send_input(b"\r")
+        .await?;
+    wait_herdr_menu_labels(typescript, 0, &["settings"], &[]).await?;
+    rig.pty_clients
+        .last_mut()
+        .expect("owned Herdr client")
+        .send_input(b"\x1b")
+        .await
+}
+
 async fn assert_herdr_popup_diagnostics(
     rig: &mut Rig,
     target_bin: &Path,
@@ -2135,19 +2150,7 @@ async fn assert_herdr_popup_diagnostics(
 ) -> io::Result<()> {
     let (socket, runtime, origin, typescript) =
         prepare_herdr_menu_origin(rig, herdr_binary).await?;
-    // Herdr's first-run welcome opens its integration settings, which intercept
-    // terminal keys. Close both host screens before driving the raw menu key.
-    rig.pty_clients
-        .last_mut()
-        .expect("owned Herdr client")
-        .send_input(b"\r")
-        .await?;
-    wait_herdr_menu_labels(&typescript, 0, &["settings"], &[]).await?;
-    rig.pty_clients
-        .last_mut()
-        .expect("owned Herdr client")
-        .send_input(b"\x1b")
-        .await?;
+    dismiss_owned_herdr_welcome(rig, &typescript).await?;
     press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin, "Owned popup").await?;
     wait_missing_plugin_log(&rig.cache_dir.join("logs/muxe.jsonl")).await?;
     let manifest = target_bin
@@ -2207,7 +2210,16 @@ async fn assert_herdr_popup_diagnostics(
     )
     .await?;
     herdr_smoke_request(&runtime, "popup.close", serde_json::json!({})).await?;
-    assert_agent_usage_popup(rig, target_bin, &socket, &runtime, &sibling, &typescript).await?;
+    assert_agent_usage_popup(
+        rig,
+        target_bin,
+        &socket,
+        &runtime,
+        &sibling,
+        &typescript,
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2218,6 +2230,7 @@ async fn assert_agent_usage_popup(
     runtime: &muxe_adapter_herdr::HerdrRuntime,
     origin: &muxe_adapter_herdr::FocusedPane,
     typescript: &Path,
+    dimensions: Option<(muxe_core::Dimension, muxe_core::Dimension)>,
 ) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     let available = std::env::var_os("PATH").is_some_and(|path| {
@@ -2235,13 +2248,19 @@ async fn assert_agent_usage_popup(
     }
     // The owned server retains only the fresh scoped HOME/XDG environment:
     // no account configuration or credentials are supplied to this executable.
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "version":1, "settings":{"timeout":"off"},
         "menus":{"main":{"bindings":{"u":{
             "label":"Requested executable",
             "action":{"type":"pane:open","pane-type":"popup","program":"agent-usage","args":["--tui"]}
         }}}}
     });
+    if let Some((width, height)) = dimensions {
+        config["menus"]["main"]["bindings"]["u"]["action"]["width"] =
+            serde_json::json!(width.to_string());
+        config["menus"]["main"]["bindings"]["u"]["action"]["height"] =
+            serde_json::json!(height.to_string());
+    }
     std::fs::write(
         &rig.config_file,
         serde_json::to_vec(&config).map_err(io::Error::other)?,
@@ -2262,12 +2281,124 @@ async fn assert_agent_usage_popup(
     Ok(())
 }
 
+fn complete_terminal_measurement(text: &str) -> Option<[u16; 2]> {
+    if !text.ends_with('\n') {
+        return None;
+    }
+    let mut values = text.split_whitespace();
+    let rows = values.next()?.parse().ok()?;
+    let columns = values.next()?.parse().ok()?;
+    values.next().is_none().then_some([rows, columns])
+}
+
+#[test]
+fn terminal_measurement_readiness_requires_complete_output_not_expected_geometry() {
+    for incomplete in ["", "18", "18 7", "18 \n", "18 invalid\n", "18 72 1\n"] {
+        assert_eq!(complete_terminal_measurement(incomplete), None);
+    }
+    assert_eq!(complete_terminal_measurement("18 72\n"), Some([18, 72]));
+    // Complete wrong sizes must reach the geometry assertion, not be retried.
+    assert_eq!(complete_terminal_measurement("12 58\n"), Some([12, 58]));
+    assert_eq!(complete_terminal_measurement("0 0\n"), Some([0, 0]));
+}
+
+async fn assert_sized_herdr_popup(
+    rig: &mut Rig,
+    target_bin: &Path,
+    herdr_binary: &Path,
+) -> io::Result<()> {
+    let (socket, runtime, origin, typescript) =
+        prepare_herdr_menu_origin(rig, herdr_binary).await?;
+    dismiss_owned_herdr_welcome(rig, &typescript).await?;
+    // The retained 120x30 client has default sidebar 26 and tab bar 1, hence a 94x29 render area.
+    if (origin.columns, origin.rows) != (94, 29) {
+        return Err(io::Error::other(format!(
+            "geometry fixture render area changed: {}x{}",
+            origin.columns, origin.rows
+        )));
+    }
+    let manifest = target_bin
+        .parent()
+        .ok_or_else(|| io::Error::other("installation root absent"))?
+        .join("lib/muxe/herdr-plugin.toml");
+    let mut link = tokio::process::Command::new(herdr_binary);
+    apply_scoped_env(&mut link, &rig.scoped_root);
+    link.env("HERDR_SOCKET_PATH", &socket)
+        .args(["plugin", "link"])
+        .arg(manifest);
+    let output = run_cli_bounded("owned-sized-popup-plugin-link", &mut link).await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "owned plugin link failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let marker = rig.workdir.join("sized-popup-tty");
+    for (width, height, expected_rows, expected_columns) in [
+        ("80%", "70%", 18, 72),
+        ("60", "20", 18, 57),
+        ("1000", "1000", 27, 91),
+    ] {
+        let config = serde_json::json!({
+            "version":1, "settings":{"timeout":"off"},
+            "menus":{"main":{"bindings":{"u":{
+                "label":format!("Sized popup {width} {height}"),
+                "action":{"type":"pane:open","pane-type":"popup","width":width,"height":height,
+                    "program":"/bin/sh","args":["-c","stty size > sized-popup-tty; sleep 120"]}
+            }}}}
+        });
+        std::fs::write(
+            &rig.config_file,
+            serde_json::to_vec(&config).map_err(io::Error::other)?,
+        )?;
+        let label = format!("Sized popup {width} {height}");
+        press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin, &label).await?;
+        let (measured, actual) = poll_until(
+            "real sized popup PTY ioctl measurement",
+            Duration::from_secs(10),
+            async || {
+                let measured =
+                    std::fs::read_to_string(&marker).map_err(|error| error.to_string())?;
+                let actual = complete_terminal_measurement(&measured)
+                    .ok_or_else(|| "waiting for a complete rows/columns measurement".to_owned())?;
+                Ok((measured, actual))
+            },
+        )
+        .await?;
+        if actual != [expected_rows, expected_columns] {
+            return Err(io::Error::other(format!(
+                "popup {width}x{height}: actual stty size {measured:?}, expected {expected_rows} {expected_columns} after borders/clamping"
+            )));
+        }
+        eprintln!(
+            "actual popup {width}x{height}: ioctl rows={expected_rows} columns={expected_columns} (94x29 render area; outer border/renderer and viewport clamp accounted)"
+        );
+        herdr_smoke_request(&runtime, "popup.close", serde_json::json!({})).await?;
+        std::fs::remove_file(&marker)?;
+    }
+    // Exercise the requested executable too, with the same representative dimensions and no accounts.
+    assert_agent_usage_popup(
+        rig,
+        target_bin,
+        &socket,
+        &runtime,
+        &origin,
+        &typescript,
+        Some((
+            muxe_core::Dimension::Percent(80),
+            muxe_core::Dimension::Percent(70),
+        )),
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum HerdrMenuSmoke {
     StaysOpen,
     BareTabCreate,
     Navigation,
     ExecutablePopup,
+    SizedPopup,
 }
 
 async fn activate_herdr_smoke(rig: &Rig, target_bin: &Path, socket: &Path) -> io::Result<()> {
@@ -2292,7 +2423,7 @@ async fn activate_herdr_smoke(rig: &Rig, target_bin: &Path, socket: &Path) -> io
 
 fn write_herdr_smoke_config(scenario: HerdrMenuSmoke, config_file: &Path) -> io::Result<()> {
     let yaml = match scenario {
-        HerdrMenuSmoke::StaysOpen => return Ok(()),
+        HerdrMenuSmoke::StaysOpen | HerdrMenuSmoke::SizedPopup => return Ok(()),
         HerdrMenuSmoke::BareTabCreate => {
             "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      t: { label: tabs, action: 'menu:open tabs' }\n      u: { label: up, skip-hosts: [herdr], action: 'pane:split direction=up' }\n  tabs:\n    bindings:\n      t: { label: new tab, action: 'tab:create' }\n  foreign:\n    only-hosts: [zellij]\n    bindings:\n      p: { label: unsupported, action: 'pane:create' }\n"
         }
@@ -2312,7 +2443,12 @@ async fn finish_herdr_menu_smoke(
     body: io::Result<()>,
 ) -> io::Result<()> {
     let result = rig.finish("herdr-menu", body).await;
-    if result.is_err() && matches!(scenario, HerdrMenuSmoke::ExecutablePopup) {
+    if result.is_err()
+        && matches!(
+            scenario,
+            HerdrMenuSmoke::ExecutablePopup | HerdrMenuSmoke::SizedPopup
+        )
+    {
         eprintln!(
             "preserved owned popup diagnostics: {}",
             rig.root.keep().display()
@@ -2410,6 +2546,9 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
             }
             HerdrMenuSmoke::ExecutablePopup => {
                 assert_herdr_popup_diagnostics(&mut rig, &target_bin, &herdr_binary).await
+            }
+            HerdrMenuSmoke::SizedPopup => {
+                assert_sized_herdr_popup(&mut rig, &target_bin, &herdr_binary).await
             }
         }
     }
@@ -2914,6 +3053,15 @@ async fn herdr_popup_retains_failure_reason_and_executes_after_plugin_link() {
     require_live_approval();
     if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::ExecutablePopup).await {
         panic!("Herdr popup diagnostics regression failed: {error}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live Herdr: needs a staged install, Herdr binary, and MUXE_LIVE_HOSTS_APPROVED=true"]
+async fn herdr_sized_public_popup_observes_real_tty_geometry() {
+    require_live_approval();
+    if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::SizedPopup).await {
+        panic!("sized Herdr popup regression failed: {error}");
     }
 }
 

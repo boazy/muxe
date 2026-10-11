@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+### Features
+
+- Support width and height on portable executable pane actions with host-specific size validation and coordinate-preserving Zellij SDK lowering.
+- Represent uncertain Zellij placement completion explicitly in the bridge protocol. Native and WASM builds must have matching protocol fingerprints; older bridges are rejected rather than silently misdecoded.
+
 ### Bug Fixes
 
 - Retain payload-safe reasons for detached and deferred action failures in persistent logs.

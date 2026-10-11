@@ -2791,6 +2791,8 @@ menus:
           program: /bin/echo
           args: ["", "a b", "$HOME", "; touch nope"]
           cwd: {$context: origin.pane.cwd}
+          width: 80%
+          height: 12
       s:
         label: Split command
         action: pane:open program=htop
@@ -2805,6 +2807,8 @@ menus:
         program,
         args,
         cwd,
+        width,
+        height,
         ..
     }) = portable_main_action(&config, "p")
         .resolve_context(&origin)
@@ -2814,6 +2818,8 @@ menus:
     };
     assert_eq!(pane_type, muxe_core::ExecutablePaneType::Popup);
     assert_eq!(program.as_os_str(), "/bin/echo");
+    assert_eq!(width, Some(muxe_core::Dimension::Percent(80)));
+    assert_eq!(height, Some(muxe_core::Dimension::Cells(12)));
     assert_eq!(
         args.iter()
             .map(muxe_core::CommandWord::as_os_str)
@@ -2839,7 +2845,7 @@ fn executable_panes_reject_missing_program_unknown_types_and_unimplemented_knobs
         "pane:open",
         "pane:open program=''",
         "pane:open program=htop pane-type=bogus",
-        "pane:open program=htop width=80%",
+        "pane:open program=htop position=10",
         "plugin.pane:open",
     ] {
         let yaml = format!(
@@ -2850,4 +2856,73 @@ fn executable_panes_reject_missing_program_unknown_types_and_unimplemented_knobs
             "{action}"
         );
     }
+}
+
+#[test]
+fn executable_pane_dimensions_validate_literals_without_new_context_references() {
+    for (width, height, expected_width, expected_height) in [
+        (
+            "80%",
+            "70%",
+            muxe_core::Dimension::Percent(80),
+            muxe_core::Dimension::Percent(70),
+        ),
+        (
+            "1",
+            "65535",
+            muxe_core::Dimension::Cells(1),
+            muxe_core::Dimension::Cells(u16::MAX),
+        ),
+        (
+            "100%",
+            "12",
+            muxe_core::Dimension::Percent(100),
+            muxe_core::Dimension::Cells(12),
+        ),
+    ] {
+        let yaml = format!(
+            "version: 1\nmenus:\n  main:\n    bindings:\n      p:\n        label: Sized\n        action: pane:open program=htop pane-type=popup width={width} height={height}\n"
+        );
+        let config = compile(&yaml, None, KeyCapabilities::default()).unwrap();
+        let muxe_core::ResolvedPortableAction::Pane(muxe_core::ResolvedPaneAction::Open {
+            width,
+            height,
+            ..
+        }) = portable_main_action(&config, "p")
+            .resolve_context(&origin_with_context_values())
+            .unwrap()
+        else {
+            panic!("expected executable pane");
+        };
+        assert_eq!(width, Some(expected_width));
+        assert_eq!(height, Some(expected_height));
+    }
+    for dimension in [
+        "0",
+        "-1",
+        "0%",
+        "101%",
+        "65536",
+        "1.5%",
+        "$origin.tab.index",
+        "$origin.pane.cwd",
+    ] {
+        let yaml = format!(
+            "version: 1\nmenus:\n  main:\n    bindings:\n      p:\n        label: Invalid size\n        action: pane:open program=htop pane-type=popup width={dimension}\n"
+        );
+        let errors = compile(&yaml, None, KeyCapabilities::default())
+            .expect_err("invalid portable dimension");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == muxe_core::DiagnosticCode::InvalidActionArguments)
+        );
+    }
+    let errors = compile("version: 1\nmenus:\n  main:\n    bindings:\n      p:\n        label: Invalid reference\n        action:\n          type: pane:open\n          program: htop\n          width: {$context: origin.pane.cwd}\n", None, KeyCapabilities::default())
+        .expect_err("dimension context references are not added");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.code == muxe_core::DiagnosticCode::InvalidActionArguments)
+    );
 }

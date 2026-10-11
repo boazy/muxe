@@ -67,7 +67,7 @@
 use std::path::{Path, PathBuf};
 
 use muxe_core::{
-    ActionScalar, CanonicalKey, CommandWord, ConfigValueKind, ContextType, Direction,
+    ActionScalar, CanonicalKey, CommandWord, ConfigValueKind, ContextType, Dimension, Direction,
     KeyboardAction, OriginContext, PaneAction, PortableAction, ResolvedCreateCommand,
     ResolvedKeyboardAction, ResolvedPaneAction, ResolvedPaneTarget, ResolvedPortableAction,
     ResolvedSessionAction, ResolvedTabAction, ResolvedTabTarget, SessionAction, SessionName,
@@ -77,6 +77,9 @@ use muxe_zellij_protocol::generated::{RawNativeCommand, raw, validated};
 use thiserror::Error;
 
 use crate::keyboard::{KeyboardError, map_canonical_key};
+use crate::launch::{
+    SizeSpec, ZellijPaneKind, ZellijPlacement, ZellijSplitDirection, normalize_placement,
+};
 
 /// Broker-owned actions need no host dispatch; host-mapped actions carry
 /// generated raw mirrors the bridge revalidates before dispatch.
@@ -457,6 +460,52 @@ fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
     }
 }
 
+fn normalized_open_placement(
+    pane_type: muxe_core::ExecutablePaneType,
+    width: Option<Dimension>,
+    height: Option<Dimension>,
+) -> Result<ZellijPlacement, PortableError> {
+    if pane_type == muxe_core::ExecutablePaneType::Split && (width.is_some() || height.is_some()) {
+        return Err(PortableError::Incompatible {
+            action: "pane:open",
+            reason: "Zellij tiled splits do not support width or height; use overlay or popup",
+        });
+    }
+    let invalid = |parameter| PortableError::InvalidScalar {
+        action: "pane:open",
+        parameter,
+        reason: "expected positive cells or an integer percentage from 1% to 100%",
+    };
+    let size = |parameter, value: Option<Dimension>| {
+        value
+            .map(|dimension| {
+                if !dimension.is_valid_size() {
+                    return Err(invalid(parameter));
+                }
+                match dimension {
+                    Dimension::Cells(cells) => Ok(SizeSpec::Cells(u32::from(cells))),
+                    Dimension::Percent(percent) => u8::try_from(percent)
+                        .map(SizeSpec::Percent)
+                        .map_err(|_| invalid(parameter)),
+                }
+            })
+            .transpose()
+    };
+    let kind = match pane_type {
+        muxe_core::ExecutablePaneType::Split => ZellijPaneKind::Split,
+        muxe_core::ExecutablePaneType::Overlay => ZellijPaneKind::Overlay,
+        muxe_core::ExecutablePaneType::Popup => ZellijPaneKind::Popup,
+    };
+    normalize_placement(
+        kind,
+        ZellijSplitDirection::Right,
+        size("width", width)?,
+        size("height", height)?,
+        None,
+    )
+    .map_err(|_| invalid("dimensions"))
+}
+
 /// Validates executable-pane placement and command scalars before context resolution.
 fn validate_open_structure(pane: &PaneAction) -> Result<(), PortableError> {
     let PaneAction::Open {
@@ -466,6 +515,8 @@ fn validate_open_structure(pane: &PaneAction) -> Result<(), PortableError> {
         program,
         args,
         cwd,
+        width,
+        height,
     } = pane
     else {
         unreachable!("validate_open_structure accepts only pane:open")
@@ -487,6 +538,7 @@ fn validate_open_structure(pane: &PaneAction) -> Result<(), PortableError> {
             reason: "Zellij executable panes require focus=true",
         });
     }
+    normalized_open_placement(*pane_type, *width, *height)?;
     for (parameter, value) in
         std::iter::once(("program", program)).chain(args.iter().map(|value| ("args", value)))
     {
@@ -1068,6 +1120,27 @@ fn resolve_open_cwd(
     Ok(cwd)
 }
 
+fn portable_floating_coordinates(
+    placement: ZellijPlacement,
+) -> Option<raw::FloatingPaneCoordinates> {
+    let ZellijPlacement::Floating { width, height, .. } = placement else {
+        return None;
+    };
+    if width.is_none() && height.is_none() {
+        return None;
+    }
+    Some(raw::FloatingPaneCoordinates {
+        // No portable position parameter: retain the prior host-managed placement.
+        x: None,
+        y: None,
+        width: width.map(SizeSpec::into_mirror),
+        height: height.map(SizeSpec::into_mirror),
+        pinned: None,
+        borderless: None,
+        border_style: None,
+    })
+}
+
 /// Maps pane creation and immutable-origin-targeted operations.
 fn map_open(
     pane: &ResolvedPaneAction,
@@ -1080,6 +1153,8 @@ fn map_open(
         program,
         args,
         cwd,
+        width,
+        height,
     } = pane
     else {
         unreachable!("map_open accepts only pane:open")
@@ -1095,6 +1170,7 @@ fn map_open(
             reason: "Zellij executable panes require focus=true",
         });
     }
+    let placement = normalized_open_placement(*pane_type, *width, *height)?;
     let program_text = command_text("pane:open", "program", program)?;
     if program_text.is_empty() || program_text.contains('\0') {
         return Err(invalid(
@@ -1148,7 +1224,7 @@ fn map_open(
             raw::Action::NewFloatingPane {
                 command,
                 pane_name: None,
-                coordinates: None,
+                coordinates: portable_floating_coordinates(placement),
                 near_current_pane: false,
                 no_focus: false,
                 tab_id: None,
@@ -2053,6 +2129,8 @@ mod tests {
                     .map(|value| CommandWord::Text(value.into()))
                     .to_vec(),
                 cwd: Some(muxe_core::CommandCwd::Literal("relative".into())),
+                width: None,
+                height: None,
             });
             assert!(creation_requires_post_dismissal(&action));
             let RawNativeCommand::RunAction { action, .. } =
@@ -2088,6 +2166,78 @@ mod tests {
     }
 
     #[test]
+    fn executable_floating_dimensions_keep_typed_units_and_host_position() {
+        for pane_type in [
+            muxe_core::ExecutablePaneType::Overlay,
+            muxe_core::ExecutablePaneType::Popup,
+        ] {
+            let action = ResolvedPaneAction::Open {
+                pane_type,
+                direction: None,
+                focus: None,
+                program: CommandWord::Text("/bin/true".into()),
+                args: Vec::new(),
+                cwd: None,
+                width: Some(Dimension::Percent(80)),
+                height: Some(Dimension::Cells(12)),
+            };
+            let mut origin = test_origin();
+            origin.pane_cwd = Some("/captured".into());
+            let RawNativeCommand::RunAction {
+                action:
+                    raw::Action::NewFloatingPane {
+                        coordinates: Some(coordinates),
+                        ..
+                    },
+                ..
+            } = map_open(&action, &origin).unwrap()
+            else {
+                panic!("expected sized floating command");
+            };
+            assert_eq!(coordinates.width, Some(raw::PercentOrFixed::Percent(80)));
+            assert_eq!(coordinates.height, Some(raw::PercentOrFixed::Fixed(12)));
+            assert_eq!(coordinates.x, None);
+            assert_eq!(coordinates.y, None);
+        }
+    }
+
+    #[test]
+    fn portable_sizes_reject_ignored_tiled_values_before_numeric_bounds() {
+        let invalid = normalized_open_placement(
+            muxe_core::ExecutablePaneType::Split,
+            Some(Dimension::Cells(0)),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(invalid, PortableError::Incompatible { .. }));
+        for size in [
+            Dimension::Cells(0),
+            Dimension::Percent(0),
+            Dimension::Percent(101),
+            Dimension::Percent(u16::MAX),
+        ] {
+            assert!(matches!(
+                normalized_open_placement(muxe_core::ExecutablePaneType::Popup, Some(size), None),
+                Err(PortableError::InvalidScalar {
+                    parameter: "width",
+                    ..
+                })
+            ));
+        }
+        for size in [
+            Dimension::Cells(1),
+            Dimension::Cells(u16::MAX),
+            Dimension::Percent(1),
+            Dimension::Percent(100),
+        ] {
+            assert!(
+                normalized_open_placement(muxe_core::ExecutablePaneType::Popup, Some(size), None)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
     fn executable_pane_focus_direction_and_program_boundaries_fail_closed() {
         let mut action = ResolvedPaneAction::Open {
             pane_type: muxe_core::ExecutablePaneType::Popup,
@@ -2096,6 +2246,8 @@ mod tests {
             program: CommandWord::Text("echo".into()),
             args: Vec::new(),
             cwd: None,
+            width: None,
+            height: None,
         };
         let mut origin = test_origin();
         origin.pane_cwd = Some("/captured".into());

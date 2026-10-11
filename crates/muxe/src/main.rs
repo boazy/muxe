@@ -2589,19 +2589,11 @@ async fn herdr_open_plugin_pane(
     {
         bail!("Herdr executable overlays do not support --width or --height; use popup");
     }
-    let size = |dimension: Option<muxe::cli::Dimension>| -> Result<_> {
-        use muxe_adapter_herdr::generated::request_types::PopupSize;
+    let size = |dimension: Option<muxe_core::Dimension>| -> Result<_> {
         dimension
-            .map(|dimension| match dimension {
-                muxe::cli::Dimension::Cells(cells) => Ok(PopupSize::Integer(cells)),
-                muxe::cli::Dimension::Percent(percent) => format!("{percent}%")
-                    .parse()
-                    .map(PopupSize::String)
-                    .map_err(|_| {
-                        color_eyre::eyre::eyre!("popup percentages must be between 1% and 100%")
-                    }),
-            })
+            .map(muxe_adapter_herdr::popup_size)
             .transpose()
+            .map_err(Into::into)
     };
     let placement = muxe_adapter_herdr::open_plugin_command_pane(
         runtime,
@@ -3007,8 +2999,8 @@ fn zellij_run_argv(session: &str, open: &PaneOpen) -> Result<Vec<OsString>> {
                 if let Some(dimension) = dimension {
                     argv.push(OsString::from(flag));
                     argv.push(OsString::from(match dimension {
-                        muxe::cli::Dimension::Cells(cells) => cells.to_string(),
-                        muxe::cli::Dimension::Percent(percent) => format!("{percent}%"),
+                        muxe_core::Dimension::Cells(cells) => cells.to_string(),
+                        muxe_core::Dimension::Percent(percent) => format!("{percent}%"),
                     }));
                 }
             }
@@ -3405,46 +3397,13 @@ fn command_pane_ratio(
     destination: &muxe_adapter_herdr::FocusedPane,
     direction: muxe_adapter_herdr::UiSplitDirection,
 ) -> Result<f64> {
-    let (requested, unsupported, available) = match direction {
-        muxe_adapter_herdr::UiSplitDirection::Down => {
-            (placement.height, placement.width, destination.rows)
-        }
-        muxe_adapter_herdr::UiSplitDirection::Right => {
-            (placement.width, placement.height, destination.columns)
-        }
-    };
-    if unsupported.is_some() {
-        bail!(
-            "use --height for a downward Herdr split and --width for a rightward split; the other dimension is unsupported"
-        );
-    }
-    let requested_ratio = match requested {
-        None => return Ok(0.5),
-        Some(muxe::cli::Dimension::Percent(percent)) if (10..=90).contains(&percent) => {
-            f64::from(percent) / 100.0
-        }
-        Some(muxe::cli::Dimension::Percent(_)) => {
-            bail!("Herdr split percentage must be between 10% and 90%")
-        }
-        Some(muxe::cli::Dimension::Cells(cells)) => {
-            if cells == 0 || cells >= available {
-                bail!(
-                    "the requested Herdr split size is {cells} cells; it must be greater than zero and smaller than the parent pane's {available} cells in the split direction"
-                );
-            }
-            let cells = u32::from(cells);
-            let available = u32::from(available);
-            if cells * 10 < available || cells * 10 > available * 9 {
-                bail!(
-                    "the requested Herdr split size is {cells} of {available} parent-pane cells; it must occupy between 10% and 90% in the split direction"
-                );
-            }
-            f64::from(cells) / f64::from(available)
-        }
-    };
-    // Herdr records the existing target as the first child and applies `ratio` to it.
-    // The CLI dimension instead names the newly opened second child.
-    Ok(1.0 - requested_ratio)
+    muxe_adapter_herdr::command_pane_ratio(
+        placement.width,
+        placement.height,
+        destination,
+        direction,
+    )
+    .map_err(Into::into)
 }
 
 /// Resolves `muxe pane open --cwd` exactly once at the launcher boundary. The captured live
@@ -4882,7 +4841,8 @@ mod launcher_tests {
 #[cfg(test)]
 mod consumer_tests {
     use super::*;
-    use muxe::cli::{Dimension, ParentPane};
+    use muxe::cli::ParentPane;
+    use muxe_core::Dimension;
 
     fn placement() -> muxe::cli::PlacementOptions {
         muxe::cli::PlacementOptions {
