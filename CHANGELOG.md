@@ -1,10 +1,18 @@
-## Unreleased
+## [0.4.0] - 2026-10-11
 
-### Features
+### 🚀 Features
 
-- Add `pane:open` for exact executable commands in host split, overlay, and popup terminals.
-- Ship the optional persistent Herdr command-pane plugin for real executable overlays and session-modal popups. Installation remains an explicit `herdr plugin link` operation.
+- *(panes)* Open executable panes through portable actions
 
+### 🐛 Bug Fixes
+
+- *(themes)* Separate built-in semantic roles and retain source provenance
+
+### 🧪 Testing
+
+- *(broker)* Isolate cleanup race gates between fixtures
+- *(herdr)* Wait for executable pane terminal output
+- *(herdr)* Use visible overlay output source
 ## [0.3.2] - 2026-10-10
 
 ### 🚀 Features
@@ -25,6 +33,10 @@
 
 - *(herdr)* Handle reset after read-only retirement
 - *(lifecycle)* Assert bridge preflight outcomes without wording pins
+
+### 💼 Other
+
+- V0.3.2
 ## [0.3.1] - 2026-10-09
 
 ### 🐛 Bug Fixes
