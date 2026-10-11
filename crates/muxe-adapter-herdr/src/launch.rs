@@ -9,7 +9,7 @@ use muxe_core::{PaneId, TabId, WorkspaceId};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    HerdrResponse, HerdrRuntime,
+    HerdrExecutionDiagnostic, HerdrResponse, HerdrRuntime,
     runtime::{HerdrRequestAuthority, IncarnationEpoch, RuntimeTransactionAuthority},
 };
 
@@ -185,9 +185,10 @@ pub(crate) async fn open_plugin_command_pane_with(
         || active.tab != launch.origin.tab
         || active.pane != launch.origin.pane
     {
-        return Err(invalid(
-            "Herdr overlays and popups require the captured origin to be active",
-        ));
+        return Err(
+            invalid("Herdr overlays and popups require the captured origin to be active")
+                .with_safe_diagnostic(HerdrExecutionDiagnostic::OriginNotActive.safe()),
+        );
     }
     let argv = serde_json::to_string(&launch.argv)
         .map_err(|error| invalid(format!("Could not encode command argv: {error}")))?;
@@ -230,7 +231,7 @@ fn plugin_command_pane_response(
                 "Herdr accepted plugin.pane.open but returned invalid placement evidence: {cause}. \
             The command may already be running; inspect the host before deciding whether to repeat it."
             ),
-        )
+        ).with_safe_diagnostic(HerdrExecutionDiagnostic::CommandPaneOutcomeUnknown.safe())
     };
     match response {
         HerdrResponse::Success(result) => {
@@ -270,10 +271,21 @@ fn plugin_command_pane_response(
                 }
                 _ => {}
             }
-            Err(AdapterError::new(
-                AdapterErrorKind::DispatchFailed,
-                diagnostic,
-            ))
+            Err(
+                AdapterError::new(AdapterErrorKind::DispatchFailed, diagnostic)
+                    .with_safe_diagnostic(
+                        match code.as_str() {
+                            "plugin_not_found" => {
+                                HerdrExecutionDiagnostic::CommandPanePluginMissing
+                            }
+                            "plugin_disabled" => {
+                                HerdrExecutionDiagnostic::CommandPanePluginDisabled
+                            }
+                            _ => HerdrExecutionDiagnostic::CommandPaneRejected,
+                        }
+                        .safe(),
+                    ),
+            )
         }
     }
 }
@@ -404,25 +416,29 @@ fn pane_from_snapshot(
     tab: TabId,
     pane: PaneId,
 ) -> Result<FocusedPane, AdapterError> {
-    let cwd = snapshot
+    let captured_pane = snapshot
         .get("panes")
         .and_then(Value::as_array)
         .and_then(|panes| {
-            panes
-                .iter()
-                .filter_map(Value::as_object)
-                .find_map(|candidate| {
-                    (candidate.get("workspace_id").and_then(Value::as_str)
-                        == Some(workspace.as_str())
-                        && candidate.get("tab_id").and_then(Value::as_str) == Some(tab.as_str())
-                        && candidate.get("pane_id").and_then(Value::as_str) == Some(pane.as_str()))
-                    .then(|| candidate.get("cwd").and_then(Value::as_str))
-                    .flatten()
-                })
+            panes.iter().filter_map(Value::as_object).find(|candidate| {
+                candidate.get("workspace_id").and_then(Value::as_str) == Some(workspace.as_str())
+                    && candidate.get("tab_id").and_then(Value::as_str) == Some(tab.as_str())
+                    && candidate.get("pane_id").and_then(Value::as_str) == Some(pane.as_str())
+            })
         })
+        .ok_or_else(|| {
+            invalid("The captured Herdr pane is not present in the live snapshot")
+                .with_safe_diagnostic(HerdrExecutionDiagnostic::OriginUnavailable.safe())
+        })?;
+    let cwd = captured_pane
+        .get("cwd")
+        .and_then(Value::as_str)
         .map(PathBuf::from)
         .filter(|cwd| cwd.is_absolute())
-        .ok_or_else(|| invalid("The Herdr pane has no captured absolute working directory"))?;
+        .ok_or_else(|| {
+            invalid("The Herdr pane has no captured absolute working directory")
+                .with_safe_diagnostic(HerdrExecutionDiagnostic::CapturedCwdUnavailable.safe())
+        })?;
     let (columns, rows) = snapshot
         .get("layouts")
         .and_then(Value::as_array)
@@ -451,6 +467,7 @@ fn pane_from_snapshot(
         .filter(|(columns, rows)| *columns > 0 && *rows > 0)
         .ok_or_else(|| {
             invalid("The Herdr pane has no live layout with positive row and column counts")
+                .with_safe_diagnostic(HerdrExecutionDiagnostic::OriginGeometryUnavailable.safe())
         })?;
     Ok(FocusedPane {
         workspace,
@@ -748,7 +765,7 @@ pub(crate) async fn move_prepared_ui_pane_with(
                     format!(
                         "The Herdr UI pane move request failed: {move_error}. Closing the temporary tab returned by Herdr also failed: {cleanup_error}"
                     ),
-                ));
+                ).with_safe_diagnostic(HerdrExecutionDiagnostic::CleanupFailed.safe()));
             }
             Err(move_error)
         }
@@ -977,6 +994,95 @@ fn invalid(message: impl Into<String>) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_pane_missing_cwd_is_not_classified_as_a_vanished_origin() {
+        for cwd in [None, Some("relative-secret-cwd")] {
+            let mut live_pane = json!({
+                "workspace_id":"workspace", "tab_id":"tab", "pane_id":"pane",
+            });
+            if let Some(cwd) = cwd {
+                live_pane
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("cwd".to_owned(), json!(cwd));
+            }
+            let snapshot = json!({"panes":[live_pane]}).as_object().unwrap().clone();
+            let error = pane_from_snapshot(
+                &snapshot,
+                WorkspaceId::new("workspace"),
+                TabId::new("tab"),
+                PaneId::new("pane"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, AdapterErrorKind::InvalidRequest);
+            assert_eq!(
+                error.safe_message(),
+                HerdrExecutionDiagnostic::CapturedCwdUnavailable
+                    .safe()
+                    .message()
+            );
+            assert_ne!(
+                error.safe_message(),
+                HerdrExecutionDiagnostic::OriginUnavailable.safe().message()
+            );
+            assert!(!error.safe_message().contains("relative-secret-cwd"));
+        }
+        let absent = json!({"panes":[]}).as_object().unwrap().clone();
+        let error = pane_from_snapshot(
+            &absent,
+            WorkspaceId::new("workspace"),
+            TabId::new("tab"),
+            PaneId::new("pane"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.safe_message(),
+            HerdrExecutionDiagnostic::OriginUnavailable.safe().message()
+        );
+    }
+
+    #[test]
+    fn command_pane_durable_context_classifies_without_retaining_host_payload() {
+        for (code, expected) in [
+            (
+                "plugin_not_found",
+                HerdrExecutionDiagnostic::CommandPanePluginMissing,
+            ),
+            (
+                "plugin_disabled",
+                HerdrExecutionDiagnostic::CommandPanePluginDisabled,
+            ),
+            (
+                "unknown-secret-code",
+                HerdrExecutionDiagnostic::CommandPaneRejected,
+            ),
+        ] {
+            let error = plugin_command_pane_response(
+                HerdrResponse::Error {
+                    code: code.to_owned(),
+                    message: "secret argv and environment sentinel".to_owned(),
+                },
+                PluginCommandPaneType::Popup,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
+            assert_eq!(error.safe_message(), expected.safe().message());
+            assert!(!error.safe_message().contains("secret"));
+        }
+        let error = plugin_command_pane_response(
+            HerdrResponse::Success(json!({"type":"secret-host-result"})),
+            PluginCommandPaneType::Popup,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+        assert_eq!(
+            error.safe_message(),
+            HerdrExecutionDiagnostic::CommandPaneOutcomeUnknown
+                .safe()
+                .message()
+        );
+    }
 
     fn bootstrap_env() -> BTreeMap<String, String> {
         BTreeMap::from([

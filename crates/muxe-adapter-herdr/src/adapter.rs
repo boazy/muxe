@@ -31,8 +31,8 @@ use tokio::task::JoinHandle;
 
 use crate::{
     ApiSchema, CandidateValidationError, ComparisonKey, DeliveryState, EventSubscription,
-    HerdrAdapterConfig, HerdrCache, HerdrResponse, HerdrRuntime, SocketError, SubscriptionConfig,
-    SubscriptionEvent,
+    HerdrAdapterConfig, HerdrCache, HerdrExecutionDiagnostic, HerdrResponse, HerdrRuntime,
+    SocketError, SubscriptionConfig, SubscriptionEvent,
     commands::CommandBinding,
     fields_to_json,
     generated::{BUNDLED_REQUEST_SCHEMA_SHA256, method_metadata},
@@ -3857,7 +3857,9 @@ async fn perform_pane_open(
         .clone()
         .ok_or_else(|| incompatible("pane:open requires an origin pane"))?;
     let destination = crate::launch::pane_by_identity_with(authority, workspace, tab, pane).await?;
-    let cwd = creation_cwd(cwd.as_ref(), origin, "pane.cwd")?;
+    let cwd = creation_cwd(cwd.as_ref(), origin, "pane.cwd").map_err(|error| {
+        error.with_safe_diagnostic(HerdrExecutionDiagnostic::CwdUnavailable.safe())
+    })?;
     let argv = creation_argv(Some(program), args, "pane.program", "pane.args")?;
     match pane_type {
         muxe_core::ExecutablePaneType::Split => crate::launch::open_command_pane_with(
@@ -4591,6 +4593,7 @@ fn socket_error(error: &SocketError) -> AdapterError {
         },
         error.to_string(),
     )
+    .with_safe_diagnostic(HerdrExecutionDiagnostic::TransportFailed.safe())
 }
 
 fn host_rejection(method: &str, code: &str, message: &str) -> AdapterError {
@@ -4598,6 +4601,7 @@ fn host_rejection(method: &str, code: &str, message: &str) -> AdapterError {
         AdapterErrorKind::DispatchFailed,
         format!("Herdr rejected {method} ({code}): {message}"),
     )
+    .with_safe_diagnostic(HerdrExecutionDiagnostic::HostRejected.safe())
 }
 
 fn pane_is_proven_absent(code: &str) -> bool {
@@ -4608,14 +4612,14 @@ fn pending_cleanup_lease_stale() -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::ContextUnavailable,
         "The saved permission to close the pending Herdr pane no longer matches the current pane, UI session, or connection.",
-    )
+    ).with_safe_diagnostic(HerdrExecutionDiagnostic::CleanupFailed.safe())
 }
 
 fn pending_cleanup_outcome_unknown() -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::OutcomeUnknown,
         "Herdr may already have closed the pending pane. Muxe will not send another close request because the pane ID may have been reused.",
-    )
+    ).with_safe_diagnostic(HerdrExecutionDiagnostic::CleanupFailed.safe())
 }
 
 fn incompatible(message: impl Into<String>) -> AdapterError {

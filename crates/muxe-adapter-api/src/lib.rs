@@ -515,11 +515,38 @@ pub enum AdapterErrorKind {
     Unsupported,
     Shutdown,
 }
+/// Fixed adapter-authored context that is safe to retain after its UI closes.
+/// This capability carries no host policy and performs no allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SafeAdapterDiagnostic(&'static str);
+
+impl SafeAdapterDiagnostic {
+    /// Marks fixed adapter-authored text as safe for persistent diagnostics.
+    ///
+    /// Never pass host responses, command arguments, environment, or output.
+    /// Do not leak or promote dynamic strings to satisfy the static lifetime.
+    ///
+    /// ```compile_fail
+    /// let host_payload = String::from("untrusted host response");
+    /// let _ = muxe_adapter_api::SafeAdapterDiagnostic::new(host_payload.as_str());
+    /// ```
+    #[must_use]
+    pub const fn new(message: &'static str) -> Self {
+        Self(message)
+    }
+
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterError {
     pub kind: AdapterErrorKind,
     pub message: String,
     pub diagnostic: Option<ConfigDiagnostic>,
+    safe_diagnostic: Option<SafeAdapterDiagnostic>,
 }
 
 impl AdapterError {
@@ -528,6 +555,7 @@ impl AdapterError {
             kind,
             message: message.into(),
             diagnostic: None,
+            safe_diagnostic: None,
         }
     }
 
@@ -535,6 +563,40 @@ impl AdapterError {
     pub fn with_diagnostic(mut self, diagnostic: ConfigDiagnostic) -> Self {
         self.diagnostic = Some(diagnostic);
         self
+    }
+
+    #[must_use]
+    pub fn with_safe_diagnostic(mut self, diagnostic: SafeAdapterDiagnostic) -> Self {
+        self.safe_diagnostic = Some(diagnostic);
+        self
+    }
+
+    /// Returns only adapter-authored, payload-free text for persistent logs.
+    #[must_use]
+    pub fn safe_message(&self) -> &'static str {
+        if let Some(diagnostic) = self.safe_diagnostic {
+            return diagnostic.message();
+        }
+        match self.kind {
+            AdapterErrorKind::Unavailable => "The host adapter is unavailable.",
+            AdapterErrorKind::InvalidRequest => {
+                "The adapter rejected the action parameters; request values are omitted."
+            }
+            AdapterErrorKind::ContextUnavailable => "The captured host context is unavailable.",
+            AdapterErrorKind::Incompatible => {
+                "The action is incompatible with the host's supported methods or parameters."
+            }
+            AdapterErrorKind::DispatchFailed => {
+                "The host rejected the action; host response text is omitted."
+            }
+            AdapterErrorKind::OutcomeUnknown => {
+                "The action may have reached the host; inspect the host before repeating it."
+            }
+            AdapterErrorKind::CaptureLost => "The host lost the menu input capture.",
+            AdapterErrorKind::CancelUnsupported => "The host cannot cancel this execution.",
+            AdapterErrorKind::Unsupported => "The host does not support this execution operation.",
+            AdapterErrorKind::Shutdown => "The host adapter shut down before execution completed.",
+        }
     }
 }
 

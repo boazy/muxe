@@ -482,15 +482,14 @@ fn compatibility_admission_diagnostic(error: CompatibilityAdmissionError) -> &'s
     }
 }
 
-/// A payload-safe terminal diagnostic for externally dispatched work that has
-/// outlived the UI session that initiated it. The composition root must use its
-/// typed outcome and code to select broker-authored log text; host error payloads
-/// never cross this boundary.
+/// A payload-safe terminal diagnostic for work that outlived its initiating UI.
+/// `reason` contains only adapter- or broker-authored context, never host payloads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerDiagnostic {
     pub execution: ExecutionId,
     pub outcome: ExecutionOutcome,
     pub code: DiagnosticCode,
+    pub reason: &'static str,
 }
 
 #[derive(Default)]
@@ -2391,6 +2390,7 @@ impl Broker {
                 core,
                 ExecutionOutcome::Failed,
                 Some(diagnostic(DiagnosticCode::HostUnavailable, &message)),
+                error.safe_message(),
             )
             .await;
         }
@@ -2409,9 +2409,9 @@ impl Broker {
     }
 
     async fn dispatch_completed(&self, completion: DispatchCompletion) {
-        let (core, outcome, diagnostic) = match completion {
+        let (core, outcome, diagnostic, reason) = match completion {
             DispatchCompletion::Succeeded { execution } => {
-                (execution, ExecutionOutcome::Succeeded, None)
+                (execution, ExecutionOutcome::Succeeded, None, "")
             }
             DispatchCompletion::Failed { execution, error } => (
                 execution,
@@ -2420,6 +2420,7 @@ impl Broker {
                     DiagnosticCode::ActionBlocked,
                     &error.to_string(),
                 )),
+                error.safe_message(),
             ),
             DispatchCompletion::OutcomeUnknown { execution, error } => (
                 execution,
@@ -2428,9 +2429,10 @@ impl Broker {
                     DiagnosticCode::OutcomeUnknown,
                     &error.to_string(),
                 )),
+                error.safe_message(),
             ),
         };
-        self.complete_adapter_execution(core, outcome, diagnostic)
+        self.complete_adapter_execution(core, outcome, diagnostic, reason)
             .await;
     }
 
@@ -2443,6 +2445,7 @@ impl Broker {
         core: CoreExecutionId,
         outcome: ExecutionOutcome,
         diagnostic: Option<ProtocolDiagnostic>,
+        reason: &'static str,
     ) {
         let record = {
             let mut state = self.state.lock().await;
@@ -2476,11 +2479,13 @@ impl Broker {
                     execution: record.wire,
                     outcome,
                     code: diagnostic.code,
+                    reason,
                 });
                 tracing::error!(
-                    ?record.wire,
+                    wire_execution = %record.wire,
                     execution = core.0,
-                    diagnostic = ?diagnostic,
+                    reason,
+                    code = ?diagnostic.code,
                     "detached adapter execution did not complete successfully"
                 );
             }
@@ -3930,12 +3935,12 @@ impl Broker {
                 }
             }
             Err(error) => {
-                self.release_reservation(expected).await;
-                tracing::error!(
-                    execution = expected.0,
-                    %error,
-                    "post-dismissal portable dispatch failed"
-                );
+                self.detach_execution_ui(expected).await;
+                self.dispatch_completed(DispatchCompletion::Failed {
+                    execution: expected,
+                    error,
+                })
+                .await;
             }
         }
     }
@@ -4627,8 +4632,8 @@ async fn supervise_generic_child(spec: GenericChildSpec) {
     };
     match await_child_exit(&mut child, &mut cancellation, None).await {
         GenericWait::Exited(status) => {
-            let (outcome, diagnostic) = generic_exit_outcome(status);
-            finish_generic(&session, core, outcome, diagnostic, true, &handles).await;
+            let (outcome, diagnostic, reason) = generic_exit_outcome(status);
+            finish_generic(&session, core, outcome, diagnostic, reason, true, &handles).await;
         }
         GenericWait::Cancelled(reason) => {
             let completion = terminate_generic_child(&mut child, process_group).await;
@@ -4642,7 +4647,16 @@ async fn supervise_generic_child(spec: GenericChildSpec) {
                     Some(diagnostic(DiagnosticCode::ActionBlocked, &error)),
                 ),
             };
-            finish_generic(&session, core, outcome, diagnostic, true, &handles).await;
+            finish_generic(
+                &session,
+                core,
+                outcome,
+                diagnostic,
+                "The generic command could not be terminated and reaped during cleanup.",
+                true,
+                &handles,
+            )
+            .await;
         }
         GenericWait::TimedOut => unreachable!("generic timeout is owned by execution deadlines"),
     }
@@ -4730,22 +4744,24 @@ fn signal_process_group(process_group: i32, signal: Signal) -> Result<bool, Stri
 
 fn generic_exit_outcome(
     status: std::io::Result<std::process::ExitStatus>,
-) -> (ExecutionOutcome, Option<ProtocolDiagnostic>) {
+) -> (ExecutionOutcome, Option<ProtocolDiagnostic>, &'static str) {
     match status {
-        Ok(status) if status.success() => (ExecutionOutcome::Succeeded, None),
+        Ok(status) if status.success() => (ExecutionOutcome::Succeeded, None, ""),
         Ok(status) => (
             ExecutionOutcome::Failed,
             Some(diagnostic(
                 DiagnosticCode::ActionBlocked,
                 &format!("generic command exited with {status}"),
             )),
+            "The generic command exited unsuccessfully; command arguments and output are omitted.",
         ),
         Err(error) => (
-            ExecutionOutcome::Failed,
+            ExecutionOutcome::OutcomeUnknown,
             Some(diagnostic(
-                DiagnosticCode::ActionBlocked,
+                DiagnosticCode::OutcomeUnknown,
                 &format!("could not collect the command's exit status: {error}"),
             )),
+            "Muxe could not collect the generic command's exit status; inspect the command before repeating it.",
         ),
     }
 }
@@ -4783,6 +4799,7 @@ async fn finish_generic(
     core: CoreExecutionId,
     outcome: ExecutionOutcome,
     diagnostic: Option<ProtocolDiagnostic>,
+    reason: &'static str,
     remove_process: bool,
     handles: &SupervisorHandles,
 ) {
@@ -4828,11 +4845,13 @@ async fn finish_generic(
                 execution: record.wire,
                 outcome,
                 code: diagnostic.code,
+                reason,
             });
             tracing::error!(
-                ?record.wire,
+                wire_execution = %record.wire,
                 execution = core.0,
-                diagnostic = ?diagnostic,
+                code = ?diagnostic.code,
+                reason,
                 "detached generic execution did not complete successfully"
             );
         }
@@ -4926,6 +4945,37 @@ mod tests {
 
     use super::*;
 
+    const METHOD_UNAVAILABLE_DIAGNOSTIC: muxe_adapter_api::SafeAdapterDiagnostic =
+        muxe_adapter_api::SafeAdapterDiagnostic::new(
+            "The adapter requires an unavailable execution method.",
+        );
+    const PLUGIN_MISSING_DIAGNOSTIC: muxe_adapter_api::SafeAdapterDiagnostic =
+        muxe_adapter_api::SafeAdapterDiagnostic::new(
+            "The adapter requires its command-pane plugin to be linked.",
+        );
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_exit_classification_preserves_known_and_unconfirmed_outcomes() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (outcome, diagnostic, _) =
+            generic_exit_outcome(Ok(std::process::ExitStatus::from_raw(0)));
+        assert_eq!(outcome, ExecutionOutcome::Succeeded);
+        assert!(diagnostic.is_none());
+
+        let (outcome, diagnostic, _) =
+            generic_exit_outcome(Ok(std::process::ExitStatus::from_raw(17 << 8)));
+        assert_eq!(outcome, ExecutionOutcome::Failed);
+        assert_eq!(diagnostic.unwrap().code, DiagnosticCode::ActionBlocked);
+
+        let (outcome, diagnostic, safe_reason) =
+            generic_exit_outcome(Err(std::io::Error::other("secret wait error payload")));
+        assert_eq!(outcome, ExecutionOutcome::OutcomeUnknown);
+        assert_eq!(diagnostic.unwrap().code, DiagnosticCode::OutcomeUnknown);
+        assert!(!safe_reason.is_empty());
+        assert!(!safe_reason.contains("secret wait error payload"));
+    }
+
     fn named(name: &str) -> muxe_core::MenuId {
         muxe_core::MenuId::named(muxe_core::MenuName::parse(name).expect("fixture menu name"))
     }
@@ -4940,6 +4990,7 @@ mod tests {
         dispatch_release: Arc<Notify>,
         block_dispatch: AtomicBool,
         mismatch_post_dismissal: AtomicBool,
+        fail_post_dismissal: AtomicBool,
         fail_cancellation: AtomicBool,
     }
 
@@ -4983,6 +5034,7 @@ mod tests {
             dispatch_release: Arc::new(Notify::new()),
             block_dispatch: AtomicBool::new(false),
             mismatch_post_dismissal: AtomicBool::new(false),
+            fail_post_dismissal: AtomicBool::new(false),
             fail_cancellation: AtomicBool::new(false),
         })
     }
@@ -5372,6 +5424,13 @@ menus:
             request: muxe_adapter_api::PostDismissalPortableDispatchRequest,
         ) -> Result<DispatchAccepted, AdapterError> {
             self.portable_dispatches.fetch_add(1, Ordering::SeqCst);
+            if self.fail_post_dismissal.load(Ordering::SeqCst) {
+                return Err(AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::Incompatible,
+                    "untrusted dispatch error sentinel",
+                )
+                .with_safe_diagnostic(METHOD_UNAVAILABLE_DIAGNOSTIC));
+            }
             let execution = if self.mismatch_post_dismissal.load(Ordering::SeqCst) {
                 CoreExecutionId(request.execution.0 + 1000)
             } else {
@@ -6834,6 +6893,54 @@ menus:
     }
 
     #[tokio::test]
+    async fn deferred_admission_failure_reaches_durable_sink_and_releases_ownership() {
+        let adapter = counting_adapter(false);
+        adapter.fail_post_dismissal.store(true, Ordering::SeqCst);
+        let (broker, _directory) = counting_broker(
+            &adapter,
+            "<deferred failure regression>",
+            COUNTING_RELOAD_YAML,
+        );
+        let mut diagnostics = broker.take_diagnostics().await.unwrap();
+        let core = CoreExecutionId(1);
+        let wire = Broker::new_execution_id(1);
+        broker
+            .reserve_execution(
+                UiSessionId::new("dismissed-ui"),
+                wire,
+                core,
+                ExecutionOwner::Adapter,
+                Some(PostDismissalPortableDispatchRequest {
+                    execution: core,
+                    action: muxe_core::ResolvedPortableAction::Tab(
+                        muxe_core::ResolvedTabAction::Create {
+                            workspace_id: None,
+                            name: None,
+                            focus: None,
+                            command: muxe_core::ResolvedCreateCommand::default(),
+                        },
+                    ),
+                    origin: CountingAdapter::origin_without_cwd(),
+                    ui_pane: muxe_core::PaneId::new("menu-pane"),
+                }),
+                &muxe_core::ExecutionPolicy::default(),
+            )
+            .await
+            .unwrap();
+        broker.schedule_post_dismissal(core).await;
+        let diagnostic = diagnostics
+            .try_recv()
+            .expect("deferred failure is retained");
+        assert_eq!(diagnostic.execution, wire);
+        assert_eq!(diagnostic.code, DiagnosticCode::ActionBlocked);
+        assert_eq!(diagnostic.reason, METHOD_UNAVAILABLE_DIAGNOSTIC.message());
+        assert!(!format!("{diagnostic:?}").contains("sentinel"));
+        let state = broker.state.lock().await;
+        assert!(state.executions.is_empty());
+        assert!(state.awaiting.is_empty());
+    }
+
+    #[tokio::test]
     async fn detached_failure_reaches_payload_safe_persistent_diagnostic_sink() {
         let (_adapter, broker, core) = dispatch_detached_adapter_execution(false).await;
         let mut diagnostics = broker
@@ -6846,7 +6953,8 @@ menus:
                 error: AdapterError::new(
                     muxe_adapter_api::AdapterErrorKind::DispatchFailed,
                     "host payload sentinel: secret request body",
-                ),
+                )
+                .with_safe_diagnostic(PLUGIN_MISSING_DIAGNOSTIC),
             })
             .await;
 
@@ -6857,6 +6965,7 @@ menus:
         assert_eq!(diagnostic.execution, Broker::new_execution_id(core.0));
         assert_eq!(diagnostic.outcome, ExecutionOutcome::Failed);
         assert_eq!(diagnostic.code, DiagnosticCode::ActionBlocked);
+        assert_eq!(diagnostic.reason, PLUGIN_MISSING_DIAGNOSTIC.message(),);
         assert!(
             !format!("{diagnostic:?}").contains("secret request body"),
             "persistent diagnostic records never include host-provided payload"

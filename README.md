@@ -444,6 +444,8 @@ If the menu does not open when pressing your hotkey:
 - **Inspect logs**: Check persistent logs at `$CACHE_DIR/logs/muxe.jsonl` (default: `~/.cache/muxe/logs/muxe.jsonl`). Native command failures add a payload-free event; stderr retains the complete diagnostic. Herdr notifications are best-effort; the log file is authoritative.
 - **Zellij permissions**: In Zellij, confirm that you accepted the host-owned permission prompt displayed when the bridge plugin loaded.
 
+If an action fails after its menu closes, inspect the `detached-execution` event in the same log. Its `message` retains a classified, payload-free reason, including command-pane plugin setup instructions or an unavailable saved origin. The `request_id` is the execution's 32-digit hexadecimal identity. Logs omit host response text, command arguments, environment values, and command output.
+
 ## Upgrades, activation, and rollback
 
 Upgrading Muxe separates updating installed binary files from activating running brokers.

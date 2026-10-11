@@ -966,11 +966,15 @@ fn persist_broker_diagnostic(
         logger.version().to_owned(),
         host,
         "detached-execution",
-        broker_diagnostic_message(diagnostic.outcome),
+        format!(
+            "{}: {}",
+            broker_diagnostic_message(diagnostic.outcome),
+            diagnostic.reason
+        ),
     )
     .map(|event| {
         event
-            .with_request(format!("{:?}", diagnostic.execution))
+            .with_request(diagnostic.execution.to_string())
             .with_code(format!("{:?}: {:?}", diagnostic.outcome, diagnostic.code))
     });
     if let Ok(event) = event {
@@ -5416,6 +5420,21 @@ mod mixed_recovery_production_tests {
             fs::read_to_string(cache.join("logs/muxe.jsonl")).expect("native diagnostic record");
         assert!(record.contains("detached execution failed"));
         assert!(record.contains("Failed: ActionBlocked"));
+        let event: serde_json::Value = serde_json::from_str(record.trim()).expect("JSON log event");
+        let request = event["request_id"]
+            .as_str()
+            .expect("execution correlation ID");
+        assert_eq!(request.len(), 32);
+        assert!(request.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(
+            event["message"].as_str().unwrap().ends_with(
+                muxe_adapter_api::AdapterError::new(
+                    muxe_adapter_api::AdapterErrorKind::DispatchFailed,
+                    "ignored test payload"
+                )
+                .safe_message()
+            )
+        );
         assert!(!record.contains("secret-sentinel"));
     }
 

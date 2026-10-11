@@ -1,3 +1,10 @@
+## [Unreleased]
+
+### Bug Fixes
+
+- Retain payload-safe reasons for detached and deferred action failures in persistent logs.
+- Format execution IDs as stable 128-bit hexadecimal values in execution logs.
+
 ## [0.4.0] - 2026-10-11
 
 ### 🚀 Features

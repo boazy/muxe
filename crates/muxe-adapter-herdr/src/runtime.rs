@@ -22,8 +22,8 @@ use tokio::{
 };
 
 use crate::{
-    ApiSchema, DeliveryState, EventSubscription, HerdrCache, HerdrResponse, SocketError,
-    SubscriptionConfig,
+    ApiSchema, DeliveryState, EventSubscription, HerdrCache, HerdrExecutionDiagnostic,
+    HerdrResponse, SocketError, SubscriptionConfig,
     commands::{self, CommandBinding},
     generated::{MethodMetadata, MethodTransport, method_metadata},
     transport::{CommandRequestGuard, EndpointContinuityToken, HerdrSocketClient},
@@ -821,12 +821,14 @@ impl HerdrRuntime {
             if self.schema.method(method).is_none() {
                 return Err(incompatible(format!(
                     "active Herdr schema does not declare required method {method}"
-                )));
+                ))
+                .with_safe_diagnostic(HerdrExecutionDiagnostic::MethodUnavailable.safe()));
             }
             if method_metadata(method).is_none() {
                 return Err(incompatible(format!(
                     "bundled Herdr metadata does not declare required method {method}"
-                )));
+                ))
+                .with_safe_diagnostic(HerdrExecutionDiagnostic::MethodUnavailable.safe()));
             }
         }
         Ok(())
@@ -1256,6 +1258,7 @@ fn socket_error(error: &SocketError) -> AdapterError {
         },
         error.to_string(),
     )
+    .with_safe_diagnostic(HerdrExecutionDiagnostic::TransportFailed.safe())
 }
 
 fn incompatible(message: impl Into<String>) -> AdapterError {

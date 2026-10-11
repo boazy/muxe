@@ -69,6 +69,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use muxe_adapter_api::{AdapterHealthEvent, HostAdapter as _};
 use muxe_adapter_zellij::{
@@ -2027,11 +2028,193 @@ async fn assert_herdr_navigation(
     })
 }
 
+async fn press_owned_popup_binding(
+    rig: &mut Rig,
+    target_bin: &Path,
+    socket: &Path,
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
+    origin: &muxe_adapter_herdr::FocusedPane,
+) -> io::Result<()> {
+    let menu = launch_herdr_smoke_menu(rig, target_bin, socket, origin).await?;
+    poll_until(
+        "popup menu is rendered",
+        Duration::from_secs(10),
+        async || {
+            let reply = herdr_smoke_request(
+                runtime,
+                "pane.read",
+                serde_json::json!({"pane_id":menu.as_str(),"source":"visible"}),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            if reply
+                .pointer("/read/text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains("Owned popup"))
+            {
+                Ok(())
+            } else {
+                Err(format!("popup binding not visible: {reply}"))
+            }
+        },
+    )
+    .await?;
+    let focused = muxe_adapter_herdr::focused_pane(runtime)
+        .await
+        .map_err(io::Error::other)?;
+    if focused.pane != menu {
+        return Err(io::Error::other(format!(
+            "public menu {menu} is rendered but focus remains on {}",
+            focused.pane,
+        )));
+    }
+    rig.pty_clients
+        .last_mut()
+        .ok_or_else(|| io::Error::other("owned Herdr PTY is gone"))?
+        .send_input(b"u")
+        .await?;
+    poll_until(
+        "popup menu dismisses",
+        Duration::from_secs(10),
+        async || {
+            if muxe_adapter_herdr::pane_by_id(runtime, menu.as_str())
+                .await
+                .is_err()
+            {
+                Ok(())
+            } else {
+                let reply = herdr_smoke_request(
+                    runtime,
+                    "pane.read",
+                    serde_json::json!({"pane_id":menu.as_str(),"source":"visible"}),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                Err(format!("menu {menu} remains live: {reply}"))
+            }
+        },
+    )
+    .await
+}
+
+async fn wait_missing_plugin_log(log_path: &Path) -> io::Result<()> {
+    poll_until(
+        "missing plugin reason reaches durable log",
+        Duration::from_secs(10),
+        async || {
+            let contents = std::fs::read_to_string(log_path).map_err(|error| error.to_string())?;
+            let event = contents
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|event| event["operation"] == "detached-execution")
+                .ok_or_else(|| format!("no detached event in {contents}"))?;
+            let reason = muxe_adapter_herdr::HerdrExecutionDiagnostic::CommandPanePluginMissing
+                .safe()
+                .message();
+            if !event["message"]
+                .as_str()
+                .is_some_and(|message| message.ends_with(reason))
+            {
+                return Err(format!("wrong missing-plugin classification: {event}"));
+            }
+            let request = event["request_id"].as_str().ok_or("missing execution ID")?;
+            if request.len() != 32 || !request.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("unreadable execution ID: {request}"));
+            }
+            Ok(())
+        },
+    )
+    .await
+}
+
+async fn assert_herdr_popup_diagnostics(
+    rig: &mut Rig,
+    target_bin: &Path,
+    herdr_binary: &Path,
+) -> io::Result<()> {
+    let (socket, runtime, origin, typescript) =
+        prepare_herdr_menu_origin(rig, herdr_binary).await?;
+    // Herdr's first-run welcome opens its integration settings, which intercept
+    // terminal keys. Close both host screens before driving the raw menu key.
+    rig.pty_clients
+        .last_mut()
+        .expect("owned Herdr client")
+        .send_input(b"\r")
+        .await?;
+    wait_herdr_menu_labels(&typescript, 0, &["settings"], &[]).await?;
+    rig.pty_clients
+        .last_mut()
+        .expect("owned Herdr client")
+        .send_input(b"\x1b")
+        .await?;
+    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin).await?;
+    wait_missing_plugin_log(&rig.cache_dir.join("logs/muxe.jsonl")).await?;
+    let manifest = target_bin
+        .parent()
+        .ok_or_else(|| io::Error::other("installation root absent"))?
+        .join("lib/muxe/herdr-plugin.toml");
+    let mut link = tokio::process::Command::new(herdr_binary);
+    apply_scoped_env(&mut link, &rig.scoped_root);
+    link.env("HERDR_SOCKET_PATH", &socket)
+        .args(["plugin", "link"])
+        .arg(manifest);
+    let output = run_cli_bounded("owned-popup-plugin-link", &mut link).await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "owned plugin link failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin).await?;
+    let proof = rig.workdir.join("muxe-popup-proof");
+    poll_until(
+        "real popup command runs in saved cwd",
+        Duration::from_secs(10),
+        async || {
+            let cwd = std::fs::read_to_string(&proof).map_err(|error| error.to_string())?;
+            if Path::new(cwd.trim()) == origin.cwd {
+                Ok(())
+            } else {
+                Err(format!("popup cwd differs from saved origin: {cwd}"))
+            }
+        },
+    )
+    .await?;
+    herdr_smoke_request(&runtime, "popup.close", serde_json::json!({})).await?;
+    std::fs::remove_file(&proof)?;
+    herdr_smoke_request(
+        &runtime,
+        "pane.split",
+        serde_json::json!({
+            "target_pane_id":origin.pane.as_str(), "direction":"right",
+            "focus":true, "cwd":origin.cwd,
+        }),
+    )
+    .await?;
+    let sibling = muxe_adapter_herdr::focused_pane(&runtime)
+        .await
+        .map_err(io::Error::other)?;
+    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &sibling).await?;
+    poll_until(
+        "multi-pane popup runs from saved origin",
+        Duration::from_secs(10),
+        async || {
+            std::fs::read_to_string(&proof)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+    )
+    .await?;
+    herdr_smoke_request(&runtime, "popup.close", serde_json::json!({})).await?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum HerdrMenuSmoke {
     StaysOpen,
     BareTabCreate,
     Navigation,
+    ExecutablePopup,
 }
 
 async fn activate_herdr_smoke(rig: &Rig, target_bin: &Path, socket: &Path) -> io::Result<()> {
@@ -2063,8 +2246,26 @@ fn write_herdr_smoke_config(scenario: HerdrMenuSmoke, config_file: &Path) -> io:
         HerdrMenuSmoke::Navigation => {
             "version: 1\ntheme: brackets\ncolor-scheme: catppuccin-mocha\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      s: { label: split, action: 'menu:open split' }\n      left: { label: ML, action: 'pane:focus direction=left' }\n      right: { label: MR, action: 'pane:focus direction=right' }\n  split:\n    bindings:\n      left: { label: SL-unavailable, skip-hosts: [herdr], action: 'pane:split direction=left' }\n      right: { label: SR, action: 'pane:split direction=right' }\n"
         }
+        HerdrMenuSmoke::ExecutablePopup => {
+            "version: 1\nsettings:\n  timeout: off\nmenus:\n  main:\n    bindings:\n      u:\n        label: Owned popup\n        action:\n          type: pane:open\n          pane-type: popup\n          program: /bin/sh\n          args: ['-c', 'pwd > muxe-popup-proof; sleep 120']\n"
+        }
     };
     std::fs::write(config_file, yaml)
+}
+
+async fn finish_herdr_menu_smoke(
+    mut rig: Rig,
+    scenario: HerdrMenuSmoke,
+    body: io::Result<()>,
+) -> io::Result<()> {
+    let result = rig.finish("herdr-menu", body).await;
+    if result.is_err() && matches!(scenario, HerdrMenuSmoke::ExecutablePopup) {
+        eprintln!(
+            "preserved owned popup diagnostics: {}",
+            rig.root.keep().display()
+        );
+    }
+    result
 }
 
 async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
@@ -2154,10 +2355,13 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
             HerdrMenuSmoke::Navigation => {
                 assert_herdr_navigation(&mut rig, &target_bin, &herdr_binary).await
             }
+            HerdrMenuSmoke::ExecutablePopup => {
+                assert_herdr_popup_diagnostics(&mut rig, &target_bin, &herdr_binary).await
+            }
         }
     }
     .await;
-    rig.finish("herdr-menu", result).await
+    finish_herdr_menu_smoke(rig, scenario, result).await
 }
 async fn run_target_only_smoke() -> io::Result<()> {
     let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
@@ -2648,6 +2852,15 @@ async fn herdr_navigation_bindings_are_visible_and_dispatch() {
     require_live_approval();
     if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::Navigation).await {
         panic!("Herdr navigation regression failed: {error}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live Herdr: needs a staged install, Herdr binary, and MUXE_LIVE_HOSTS_APPROVED=true"]
+async fn herdr_popup_retains_failure_reason_and_executes_after_plugin_link() {
+    require_live_approval();
+    if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::ExecutablePopup).await {
+        panic!("Herdr popup diagnostics regression failed: {error}");
     }
 }
 

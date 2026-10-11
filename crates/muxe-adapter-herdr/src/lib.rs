@@ -25,6 +25,65 @@ mod transport;
 mod validation;
 mod version;
 
+/// Fixed Herdr execution causes, independent of host-provided error payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HerdrExecutionDiagnostic {
+    CommandPanePluginMissing,
+    CommandPanePluginDisabled,
+    CommandPaneRejected,
+    CommandPaneOutcomeUnknown,
+    OriginNotActive,
+    OriginUnavailable,
+    CapturedCwdUnavailable,
+    OriginGeometryUnavailable,
+    CwdUnavailable,
+    MethodUnavailable,
+    HostRejected,
+    TransportFailed,
+    CleanupFailed,
+}
+
+impl HerdrExecutionDiagnostic {
+    #[must_use]
+    pub const fn safe(self) -> muxe_adapter_api::SafeAdapterDiagnostic {
+        muxe_adapter_api::SafeAdapterDiagnostic::new(match self {
+            Self::CommandPanePluginMissing => {
+                "Herdr command-pane plugin muxe.command-panes is not linked. Run `herdr plugin link <installation>/lib/muxe/herdr-plugin.toml`; the installed muxe executable must be on the Herdr server's PATH."
+            }
+            Self::CommandPanePluginDisabled => {
+                "Herdr command-pane plugin muxe.command-panes is disabled. Run `herdr plugin enable muxe.command-panes`."
+            }
+            Self::CommandPaneRejected => {
+                "Herdr rejected plugin.pane.open. Inspect the host plugin configuration; host response text is omitted."
+            }
+            Self::CommandPaneOutcomeUnknown => {
+                "Herdr accepted plugin.pane.open but placement evidence was invalid. The command may already be running; inspect the host before repeating it."
+            }
+            Self::OriginNotActive => {
+                "The captured origin is not active after menu dismissal; Herdr overlays and popups require that origin to be active."
+            }
+            Self::OriginUnavailable => "The captured command-pane origin is no longer available.",
+            Self::CapturedCwdUnavailable => {
+                "The captured Herdr pane has no absolute working directory; command-pane creation cannot use that origin."
+            }
+            Self::OriginGeometryUnavailable => {
+                "The captured Herdr pane has no valid terminal geometry."
+            }
+            Self::CwdUnavailable => {
+                "The command pane requires an absolute UTF-8 working directory from the configured action or captured origin."
+            }
+            Self::MethodUnavailable => "Herdr does not support a required execution method.",
+            Self::HostRejected => "Herdr rejected the action; host response text is omitted.",
+            Self::TransportFailed => {
+                "The Herdr execution transport failed; inspect host connectivity before repeating the action."
+            }
+            Self::CleanupFailed => {
+                "Execution cleanup failed; inspect Herdr for retained command or menu panes."
+            }
+        })
+    }
+}
+
 /// Optional configuration override used by this host adapter.
 pub const CONFIG_OVERRIDE_FILENAME: &str = "herdr.yml";
 
