@@ -582,6 +582,8 @@ struct CleanupSupervisor {
     launch: StdMutex<()>,
     claim_issuer: AtomicCleanupClaim,
     wake: Notify,
+    #[cfg(test)]
+    exit_gates: crate::cleanup_task_hooks::ExitGates,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,6 +619,8 @@ impl Default for CleanupSupervisor {
             launch: StdMutex::new(()),
             claim_issuer: AtomicCleanupClaim::new(),
             wake: Notify::new(),
+            #[cfg(test)]
+            exit_gates: crate::cleanup_task_hooks::ExitGates::default(),
         }
     }
 }
@@ -662,7 +666,7 @@ impl CleanupSupervisor {
         // through this handshake, so arming it for a key forces the
         // interleaving deterministically.
         #[cfg(test)]
-        crate::cleanup_task_hooks::exit_gate(key).await;
+        self.exit_gates.exit_gate(key).await;
         let guard = state.lock().await;
         let requeued = match key {
             CleanupTaskKey::PendingPane(lease) => guard.cleanup.pending_panes.contains_key(lease),
@@ -8215,6 +8219,70 @@ menus:
     }
 
     #[tokio::test]
+    async fn cleanup_exit_gate_drop_preserves_other_supervisor_with_same_lease() {
+        for key in [
+            CleanupTaskKey::PendingPane(muxe_adapter_api::PendingPaneLeaseId::new("scoped:ui-1")),
+            CleanupTaskKey::Capture(CaptureLeaseId::new("ui-1")),
+        ] {
+            let first = Arc::new(CleanupSupervisor::default());
+            let second = Arc::new(CleanupSupervisor::default());
+            let start_terminal_pass = |supervisor: &Arc<CleanupSupervisor>| {
+                let claim = supervisor.next_claim();
+                let task_supervisor = Arc::clone(supervisor);
+                let task_key = key.clone();
+                let state = Arc::new(Mutex::new(BrokerState::default()));
+                let (finished, completion) = tokio::sync::oneshot::channel();
+                let handle = tokio::spawn(async move {
+                    let released = task_supervisor
+                        .release_slot_unless_requeued(&state, &task_key, claim)
+                        .await;
+                    let _ = finished.send(released);
+                });
+                supervisor
+                    .tasks
+                    .lock()
+                    .expect("cleanup tasks are not poisoned")
+                    .insert(key.clone(), CleanupTask { claim, handle });
+                completion
+            };
+
+            let first_gate = first.exit_gates.arm(&key);
+            let first_completion = start_terminal_pass(&first);
+            tokio::time::timeout(Duration::from_secs(1), first_gate.entered())
+                .await
+                .expect("first supervisor parks its terminal task");
+            assert!(first.has_live_task(&key));
+
+            // Another fixture can arm the identical lease before the first
+            // fixture finishes. Dropping the first guard must neither disarm
+            // nor release that still-unclaimed gate.
+            let second_gate = second.exit_gates.arm(&key);
+            drop(first_gate);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), first_completion)
+                    .await
+                    .expect("guard drop releases the claimed task")
+                    .expect("first terminal task completes")
+            );
+            assert_eq!(first.task_count(), 0);
+
+            let second_completion = start_terminal_pass(&second);
+            tokio::time::timeout(Duration::from_secs(1), second_gate.entered())
+                .await
+                .expect("second supervisor's armed gate survives the first guard drop");
+            assert!(second.has_live_task(&key));
+            drop(second_gate);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), second_completion)
+                    .await
+                    .expect("second guard drop releases only its own task")
+                    .expect("second terminal task completes")
+            );
+            assert_eq!(second.task_count(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn requeued_pane_entry_keeps_live_task_through_terminal_window() {
         // B2 pane variant: parks the task between success entry-removal and
         // slot removal, re-enqueues the same lease in that window, and proves
@@ -8224,24 +8292,27 @@ menus:
         let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
         let token =
             prepared_registered_launch(&broker, "requeue-pane", Some("temporary-tab")).await;
+        // Establish the adapter barrier before abort can spawn the cleanup task.
+        adapter.block_close.store(true, Ordering::SeqCst);
         broker
             .abort(token)
             .await
             .expect("abort enqueues pane cleanup");
-        let key = {
+        // Retain the exact provenance while the adapter close is blocked.
+        let (key, session, registration) = {
             let state = broker.state.lock().await;
-            let lease = state
+            let (lease, entry) = state
                 .cleanup
                 .pending_panes
-                .keys()
+                .iter()
                 .next()
-                .expect("abort retains a pane entry")
-                .clone();
-            crate::broker::CleanupTaskKey::PendingPane(lease)
+                .expect("abort retains a pane entry");
+            (
+                CleanupTaskKey::PendingPane(lease.clone()),
+                entry.session.clone(),
+                entry.registration.clone(),
+            )
         };
-        // Block the first close so the task cannot finish before the gate
-        // is armed, then wait until it owns the key.
-        adapter.block_close.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !broker.cleanup.has_live_task(&key) {
                 tokio::task::yield_now().await;
@@ -8252,28 +8323,13 @@ menus:
         tokio::time::timeout(Duration::from_secs(1), adapter.close_entered.notified())
             .await
             .expect("pane task reaches the blocked adapter close");
-        let (entered, release) = crate::cleanup_task_hooks::arm(&key);
-        // Release the first close: it succeeds, the task removes the entry,
-        // then parks in the exit gate before removing its slot.
+        let gate = broker.cleanup.exit_gates.arm(&key);
+        // The first close succeeds, removes the entry, then parks before slot removal.
         adapter.block_close.store(false, Ordering::SeqCst);
         adapter.close_release.notify_one();
-        // Capture the SAME provenance before the terminal pass consumes it:
-        // re-enqueueing this exact (session, registration) reuses the same
-        // lease id, hence the same CleanupTaskKey the parked task owns.
-        let (session, registration) = {
-            let state = broker.state.lock().await;
-            let (session, entry) = state
-                .cleanup
-                .pending_panes
-                .iter()
-                .next()
-                .map(|(_, entry)| (entry.session.clone(), entry.registration.clone()))
-                .expect("abort retains a pane entry");
-            (session, entry)
-        };
         // Trigger the terminal pass: the task removes the entry and parks in
         // the exit gate between entry removal and slot removal.
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        tokio::time::timeout(Duration::from_secs(1), gate.entered())
             .await
             .expect("task parks in the terminal window");
         // Re-enqueue the SAME key inside the window: the slot is still live
@@ -8285,10 +8341,8 @@ menus:
             broker.cleanup.has_live_task(&key),
             "re-enqueued entry keeps its live owning task"
         );
-        release.notify_one();
-        // Disarm immediately: the re-processing pass also routes through the
-        // handshake, and must not park a second time.
-        crate::cleanup_task_hooks::clear();
+        // Drop releases only this gate; the terminal gate is already consumed.
+        drop(gate);
         wait_for_closed_pane(&adapter, "requeue-pane").await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while !broker.state.lock().await.cleanup.pending_panes.is_empty()
@@ -8299,7 +8353,6 @@ menus:
         })
         .await
         .expect("re-enqueued pane cleanup completes and the slot is released");
-        crate::cleanup_task_hooks::clear();
     }
 
     #[tokio::test]
@@ -8307,6 +8360,8 @@ menus:
         // B2 capture variant: same terminal-window interleaving for captures.
         let (adapter, broker, _binding, _directory) = scoped_two_client_fixture();
         let (session, _events) = attach_ready(&broker, "requeue-capture").await;
+        // Establish the adapter barrier before detach can spawn the cleanup task.
+        adapter.block_end.store(true, Ordering::SeqCst);
         let lease_id = {
             broker
                 .detach(&session, CaptureReleaseReason::UiDismissed)
@@ -8322,9 +8377,6 @@ menus:
                 .clone()
         };
         let key = crate::broker::CleanupTaskKey::Capture(lease_id);
-        // Block the first end so the task cannot finish before the gate is
-        // armed, then wait until it owns the key.
-        adapter.block_end.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !broker.cleanup.has_live_task(&key) {
                 tokio::task::yield_now().await;
@@ -8335,11 +8387,7 @@ menus:
         tokio::time::timeout(Duration::from_secs(1), adapter.end_entered.notified())
             .await
             .expect("capture task reaches the blocked adapter end");
-        let (entered, release) = crate::cleanup_task_hooks::arm(&key);
-        // Release the first end: it succeeds, the task removes the entry,
-        // then parks in the exit gate before removing its slot.
-        adapter.block_end.store(false, Ordering::SeqCst);
-        adapter.end_release.notify_one();
+        let gate = broker.cleanup.exit_gates.arm(&key);
         // Capture the SAME lease before the terminal pass consumes it:
         // re-enqueueing this exact lease reuses the same CaptureLeaseId,
         // hence the same CleanupTaskKey the parked task owns.
@@ -8353,9 +8401,12 @@ menus:
                 .map(|entry| (entry.lease.clone(), entry.reason))
                 .expect("detach retains a capture entry")
         };
+        // The first end succeeds, removes the entry, then parks before slot removal.
+        adapter.block_end.store(false, Ordering::SeqCst);
+        adapter.end_release.notify_one();
         // The task removes the entry and parks in the exit gate between
         // entry removal and slot removal.
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        tokio::time::timeout(Duration::from_secs(1), gate.entered())
             .await
             .expect("capture task parks in the terminal window");
         // Re-enqueue the SAME key inside the window: the slot is still live
@@ -8365,8 +8416,7 @@ menus:
             broker.cleanup.has_live_task(&key),
             "re-enqueued capture keeps its live owning task"
         );
-        release.notify_one();
-        crate::cleanup_task_hooks::clear();
+        drop(gate);
         wait_for_ended_capture(&adapter, session.as_str()).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while !broker.state.lock().await.cleanup.captures.is_empty()
@@ -8377,7 +8427,6 @@ menus:
         })
         .await
         .expect("re-enqueued capture cleanup completes and the slot is released");
-        crate::cleanup_task_hooks::clear();
     }
 
     #[tokio::test]
@@ -8592,7 +8641,6 @@ menus:
         adapter.end_release.notify_waiters();
         wait_for_closed_pane(&adapter, "cancel-detach").await;
         wait_for_ended_capture(&adapter, session.as_str()).await;
-        crate::cleanup_task_hooks::clear();
     }
 
     #[tokio::test]

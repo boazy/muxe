@@ -49,65 +49,91 @@ pub use service::{
 };
 pub use spawn::{ServeHerdrSpawn, ServeZellijSpawn, SpawnArgvError};
 
-/// Test-only gates parked in the terminal step of each cleanup task, between
-/// the success entry-removal and the task-slot removal. Arming a gate for a
-/// key pauses that task exactly in the B2 race window: the entry is gone but
-/// the slot is still live, so a re-enqueue in that window observes
-/// `has_live_task` and wakes instead of spawning. The terminal
-/// `release_slot_unless_requeued` handshake then keeps the slot and loops to
-/// process the re-enqueued entry.
+/// Test-only, supervisor-owned gates parked between cleanup entry removal and
+/// task-slot removal. Each gate pauses one terminal pass in the B2 race window;
+/// its guard disarms and releases only that supervisor's gate on drop.
 #[cfg(test)]
 pub(crate) mod cleanup_task_hooks {
     use std::{
         collections::HashMap,
-        sync::{Arc, LazyLock, Mutex as StdMutex},
+        sync::{Arc, Mutex as StdMutex},
     };
 
     use tokio::sync::Notify;
 
     struct Gate {
-        entered: Arc<Notify>,
-        release: Arc<Notify>,
+        entered: Notify,
+        release: Notify,
     }
 
-    static GATES: LazyLock<StdMutex<HashMap<crate::broker::CleanupTaskKey, Arc<Gate>>>> =
-        LazyLock::new(|| StdMutex::new(HashMap::new()));
+    #[derive(Default)]
+    pub(crate) struct ExitGates {
+        gates: StdMutex<HashMap<crate::broker::CleanupTaskKey, Arc<Gate>>>,
+    }
 
-    /// Arms the exit gate for one cleanup key; returns the (entered, release)
-    /// notifies. The next task pass for that key notifies `entered` and waits
-    /// for `release` before removing its task slot.
-    #[must_use]
-    pub(crate) fn arm(key: &crate::broker::CleanupTaskKey) -> (Arc<Notify>, Arc<Notify>) {
-        let gate = Arc::new(Gate {
-            entered: Arc::new(Notify::new()),
-            release: Arc::new(Notify::new()),
-        });
-        let mut gates = GATES.lock().expect("cleanup task gates are not poisoned");
-        if let Some(current) = gates.get_mut(key) {
-            *current = Arc::clone(&gate);
-        } else {
+    pub(crate) struct ExitGateGuard<'a> {
+        owner: &'a ExitGates,
+        key: crate::broker::CleanupTaskKey,
+        gate: Arc<Gate>,
+    }
+
+    impl ExitGates {
+        /// Arms one terminal pass for this supervisor's cleanup key.
+        pub(crate) fn arm(&self, key: &crate::broker::CleanupTaskKey) -> ExitGateGuard<'_> {
+            let gate = Arc::new(Gate {
+                entered: Notify::new(),
+                release: Notify::new(),
+            });
+            let mut gates = self
+                .gates
+                .lock()
+                .expect("cleanup task gates are not poisoned");
+            assert!(
+                !gates.contains_key(key),
+                "cleanup exit gate is already armed"
+            );
             gates.insert(key.clone(), Arc::clone(&gate));
+            ExitGateGuard {
+                owner: self,
+                key: key.clone(),
+                gate,
+            }
         }
-        (Arc::clone(&gate.entered), Arc::clone(&gate.release))
+
+        pub(crate) async fn exit_gate(&self, key: &crate::broker::CleanupTaskKey) {
+            let gate = self
+                .gates
+                .lock()
+                .expect("cleanup task gates are not poisoned")
+                .remove(key);
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
     }
 
-    /// Clears every armed gate without releasing waiters.
-    pub(crate) fn clear() {
-        GATES
-            .lock()
-            .expect("cleanup task gates are not poisoned")
-            .clear();
+    impl ExitGateGuard<'_> {
+        pub(crate) async fn entered(&self) {
+            self.gate.entered.notified().await;
+        }
     }
 
-    pub(crate) async fn exit_gate(key: &crate::broker::CleanupTaskKey) {
-        let gate = GATES
-            .lock()
-            .expect("cleanup task gates are not poisoned")
-            .get(key)
-            .cloned();
-        if let Some(gate) = gate {
-            gate.entered.notify_one();
-            gate.release.notified().await;
+    impl Drop for ExitGateGuard<'_> {
+        fn drop(&mut self) {
+            let mut gates = self
+                .owner
+                .gates
+                .lock()
+                .expect("cleanup task gates are not poisoned");
+            if gates
+                .get(&self.key)
+                .is_some_and(|gate| Arc::ptr_eq(gate, &self.gate))
+            {
+                gates.remove(&self.key);
+            }
+            drop(gates);
+            self.gate.release.notify_one();
         }
     }
 }
