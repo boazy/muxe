@@ -421,7 +421,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 tinted comparison collection / MIT
-Source: https://raw.githubusercontent.com/tinted-theming/schemes/a70da1dab18008023cfd55a94053f3b6cab4f86e/LICENSE
+Source: https://raw.githubusercontent.com/tinted-theming/schemes/3ac91137e879502c442ab89ba0f1a98077d0da9d/LICENSE
 Copyright (c) 2022 Tinted Theming (https://github.com/tinted-theming)
 
 Permission is hereby granted, free of charge, to any person obtaining
@@ -444,7 +444,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 iterm comparison collection / MIT
-Source: https://raw.githubusercontent.com/mbadolato/iTerm2-Color-Schemes/31756e77934045c66b28f59463ddb2870606d7ca/LICENSE
+Source: https://raw.githubusercontent.com/mbadolato/iTerm2-Color-Schemes/c02052159ff9a1c438ff419b7451cd33f9ab4934/LICENSE
 MIT License
 
 Copyright (c) 2011 to Present Mark Badolato
@@ -470,3 +470,27 @@ SOFTWARE.
 This license covers the iTerm-Color-Schemes repository collection of themes. 
 
 The copyright/license for each individual theme belongs to the author of that theme.
+
+Gogh comparison collection / MIT (chosen from MIT OR Apache-2.0)
+Source: https://raw.githubusercontent.com/Gogh-Co/Gogh/2fbe9bbf3715173fc6f477d4992b66f11afca2b1/LICENSE-MIT
+MIT License
+
+Copyright (c) 2024 Gogh
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

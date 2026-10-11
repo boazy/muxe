@@ -25,9 +25,9 @@ colors:
   base.background: base
   base.muted: subtle
   menu.hotkey: pine
-  menu.separator: subtle
+  menu.separator: muted
   status.error: love
   status.pending: gold
-  status.blocked: gold
+  status.blocked: rose
   status.reload: leaf
   status.notice: pine

@@ -18,12 +18,15 @@ palette:
   nord13: "#ebcb8b"
   nord14: "#a3be8c"
   nord15: "#b48ead"
+  # Muxe adaptations; exact derivation and rejected candidates in catalog.json.
+  muxe_snow_muted: "#a8adb6"
+  muxe_polar_separator: "#7d8696"
 colors:
   base.text: nord4
   base.background: nord0
-  base.muted: nord9
+  base.muted: muxe_snow_muted
   menu.hotkey: nord8
-  menu.separator: nord9
+  menu.separator: muxe_polar_separator
   status.error: nord11
   status.pending: nord13
   status.blocked: nord12

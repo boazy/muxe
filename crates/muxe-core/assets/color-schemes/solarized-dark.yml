@@ -18,10 +18,12 @@ palette:
   base1: "#93a1a1"
   base2: "#eee8d5"
   base3: "#fdf6e3"
+  # Muxe adaptation; exact derivation and rejected candidates in catalog.json.
+  muxe_base0_emphasis: "#b7cfd2"
 colors:
-  base.text: base0
+  base.text: muxe_base0_emphasis
   base.background: base03
-  base.muted: base00
+  base.muted: base0
   menu.hotkey: blue
   menu.separator: base00
   status.error: red

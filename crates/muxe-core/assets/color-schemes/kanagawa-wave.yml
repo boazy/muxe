@@ -106,12 +106,14 @@ palette:
   lotusTeal2: "#6693bf"
   lotusTeal3: "#5a7785"
   lotusCyan: "#d7e3d8"
+  # Muxe adaptations; exact derivation and rejected candidates in catalog.json.
+  muxe_fuji_muted: "#aca891"
 colors:
   base.text: fujiWhite
   base.background: sumiInk3
-  base.muted: oldWhite
+  base.muted: muxe_fuji_muted
   menu.hotkey: crystalBlue
-  menu.separator: oldWhite
+  menu.separator: fujiGray
   status.error: waveRed
   status.pending: carpYellow
   status.blocked: surimiOrange

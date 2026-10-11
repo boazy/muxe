@@ -65,7 +65,7 @@ colors:
   base.background: bg0
   base.muted: fg3
   menu.hotkey: bright_aqua
-  menu.separator: fg3
+  menu.separator: gray
   status.error: bright_red
   status.pending: bright_yellow
   status.blocked: bright_orange

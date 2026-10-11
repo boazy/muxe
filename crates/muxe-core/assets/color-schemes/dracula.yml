@@ -14,10 +14,12 @@ palette:
   purple: "#bd93f9"
   red: "#ff5555"
   yellow: "#f1fa8c"
+  # Muxe adaptations; exact derivation and rejected candidates in catalog.json.
+  muxe_foreground_muted: "#aeaea9"
 colors:
   base.text: foreground
   base.background: background
-  base.muted: comment
+  base.muted: muxe_foreground_muted
   menu.hotkey: cyan
   menu.separator: comment
   status.error: red

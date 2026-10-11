@@ -65,7 +65,7 @@ colors:
   base.background: bg0
   base.muted: fg3
   menu.hotkey: faded_blue
-  menu.separator: fg3
+  menu.separator: gray
   status.error: faded_red
   status.pending: faded_yellow
   status.blocked: faded_orange

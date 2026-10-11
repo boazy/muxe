@@ -48,9 +48,9 @@ palette:
 colors:
   base.text: text
   base.background: base
-  base.muted: subtext1
+  base.muted: subtext0
   menu.hotkey: mauve
-  menu.separator: subtext1
+  menu.separator: overlay1
   status.error: red
   status.pending: yellow
   status.blocked: peach

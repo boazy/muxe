@@ -868,14 +868,6 @@ pub fn default_theme() -> Theme {
                     },
                 ),
                 (
-                    "alert".to_owned(),
-                    Style {
-                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("status.error")))),
-                        bold: true,
-                        ..Style::default()
-                    },
-                ),
-                (
                     "arrow".to_owned(),
                     Style {
                         foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("menu.separator")))),
@@ -886,14 +878,13 @@ pub fn default_theme() -> Theme {
                     "disabled".to_owned(),
                     Style {
                         foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("base.muted")))),
-                        dim: true,
                         ..Style::default()
                     },
                 ),
                 (
                     "crumb".to_owned(),
                     Style {
-                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("menu.separator")))),
+                        foreground: Some(Ok(ColorExpr::Alias(ColorAliasName::new("base.muted")))),
                         ..Style::default()
                     },
                 ),
@@ -938,11 +929,11 @@ pub fn default_theme() -> Theme {
             templates: BTreeMap::from([
                 (
                     "cell".to_owned(),
-                    "{% if blocked %}[alert]! [/alert]{% endif %}{% if disabled %}[disabled]{{ key | rpad(6, ' ') }} → {{ title }}[/disabled]{% else %}[hotkey]{{ key | rpad(6, ' ') }}[/hotkey] [arrow]→[/arrow] [title]{{ title }}[/title]{% endif %}".to_owned(),
+                    "{% if blocked %}[blocked]! [/blocked]{% elif disabled %}[disabled]- [/disabled]{% else %}  {% endif %}{% if disabled %}[disabled]{{ key | rpad(6 if key_width < 6 else key_width, ' ') }}[/disabled] [arrow]→[/arrow] [disabled]{{ title }}[/disabled]{% else %}[hotkey]{{ key | rpad(6 if key_width < 6 else key_width, ' ') }}[/hotkey] [arrow]→[/arrow] [title]{{ title }}[/title]{% endif %}".to_owned(),
                 ),
                 (
                     "breadcrumbs".to_owned(),
-                    "{% for c in crumbs %}[crumb]{{ c }}[/crumb]{% if not loop.last %} › {% endif %}{% endfor %}".to_owned(),
+                    "{% for c in crumbs %}{% if loop.last %}[title]{{ c }}[/title]{% else %}[crumb]{{ c }}[/crumb][arrow] › [/arrow]{% endif %}{% endfor %}".to_owned(),
                 ),
                 (
                     "pagination.full".to_owned(),

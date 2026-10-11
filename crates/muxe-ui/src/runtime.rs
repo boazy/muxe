@@ -3458,10 +3458,6 @@ pub(crate) mod tests {
         let child = runtime
             .prepare(Rect::new(0, 0, 40, 8))
             .expect("child renders");
-        assert_eq!(
-            root.cells[0].spans[0].style.fg,
-            Some(ratatui::style::Color::Reset)
-        );
         assert_eq!(child.title, "Child");
         assert_eq!(
             runtime

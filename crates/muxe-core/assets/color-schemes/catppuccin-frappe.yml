@@ -50,7 +50,7 @@ colors:
   base.background: base
   base.muted: subtext0
   menu.hotkey: mauve
-  menu.separator: subtext0
+  menu.separator: overlay1
   status.error: red
   status.pending: yellow
   status.blocked: peach

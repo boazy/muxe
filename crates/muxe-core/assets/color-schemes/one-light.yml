@@ -55,14 +55,17 @@ palette:
   syntax-deprecated-bg: "#f2a60d"
   syntax-illegal-fg: "#ffffff"
   syntax-illegal-bg: "#ff1414"
+  # Muxe adaptations; exact derivation and rejected candidates in catalog.json.
+  muxe_blocked_orange: "#983d01"
+  muxe_mono_separator: "#8a8c94"
 colors:
   base.text: syntax-fg
   base.background: syntax-bg
   base.muted: mono-2
   menu.hotkey: hue-3
-  menu.separator: mono-2
+  menu.separator: muxe_mono_separator
   status.error: hue-5-2
   status.pending: hue-6-2
-  status.blocked: hue-6
+  status.blocked: muxe_blocked_orange
   status.reload: hue-4
   status.notice: hue-1

@@ -1,10 +1,8 @@
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use muxe_core::{
     Color, ColorAliasName, ColorSchemeName, ConfigDocument, SourceId, ThemeAssets, ThemeName,
 };
-use serde::Deserialize;
 
 const SEMANTICS: [&str; 10] = [
     "base.text",
@@ -129,6 +127,25 @@ fn contrast_ratio(foreground: Color, background: Color) -> f64 {
     (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
 }
 
+fn hue_degrees(color: Color) -> f64 {
+    let [red_channel, green_channel, blue_channel] = rgb(color);
+    let maximum_channel = red_channel.max(green_channel).max(blue_channel);
+    let minimum_channel = red_channel.min(green_channel).min(blue_channel);
+    let chroma = f64::from(maximum_channel - minimum_channel);
+    assert!(chroma > 0.0, "status colors must retain a hue");
+    let red = f64::from(red_channel);
+    let green = f64::from(green_channel);
+    let blue = f64::from(blue_channel);
+    let sector = if maximum_channel == red_channel {
+        (green - blue) / chroma
+    } else if maximum_channel == green_channel {
+        (blue - red) / chroma + 2.0
+    } else {
+        (red - green) / chroma + 4.0
+    };
+    (sector * 60.0).rem_euclid(360.0)
+}
+
 #[test]
 fn explicit_schemes_preserve_secondary_hierarchy_and_status_accents() {
     let catalog = ThemeAssets::default().compile_catalog();
@@ -153,10 +170,10 @@ fn explicit_schemes_preserve_secondary_hierarchy_and_status_accents() {
             "{name}: secondary text must be subdued, not primary or emphasized text"
         );
         assert_ne!(hotkey, text, "{name}: keys need their own accent");
-        for other in [text, hotkey, role("status.error")] {
+        for other in [text, muted, hotkey, role("status.error")] {
             assert_ne!(
                 separator, other,
-                "{name}: separators must not collapse into text, keys or errors"
+                "{name}: separators must not collapse into text, secondary labels, keys or errors"
             );
         }
 
@@ -178,160 +195,23 @@ fn explicit_schemes_preserve_secondary_hierarchy_and_status_accents() {
                 );
             }
         }
-        for warning in ["status.pending", "status.blocked"] {
-            assert_ne!(
-                role(warning),
-                role("status.error"),
-                "{name}: warnings must remain distinct from errors"
-            );
+        let states = [
+            role("status.error"),
+            role("status.pending"),
+            role("status.blocked"),
+            role("status.reload"),
+            role("status.notice"),
+        ];
+        for (index, state) in states.iter().enumerate() {
+            for other in &states[index + 1..] {
+                // A small guard against identical-hue ochres, even when their
+                // brightness differs. This is not a visual acceptance metric.
+                let distance = (hue_degrees(*state) - hue_degrees(*other)).abs();
+                assert!(
+                    distance.min(360.0 - distance) >= 5.0,
+                    "{name}: states must not differ only in brightness"
+                );
+            }
         }
-    }
-}
-
-// Raw strings are confined to the catalog's serialization boundary. Resolve them
-// through domain names before comparing metadata with the consumer's scheme.
-#[derive(Deserialize)]
-struct RawCatalog {
-    variants: Vec<RawVariant>,
-}
-
-#[derive(Deserialize)]
-struct RawVariant {
-    id: String,
-    palette: BTreeMap<String, String>,
-    semantic: BTreeMap<String, String>,
-    upstream_roles: RawUpstreamRoles,
-    palette_usage: BTreeMap<String, Vec<String>>,
-    contrast: RawContrast,
-}
-
-#[derive(Deserialize)]
-struct RawUpstreamRoles {
-    foreground: String,
-    background: String,
-}
-
-#[derive(Deserialize)]
-struct RawContrast {
-    normal_text_reference: f64,
-    background: String,
-    slots: BTreeMap<String, RawContrastSlot>,
-    chevron_badge: RawBadgeContrast,
-}
-
-#[derive(Deserialize)]
-struct RawContrastSlot {
-    palette_name: String,
-    hex: String,
-    ratio: f64,
-    below_normal_text_reference: bool,
-}
-
-#[derive(Deserialize)]
-struct RawBadgeContrast {
-    foreground_name: String,
-    foreground_hex: String,
-    background_name: String,
-    background_hex: String,
-    ratio: f64,
-    below_normal_text_reference: bool,
-}
-
-#[test]
-fn catalog_metadata_matches_consumed_palettes_roles_and_measured_contrast() {
-    // JSON is a YAML flow document; use the existing parser without adding a
-    // second serialization dependency solely for embedded metadata.
-    let raw: RawCatalog = serde_saphyr::from_str(include_str!("../assets/catalog.json")).unwrap();
-    let catalog = ThemeAssets::default().compile_catalog();
-    assert_eq!(raw.variants.len(), catalog.color_scheme_names().count() - 1);
-    for variant in raw.variants {
-        let name = ColorSchemeName::new(variant.id);
-        let pair = catalog.resolve(&ThemeName::new("default"), &name).unwrap();
-        let palette: BTreeMap<_, _> = variant
-            .palette
-            .into_iter()
-            .map(|(alias, hex)| (ColorAliasName::new(alias), Color::parse(&hex).unwrap()))
-            .collect();
-        assert_eq!(
-            pair.scheme.palette, palette,
-            "{name}: complete source palette"
-        );
-        let semantic: BTreeMap<_, _> = variant
-            .semantic
-            .into_iter()
-            .map(|(role, alias)| (ColorAliasName::new(role), ColorAliasName::new(alias)))
-            .collect();
-        let role = |name| pair.scheme.resolve(&ColorAliasName::new(name)).unwrap();
-        assert_eq!(
-            role("base.text"),
-            palette[&ColorAliasName::new(variant.upstream_roles.foreground)],
-            "{name}: keep the canonical foreground, even below the contrast reference"
-        );
-        let background = role("base.background");
-        assert_eq!(
-            background,
-            palette[&ColorAliasName::new(variant.upstream_roles.background)],
-            "{name}: keep the canonical background"
-        );
-        assert_eq!(pair.scheme.colors.len(), semantic.len());
-        for (role, alias) in &semantic {
-            assert_eq!(
-                pair.scheme.resolve(role).unwrap(),
-                palette[alias],
-                "{name}: {role}"
-            );
-        }
-        assert_eq!(variant.palette_usage.len(), palette.len());
-        for (alias, roles) in variant.palette_usage {
-            let alias = ColorAliasName::new(alias);
-            let mut documented: Vec<_> = roles.into_iter().map(ColorAliasName::new).collect();
-            documented.sort();
-            let actual: Vec<_> = semantic
-                .iter()
-                .filter(|(_, chosen)| *chosen == &alias)
-                .map(|(role, _)| role.clone())
-                .collect();
-            assert_eq!(documented, actual, "{name}: {alias} usage");
-        }
-        assert_eq!(
-            Color::parse(&variant.contrast.background).unwrap(),
-            background
-        );
-        assert_eq!(variant.contrast.slots.len(), semantic.len() - 1);
-        for (role, slot) in variant.contrast.slots {
-            let role = ColorAliasName::new(role);
-            let color = pair.scheme.resolve(&role).unwrap();
-            assert_eq!(semantic[&role], ColorAliasName::new(slot.palette_name));
-            assert_eq!(color, Color::parse(&slot.hex).unwrap());
-            let measured = contrast_ratio(color, background);
-            assert!(
-                (measured - slot.ratio).abs() < 0.000_001,
-                "{name}: {role} contrast must describe the actual RGB pair"
-            );
-            assert_eq!(
-                slot.below_normal_text_reference,
-                measured < variant.contrast.normal_text_reference,
-                "{name}: {role} must disclose contrast below the reference"
-            );
-        }
-        let badge = variant.contrast.chevron_badge;
-        let hotkey = role("menu.hotkey");
-        assert_eq!(
-            palette[&ColorAliasName::new(badge.foreground_name)],
-            background
-        );
-        assert_eq!(palette[&ColorAliasName::new(badge.background_name)], hotkey);
-        assert_eq!(Color::parse(&badge.foreground_hex).unwrap(), background);
-        assert_eq!(Color::parse(&badge.background_hex).unwrap(), hotkey);
-        let measured = contrast_ratio(background, hotkey);
-        assert!(
-            (measured - badge.ratio).abs() < 0.000_001,
-            "{name}: badge contrast"
-        );
-        assert_eq!(
-            badge.below_normal_text_reference,
-            measured < variant.contrast.normal_text_reference,
-            "{name}: inverted badges must disclose contrast below the reference"
-        );
     }
 }

@@ -106,12 +106,14 @@ palette:
   lotusTeal2: "#6693bf"
   lotusTeal3: "#5a7785"
   lotusCyan: "#d7e3d8"
+  # Muxe adaptations; exact derivation and rejected candidates in catalog.json.
+  muxe_lotus_ink_emphasis: "#3c3c48"
 colors:
-  base.text: lotusInk1
+  base.text: muxe_lotus_ink_emphasis
   base.background: lotusWhite3
-  base.muted: lotusGray2
+  base.muted: lotusInk1
   menu.hotkey: lotusBlue4
-  menu.separator: lotusGray2
+  menu.separator: lotusGray3
   status.error: lotusRed
   status.pending: lotusYellow
   status.blocked: lotusOrange

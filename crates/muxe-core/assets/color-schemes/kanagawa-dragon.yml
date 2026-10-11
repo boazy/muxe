@@ -111,7 +111,7 @@ colors:
   base.background: dragonBlack3
   base.muted: dragonGray2
   menu.hotkey: dragonBlue2
-  menu.separator: dragonGray2
+  menu.separator: dragonGray3
   status.error: dragonRed
   status.pending: dragonYellow
   status.blocked: dragonOrange

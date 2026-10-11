@@ -19,9 +19,9 @@ palette:
   base2: "#eee8d5"
   base3: "#fdf6e3"
 colors:
-  base.text: base00
+  base.text: base02
   base.background: base3
-  base.muted: base0
+  base.muted: base00
   menu.hotkey: blue
   menu.separator: base0
   status.error: red

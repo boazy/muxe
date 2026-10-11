@@ -81,14 +81,16 @@ palette:
   todo: "#2e7de9"
   warning: "#8c6c3e"
   yellow: "#8c6c3e"
+  # Muxe adaptation; exact derivation and rejected candidates in catalog.json.
+  muxe_blocked_orange: "#b13b00"
 colors:
   base.text: fg
   base.background: bg
   base.muted: fg_dark
   menu.hotkey: blue5
-  menu.separator: fg_dark
+  menu.separator: comment
   status.error: red1
   status.pending: yellow
-  status.blocked: orange
+  status.blocked: muxe_blocked_orange
   status.reload: green
   status.notice: cyan

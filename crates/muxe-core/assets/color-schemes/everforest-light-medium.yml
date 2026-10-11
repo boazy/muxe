@@ -29,12 +29,14 @@ palette:
   statusline1: "#93b259"
   statusline2: "#708089"
   statusline3: "#e66868"
+  # Muxe adaptations; exact derivation and rejected candidates in catalog.json.
+  muxe_ink_emphasis: "#455056"
 colors:
-  base.text: fg
+  base.text: muxe_ink_emphasis
   base.background: bg0
-  base.muted: statusline2
+  base.muted: fg
   menu.hotkey: blue
-  menu.separator: statusline2
+  menu.separator: grey2
   status.error: red
   status.pending: yellow
   status.blocked: orange

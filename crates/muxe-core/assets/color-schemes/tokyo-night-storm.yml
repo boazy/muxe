@@ -86,7 +86,7 @@ colors:
   base.background: bg
   base.muted: fg_dark
   menu.hotkey: blue
-  menu.separator: fg_dark
+  menu.separator: dark5
   status.error: red
   status.pending: yellow
   status.blocked: orange
