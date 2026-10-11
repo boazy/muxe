@@ -167,6 +167,44 @@ async fn wait_for_dispatch_completion(
     .map_err(|_| io::Error::other("action completion timed out"))?
 }
 
+async fn wait_for_overlay_output(runtime: &HerdrRuntime, pane_id: &str) -> io::Result<()> {
+    let mut last_reply = None;
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let reply = invoke(
+                runtime,
+                "pane.read",
+                json!({"pane_id":pane_id,"source":"recent","lines":20}),
+            )
+            .await?;
+            let text = reply
+                .pointer("/read/text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "pane.read response has no string /read/text: {reply}"
+                    ))
+                })?;
+            if text.contains("real-command-output") {
+                return Ok(());
+            }
+            last_reply = Some(reply);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other(format!(
+            "missing real overlay terminal output: {}",
+            last_reply.map_or_else(
+                || "<no pane.read reply>".to_owned(),
+                |reply| reply.to_string()
+            )
+        ))),
+    }
+}
+
 async fn close_executable_pane(
     runtime: &HerdrRuntime,
     origin: &muxe_adapter_herdr::FocusedPane,
@@ -188,17 +226,7 @@ async fn close_executable_pane(
         .filter_map(Value::as_str)
         .find(|id| *id != origin.pane.as_str())
         .ok_or_else(|| io::Error::other(format!("no overlay pane: {snapshot}")))?;
-    let output = invoke(
-        runtime,
-        "pane.read",
-        json!({"pane_id":overlay,"source":"recent","lines":20}),
-    )
-    .await?;
-    if !output.to_string().contains("real-command-output") {
-        return Err(io::Error::other(format!(
-            "missing real overlay terminal output: {output}"
-        )));
-    }
+    wait_for_overlay_output(runtime, overlay).await?;
     invoke(runtime, "pane.close", json!({"pane_id":overlay})).await?;
     Ok(())
 }
