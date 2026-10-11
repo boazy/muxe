@@ -171,10 +171,11 @@ async fn wait_for_overlay_output(runtime: &HerdrRuntime, pane_id: &str) -> io::R
     let mut last_reply = None;
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
+            // Check the viewport; Herdr 0.8.2's recent tail can omit visible output.
             let reply = invoke(
                 runtime,
                 "pane.read",
-                json!({"pane_id":pane_id,"source":"recent","lines":20}),
+                json!({"pane_id":pane_id,"source":"visible","lines":20}),
             )
             .await?;
             let text = reply
