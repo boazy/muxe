@@ -2034,6 +2034,7 @@ async fn press_owned_popup_binding(
     socket: &Path,
     runtime: &muxe_adapter_herdr::HerdrRuntime,
     origin: &muxe_adapter_herdr::FocusedPane,
+    label: &str,
 ) -> io::Result<()> {
     let menu = launch_herdr_smoke_menu(rig, target_bin, socket, origin).await?;
     poll_until(
@@ -2050,7 +2051,7 @@ async fn press_owned_popup_binding(
             if reply
                 .pointer("/read/text")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|text| text.contains("Owned popup"))
+                .is_some_and(|text| text.contains(label))
             {
                 Ok(())
             } else {
@@ -2147,7 +2148,7 @@ async fn assert_herdr_popup_diagnostics(
         .expect("owned Herdr client")
         .send_input(b"\x1b")
         .await?;
-    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin).await?;
+    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin, "Owned popup").await?;
     wait_missing_plugin_log(&rig.cache_dir.join("logs/muxe.jsonl")).await?;
     let manifest = target_bin
         .parent()
@@ -2165,7 +2166,7 @@ async fn assert_herdr_popup_diagnostics(
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin).await?;
+    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin, "Owned popup").await?;
     let proof = rig.workdir.join("muxe-popup-proof");
     poll_until(
         "real popup command runs in saved cwd",
@@ -2194,7 +2195,7 @@ async fn assert_herdr_popup_diagnostics(
     let sibling = muxe_adapter_herdr::focused_pane(&runtime)
         .await
         .map_err(io::Error::other)?;
-    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &sibling).await?;
+    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &sibling, "Owned popup").await?;
     poll_until(
         "multi-pane popup runs from saved origin",
         Duration::from_secs(10),
@@ -2206,6 +2207,58 @@ async fn assert_herdr_popup_diagnostics(
     )
     .await?;
     herdr_smoke_request(&runtime, "popup.close", serde_json::json!({})).await?;
+    assert_agent_usage_popup(rig, target_bin, &socket, &runtime, &sibling, &typescript).await?;
+    Ok(())
+}
+
+async fn assert_agent_usage_popup(
+    rig: &mut Rig,
+    target_bin: &Path,
+    socket: &Path,
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
+    origin: &muxe_adapter_herdr::FocusedPane,
+    typescript: &Path,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let available = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| {
+            std::fs::metadata(directory.join("agent-usage")).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+    });
+    if !available {
+        eprintln!(
+            "agent-usage unavailable on the owned host PATH; real shell popup proof completed"
+        );
+        return Ok(());
+    }
+    // The owned server retains only the fresh scoped HOME/XDG environment:
+    // no account configuration or credentials are supplied to this executable.
+    let config = serde_json::json!({
+        "version":1, "settings":{"timeout":"off"},
+        "menus":{"main":{"bindings":{"u":{
+            "label":"Requested executable",
+            "action":{"type":"pane:open","pane-type":"popup","program":"agent-usage","args":["--tui"]}
+        }}}}
+    });
+    std::fs::write(
+        &rig.config_file,
+        serde_json::to_vec(&config).map_err(io::Error::other)?,
+    )?;
+    let start = usize::try_from(std::fs::metadata(typescript)?.len()).map_err(io::Error::other)?;
+    press_owned_popup_binding(
+        rig,
+        target_bin,
+        socket,
+        runtime,
+        origin,
+        "Requested executable",
+    )
+    .await?;
+    wait_herdr_menu_labels(typescript, start, &["Agent usage", "0 account(s)"], &[]).await?;
+    eprintln!("actual agent-usage --tui rendered in an owned popup with fresh HOME");
+    herdr_smoke_request(runtime, "popup.close", serde_json::json!({})).await?;
     Ok(())
 }
 
