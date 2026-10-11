@@ -705,6 +705,7 @@ pub struct ControlDecoder {
     policy: ControlPolicy,
     state: ControlDecoderState,
     failed: bool,
+    peer_prelude_verified: bool,
 }
 
 #[derive(Debug)]
@@ -734,7 +735,15 @@ impl ControlDecoder {
                 filled: 0,
             },
             failed: false,
+            peer_prelude_verified: false,
         }
+    }
+
+    /// Reports that this connection supplied the expected control peer prelude.
+    /// This is a role claim, not an OS process-ownership proof.
+    #[must_use]
+    pub fn peer_prelude_verified(&self) -> bool {
+        self.peer_prelude_verified
     }
 
     /// Decodes length-prefixed coordinator frames and delivers each message.
@@ -775,6 +784,7 @@ impl ControlDecoder {
                     ) {
                         return self.fail(ControlDecodeError::Prelude(error));
                     }
+                    self.peer_prelude_verified = true;
                     self.state = ControlDecoderState::LengthPrefix {
                         bytes: [0; LENGTH_PREFIX_LEN],
                         filled: 0,

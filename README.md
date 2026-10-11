@@ -470,6 +470,22 @@ mise use -g github:boazy/muxe@{version}
 muxe activate
 ```
 
+### Forced broker replacement
+
+Use `muxe activate -f` or `muxe activate --force` when normal activation cannot replace a broker because its lifecycle state is incorrect. Force also replaces a healthy broker that already serves the selected version. The same `--host` choices apply, including the complete shared Zellij bridge group.
+
+Muxe validates the target configuration and bridge package before stopping participants. It authenticates the current-user broker and asks it to retire cleanly first. A confirmed shutdown of the host connection and listener is sufficient; a process that only supervises detached local commands may remain alive. Muxe does not kill that confirmed supervisor.
+
+If retirement is refused or cannot be confirmed, Muxe can stop only an authenticated exact OS process and must confirm its exit before starting a replacement. Muxe never signals the multiplexer server, kills by process name, or removes a live endpoint whose owner it cannot authenticate. A hard stop can leave menus or captures needing manual cleanup and can abandon local command supervision. Host-owned processes continue; actions that may already have executed are not replayed.
+
+Muxe trusts strong broker self-registration records loaded from its private, owner-only native registry and activation files. Those records establish broker role; the operating system separately verifies the exact process instance and user. An arbitrary record from configuration or IPC is not stop authority. This is not a defense against deliberate edits by the same user, who can already run configured commands or stop their own processes.
+
+Force retains irreversible stop intentions and completion proofs. If a replacement fails after its old broker stops, Muxe reports failure rather than claiming that broker was restored. Run `muxe activate --force` again to resume the retained activation target or group, including when its old endpoint and registry row are absent.
+
+For interrupted activation, Muxe holds the existing unit lock and preserves the previous decision. Authentication authorizes a stop; every known participant must have confirmed ended host authority before Muxe replaces the saved decision. A durable Ready decision keeps its commit direction. Active coordinators, corrupt records, unknown participants, contradictory process identities, or missing ownership proofs still prevent unsafe replacement. Leave the reported activation record and its artifacts unchanged when Muxe cannot resolve that ownership safely.
+
+Force requires OS identity facilities that normal menu startup and normal activation do not require. Linux currently needs `SO_PEERPIDFD`; kernels without it cannot use force, including its cooperative path. Darwin needs peer audit tokens and the token-bound process query for force admission; hard-stop fallback also needs `proc_signal_with_audittoken`. Missing APIs produce a force-only refusal, never a PID-only signal. An accepted legacy Darwin peer can be identified through its exact reciprocal socket ownership. A legacy peer that never accepts and has no strong saved OS identity cannot safely be force-stopped. Linux cannot reconstruct signal authority from a saved PID/start-time tuple after its endpoint disappears.
+
 ### How activation works
 
 `muxe activate` preflights every selected unit before mutation:
@@ -489,7 +505,11 @@ Only a running ordinary or `TargetCommitted` broker with matching host identity 
 
 The `control-json-v1` protocol accepts additional fields and allows newer status fields to be absent. Before replacing an existing broker, activation checks that the broker supports coordinator-assigned replacement requests (`CoordinatorSuppliedV1`), reports the expected bridge identity, is running, and has no replacement already in progress. A failed check identifies the specific condition and any relevant status value. These checks run before Muxe creates a new activation record or asks that broker to stop accepting work. Installing a new executable does not update a broker process that is still running.
 
-New activation journals use schema v5. Schemas v3 and v4 remain readable for rollback before Ready. Earlier Ready journals lack exact target-incarnation proof and remain preserved instead of authorizing a commit. Corrupt or unsupported journals are also preserved for diagnosis.
+A `TargetCommitted` broker retains its previous handoff ID as confirmation of a completed replacement. That ID does not block another activation. A gated target or an ambiguous legacy handoff still prevents normal activation.
+
+When an abort restores the old host connection, the adapter must first confirm a fresh, compatible connection to the same host scope. Muxe then advertises that new connection identity for status, UI attachment, and origins. It keeps the original registry token for ownership-scoped cleanup. An unsuccessful or foreign-scope resume remains closed to new work; installing this fix cannot change the behavior of an already-running older broker.
+
+Normal activation journals remain schema v5 so running v0.4.0 brokers can read them during ordinary replacement. Force-only stop records and participant ledgers use schema v6. Schemas v3 and v4 remain readable for rollback before Ready. Earlier Ready journals lack exact target-incarnation proof and remain preserved instead of authorizing a commit. Corrupt or unsupported journals are also preserved for diagnosis.
 
 For Zellij, the coordinator holds the bridge-unit readiness gate while checking every target at one OS-wide monotonic as-of tick. The v5 Ready proof records the unit epoch ID separately from the tick, the exact member set, and each target's process-scoped registration identity. Herdr Ready records its exact target identity too. This is a broker-observed snapshot, not simultaneous physical host membership: `list-clients` is a snapshot, not a host-issued lease, and clients can attach or detach around it. Later heartbeat expiry does not change the earlier proof. An endpoint and handoff match alone do not establish the recorded target incarnation.
 

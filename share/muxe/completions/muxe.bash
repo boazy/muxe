@@ -283,7 +283,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__activate)
-            opts="-h -V --host --help --version"
+            opts="-f -h -V --host --force --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

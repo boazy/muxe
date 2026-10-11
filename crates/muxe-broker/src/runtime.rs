@@ -96,6 +96,27 @@ impl RuntimeEndpoint {
         })
     }
 
+    /// Reconstructs startup serialization for an authenticated recorded endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a relative path, a missing parent, or an overlong socket path.
+    pub fn from_recorded_socket(socket: &Path) -> Result<Self, RuntimeError> {
+        if !socket.is_absolute()
+            || socket.as_os_str().as_encoded_bytes().len() > MAX_SOCKET_PATH_BYTES
+        {
+            return Err(RuntimeError::SocketPathTooLong(socket.to_path_buf()));
+        }
+        let runtime_dir = socket
+            .parent()
+            .ok_or_else(|| RuntimeError::SocketPathTooLong(socket.to_path_buf()))?;
+        Ok(Self {
+            runtime_dir: runtime_dir.to_path_buf(),
+            socket: socket.to_path_buf(),
+            startup_lock: socket.with_extension("lock"),
+        })
+    }
+
     #[must_use]
     pub fn socket(&self) -> &Path {
         &self.socket

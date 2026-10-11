@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 # Runtime members are added only when their source owners have real crate roots.
-members = ["crates/muxe-condition", "crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "crates/muxe-ui", "crates/muxe-broker", "crates/muxe", "tools/muxe-herdr-gen", "tools/muxe-zellij-gen", "crates/muxe-zellij-protocol", "crates/muxe-adapter-zellij", "tools/codegen-completions", "crates/muxe-zellij-wasm"]
+members = ["crates/muxe-condition", "crates/muxe-core", "crates/muxe-terminal-input", "crates/muxe-protocol", "crates/muxe-adapter-api", "crates/muxe-adapter-herdr", "crates/muxe-ui", "crates/muxe-broker", "crates/muxe-process", "crates/muxe", "tools/muxe-herdr-gen", "tools/muxe-zellij-gen", "crates/muxe-zellij-protocol", "crates/muxe-adapter-zellij", "tools/codegen-completions", "crates/muxe-zellij-wasm"]
 # Test-only foreground Zellij server: independent lockfile, never in the
 # main build or release archives. Release owns its sources; core owns pins.
 exclude = ["tools/muxe-zellij-foreground"]
@@ -33,7 +33,8 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 unicode-width = "0.2.1"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync", "time", "process", "net", "io-util", "signal", "test-util"] }
 tokio-util = { version = "0.7.17", features = ["codec"] }
-nix = { version = "0.30.1", features = ["signal", "process", "user", "fs", "term", "time"] }
+nix = { version = "0.30.1", features = ["signal", "process", "user", "fs", "term", "time", "socket", "event"] }
+cc = "=1.4.5"
 notify = "8.2.0"
 regress = "0.12.0"
 regex = "1.12.2"

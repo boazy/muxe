@@ -1756,6 +1756,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5449c8c750f1a07ea702bbd212bd999fceece9b3d1508b17023b3e174583124b"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "miette"
 version = "5.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1902,6 +1911,7 @@ dependencies = [
  "muxe-adapter-zellij",
  "muxe-broker",
  "muxe-core",
+ "muxe-process",
  "muxe-protocol",
  "muxe-ui",
  "muxe-zellij-protocol",
@@ -2026,6 +2036,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "muxe-process"
+version = "0.4.0"
+dependencies = [
+ "cc",
+ "nix 0.30.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "muxe-protocol"
 version = "0.4.0"
 dependencies = [
@@ -2128,6 +2150,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

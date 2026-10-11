@@ -24,7 +24,7 @@ pub enum Command {
     Pane(PaneCommand),
     /// Install or remove managed host integration.
     Integration(IntegrationCommand),
-    /// Activate this version for selected live hosts.
+    /// Activate this version for selected hosts.
     Activate(ActivateCommand),
     /// Manage broker lifecycle.
     Broker(BrokerCommand),
@@ -310,9 +310,12 @@ pub enum ConfigurationPolicy {
 /// Arguments for `muxe activate`.
 #[derive(Debug, Args)]
 pub struct ActivateCommand {
-    /// Select live hosts for activation.
+    /// Select hosts for activation.
     #[arg(long, value_enum, default_value = "all")]
     pub host: HostScope,
+    /// Replace the broker even when its version or lifecycle state would normally prevent activation.
+    #[arg(short = 'f', long)]
+    pub force: bool,
 }
 
 /// Commands under `muxe broker`.
@@ -659,6 +662,7 @@ mod tests {
             panic!("expected activate");
         };
         assert_eq!(command.host, HostScope::All);
+        assert!(!command.force);
         let retire = Cli::try_parse_from(["muxe", "broker", "retire"]).expect("retire parses");
         let Command::Broker(BrokerCommand {
             command: BrokerSubcommand::Retire(command),
@@ -669,6 +673,20 @@ mod tests {
         assert_eq!(command.host, None);
         assert!(Cli::try_parse_from(["muxe", "purge", "--yes"]).is_err());
         assert!(Cli::try_parse_from(["muxe", "purge", "--config", "--yes"]).is_ok());
+    }
+
+    #[test]
+    fn forced_activation_flags_work_with_every_host_scope() {
+        for flag in ["-f", "--force"] {
+            for host in ["all", "current", "herdr", "zellij"] {
+                let cli = Cli::try_parse_from(["muxe", "activate", flag, "--host", host])
+                    .expect("forced activation parses");
+                let Command::Activate(command) = cli.command else {
+                    panic!("expected activate");
+                };
+                assert!(command.force);
+            }
+        }
     }
 
     #[test]

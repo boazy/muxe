@@ -58,9 +58,15 @@
 //! records, the installed bridge digest restored, live sessions, and
 //! unbroken host witnesses.
 
+#[path = "support/activation_recovery.rs"]
+mod activation_recovery;
 #[path = "support/executable_panes.rs"]
 mod executable_panes;
 #[path = "support/mod.rs"]
+#[expect(
+    dead_code,
+    reason = "owned-child suspension belongs to the forced Herdr test target, not these live Zellij scenarios"
+)]
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -451,8 +457,13 @@ keybinds {{
         Ok(()) => Ok(rig),
         Err(error) => {
             let cleanup = rig.close(case).await;
-            Err(combine_body_and_cleanup(Err(error), cleanup)
-                .expect_err("startup failed before cleanup"))
+            let result = combine_body_and_cleanup(Err(error), cleanup)
+                .expect_err("startup failed before cleanup");
+            eprintln!(
+                "[{case}] startup failure evidence retained at {}",
+                rig.root.keep().display()
+            );
+            Err(result)
         }
     }
 }

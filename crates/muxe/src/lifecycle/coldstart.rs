@@ -938,7 +938,18 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
         .status
         .registration
         .expect("checked registration attestation");
-    let candidate = BrokerEntry {
+    let process_identity = entries
+        .iter()
+        .find(|known| {
+            known.parsed_host_kind().ok() == Some(host_kind)
+                && known.discovery_key == discovery
+                && known.server_pid == process
+                && known.registration_id == Some(proof.id)
+                && known.started_at == proof.started_at
+        })
+        .and_then(|known| known.process_identity.clone());
+    let mut candidate = BrokerEntry {
+        process_identity,
         host_kind: super::registry::persisted_host_label(host_kind).to_owned(),
         discovery_key: discovery.to_owned(),
         socket: verified.authority.endpoint().to_path_buf(),
@@ -950,6 +961,7 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
         handoff_id: bridge.and(verified.status.handoff_id),
         live_server: Some(server_id.to_owned()),
     };
+    preserve_cleanup_ownership(&mut candidate, verified, entries);
     registry
         .reconcile_live(authority, entries, candidate, || {
             verified
@@ -959,6 +971,47 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
         })
         .and_then(|entry| authority.validate_recorded(entry))
         .map_err(ColdstartError::Registry)
+}
+
+fn preserve_cleanup_ownership(
+    candidate: &mut BrokerEntry,
+    verified: &VerifiedControlStatus,
+    entries: &[BrokerEntry],
+) {
+    // Registry handoff and live-server fields are immutable cleanup ownership.
+    // A successful authorized adapter resume may establish a fresh admission
+    // epoch. Keep the original token only for this exact authenticated process;
+    // callers still attach using the fresh Status identity, never this row.
+    if matches!(
+        verified.status.phase,
+        ActivationPhase::Ordinary | ActivationPhase::TargetCommitted
+    ) && verified.status.lifecycle == LifecycleState::Running
+        && verified.status.target.is_none()
+        && let Some(known) = entries.iter().find(|known| {
+            known.socket == candidate.socket
+                && known.host_kind == candidate.host_kind
+                && known.discovery_key == candidate.discovery_key
+                && known.server_pid == candidate.server_pid
+                && known.registration_id == candidate.registration_id
+                && known.started_at == candidate.started_at
+                && known
+                    .live_server
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                && known.bridge_identity == candidate.bridge_identity
+                && known.bridge_member == candidate.bridge_member
+                && known.process_identity == candidate.process_identity
+                && (verified.status.phase != ActivationPhase::TargetCommitted
+                    || known.handoff_id == candidate.handoff_id)
+        })
+    {
+        candidate.live_server.clone_from(&known.live_server);
+        if verified.status.phase == ActivationPhase::Ordinary
+            && verified.status.handoff_id.is_none()
+        {
+            candidate.handoff_id = known.handoff_id;
+        }
+    }
 }
 
 fn ensure_no_activation_journal(cache_dir: &Path, unit: &UnitKind) -> Result<(), ColdstartError> {
@@ -1944,6 +1997,62 @@ mod tests {
     async fn live_both_hosts_adopt_or_relocate_without_regenerating_owner() {
         assert_adoption_for(HerdrFixtureHost).await;
         assert_adoption_for(ZellijFixtureHost).await;
+    }
+
+    #[tokio::test]
+    async fn baseline_ordinary_admission_preserves_historical_cleanup_ownership() {
+        let mut fixture = OwnedBrokerFixture::start(ZellijFixtureHost, false).await;
+        let mut historical = fixture.registration.entry().clone();
+        assert!(fixture.unregister_original());
+        historical.handoff_id = Some(HandoffId([17; 16]));
+        fixture.registration = fixture.host.register(
+            &fixture.registry,
+            fixture.root.path(),
+            fixture.bridge.as_ref(),
+            historical.clone(),
+        );
+        let spawner = RejectSpawn::default();
+        let ColdstartOutcome::Ready(live) = ensure_broker(&fixture.inputs(&spawner)).await.unwrap()
+        else {
+            panic!("baseline Ordinary peer with exact historical ownership must attach");
+        };
+        assert_eq!(live.status.phase, ActivationPhase::Ordinary);
+        assert!(live.status.handoff_id.is_none());
+        assert!(live.entry.matches_recorded(&historical));
+        assert_eq!(fixture.registry.entries().unwrap(), vec![historical]);
+        assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
+        let mut client = muxe_broker::BrokerClient::connect(
+            fixture.endpoint.socket(),
+            muxe_protocol::PeerRole::Ui,
+            "baseline-rollback-ui",
+            live.status.live_server,
+        )
+        .await
+        .unwrap();
+        let attached = client
+            .request(muxe_protocol::ClientRequest::AttachUi(
+                muxe_protocol::AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: muxe_protocol::HostPaneId::new("owned-baseline-ui"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            attached,
+            muxe_protocol::BrokerResponse::UiAttached { .. }
+        ));
+        drop(client);
+        assert!(
+            fixture.unregister_original(),
+            "unchanged historical cleanup token still owns row"
+        );
+        fixture.stop().await;
     }
     #[tokio::test]
     async fn stale_record_and_foreign_herdr_incarnation_never_spawn() {

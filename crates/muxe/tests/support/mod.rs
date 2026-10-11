@@ -416,6 +416,27 @@ impl OwnedChild {
         }
     }
 
+    /// Suspends only this retained, unreaped child for unresponsive-peer tests.
+    /// A PID cannot be reused while the owned child has not been reaped.
+    pub fn suspend(&mut self) -> io::Result<u32> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("owned child was reaped"))?;
+        if child.try_wait()?.is_some() {
+            return Err(io::Error::other("owned child exited before suspension"));
+        }
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("owned child has no PID"))?;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(pid).map_err(io::Error::other)?),
+            nix::sys::signal::Signal::SIGSTOP,
+        )
+        .map_err(io::Error::other)?;
+        Ok(pid)
+    }
+
     /// Graceful SIGTERM (unix) then forceful kill, bounded waits, awaited
     /// reap, and preserved diagnostics. Consumes the handle so a child is
     /// never reaped twice.

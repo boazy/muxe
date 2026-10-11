@@ -83,7 +83,7 @@ pub enum ActivationBootstrap {
 #[derive(Clone)]
 struct ActivationController {
     current: CompatibilityRecord,
-    expected_live_server: muxe_protocol::LiveServerIdentity,
+    expected_live_server: Arc<Mutex<muxe_protocol::LiveServerIdentity>>,
     bridge_unit: Option<BridgeUnitId>,
     registration: Arc<OnceLock<BrokerRegistrationProof>>,
     state: Arc<Mutex<ActivationState>>,
@@ -188,6 +188,8 @@ impl RecoveryView {
     }
 }
 
+type RegistrationReleaseFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
 pub trait RecoveryJournal: Send + Sync {
     /// Performs owner-side journal validation, per-member probing, and any
     /// required artifact decision without holding broker transition locks.
@@ -218,6 +220,13 @@ pub trait RecoveryJournal: Send + Sync {
         handoff: &'a HandoffId,
         local_status: &'a ActivationStatus,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Supplies registry cleanup only for a service that owns such a registration.
+    fn release_retired_registration<'a>(
+        &'a self,
+        _proof: &'a RetiredRegistrationProof,
+    ) -> Option<RegistrationReleaseFuture<'a>> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +235,7 @@ enum ActivationState {
     Draining {
         target: Box<CompatibilityRecord>,
         handoff: HandoffId,
+        previous_handoff: Option<HandoffId>,
         // True once the old host subscription is suspended (and false again once a
         // failed Prepare restored it). Abort resumes the adapter only when set; the
         // listener rebind always runs. Without this Abort would demand a resume from
@@ -242,6 +252,12 @@ enum ActivationState {
         handoff: HandoffId,
     },
     Retired,
+}
+
+impl ActivationState {
+    fn restored(previous_handoff: Option<HandoffId>) -> Self {
+        previous_handoff.map_or(Self::Running, |handoff| Self::TargetCommitted { handoff })
+    }
 }
 enum PrepareAdmission {
     Begin,
@@ -278,6 +294,25 @@ impl RetirementTicket {
             },
             released,
         )
+    }
+}
+
+/// A service-created capability proving host shutdown and owned endpoint unlink.
+/// Detached generic children may still be supervised by this process.
+pub struct RetiredRegistrationProof {
+    registration: BrokerRegistrationProof,
+    endpoint: RuntimeEndpoint,
+}
+
+impl RetiredRegistrationProof {
+    #[must_use]
+    pub fn registration(&self) -> BrokerRegistrationProof {
+        self.registration
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &RuntimeEndpoint {
+        &self.endpoint
     }
 }
 
@@ -340,7 +375,7 @@ impl ActivationController {
         };
         Ok(Arc::new(Self {
             current,
-            expected_live_server,
+            expected_live_server: Arc::new(Mutex::new(expected_live_server)),
             bridge_unit,
             registration: Arc::new(OnceLock::new()),
             state: Arc::new(Mutex::new(state)),
@@ -378,22 +413,23 @@ impl ActivationController {
         proof: Option<(muxe_protocol::AsOfTick, muxe_protocol::UnitReadinessEpochId)>,
     ) -> Result<ActivationStatus, String> {
         let state = self.state.lock().await.clone();
+        let expected = self.expected_live_server.lock().await;
         // Draining retains the previously proven identity while the adapter
         // is suspended. A gated target may report only its reserved candidate
         // before coverage; readiness remains absent until the host proves it.
         // All other live states compare the current covered identity.
         let (live_server, uncovered_target) = match state {
             ActivationState::Draining { .. } | ActivationState::SupervisorOnly { .. } => {
-                (self.expected_live_server.clone(), false)
+                (expected.clone(), false)
             }
             ActivationState::TargetGated { .. } => match broker.live_identity().await {
                 Err(BrokerError::Adapter(error)) if error.kind == AdapterErrorKind::Unavailable => {
-                    (self.expected_live_server.clone(), true)
+                    (expected.clone(), true)
                 }
                 Err(error) => return Err(error.to_string()),
-                Ok(actual) if actual == self.expected_live_server => (actual, false),
+                Ok(actual) if actual == *expected => (actual, false),
                 Ok(actual) => {
-                    return Err(self.identity_mismatch_diagnostic(&actual));
+                    return Err(Self::identity_mismatch_diagnostic(&expected, &actual));
                 }
             },
             _ => {
@@ -401,8 +437,8 @@ impl ActivationController {
                     .live_identity()
                     .await
                     .map_err(|error| error.to_string())?;
-                if actual != self.expected_live_server {
-                    return Err(self.identity_mismatch_diagnostic(&actual));
+                if actual != *expected {
+                    return Err(Self::identity_mismatch_diagnostic(&expected, &actual));
                 }
                 (actual, false)
             }
@@ -476,16 +512,39 @@ impl ActivationController {
         })
     }
 
-    fn identity_mismatch_diagnostic(&self, actual: &muxe_protocol::LiveServerIdentity) -> String {
+    fn identity_mismatch_diagnostic(
+        expected: &muxe_protocol::LiveServerIdentity,
+        actual: &muxe_protocol::LiveServerIdentity,
+    ) -> String {
         format!(
             "cannot confirm activation status because the host identity changed: expected {:?} at {} with server ID {}, received {:?} at {} with server ID {}",
-            self.expected_live_server.host,
-            self.expected_live_server.discovery_key,
-            self.expected_live_server.server_id.as_str(),
+            expected.host,
+            expected.discovery_key,
+            expected.server_id.as_str(),
             actual.host,
             actual.discovery_key,
             actual.server_id.as_str()
         )
+    }
+
+    /// The adapter's successful resume is the authorization barrier for a
+    /// fresh covered admission epoch. It does not rewrite registration or
+    /// accept an arbitrary identity change observed by Status.
+    async fn resume_host_admission(&self, broker: &Broker) -> Result<(), String> {
+        broker
+            .resume_host_after_abort()
+            .await
+            .map_err(|error| error.to_string())?;
+        let actual = broker
+            .live_identity()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut expected = self.expected_live_server.lock().await;
+        if actual.host != expected.host || actual.discovery_key != expected.discovery_key {
+            return Err(Self::identity_mismatch_diagnostic(&expected, &actual));
+        }
+        *expected = actual;
+        Ok(())
     }
 
     async fn drain_listener(&self) -> Result<(), String> {
@@ -577,7 +636,7 @@ impl ActivationController {
             ControlOperation::Commit { handoff_id } => self.handle_commit(broker, handoff_id).await,
             ControlOperation::Abort { handoff_id } => self.handle_abort(broker, handoff_id).await,
             ControlOperation::Retire => {
-                {
+                let previous = {
                     let mut state = self.state.lock().await;
                     if !matches!(
                         *state,
@@ -592,9 +651,18 @@ impl ActivationController {
                             false,
                         );
                     }
+                    let previous = state.clone();
                     *state = ActivationState::Retired;
-                }
+                    previous
+                };
                 if let Err(error) = broker.drain_for_activation().await {
+                    if matches!(
+                        previous,
+                        ActivationState::Running | ActivationState::TargetCommitted { .. }
+                    ) {
+                        broker.reopen_dispatch().await;
+                        *self.state.lock().await = previous;
+                    }
                     return (control_error(error.to_string()), false);
                 }
                 (
@@ -746,9 +814,14 @@ impl ActivationController {
                 "cannot prepare the existing broker: it is already preparing a different activation target or handoff ID".to_owned(),
             ),
             ActivationState::Running | ActivationState::TargetCommitted { .. } => {
+                let previous_handoff = match &*state {
+                    ActivationState::TargetCommitted { handoff } => Some(*handoff),
+                    _ => None,
+                };
                 *state = ActivationState::Draining {
                     target: Box::new(target.clone()),
                     handoff,
+                    previous_handoff,
                     host_suspended: false,
                 };
                 PrepareAdmission::Begin
@@ -764,13 +837,14 @@ impl ActivationController {
         broker: &Broker,
         target: &CompatibilityRecord,
         handoff: HandoffId,
+        previous_handoff: Option<HandoffId>,
         error: &BrokerError,
     ) -> (ControlResult, bool) {
         if matches!(
             error,
             BrokerError::Adapter(adapter) if adapter.kind == AdapterErrorKind::Unsupported
         ) {
-            *self.state.lock().await = ActivationState::Running;
+            *self.state.lock().await = ActivationState::restored(previous_handoff);
             broker.reopen_dispatch().await;
             return (
                 control_error(format!(
@@ -779,17 +853,18 @@ impl ActivationController {
                 false,
             );
         }
-        let restore = broker.resume_host_after_abort().await;
+        let restore = self.resume_host_admission(broker).await;
         let mut diagnostic = format!("could not suspend host subscription for activation: {error}");
         match restore {
             Ok(()) => {
-                *self.state.lock().await = ActivationState::Running;
+                *self.state.lock().await = ActivationState::restored(previous_handoff);
                 broker.reopen_dispatch().await;
             }
             Err(restore) => {
                 *self.state.lock().await = ActivationState::Draining {
                     target: Box::new(target.clone()),
                     handoff,
+                    previous_handoff,
                     host_suspended: true,
                 };
                 let _ = write!(
@@ -806,13 +881,15 @@ impl ActivationController {
         broker: &Broker,
         target: &CompatibilityRecord,
         handoff: HandoffId,
+        previous_handoff: Option<HandoffId>,
         error: &str,
     ) -> (ControlResult, bool) {
-        let restore = broker.resume_host_after_abort().await;
+        let restore = self.resume_host_admission(broker).await;
         *self.state.lock().await = ActivationState::Draining {
             target: Box::new(target.clone()),
             handoff,
-            host_suspended: restore.is_ok(),
+            previous_handoff,
+            host_suspended: restore.is_err(),
         };
         let mut diagnostic = format!(
             "could not stop the existing broker listener for activation: {error}; the broker is still not accepting new work"
@@ -847,10 +924,16 @@ impl ActivationController {
             }
             PrepareAdmission::Begin => {}
         }
+        let previous_handoff = match &*self.state.lock().await {
+            ActivationState::Draining {
+                previous_handoff, ..
+            } => *previous_handoff,
+            _ => unreachable!("Prepare admission entered Draining"),
+        };
         if let Err(error) = broker.drain_for_activation().await {
             let prepare_refusal = matches!(&error, BrokerError::ActivationDrainRefused(_))
                 .then_some(muxe_protocol::control::PrepareRefusalEvidence::NoHostMutation);
-            *self.state.lock().await = ActivationState::Running;
+            *self.state.lock().await = ActivationState::restored(previous_handoff);
             return (
                 ControlResult::Error {
                     diagnostic: bounded_control_diagnostic(error.to_string()),
@@ -861,12 +944,12 @@ impl ActivationController {
         }
         if let Err(error) = broker.suspend_host_for_activation().await {
             return self
-                .handle_suspend_failure(broker, &target, handoff, &error)
+                .handle_suspend_failure(broker, &target, handoff, previous_handoff, &error)
                 .await;
         }
         if let Err(error) = self.drain_listener().await {
             return self
-                .handle_listener_drain_failure(broker, &target, handoff, &error)
+                .handle_listener_drain_failure(broker, &target, handoff, previous_handoff, &error)
                 .await;
         }
         if let ActivationState::Draining { host_suspended, .. } = &mut *self.state.lock().await {
@@ -885,6 +968,7 @@ impl ActivationController {
             ResumeOld {
                 target: Box<CompatibilityRecord>,
                 host_suspended: bool,
+                previous_handoff: Option<HandoffId>,
             },
             Stop,
         }
@@ -897,9 +981,11 @@ impl ActivationController {
                     target,
                     handoff,
                     host_suspended,
+                    previous_handoff,
                 } if handoff == handoff_id => AbortPlan::ResumeOld {
                     target,
                     host_suspended,
+                    previous_handoff,
                 },
                 ActivationState::TargetGated { handoff } if handoff == handoff_id => {
                     *state = ActivationState::Retired;
@@ -920,6 +1006,7 @@ impl ActivationController {
             AbortPlan::ResumeOld {
                 target,
                 host_suspended,
+                previous_handoff,
             } => {
                 // Resume and revalidate the old host subscription before
                 // the old endpoint accepts dispatch again, then rebind the
@@ -929,7 +1016,7 @@ impl ActivationController {
                 // pretend rollback succeeded. A Prepare that restored the
                 // adapter after its own listener failure leaves the host
                 // live, so the adapter resume is skipped then.
-                if host_suspended && let Err(error) = broker.resume_host_after_abort().await {
+                if host_suspended && let Err(error) = self.resume_host_admission(broker).await {
                     return (
                         control_error(format!(
                             "could not restore the existing broker's host subscription after activation abort: {error}; the broker is still not accepting new work"
@@ -942,6 +1029,7 @@ impl ActivationController {
                         target,
                         handoff: handoff_id,
                         host_suspended: false,
+                        previous_handoff,
                     };
                     return (
                         control_error(format!(
@@ -950,7 +1038,8 @@ impl ActivationController {
                         false,
                     );
                 }
-                *self.state.lock().await = ActivationState::Running;
+                broker.reopen_dispatch().await;
+                *self.state.lock().await = ActivationState::restored(previous_handoff);
                 (
                     self.status_result(broker, ControlResult::Aborted).await,
                     false,
@@ -1258,24 +1347,34 @@ impl ActivationController {
         resume_permit: Option<Arc<dyn RecoveryPermit>>,
     ) {
         // Old unit restoration: only from the same Draining handoff, never after commit.
-        let host_suspended = match self.state.lock().await.clone() {
+        let (host_suspended, previous_handoff) = match self.state.lock().await.clone() {
             ActivationState::Draining {
                 handoff: current,
                 host_suspended,
+                previous_handoff,
                 ..
-            } if current == *handoff => host_suspended,
+            } if current == *handoff => (host_suspended, previous_handoff),
             _ => return,
         };
-        if host_suspended && let Err(error) = broker.resume_host_after_abort().await {
+        if host_suspended && let Err(error) = self.resume_host_admission(broker).await {
             tracing::warn!(%error, "disconnect recovery could not resume host; endpoint stays drained");
             return;
+        }
+        if let ActivationState::Draining {
+            handoff: current,
+            host_suspended,
+            ..
+        } = &mut *self.state.lock().await
+            && current == handoff
+        {
+            *host_suspended = false;
         }
         if let Err(error) = self.resume_listener().await {
             tracing::warn!(%error, "disconnect recovery could not rebind listener; endpoint stays drained");
             return;
         }
-        *self.state.lock().await = ActivationState::Running;
         broker.reopen_dispatch().await;
+        *self.state.lock().await = ActivationState::restored(previous_handoff);
         if let Some(permit) = resume_permit
             && let Err(error) = permit.acknowledge(handoff, RecoveryAck::Resumed).await
         {
@@ -1589,6 +1688,20 @@ impl BrokerServer {
                             };
                             match outcome {
                                 Ok(()) => {
+                                    if let Some(controller) = &activation
+                                        && let Some(registration) = controller.registration.get()
+                                        && let Some(recovery) = controller.recovery.lock().await.clone()
+                                    {
+                                        let proof = RetiredRegistrationProof {
+                                            registration: *registration,
+                                            endpoint: endpoint.clone(),
+                                        };
+                                        if let Some(release) = recovery.release_retired_registration(&proof)
+                                            && let Err(error) = release.await
+                                        {
+                                            tracing::warn!(%error, "host authority retired but exact registry release failed");
+                                        }
+                                    }
                                     supervisor_only = true;
                                     let (ticket, released) = RetirementTicket::pair();
                                     if complete.send(Ok(ticket)).is_ok() {
@@ -3395,7 +3508,7 @@ mod tests {
         close_calls: AtomicUsize,
         release_calls: AtomicUsize,
         suspend_unsupported: bool,
-        resume_fails: bool,
+        resume_fails: AtomicBool,
         readiness: std::sync::Mutex<Option<muxe_adapter_api::ActivationReadiness>>,
         current_identity: tokio::sync::RwLock<Option<HostIdentity>>,
         config_override_filename: &'static str,
@@ -3628,7 +3741,7 @@ mod tests {
 
         async fn resume_after_activation_abort(&self) -> Result<(), AdapterError> {
             self.record("resume");
-            if self.resume_fails {
+            if self.resume_fails.load(Ordering::SeqCst) {
                 return Err(AdapterError::new(
                     muxe_adapter_api::AdapterErrorKind::Unavailable,
                     "ordering fake host lost its retained subscription",
@@ -3722,7 +3835,7 @@ mod tests {
             close_calls: AtomicUsize::new(0),
             release_calls: AtomicUsize::new(0),
             suspend_unsupported,
-            resume_fails,
+            resume_fails: AtomicBool::new(resume_fails),
             readiness: std::sync::Mutex::new(None),
             current_identity: tokio::sync::RwLock::new(Some(identity)),
             config_override_filename,
@@ -4110,6 +4223,25 @@ mod tests {
             "owned broker listener unlinks only its own endpoint on shutdown"
         );
     }
+    async fn assert_active_drain_rejects_another_handoff(
+        controller: &ActivationController,
+        broker: &Broker,
+    ) {
+        let (conflict, _) = controller
+            .handle(
+                broker,
+                ControlOperation::Prepare {
+                    target: Box::new(test_record()),
+                    handoff_id: test_handoff(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(conflict, ControlResult::Error { .. }),
+            "a different handoff cannot adopt the active drain"
+        );
+    }
+
     #[tokio::test]
     async fn prepare_suspends_after_drain_and_abort_resumes_before_rebind() {
         let (broker, adapter, _directory) = ordering_broker(false, false);
@@ -4171,19 +4303,7 @@ mod tests {
             vec!["suspend".to_owned(), "drain_listener".to_owned()],
             "an idempotent retry does not drain twice"
         );
-        let (conflict, _) = controller
-            .handle(
-                &broker,
-                ControlOperation::Prepare {
-                    target: Box::new(test_record()),
-                    handoff_id: test_handoff(),
-                },
-            )
-            .await;
-        assert!(
-            matches!(conflict, ControlResult::Error { .. }),
-            "a different handoff cannot adopt the active drain"
-        );
+        assert_active_drain_rejects_another_handoff(&controller, &broker).await;
 
         let (result, stop) = controller
             .handle(
@@ -4211,6 +4331,434 @@ mod tests {
             ],
             "the old host subscription resumes and revalidates before the endpoint rebinds"
         );
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::PrepareUiLaunch(launch_request()),
+                tokio::sync::mpsc::channel(1).0,
+            )
+            .await
+            .expect("Abort reopens real broker launch admission");
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn committed_target_repeated_prepare_abort_restores_historical_phase_and_admission() {
+        let (broker, adapter, _directory) = ordering_broker(false, false);
+        let committed_handoff = test_handoff();
+        let controller = ActivationController::start(
+            &broker,
+            ActivationBootstrap::Target {
+                current: test_record(),
+                handoff: committed_handoff,
+                live_server: broker.live_identity().await.expect("live identity"),
+                bridge_unit: None,
+            },
+        )
+        .await
+        .expect("gated target starts");
+        let recovery = absent_recovery();
+        *recovery.0.lock().expect("recovery fixture is writable") = RecoveryView {
+            journal: RecoveryJournalStatus::Present,
+            member: RecoveryMemberStatus::Ready,
+            target_live: true,
+            recover_after: Duration::ZERO,
+        };
+        controller.set_recovery(recovery).await;
+        let (committed, stop) = controller
+            .handle(
+                &broker,
+                ControlOperation::Commit {
+                    handoff_id: committed_handoff,
+                },
+            )
+            .await;
+        assert!(!stop);
+        assert!(
+            matches!(committed, ControlResult::Committed(ActivationStatus {
+            phase: ActivationPhase::TargetCommitted, handoff_id: Some(id), ..
+        }) if id == committed_handoff)
+        );
+        let responder = with_listener_commands(&controller, &adapter.calls).await;
+        for _ in 0..2 {
+            let next = test_handoff();
+            let (prepared, _) = controller
+                .handle(
+                    &broker,
+                    ControlOperation::Prepare {
+                        target: Box::new(test_record()),
+                        handoff_id: next,
+                    },
+                )
+                .await;
+            assert!(matches!(prepared, ControlResult::Prepared(_)));
+            let (aborted, _) = controller
+                .handle(&broker, ControlOperation::Abort { handoff_id: next })
+                .await;
+            assert!(matches!(aborted, ControlResult::Aborted(ActivationStatus {
+                phase: ActivationPhase::TargetCommitted, handoff_id: Some(id), target: None, ..
+            }) if id == committed_handoff));
+            assert!(controller.allows_ui().await);
+            let launch = broker
+                .handle(
+                    PeerRole::Launcher,
+                    ClientRequest::PrepareUiLaunch(launch_request()),
+                    tokio::sync::mpsc::channel(1).0,
+                )
+                .await
+                .expect("launch works after repeated rollback");
+            assert!(matches!(
+                launch,
+                RequestResult::Immediate(BrokerResponse::LaunchPrepared { .. })
+            ));
+            broker
+                .drain_for_activation()
+                .await
+                .expect("close test launch before next prepare");
+            broker.reopen_dispatch().await;
+        }
+        responder.abort();
+    }
+
+    async fn broker_with_unfinished_host_execution()
+    -> (Arc<Broker>, Arc<OrderingAdapter>, tempfile::TempDir) {
+        let (_, adapter, directory) = ordering_broker(false, false);
+        let config = muxe_core::compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("<retirement refusal regression>"),
+            "version: 1\nmenus:\n  main:\n    bindings:\n      f:\n        label: focus tab\n        action: tab:focus index=1\n        settings:\n          execution:\n            mode: detach\n".to_owned(),
+            KeyCapabilities::default(),
+            Some(adapter.as_ref()),
+        ).expect("host action configuration compiles");
+        let root = muxe_core::MenuId::named(
+            muxe_core::MenuName::parse("main").expect("fixture menu name"),
+        );
+        let view = config
+            .attachment_view(&root, &config.theme_selection)
+            .expect("menu view");
+        let binding = view.menu.menu(&root).expect("main menu").bindings[0].id;
+        let broker =
+            Broker::from_compiled(adapter.clone(), directory.path().join("config.yml"), config);
+        let (events, _receiver) = mpsc::channel(8);
+        let attached = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::AttachUi(AttachUi {
+                    root: muxe_protocol::MenuId::named("main"),
+                    pane: HostPaneId::new("owned-ui-pane"),
+                    pending_launch: None,
+                    origin: None,
+                    caller_identity: None,
+                    theme: None,
+                    color_scheme: None,
+                }),
+                events.clone(),
+            )
+            .await
+            .expect("UI attaches");
+        let RequestResult::Immediate(BrokerResponse::UiAttached { session, .. }) = attached else {
+            panic!("UI attachment must be immediate");
+        };
+        let dispatched = broker
+            .handle(
+                PeerRole::Ui,
+                ClientRequest::InvokeBinding(muxe_protocol::InvokeBinding {
+                    session,
+                    generation: 1,
+                    binding: muxe_protocol::BindingId {
+                        generation: binding.generation().0,
+                        ordinal: binding.ordinal(),
+                    },
+                }),
+                events,
+            )
+            .await
+            .expect("adapter accepts host action");
+        assert!(matches!(
+            dispatched,
+            RequestResult::Immediate(BrokerResponse::InvocationAccepted {
+                disposition: InvocationDisposition::Detached,
+                ..
+            })
+        ));
+        (broker, adapter, directory)
+    }
+
+    #[tokio::test]
+    async fn refused_retire_keeps_running_status_and_admission_until_host_completion() {
+        let (broker, adapter, _directory) = broker_with_unfinished_host_execution().await;
+        let controller = ActivationController::start(
+            &broker,
+            ActivationBootstrap::Running {
+                current: test_record(),
+                bridge_unit: None,
+            },
+        )
+        .await
+        .expect("ordinary broker starts");
+        let (refusal, stop) = controller.handle(&broker, ControlOperation::Retire).await;
+        assert!(!stop, "refused drain must not request adapter shutdown");
+        assert!(matches!(refusal, ControlResult::Error { .. }));
+        let (status, _) = controller.handle(&broker, ControlOperation::Status).await;
+        assert!(matches!(
+            status,
+            ControlResult::Status(ActivationStatus {
+                lifecycle: LifecycleState::Running,
+                phase: ActivationPhase::Ordinary,
+                handoff_id: None,
+                target: None,
+                ..
+            })
+        ));
+        assert!(controller.allows_ui().await);
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::PrepareUiLaunch(launch_request()),
+                mpsc::channel(1).0,
+            )
+            .await
+            .expect("refused Retire leaves real launch admission usable");
+        assert!(!adapter.shutdown.load(Ordering::SeqCst));
+        assert!(
+            !broker
+                .handle_health_event(AdapterHealthEvent::DispatchCompleted(
+                    DispatchCompletion::Succeeded {
+                        execution: muxe_core::ExecutionId(1)
+                    },
+                ))
+                .await
+        );
+        let (retired, stop) = controller.handle(&broker, ControlOperation::Retire).await;
+        assert!(stop, "later completed drain may stop host authority");
+        assert!(matches!(
+            retired,
+            ControlResult::Retired(ActivationStatus {
+                lifecycle: LifecycleState::Retired,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn abort_refreshes_only_successfully_resumed_same_scope_admission() {
+        for scenario in [
+            "fresh-epoch",
+            "foreign-kind",
+            "foreign-key",
+            "uncovered",
+            "resume-error",
+        ] {
+            let (broker, adapter, _directory) = ordering_broker(false, scenario == "resume-error");
+            let controller = ActivationController::start(
+                &broker,
+                ActivationBootstrap::Running {
+                    current: test_record(),
+                    bridge_unit: None,
+                },
+            )
+            .await
+            .unwrap();
+            let original = controller.status(&broker).await.unwrap().live_server;
+            let (handoff, responder) = prepared_old(&broker, &controller, &adapter.calls).await;
+            let mut next = adapter.current_identity.read().await.clone().unwrap();
+            next.live_server_id =
+                muxe_adapter_api::LiveServerIncarnationId::parse("fresh-covered-epoch").unwrap();
+            if scenario == "foreign-kind" {
+                next.kind = muxe_adapter_api::HostKind::Zellij;
+            }
+            if scenario == "foreign-key" {
+                next.discovery_key =
+                    muxe_adapter_api::HostDiscoveryKey::parse("foreign-scope").unwrap();
+            }
+            *adapter.current_identity.write().await = (scenario != "uncovered").then_some(next);
+            let (result, stop) = controller
+                .handle(
+                    &broker,
+                    ControlOperation::Abort {
+                        handoff_id: handoff,
+                    },
+                )
+                .await;
+            assert!(!stop);
+            if scenario == "fresh-epoch" {
+                let ControlResult::Aborted(status) = result else {
+                    panic!("authorized resume failed: {result:?}");
+                };
+                assert_eq!(status.lifecycle, LifecycleState::Running);
+                assert_eq!(status.live_server.server_id.as_str(), "fresh-covered-epoch");
+                assert_ne!(status.live_server, original);
+                broker
+                    .handle(
+                        PeerRole::Launcher,
+                        ClientRequest::PrepareUiLaunch(launch_request()),
+                        mpsc::channel(1).0,
+                    )
+                    .await
+                    .expect("fresh admission remains usable");
+                adapter
+                    .current_identity
+                    .write()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .live_server_id =
+                    muxe_adapter_api::LiveServerIncarnationId::parse("unapproved-later-epoch")
+                        .unwrap();
+                assert!(
+                    controller.status(&broker).await.is_err(),
+                    "Status must not authorize arbitrary later drift"
+                );
+            } else {
+                assert!(
+                    matches!(result, ControlResult::Error { .. }),
+                    "{scenario}: {result:?}"
+                );
+                assert!(!controller.allows_ui().await);
+                assert_eq!(
+                    controller.status(&broker).await.unwrap().lifecycle,
+                    LifecycleState::Draining
+                );
+                assert_eq!(*controller.expected_live_server.lock().await, original);
+            }
+            responder.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_drain_failure_records_real_suspension_and_abort_retries_once() {
+        for failed_restore in [false, true] {
+            let (broker, adapter, _directory) = ordering_broker(false, failed_restore);
+            let controller = ActivationController::start(
+                &broker,
+                ActivationBootstrap::Running {
+                    current: test_record(),
+                    bridge_unit: None,
+                },
+            )
+            .await
+            .expect("controller starts");
+            let handoff = test_handoff();
+            assert!(matches!(
+                controller.admit_prepare(&test_record(), handoff).await,
+                PrepareAdmission::Begin
+            ));
+            broker.drain_for_activation().await.expect("seal admission");
+            broker
+                .suspend_host_for_activation()
+                .await
+                .expect("suspend host");
+            let _ = controller
+                .handle_listener_drain_failure(
+                    &broker,
+                    &test_record(),
+                    handoff,
+                    None,
+                    "injected listener failure",
+                )
+                .await;
+            assert!(matches!(*controller.state.lock().await,
+                ActivationState::Draining { host_suspended, .. } if host_suspended == failed_restore));
+            adapter.resume_fails.store(false, Ordering::SeqCst);
+            let responder = with_listener_commands(&controller, &adapter.calls).await;
+            let (result, _) = controller
+                .handle(
+                    &broker,
+                    ControlOperation::Abort {
+                        handoff_id: handoff,
+                    },
+                )
+                .await;
+            assert!(matches!(result, ControlResult::Aborted(_)));
+            assert_eq!(
+                adapter
+                    .calls()
+                    .iter()
+                    .filter(|call| *call == "resume")
+                    .count(),
+                if failed_restore { 2 } else { 1 }
+            );
+            broker
+                .handle(
+                    PeerRole::Launcher,
+                    ClientRequest::PrepareUiLaunch(launch_request()),
+                    tokio::sync::mpsc::channel(1).0,
+                )
+                .await
+                .expect("launch after restored host");
+            responder.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_rebind_failure_does_not_resume_host_twice() {
+        let (broker, adapter, _directory) = ordering_broker(false, false);
+        let controller = ActivationController::start(
+            &broker,
+            ActivationBootstrap::Running {
+                current: test_record(),
+                bridge_unit: None,
+            },
+        )
+        .await
+        .expect("controller starts");
+        let handoff = test_handoff();
+        assert!(matches!(
+            controller.admit_prepare(&test_record(), handoff).await,
+            PrepareAdmission::Begin
+        ));
+        broker.drain_for_activation().await.expect("seal admission");
+        broker
+            .suspend_host_for_activation()
+            .await
+            .expect("suspend host");
+        if let ActivationState::Draining { host_suspended, .. } =
+            &mut *controller.state.lock().await
+        {
+            *host_suspended = true;
+        }
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(8);
+        controller.install_commands(commands).await;
+        let responder = tokio::spawn(async move {
+            let mut attempt = 0;
+            while let Some(ServerCommand::Resume { complete }) = receiver.recv().await {
+                attempt += 1;
+                let _ = complete.send(if attempt == 1 {
+                    Err("injected rebind failure".to_owned())
+                } else {
+                    Ok(())
+                });
+            }
+        });
+        controller
+            .resume_old_after_disconnect(&broker, &handoff, None)
+            .await;
+        assert!(matches!(
+            *controller.state.lock().await,
+            ActivationState::Draining {
+                host_suspended: false,
+                ..
+            }
+        ));
+        controller
+            .resume_old_after_disconnect(&broker, &handoff, None)
+            .await;
+        assert_eq!(
+            adapter
+                .calls()
+                .iter()
+                .filter(|call| *call == "resume")
+                .count(),
+            1
+        );
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::PrepareUiLaunch(launch_request()),
+                tokio::sync::mpsc::channel(1).0,
+            )
+            .await
+            .expect("launch after rebind retry");
         responder.abort();
     }
 
@@ -4263,6 +4811,63 @@ mod tests {
             "the old broker stays running after a refused prepare, got {result:?}"
         );
         responder.abort();
+    }
+
+    #[tokio::test]
+    async fn refused_prepare_restores_completed_target_handoff() {
+        let (broker, _adapter, _directory) = ordering_broker(true, false);
+        let historical = test_handoff();
+        let controller = ActivationController::start(
+            &broker,
+            ActivationBootstrap::Target {
+                current: test_record(),
+                handoff: historical,
+                live_server: broker.live_identity().await.expect("live identity"),
+                bridge_unit: None,
+            },
+        )
+        .await
+        .expect("target starts");
+        let recovery = absent_recovery();
+        *recovery.0.lock().expect("recovery fixture is writable") = RecoveryView {
+            journal: RecoveryJournalStatus::Present,
+            member: RecoveryMemberStatus::Ready,
+            target_live: true,
+            recover_after: Duration::ZERO,
+        };
+        controller.set_recovery(recovery).await;
+        let (committed, _) = controller
+            .handle(
+                &broker,
+                ControlOperation::Commit {
+                    handoff_id: historical,
+                },
+            )
+            .await;
+        assert!(matches!(committed, ControlResult::Committed(_)));
+        let (refused, _) = controller
+            .handle(
+                &broker,
+                ControlOperation::Prepare {
+                    target: Box::new(test_record()),
+                    handoff_id: test_handoff(),
+                },
+            )
+            .await;
+        assert!(matches!(refused, ControlResult::Error { .. }));
+        let (status, _) = controller.handle(&broker, ControlOperation::Status).await;
+        assert!(matches!(status, ControlResult::Status(ActivationStatus {
+            lifecycle: LifecycleState::Running, phase: ActivationPhase::TargetCommitted,
+            handoff_id: Some(id), target: None, ..
+        }) if id == historical));
+        broker
+            .handle(
+                PeerRole::Launcher,
+                ClientRequest::PrepareUiLaunch(launch_request()),
+                tokio::sync::mpsc::channel(1).0,
+            )
+            .await
+            .expect("refusal leaves launch admission open");
     }
 
     #[tokio::test]

@@ -4,11 +4,16 @@
 
 - Support width and height on portable executable pane actions with host-specific size validation and coordinate-preserving Zellij SDK lowering.
 - Represent uncertain Zellij placement completion explicitly in the bridge protocol. Native and WASM builds must have matching protocol fingerprints; older bridges are rejected rather than silently misdecoded.
+- Add `muxe activate -f` / `--force` with authenticated cooperative retirement, exact-process hard-stop fallback, and durable forced retry.
 
 ### Bug Fixes
 
 - Retain payload-safe reasons for detached and deferred action failures in persistent logs.
 - Format execution IDs as stable 128-bit hexadecimal values in execution logs.
+- Permit another activation after a broker has committed its previous replacement.
+- Restore a completed broker's historical handoff and work admission after a later activation abort or pre-stop refusal.
+- Correct suspension bookkeeping when listener restoration fails, so recovery does not resume the host twice or falsely report it as restored.
+- Refresh the broker's current host-connection identity after a successful activation abort without rewriting its original cleanup registration.
 
 ## [0.4.0] - 2026-10-11
 

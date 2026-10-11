@@ -446,7 +446,9 @@ esac
 ;;
 (activate)
 _arguments "${_arguments_options[@]}" : \
-'--host=[Select live hosts for activation]:HOST:(all current zellij herdr)' \
+'--host=[Select hosts for activation]:HOST:(all current zellij herdr)' \
+'-f[Replace the broker even when its version or lifecycle state would normally prevent activation]' \
+'--force[Replace the broker even when its version or lifecycle state would normally prevent activation]' \
 '-h[Print help]' \
 '--help[Print help]' \
 '-V[Print version]' \
@@ -844,7 +846,7 @@ _muxe_commands() {
 'menu:Open a configured root menu through a host launcher' \
 'pane:Open a generic command pane' \
 'integration:Install or remove managed host integration' \
-'activate:Activate this version for selected live hosts' \
+'activate:Activate this version for selected hosts' \
 'broker:Manage broker lifecycle' \
 'compatibility:Print the embedded compatibility record' \
 'purge:Remove explicitly selected retained Muxe data' \
@@ -969,7 +971,7 @@ _muxe__subcmd__help_commands() {
 'menu:Open a configured root menu through a host launcher' \
 'pane:Open a generic command pane' \
 'integration:Install or remove managed host integration' \
-'activate:Activate this version for selected live hosts' \
+'activate:Activate this version for selected hosts' \
 'broker:Manage broker lifecycle' \
 'compatibility:Print the embedded compatibility record' \
 'purge:Remove explicitly selected retained Muxe data' \

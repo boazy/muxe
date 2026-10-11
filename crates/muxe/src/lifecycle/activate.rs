@@ -39,6 +39,10 @@
 //! preflight orchestration, the journals, the bridge swap and reload fan-out,
 //! commit/abort sequencing, and crash recovery.
 
+#[path = "forced.rs"]
+mod forced;
+use forced::recover_for_force;
+
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -46,7 +50,7 @@ use std::{
 };
 
 use muxe_protocol::control::{
-    ActivationStatus, AsOfTick, CompatibilityRecord, HandoffId, LifecycleState,
+    ActivationPhase, ActivationStatus, AsOfTick, CompatibilityRecord, HandoffId, LifecycleState,
     PrepareHandoffProtocol, TargetReadiness, UnitReadinessEpochId,
 };
 use muxe_protocol::wire::HostKind;
@@ -71,7 +75,8 @@ use super::{
         TransactionMember, UnitKind, unit_hash,
     },
     registry::{
-        BridgeMemberId, BrokerEntry, MemberCensus, RegisteredBroker, Registry, RegistryError,
+        BridgeMemberId, BrokerEntry, MemberCensus, NativeBrokerAuthority, RegisteredBroker,
+        Registry, RegistryError,
     },
 };
 
@@ -86,6 +91,8 @@ pub enum ActivateStep {
     BridgeSwapped,
     OldInstallAppliedBeforeOutcome,
     ReloadIssued,
+    /// Exact target identities are verified, but Ready is not durable yet.
+    ReadyVerified,
     ReadinessRecorded,
     ReceiptUpdated,
     TerminalWritten,
@@ -182,6 +189,9 @@ pub struct StagedBridge {
     reason = "coordinator traits use static dispatch with one implementation per process; no Send bound is required"
 )]
 pub trait ControlSession {
+    fn authority(&self) -> Option<&super::control::ControlAuthority> {
+        None
+    }
     async fn status(&mut self) -> Result<ActivationStatus, ControlError>;
     async fn status_at(
         &mut self,
@@ -199,9 +209,18 @@ pub trait ControlSession {
     async fn commit(&mut self, handoff: &HandoffId) -> Result<ActivationStatus, ControlError>;
     async fn abort(&mut self, handoff: &HandoffId) -> Result<ActivationStatus, ControlError>;
     async fn retire(&mut self) -> Result<ActivationStatus, ControlError>;
+    async fn forced_peer(
+        &mut self,
+        _entry: &NativeBrokerAuthority<'_>,
+    ) -> Result<super::control::ForcedPeer, ControlError> {
+        Err(ControlError::PeerIdentity)
+    }
 }
 
 impl ControlSession for ControlClient {
+    fn authority(&self) -> Option<&super::control::ControlAuthority> {
+        Some(ControlClient::authority(self))
+    }
     async fn status(&mut self) -> Result<ActivationStatus, ControlError> {
         ControlClient::status(self).await
     }
@@ -228,6 +247,12 @@ impl ControlSession for ControlClient {
     }
     async fn retire(&mut self) -> Result<ActivationStatus, ControlError> {
         ControlClient::retire(self).await
+    }
+    async fn forced_peer(
+        &mut self,
+        entry: &NativeBrokerAuthority<'_>,
+    ) -> Result<super::control::ForcedPeer, ControlError> {
+        ControlClient::forced_peer(self, entry).await
     }
 }
 
@@ -303,6 +328,7 @@ enum TargetStopFault {
 pub struct TargetHandle {
     pub child: std::process::Child,
     cleanup_on_drop: bool,
+    exit_observed: bool,
     #[cfg(test)]
     stop_fault: Option<TargetStopFault>,
 }
@@ -313,9 +339,22 @@ impl TargetHandle {
         Self {
             child,
             cleanup_on_drop: true,
+            exit_observed: false,
             #[cfg(test)]
             stop_fault: None,
         }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.exit_observed |= status.is_some();
+        Ok(status)
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.exit_observed = true;
+        Ok(status)
     }
 
     pub(crate) fn surrender_to_live_broker(&mut self) {
@@ -337,6 +376,13 @@ impl Drop for TargetHandle {
 struct OwnedTarget {
     member: MemberTransactionId,
     handle: TargetHandle,
+    gated_registration: Option<CertifiedGatedRegistration>,
+}
+
+#[derive(Debug)]
+struct CertifiedGatedRegistration {
+    entry: RegisteredBroker,
+    endpoint: super::control::EndpointIdentity,
 }
 
 /// Bounded owner for one activation unit. It never outlives the coordinator
@@ -471,7 +517,7 @@ impl ActivationSupervisor {
         self.targets
             .iter_mut()
             .find(|target| &target.member == member)
-            .is_some_and(|target| matches!(target.handle.child.try_wait(), Ok(None)))
+            .is_some_and(|target| matches!(target.handle.try_wait(), Ok(None)))
     }
 }
 
@@ -521,7 +567,6 @@ impl BrokerSpawner for ProcessSpawner {
             ));
         }
         if handle
-            .child
             .try_wait()
             .map_err(|source| ActivateError::TargetStopInspect(source.to_string()))?
             .is_none()
@@ -544,7 +589,6 @@ impl BrokerSpawner for ProcessSpawner {
             ));
         }
         handle
-            .child
             .wait()
             .map(|_| ())
             .map_err(|source| ActivateError::TargetStopWait(source.to_string()))
@@ -925,7 +969,7 @@ pub(crate) enum PlannedUnit {
 }
 
 impl PlannedUnit {
-    fn unit_kind(&self) -> UnitKind {
+    pub(crate) fn unit_kind(&self) -> UnitKind {
         match self {
             Self::Herdr { entry } => UnitKind::Herdr {
                 host_hash: unit_hash(entry.discovery_key().as_str()),
@@ -935,6 +979,13 @@ impl PlannedUnit {
             } => UnitKind::Zellij {
                 bridge_unit: bridge_identity.unit(),
             },
+        }
+    }
+
+    fn entries(&self) -> &[RegisteredBroker] {
+        match self {
+            Self::Herdr { entry } => std::slice::from_ref(entry),
+            Self::Zellij { entries, .. } => entries,
         }
     }
 
@@ -970,6 +1021,11 @@ trait ActivationHost: HostPreflight {
     fn attests_entry(&self, status: &ActivationStatus, entry: &RegisteredBroker) -> bool;
     fn wire_host(&self) -> muxe_protocol::wire::HostKind;
     fn bridge(&self) -> Option<&dyn BridgeActivation>;
+    fn revalidate_forced_locked(
+        &self,
+        cache_dir: &Path,
+        prior: Option<&forced::ForcedRecovery>,
+    ) -> Result<(), String>;
     async fn preflight<P: Preflight>(&self, preflight: &P, config_dir: &Path)
     -> Result<(), String>;
     fn attests_host(&self, status: &ActivationStatus) -> bool;
@@ -1002,6 +1058,11 @@ trait BridgeActivation {
         preparation: &mut GlobalPreflight,
     ) -> Result<(), String>;
     fn revalidate_locked(&self, cache_dir: &Path) -> Result<(), String>;
+    fn revalidate_forced(
+        &self,
+        cache_dir: &Path,
+        prior: Option<&forced::ForcedRecovery>,
+    ) -> Result<(), String>;
     fn unchanged_bridge(&self, preparation: &GlobalPreflight) -> bool;
     fn target_coverage(&self, status: &ActivationStatus, target: &CompatibilityRecord) -> bool;
     fn retirement_guard(
@@ -1090,6 +1151,31 @@ impl ActivationHost for HerdrActivation<'_> {
     type ReadinessGuard = ();
     type ProofSnapshot = ();
 
+    fn revalidate_forced_locked(
+        &self,
+        cache_dir: &Path,
+        _prior: Option<&forced::ForcedRecovery>,
+    ) -> Result<(), String> {
+        let selected = self.0;
+        let rows = Registry::open(cache_dir)
+            .map_err(|error| error.to_string())?
+            .entries()
+            .map_err(|error| error.to_string())?;
+        let mut owners = rows.iter().filter(|row| {
+            row.socket == selected.socket()
+                || (row.host_kind == "herdr"
+                    && row.discovery_key == selected.discovery_key().as_str())
+        });
+        let owner = owners.next();
+        if owners.next().is_some() || owner.is_some_and(|row| !selected.matches_recorded(row)) {
+            return Err(format!(
+                "Muxe cannot force-replace Herdr broker {}: multiple or conflicting registrations claim its socket or host identity. No stop has begun for this activation target",
+                selected.discovery_key()
+            ));
+        }
+        Ok(())
+    }
+
     fn entries(&self) -> &[RegisteredBroker] {
         std::slice::from_ref(self.0)
     }
@@ -1165,6 +1251,14 @@ impl ActivationHost for HerdrActivation<'_> {
 impl ActivationHost for ZellijActivation<'_> {
     type ReadinessGuard = muxe_adapter_zellij::ReadinessGateGuard;
     type ProofSnapshot = (BridgeIdentity, Vec<RegisteredBroker>, MemberCensus);
+
+    fn revalidate_forced_locked(
+        &self,
+        cache_dir: &Path,
+        prior: Option<&forced::ForcedRecovery>,
+    ) -> Result<(), String> {
+        self.revalidate_forced(cache_dir, prior)
+    }
 
     fn entries(&self) -> &[RegisteredBroker] {
         self.entries
@@ -1332,6 +1426,70 @@ impl BridgeActivation for ZellijActivation<'_> {
         Ok(())
     }
 
+    fn revalidate_forced(
+        &self,
+        cache_dir: &Path,
+        prior: Option<&forced::ForcedRecovery>,
+    ) -> Result<(), String> {
+        let registry = Registry::open(cache_dir).map_err(|error| error.to_string())?;
+        let recorded = recorded_zellij_group(
+            &registry.entries().map_err(|error| error.to_string())?,
+            self.identity,
+        )
+        .map_err(|error| error.to_string())?;
+        if recorded.iter().any(|entry| {
+            !self.entries.contains(entry)
+                && !prior.is_some_and(|prior| {
+                    prior
+                        .journal
+                        .old_registry
+                        .iter()
+                        .any(|saved| entry.matches_recorded(saved))
+                })
+        }) {
+            return Err("a recorded Zellij session lies outside the exact planned and saved activation participants; no stop has begun for this unit".to_owned());
+        }
+        let live = registry.probe().map_err(|error| error.to_string())?.live;
+        let current =
+            recorded_zellij_group(&live, self.identity).map_err(|error| error.to_string())?;
+        if current.iter().any(|entry| !self.entries.contains(entry)) {
+            return Err("the live Zellij bridge group changed before forced replacement; no stop has begun for this unit".to_owned());
+        }
+        for entry in self.entries {
+            if current.contains(entry) {
+                continue;
+            }
+            let stopped = prior.is_some_and(|prior| {
+                prior.stopped.iter().any(|stop| {
+                    entry.matches_recorded(&stop.entry) && stop.authority.proof.is_some()
+                })
+            });
+            let identity = prior
+                .and_then(|prior| {
+                    prior
+                        .journal
+                        .members()
+                        .iter()
+                        .find(|member| member.endpoint().as_path() == entry.socket())
+                })
+                .and_then(|member| member.forced_stop.as_ref())
+                .map(|stop| &stop.process)
+                .or_else(|| entry.process_identity());
+            let safe = stopped
+                || identity.is_some_and(|identity| {
+                    identity.authorizes_stored_peer() || identity.is_gone().is_ok_and(|gone| gone)
+                });
+            if !safe {
+                return Err(format!(
+                    "Muxe cannot safely identify the unreachable broker for Zellij session {} (process {}). Leave its saved activation record unchanged; this unit was not stopped by this attempt",
+                    entry.discovery_key(),
+                    entry.server_pid().get()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn unchanged_bridge(&self, preparation: &GlobalPreflight) -> bool {
         matches!(
             (&preparation.expected_current, &preparation.verified_bridge),
@@ -1371,7 +1529,7 @@ impl BridgeActivation for ZellijActivation<'_> {
         let identity = integration::bridge_identity(config_dir)
             .map_err(|error| format!("cannot resolve the managed bridge location: {error}"))?;
         let stable = identity.stable_path(std::ffi::OsStr::new(integration::BRIDGE_FILE_NAME));
-        let receipt = integration::receipt::load(identity.directory())
+        let mut receipt = integration::receipt::load(identity.directory())
             .map_err(|error| format!("cannot read integration receipt: {error}"))?
             .ok_or_else(|| {
                 "activation requires an existing receipt-owned Zellij bridge; install it first"
@@ -1383,8 +1541,57 @@ impl BridgeActivation for ZellijActivation<'_> {
                 receipt.bridge.bridge_identity, identity
             ));
         }
-        integration::bridge::check_previous(&stable, receipt.bridge.previous_digest.as_ref())
-            .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
+        let committing = preparation
+            .forced_retries
+            .iter()
+            .find(|recovery| {
+                recovery.journal.unit
+                    == (UnitKind::Zellij {
+                        bridge_unit: self.identity.unit(),
+                    })
+                    && recovery.journal.directive() == TransactionDirective::Commit
+            })
+            .and_then(|recovery| recovery.journal.bridge());
+        if let Some(commit) = committing {
+            let artifacts = &commit.artifacts;
+            if receipt.bridge != artifacts.receipt_preimage
+                && receipt.bridge != artifacts.receipt_target
+            {
+                return Err("the bridge receipt no longer matches either side of the saved commit; no forced stop is authorized".to_owned());
+            }
+            for (artifact, digest) in [
+                (artifacts.old, &artifacts.old_digest),
+                (artifacts.target, &artifacts.target_digest),
+            ] {
+                let path = integration::bridge::artifact_path(self.identity, artifact);
+                let bytes = fsutil::read_owner_file(&path).map_err(|error| {
+                    format!("cannot verify the bridge file required by the saved commit: {error}")
+                })?;
+                if fsutil::sha256_hex(&bytes) != digest.as_str() {
+                    return Err(format!(
+                        "bridge artifact {} differs from its saved digest; no forced stop is authorized",
+                        path.display()
+                    ));
+                }
+            }
+            if integration::bridge::check_previous(&stable, receipt.bridge.previous_digest.as_ref())
+                .is_err()
+            {
+                integration::bridge::check_previous(
+                    &stable,
+                    artifacts.receipt_target.previous_digest.as_ref(),
+                )
+                .map_err(|error| {
+                    format!("the rollback copy matches neither saved commit state: {error}")
+                })?;
+            }
+            // Validate the state the original durable Commit will publish,
+            // without changing it or stopping any participant during preflight.
+            receipt.bridge = artifacts.receipt_target.clone();
+        } else {
+            integration::bridge::check_previous(&stable, receipt.bridge.previous_digest.as_ref())
+                .map_err(|error| format!("rollback copy preflight failed: {error}"))?;
+        }
         let (eligibility, _) =
             integration::bridge::check_destination(&stable, Some(&receipt.bridge.installed_digest))
                 .map_err(|error| format!("bridge preflight failed: {error}"))?;
@@ -1617,6 +1824,8 @@ pub trait TargetSpawnSelector {
 pub type SpawnPolicySelector<'a> = &'a dyn TargetSpawnSelector;
 
 pub struct ActivateInputs<'a, C, S, R, P> {
+    /// Replace even a current or incorrectly phased broker using exact stop authority.
+    pub force: bool,
     pub config_dir: &'a Path,
     pub cache_dir: &'a Path,
     pub target: CompatibilityRecord,
@@ -1642,6 +1851,7 @@ struct GlobalPreflight {
     verified_bridge: Option<compatibility::NativeAssetVerification>,
     expected_current: Option<Sha256Digest>,
     bridge_receipt: Option<integration::receipt::BridgeRecord>,
+    forced_retries: Vec<forced::ForcedRecovery>,
 }
 
 /// Runs one activation across every selected unit, committing or rolling back
@@ -1661,26 +1871,46 @@ where
     R: HostReloader,
     P: Preflight,
 {
-    let recovered = recover(
-        inputs.cache_dir,
-        inputs.control,
-        inputs.reloader,
-        inputs.logger,
-    )
-    .await?;
-    if let Some(RecoveryOutcome::Preserved { unit, reason }) = recovered
-        .iter()
-        .find(|outcome| matches!(outcome, RecoveryOutcome::Preserved { .. }))
-    {
-        return Err(ActivateError::UnitFailed {
-            reason: format!("activation recovery remains unresolved for {unit}: {reason}"),
-        });
-    }
+    let forced_retries = if inputs.force {
+        recover_for_force(&inputs).await?
+    } else {
+        let recovered = recover(
+            inputs.cache_dir,
+            inputs.control,
+            inputs.reloader,
+            inputs.logger,
+        )
+        .await?;
+        if let Some(RecoveryOutcome::Preserved { unit, reason }) = recovered
+            .iter()
+            .find(|outcome| matches!(outcome, RecoveryOutcome::Preserved { .. }))
+        {
+            return Err(ActivateError::UnitFailed {
+                reason: format!("activation recovery remains unresolved for {unit}: {reason}"),
+            });
+        }
+        Vec::new()
+    };
 
     inputs.hooks.check(ActivateStep::PreflightDone)?;
 
     let registry = Registry::open(inputs.cache_dir)?;
-    let live = registry.probe()?.live;
+    let mut live = if inputs.force {
+        force_registry_rows(&registry, inputs.scope, inputs.current.as_ref())?
+    } else {
+        registry.probe()?.live
+    };
+    for prior in &forced_retries {
+        for row in &prior.rows {
+            if !live.iter().any(|current| {
+                current.socket == row.socket
+                    || (current.host_kind == row.host_kind
+                        && current.discovery_key == row.discovery_key)
+            }) {
+                live.push(row.clone());
+            }
+        }
+    }
     let units = select_units(&live, inputs.scope, inputs.current.as_ref())?;
     if units.is_empty() {
         return Err(ActivateError::NoLiveUnits);
@@ -1688,7 +1918,7 @@ where
 
     // Global preflight before any unit mutates. Transaction artifacts are
     // created only after the complete v2 intent journal is durable.
-    let mut preparation = global_preflight(&inputs, &units)
+    let mut preparation = global_preflight(&inputs, &units, forced_retries)
         .await
         .map_err(ActivateError::Preflight)?;
     inputs.hooks.check(ActivateStep::PreflightDone)?;
@@ -1700,6 +1930,85 @@ where
             .push(activate_unit(&inputs, &unit, &mut preparation).await);
     }
     Ok(report)
+}
+
+fn force_registry_rows(
+    registry: &Registry,
+    scope: HostScope,
+    current: Option<&DetectedHost>,
+) -> Result<Vec<BrokerEntry>, ActivateError> {
+    let probe = registry.probe()?;
+    let mut rows = probe.live;
+    let candidates = probe
+        .stale
+        .into_iter()
+        .filter(|row| {
+            row.process_identity
+                .as_ref()
+                .is_some_and(muxe_process::ProcessIdentity::authorizes_stored_peer)
+        })
+        .collect::<Vec<_>>();
+    let units = match select_units(&candidates, scope, current) {
+        Ok(units) => units,
+        Err(ActivateError::NoLiveUnits) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    for unit in units {
+        for entry in unit.entries() {
+            let identity = entry
+                .process_identity()
+                .expect("selected strong OS identity");
+            match identity.is_gone() {
+                Ok(false) => rows.push(entry.recorded_entry()),
+                Ok(true) => {}
+                Err(error) => {
+                    return Err(ActivateError::UnitFailed {
+                        reason: format!(
+                            "Muxe cannot inspect unreachable broker {} (process {}): {error}. No stop was authorized for this registration",
+                            entry.discovery_key(),
+                            entry.server_pid().get()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Reads candidate host requirements without applying forced recovery.
+///
+/// # Errors
+///
+/// Refuses corrupt journals or registrations whose saved host unit is inconsistent.
+pub fn force_selection_rows(
+    cache_dir: &Path,
+    scope: HostScope,
+    current: Option<&DetectedHost>,
+) -> Result<Vec<BrokerEntry>, ActivateError> {
+    let registry = Registry::open(cache_dir)?;
+    let mut rows = force_registry_rows(&registry, scope, current)?;
+    for (_, saved) in journal::list_journals(cache_dir)? {
+        let saved = saved?;
+        forced::validate_admission_scope(&saved)?;
+        let candidates = if let Some(proof) = saved.ready_proof().filter(|_| {
+            saved.directive() == TransactionDirective::Commit && saved.has_commit_certificate()
+        }) {
+            proof
+                .incarnations
+                .iter()
+                .map(|proof| proof.entry.clone())
+                .collect::<Vec<_>>()
+        } else {
+            saved.old_registry
+        };
+        for row in candidates {
+            if !rows.iter().any(|known| known.socket == row.socket) {
+                rows.push(row);
+            }
+        }
+    }
+    Ok(rows)
 }
 
 pub(crate) fn select_units(
@@ -1883,6 +2192,7 @@ fn zellij_unit(
 async fn global_preflight<C, S, R, P>(
     inputs: &ActivateInputs<'_, C, S, R, P>,
     units: &[PlannedUnit],
+    forced_retries: Vec<forced::ForcedRecovery>,
 ) -> Result<GlobalPreflight, String>
 where
     P: Preflight,
@@ -1891,6 +2201,7 @@ where
         verified_bridge: None,
         expected_current: None,
         bridge_receipt: None,
+        forced_retries,
     };
     // Select the concrete bridge validator once before any unit mutates.
     if let Some(bridge) = units.iter().find_map(|unit| match unit {
@@ -1989,24 +2300,59 @@ where
 {
     let label = unit_label(unit);
     let unit_kind = unit.unit_kind();
-    let _unit_lock = match journal::acquire_unit_lock(inputs.cache_dir, &unit_kind) {
-        Ok(lock) => lock,
-        Err(error) => {
-            return UnitOutcome::Failed {
-                unit: label,
-                reason: format!("could not lock this activation target: {error}"),
-            };
+    let position = preparation
+        .forced_retries
+        .iter()
+        .position(|recovery| recovery.journal.unit == unit_kind);
+    let mut prior = position.map(|index| preparation.forced_retries.remove(index));
+    let _unit_lock = if prior.is_some() {
+        None
+    } else {
+        match journal::acquire_unit_lock(inputs.cache_dir, &unit_kind) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                return UnitOutcome::Failed {
+                    unit: label,
+                    reason: format!("could not lock this activation target: {error}"),
+                };
+            }
         }
     };
-    if let Some(bridge) = host.bridge()
-        && let Err(reason) = bridge.revalidate_locked(inputs.cache_dir)
-    {
+    let validation = if inputs.force {
+        host.revalidate_forced_locked(inputs.cache_dir, prior.as_ref())
+    } else {
+        host.bridge()
+            .map_or(Ok(()), |bridge| bridge.revalidate_locked(inputs.cache_dir))
+    };
+    if let Err(reason) = validation {
         return UnitOutcome::Failed {
             unit: label,
             reason,
         };
     }
-    match activate_unit_inner_prepared(inputs, unit, host, unit_kind, preparation).await {
+    if let Some(recovery) = &mut prior
+        && recovery.journal.directive() == TransactionDirective::Commit
+    {
+        match forced::resolve_commit(
+            inputs.cache_dir,
+            inputs.control,
+            inputs.reloader,
+            &mut recovery.journal,
+        )
+        .await
+        {
+            Ok(stopped) => recovery.stopped = stopped,
+            Err(error) => {
+                return UnitOutcome::Failed {
+                    unit: label,
+                    reason: error.to_string(),
+                };
+            }
+        }
+    }
+    match activate_unit_inner_prepared(inputs, unit, host, unit_kind, preparation, prior.as_ref())
+        .await
+    {
         Ok(outcome) => outcome,
         Err(ActivateError::FaultInjected { step }) => UnitOutcome::Failed {
             unit: label,
@@ -2078,7 +2424,7 @@ fn revalidate_transaction_membership(
 struct PreparedMember<C: ControlPort> {
     entry: RegisteredBroker,
     handoff: HandoffId,
-    old_session: C::Session,
+    old_session: Option<C::Session>,
 }
 
 /// Session-free authority copied into a bounded, read-only filesystem probe.
@@ -2107,7 +2453,7 @@ where
     R: HostReloader,
     P: Preflight,
 {
-    let mut preparation = global_preflight(inputs, std::slice::from_ref(unit))
+    let mut preparation = global_preflight(inputs, std::slice::from_ref(unit), Vec::new())
         .await
         .map_err(ActivateError::Preflight)?;
     Ok(activate_unit(inputs, unit, &mut preparation).await)
@@ -2123,6 +2469,7 @@ async fn activate_unit_inner_prepared<C, S, R, P, H>(
     host: &H,
     unit_kind: UnitKind,
     preparation: &mut GlobalPreflight,
+    prior: Option<&forced::ForcedRecovery>,
 ) -> Result<UnitOutcome, ActivateError>
 where
     C: ControlPort,
@@ -2137,15 +2484,84 @@ where
     // Observe exact old records before constructing the complete journal. No
     // Prepare can occur until every handoff and member intent is durable.
     let mut observed = Vec::with_capacity(entries.len());
+    let mut forced_peers = Vec::new();
+    let mut forced_authorities = Vec::new();
     let mut all_current = true;
     for entry in entries {
-        let mut session = inputs
-            .control
-            .connect(entry.socket())
-            .await
-            .map_err(|error| ActivateError::UnitFailed {
-                reason: format!("could not connect to the existing broker {} to check activation prerequisites: {error}. No replacement broker was started for this activation target", entry.discovery_key()),
-            })?;
+        if inputs.force {
+            let ended = prior.and_then(|prior| {
+                prior
+                    .stopped
+                    .iter()
+                    .find(|stop| entry.matches_recorded(&stop.entry))
+            });
+            if let Some(ended) = ended {
+                observed.push((entry.clone(), ended.old_record.clone()));
+                forced_authorities.push(ended.authority.clone());
+                forced_peers.push(None);
+            } else {
+                let previous = prior.and_then(|prior| {
+                    prior
+                        .journal
+                        .old_registry
+                        .iter()
+                        .any(|row| entry.matches_recorded(row))
+                        .then(|| {
+                            prior
+                                .journal
+                                .members()
+                                .iter()
+                                .find(|member| member.endpoint().as_path() == entry.socket())
+                        })
+                        .flatten()
+                        .and_then(|member| member.forced_stop.as_ref())
+                });
+                let admitted = if let Some(prior) = prior {
+                    NativeBrokerAuthority::from_journal(inputs.cache_dir, &prior.journal, entry)?
+                } else {
+                    NativeBrokerAuthority::from_registry(&Registry::open(inputs.cache_dir)?, entry)?
+                };
+                let (session, peer, authority) =
+                    forced::capture_participant(inputs.control, &admitted, previous, false, None)
+                        .await?;
+                if peer
+                    .as_ref()
+                    .and_then(|peer| peer.status.as_ref())
+                    .is_some_and(|status| {
+                        !host.attests_host(status)
+                            || status.live_server.discovery_key != entry.discovery_key().as_str()
+                    })
+                {
+                    return Err(ActivateError::UnitFailed {
+                        reason: format!(
+                            "broker {} reports a different host identity; this participant was not stopped",
+                            entry.discovery_key()
+                        ),
+                    });
+                }
+                let record =
+                    peer.as_ref()
+                        .and_then(|peer| peer.status.as_ref())
+                        .map(|status| status.current.clone())
+                        .or_else(|| {
+                            prior
+                                .and_then(|prior| {
+                                    prior.journal.members().iter().find(|member| {
+                                        member.endpoint().as_path() == entry.socket()
+                                    })
+                                })
+                                .and_then(|member| member.old_record.clone())
+                        });
+                observed.push((entry.clone(), record));
+                forced_authorities.push(authority);
+                forced_peers.push(peer.map(|peer| (session, peer)));
+            }
+            all_current = false;
+            continue;
+        }
+        let mut session = inputs.control.connect(entry.socket()).await.map_err(|error| ActivateError::UnitFailed {
+            reason: format!("could not connect to existing broker {}: {error}. No replacement was started for this unit", entry.discovery_key()),
+        })?;
         let status = session
             .status()
             .await
@@ -2174,10 +2590,16 @@ where
                 "cannot be replaced in its current state: {}. Activation requires the broker to be accepting normal work",
                 status.lifecycle
             ))
-        } else {
-            status.handoff_id.map(|handoff| format!(
-                "still reports a broker replacement request (request ID {handoff}). A new activation requires that request to be cleared"
+        } else if !accepts_new_activation(&status) {
+            Some(format!(
+                "still reports an unfinished broker replacement (phase {:?}, request ID {}). A new activation requires that replacement to finish",
+                status.phase,
+                status
+                    .handoff_id
+                    .map_or_else(|| "none".to_owned(), |handoff| handoff.to_string())
             ))
+        } else {
+            None
         };
         if let Some(reason) = rejection {
             return Err(ActivateError::UnitFailed {
@@ -2188,7 +2610,7 @@ where
             });
         }
         all_current &= status.current == inputs.target;
-        observed.push((entry.clone(), status.current));
+        observed.push((entry.clone(), Some(status.current)));
     }
     if all_current
         && host
@@ -2217,8 +2639,20 @@ where
     journal
         .old_registry
         .extend(entries.iter().map(RegisteredBroker::recorded_entry));
+    if inputs.force {
+        journal.schema_version = journal::FORCED_ACTIVATION_JOURNAL_SCHEMA_VERSION;
+        for (member, authority) in journal.members_mut().iter_mut().zip(forced_authorities) {
+            if authority.proof.is_some() {
+                member.old = OldMemberProgress::ForceStopped;
+            }
+            member.forced_stop = Some(authority);
+        }
+    }
     if let Some(bridge) = host.bridge() {
         bridge.bind_authority(&mut journal, preparation, &inputs.target)?;
+    }
+    if let Some(prior) = prior {
+        journal::retain_before_force(inputs.cache_dir, &prior.journal)?;
     }
     let journal_path = journal::write_journal(inputs.cache_dir, &journal)?;
     // Private artifacts are created only after their exact typed identities,
@@ -2275,50 +2709,69 @@ where
     }
 
     let mut prepared = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let member_index = journal
-            .members()
-            .iter()
-            .position(|member| member.endpoint().as_path() == entry.socket())
-            .expect("journal member covers every planned entry");
-        journal.members_mut()[member_index].old = OldMemberProgress::PrepareIntent;
-        if let Err(error) = journal::write_journal(inputs.cache_dir, &journal) {
-            let reason = error.to_string();
-            let diagnostics = rollback_transaction(
-                inputs,
-                unit,
-                &mut journal,
-                &journal_path,
-                prepared,
-                Vec::new(),
-                reason.clone(),
-            )
-            .await;
-            return Ok(rollback_outcome(label, reason, &journal, diagnostics));
-        }
-        let handoff = journal.members()[member_index].handoff_id();
-        let old_record = journal.members()[member_index].old_record.clone();
-        match drain_one(inputs, host, entry, handoff, &old_record).await {
-            Ok(member) => {
-                journal.members_mut()[member_index].old = OldMemberProgress::Drained;
-                prepared.push(member);
-                if let Err(error) = journal::write_journal(inputs.cache_dir, &journal) {
-                    let reason = error.to_string();
-                    let diagnostics = rollback_transaction(
-                        inputs,
-                        unit,
-                        &mut journal,
-                        &journal_path,
-                        prepared,
-                        Vec::new(),
-                        reason.clone(),
-                    )
-                    .await;
-                    return Ok(rollback_outcome(label, reason, &journal, diagnostics));
+    if inputs.force {
+        for (index, captured) in forced_peers.into_iter().enumerate() {
+            if let Some((mut session, peer)) = captured {
+                if let Err(error) =
+                    stop_forced_member(inputs, host, &mut journal, index, session.as_mut(), peer)
+                        .await
+                {
+                    return Ok(UnitOutcome::Failed {
+                        unit: label,
+                        reason: format!(
+                            "{error}; forced intent retained at {}. Run muxe activate --force to resume",
+                            journal_path.display()
+                        ),
+                    });
+                }
+            } else if let Some(endpoint) = journal.members()[index]
+                .forced_stop
+                .as_ref()
+                .and_then(|stop| stop.endpoint.as_ref())
+            {
+                endpoint
+                    .remove_stopped()
+                    .map_err(|error| ActivateError::UnitFailed {
+                        reason: error.to_string(),
+                    })?;
+            } else {
+                match std::os::unix::net::UnixStream::connect(entries[index].socket()) {
+                    Ok(_) => {
+                        return Err(ActivateError::UnitFailed {
+                            reason: format!(
+                                "broker {} ended, but its path now has an unauthenticated listener; no replacement was started",
+                                entries[index].discovery_key()
+                            ),
+                        });
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) => {}
+                    Err(error) => {
+                        return Err(ActivateError::UnitFailed {
+                            reason: error.to_string(),
+                        });
+                    }
                 }
             }
-            Err(PrepareFailure::Refused { reason, evidence }) => {
-                let member = journal.members()[member_index].member().clone();
+            prepared.push(PreparedMember {
+                entry: entries[index].clone(),
+                handoff: journal.members()[index].handoff_id(),
+                old_session: None,
+            });
+        }
+    } else {
+        for entry in entries {
+            let member_index = journal
+                .members()
+                .iter()
+                .position(|member| member.endpoint().as_path() == entry.socket())
+                .expect("journal member covers every planned entry");
+            journal.members_mut()[member_index].old = OldMemberProgress::PrepareIntent;
+            if let Err(error) = journal::write_journal(inputs.cache_dir, &journal) {
+                let reason = error.to_string();
                 let diagnostics = rollback_transaction(
                     inputs,
                     unit,
@@ -2329,20 +2782,62 @@ where
                     reason.clone(),
                 )
                 .await;
-                return Ok(prepare_refusal_outcome(
-                    label,
-                    member,
-                    reason,
-                    evidence,
-                    &journal,
-                    diagnostics,
-                ));
+                return Ok(rollback_outcome(label, reason, &journal, diagnostics));
             }
-            Err(PrepareFailure::Ambiguous(reason)) => {
-                return Ok(UnitOutcome::Failed {
-                    unit: label,
-                    reason: format!("{reason}; journal preserved at {}", journal_path.display()),
-                });
+            let handoff = journal.members()[member_index].handoff_id();
+            let old_record = journal.members()[member_index]
+                .old_record
+                .clone()
+                .expect("ordinary activation observed old compatibility");
+            match drain_one(inputs, host, entry, handoff, &old_record).await {
+                Ok(member) => {
+                    journal.members_mut()[member_index].old = OldMemberProgress::Drained;
+                    prepared.push(member);
+                    if let Err(error) = journal::write_journal(inputs.cache_dir, &journal) {
+                        let reason = error.to_string();
+                        let diagnostics = rollback_transaction(
+                            inputs,
+                            unit,
+                            &mut journal,
+                            &journal_path,
+                            prepared,
+                            Vec::new(),
+                            reason.clone(),
+                        )
+                        .await;
+                        return Ok(rollback_outcome(label, reason, &journal, diagnostics));
+                    }
+                }
+                Err(PrepareFailure::Refused { reason, evidence }) => {
+                    let member = journal.members()[member_index].member().clone();
+                    let diagnostics = rollback_transaction(
+                        inputs,
+                        unit,
+                        &mut journal,
+                        &journal_path,
+                        prepared,
+                        Vec::new(),
+                        reason.clone(),
+                    )
+                    .await;
+                    return Ok(prepare_refusal_outcome(
+                        label,
+                        member,
+                        reason,
+                        evidence,
+                        &journal,
+                        diagnostics,
+                    ));
+                }
+                Err(PrepareFailure::Ambiguous(reason)) => {
+                    return Ok(UnitOutcome::Failed {
+                        unit: label,
+                        reason: format!(
+                            "{reason}; journal preserved at {}",
+                            journal_path.display()
+                        ),
+                    });
+                }
             }
         }
     }
@@ -2431,6 +2926,7 @@ where
                 targets.push(OwnedTarget {
                     member: journal.members()[index].id.clone(),
                     handle,
+                    gated_registration: None,
                 });
                 if let Err(error) = journal::write_journal(inputs.cache_dir, &journal) {
                     let reason = format!("persist exact spawned target: {error}");
@@ -2472,6 +2968,19 @@ where
         .collect::<Vec<_>>();
     let pre_ready = async {
         inputs.hooks.check(ActivateStep::TargetSpawned)?;
+        let deadline = Instant::now() + inputs.readiness_deadline;
+        if journal.is_forced() && host.bridge().is_some() {
+            wait_gated_registrations(
+                inputs.control,
+                inputs.cache_dir,
+                &journal,
+                &prepared,
+                &mut targets,
+                deadline,
+                inputs.poll_interval,
+            )
+            .await?;
+        }
         if let Some(bridge) = host.bridge() {
             bridge.install_and_reload(
                 inputs.cache_dir,
@@ -2482,7 +2991,6 @@ where
             )?;
         }
 
-        let deadline = Instant::now() + inputs.readiness_deadline;
         for member in &prepared {
             wait_ready(
                 inputs.control,
@@ -2554,7 +3062,9 @@ where
             },
         )
         .await?;
-        journal::ReadyProof::new(&journal, epoch, incarnations).map_err(ActivateError::from)
+        let proof = journal::ReadyProof::new(&journal, epoch, incarnations)?;
+        inputs.hooks.check(ActivateStep::ReadyVerified)?;
+        Ok::<_, ActivateError>(proof)
     }
     .await;
     let sealed_proof = match proof_result {
@@ -2609,9 +3119,18 @@ where
             .iter()
             .position(|record| record.endpoint().as_path() == member.entry.socket())
             .expect("commit member remains journaled");
+        if journal.members()[index].old == OldMemberProgress::ForceStopped {
+            continue;
+        }
         journal.members_mut()[index].old = OldMemberProgress::CommitIntent;
         journal::write_journal(inputs.cache_dir, &journal)?;
-        match member.old_session.commit(&member.handoff).await {
+        match member
+            .old_session
+            .as_mut()
+            .expect("cooperative member retains its old session")
+            .commit(&member.handoff)
+            .await
+        {
             Ok(_) => {
                 if !journal::has_old_retirement_receipt(
                     &journal::activation_dir(inputs.cache_dir),
@@ -2697,6 +3216,90 @@ where
     Ok(UnitOutcome::Committed { unit: label })
 }
 
+async fn stop_forced_member<C: ControlPort, H: ActivationHost>(
+    inputs: &ActivateInputs<'_, C, impl BrokerSpawner, impl HostReloader, impl Preflight>,
+    host: &H,
+    journal: &mut ActivationJournal,
+    index: usize,
+    session: Option<&mut C::Session>,
+    peer: super::control::ForcedPeer,
+) -> Result<(), ActivateError> {
+    journal.members_mut()[index].old = OldMemberProgress::ForceStopIntent;
+    journal::write_journal(inputs.cache_dir, journal)?;
+    let retired = if let Some(session) = session {
+        Some(tokio::time::timeout(Duration::from_secs(5), session.retire()).await)
+    } else {
+        None
+    };
+    let cooperative = matches!(&retired, Some(Ok(Ok(status)))
+        if status.lifecycle == LifecycleState::Retired
+            && status.target.is_none() && status.handoff_id.is_none()
+            && host.attests_host(status)
+            && status.live_server.discovery_key == journal.members()[index].member().as_str());
+    let proof = if cooperative {
+        journal::ForcedStopProof::CooperativeRetirement
+    } else {
+        journal.members_mut()[index]
+            .forced_stop
+            .as_mut()
+            .expect("forced authority")
+            .hard_stop_intent = true;
+        journal::write_journal(inputs.cache_dir, journal)?;
+        let endpoint = &peer.endpoint;
+        let result = peer.process.kill_and_wait(Duration::from_secs(5));
+        result.map_err(|error| ActivateError::UnitFailed {
+            reason: format!("Muxe cannot confirm that broker {} (process {}) stopped: {error}. A stop may have been requested, but no replacement was started for this broker. Its saved stop intent is retained; retry with muxe activate --force to resolve this exact process",
+                journal.members()[index].member().as_str(), peer.process.identity().process().get()),
+        })?;
+        // Exact exit is durable before unlink; a cleanup failure must not erase it.
+        journal.members_mut()[index]
+            .forced_stop
+            .as_mut()
+            .expect("forced authority")
+            .proof = Some(journal::ForcedStopProof::ProcessExited);
+        journal.members_mut()[index].old = OldMemberProgress::ForceStopped;
+        journal::write_journal(inputs.cache_dir, journal)?;
+        if let Some(endpoint) = endpoint {
+            endpoint
+                .remove_stopped()
+                .map_err(|error| ActivateError::UnitFailed {
+                    reason: error.to_string(),
+                })?;
+        }
+        log(
+            inputs.logger,
+            journal.members()[index].member().as_str(),
+            "forced broker hard stop: pending UI/capture cleanup and execution supervision may be abandoned; uncertain host actions were not replayed",
+        )?;
+        journal::ForcedStopProof::ProcessExited
+    };
+    journal.members_mut()[index]
+        .forced_stop
+        .as_mut()
+        .expect("forced authority")
+        .proof = Some(proof);
+    journal.members_mut()[index].old = OldMemberProgress::ForceStopped;
+    journal::write_journal(inputs.cache_dir, journal)?;
+    if cooperative && let Some(endpoint) = &peer.endpoint {
+        endpoint.remove_stopped().map_err(|error| ActivateError::UnitFailed {
+            reason: format!("The old broker {} stopped serving requests. Muxe could not safely remove its original socket: {error}. No termination signal was sent to this broker. Recovery details were kept at {}. Retry with muxe activate --force", journal.members()[index].member().as_str(), journal::activation_dir(inputs.cache_dir).join(journal.unit.journal_name()).display()),
+        })?;
+    }
+    Ok(())
+}
+
+/// A committed target retains its handoff as historical commit evidence.
+/// Gated targets and ambiguous legacy handoffs are not eligible old brokers.
+fn accepts_new_activation(status: &ActivationStatus) -> bool {
+    status.lifecycle == LifecycleState::Running
+        && status.target.is_none()
+        && match status.phase {
+            ActivationPhase::TargetCommitted => status.handoff_id.is_some(),
+            ActivationPhase::Ordinary | ActivationPhase::Legacy => status.handoff_id.is_none(),
+            _ => false,
+        }
+}
+
 /// Drains one old broker with a handoff that was durable before this call.
 async fn drain_one<C, H: ActivationHost>(
     inputs: &ActivateInputs<'_, C, impl BrokerSpawner, impl HostReloader, impl Preflight>,
@@ -2726,11 +3329,10 @@ where
     })?;
     if !host.attests_entry(&status, entry)
         || status.current != *old_record
-        || status.lifecycle != LifecycleState::Running
-        || status.handoff_id.is_some()
+        || !accepts_new_activation(&status)
     {
         return Err(PrepareFailure::Ambiguous(format!(
-            "existing broker {} no longer matches the recorded version, bridge identity, running state, or absence of a handoff. The handoff request was not sent; recovery must determine whether an earlier request changed the broker",
+            "existing broker {} no longer matches the recorded version, bridge identity, or completed running state. The handoff request was not sent; recovery must determine whether an earlier request changed the broker",
             entry.discovery_key()
         )));
     }
@@ -2740,8 +3342,7 @@ where
             Ok(status)
                 if host.attests_entry(&status, entry)
                     && status.current == *old_record
-                    && status.lifecycle == LifecycleState::Running
-                    && status.handoff_id.is_none() =>
+                    && accepts_new_activation(&status) =>
             {
                 let evidence = match &error {
                     ControlError::Rejected {
@@ -2785,7 +3386,7 @@ where
     Ok(PreparedMember {
         entry: entry.clone(),
         handoff,
-        old_session: session,
+        old_session: Some(session),
     })
 }
 
@@ -2873,6 +3474,140 @@ fn zellij_census_covered(ready: &TargetReadiness) -> bool {
     registered == members
 }
 
+/// Force retry may have no old registry rows. Child spawn does not imply that
+/// the new listener and registry publication have finished. Wait for their
+/// authenticated gated identities before a bridge reload needs a full census;
+/// do not wait for Ready, which depends on that reload.
+async fn wait_gated_registrations<C: ControlPort>(
+    control: &C,
+    cache_dir: &Path,
+    journal: &ActivationJournal,
+    prepared: &[PreparedMember<C>],
+    targets: &mut [OwnedTarget],
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<(), ActivateError> {
+    let identity = journal
+        .bridge_identity
+        .as_ref()
+        .expect("Zellij registration barrier");
+    let registry = Registry::open(cache_dir)?;
+    for member in prepared {
+        let record = journal
+            .members()
+            .iter()
+            .find(|record| record.endpoint().as_path() == member.entry.socket())
+            .expect("prepared target matches journal member");
+        let target = targets
+            .iter_mut()
+            .find(|target| target.member == record.id)
+            .ok_or_else(|| ActivateError::UnitFailed {
+                reason: "cannot confirm target registration without its owned child".to_owned(),
+            })?;
+        loop {
+            if target
+                .handle
+                .try_wait()
+                .map_err(|error| ActivateError::TargetStopInspect(error.to_string()))?
+                .is_some()
+            {
+                return Err(ActivateError::UnitFailed {
+                    reason: format!(
+                        "replacement broker {} exited before registering",
+                        member.entry.discovery_key()
+                    ),
+                });
+            }
+            let rows = recorded_zellij_group(&registry.entries()?, identity)?;
+            let mut matching = rows
+                .iter()
+                .filter(|row| row.socket() == member.entry.socket());
+            if let Some(row) = matching.next() {
+                if matching.next().is_some() {
+                    return Err(ActivateError::UnitFailed {
+                        reason: "multiple brokers claim a replacement endpoint".to_owned(),
+                    });
+                }
+                if !row.matches_recorded(&member.entry.recorded_entry()) {
+                    if row.server_pid().get() != target.handle.child.id()
+                        || row.discovery_key() != member.entry.discovery_key()
+                        || row.bridge_member() != member.entry.bridge_member()
+                        || row.handoff_id() != Some(member.handoff)
+                        || row.registration_id().is_none()
+                    {
+                        return Err(ActivateError::UnitFailed {
+                            reason: format!(
+                                "replacement broker {} has an unexpected registration identity",
+                                member.entry.discovery_key()
+                            ),
+                        });
+                    }
+                    if let Ok(verified) = tokio::time::timeout_at(
+                        deadline.into(),
+                        control.verified_status(row.socket()),
+                    )
+                    .await
+                    .map_err(|_| ActivateError::ReadinessTimeout {
+                        identity: member.entry.discovery_key().as_str().to_owned(),
+                    })? {
+                        target.gated_registration = Some(certify_gated_registration(
+                            &verified, row, member, journal, target,
+                        )?);
+                        break;
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(ActivateError::ReadinessTimeout {
+                    identity: member.entry.discovery_key().as_str().to_owned(),
+                });
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+    Ok(())
+}
+
+fn certify_gated_registration<C: ControlPort>(
+    verified: &super::control::VerifiedControlStatus,
+    row: &RegisteredBroker,
+    member: &PreparedMember<C>,
+    journal: &ActivationJournal,
+    target: &OwnedTarget,
+) -> Result<CertifiedGatedRegistration, ActivateError> {
+    let status = &verified.status;
+    if verified.authority.process().get() != target.handle.child.id()
+        || status.registration.is_none_or(|proof| {
+            Some(proof.id) != row.registration_id() || proof.started_at != row.started_at()
+        })
+        || status.phase != ActivationPhase::TargetGated
+        || status.lifecycle != LifecycleState::Running
+        || status.target.is_some()
+        || status.handoff_id != Some(member.handoff)
+        || status.current != journal.target_record
+        || row.live_server() != Some(&status.live_server.server_id)
+        || !status_attests_journal(status, journal)
+        || status.live_server.discovery_key != row.discovery_key().as_str()
+    {
+        return Err(ActivateError::UnitFailed {
+            reason: format!(
+                "replacement broker {} does not authenticate its gated registration",
+                member.entry.discovery_key()
+            ),
+        });
+    }
+    verified
+        .authority
+        .verify_path()
+        .map_err(|error| ActivateError::UnitFailed {
+            reason: format!("replacement broker endpoint changed before reload: {error}"),
+        })?;
+    Ok(CertifiedGatedRegistration {
+        entry: row.clone(),
+        endpoint: verified.authority.socket_identity().clone(),
+    })
+}
+
 async fn wait_ready<C, H>(
     control: &C,
     member: &RegisteredBroker,
@@ -2944,7 +3679,10 @@ where
         || prepared.len() != journal.members().len()
         || targets.len() != prepared.len()
         || journal.members().iter().any(|member| {
-            member.old != OldMemberProgress::Drained || member.target != TargetMemberProgress::Ready
+            !matches!(
+                member.old,
+                OldMemberProgress::Drained | OldMemberProgress::ForceStopped
+            ) || member.target != TargetMemberProgress::Ready
         })
     {
         return Err(ActivateError::UnitFailed {
@@ -3088,7 +3826,6 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
         })?;
     if target
         .handle
-        .child
         .try_wait()
         .map_err(|error| ActivateError::TargetStopInspect(error.to_string()))?
         .is_some()
@@ -3123,8 +3860,15 @@ async fn prove_ready_member<C: ControlPort, H: ActivationHost>(
             ),
         });
     }
-    let status =
-        fetch_final_ready_status(control, prepared, row, window.proof, window.deadline).await?;
+    let status = fetch_final_ready_status(
+        control,
+        prepared,
+        row,
+        window.proof,
+        window.deadline,
+        journal.is_forced().then_some(&mut *target),
+    )
+    .await?;
     if !target_ready(
         &status,
         row,
@@ -3159,6 +3903,7 @@ async fn fetch_final_ready_status<C: ControlPort>(
     row: &RegisteredBroker,
     proof: Option<(UnitReadinessEpochId, AsOfTick)>,
     deadline: Instant,
+    owned: Option<&mut OwnedTarget>,
 ) -> Result<ActivationStatus, ActivateError> {
     let discovery = prepared.entry.discovery_key().as_str();
     let mut session = tokio::time::timeout_at(deadline.into(), control.connect(row.socket()))
@@ -3169,7 +3914,7 @@ async fn fetch_final_ready_status<C: ControlPort>(
         .map_err(|error| ActivateError::UnitFailed {
             reason: format!("cannot connect to replacement broker {discovery} for the final readiness check: {error}"),
         })?;
-    tokio::time::timeout_at(deadline.into(), async {
+    let status = tokio::time::timeout_at(deadline.into(), async {
         if let Some((epoch, as_of)) = proof {
             session.status_at(&prepared.handoff, epoch, as_of).await
         } else {
@@ -3182,7 +3927,36 @@ async fn fetch_final_ready_status<C: ControlPort>(
     })?
     .map_err(|error| ActivateError::UnitFailed {
         reason: format!("cannot read replacement broker {discovery} status for the final readiness check: {error}"),
-    })
+    })?;
+    if let Some(target) = owned {
+        let authority = session
+            .authority()
+            .ok_or_else(|| ActivateError::UnitFailed {
+                reason: "forced target readiness has no same-stream kernel peer authority"
+                    .to_owned(),
+            })?;
+        authority
+            .verify_path()
+            .map_err(|error| ActivateError::UnitFailed {
+                reason: error.to_string(),
+            })?;
+        if authority.process().get() != target.handle.child.id()
+            || status.registration.is_none_or(|proof| {
+                Some(proof.id) != row.registration_id() || proof.started_at != row.started_at()
+            })
+        {
+            return Err(ActivateError::UnitFailed {
+                reason:
+                    "forced target readiness does not match its exact owned child and registration"
+                        .to_owned(),
+            });
+        }
+        target.gated_registration = Some(CertifiedGatedRegistration {
+            entry: row.clone(),
+            endpoint: authority.socket_identity().clone(),
+        });
+    }
+    Ok(status)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3308,14 +4082,18 @@ fn next_rollback_action<A: RollbackActor>(
                 if let Some(index) = journal.members().iter().position(|member| {
                     !matches!(
                         member.old,
-                        OldMemberProgress::Pending | OldMemberProgress::Resumed
+                        OldMemberProgress::Pending
+                            | OldMemberProgress::Resumed
+                            | OldMemberProgress::ForceStopped
                     ) && actor.can_resume(member)
                 }) {
                     RollbackAction::ResumeOld(index)
                 } else if journal.members().iter().any(|member| {
                     !matches!(
                         member.old,
-                        OldMemberProgress::Pending | OldMemberProgress::Resumed
+                        OldMemberProgress::Pending
+                            | OldMemberProgress::Resumed
+                            | OldMemberProgress::ForceStopped
                     )
                 }) {
                     RollbackAction::AwaitingPeer
@@ -3351,14 +4129,18 @@ fn next_rollback_action<A: RollbackActor>(
     if let Some(index) = journal.members().iter().position(|member| {
         !matches!(
             member.old,
-            OldMemberProgress::Pending | OldMemberProgress::Resumed
+            OldMemberProgress::Pending
+                | OldMemberProgress::Resumed
+                | OldMemberProgress::ForceStopped
         ) && actor.can_resume(member)
     }) {
         RollbackAction::ResumeOld(index)
     } else if journal.members().iter().any(|member| {
         !matches!(
             member.old,
-            OldMemberProgress::Pending | OldMemberProgress::Resumed
+            OldMemberProgress::Pending
+                | OldMemberProgress::Resumed
+                | OldMemberProgress::ForceStopped
         )
     }) {
         RollbackAction::AwaitingPeer
@@ -3564,14 +4346,10 @@ fn classify_prepare_status(
             ),
         });
     }
-    if status.lifecycle == LifecycleState::Running
-        && status.current == member.old_record
-        && status.target.is_none()
-        && status.handoff_id.is_none()
-    {
+    if accepts_new_activation(status) && member.old_record.as_ref() == Some(&status.current) {
         Ok(PrepareResolution::Pending)
     } else if status.lifecycle == LifecycleState::Draining
-        && status.current == member.old_record
+        && member.old_record.as_ref() == Some(&status.current)
         && status.target.as_ref() == Some(&journal.target_record)
         && status.handoff_id == Some(member.handoff_id())
     {
@@ -3616,7 +4394,7 @@ fn classify_resume_status(
 ) -> Result<ResumeEvidence, ActivateError> {
     if status.live_server.discovery_key != member.member().as_str()
         || !status_attests_journal(status, journal)
-        || status.current != member.old_record
+        || member.old_record.as_ref() != Some(&status.current)
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
@@ -3625,10 +4403,7 @@ fn classify_resume_status(
             ),
         });
     }
-    if status.lifecycle == LifecycleState::Running
-        && status.target.is_none()
-        && status.handoff_id.is_none()
-    {
+    if accepts_new_activation(status) {
         Ok(ResumeEvidence::AlreadyResumed)
     } else if status.lifecycle == LifecycleState::Draining
         && status.target.as_ref() == Some(&journal.target_record)
@@ -3653,6 +4428,16 @@ trait RollbackActor {
     }
     fn can_resume(&self, _member: &TransactionMember) -> bool {
         true
+    }
+    fn can_snapshot_owned_target(&self, _member: &TransactionMember) -> bool {
+        false
+    }
+    async fn target_registration_endpoint(
+        &self,
+        _member: &TransactionMember,
+        _row: &BrokerEntry,
+    ) -> Result<Option<super::control::EndpointIdentity>, ActivateError> {
+        Ok(None)
     }
     fn observe(
         &self,
@@ -3701,13 +4486,26 @@ async fn complete_target_retirement<A: RollbackActor>(
 ) -> Result<(), ActivateError> {
     let replaying_intent = journal.members()[index].target == TargetMemberProgress::RetireIntent;
     let directory = journal::activation_dir(actor.cache_dir());
+    let mut _publication_guard = None;
     if !replaying_intent {
         let member = journal.members()[index].clone();
         let authority = match prepared_authority {
             Some(authority) => authority,
             None => actor.target_retirement_authority(&member, journal).await?,
         };
-        let intent = TargetRetirementIntent::new(journal, &member, authority)?;
+        let mut intent = TargetRetirementIntent::new(journal, &member, authority)?;
+        if journal.is_forced()
+            && actor.can_snapshot_owned_target(&member)
+            && let TargetRetirementAuthority::OwnedProcess { process_id } = intent.authority()
+        {
+            let guard = Registry::open(actor.cache_dir())?
+                .hold_target_publication(&member.authority, *process_id)?;
+            if let Some(row) = &guard.entry {
+                let endpoint = actor.target_registration_endpoint(&member, row).await?;
+                intent.bind_stopped_registration(journal, &member, row.clone(), endpoint)?;
+            }
+            _publication_guard = Some(guard);
+        }
         if journal::target_retirement_receipt_entry_exists(&directory, &intent)? {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
@@ -3761,6 +4559,15 @@ async fn drive_rollback<A: RollbackActor>(
     journal: &mut ActivationJournal,
     journal_path: &Path,
 ) -> Result<RollbackDriveOutcome, ActivateError> {
+    if journal
+        .members()
+        .iter()
+        .any(|member| member.old == OldMemberProgress::ForceStopIntent)
+    {
+        return Err(ActivateError::UnitFailed {
+            reason: "a forced old-broker stop has no durable completion proof; run muxe activate --force to resolve its exact process before recovery can continue".to_owned(),
+        });
+    }
     let mut registry_restored = false;
     loop {
         let action = next_rollback_action(journal, actor);
@@ -3841,21 +4648,33 @@ async fn drive_rollback<A: RollbackActor>(
             }
             RollbackAction::AwaitingPeer => return Ok(RollbackDriveOutcome::AwaitingPeer),
             RollbackAction::Finish => {
-                journal.enter_rolled_back();
-                journal::write_journal(actor.cache_dir(), journal)?;
-                actor.observe("terminal_written", &action, journal);
-                if let Some(hooks) = actor.hooks() {
-                    hooks.check(ActivateStep::TerminalWritten)?;
-                }
-                cleanup_terminal_transaction(journal, journal_path)?;
-                actor.observe("cleanup_complete", &action, journal);
-                if let Some(hooks) = actor.hooks() {
-                    hooks.check(ActivateStep::TerminalCleaned)?;
-                }
-                return Ok(RollbackDriveOutcome::Complete);
+                return finish_rollback(actor, journal, journal_path, &action);
             }
         }
     }
+}
+
+fn finish_rollback<A: RollbackActor>(
+    actor: &mut A,
+    journal: &mut ActivationJournal,
+    journal_path: &Path,
+    action: &RollbackAction,
+) -> Result<RollbackDriveOutcome, ActivateError> {
+    journal.enter_rolled_back();
+    journal::write_journal(actor.cache_dir(), journal)?;
+    actor.observe("terminal_written", action, journal);
+    if let Some(hooks) = actor.hooks() {
+        hooks.check(ActivateStep::TerminalWritten)?;
+    }
+    if journal.is_forced() {
+        return Ok(RollbackDriveOutcome::Complete);
+    }
+    cleanup_terminal_transaction(journal, journal_path)?;
+    actor.observe("cleanup_complete", action, journal);
+    if let Some(hooks) = actor.hooks() {
+        hooks.check(ActivateStep::TerminalCleaned)?;
+    }
+    Ok(RollbackDriveOutcome::Complete)
 }
 
 #[cfg(test)]
@@ -3933,6 +4752,7 @@ where
         {
             prepared
                 .old_session
+                .as_mut().expect("cooperative prepare retains its old session")
                 .status()
                 .await
                 .map_err(|error| ActivateError::UnitFailed {
@@ -3981,6 +4801,61 @@ where
             }
             None => TargetSpawnResolution::Absent,
         })
+    }
+
+    fn can_snapshot_owned_target(&self, member: &TransactionMember) -> bool {
+        self.supervisor.targets.iter().any(|target| {
+            target.member == member.id
+                && (!target.handle.exit_observed || target.gated_registration.is_some())
+        })
+    }
+
+    async fn target_registration_endpoint(
+        &self,
+        member: &TransactionMember,
+        row: &BrokerEntry,
+    ) -> Result<Option<super::control::EndpointIdentity>, ActivateError> {
+        let target = self
+            .supervisor
+            .targets
+            .iter()
+            .find(|target| target.member == member.id)
+            .expect("owned target snapshot requires retained child");
+        if let Some(certified) = &target.gated_registration {
+            if !certified.entry.matches_recorded(row) {
+                return Err(ActivateError::UnitFailed {
+                    reason: "the target registration changed after its exact owned-child attestation; leaving it unchanged".to_owned(),
+                });
+            }
+            return Ok(Some(certified.endpoint.clone()));
+        }
+        if target.handle.exit_observed {
+            return Ok(None);
+        }
+        let observed = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.inputs.control.verified_status(&row.socket),
+        )
+        .await;
+        let Ok(Ok(verified)) = observed else {
+            return Ok(None);
+        };
+        if verified.authority.process().get() != target.handle.child.id()
+            || row.server_pid != target.handle.child.id()
+            || verified.status.registration.is_none_or(|proof| {
+                Some(proof.id) != row.registration_id || proof.started_at != row.started_at
+            })
+            || verified.status.phase != ActivationPhase::TargetGated
+            || verified.status.handoff_id != Some(member.handoff_id())
+            || verified.status.live_server.discovery_key != row.discovery_key
+            || row.live_server.as_deref() != Some(verified.status.live_server.server_id.as_str())
+            || verified.status.bridge_unit != row.bridge_identity.as_ref().map(BridgeIdentity::unit)
+        {
+            return Err(ActivateError::UnitFailed {
+                reason: "the target socket or registration does not authenticate the retained owned child; leaving it unchanged".to_owned(),
+            });
+        }
+        Ok(Some(verified.authority.socket_identity().clone()))
     }
 
     async fn target_retirement_authority(
@@ -4041,22 +4916,25 @@ where
                     member.member().as_str()
                 ),
             })?;
-        let before =
-            prepared
-                .old_session
-                .status()
-                .await
-                .map_err(|error| ActivateError::UnitFailed {
-                    reason: format!(
-                        "query old {} before resume: {error}",
-                        member.member().as_str()
-                    ),
-                })?;
+        let before = prepared
+            .old_session
+            .as_mut()
+            .expect("cooperative resume retains its old session")
+            .status()
+            .await
+            .map_err(|error| ActivateError::UnitFailed {
+                reason: format!(
+                    "query old {} before resume: {error}",
+                    member.member().as_str()
+                ),
+            })?;
         if classify_resume_status(&before, member, journal)? == ResumeEvidence::AlreadyResumed {
             return Ok(ResumeDisposition::Completed);
         }
         let after = prepared
             .old_session
+            .as_mut()
+            .expect("cooperative resume retains its old session")
             .abort(&prepared.handoff)
             .await
             .map_err(|error| ActivateError::UnitFailed {
@@ -4180,6 +5058,38 @@ fn rollback_outcome(
     journal: &ActivationJournal,
     diagnostics: Vec<String>,
 ) -> UnitOutcome {
+    if journal.is_forced() {
+        let extra = if diagnostics.is_empty() {
+            String::new()
+        } else {
+            format!("; recovery diagnostics: {}", diagnostics.join("; "))
+        };
+        let stopped = journal
+            .members()
+            .iter()
+            .filter(|member| member.old == OldMemberProgress::ForceStopped)
+            .count();
+        let uncertain = journal
+            .members()
+            .iter()
+            .filter(|member| member.old == OldMemberProgress::ForceStopIntent)
+            .count();
+        let progress = if stopped == 0 && uncertain == 0 {
+            "No broker stop began for this activation target".to_owned()
+        } else if uncertain > 0 {
+            format!(
+                "Confirmed broker stops: {stopped}; unconfirmed stop outcomes: {uncertain}. Muxe did not report these brokers as restored"
+            )
+        } else {
+            format!("Confirmed broker stops: {stopped}. Muxe did not restore these brokers")
+        };
+        return UnitOutcome::Failed {
+            unit,
+            reason: format!(
+                "{reason}{extra}. {progress}. Recovery details were kept for this activation target; run muxe activate --force to retry"
+            ),
+        };
+    }
     if !diagnostics.is_empty() {
         UnitOutcome::RollbackFailed {
             unit,
@@ -4209,6 +5119,9 @@ pub fn restore_old_registry_rows(
     cache_dir: &Path,
     journal: &ActivationJournal,
 ) -> Result<(), String> {
+    if journal.is_forced() {
+        return Ok(());
+    }
     if !matches!(journal.unit, UnitKind::Zellij { .. }) {
         return Ok(());
     }
@@ -4336,13 +5249,18 @@ pub fn finish_acknowledged_commit(
         });
     }
     if journal.members().iter().any(|member| {
-        member.old != OldMemberProgress::Committed
-            || member.target != TargetMemberProgress::Committed
+        !matches!(
+            member.old,
+            OldMemberProgress::Committed | OldMemberProgress::ForceStopped
+        ) || member.target != TargetMemberProgress::Committed
     }) {
         return Ok(false);
     }
     let directory = journal::activation_dir(cache_dir);
     for member in journal.members() {
+        if member.old == OldMemberProgress::ForceStopped {
+            continue;
+        }
         if !journal::has_old_retirement_receipt(&directory, journal, member)? {
             return Err(ActivateError::UnitFailed {
                 reason: format!(
@@ -4528,7 +5446,30 @@ where
                 continue;
             }
         };
-        outcomes.push(recover_one(cache_dir, control, reloader, journal, &path, logger).await);
+        if matches!(std::fs::symlink_metadata(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            continue;
+        }
+        let current = match journal::read_journal(&path) {
+            Ok(current) if current.unit == journal.unit => current,
+            Ok(_) => {
+                outcomes.push(RecoveryOutcome::Preserved {
+                    unit: path.display().to_string(),
+                    reason: "the saved host unit changed while its recovery lock was acquired"
+                        .to_owned(),
+                });
+                continue;
+            }
+            Err(error) => {
+                outcomes.push(RecoveryOutcome::Preserved {
+                    unit: path.display().to_string(),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        outcomes.push(recover_one(cache_dir, control, reloader, current, &path, logger).await);
         drop(lock);
     }
     Ok(outcomes)
@@ -4586,7 +5527,16 @@ where
         TransactionDirective::Commit => recover_commit(cache_dir, control, &mut journal, path)
             .await
             .map(|()| RecoveryOutcome::Committed { unit: unit.clone() }),
+        TransactionDirective::RetryForce => Err(ActivateError::UnitFailed {
+            reason: "the old broker remains stopped and its forced replacement needs another muxe activate --force; the saved intent was retained".to_owned(),
+        }),
     };
+    if journal.is_forced() && journal.directive() == TransactionDirective::RetryForce {
+        return RecoveryOutcome::Preserved {
+            unit,
+            reason: "forced replacement cleanup finished, but the stopped broker was not restored; run muxe activate --force to retry the retained intent".to_owned(),
+        };
+    }
     match result {
         Ok(outcome) => {
             let _ = log(logger, &unit, "activation recovery converged");
@@ -4684,6 +5634,9 @@ async fn recover_commit<C: ControlPort>(
     let directory = journal::activation_dir(cache_dir);
     for index in 0..journal.members().len() {
         let member = &journal.members()[index];
+        if member.old == OldMemberProgress::ForceStopped {
+            continue;
+        }
         if !matches!(
             member.old,
             OldMemberProgress::CommitIntent | OldMemberProgress::Committed
@@ -5010,7 +5963,7 @@ where
         .iter()
         .find(|member| member.member() == local_member)
         .is_some_and(|member| {
-            local_status.current == member.old_record
+            member.old_record.as_ref() == Some(&local_status.current)
                 && matches!(
                     local_status.lifecycle,
                     LifecycleState::Running | LifecycleState::Draining
@@ -5184,6 +6137,7 @@ mod tests {
     /// Script for one framed fixture broker.
     struct BrokerScript {
         current: CompatibilityRecord,
+        committed_handoff: Option<HandoffId>,
         prepare_refusals: usize,
         abort_refusals: usize,
         supports_supplied_handoff: bool,
@@ -5277,6 +6231,9 @@ mod tests {
                             );
                             if prepared_handoff.is_some() {
                                 status.target = Some(target_record());
+                            } else if let Some(handoff) = script.committed_handoff {
+                                status.phase = ActivationPhase::TargetCommitted;
+                                status.handoff_id = Some(handoff);
                             }
                             if !script.supports_supplied_handoff {
                                 status.prepare_handoff = None;
@@ -5344,6 +6301,7 @@ mod tests {
                                 }
                             } else if Some(handoff_id) == prepared_handoff {
                                 prepared_handoff = None;
+                                script.committed_handoff = None;
                                 events
                                     .lock()
                                     .expect("fixture events are not poisoned")
@@ -5646,6 +6604,7 @@ mod tests {
             let registry = Registry::open(&self.cache).unwrap();
             registry
                 .register(BrokerEntry {
+                    process_identity: None,
                     host_kind: "herdr".to_owned(),
                     discovery_key: discovery_key.to_owned(),
                     socket: socket.clone(),
@@ -5677,6 +6636,7 @@ mod tests {
         ) -> ActivateInputs<'_, LiveControl, FixtureHerdrSpawner, FixtureReloader, FixturePreflight>
         {
             ActivateInputs {
+                force: false,
                 config_dir: &self.config,
                 cache_dir: &self.cache,
                 target: target_record(),
@@ -5700,6 +6660,7 @@ mod tests {
         BrokerScript {
             current: old_record(),
             prepare_refusals: 0,
+            committed_handoff: None,
             abort_refusals: 0,
             supports_supplied_handoff: true,
             host: HostKind::Herdr,
@@ -5717,6 +6678,7 @@ mod tests {
         )
         .unwrap();
         BrokerEntry {
+            process_identity: None,
             host_kind: "zellij".to_owned(),
             discovery_key: "session".to_owned(),
             socket,
@@ -5747,6 +6709,98 @@ mod tests {
             .map(|entry| RegisteredBroker::zellij(entry, &identity).unwrap())
             .collect();
         zellij_unit(identity, registered).unwrap()
+    }
+
+    #[tokio::test]
+    async fn forced_current_herdr_rejects_duplicate_owner_before_stop() {
+        let fixture = Fixture::new();
+        let (socket, server) = fixture.old_broker("server", herdr_script()).await;
+        let registry = Registry::open(&fixture.cache).unwrap();
+        let original = registry.entries().unwrap()[0].clone();
+        for same_socket in [true, false] {
+            let mut conflicting = original.clone();
+            conflicting.server_pid = original.server_pid + 1;
+            conflicting.registration_id =
+                Some(muxe_protocol::control::BrokerRegistrationId::generate().unwrap());
+            if !same_socket {
+                conflicting.socket = fixture.cache.join("other-owner.sock");
+            }
+            let rows = vec![original.clone(), conflicting];
+            let value = serde_json::json!({
+                "schema_version": super::super::registry::REGISTRY_SCHEMA_VERSION,
+                "brokers": rows,
+            });
+            let path = fixture
+                .cache
+                .join(super::super::registry::REGISTRY_DIR_NAME)
+                .join(super::super::registry::REGISTRY_FILE_NAME);
+            fsutil::write_atomic(
+                &path,
+                &serde_json::to_vec(&value).unwrap(),
+                "duplicate-owner regression",
+            )
+            .unwrap();
+            let mut inputs = fixture.herdr_inputs();
+            inputs.force = true;
+            inputs.scope = HostScope::Current;
+            inputs.current = Some(DetectedHost::Herdr {
+                discovery_key: "server".to_owned(),
+            });
+            let report = Box::pin(activate(inputs)).await.unwrap();
+            assert!(
+                matches!(report.units.as_slice(), [UnitOutcome::Failed { reason, .. }]
+                if reason.contains("multiple or conflicting registrations")),
+                "{report:?}"
+            );
+            assert_eq!(registry.entries().unwrap(), rows);
+            assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
+            let mut client = ControlClient::connect(&socket).await.unwrap();
+            assert_eq!(
+                client.status().await.unwrap().lifecycle,
+                LifecycleState::Running
+            );
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn forced_locked_census_rejects_unplanned_stale_sibling_before_stop() {
+        let fixture = Fixture::new();
+        let stable = fixture.config.join(integration::BRIDGE_FILE_NAME);
+        let selected = zellij_entry(fixture.cache.join("selected.sock"), stable.clone());
+        let unit = test_zellij_unit(stable, vec![selected]);
+        let PlannedUnit::Zellij {
+            bridge_identity,
+            entries,
+            census,
+        } = &unit
+        else {
+            panic!("fixed Zellij fixture");
+        };
+        let mut sibling = entries[0].recorded_entry();
+        sibling.discovery_key = "unplanned-dead-session".to_owned();
+        sibling.bridge_member = Some(BridgeMemberId::new(sibling.discovery_key.clone()).unwrap());
+        sibling.socket = fixture.cache.join("unplanned-absent.sock");
+        let guard = super::super::registry::BridgeUnitGuard::acquire(
+            &fixture.cache,
+            bridge_identity.clone(),
+        )
+        .unwrap();
+        let registry = Registry::open(&fixture.cache).unwrap();
+        registry.register_zellij(&guard, sibling.clone()).unwrap();
+        assert!(registry.probe().unwrap().live.is_empty());
+        let host = ZellijActivation {
+            identity: bridge_identity,
+            entries,
+            census,
+        };
+        let error = host.revalidate_forced(&fixture.cache, None).unwrap_err();
+        assert!(
+            error.contains("outside the exact planned and saved activation participants"),
+            "{error}"
+        );
+        assert_eq!(registry.entries().unwrap(), vec![sibling]);
+        assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
     }
 
     async fn zellij_member(
@@ -5783,6 +6837,7 @@ mod tests {
         staged_bridge: &[u8],
     ) -> ActivateInputs<'a, LiveControl, ProcessSpawner, FixtureReloader, FixturePreflight> {
         ActivateInputs {
+            force: false,
             config_dir: &fixture.config,
             cache_dir: &fixture.cache,
             target: target_record(),
@@ -5982,6 +7037,7 @@ mod tests {
         let (entry, old) = zellij_member(&fixture, &stable, target_record()).await;
         let reject = RejectingTargetSpawner;
         let inputs = ActivateInputs {
+            force: false,
             config_dir: &fixture.config,
             cache_dir: &fixture.cache,
             target: target_record(),
@@ -6367,10 +7423,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn force_admission_rejects_foreign_herdr_unit_rows_and_members() {
+        let (_temp, _cache, mut journal, _path, _control) = rollback_trace_case();
+        let member = &journal.members()[0];
+        journal.old_registry.push(BrokerEntry::now(
+            "herdr",
+            member.member().as_str(),
+            member.endpoint().as_path().to_path_buf(),
+            std::process::id(),
+        ));
+        forced::validate_admission_scope(&journal).expect("one exact Herdr unit");
+        journal.old_registry[0].discovery_key = "another-server".to_owned();
+        assert!(forced::validate_admission_scope(&journal).is_err());
+        journal.old_registry[0].discovery_key = "server".to_owned();
+        journal.unit = UnitKind::Herdr {
+            host_hash: unit_hash("another-server"),
+        };
+        assert!(forced::validate_admission_scope(&journal).is_err());
+        journal.unit = UnitKind::Herdr {
+            host_hash: unit_hash("server"),
+        };
+        journal.old_registry.push(BrokerEntry::now(
+            "herdr",
+            "unrelated",
+            journal.old_registry[0]
+                .socket
+                .with_file_name("unrelated.sock"),
+            std::process::id(),
+        ));
+        assert!(forced::validate_admission_scope(&journal).is_err());
+    }
+
+    #[test]
+    fn recovery_accepts_completed_handoff_but_preserves_active_or_ambiguous_handoff() {
+        let (_temp, _cache, journal, _path, _control) = rollback_trace_case();
+        let member = &journal.members()[0];
+        let mut status = status_of(
+            member.old_record.as_ref().unwrap(),
+            Some(handoff(0x42)),
+            member.member().as_str(),
+            LifecycleState::Running,
+        );
+        status.phase = ActivationPhase::TargetCommitted;
+        assert!(matches!(
+            classify_prepare_status(&status, member, &journal).unwrap(),
+            PrepareResolution::Pending
+        ));
+        assert!(matches!(
+            classify_resume_status(&status, member, &journal).unwrap(),
+            ResumeEvidence::AlreadyResumed
+        ));
+        for phase in [ActivationPhase::TargetGated, ActivationPhase::Legacy] {
+            status.phase = phase;
+            assert!(classify_prepare_status(&status, member, &journal).is_err());
+            assert!(classify_resume_status(&status, member, &journal).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_target_can_be_activated_again_and_restored_after_failure() {
+        let fixture = Fixture::new();
+        let (_socket, old) = fixture
+            .old_broker(
+                "server",
+                BrokerScript {
+                    committed_handoff: Some(handoff(0x42)),
+                    ..herdr_script()
+                },
+            )
+            .await;
+        // No target serves readiness, so replacement must prepare the committed
+        // old broker and then restore it rather than reject its historical ID.
+        let report = Box::pin(activate(fixture.herdr_inputs())).await.unwrap();
+        assert!(matches!(report.units[0], UnitOutcome::RolledBack { .. }));
+        let events = fixture
+            .events
+            .lock()
+            .expect("fixture events are not poisoned");
+        assert!(events.contains(&"prepared".to_owned()));
+        assert!(events.contains(&"old-aborted".to_owned()));
+        assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
+        old.abort();
+    }
+
+    #[tokio::test]
+    async fn current_committed_target_is_already_active_without_mutation() {
+        let fixture = Fixture::new();
+        let socket = fixture.cache.join("broker.sock");
+        let mut status = status_of(
+            &target_record(),
+            Some(handoff(0x42)),
+            "server",
+            LifecycleState::Running,
+        );
+        status.phase = ActivationPhase::TargetCommitted;
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let broker = status_only_broker(&socket, status, requests.clone());
+        Registry::open(&fixture.cache)
+            .unwrap()
+            .register_herdr(BrokerEntry::now(
+                "herdr",
+                "server",
+                socket,
+                std::process::id(),
+            ))
+            .unwrap();
+        let report = Box::pin(activate(fixture.herdr_inputs())).await.unwrap();
+        assert!(matches!(report.units[0], UnitOutcome::Unchanged { .. }));
+        assert!(journal::list_journals(&fixture.cache).unwrap().is_empty());
+        assert!(
+            requests
+                .lock()
+                .iter()
+                .all(|request| matches!(request, ControlOperation::Status))
+        );
+        broker.abort();
+    }
+
     #[tokio::test]
     async fn activation_preconditions_fail_before_handoff_spawn_or_journal() {
         let mut reasons = std::collections::BTreeSet::new();
-        for rejected_check in 0..4 {
+        for rejected_check in 0..5 {
             let fixture = Fixture::new();
             let socket = fixture.cache.join("broker.sock");
             let mut status = status_of(&old_record(), None, "server", LifecycleState::Running);
@@ -6392,6 +7566,10 @@ mod tests {
                     status.handoff_id = Some(handoff(0x42));
                 }
                 3 => status.handoff_id = Some(handoff(0x42)),
+                4 => {
+                    status.phase = ActivationPhase::TargetGated;
+                    status.handoff_id = Some(handoff(0x42));
+                }
                 _ => unreachable!(),
             }
             let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -6408,6 +7586,7 @@ mod tests {
             let before = registry.entries().unwrap();
             let original = fixture.herdr_inputs();
             let inputs = ActivateInputs {
+                force: false,
                 config_dir: original.config_dir,
                 cache_dir: original.cache_dir,
                 target: original.target,
@@ -6470,9 +7649,14 @@ mod tests {
         crate::fsutil::ensure_owner_dir(&journal::activation_dir(&fixture.cache)).unwrap();
         let path = journal::activation_dir(&fixture.cache).join("herdr-x.json");
         crate::fsutil::write_atomic(&path, b"{corrupt", "activation").unwrap();
-        let outcomes = recover(&fixture.cache, &fixture.control, &fixture.reloader, None)
-            .await
-            .unwrap();
+        let outcomes = Box::pin(recover(
+            &fixture.cache,
+            &fixture.control,
+            &fixture.reloader,
+            None,
+        ))
+        .await
+        .unwrap();
         assert!(matches!(outcomes[0], RecoveryOutcome::Preserved { .. }));
         assert!(path.exists());
     }
@@ -6568,6 +7752,7 @@ mod tests {
 
     fn census_member(socket: PathBuf, host_kind: &str, discovery: &str) -> BrokerEntry {
         BrokerEntry {
+            process_identity: None,
             host_kind: host_kind.to_owned(),
             discovery_key: discovery.to_owned(),
             socket,
@@ -8416,7 +9601,7 @@ mod tests {
             ))
             .unwrap(),
             handoff: member.handoff_id(),
-            old_session: control.session.clone(),
+            old_session: Some(control.session.clone()),
         }
     }
 
@@ -8927,14 +10112,15 @@ mod tests {
                 prepared.push(PreparedMember {
                     entry: RegisteredBroker::zellij(entry.clone(), &identity).unwrap(),
                     handoff: member.handoff_id(),
-                    old_session: ReadyRoundSession {
+                    old_session: Some(ReadyRoundSession {
                         socket: entry.socket.clone(),
                         control: control.clone(),
-                    },
+                    }),
                 });
                 targets.push(OwnedTarget {
                     member: member.id.clone(),
                     handle,
+                    gated_registration: None,
                 });
             }
             Self {
@@ -9016,6 +10202,7 @@ mod tests {
             readiness_deadline: Duration,
         ) -> Result<(), ActivateError> {
             let inputs = ActivateInputs {
+                force: false,
                 config_dir: &self.config,
                 cache_dir: &self.cache,
                 target: self.journal.target_record.clone(),
@@ -9086,6 +10273,7 @@ mod tests {
 
         async fn rollback_after_failed_proof(&mut self) -> Vec<String> {
             let inputs = ActivateInputs {
+                force: false,
                 config_dir: &self.config,
                 cache_dir: &self.cache,
                 target: self.journal.target_record.clone(),
@@ -9483,7 +10671,7 @@ mod tests {
         let prepared = vec![PreparedMember {
             entry: RegisteredBroker::herdr(old).unwrap(),
             handoff,
-            old_session: control.connect(&endpoint).await.unwrap(),
+            old_session: Some(control.connect(&endpoint).await.unwrap()),
         }];
         let authorities = vec![PreparedAuthority {
             entry: prepared[0].entry.clone(),
@@ -9492,8 +10680,10 @@ mod tests {
         let mut targets = vec![OwnedTarget {
             member: journal.members()[0].id.clone(),
             handle,
+            gated_registration: None,
         }];
         let inputs = ActivateInputs {
+            force: false,
             config_dir: &config,
             cache_dir: &cache,
             target: journal.target_record.clone(),
@@ -10324,6 +11514,7 @@ mod tests {
             let preflight = FixturePreflight::default();
             let spawner = ProcessSpawner;
             let inputs = ActivateInputs {
+                force: false,
                 config_dir: &config,
                 cache_dir: &cache,
                 target: target_record(),
@@ -10348,6 +11539,7 @@ mod tests {
                 vec![OwnedTarget {
                     member: member_id.clone(),
                     handle,
+                    gated_registration: None,
                 }],
             )
             .unwrap();
@@ -10403,6 +11595,7 @@ mod tests {
             let preflight = FixturePreflight::default();
             let spawner = ProcessSpawner;
             let inputs = ActivateInputs {
+                force: false,
                 config_dir: &config,
                 cache_dir: &cache,
                 target: target_record(),
@@ -10442,6 +11635,7 @@ mod tests {
                 vec![OwnedTarget {
                     member: member_id.clone(),
                     handle,
+                    gated_registration: None,
                 }],
                 "injected rollback decision failure".to_owned(),
             )
@@ -10467,6 +11661,7 @@ mod tests {
         let preflight = FixturePreflight::default();
         let spawner = ProcessSpawner;
         let inputs = ActivateInputs {
+            force: false,
             config_dir: &config,
             cache_dir: &cache,
             target: target_record(),
@@ -10491,6 +11686,7 @@ mod tests {
             vec![OwnedTarget {
                 member: member_id.clone(),
                 handle,
+                gated_registration: None,
             }],
         )
         .unwrap();
@@ -10553,6 +11749,7 @@ mod tests {
             vec![OwnedTarget {
                 member: member.id.clone(),
                 handle,
+                gated_registration: None,
             }],
         )
         .unwrap();
@@ -10593,10 +11790,12 @@ mod tests {
                 OwnedTarget {
                     member: member_id.clone(),
                     handle: first,
+                    gated_registration: None,
                 },
                 OwnedTarget {
                     member: member_id,
                     handle: second,
+                    gated_registration: None,
                 },
             ],
         )
@@ -10664,6 +11863,7 @@ mod tests {
             let preflight = FixturePreflight::default();
             let spawner = ProcessSpawner;
             let inputs = ActivateInputs {
+                force: false,
                 config_dir: &config,
                 cache_dir: &cache,
                 target: target_record(),
@@ -10692,6 +11892,7 @@ mod tests {
                 vec![OwnedTarget {
                     member: member_id.clone(),
                     handle,
+                    gated_registration: None,
                 }],
                 "old status unavailable".to_owned(),
             )
@@ -10738,6 +11939,7 @@ mod tests {
             let preflight = FixturePreflight::default();
             let spawner = ProcessSpawner;
             let inputs = ActivateInputs {
+                force: false,
                 config_dir: &config,
                 cache_dir: &cache,
                 target: target_record(),
@@ -10763,7 +11965,7 @@ mod tests {
                 ))
                 .unwrap(),
                 handoff: member.handoff_id(),
-                old_session: control.session.clone(),
+                old_session: Some(control.session.clone()),
             };
             let mut supervisor =
                 ActivationSupervisor::new(&cache, &journal.unit, Vec::new()).unwrap();

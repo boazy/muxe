@@ -45,7 +45,7 @@ pub use runtime::{
 };
 pub use service::{
     ActivationBootstrap, BrokerServer, RecoveryAck, RecoveryDecision, RecoveryJournal,
-    RecoveryPermit, ServerError,
+    RecoveryPermit, RetiredRegistrationProof, ServerError,
 };
 pub use spawn::{ServeHerdrSpawn, ServeZellijSpawn, SpawnArgvError};
 

@@ -83,6 +83,9 @@ pub struct BrokerEntry {
     /// Fresh process-scoped registration identity; absent on legacy rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_id: Option<BrokerRegistrationId>,
+    /// Self-recorded OS incarnation for authenticated forced retirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_identity: Option<muxe_process::ProcessIdentity>,
     /// Descriptor-validated physical bridge authority (Zellij only).
     pub bridge_identity: Option<BridgeIdentity>,
     /// Logical bridge-group member (Zellij only).
@@ -108,6 +111,7 @@ impl BrokerEntry {
             socket,
             server_pid,
             registration_id: None,
+            process_identity: None,
             started_at: unix_now(),
             bridge_identity: None,
             bridge_member: None,
@@ -191,6 +195,7 @@ pub struct RegisteredBroker {
     server_pid: RecordedServerPid,
     started_at: u64,
     registration_id: Option<BrokerRegistrationId>,
+    process_identity: Option<muxe_process::ProcessIdentity>,
     bridge_identity: Option<BridgeIdentity>,
     bridge_member: Option<BridgeMemberId>,
     handoff_id: Option<HandoffId>,
@@ -238,6 +243,16 @@ impl RegisteredBroker {
     }
 
     #[must_use]
+    pub fn process_identity(&self) -> Option<&muxe_process::ProcessIdentity> {
+        self.process_identity.as_ref()
+    }
+
+    #[must_use]
+    pub fn started_at(&self) -> u64 {
+        self.started_at
+    }
+
+    #[must_use]
     pub fn bridge_identity(&self) -> Option<&BridgeIdentity> {
         self.bridge_identity.as_ref()
     }
@@ -274,6 +289,7 @@ impl RegisteredBroker {
             server_pid: RecordedServerPid::from_recorded(entry.server_pid),
             started_at: entry.started_at,
             registration_id: entry.registration_id,
+            process_identity: entry.process_identity,
             bridge_identity: entry.bridge_identity,
             bridge_member: entry.bridge_member,
             handoff_id: entry.handoff_id,
@@ -285,6 +301,7 @@ impl RegisteredBroker {
     #[must_use]
     pub(crate) fn recorded_entry(&self) -> BrokerEntry {
         BrokerEntry {
+            process_identity: self.process_identity.clone(),
             host_kind: persisted_host_label(self.persisted_host).to_owned(),
             discovery_key: self.discovery_key.as_str().to_owned(),
             socket: self.socket.clone(),
@@ -307,6 +324,7 @@ impl RegisteredBroker {
             && entry.server_pid == self.server_pid.get()
             && entry.started_at == self.started_at
             && entry.registration_id == self.registration_id
+            && entry.process_identity == self.process_identity
             && entry.bridge_identity == self.bridge_identity
             && entry.bridge_member == self.bridge_member
             && entry.handoff_id == self.handoff_id
@@ -315,6 +333,109 @@ impl RegisteredBroker {
                     .live_server
                     .as_ref()
                     .map(muxe_protocol::ServerId::as_str)
+    }
+}
+
+/// Broker-role provenance from the native private store, not an arbitrary DTO.
+///
+/// Native writers self-register `ProcessIdentity::current()`. Deliberate
+/// same-user edits of this owner-only store are not a privilege boundary.
+/// This capability establishes role provenance only; OS identity, UID, scope,
+/// and reachable-peer contradictions still require separate verification.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeBrokerAuthority<'a> {
+    entry: &'a RegisteredBroker,
+}
+
+impl<'a> NativeBrokerAuthority<'a> {
+    #[must_use]
+    pub const fn entry(&self) -> &RegisteredBroker {
+        self.entry
+    }
+
+    pub(crate) fn from_registry(
+        registry: &Registry,
+        entry: &'a RegisteredBroker,
+    ) -> Result<Self, RegistryError> {
+        let _lock = RegistryLock::acquire(&registry.lock_path)?;
+        let file = registry.read()?;
+        let mut matching = file.brokers.iter().filter(|row| {
+            row.socket == entry.socket()
+                || (row.host_kind == persisted_host_label(entry.persisted_host)
+                    && row.discovery_key == entry.discovery_key().as_str())
+        });
+        if matching
+            .next()
+            .is_none_or(|row| !entry.matches_recorded(row))
+            || matching.next().is_some()
+        {
+            return Err(RegistryError::Unauthorized(
+                "the broker has no exact, unambiguous registration in the private native store"
+                    .to_owned(),
+            ));
+        }
+        Self::check_identity_binding(entry)?;
+        Ok(Self { entry })
+    }
+
+    /// The native caller retains this journal's exclusive unit lock.
+    pub(crate) fn from_journal(
+        cache: &Path,
+        snapshot: &super::journal::ActivationJournal,
+        entry: &'a RegisteredBroker,
+    ) -> Result<Self, RegistryError> {
+        let path = super::journal::activation_dir(cache).join(snapshot.unit.journal_name());
+        let saved = super::journal::read_journal(&path).map_err(|error| {
+            RegistryError::Unauthorized(format!(
+                "cannot admit the private native activation record: {error}"
+            ))
+        })?;
+        if saved != *snapshot {
+            return Err(RegistryError::Conflict(
+                "the private activation record changed before broker-role admission".to_owned(),
+            ));
+        }
+        let known = saved
+            .old_registry
+            .iter()
+            .any(|row| entry.matches_recorded(row))
+            || saved.ready_proof().is_some_and(|proof| {
+                proof
+                    .incarnations
+                    .iter()
+                    .any(|member| entry.matches_recorded(&member.entry))
+            });
+        let units = super::activate::select_units(
+            std::slice::from_ref(&entry.recorded_entry()),
+            crate::cli::HostScope::All,
+            None,
+        )
+        .map_err(|error| RegistryError::Unauthorized(error.to_string()))?;
+        if !known || units.len() != 1 || units[0].unit_kind() != saved.unit {
+            return Err(RegistryError::Unauthorized(
+                "the broker is not an exact participant of the private native activation record"
+                    .to_owned(),
+            ));
+        }
+        Self::check_identity_binding(entry)?;
+        Ok(Self { entry })
+    }
+
+    fn check_identity_binding(entry: &RegisteredBroker) -> Result<(), RegistryError> {
+        if entry.process_identity().is_some_and(|identity| {
+            identity.process().get() != entry.server_pid().get()
+                || entry
+                    .registration_id()
+                    .is_none_or(BrokerRegistrationId::is_zero)
+                || entry.started_at() == 0
+                || entry.live_server().is_none_or(|id| id.as_str().is_empty())
+        }) {
+            return Err(RegistryError::Unauthorized(
+                "the saved OS identity is not bound to a complete native self-registration"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 /// Stable logical member of a bridge-sharing group.
@@ -564,6 +685,12 @@ pub struct TargetRegistrationCapability {
     endpoint: PathBuf,
     discovery_key: String,
     handoff_id: HandoffId,
+    admit_absent: bool,
+}
+
+pub(crate) struct TargetPublicationGuard {
+    _lock: RegistryLock,
+    pub(crate) entry: Option<BrokerEntry>,
 }
 
 impl TargetRegistrationCapability {
@@ -580,7 +707,13 @@ impl TargetRegistrationCapability {
             endpoint,
             discovery_key,
             handoff_id,
+            admit_absent: false,
         }
+    }
+
+    pub(crate) fn certify_absent_member(mut self) -> Self {
+        self.admit_absent = true;
+        self
     }
 }
 
@@ -723,7 +856,29 @@ impl Registry {
                 && known.bridge_member.as_ref() == Some(&capability.member)
                 && known.socket == capability.endpoint
         });
-        if !replaceable {
+        let conflicts = file.brokers.iter().any(|known| {
+            (known.socket == capability.endpoint
+                && (known.host_kind != "zellij"
+                    || known.bridge_identity.as_ref() != Some(&capability.bridge_identity)
+                    || known.bridge_member.as_ref() != Some(&capability.member)))
+                || (known.bridge_identity.as_ref() == Some(&capability.bridge_identity)
+                    && known.bridge_member.as_ref() == Some(&capability.member)
+                    && known.socket != capability.endpoint)
+        });
+        if conflicts
+            || file
+                .brokers
+                .iter()
+                .filter(|known| known.socket == capability.endpoint)
+                .count()
+                > 1
+        {
+            return Err(RegistryError::Conflict(
+                "another registration occupies the authorized target socket or bridge member"
+                    .to_owned(),
+            ));
+        }
+        if !replaceable && !capability.admit_absent {
             return Err(RegistryError::Unauthorized(
                 "the replacement broker cannot register a session absent from the existing bridge group".to_owned(),
             ));
@@ -787,6 +942,66 @@ impl Registry {
         Ok(true)
     }
 
+    /// Keeps target registration publication quiescent while its retained
+    /// owned child is stopped. No late registration can race the snapshot.
+    pub(crate) fn hold_target_publication(
+        &self,
+        authority: &super::journal::MemberLaunchAuthority,
+        process: super::journal::TargetProcessId,
+    ) -> Result<TargetPublicationGuard, RegistryError> {
+        let lock = RegistryLock::acquire(&self.lock_path)?;
+        let file = self.read()?;
+        let mut matching = file
+            .brokers
+            .iter()
+            .filter(|row| row.socket == authority.endpoint.as_path());
+        let row = matching.next();
+        if matching.next().is_some() {
+            return Err(RegistryError::Conflict(
+                "multiple registrations claim the target socket; leaving all rows unchanged"
+                    .to_owned(),
+            ));
+        }
+        let entry = row.filter(|row| row.server_pid == process.get()).cloned();
+        if entry
+            .as_ref()
+            .is_some_and(|row| row.discovery_key != authority.member.as_str())
+        {
+            return Err(RegistryError::Conflict(
+                "the target registration differs from its saved host identity".to_owned(),
+            ));
+        }
+        Ok(TargetPublicationGuard { _lock: lock, entry })
+    }
+
+    /// Releases only a transaction's certified stopped target registration.
+    /// The caller holds the unit lock and has verified the durable retirement
+    /// receipt; this changes registry metadata, never signals or unlinks.
+    pub(crate) fn release_stopped_target(
+        &self,
+        proof: &super::journal::StoppedTargetRegistrationProof<'_>,
+    ) -> Result<bool, RegistryError> {
+        let expected = proof.entry();
+        let _lock = RegistryLock::acquire(&self.lock_path)?;
+        let mut file = self.read()?;
+        let mut target = None;
+        for (index, row) in file.brokers.iter().enumerate() {
+            if row.socket != expected.socket {
+                continue;
+            }
+            if target.is_some() || row != expected {
+                return Err(RegistryError::Conflict("stopped replacement registry row differs from its certified transaction identity; leaving the row unchanged".to_owned()));
+            }
+            target = Some(index);
+        }
+        let Some(index) = target else {
+            return Ok(false);
+        };
+        file.brokers.remove(index);
+        self.write(&file)?;
+        Ok(true)
+    }
+
     fn register_inner(&self, entry: BrokerEntry) -> Result<Registration, RegistryError> {
         let _lock = RegistryLock::acquire(&self.lock_path)?;
         let mut file = self.read()?;
@@ -795,6 +1010,38 @@ impl Registry {
         self.write(&file)?;
         Ok(Registration { entry })
     }
+    /// Releases this process's exact row after the service sealed host authority.
+    ///
+    /// # Errors
+    ///
+    /// Refuses ambiguous ownership or a registry storage failure.
+    pub fn release_retired(
+        &self,
+        proof: &muxe_broker::RetiredRegistrationProof,
+    ) -> Result<bool, RegistryError> {
+        let registration = proof.registration();
+        let _lock = RegistryLock::acquire(&self.lock_path)?;
+        let mut file = self.read()?;
+        let owns = |entry: &BrokerEntry| {
+            entry.server_pid == std::process::id()
+                && entry.registration_id == Some(registration.id)
+                && entry.started_at == registration.started_at
+                && entry.socket == proof.endpoint().socket()
+        };
+        let count = file.brokers.iter().filter(|entry| owns(entry)).count();
+        if count > 1 {
+            return Err(RegistryError::Conflict(
+                "more than one row claims this retired registration".to_owned(),
+            ));
+        }
+        if count == 0 {
+            return Ok(false);
+        }
+        file.brokers.retain(|entry| !owns(entry));
+        self.write(&file)?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn register(&self, entry: BrokerEntry) -> Result<Registration, RegistryError> {
         self.register_inner(entry)
@@ -1093,18 +1340,15 @@ impl Registry {
     }
 
     fn read(&self) -> Result<RegistryFile, RegistryError> {
-        match std::fs::read(&self.path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(RegistryFile {
-                schema_version: REGISTRY_SCHEMA_VERSION,
-                brokers: Vec::new(),
-            }),
-            Err(source) => Err(RegistryError::Fs(fsutil::io_error(
-                "reading broker registry",
-                &self.path,
-                source,
-            ))),
+        match fsutil::read_owner_file(&self.path) {
+            Err(FsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(RegistryFile {
+                    schema_version: REGISTRY_SCHEMA_VERSION,
+                    brokers: Vec::new(),
+                })
+            }
+            Err(error) => Err(RegistryError::Fs(error)),
             Ok(bytes) => {
-                fsutil::check_owner_file(&self.path)?;
                 let file: RegistryFile =
                     serde_json::from_slice(&bytes).map_err(|source| RegistryError::Corrupt {
                         path: self.path.clone(),
@@ -1216,6 +1460,36 @@ mod tests {
         entry.registration_id = Some(BrokerRegistrationId::generate().unwrap());
         entry.live_server = Some("server-test".to_owned());
         entry
+    }
+
+    #[test]
+    fn native_role_admission_requires_exact_private_record_not_a_valid_dto() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(root.path());
+        let raw = entry(root.path().join("owned.sock"));
+        let typed = RegisteredBroker::herdr(raw.clone()).unwrap();
+        assert!(NativeBrokerAuthority::from_registry(&registry, &typed).is_err());
+        registry.register(raw.clone()).unwrap();
+        assert!(NativeBrokerAuthority::from_registry(&registry, &typed).is_ok());
+        for change in 0..3 {
+            let mut changed = raw.clone();
+            match change {
+                0 => changed.server_pid += 1,
+                1 => changed.registration_id = Some(BrokerRegistrationId::generate().unwrap()),
+                _ => changed.started_at += 1,
+            }
+            let changed = RegisteredBroker::herdr(changed).unwrap();
+            assert!(NativeBrokerAuthority::from_registry(&registry, &changed).is_err());
+        }
+        std::fs::set_permissions(&registry.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(NativeBrokerAuthority::from_registry(&registry, &typed).is_err());
+        std::fs::set_permissions(&registry.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let saved = root.path().join("saved.json");
+        std::fs::rename(&registry.path, &saved).unwrap();
+        std::os::unix::fs::symlink(saved, &registry.path).unwrap();
+        assert!(NativeBrokerAuthority::from_registry(&registry, &typed).is_err());
     }
 
     #[test]

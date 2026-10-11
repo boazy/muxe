@@ -517,7 +517,12 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
         HostScope::Current => Some(detect_current_host(&paths.cache_dir)?),
         _ => None,
     };
-    let report = Box::pin(run_activation(command.host, current)).await?;
+    if command.force {
+        println!(
+            "Muxe will try to retire each broker cleanly. If it must stop a broker process, pending menu/capture cleanup and local command supervision may be lost. Host-owned processes are not terminated, and uncertain actions are not replayed."
+        );
+    }
+    let report = Box::pin(run_activation(command.host, current, command.force)).await?;
     for unit in &report.units {
         match unit {
             muxe::lifecycle::UnitOutcome::Committed { unit } => println!("Activated {unit}."),
@@ -591,6 +596,7 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
 async fn run_activation(
     scope: HostScope,
     current: Option<muxe::lifecycle::DetectedHost>,
+    force: bool,
 ) -> Result<muxe::lifecycle::ActivateReport> {
     let paths = muxe::paths::resolve()?;
     let logger = muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION"))
@@ -599,10 +605,15 @@ async fn run_activation(
         .wrap_err("could not load the embedded compatibility record")?;
     let registry = muxe::lifecycle::Registry::open(&paths.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
-    let live = registry
-        .probe()
-        .wrap_err("could not probe the owner-only broker registry")?
-        .live;
+    let live = if force {
+        muxe::lifecycle::activate::force_selection_rows(&paths.cache_dir, scope, current.as_ref())
+            .wrap_err("could not read selected force-recovery registrations")?
+    } else {
+        registry
+            .probe()
+            .wrap_err("could not probe the owner-only broker registry")?
+            .live
+    };
     let selected =
         muxe::lifecycle::activate::selected_host_requirements(live, scope, current.as_ref())
             .wrap_err("could not validate selected broker registry records")?;
@@ -653,6 +664,7 @@ async fn run_activation(
         logger: Some(&logger),
     };
     Box::pin(muxe::lifecycle::activate(muxe::lifecycle::ActivateInputs {
+        force,
         config_dir: &paths.config_dir,
         cache_dir: &paths.cache_dir,
         target: record.handoff,
@@ -716,7 +728,7 @@ async fn ensure_herdr_broker(
     {
         muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.into_socket()),
         muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
-            Box::pin(run_activation(HostScope::Herdr, None)).await?;
+            Box::pin(run_activation(HostScope::Herdr, None, false)).await?;
             match muxe::lifecycle::ensure_broker(&inputs)
                 .await
                 .map_err(|error| {
@@ -773,7 +785,7 @@ async fn ensure_zellij_broker(
         muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live),
         muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
             let current = Some(detect_current_host(cache_dir)?);
-            Box::pin(run_activation(HostScope::Current, current)).await?;
+            Box::pin(run_activation(HostScope::Current, current, false)).await?;
             match muxe::lifecycle::ensure_broker(&inputs)
                 .await
                 .map_err(|error| {
@@ -1144,6 +1156,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
         muxe_protocol::control::BrokerRegistrationId::generate()
             .wrap_err("could not generate the Herdr broker's process registration ID")?,
     );
+    entry.process_identity = muxe_process::ProcessIdentity::current().ok();
     entry.live_server = Some(live_server.server_id.as_str().to_owned());
     // The Registration token scopes cleanup to this process's exact entry: an old
     // broker exiting after handoff must never erase the target's entry at the same
@@ -1420,6 +1433,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         muxe_protocol::control::BrokerRegistrationId::generate()
             .wrap_err("could not generate the Zellij broker's process registration ID")?,
     );
+    entry.process_identity = muxe_process::ProcessIdentity::current().ok();
     let recovery = Arc::new(JournalRecovery {
         cache_dir: command.cache_dir.clone(),
         unit: muxe::lifecycle::UnitKind::Zellij {
@@ -1957,7 +1971,7 @@ impl JournalRecovery {
     ) -> std::result::Result<(), String> {
         if journal.directive() != muxe::lifecycle::TransactionDirective::Commit
             || !journal.has_commit_certificate()
-            || status.current != member.old_record
+            || member.old_record.as_ref() != Some(&status.current)
             || status.handoff_id != Some(member.handoff_id())
             || status.live_server.discovery_key != member.member().as_str()
             || !muxe::lifecycle::activate::status_attests_journal(status, journal)
@@ -1986,7 +2000,10 @@ impl JournalRecovery {
             || row
                 .registration_id
                 .is_none_or(muxe_protocol::control::BrokerRegistrationId::is_zero)
-            || row.live_server.as_deref() != Some(status.live_server.server_id.as_str())
+            || row.live_server.as_deref().is_none_or(str::is_empty)
+            || status.registration.is_none_or(|proof| {
+                Some(proof.id) != row.registration_id || proof.started_at != row.started_at
+            })
             || row.bridge_identity != self.bridge_identity
             || row.bridge_member != self.bridge_member
         {
@@ -1997,6 +2014,20 @@ impl JournalRecovery {
 }
 
 impl muxe_broker::RecoveryJournal for JournalRecovery {
+    fn release_retired_registration<'a>(
+        &'a self,
+        proof: &'a muxe_broker::RetiredRegistrationProof,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send + 'a>>>
+    {
+        Some(Box::pin(async move {
+            muxe::lifecycle::Registry::open(&self.cache_dir)
+                .and_then(|registry| registry.release_retired(proof))
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("could not release the retired broker registration: {error}")
+                })
+        }))
+    }
     #[expect(
         clippy::too_many_lines,
         reason = "recovery keeps lock acquisition, exact authority validation, durable directive selection, and permit construction in one auditable critical section"
@@ -2119,7 +2150,7 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 );
             }
             if journal.directive() == muxe::lifecycle::TransactionDirective::Commit {
-                let old_role = local_status.current == member.old_record
+                let old_role = member.old_record.as_ref() == Some(&local_status.current)
                     && local_status.handoff_id == Some(*handoff)
                     && match local_status.lifecycle {
                         muxe_protocol::control::LifecycleState::Draining => {
@@ -2155,7 +2186,7 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
             let old_commit_index = (journal.directive()
                 == muxe::lifecycle::TransactionDirective::Commit
                 && local_status.lifecycle == muxe_protocol::control::LifecycleState::Draining
-                && local_status.current == member.old_record
+                && member.old_record.as_ref() == Some(&local_status.current)
                 && member.old == muxe::lifecycle::journal::OldMemberProgress::Drained)
                 .then(|| {
                     journal
@@ -2307,6 +2338,11 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                         reason: "the completed activation still requires file cleanup before recovery can continue".to_owned(),
                     }
                 }
+                muxe::lifecycle::TransactionDirective::RetryForce => {
+                    muxe_broker::RecoveryDecision::Preserve {
+                        reason: "the broker's forced replacement is awaiting another muxe activate --force; the previous broker was not restored".to_owned(),
+                    }
+                }
             }
         })
     }
@@ -2368,11 +2404,20 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 .recovery_member(&self.discovery_key, *handoff)
                 .map_err(|error| format!("old retirement member unauthorized: {error}"))?;
             self.validate_old_incarnation(&journal, member, local_status)?;
+            let ownership_server = journal
+                .old_registry
+                .iter()
+                .find(|row| {
+                    row.socket == member.endpoint().as_path()
+                        && row.discovery_key == member.member().as_str()
+                })
+                .and_then(|row| row.live_server.as_ref())
+                .expect("validated old ownership identity");
             muxe::lifecycle::journal::write_old_retirement_receipt(
                 &self.cache_dir,
                 &journal,
                 member,
-                &local_status.live_server.server_id,
+                &muxe_protocol::wire::ServerId::new(ownership_server.clone()),
             )
             .map_err(|error| format!("cannot persist old retirement proof: {error}"))
         })
@@ -3963,6 +4008,30 @@ mod tests {
             old_recovery.recovery_decision(&handoff, old).await,
             RecoveryDecision::TargetOwns { .. }
         ));
+        let saved = muxe::lifecycle::journal::read_journal(path).unwrap();
+        let member = &saved.members()[0];
+        let mut fresh = old.clone();
+        fresh.live_server.server_id =
+            muxe_protocol::wire::ServerId::new("authorized-fresh-admission");
+        assert!(
+            old_recovery
+                .validate_old_incarnation(&saved, member, &fresh)
+                .is_ok()
+        );
+        for changed in [true, false] {
+            let mut wrong = fresh.clone();
+            let proof = wrong.registration.as_mut().unwrap();
+            if changed {
+                proof.id = muxe_protocol::control::BrokerRegistrationId::generate().unwrap();
+            } else {
+                proof.started_at += 1;
+            }
+            assert!(
+                old_recovery
+                    .validate_old_incarnation(&saved, member, &wrong)
+                    .is_err()
+            );
+        }
         assert!(
             old_recovery
                 .authorize_old_commit(&handoff, old)
@@ -4113,6 +4182,19 @@ mod tests {
         }
     }
 
+    fn registered_ready_old_row(cache: &Path) -> muxe::lifecycle::BrokerEntry {
+        let mut row = muxe::lifecycle::BrokerEntry::now(
+            "herdr",
+            "server",
+            cache.join("server.sock"),
+            std::process::id(),
+        );
+        row.live_server = Some("old-server".to_owned());
+        row.registration_id =
+            Some(muxe_protocol::control::BrokerRegistrationId::generate().unwrap());
+        row
+    }
+
     #[tokio::test]
     async fn broker_ready_permit_requires_exact_target_status_and_registry_incarnation() {
         use muxe::lifecycle::journal::{
@@ -4179,21 +4261,20 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut old_row = muxe::lifecycle::BrokerEntry::now(
-            "herdr",
-            "server",
-            cache.join("server.sock"),
-            std::process::id(),
-        );
-        old_row.live_server = Some("old-server".to_owned());
-        old_row.registration_id =
-            Some(muxe_protocol::control::BrokerRegistrationId::generate().unwrap());
+        let old_row = registered_ready_old_row(&cache);
         journal.old_registry.push(old_row.clone());
         journal.enter_ready(Some(proof));
         let path = muxe::lifecycle::journal::write_journal(&cache, &journal).unwrap();
         let recovery = ready_recovery_for_server(&cache, &unit, row.registration_id);
         let old_recovery = ready_recovery_for_server(&cache, &unit, old_row.registration_id);
         let (status, mut old) = rollback_peer_statuses(old_record, target, handoff);
+        old.registration = Some(
+            muxe_protocol::control::BrokerRegistrationProof::new(
+                old_row.registration_id.unwrap(),
+                old_row.started_at,
+            )
+            .unwrap(),
+        );
         assert_ready_initial_authority(
             &recovery,
             &old_recovery,

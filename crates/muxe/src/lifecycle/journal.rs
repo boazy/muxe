@@ -50,6 +50,8 @@ const TARGET_RETIREMENT_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const OLD_RETIREMENT_RECEIPT_SCHEMA_VERSION: u32 = 1;
 /// Activation journal schema version.
 pub const ACTIVATION_JOURNAL_SCHEMA_VERSION: u32 = 5;
+/// Forced stop extensions are written only when no old Prepare needs this record.
+pub const FORCED_ACTIVATION_JOURNAL_SCHEMA_VERSION: u32 = 6;
 /// Recovery deadline: ten minutes after the journal is written.
 pub const RECOVERY_DEADLINE_SECS: u64 = 600;
 
@@ -608,6 +610,8 @@ impl TargetRetirementReceiptId {
         launch_authority: &MemberLaunchAuthority,
         target_record: &CompatibilityRecord,
         authority: &TargetRetirementAuthority,
+        retired_registration: Option<&BrokerEntry>,
+        retired_endpoint: Option<&super::control::EndpointIdentity>,
     ) -> Result<Self, JournalError> {
         #[derive(Serialize)]
         struct Binding<'a> {
@@ -616,6 +620,10 @@ impl TargetRetirementReceiptId {
             launch_authority: &'a MemberLaunchAuthority,
             target_record: &'a CompatibilityRecord,
             authority: &'a TargetRetirementAuthority,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            retired_registration: Option<&'a BrokerEntry>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            retired_endpoint: Option<&'a super::control::EndpointIdentity>,
         }
 
         let bytes = serde_json::to_vec(&Binding {
@@ -624,6 +632,8 @@ impl TargetRetirementReceiptId {
             launch_authority,
             target_record,
             authority,
+            retired_registration,
+            retired_endpoint,
         })
         .map_err(|error| {
             JournalError::Inconsistent(format!(
@@ -652,6 +662,12 @@ impl TargetRetirementReceiptId {
 pub struct TargetRetirementIntent {
     receipt_id: TargetRetirementReceiptId,
     authority: TargetRetirementAuthority,
+    /// Force-only exact registry metadata observed when the owned target
+    /// stopped. It permits metadata release, never process signalling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired_registration: Option<BrokerEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired_endpoint: Option<super::control::EndpointIdentity>,
 }
 
 impl TargetRetirementIntent {
@@ -673,10 +689,14 @@ impl TargetRetirementIntent {
             &member.authority,
             &journal.target_record,
             &authority,
+            None,
+            None,
         )?;
         Ok(Self {
             receipt_id,
             authority,
+            retired_registration: None,
+            retired_endpoint: None,
         })
     }
 
@@ -686,6 +706,55 @@ impl TargetRetirementIntent {
         member: &TransactionMember,
     ) -> Result<(), JournalError> {
         self.authority.validate()?;
+        if let Some(row) = &self.retired_registration {
+            let old = journal
+                .old_registry
+                .iter()
+                .find(|old| {
+                    old.socket == member.endpoint().as_path()
+                        && old.discovery_key == member.member().as_str()
+                })
+                .ok_or_else(|| {
+                    JournalError::Inconsistent(
+                        "stopped target has no original host scope".to_owned(),
+                    )
+                })?;
+            let same_host = row
+                .parsed_host_kind()
+                .map_err(|error| JournalError::Inconsistent(error.to_string()))?
+                == old
+                    .parsed_host_kind()
+                    .map_err(|error| JournalError::Inconsistent(error.to_string()))?;
+            let exact = journal.is_forced()
+                && same_host
+                && row.socket == member.endpoint().as_path()
+                && row.discovery_key == member.member().as_str()
+                && row.bridge_identity == old.bridge_identity
+                && row.bridge_member == old.bridge_member
+                && row.handoff_id
+                    == journal
+                        .bridge_identity
+                        .as_ref()
+                        .map(|_| member.handoff_id())
+                && row.registration_id.is_some_and(|id| !id.is_zero())
+                && row.started_at != 0
+                && row.live_server.as_deref().is_some_and(|id| !id.is_empty())
+                && matches!(self.authority, TargetRetirementAuthority::OwnedProcess { process_id } if process_id.get() == row.server_pid);
+            if !exact {
+                return Err(JournalError::Inconsistent("saved stopped-target registration differs from its forced transaction authority".to_owned()));
+            }
+        }
+        if self.retired_endpoint.as_ref().is_some_and(|endpoint| {
+            !endpoint.valid_recorded()
+                || self
+                    .retired_registration
+                    .as_ref()
+                    .is_none_or(|row| endpoint.path() != row.socket)
+        }) {
+            return Err(JournalError::Inconsistent(
+                "saved stopped-target socket differs from its exact registration".to_owned(),
+            ));
+        }
         if !self.receipt_id.is_valid()
             || self.receipt_id
                 != TargetRetirementReceiptId::derive(
@@ -694,6 +763,8 @@ impl TargetRetirementIntent {
                     &member.authority,
                     &journal.target_record,
                     &self.authority,
+                    self.retired_registration.as_ref(),
+                    self.retired_endpoint.as_ref(),
                 )?
         {
             return Err(JournalError::Inconsistent(
@@ -701,6 +772,52 @@ impl TargetRetirementIntent {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn bind_stopped_registration(
+        &mut self,
+        journal: &ActivationJournal,
+        member: &TransactionMember,
+        row: BrokerEntry,
+        endpoint: Option<super::control::EndpointIdentity>,
+    ) -> Result<(), JournalError> {
+        self.retired_registration = Some(row);
+        self.retired_endpoint = endpoint;
+        self.receipt_id = TargetRetirementReceiptId::derive(
+            journal.activation_id,
+            &member.id,
+            &member.authority,
+            &journal.target_record,
+            &self.authority,
+            self.retired_registration.as_ref(),
+            self.retired_endpoint.as_ref(),
+        )?;
+        self.validate(journal, member)
+    }
+
+    pub(crate) fn stopped_registration_proof<'a>(
+        &'a self,
+        cache: &Path,
+        journal: &ActivationJournal,
+        member: &TransactionMember,
+    ) -> Result<Option<StoppedTargetRegistrationProof<'a>>, JournalError> {
+        self.validate(journal, member)?;
+        if !journal.is_forced()
+            || member.target != TargetMemberProgress::Retired
+            || member.target_retirement.as_ref() != Some(self)
+            || !has_target_retirement_receipt(&activation_dir(cache), journal, member)?
+        {
+            return Err(JournalError::Inconsistent(
+                "stopped target registration lacks its exact forced retirement receipt".to_owned(),
+            ));
+        }
+        Ok(self
+            .retired_registration
+            .as_ref()
+            .map(|entry| StoppedTargetRegistrationProof {
+                entry,
+                endpoint: self.retired_endpoint.as_ref(),
+            }))
     }
 
     #[must_use]
@@ -711,6 +828,21 @@ impl TargetRetirementIntent {
     #[must_use]
     pub const fn receipt_id(&self) -> &TargetRetirementReceiptId {
         &self.receipt_id
+    }
+}
+
+/// Exact receipt-backed permission to release stopped target metadata.
+pub(crate) struct StoppedTargetRegistrationProof<'a> {
+    entry: &'a BrokerEntry,
+    endpoint: Option<&'a super::control::EndpointIdentity>,
+}
+
+impl StoppedTargetRegistrationProof<'_> {
+    pub(crate) fn entry(&self) -> &BrokerEntry {
+        self.entry
+    }
+    pub(crate) fn endpoint(&self) -> Option<&super::control::EndpointIdentity> {
+        self.endpoint
     }
 }
 
@@ -756,6 +888,8 @@ pub enum OldMemberProgress {
     Committed,
     ResumeIntent,
     Resumed,
+    ForceStopIntent,
+    ForceStopped,
 }
 
 /// Progress of the target broker for one exact member.
@@ -782,17 +916,40 @@ pub struct MemberLaunchAuthority {
     pub handoff_id: HandoffId,
 }
 
+/// Irreversible forced retirement authority, recorded before sending Retire.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ForcedStop {
+    pub process: muxe_process::ProcessIdentity,
+    pub endpoint: Option<super::control::EndpointIdentity>,
+    /// A new explicit force attempt durably authorizes exact termination.
+    /// Unconfirmed earlier retirement is not a claim that supervision ended.
+    #[serde(default)]
+    pub hard_stop_intent: bool,
+    pub proof: Option<ForcedStopProof>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedStopProof {
+    /// The authenticated Retire ACK follows adapter shutdown and owned unlink.
+    CooperativeRetirement,
+    /// Exact OS proof confirmed that the process exited.
+    ProcessExited,
+}
+
 /// One exact old/target member pair.
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransactionMember {
     pub id: MemberTransactionId,
     pub authority: MemberLaunchAuthority,
-    pub old_record: CompatibilityRecord,
+    pub old_record: Option<CompatibilityRecord>,
     pub old: OldMemberProgress,
     pub target: TargetMemberProgress,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_retirement: Option<TargetRetirementIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_stop: Option<ForcedStop>,
 }
 
 impl TransactionMember {
@@ -806,7 +963,7 @@ impl TransactionMember {
         member: ActivationMemberId,
         endpoint: MemberEndpoint,
         handoff_id: HandoffId,
-        old_record: CompatibilityRecord,
+        old_record: impl Into<Option<CompatibilityRecord>>,
     ) -> Result<Self, JournalError> {
         if handoff_id.0 == [0; 16] {
             return Err(JournalError::Inconsistent(
@@ -821,10 +978,11 @@ impl TransactionMember {
                 endpoint,
                 handoff_id,
             },
-            old_record,
+            old_record: old_record.into(),
             old: OldMemberProgress::Pending,
             target: TargetMemberProgress::Absent,
             target_retirement: None,
+            forced_stop: None,
         })
     }
 
@@ -1136,6 +1294,10 @@ pub enum TransactionPhase {
     Committed {
         progress: TransactionProgress,
     },
+    ForcedRetry {
+        reason: String,
+        progress: TransactionProgress,
+    },
     RolledBack {
         progress: TransactionProgress,
     },
@@ -1151,6 +1313,7 @@ pub enum TransactionDirective {
     RollBack,
     CleanupCommitted,
     CleanupRolledBack,
+    RetryForce,
 }
 
 /// Broker-local progress acknowledgement. Old and target commit proof remain
@@ -1173,6 +1336,7 @@ impl TransactionPhase {
             | Self::Committing { progress }
             | Self::RollingBack { progress, .. }
             | Self::Committed { progress }
+            | Self::ForcedRetry { progress, .. }
             | Self::RolledBack { progress } => progress,
         }
     }
@@ -1185,6 +1349,7 @@ impl TransactionPhase {
             | Self::Committing { progress }
             | Self::RollingBack { progress, .. }
             | Self::Committed { progress }
+            | Self::ForcedRetry { progress, .. }
             | Self::RolledBack { progress } => progress,
         }
     }
@@ -1197,6 +1362,7 @@ impl TransactionPhase {
             Self::Ready { .. } | Self::Committing { .. } => TransactionDirective::Commit,
             Self::RollingBack { .. } => TransactionDirective::RollBack,
             Self::Committed { .. } => TransactionDirective::CleanupCommitted,
+            Self::ForcedRetry { .. } => TransactionDirective::RetryForce,
             Self::RolledBack { .. } => TransactionDirective::CleanupRolledBack,
         }
     }
@@ -1402,11 +1568,16 @@ impl ActivationJournal {
         self.transaction.progress().ready_proof.as_ref()
     }
 
+    #[must_use]
+    pub fn is_forced(&self) -> bool {
+        self.schema_version == FORCED_ACTIVATION_JOURNAL_SCHEMA_VERSION
+    }
+
     /// Only a v5 Ready decision with a complete target incarnation census
     /// authorizes Commit. Earlier Ready files remain readable but Preserved.
     #[must_use]
     pub fn has_commit_certificate(&self) -> bool {
-        self.schema_version == ACTIVATION_JOURNAL_SCHEMA_VERSION
+        matches!(self.schema_version, 5 | 6)
             && self
                 .ready_proof()
                 .is_some_and(|proof| proof.validate(self).is_ok())
@@ -1439,8 +1610,17 @@ impl ActivationJournal {
     }
 
     pub fn enter_rolled_back(&mut self) {
-        let progress = self.transaction.progress().clone();
-        self.transaction = TransactionPhase::RolledBack { progress };
+        let mut progress = self.transaction.progress().clone();
+        progress.ready_proof = None;
+        self.transaction = if self.is_forced() {
+            let reason = match &self.transaction {
+                TransactionPhase::RollingBack { reason, .. } => reason.clone(),
+                _ => "forced replacement did not complete".to_owned(),
+            };
+            TransactionPhase::ForcedRetry { reason, progress }
+        } else {
+            TransactionPhase::RolledBack { progress }
+        };
     }
 
     /// Derives target registration authority for one exact journal member.
@@ -1463,7 +1643,23 @@ impl ActivationJournal {
                 "replacement broker identities have already been saved with the readiness decision; no new replacement registration is allowed".to_owned(),
             ));
         }
-        self.target_restore_capability(discovery_key, endpoint, handoff)
+        let capability = self.target_restore_capability(discovery_key, endpoint, handoff)?;
+        let ended = self.is_forced()
+            && self.members().iter().any(|member| {
+                member.member().as_str() == discovery_key
+                    && member.endpoint().as_path() == endpoint
+                    && member.handoff_id() == handoff
+                    && member.old == OldMemberProgress::ForceStopped
+                    && member
+                        .forced_stop
+                        .as_ref()
+                        .is_some_and(|stop| stop.proof.is_some())
+            });
+        Ok(if ended {
+            capability.certify_absent_member()
+        } else {
+            capability
+        })
     }
 
     /// Internal rollback authority for restoring an old row after Ready; it
@@ -1518,7 +1714,7 @@ impl ActivationJournal {
     pub fn validate(&self) -> Result<(), JournalError> {
         if !matches!(
             self.schema_version,
-            3 | 4 | ACTIVATION_JOURNAL_SCHEMA_VERSION
+            3 | 4 | ACTIVATION_JOURNAL_SCHEMA_VERSION | FORCED_ACTIVATION_JOURNAL_SCHEMA_VERSION
         ) {
             return Err(JournalError::UnsupportedVersion {
                 path: PathBuf::from("<memory>"),
@@ -1545,6 +1741,53 @@ impl ActivationJournal {
                 return Err(JournalError::Inconsistent(
                     "the saved activation record contains an invalid or duplicate broker target, socket, transaction ID, or handoff ID".to_owned(),
                 ));
+            }
+            if self.is_forced() {
+                let stop = member.forced_stop.as_ref().ok_or_else(|| {
+                    JournalError::Inconsistent(
+                        "forced replacement lacks exact old process and socket authority"
+                            .to_owned(),
+                    )
+                })?;
+                let mut rows = self.old_registry.iter().filter(|row| {
+                    row.socket == member.endpoint().as_path()
+                        && row.discovery_key == member.member().as_str()
+                });
+                let old = rows.next();
+                if stop.endpoint.as_ref().is_some_and(|endpoint| {
+                    endpoint.path() != member.endpoint().as_path() || !endpoint.valid_recorded()
+                }) || old.is_none_or(|row| {
+                    row.server_pid != stop.process.process().get()
+                        || row
+                            .process_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity != &stop.process)
+                        || (stop.endpoint.is_none()
+                            && row.process_identity.as_ref() != Some(&stop.process))
+                }) || (stop.endpoint.is_none()
+                    && stop.proof.is_none()
+                    && !stop.process.authorizes_stored_peer())
+                    || rows.next().is_some()
+                    || (member.old == OldMemberProgress::ForceStopped) != stop.proof.is_some()
+                    || !matches!(
+                        member.old,
+                        OldMemberProgress::Pending
+                            | OldMemberProgress::ForceStopIntent
+                            | OldMemberProgress::ForceStopped
+                    )
+                {
+                    return Err(JournalError::Inconsistent(
+                        "forced stop proof differs from its old process, endpoint, or durable progress".to_owned()));
+                }
+            } else if member.old_record.is_none()
+                || member.forced_stop.is_some()
+                || matches!(
+                    member.old,
+                    OldMemberProgress::ForceStopIntent | OldMemberProgress::ForceStopped
+                )
+            {
+                return Err(JournalError::Inconsistent(
+                    "ordinary activation requires observed old compatibility and cooperative old progress".to_owned()));
             }
             match (member.target, member.target_retirement.as_ref()) {
                 (
@@ -1678,21 +1921,27 @@ impl ActivationJournal {
                     OldMemberProgress::Pending
                         | OldMemberProgress::PrepareIntent
                         | OldMemberProgress::Drained
+                        | OldMemberProgress::ForceStopIntent
+                        | OldMemberProgress::ForceStopped
                 ) && member.target == TargetMemberProgress::Absent
             }),
             TransactionPhase::Activating { progress } => progress.members.iter().all(|member| {
-                member.old == OldMemberProgress::Drained
-                    && matches!(
-                        member.target,
-                        TargetMemberProgress::Absent
-                            | TargetMemberProgress::SpawnIntent
-                            | TargetMemberProgress::Gated
-                            | TargetMemberProgress::Ready
-                    )
+                matches!(
+                    member.old,
+                    OldMemberProgress::Drained | OldMemberProgress::ForceStopped
+                ) && matches!(
+                    member.target,
+                    TargetMemberProgress::Absent
+                        | TargetMemberProgress::SpawnIntent
+                        | TargetMemberProgress::Gated
+                        | TargetMemberProgress::Ready
+                )
             }),
             TransactionPhase::Ready { progress } => progress.members.iter().all(|member| {
-                member.old == OldMemberProgress::Drained
-                    && member.target == TargetMemberProgress::Ready
+                matches!(
+                    member.old,
+                    OldMemberProgress::Drained | OldMemberProgress::ForceStopped
+                ) && member.target == TargetMemberProgress::Ready
             }),
             TransactionPhase::Committing { progress } => progress.members.iter().all(|member| {
                 matches!(
@@ -1700,6 +1949,7 @@ impl ActivationJournal {
                     OldMemberProgress::Drained
                         | OldMemberProgress::CommitIntent
                         | OldMemberProgress::Committed
+                        | OldMemberProgress::ForceStopped
                 ) && matches!(
                     member.target,
                     TargetMemberProgress::Ready
@@ -1716,8 +1966,10 @@ impl ActivationJournal {
                 })
             }
             TransactionPhase::Committed { progress } => progress.members.iter().all(|member| {
-                member.old == OldMemberProgress::Committed
-                    && member.target == TargetMemberProgress::Committed
+                matches!(
+                    member.old,
+                    OldMemberProgress::Committed | OldMemberProgress::ForceStopped
+                ) && member.target == TargetMemberProgress::Committed
             }),
             TransactionPhase::RolledBack { progress } => progress.members.iter().all(|member| {
                 matches!(
@@ -1728,6 +1980,18 @@ impl ActivationJournal {
                     TargetMemberProgress::Absent | TargetMemberProgress::Retired
                 )
             }),
+            TransactionPhase::ForcedRetry { progress, .. } => {
+                self.is_forced()
+                    && progress.members.iter().all(|member| {
+                        matches!(
+                            member.old,
+                            OldMemberProgress::Pending | OldMemberProgress::ForceStopped
+                        ) && matches!(
+                            member.target,
+                            TargetMemberProgress::Absent | TargetMemberProgress::Retired
+                        )
+                    })
+            }
         };
         let bridge_valid = progress
             .bridge
@@ -1783,7 +2047,7 @@ impl ActivationJournal {
                 TransactionPhase::Committed { .. } => {
                     bridge.progress == BridgeProgress::ReceiptPublished
                 }
-                TransactionPhase::RolledBack { .. } => {
+                TransactionPhase::RolledBack { .. } | TransactionPhase::ForcedRetry { .. } => {
                     matches!(bridge.progress, BridgeProgress::Restored { .. })
                 }
             });
@@ -1812,8 +2076,8 @@ impl ActivationJournal {
                 | TransactionPhase::Committed { .. }
         );
         let proof_valid = match (self.schema_version, progress.ready_proof.as_ref()) {
-            (5, Some(proof)) if proof_phase => proof.validate(self).is_ok(),
-            (5, None) if !proof_phase => true,
+            (5 | 6, Some(proof)) if proof_phase => proof.validate(self).is_ok(),
+            (5 | 6, None) if !proof_phase => true,
             (4, Some(proof)) if proof_phase => proof.validate_legacy(self),
             (4, None) if !proof_phase || matches!(self.unit, UnitKind::Herdr { .. }) => true,
             (3, None) => true,
@@ -1925,7 +2189,7 @@ struct OldRetirementReceipt {
     activation_id: ActivationId,
     member_id: MemberTransactionId,
     authority: MemberLaunchAuthority,
-    old_record: CompatibilityRecord,
+    old_record: Option<CompatibilityRecord>,
     target_record: CompatibilityRecord,
     old_entry: BrokerEntry,
 }
@@ -2264,6 +2528,45 @@ pub fn write_journal(
     Ok(path)
 }
 
+/// Preserves the exact prior decision before an authenticated forced cutover.
+/// The retained file is not another active coordinator journal.
+pub(crate) fn retain_before_force(
+    cache_dir: &Path,
+    journal: &ActivationJournal,
+) -> Result<(), JournalError> {
+    let directory = activation_dir(cache_dir);
+    let path = directory.join(journal.unit.journal_name());
+    if read_journal(&path)? != *journal {
+        return Err(JournalError::Inconsistent(
+            "the saved activation decision changed before forced replacement".to_owned(),
+        ));
+    }
+    let bytes = fsutil::read_owner_file(&path)?;
+    let retained = directory.join(format!(
+        "{}.retained-{}",
+        journal.unit.journal_name(),
+        journal.activation_id
+    ));
+    match fs::symlink_metadata(&retained) {
+        Ok(_) => {
+            if fsutil::read_owner_file(&retained)? != bytes {
+                return Err(JournalError::Inconsistent(
+                    "retained activation evidence differs from the prior decision".to_owned(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fsutil::write_atomic(&retained, &bytes, "retaining forced activation evidence")?;
+        }
+        Err(error) => {
+            return Err(
+                fsutil::io_error("reading retained activation evidence", &retained, error).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Reads and validates a journal. Unrecognized states fail closed.
 ///
 /// # Errors
@@ -2285,7 +2588,7 @@ pub fn read_journal(path: &Path) -> Result<ActivationJournal, JournalError> {
             version: 0,
         });
     };
-    if !matches!(version, 3..=5) {
+    if !matches!(version, 3..=6) {
         return Err(JournalError::UnsupportedVersion {
             path: path.to_path_buf(),
             version: u32::try_from(version).unwrap_or(u32::MAX),

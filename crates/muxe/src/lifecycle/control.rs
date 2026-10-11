@@ -14,13 +14,10 @@
 //! that the broker left its state unchanged.
 
 use std::{
-    fs::{self, File},
-    io::Read,
+    fs,
     num::NonZeroU32,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use muxe_protocol::{
@@ -92,9 +89,17 @@ pub enum ControlError {
     #[error("control operation timed out")]
     Timeout,
     #[error(
-        "the broker control connection belongs to another user or does not expose its process identity"
+        "Muxe cannot authenticate the broker process or match its saved identity: its owner or process identity is unavailable, or its PID, OS identity, or registration token differs from the saved record"
     )]
     PeerIdentity,
+    #[error("the OS could not authorize or finish stopping the exact broker process: {0}")]
+    Process(#[from] muxe_process::ProcessError),
+    #[error("Muxe could not obtain OS entropy for an authenticated control request: {0}")]
+    Entropy(String),
+    #[error(
+        "Muxe cannot authenticate this unresponsive older broker: its registration has no saved OS identity that uniquely identifies this process. No process was signalled"
+    )]
+    UnprovenLegacy,
     #[error("broker control endpoint is not an owner-only socket: {}", .0.display())]
     InvalidEndpoint(PathBuf),
     #[error("broker control endpoint changed during verification: {}", .0.display())]
@@ -193,30 +198,16 @@ fn encode_request(message: &impl serde::Serialize) -> Result<Vec<u8>, ControlErr
     Ok(payload)
 }
 
-/// Generates a unique 128-bit request nonce.
-///
-/// Reads from the OS entropy source; if it is unavailable, mixes an atomic
-/// counter with the process ID and nanosecond time. Coordinator request IDs
-/// need uniqueness (duplicates are rejected), not secrecy.
-fn new_request_id(counter: &AtomicU64) -> ControlRequestId {
-    let mut bytes = [0u8; 16];
-    if let Ok(mut entropy) = File::open("/dev/urandom")
-        && entropy.read_exact(&mut bytes).is_ok()
-        && bytes != [0; 16]
-    {
-        return ControlRequestId(bytes);
-    }
-    let count = counter.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    bytes[..8].copy_from_slice(&nanos.to_be_bytes()[..8]);
-    bytes[8..12].copy_from_slice(&std::process::id().to_be_bytes());
-    bytes[12..].copy_from_slice(&count.to_be_bytes()[..4]);
+/// Generates a fresh unpredictable request nonce, including for peer authentication.
+fn new_request_id() -> Result<ControlRequestId, ControlError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| ControlError::Entropy(error.to_string()))?;
     if bytes == [0; 16] {
-        bytes[0] = 1;
+        return Err(ControlError::Entropy(
+            "the OS returned the reserved zero nonce".to_owned(),
+        ));
     }
-    ControlRequestId(bytes)
+    Ok(ControlRequestId(bytes))
 }
 
 /// Decodes a 32-hex-character handoff ID from journal form.
@@ -248,8 +239,8 @@ impl BrokerProcessId {
 }
 
 /// Nofollow filesystem identity of the endpoint observed by one control stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct EndpointIdentity {
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EndpointIdentity {
     path: PathBuf,
     device: u64,
     inode: u64,
@@ -277,6 +268,70 @@ impl EndpointIdentity {
             owner: metadata.uid(),
             mode,
         })
+    }
+}
+
+impl EndpointIdentity {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn valid_recorded(&self) -> bool {
+        self.path.is_absolute()
+            && self.path.file_name().is_some()
+            && !self.path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            && self.owner == Uid::current().as_raw()
+            && self.mode == 0o600
+            && self.device != 0
+            && self.inode != 0
+    }
+
+    #[must_use]
+    pub(crate) fn is_current(&self) -> bool {
+        Self::inspect(&self.path).is_ok_and(|current| current == *self)
+    }
+
+    /// Removes only this previously authenticated socket after exact stop proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError`] if socket metadata or the recorded runtime endpoint
+    /// is invalid, or metadata inspection, startup locking, probing, or durable
+    /// removal fails. Also rejects a still-reachable socket or one whose identity
+    /// no longer matches this endpoint.
+    pub fn remove_stopped(&self) -> Result<(), ControlError> {
+        match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let endpoint = muxe_broker::RuntimeEndpoint::from_recorded_socket(&self.path)
+            .map_err(|error| ControlError::Io(std::io::Error::other(error.to_string())))?;
+        let _startup_lock = endpoint
+            .acquire_startup_lock()
+            .map_err(|error| ControlError::Io(std::io::Error::other(error.to_string())))?;
+        match std::os::unix::net::UnixStream::connect(&self.path) {
+            Ok(_) => return Err(ControlError::EndpointReplaced(self.path.clone())),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if Self::inspect(&self.path)? != *self {
+            return Err(ControlError::EndpointReplaced(self.path.clone()));
+        }
+        crate::fsutil::remove_file_durable(&self.path, "removing a stopped broker socket")
+            .map(|_| ())
+            .map_err(|error| ControlError::Io(std::io::Error::other(error.to_string())))
     }
 }
 
@@ -309,6 +364,11 @@ impl ControlAuthority {
             Ok(_) | Err(_) => Err(ControlError::EndpointReplaced(self.endpoint.path.clone())),
         }
     }
+
+    #[must_use]
+    pub fn socket_identity(&self) -> &EndpointIdentity {
+        &self.endpoint
+    }
 }
 
 /// Status plus same-stream peer and path attestation.
@@ -318,12 +378,19 @@ pub struct VerifiedControlStatus {
     pub authority: ControlAuthority,
 }
 
+/// Exact stop capability plus optional compatibility observed before mutation.
+#[derive(Debug)]
+pub struct ForcedPeer {
+    pub process: muxe_process::BrokerStopHandle,
+    pub endpoint: Option<EndpointIdentity>,
+    pub status: Option<ActivationStatus>,
+}
+
 /// Coordinator control connection to one broker.
 pub struct ControlClient {
     stream: UnixStream,
     decoder: ControlDecoder,
     authority: ControlAuthority,
-    counter: AtomicU64,
 }
 
 impl ControlClient {
@@ -360,7 +427,6 @@ impl ControlClient {
         Ok(Self {
             stream,
             decoder: ControlDecoder::new(ControlPolicy::coordinator()),
-            counter: AtomicU64::new(1),
             authority: ControlAuthority { process, endpoint },
         })
     }
@@ -377,6 +443,12 @@ impl ControlClient {
         }
     }
 
+    /// Kernel peer and path identity retained by this connection.
+    #[must_use]
+    pub fn authority(&self) -> &ControlAuthority {
+        &self.authority
+    }
+
     /// Returns status and peer/path authority observed on this same stream.
     ///
     /// # Errors
@@ -388,6 +460,74 @@ impl ControlClient {
         Ok(VerifiedControlStatus {
             status,
             authority: self.authority.clone(),
+        })
+    }
+
+    /// Authenticates a forced stop before creating its durable intent.
+    ///
+    /// The caller must supply native private-store role admission. A raw
+    /// `BrokerEntry`, validated shape, or OS cookie alone does not prove that
+    /// the process is a broker. The OS handle below proves the exact instance,
+    /// not application role; reachable identity contradictions still refuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError`] if the endpoint changes or cannot be inspected,
+    /// the peer PID or stored process incarnation disagrees with the admitted
+    /// broker, or a reported registration nonce or start time differs.
+    /// Also returns an error if unavailable status leaves the socket peer
+    /// unauthenticated, an OS process-proof facility fails, or request nonce
+    /// generation fails.
+    pub async fn forced_peer(
+        &mut self,
+        admitted: &super::registry::NativeBrokerAuthority<'_>,
+    ) -> Result<ForcedPeer, ControlError> {
+        let entry = admitted.entry();
+        self.authority.verify_path()?;
+        let pid = self.authority.process().get();
+        if pid != entry.server_pid().get() || pid == std::process::id() {
+            return Err(ControlError::PeerIdentity);
+        }
+        let process = muxe_process::BrokerStopHandle::capture(
+            &self.stream,
+            muxe_process::ProcessId::new(pid)?,
+        )?;
+        if entry
+            .process_identity()
+            .is_some_and(|recorded| recorded != process.identity())
+        {
+            return Err(ControlError::PeerIdentity);
+        }
+        let observed = timeout(Duration::from_secs(2), self.verified_status()).await;
+        let status = match observed {
+            Ok(Ok(verified)) => {
+                if entry.registration_id().is_some_and(|id| {
+                    verified.status.registration.is_none_or(|proof| {
+                        proof.id != id || proof.started_at != entry.started_at()
+                    })
+                }) {
+                    return Err(ControlError::PeerIdentity);
+                }
+                Some(verified.status)
+            }
+            Ok(Err(ControlError::Entropy(reason))) => return Err(ControlError::Entropy(reason)),
+            Ok(Err(_)) | Err(_) => {
+                let recorded = process.identity().authorizes_stored_peer()
+                    && entry.process_identity() == Some(process.identity());
+                if !recorded && !self.decoder.peer_prelude_verified() {
+                    return Err(ControlError::UnprovenLegacy);
+                }
+                if !recorded {
+                    process.prove_socket_peer(&self.stream)?;
+                }
+                None
+            }
+        };
+        self.authority.verify_path()?;
+        Ok(ForcedPeer {
+            process,
+            endpoint: Some(self.authority.endpoint.clone()),
+            status,
         })
     }
 
@@ -500,7 +640,7 @@ impl ControlClient {
         &mut self,
         operation: ControlOperation,
     ) -> Result<ControlResult, ControlError> {
-        let request_id = new_request_id(&self.counter);
+        let request_id = new_request_id()?;
         let operation_name = operation_name(&operation);
         let message = ControlMessage::Request(ControlRequest {
             request_id,
@@ -1026,9 +1166,8 @@ mod tests {
 
     #[test]
     fn request_ids_are_unique() {
-        let counter = AtomicU64::new(1);
-        let first = new_request_id(&counter);
-        let second = new_request_id(&counter);
+        let first = new_request_id().unwrap();
+        let second = new_request_id().unwrap();
         assert_ne!(first, second);
         assert_ne!(first.0, [0; 16]);
     }
