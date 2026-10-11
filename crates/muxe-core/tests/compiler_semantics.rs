@@ -2774,3 +2774,80 @@ menus:
                 && menu.inactivity_timeout == Some(std::time::Duration::ZERO))
     );
 }
+
+#[test]
+fn executable_pane_action_preserves_command_and_typed_placement() {
+    let config = compile(
+        r#"
+version: 1
+menus:
+  main:
+    bindings:
+      p:
+        label: Popup command
+        action:
+          type: pane:open
+          pane-type: popup
+          program: /bin/echo
+          args: ["", "a b", "$HOME", "; touch nope"]
+          cwd: {$context: origin.pane.cwd}
+      s:
+        label: Split command
+        action: pane:open program=htop
+"#,
+        None,
+        KeyCapabilities::default(),
+    )
+    .expect("executable pane mapping and compact forms compile");
+    let origin = origin_with_context_values();
+    let muxe_core::ResolvedPortableAction::Pane(muxe_core::ResolvedPaneAction::Open {
+        pane_type,
+        program,
+        args,
+        cwd,
+        ..
+    }) = portable_main_action(&config, "p")
+        .resolve_context(&origin)
+        .expect("saved origin resolves")
+    else {
+        panic!("expected executable pane");
+    };
+    assert_eq!(pane_type, muxe_core::ExecutablePaneType::Popup);
+    assert_eq!(program.as_os_str(), "/bin/echo");
+    assert_eq!(
+        args.iter()
+            .map(muxe_core::CommandWord::as_os_str)
+            .collect::<Vec<_>>(),
+        ["", "a b", "$HOME", "; touch nope"]
+    );
+    assert_eq!(
+        cwd.expect("captured cwd").as_path(),
+        origin.pane_cwd.as_deref().unwrap()
+    );
+    assert!(matches!(
+        portable_main_action(&config, "s"),
+        muxe_core::PortableAction::Pane(muxe_core::PaneAction::Open {
+            pane_type: muxe_core::ExecutablePaneType::Split,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn executable_panes_reject_missing_program_unknown_types_and_unimplemented_knobs() {
+    for action in [
+        "pane:open",
+        "pane:open program=''",
+        "pane:open program=htop pane-type=bogus",
+        "pane:open program=htop width=80%",
+        "plugin.pane:open",
+    ] {
+        let yaml = format!(
+            "version: 1\nmenus:\n  main:\n    bindings:\n      p:\n        label: Pane\n        action: {action}\n"
+        );
+        assert!(
+            compile(&yaml, None, KeyCapabilities::default()).is_err(),
+            "{action}"
+        );
+    }
+}

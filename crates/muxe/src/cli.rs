@@ -105,6 +105,9 @@ pub struct PaneCommand {
 pub enum PaneSubcommand {
     /// Open one generic command pane.
     Open(PaneOpen),
+    /// Execute the exact command supplied by the persistent Herdr plugin.
+    #[command(hide = true)]
+    Exec,
 }
 
 /// Arguments for `muxe pane open`.
@@ -135,9 +138,9 @@ pub struct PlacementOptions {
     /// Select an explicit parent pane or the captured origin pane.
     #[arg(long = "parent-pane", default_value = "current")]
     pub parent_pane: ParentPane,
-    /// Choose the split direction where the host supports it.
-    #[arg(long, value_enum, default_value = "down")]
-    pub direction: SplitDirection,
+    /// Choose the split direction (default: down). Unsupported for overlays and popups.
+    #[arg(long, value_enum)]
+    pub direction: Option<SplitDirection>,
     /// Set a pane width in terminal cells or as a percentage.
     #[arg(long)]
     pub width: Option<Dimension>,
@@ -594,7 +597,7 @@ mod tests {
             command.placement.parent_pane,
             ParentPane::Id("pane-7".into())
         );
-        assert_eq!(command.placement.direction, SplitDirection::Right);
+        assert_eq!(command.placement.direction, Some(SplitDirection::Right));
         assert_eq!(command.placement.width, Some(Dimension::Percent(80)));
         assert_eq!(command.placement.height, Some(Dimension::Cells(12)));
         assert_eq!(command.placement.position, Some(Position { x: 3, y: 4 }));

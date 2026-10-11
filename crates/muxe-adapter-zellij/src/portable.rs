@@ -457,9 +457,69 @@ fn validate_tab_structure(tab: &TabAction) -> Result<(), PortableError> {
     }
 }
 
+/// Validates executable-pane placement and command scalars before context resolution.
+fn validate_open_structure(pane: &PaneAction) -> Result<(), PortableError> {
+    let PaneAction::Open {
+        pane_type,
+        direction,
+        focus,
+        program,
+        args,
+        cwd,
+    } = pane
+    else {
+        unreachable!("validate_open_structure accepts only pane:open")
+    };
+    if let Some(direction) = direction {
+        if *pane_type != muxe_core::ExecutablePaneType::Split {
+            return Err(PortableError::Incompatible {
+                action: "pane:open",
+                reason: "floating panes do not support direction",
+            });
+        }
+        Cardinal::parse("pane:open", direction)?;
+    }
+    if let Some(focus) = focus
+        && !scalar_bool("pane:open", "focus", focus)?
+    {
+        return Err(PortableError::Incompatible {
+            action: "pane:open",
+            reason: "Zellij executable panes require focus=true",
+        });
+    }
+    for (parameter, value) in
+        std::iter::once(("program", program)).chain(args.iter().map(|value| ("args", value)))
+    {
+        if let ConfigValueKind::Context(reference) = &value.value.kind {
+            if reference.path.value_type() == ContextType::UnsignedInteger {
+                return Err(PortableError::UnresolvedContext {
+                    action: "pane:open",
+                    parameter,
+                });
+            }
+        } else {
+            scalar_string("pane:open", parameter, value)?;
+        }
+    }
+    if let Some(cwd) = cwd {
+        check_marker(
+            "pane:open",
+            "cwd",
+            cwd,
+            &[ContextType::AbsolutePath, ContextType::String],
+            true,
+        )?;
+        if !is_marker(cwd) {
+            scalar_string("pane:open", "cwd", cwd)?;
+        }
+    }
+    Ok(())
+}
+
 /// Validates the pane subgroup structurally.
 fn validate_pane_structure(pane: &PaneAction) -> Result<(), PortableError> {
     match pane {
+        pane @ PaneAction::Open { .. } => validate_open_structure(pane),
         PaneAction::Create | PaneAction::Close => Ok(()),
         PaneAction::Split {
             direction,
@@ -707,6 +767,9 @@ pub fn map_post_dismissal_creation(
                 reason: "tab:create produced no host action",
             })
         }
+        ResolvedPortableAction::Pane(pane @ ResolvedPaneAction::Open { .. }) => {
+            map_open(pane, origin)
+        }
         ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
             direction,
             focus,
@@ -738,9 +801,9 @@ pub fn map_post_dismissal_creation(
 pub fn creation_requires_post_dismissal(action: &ResolvedPortableAction) -> bool {
     match action {
         ResolvedPortableAction::Tab(ResolvedTabAction::Create { focus, .. })
-        | ResolvedPortableAction::Pane(ResolvedPaneAction::Split { focus, .. }) => {
-            focus.unwrap_or(true)
-        }
+        | ResolvedPortableAction::Pane(
+            ResolvedPaneAction::Split { focus, .. } | ResolvedPaneAction::Open { focus, .. },
+        ) => focus.unwrap_or(true),
         _ => false,
     }
 }
@@ -968,12 +1031,144 @@ fn map_split(
     })
 }
 
+/// Resolves executable-pane cwd against the saved origin at the JSON path boundary.
+fn resolve_open_cwd(
+    requested: Option<&muxe_core::CommandCwd>,
+    origin: &OriginContext,
+) -> Result<PathBuf, PortableError> {
+    let invalid = |reason| PortableError::InvalidScalar {
+        action: "pane:open",
+        parameter: "cwd",
+        reason,
+    };
+    let cwd = requested
+        .map(muxe_core::CommandCwd::as_path)
+        .or(origin.pane_cwd.as_deref())
+        .ok_or(PortableError::Incompatible {
+            action: "pane:open",
+            reason: "pane:open requires an explicit cwd or captured origin cwd",
+        })?;
+    let cwd = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        origin
+            .pane_cwd
+            .as_ref()
+            .ok_or(invalid("relative cwd requires captured origin cwd"))?
+            .join(cwd)
+    };
+    let cwd_text = cwd
+        .to_str()
+        .ok_or(invalid("path cannot be represented as UTF-8 text"))?;
+    if !cwd.is_absolute() || cwd_text.contains('\0') {
+        return Err(invalid(
+            "cwd must resolve to an absolute path without NUL bytes",
+        ));
+    }
+    Ok(cwd)
+}
+
 /// Maps pane creation and immutable-origin-targeted operations.
+fn map_open(
+    pane: &ResolvedPaneAction,
+    origin: &OriginContext,
+) -> Result<RawNativeCommand, PortableError> {
+    let ResolvedPaneAction::Open {
+        pane_type,
+        direction,
+        focus,
+        program,
+        args,
+        cwd,
+    } = pane
+    else {
+        unreachable!("map_open accepts only pane:open")
+    };
+    let invalid = |parameter, reason| PortableError::InvalidScalar {
+        action: "pane:open",
+        parameter,
+        reason,
+    };
+    if !focus.unwrap_or(true) {
+        return Err(PortableError::Incompatible {
+            action: "pane:open",
+            reason: "Zellij executable panes require focus=true",
+        });
+    }
+    let program_text = command_text("pane:open", "program", program)?;
+    if program_text.is_empty() || program_text.contains('\0') {
+        return Err(invalid(
+            "program",
+            "expected a nonempty program without NUL bytes",
+        ));
+    }
+    let args = args
+        .iter()
+        .map(|word| {
+            let value = command_text("pane:open", "args", word)?;
+            if value.contains('\0') {
+                return Err(invalid("args", "arguments cannot contain NUL bytes"));
+            }
+            Ok(value.to_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    let cwd = resolve_open_cwd(cwd.as_ref(), origin)?;
+    let command = Some(raw::RunCommandAction {
+        command: PathBuf::from(program.as_os_str()),
+        args,
+        cwd: Some(cwd),
+        direction: None,
+        hold_on_close: false,
+        hold_on_start: false,
+        originating_plugin: None,
+        use_terminal_title: false,
+    });
+    let action = match pane_type {
+        muxe_core::ExecutablePaneType::Split => raw::Action::NewTiledPane {
+            direction: direction
+                .map(|value| {
+                    Cardinal::from_direction("pane:open", value).map(Cardinal::into_mirror)
+                })
+                .transpose()?,
+            command,
+            pane_name: None,
+            near_current_pane: false,
+            no_focus: false,
+            borderless: None,
+            border_style: None,
+            tab_id: None,
+        },
+        muxe_core::ExecutablePaneType::Overlay | muxe_core::ExecutablePaneType::Popup => {
+            if direction.is_some() {
+                return Err(invalid(
+                    "direction",
+                    "floating panes do not support direction",
+                ));
+            }
+            raw::Action::NewFloatingPane {
+                command,
+                pane_name: None,
+                coordinates: None,
+                near_current_pane: false,
+                no_focus: false,
+                tab_id: None,
+            }
+        }
+    };
+    Ok(RawNativeCommand::RunAction {
+        action,
+        context: Vec::new(),
+    })
+}
+
 fn map_pane_action(
     pane: &ResolvedPaneAction,
     origin: &OriginContext,
 ) -> Result<PortableMapping, PortableError> {
     match pane {
+        pane @ ResolvedPaneAction::Open { .. } => Ok(PortableMapping::HostAction {
+            commands: vec![map_open(pane, origin)?],
+        }),
         ResolvedPaneAction::Create => Ok(wrap(raw::Action::NewPane {
             direction: None,
             pane_name: None,
@@ -1839,5 +2034,91 @@ mod tests {
                 }
             ));
         }
+    }
+    #[test]
+    fn executable_panes_map_exact_argv_after_dismissal_to_real_terminal_actions() {
+        for pane_type in [
+            muxe_core::ExecutablePaneType::Split,
+            muxe_core::ExecutablePaneType::Overlay,
+            muxe_core::ExecutablePaneType::Popup,
+        ] {
+            let mut origin = test_origin();
+            origin.pane_cwd = Some("/captured".into());
+            let action = ResolvedPortableAction::Pane(ResolvedPaneAction::Open {
+                pane_type,
+                direction: None,
+                focus: None,
+                program: CommandWord::Text("/bin/echo".into()),
+                args: ["", "a b", "$HOME", "; touch nope"]
+                    .map(|value| CommandWord::Text(value.into()))
+                    .to_vec(),
+                cwd: Some(muxe_core::CommandCwd::Literal("relative".into())),
+            });
+            assert!(creation_requires_post_dismissal(&action));
+            let RawNativeCommand::RunAction { action, .. } =
+                map_post_dismissal_creation(&action, &origin).expect("real executable mapping")
+            else {
+                panic!("expected run_action");
+            };
+            let ((
+                muxe_core::ExecutablePaneType::Split,
+                raw::Action::NewTiledPane {
+                    command: Some(command),
+                    near_current_pane: false,
+                    ..
+                },
+            )
+            | (
+                muxe_core::ExecutablePaneType::Overlay | muxe_core::ExecutablePaneType::Popup,
+                raw::Action::NewFloatingPane {
+                    command: Some(command),
+                    near_current_pane: false,
+                    ..
+                },
+            )) = (pane_type, action)
+            else {
+                panic!("wrong terminal representation or bridge-relative launch");
+            };
+            assert_eq!(command.command, PathBuf::from("/bin/echo"));
+            assert_eq!(command.args, ["", "a b", "$HOME", "; touch nope"]);
+            assert_eq!(command.cwd, Some("/captured/relative".into()));
+            assert!(!command.hold_on_start);
+            assert!(!command.hold_on_close);
+        }
+    }
+
+    #[test]
+    fn executable_pane_focus_direction_and_program_boundaries_fail_closed() {
+        let mut action = ResolvedPaneAction::Open {
+            pane_type: muxe_core::ExecutablePaneType::Popup,
+            direction: Some(Direction::Right),
+            focus: None,
+            program: CommandWord::Text("echo".into()),
+            args: Vec::new(),
+            cwd: None,
+        };
+        let mut origin = test_origin();
+        origin.pane_cwd = Some("/captured".into());
+        assert!(map_open(&action, &origin).is_err());
+        let ResolvedPaneAction::Open {
+            direction, focus, ..
+        } = &mut action
+        else {
+            unreachable!()
+        };
+        *direction = None;
+        *focus = Some(false);
+        assert!(map_open(&action, &origin).is_err());
+        let ResolvedPaneAction::Open { focus, program, .. } = &mut action else {
+            unreachable!()
+        };
+        *focus = None;
+        *program = CommandWord::Text(String::new());
+        assert!(map_open(&action, &origin).is_err());
+        let ResolvedPaneAction::Open { program, .. } = &mut action else {
+            unreachable!()
+        };
+        *program = CommandWord::Text("echo\0".into());
+        assert!(map_open(&action, &origin).is_err());
     }
 }

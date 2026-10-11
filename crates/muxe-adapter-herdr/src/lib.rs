@@ -39,9 +39,11 @@ pub use cache::{
     hash_configured_request_refs, hash_configured_requests, validated_requests_hash,
 };
 pub use launch::{
-    CommandPaneLaunch, CommandPanePlacement, CommandTabLaunch, FocusedPane, PreparedUiPane,
-    UiPaneLaunch, UiPanePlacement, UiSplitDirection, close_transient_tab, focused_pane,
-    move_prepared_ui_pane, open_command_pane, open_command_tab, pane_by_id, pane_by_identity,
+    COMMAND_PANE_ARGV_ENV, COMMAND_PANE_ENTRYPOINT, COMMAND_PANE_PLUGIN_ID, CommandPaneLaunch,
+    CommandPanePlacement, CommandTabLaunch, FocusedPane, PluginCommandPaneLaunch,
+    PluginCommandPanePlacement, PluginCommandPaneType, PreparedUiPane, UiPaneLaunch,
+    UiPanePlacement, UiSplitDirection, close_transient_tab, focused_pane, move_prepared_ui_pane,
+    open_command_pane, open_command_tab, open_plugin_command_pane, pane_by_id, pane_by_identity,
     prepare_ui_pane,
 };
 pub use runtime::{HerdrAdapterConfig, HerdrRuntime};

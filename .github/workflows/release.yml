@@ -4,6 +4,7 @@ name: Release
 # `v{major}.{minor}.{patch}`. Each target archive contains:
 #   muxe
 #   lib/muxe/muxe-zellij.wasm
+#   lib/muxe/herdr-plugin.toml
 #   share/muxe/completions/ (muxe.bash, _muxe, muxe.fish)
 #   LICENSE
 #
@@ -309,6 +310,7 @@ jobs:
           cp "$BIN" "$root/muxe"
           chmod 755 "$root/muxe"
           cp "$WASM_PATH" "$root/lib/muxe/muxe-zellij.wasm"
+          cp lib/muxe/herdr-plugin.toml "$root/lib/muxe/herdr-plugin.toml"
           cp share/muxe/completions/muxe.bash \
             share/muxe/completions/_muxe \
             share/muxe/completions/muxe.fish \
@@ -390,6 +392,7 @@ jobs:
             tar -xzf "$archive" -C verify-tmp
             test -x "verify-tmp/$name/muxe"
             test -f "verify-tmp/$name/lib/muxe/muxe-zellij.wasm"
+            cmp lib/muxe/herdr-plugin.toml "verify-tmp/$name/lib/muxe/herdr-plugin.toml"
             test -f "verify-tmp/$name/share/muxe/completions/muxe.bash"
             test -f "verify-tmp/$name/share/muxe/completions/_muxe"
             test -f "verify-tmp/$name/share/muxe/completions/muxe.fish"

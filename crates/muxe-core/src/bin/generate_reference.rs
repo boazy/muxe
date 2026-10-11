@@ -248,6 +248,32 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
     render_action_inventory(&mut output);
     render_action_catalog(&mut output, host_support, catalog);
 
+    writeln!(output, "\n## Executable pane lifecycle\n\n\
+        `pane:open` runs a required `program` with an exact argument vector inside a host terminal. \
+        It does not send command text to an existing shell. `await` waits for host creation, not for the program to exit; the host owns the terminal and command after creation.\n\n\
+        A focused open is deferred until the Muxe menu pane has closed.\n\n\
+        - **Zellij:** Waits until the saved origin has regained focus.\n\
+        - **Herdr splits:** Target the saved pane explicitly without waiting for it to regain focus.\n\
+        - **Herdr overlays/popups:** Check that the saved origin is active immediately before requesting creation and fail if it is not.\n\n\
+        The Herdr snapshot check and plugin request are separate operations. Another client can change focus between them; the host provides no atomic origin-targeting guarantee for overlays/popups.\n\n\
+        Context values and relative working directories use the saved origin, not the menu or broker directory.\n\n\
+        | Host | Split | Overlay | Popup |\n\
+        |---|---|---|---|\n\
+        | Herdr | Right/down, default down; no plugin required | Persistent Muxe plugin; focused terminal | Persistent Muxe plugin; session-modal terminal |\n\
+        | Zellij | All four directions; host chooses if omitted | Floating command pane | Floating command pane, not session-modal |\n\n\
+        Herdr splits use `layout.apply` followed by `pane.move`. If placement fails, Muxe closes only the temporary tab returned by that creation. \
+        Herdr overlays/popups use the explicitly installed `muxe.command-panes` manifest entrypoint. See [Herdr setup](README.md#optional-enable-executable-overlays-and-popups). \
+        The entrypoint receives JSON argv through a reserved environment value and replaces itself with the executable. That transport value is removed before execution.\n\n\
+        If Herdr acknowledges creation but returns malformed placement evidence, Muxe reports an unknown outcome: the command may already be running. Inspect the host before deciding whether to repeat it. Muxe does not automatically repeat the request.\n\n\
+        Herdr's popup has no public pane ID or pane lifecycle events. Its program exits naturally, or `native.herdr.popup:close` closes the active popup. \
+        Overlay terminals have ordinary pane IDs and can be closed with Herdr pane APIs. Zellij closes its command panes on command exit.\n\n\
+        `pane:open` accepts only the parameters in its table. Size, position, environment overrides, and explicit parent-pane selection are not portable action parameters. \
+        The CLI `muxe pane open --pane-type popup -- program arg...` also exposes host-supported sizing. Herdr popup accepts `--width`/`--height` as cells or percentages, but no `--position` or `--no-focus`. \
+        Herdr overlay does not support dimensions, position, or `--no-focus`. Zellij floating placement supports dimensions and position, but not `--no-focus` or an explicit parent. Unsupported options fail rather than being ignored.\n\n\
+        Evidence: [Herdr plugin API](https://herdr.dev/docs/socket-api/#plugin-apis), \
+        the checked-in `fixtures/herdr/herdr-api.schema.json` (`PluginPaneOpenParams`), and \
+        pinned Zellij `fixtures/zellij/0.46.0/action-inventory.rs` (`NewTiledPane`/`NewFloatingPane`).").unwrap();
+
     writeln!(output, "\n## Command working directories\n").unwrap();
     writeln!(
         output,
@@ -389,6 +415,30 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
          A missing or ambiguous binding fails without invoking a command. Muxe resolves a fresh command ID for each invocation and does not retry after an unconfirmed send. If the command may already have executed, Muxe reports that uncertainty."
     )
     .unwrap();
+
+    writeln!(output, "\n#### Open an installed Herdr plugin pane\n\n\
+        The native action is `native.herdr.plugin.pane:open`, not `plugin.pane:open`. \
+        It opens an entrypoint declared in an installed, enabled, platform-compatible plugin's `[[panes]]` manifest. \
+        The plugin manifest supplies the executable; this native action does not accept arbitrary `program` or `args` fields.\n\n\
+        Put this binding in `herdr.yml` and replace the plugin ID and entrypoint with installed values:\n\n\
+        ```yaml\n\
+        menus:\n\
+        \x20 main:\n\
+        \x20   bindings:\n\
+        \x20     p:\n\
+        \x20       label: Plugin board\n\
+        \x20       action:\n\
+        \x20         type: native.herdr.plugin.pane:open\n\
+        \x20         plugin-id: example.board\n\
+        \x20         entrypoint: board\n\
+        \x20         placement: popup\n\
+        \x20         focus: true\n\
+        \x20         width: 80%\n\
+        \x20         height: 80%\n\
+        ```\n\n\
+        Herdr overlays and popups use its active tiled pane as launch context. \
+        For a generic executable with saved-origin ordering, use `pane:open` instead. \
+        `native.herdr.command:invoke` remains the separate path for an already configured Herdr command.").unwrap();
 
     output
 }

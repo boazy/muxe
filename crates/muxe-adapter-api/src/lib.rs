@@ -623,9 +623,10 @@ pub trait HostAdapter: ActionValidator + Send + Sync {
     ) -> Result<DispatchAccepted, AdapterError>;
 
     /// Queues a focus-sensitive creation action, then dispatches it only after
-    /// the named Muxe UI pane is gone and the captured origin is current again.
+    /// the named Muxe UI pane is gone.
     ///
-    /// The adapter owns the host-specific acknowledgement of pane disappearance.
+    /// The adapter owns the disappearance acknowledgement and its host-specific
+    /// targeting or focus validation of the immutable captured origin.
     /// A default error keeps hosts that cannot prove this ordering fail-closed.
     async fn dispatch_portable_after_ui_dismissal(
         &self,

@@ -22,9 +22,8 @@ use muxe_adapter_api::{
 use muxe_core::{
     ActionScalar, ActionValidation, ActionValidator, ConfigDiagnostic, ConfigValueKind,
     ContextType, DiagnosticCode, Direction, ExecutionCapabilities, NativeActionCandidate,
-    PaneAction, PortableAction, ResizeAmount, ResolvedCreateCommand, ResolvedKeyboardAction,
-    ResolvedPaneAction, ResolvedPaneTarget, ResolvedPortableAction, ResolvedTabAction,
-    ResolvedTabTarget, TabAction,
+    PaneAction, PortableAction, ResizeAmount, ResolvedKeyboardAction, ResolvedPaneAction,
+    ResolvedPaneTarget, ResolvedPortableAction, ResolvedTabAction, ResolvedTabTarget, TabAction,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -1630,6 +1629,22 @@ fn portable_compile_validation(
     schema: &ApiSchema,
     action: &PortableAction,
 ) -> Result<ExecutionCapabilities, String> {
+    if let PortableAction::Pane(PaneAction::Open {
+        pane_type,
+        direction,
+        focus,
+        ..
+    }) = action
+    {
+        validate_open_placement(
+            *pane_type,
+            direction.as_ref().map(split_direction_is_supported),
+            focus.as_ref().and_then(|value| match value.value.kind {
+                ConfigValueKind::Boolean(value) => Some(value),
+                _ => None,
+            }),
+        )?;
+    }
     if let Some(methods) = command_creation_methods(action) {
         return validate_required_methods(schema, methods);
     }
@@ -1663,11 +1678,15 @@ fn command_creation_methods(
     action: impl Into<PortableRequestKind>,
 ) -> Option<&'static [&'static str]> {
     match action.into() {
-        PortableRequestKind::TabCreate { command: true } => Some(&["layout.apply"]),
-        PortableRequestKind::PaneSplit {
+        PortableRequestKind::PaneOpen {
+            pane_type: muxe_core::ExecutablePaneType::Split,
+        }
+        | PortableRequestKind::PaneSplit {
             direction: Some(true),
             command: true,
         } => Some(&["session.snapshot", "layout.apply", "pane.move", "tab.close"]),
+        PortableRequestKind::PaneOpen { .. } => Some(&["session.snapshot", "plugin.pane.open"]),
+        PortableRequestKind::TabCreate { command: true } => Some(&["layout.apply"]),
         _ => None,
     }
 }
@@ -3437,6 +3456,9 @@ enum PortableRequestKind {
     TabSwap {
         index: bool,
     },
+    PaneOpen {
+        pane_type: muxe_core::ExecutablePaneType,
+    },
     PaneCreate,
     PaneSplit {
         direction: Option<bool>,
@@ -3479,6 +3501,9 @@ impl From<&PortableAction> for PortableRequestKind {
             },
             PortableAction::Tab(TabAction::Swap(target)) => Self::TabSwap {
                 index: target_is_index(target),
+            },
+            PortableAction::Pane(PaneAction::Open { pane_type, .. }) => Self::PaneOpen {
+                pane_type: *pane_type,
             },
             PortableAction::Pane(PaneAction::Create) => Self::PaneCreate,
             PortableAction::Pane(PaneAction::Split {
@@ -3533,6 +3558,11 @@ impl From<&ResolvedPortableAction> for PortableRequestKind {
             ResolvedPortableAction::Tab(ResolvedTabAction::Swap(target)) => Self::TabSwap {
                 index: matches!(target, ResolvedTabTarget::Index(_)),
             },
+            ResolvedPortableAction::Pane(ResolvedPaneAction::Open { pane_type, .. }) => {
+                Self::PaneOpen {
+                    pane_type: *pane_type,
+                }
+            }
             ResolvedPortableAction::Pane(ResolvedPaneAction::Create) => Self::PaneCreate,
             ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
                 direction, command, ..
@@ -3575,7 +3605,9 @@ fn portable_request_description(
     use PortableScalarKind as Scalar;
     use PortableValueOrigin as Origin;
     let description = match action.into() {
-        PortableRequestKind::BrokerOwned | PortableRequestKind::TabSwap { index: true } => return Ok(None),
+        PortableRequestKind::PaneOpen { .. }
+        | PortableRequestKind::BrokerOwned
+        | PortableRequestKind::TabSwap { index: true } => return Ok(None),
         PortableRequestKind::SendKeys => PortableRequestDescription {
             method: "pane.send_keys",
             fields: &[
@@ -3745,8 +3777,32 @@ struct OrderedTab {
     public_number: PublicTabNumber,
     position: TabPosition,
 }
+fn validate_open_placement(
+    pane_type: muxe_core::ExecutablePaneType,
+    direction_supported: Option<bool>,
+    focus: Option<bool>,
+) -> Result<(), String> {
+    match pane_type {
+        muxe_core::ExecutablePaneType::Split => {
+            if direction_supported == Some(false) {
+                return Err("Herdr pane:open splits support only right or down".to_owned());
+            }
+        }
+        muxe_core::ExecutablePaneType::Overlay | muxe_core::ExecutablePaneType::Popup => {
+            if direction_supported.is_some() {
+                return Err("Herdr executable overlays/popups do not support direction".to_owned());
+            }
+            if focus == Some(false) {
+                return Err("Herdr executable overlays/popups always focus the new terminal; omit focus:false".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn creation_has_program(action: &ResolvedPortableAction) -> bool {
     match action {
+        ResolvedPortableAction::Pane(ResolvedPaneAction::Open { .. }) => true,
         ResolvedPortableAction::Tab(ResolvedTabAction::Create { command, .. })
         | ResolvedPortableAction::Pane(ResolvedPaneAction::Split { command, .. }) => {
             command.program.is_some()
@@ -3758,10 +3814,86 @@ fn creation_has_program(action: &ResolvedPortableAction) -> bool {
 fn creation_requires_post_dismissal(action: &ResolvedPortableAction) -> bool {
     match action {
         ResolvedPortableAction::Tab(ResolvedTabAction::Create { focus, .. })
-        | ResolvedPortableAction::Pane(ResolvedPaneAction::Split { focus, .. }) => {
-            focus.unwrap_or(true)
-        }
+        | ResolvedPortableAction::Pane(
+            ResolvedPaneAction::Split { focus, .. } | ResolvedPaneAction::Open { focus, .. },
+        ) => focus.unwrap_or(true),
         _ => false,
+    }
+}
+
+/// Opens the required command in the representation selected by `pane:open`.
+async fn perform_pane_open(
+    authority: &IncarnationTransactionAuthority,
+    action: &ResolvedPaneAction,
+    origin: &muxe_core::OriginContext,
+) -> Result<(), AdapterError> {
+    let ResolvedPaneAction::Open {
+        pane_type,
+        direction,
+        focus,
+        program,
+        args,
+        cwd,
+    } = action
+    else {
+        unreachable!("perform_pane_open accepts only pane:open")
+    };
+    validate_open_placement(
+        *pane_type,
+        direction.map(|direction| split_direction(direction).is_ok()),
+        *focus,
+    )
+    .map_err(incompatible)?;
+    let workspace = origin
+        .workspace_id
+        .clone()
+        .ok_or_else(|| incompatible("pane:open requires an origin workspace"))?;
+    let tab = origin
+        .tab_id
+        .clone()
+        .ok_or_else(|| incompatible("pane:open requires an origin tab"))?;
+    let pane = origin
+        .pane_id
+        .clone()
+        .ok_or_else(|| incompatible("pane:open requires an origin pane"))?;
+    let destination = crate::launch::pane_by_identity_with(authority, workspace, tab, pane).await?;
+    let cwd = creation_cwd(cwd.as_ref(), origin, "pane.cwd")?;
+    let argv = creation_argv(Some(program), args, "pane.program", "pane.args")?;
+    match pane_type {
+        muxe_core::ExecutablePaneType::Split => crate::launch::open_command_pane_with(
+            authority,
+            crate::CommandPaneLaunch {
+                origin: destination.clone(),
+                destination,
+                cwd,
+                argv,
+                direction: split_direction(direction.unwrap_or(muxe_core::Direction::Down))
+                    .map_err(direction_request_error)?,
+                ratio: 0.5,
+                focus: focus.unwrap_or(true),
+            },
+        )
+        .await
+        .map(|_| ()),
+        muxe_core::ExecutablePaneType::Overlay | muxe_core::ExecutablePaneType::Popup => {
+            crate::launch::open_plugin_command_pane_with(
+                authority,
+                crate::PluginCommandPaneLaunch {
+                    origin: destination,
+                    cwd,
+                    argv,
+                    pane_type: if *pane_type == muxe_core::ExecutablePaneType::Popup {
+                        crate::PluginCommandPaneType::Popup
+                    } else {
+                        crate::PluginCommandPaneType::Overlay
+                    },
+                    width: None,
+                    height: None,
+                },
+            )
+            .await
+            .map(|_| ())
+        }
     }
 }
 
@@ -3771,6 +3903,9 @@ async fn perform_command_creation(
     origin: &muxe_core::OriginContext,
 ) -> Result<(), AdapterError> {
     match action {
+        ResolvedPortableAction::Pane(pane @ ResolvedPaneAction::Open { .. }) => {
+            perform_pane_open(authority, pane, origin).await
+        }
         ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
             direction: None, ..
         }) => Err(incompatible(
@@ -3797,8 +3932,13 @@ async fn perform_command_creation(
                 crate::CommandTabLaunch {
                     workspace,
                     label,
-                    cwd: creation_cwd(command, origin, "tab.cwd")?,
-                    argv: creation_argv(command, "tab.program", "tab.args")?,
+                    cwd: creation_cwd(command.cwd.as_ref(), origin, "tab.cwd")?,
+                    argv: creation_argv(
+                        command.program.as_ref(),
+                        &command.args,
+                        "tab.program",
+                        "tab.args",
+                    )?,
                     focus: focus.unwrap_or(true),
                 },
             )
@@ -3835,8 +3975,13 @@ async fn perform_command_creation(
                 crate::CommandPaneLaunch {
                     origin: destination.clone(),
                     destination,
-                    cwd: creation_cwd(command, origin, "pane.cwd")?,
-                    argv: creation_argv(command, "pane.program", "pane.args")?,
+                    cwd: creation_cwd(command.cwd.as_ref(), origin, "pane.cwd")?,
+                    argv: creation_argv(
+                        command.program.as_ref(),
+                        &command.args,
+                        "pane.program",
+                        "pane.args",
+                    )?,
                     direction,
                     ratio: 0.5,
                     focus: focus.unwrap_or(true),
@@ -3846,7 +3991,7 @@ async fn perform_command_creation(
             .map(|_| ())
         }
         _ => Err(incompatible(
-            "post-dismissal command creation requires tab:create or pane:split with program",
+            "post-dismissal command creation requires tab:create, pane:split, or pane:open with a program",
         )),
     }
 }
@@ -3856,24 +4001,29 @@ async fn perform_command_creation(
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
 fn creation_argv(
-    command: &ResolvedCreateCommand,
+    program: Option<&muxe_core::CommandWord>,
+    args: &[muxe_core::CommandWord],
     program_field: &str,
     args_field: &str,
 ) -> Result<Vec<String>, AdapterError> {
-    let program = command
-        .program
-        .as_ref()
-        .ok_or_else(|| incompatible("creation command requires program"))?;
+    let program = program.ok_or_else(|| incompatible("creation command requires program"))?;
     let program = json_word(program, program_field)?;
+    if program.contains('\0')
+        || args
+            .iter()
+            .any(|word| word.as_os_str().as_encoded_bytes().contains(&0))
+    {
+        return Err(incompatible("Command argv cannot contain NUL bytes"));
+    }
     if program.is_empty() {
         return Err(incompatible("creation command program must not be empty"));
     }
-    let mut argv = Vec::with_capacity(command.args.len().saturating_add(1));
-    argv.push(program.to_owned());
-    for argument in &command.args {
-        argv.push(json_word(argument, args_field)?.to_owned());
+    let mut words = Vec::with_capacity(args.len().saturating_add(1));
+    words.push(program.to_owned());
+    for argument in args {
+        words.push(json_word(argument, args_field)?.to_owned());
     }
-    Ok(argv)
+    Ok(words)
 }
 
 #[expect(
@@ -3881,13 +4031,11 @@ fn creation_argv(
     reason = "AdapterError is the crate's shared public error type; boxing it would break the public API"
 )]
 fn creation_cwd(
-    command: &ResolvedCreateCommand,
+    requested: Option<&muxe_core::CommandCwd>,
     origin: &muxe_core::OriginContext,
     field: &str,
 ) -> Result<PathBuf, AdapterError> {
-    let cwd = command
-        .cwd
-        .as_ref()
+    let cwd = requested
         .map(|cwd| cwd.as_path().to_owned())
         .or_else(|| origin.pane_cwd.clone())
         .ok_or_else(|| {
@@ -3896,6 +4044,15 @@ fn creation_cwd(
                 "The creation command needs an explicit working directory or one captured from the origin pane.",
             )
         })?;
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        origin
+            .pane_cwd
+            .as_ref()
+            .ok_or_else(|| incompatible("Relative pane cwd requires the captured origin cwd"))?
+            .join(cwd)
+    };
     if !cwd.is_absolute() {
         return Err(incompatible(
             "The creation command's working directory must be an absolute path.",
@@ -4468,6 +4625,7 @@ fn incompatible(message: impl Into<String>) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxe_core::ResolvedCreateCommand;
     use muxe_core::{
         ConfigValue, ContextReference, OriginContext, OriginHostKind, OriginInvocationSource,
         ServerId, SourceId, SourceSpan,
@@ -5008,11 +5166,16 @@ mod tests {
         ] {
             let command = ResolvedCreateCommand { program, args, cwd };
             let error = if field == "tab.cwd" {
-                creation_cwd(&command, &origin(), field)
+                creation_cwd(command.cwd.as_ref(), &origin(), field)
                     .expect_err("JSON cannot encode non-UTF8 cwd")
             } else {
-                creation_argv(&command, "tab.program", "tab.args")
-                    .expect_err("JSON cannot encode non-UTF8 argv")
+                creation_argv(
+                    command.program.as_ref(),
+                    &command.args,
+                    "tab.program",
+                    "tab.args",
+                )
+                .expect_err("JSON cannot encode non-UTF8 argv")
             };
             assert_eq!(error.kind, AdapterErrorKind::Incompatible);
             assert!(error.to_string().contains(field));
@@ -5097,6 +5260,68 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn executable_open_checks_real_capability_and_rejects_unsupported_placement_fields() {
+        let validator = HerdrConfigValidator {
+            schema: Arc::new(bundled_schema()),
+        };
+        for action in [
+            "pane:open program=htop",
+            "pane:open program=htop direction=right focus=false",
+            "pane:open program=htop pane-type=popup",
+            "pane:open program=htop pane-type=overlay",
+        ] {
+            muxe_core::compile_yaml(muxe_core::CompiledGeneration(1), SourceId::new("pane.yml"),
+                format!("version: 1\nmenus:\n  main:\n    bindings:\n      p:\n        label: Pane\n        action: {action}\n"),
+                muxe_core::KeyCapabilities::default(), Some(&validator))
+                .expect("supported executable representation compiles");
+        }
+        for action in [
+            "pane:open program=htop direction=up",
+            "pane:open program=htop pane-type=popup focus=false",
+            "pane:open program=htop pane-type=overlay direction=down",
+        ] {
+            assert!(muxe_core::compile_yaml(muxe_core::CompiledGeneration(1), SourceId::new("pane.yml"),
+                format!("version: 1\nmenus:\n  main:\n    bindings:\n      p:\n        label: Pane\n        action: {action}\n"),
+                muxe_core::KeyCapabilities::default(), Some(&validator)).is_err(), "{action}");
+        }
+        let validator = HerdrConfigValidator {
+            schema: Arc::new(mutated_schema(|raw| {
+                raw["schemas"]["request"]["oneOf"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|method| method["properties"]["method"]["const"] != "plugin.pane.open");
+            })),
+        };
+        for (pane_type, supported) in [("split", true), ("popup", false), ("overlay", false)] {
+            let result = muxe_core::compile_yaml(
+                muxe_core::CompiledGeneration(1),
+                SourceId::new("pane.yml"),
+                format!(
+                    "version: 1\nmenus:\n  main:\n    bindings:\n      p:\n        label: Pane\n        action: pane:open program=htop pane-type={pane_type}\n"
+                ),
+                muxe_core::KeyCapabilities::default(),
+                Some(&validator),
+            );
+            assert_eq!(
+                result.is_ok(),
+                supported,
+                "plugin.pane.open capability: {pane_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_plugin_pane_mapping_accepts_installed_entrypoint_parameters() {
+        let validator = HerdrConfigValidator {
+            schema: Arc::new(bundled_schema()),
+        };
+        muxe_core::compile_yaml(muxe_core::CompiledGeneration(1), SourceId::new("herdr.yml"),
+            "version: 1\nmenus:\n  main:\n    bindings:\n      p:\n        label: Plugin\n        action:\n          type: native.herdr.plugin.pane:open\n          plugin-id: example.board\n          entrypoint: board\n          placement: popup\n          focus: true\n          width: 80%\n          height: 80%\n",
+            muxe_core::KeyCapabilities::default(), Some(&validator))
+            .expect("documented native plugin pane retains its public mapping");
     }
 
     #[test]

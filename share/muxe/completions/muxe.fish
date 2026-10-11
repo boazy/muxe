@@ -63,7 +63,7 @@ complete -c muxe -n "__fish_muxe_using_subcommand menu; and __fish_seen_subcomma
 overlay\t''
 popup\t''"
 complete -c muxe -n "__fish_muxe_using_subcommand menu; and __fish_seen_subcommand_from open" -l parent-pane -d 'Select an explicit parent pane or the captured origin pane' -r
-complete -c muxe -n "__fish_muxe_using_subcommand menu; and __fish_seen_subcommand_from open" -l direction -d 'Choose the split direction where the host supports it' -r -f -a "down\t''
+complete -c muxe -n "__fish_muxe_using_subcommand menu; and __fish_seen_subcommand_from open" -l direction -d 'Choose the split direction (default: down). Unsupported for overlays and popups' -r -f -a "down\t''
 up\t''
 left\t''
 right\t''"
@@ -80,10 +80,11 @@ complete -c muxe -n "__fish_muxe_using_subcommand menu; and __fish_seen_subcomma
 complete -c muxe -n "__fish_muxe_using_subcommand menu; and __fish_seen_subcommand_from help" -f -a "open" -d 'Open a root menu as a focused modal UI'
 complete -c muxe -n "__fish_muxe_using_subcommand menu; and __fish_seen_subcommand_from help" -f -a "dump" -d 'Print the effective contents of one or every configured menu as JSON'
 complete -c muxe -n "__fish_muxe_using_subcommand menu; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open help" -s h -l help -d 'Print help'
-complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open help" -s V -l version -d 'Print version'
-complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open help" -f -a "open" -d 'Open one generic command pane'
-complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open exec help" -s h -l help -d 'Print help'
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open exec help" -s V -l version -d 'Print version'
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open exec help" -f -a "open" -d 'Open one generic command pane'
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open exec help" -f -a "exec" -d 'Execute the exact command supplied by the persistent Herdr plugin'
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and not __fish_seen_subcommand_from open exec help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from open" -l host -d 'Select a host or inherit it from the current environment' -r -f -a "auto\t''
 zellij\t''
 herdr\t''"
@@ -91,7 +92,7 @@ complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcomma
 overlay\t''
 popup\t''"
 complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from open" -l parent-pane -d 'Select an explicit parent pane or the captured origin pane' -r
-complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from open" -l direction -d 'Choose the split direction where the host supports it' -r -f -a "down\t''
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from open" -l direction -d 'Choose the split direction (default: down). Unsupported for overlays and popups' -r -f -a "down\t''
 up\t''
 left\t''
 right\t''"
@@ -102,7 +103,10 @@ complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcomma
 complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from open" -l no-focus -d 'Leave focus on the current pane after opening the generic child'
 complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from open" -s h -l help -d 'Print help'
 complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from open" -s V -l version -d 'Print version'
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from exec" -s h -l help -d 'Print help'
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from exec" -s V -l version -d 'Print version'
 complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from help" -f -a "open" -d 'Open one generic command pane'
+complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from help" -f -a "exec" -d 'Execute the exact command supplied by the persistent Herdr plugin'
 complete -c muxe -n "__fish_muxe_using_subcommand pane; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c muxe -n "__fish_muxe_using_subcommand integration; and not __fish_seen_subcommand_from install uninstall help" -s h -l help -d 'Print help'
 complete -c muxe -n "__fish_muxe_using_subcommand integration; and not __fish_seen_subcommand_from install uninstall help" -s V -l version -d 'Print version'
@@ -194,6 +198,7 @@ complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcomma
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from menu" -f -a "open" -d 'Open a root menu as a focused modal UI'
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from menu" -f -a "dump" -d 'Print the effective contents of one or every configured menu as JSON'
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from pane" -f -a "open" -d 'Open one generic command pane'
+complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from pane" -f -a "exec" -d 'Execute the exact command supplied by the persistent Herdr plugin'
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from integration" -f -a "install" -d 'Install the bundled Zellij bridge and optionally configure Zellij KDL'
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from integration" -f -a "uninstall" -d 'Remove receipt-owned Zellij integration artifacts'
 complete -c muxe -n "__fish_muxe_using_subcommand help; and __fish_seen_subcommand_from broker" -f -a "retire" -d 'Drain and retire brokers without starting replacements'

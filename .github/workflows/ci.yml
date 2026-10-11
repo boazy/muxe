@@ -210,6 +210,7 @@ jobs:
           cp "$bin" "$RUNNER_TEMP/target-install/muxe"
           chmod 755 "$RUNNER_TEMP/target-install/muxe"
           cp dist-wasm/muxe-zellij.wasm "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm"
+          cp lib/muxe/herdr-plugin.toml "$RUNNER_TEMP/target-install/lib/muxe/herdr-plugin.toml"
           cp share/muxe/completions/muxe.bash \
             share/muxe/completions/_muxe \
             share/muxe/completions/muxe.fish \
@@ -250,6 +251,11 @@ jobs:
           MUXE_ZELLIJ_PERMISSION_SEEDER="$fx/muxe-zellij-permit" \
           MUXE_LIVE_HOSTS_APPROVED=true \
           mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke --show-output
+          MUXE_TARGET_INSTALLATION="$RUNNER_TEMP/target-install" \
+          MUXE_HERDR_BINARY="$(command -v herdr)" \
+          MUXE_LIVE_HOSTS_APPROVED=true \
+          PATH="$RUNNER_TEMP/target-install:$PATH" \
+          mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact executable_panes::installed_plugin_executes_generic_popup_overlay_and_cli --show-output
 
   benches:
     name: Benchmarks
@@ -431,6 +437,7 @@ jobs:
           cp "$bin" "$RUNNER_TEMP/target-install/muxe"
           chmod 755 "$RUNNER_TEMP/target-install/muxe"
           cp dist-wasm/muxe-zellij.wasm "$RUNNER_TEMP/target-install/lib/muxe/muxe-zellij.wasm"
+          cp lib/muxe/herdr-plugin.toml "$RUNNER_TEMP/target-install/lib/muxe/herdr-plugin.toml"
           cp share/muxe/completions/muxe.bash \
             share/muxe/completions/_muxe \
             share/muxe/completions/muxe.fish \
@@ -468,3 +475,8 @@ jobs:
           MUXE_ZELLIJ_BOOTSTRAP_BINARY="$fx/muxe-zellij-bootstrap" \
           MUXE_ZELLIJ_PERMISSION_SEEDER="$fx/muxe-zellij-permit" \
           mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact target_only_smoke --show-output
+          MUXE_TARGET_INSTALLATION="$RUNNER_TEMP/target-install" \
+          MUXE_HERDR_BINARY="$(command -v herdr)" \
+          MUXE_LIVE_HOSTS_APPROVED=true \
+          PATH="$RUNNER_TEMP/target-install:$PATH" \
+          mise exec -- cargo test --locked -p muxe --test live_hosts -- --ignored --exact executable_panes::installed_plugin_executes_generic_popup_overlay_and_cli --show-output

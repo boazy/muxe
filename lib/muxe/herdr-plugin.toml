@@ -1,0 +1,16 @@
+id = "muxe.command-panes"
+name = "Muxe command panes"
+# Independently versioned plugin/runner transport contract, not the Muxe application version.
+# Change this version only when that bundled entrypoint contract changes.
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Run exact executable commands in Herdr overlays and popups through Muxe"
+platforms = ["linux", "macos"]
+
+# The installed muxe executable must be on the Herdr server's PATH.
+# There are no startup hooks, actions, events, or configuration edits.
+[[panes]]
+id = "command"
+title = "Muxe command"
+placement = "popup"
+command = ["muxe", "pane", "exec"]

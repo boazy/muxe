@@ -6,6 +6,7 @@ mod generated_executable;
 
 mod config_check;
 mod init;
+mod pane_exec;
 
 use std::{
     env,
@@ -68,7 +69,10 @@ impl NativeCommandOperation {
                 MenuSubcommand::Open(_) => Some(Self::MenuOpen),
                 MenuSubcommand::Dump(_) => Some(Self::MenuDump),
             },
-            Command::Pane(_) => Some(Self::PaneOpen),
+            Command::Pane(pane) => match pane.command {
+                PaneSubcommand::Open(_) => Some(Self::PaneOpen),
+                PaneSubcommand::Exec => None,
+            },
             Command::Ui(_) => Some(Self::UiMenu),
             Command::Integration(integration) => match integration.command {
                 IntegrationSubcommand::Install(_) => Some(Self::IntegrationInstall),
@@ -189,6 +193,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         },
         Command::Pane(pane) => match pane.command {
             PaneSubcommand::Open(open) => Box::pin(launch_pane(open)).await,
+            PaneSubcommand::Exec => pane_exec::execute(),
         },
         Command::Ui(ui) => match ui.command {
             UiSubcommand::Menu(menu) => Box::pin(run_ui(menu)).await,
@@ -2522,6 +2527,9 @@ async fn herdr_open_pane(
         ))
         .await;
     }
+    if open.placement.pane_type != PaneType::Split {
+        return herdr_open_plugin_pane(&runtime, origin, open, argv).await;
+    }
     let launch = match command_pane_launch(open, origin, destination) {
         Ok(launch) => launch,
         Err(error) => {
@@ -2549,6 +2557,73 @@ async fn herdr_open_pane(
             Err(error)
         }
     }
+}
+
+/// Launches a generic executable overlay/popup after the reserved UI-argv path.
+async fn herdr_open_plugin_pane(
+    runtime: &muxe_adapter_herdr::HerdrRuntime,
+    origin: muxe_adapter_herdr::FocusedPane,
+    open: &PaneOpen,
+    argv: Vec<String>,
+) -> Result<()> {
+    if open.placement.direction.is_some() {
+        bail!("Herdr executable overlays/popups do not support --direction");
+    }
+    if open.no_focus {
+        bail!(
+            "Herdr executable overlays/popups always focus the new terminal; --no-focus is unsupported"
+        );
+    }
+    if !matches!(open.placement.parent_pane, ParentPane::Current) {
+        bail!("Herdr overlays/popups use the active origin; --parent-pane must be current");
+    }
+    if open.placement.position.is_some() {
+        bail!("Herdr plugin overlays/popups have no position API; --position is unsupported");
+    }
+    if open.placement.pane_type == PaneType::Overlay
+        && (open.placement.width.is_some() || open.placement.height.is_some())
+    {
+        bail!("Herdr executable overlays do not support --width or --height; use popup");
+    }
+    let size = |dimension: Option<muxe::cli::Dimension>| -> Result<_> {
+        use muxe_adapter_herdr::generated::request_types::PopupSize;
+        dimension
+            .map(|dimension| match dimension {
+                muxe::cli::Dimension::Cells(cells) => Ok(PopupSize::Integer(cells)),
+                muxe::cli::Dimension::Percent(percent) => format!("{percent}%")
+                    .parse()
+                    .map(PopupSize::String)
+                    .map_err(|_| {
+                        color_eyre::eyre::eyre!("popup percentages must be between 1% and 100%")
+                    }),
+            })
+            .transpose()
+    };
+    let placement = muxe_adapter_herdr::open_plugin_command_pane(
+        runtime,
+        muxe_adapter_herdr::PluginCommandPaneLaunch {
+            cwd: resolve_pane_cwd(&origin.cwd, open.cwd.as_deref())?,
+            origin,
+            argv,
+            pane_type: if open.placement.pane_type == PaneType::Popup {
+                muxe_adapter_herdr::PluginCommandPaneType::Popup
+            } else {
+                muxe_adapter_herdr::PluginCommandPaneType::Overlay
+            },
+            width: size(open.placement.width)?,
+            height: size(open.placement.height)?,
+        },
+    )
+    .await?;
+    match placement {
+        muxe_adapter_herdr::PluginCommandPanePlacement::Pane(pane) => {
+            println!("opened {}", pane.as_str());
+        }
+        muxe_adapter_herdr::PluginCommandPanePlacement::Popup => {
+            println!("opened popup");
+        }
+    }
+    Ok(())
 }
 
 /// Lease covering pane creation after a minted launch token: layout apply and
@@ -2661,7 +2736,7 @@ async fn herdr_open_ui_pane(
     if open.placement.position.is_some() {
         bail!("Herdr split UI panes do not support --position");
     }
-    let direction = match open.placement.direction {
+    let direction = match open.placement.direction.unwrap_or(SplitDirection::Down) {
         SplitDirection::Down => muxe_adapter_herdr::UiSplitDirection::Down,
         SplitDirection::Right => muxe_adapter_herdr::UiSplitDirection::Right,
         SplitDirection::Up | SplitDirection::Left => {
@@ -2892,20 +2967,28 @@ fn zellij_run_argv(session: &str, open: &PaneOpen) -> Result<Vec<OsString>> {
     ];
     match open.placement.pane_type {
         muxe::cli::PaneType::Split => {
+            if open.placement.position.is_some() {
+                bail!("Zellij tiled command panes do not support --position");
+            }
             if open.placement.width.is_some() || open.placement.height.is_some() {
                 bail!(
                     "Zellij tiled splits take no explicit size; use overlay or popup placement for sized panes"
                 );
             }
             argv.push(OsString::from("--direction"));
-            argv.push(OsString::from(match open.placement.direction {
-                muxe::cli::SplitDirection::Down => "down",
-                muxe::cli::SplitDirection::Up => "up",
-                muxe::cli::SplitDirection::Left => "left",
-                muxe::cli::SplitDirection::Right => "right",
-            }));
+            argv.push(OsString::from(
+                match open.placement.direction.unwrap_or(SplitDirection::Down) {
+                    muxe::cli::SplitDirection::Down => "down",
+                    muxe::cli::SplitDirection::Up => "up",
+                    muxe::cli::SplitDirection::Left => "left",
+                    muxe::cli::SplitDirection::Right => "right",
+                },
+            ));
         }
         muxe::cli::PaneType::Overlay | muxe::cli::PaneType::Popup => {
+            if open.placement.direction.is_some() {
+                bail!("Zellij floating command panes do not support --direction");
+            }
             argv.push(OsString::from("--floating"));
             if let Some(position) = open.placement.position {
                 argv.push(OsString::from("--x"));
@@ -3282,7 +3365,7 @@ fn command_pane_launch(
     if open.placement.position.is_some() {
         bail!("Herdr split command panes do not support --position");
     }
-    let direction = match open.placement.direction {
+    let direction = match open.placement.direction.unwrap_or(SplitDirection::Down) {
         SplitDirection::Down => muxe_adapter_herdr::UiSplitDirection::Down,
         SplitDirection::Right => muxe_adapter_herdr::UiSplitDirection::Right,
         SplitDirection::Up | SplitDirection::Left => {
@@ -4802,7 +4885,7 @@ mod consumer_tests {
             host: HostSelector::Zellij,
             pane_type: PaneType::Split,
             parent_pane: ParentPane::Current,
-            direction: SplitDirection::Down,
+            direction: None,
             width: None,
             height: None,
             position: None,
@@ -4889,6 +4972,13 @@ mod consumer_tests {
         assert!(zellij_run_argv("alpha", &open).is_err());
         let mut open = pane_open();
         open.placement.height = Some(Dimension::Cells(10));
+        assert!(zellij_run_argv("alpha", &open).is_err());
+        let mut open = pane_open();
+        open.placement.position = Some(muxe::cli::Position { x: 1, y: 2 });
+        assert!(zellij_run_argv("alpha", &open).is_err());
+        let mut open = pane_open();
+        open.placement.pane_type = PaneType::Popup;
+        open.placement.direction = Some(SplitDirection::Down);
         assert!(zellij_run_argv("alpha", &open).is_err());
     }
 

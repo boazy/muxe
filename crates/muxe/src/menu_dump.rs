@@ -378,6 +378,30 @@ fn push_pane_action_fields<'a>(
     action: &'a PaneAction,
 ) {
     match action {
+        PaneAction::Open {
+            pane_type,
+            direction,
+            focus,
+            program,
+            args,
+            cwd,
+        } => {
+            fields.push(field(
+                "pane-type",
+                JsonNode::String(Cow::Borrowed(pane_type.as_str())),
+            ));
+            fields.push(field("direction", optional_scalar_node(direction.as_ref())));
+            fields.push(field(
+                "focus",
+                focus.as_ref().map_or(JsonNode::Bool(true), scalar_node),
+            ));
+            fields.push(field("program", scalar_node(program)));
+            fields.push(field(
+                "args",
+                JsonNode::Array(args.iter().map(scalar_node).collect()),
+            ));
+            fields.push(field("cwd", optional_scalar_node(cwd.as_ref())));
+        }
         PaneAction::Create | PaneAction::Close => {}
         PaneAction::Split {
             direction,
@@ -603,6 +627,38 @@ inject:
             None,
         )
         .expect("representative menu config compiles")
+    }
+
+    #[test]
+    fn executable_pane_dump_keeps_exact_command_and_explicit_representation() {
+        let config = compile_yaml(
+            CompiledGeneration(1),
+            SourceId::new("pane-dump.yml"),
+            r#"version: 1
+menus:
+  main:
+    bindings:
+      p:
+        label: Popup
+        action:
+          type: pane:open
+          pane-type: popup
+          program: echo
+          args: ["", "a b", "$HOME"]
+"#,
+            KeyCapabilities::default(),
+            None,
+        )
+        .expect("pane configuration compiles");
+        let output =
+            render(&config, MenuDumpSelection::Menu(&named("main"))).expect("menu renders");
+        let value: Value = serde_json::from_str(&output).expect("valid JSON");
+        let action = &value["bindings"]["p"]["action"];
+        assert_eq!(action["type"], "pane:open");
+        assert_eq!(action["pane-type"], "popup");
+        assert_eq!(action["program"], "echo");
+        assert_eq!(action["args"], serde_json::json!(["", "a b", "$HOME"]));
+        assert_eq!(action["focus"], true);
     }
 
     #[test]

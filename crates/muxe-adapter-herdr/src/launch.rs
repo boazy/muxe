@@ -101,6 +101,182 @@ pub struct CommandTabLaunch {
     pub argv: Vec<String>,
     pub focus: bool,
 }
+/// Persistent Herdr plugin used only for real executable overlays and popups.
+pub const COMMAND_PANE_PLUGIN_ID: &str = "muxe.command-panes";
+pub const COMMAND_PANE_ENTRYPOINT: &str = "command";
+/// Exact argv transport consumed and removed by `muxe pane exec` before OS execution.
+pub const COMMAND_PANE_ARGV_ENV: &str = "MUXE_COMMAND_PANE_ARGV";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginCommandPaneType {
+    Overlay,
+    Popup,
+}
+
+/// Popup terminals have no public pane ID; never invent one for them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PluginCommandPanePlacement {
+    Pane(PaneId),
+    Popup,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginCommandPaneLaunch {
+    pub origin: FocusedPane,
+    pub cwd: PathBuf,
+    pub argv: Vec<String>,
+    pub pane_type: PluginCommandPaneType,
+    pub width: Option<crate::generated::request_types::PopupSize>,
+    pub height: Option<crate::generated::request_types::PopupSize>,
+}
+
+/// Opens an exact command through the explicitly installed, persistent Muxe plugin.
+/// The host owns the command terminal and its lifetime; this creates no transient registry.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] for unsupported host methods, invalid command or
+/// placement values, an inactive saved origin, host rejection, or transport
+/// failure. A request that may have executed or a successful response with
+/// invalid placement evidence is reported as an unknown outcome.
+pub async fn open_plugin_command_pane(
+    runtime: &HerdrRuntime,
+    launch: PluginCommandPaneLaunch,
+) -> Result<PluginCommandPanePlacement, AdapterError> {
+    runtime.validate_method_set(&["session.snapshot", "plugin.pane.open"])?;
+    let lease = runtime.lease(IncarnationEpoch::INITIAL);
+    runtime
+        .run_ordered(move |invoker| async move {
+            let authority = RuntimeTransactionAuthority::new(invoker, lease);
+            open_plugin_command_pane_with(&authority, launch).await
+        })
+        .await?
+}
+
+pub(crate) async fn open_plugin_command_pane_with(
+    authority: &dyn HerdrRequestAuthority,
+    launch: PluginCommandPaneLaunch,
+) -> Result<PluginCommandPanePlacement, AdapterError> {
+    if !launch.cwd.is_absolute() || launch.argv.first().is_none_or(String::is_empty) {
+        return Err(invalid(
+            "A plugin command pane requires an absolute cwd and a nonempty program",
+        ));
+    }
+    if launch.pane_type == PluginCommandPaneType::Overlay
+        && (launch.width.is_some() || launch.height.is_some())
+    {
+        return Err(invalid(
+            "Herdr executable overlays do not support dimensions",
+        ));
+    }
+    if launch.argv.iter().any(|word| word.contains('\0')) {
+        return Err(invalid("Command argv cannot contain NUL bytes"));
+    }
+    let cwd = launch.cwd.to_str().ok_or_else(|| invalid(
+        "Herdr plugin command-pane cwd requires UTF-8 because its JSON socket API has string paths",
+    ))?;
+    if cwd.contains('\0') {
+        return Err(invalid(
+            "Herdr plugin command-pane cwd cannot contain NUL bytes",
+        ));
+    }
+    let active = focused_pane_with(authority).await?;
+    if active.workspace != launch.origin.workspace
+        || active.tab != launch.origin.tab
+        || active.pane != launch.origin.pane
+    {
+        return Err(invalid(
+            "Herdr overlays and popups require the captured origin to be active",
+        ));
+    }
+    let argv = serde_json::to_string(&launch.argv)
+        .map_err(|error| invalid(format!("Could not encode command argv: {error}")))?;
+    let placement = match launch.pane_type {
+        PluginCommandPaneType::Overlay => "overlay",
+        PluginCommandPaneType::Popup => "popup",
+    };
+    let response = authority
+        .request(
+            "plugin.pane.open",
+            json!({
+                "plugin_id": COMMAND_PANE_PLUGIN_ID,
+                "entrypoint": COMMAND_PANE_ENTRYPOINT,
+                "placement": placement,
+                "focus": true,
+                "cwd": cwd,
+                "env": { COMMAND_PANE_ARGV_ENV: argv },
+                "width": launch.width,
+                "height": launch.height,
+            }),
+        )
+        .await?;
+    plugin_command_pane_response(response, launch.pane_type)
+}
+
+/// A success envelope follows a mutating request: malformed placement evidence cannot
+/// establish that the command did not launch, and must never invite an automatic repeat.
+#[expect(
+    clippy::result_large_err,
+    reason = "AdapterError is the shared adapter boundary error; boxing only this decoder would add allocation without changing its callers' error API"
+)]
+fn plugin_command_pane_response(
+    response: HerdrResponse,
+    pane_type: PluginCommandPaneType,
+) -> Result<PluginCommandPanePlacement, AdapterError> {
+    let uncertain = |cause: String| {
+        AdapterError::new(
+            AdapterErrorKind::OutcomeUnknown,
+            format!(
+                "Herdr accepted plugin.pane.open but returned invalid placement evidence: {cause}. \
+            The command may already be running; inspect the host before deciding whether to repeat it."
+            ),
+        )
+    };
+    match response {
+        HerdrResponse::Success(result) => {
+            if pane_type == PluginCommandPaneType::Popup {
+                if result.get("type").and_then(Value::as_str) != Some("ok") {
+                    return Err(uncertain("popup success must have type ok".to_owned()));
+                }
+                Ok(PluginCommandPanePlacement::Popup)
+            } else {
+                if result.get("type").and_then(Value::as_str) != Some("plugin_pane_opened") {
+                    return Err(uncertain(
+                        "overlay success must have type plugin_pane_opened".to_owned(),
+                    ));
+                }
+                let pane = result
+                    .get("plugin_pane")
+                    .and_then(|pane| pane.get("pane"))
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| uncertain("overlay success must contain a pane".to_owned()))?;
+                let id = required_id(pane, "pane_id", "plugin.pane.open")
+                    .map_err(|error| uncertain(error.message))?;
+                Ok(PluginCommandPanePlacement::Pane(PaneId::new(id)))
+            }
+        }
+        HerdrResponse::Error { code, message } => {
+            let mut diagnostic = format!("Herdr rejected plugin.pane.open ({code}): {message}.");
+            match code.as_str() {
+                "plugin_not_found" => diagnostic.push_str(
+                    " Install the persistent Muxe command-pane plugin with \
+                    `herdr plugin link <installation>/lib/muxe/herdr-plugin.toml`; \
+                    the installed muxe executable must be on the Herdr server's PATH.",
+                ),
+                "plugin_disabled" => {
+                    diagnostic.push_str(" Enable the persistent Muxe command-pane plugin with `herdr plugin enable ");
+                    diagnostic.push_str(COMMAND_PANE_PLUGIN_ID);
+                    diagnostic.push_str("`.");
+                }
+                _ => {}
+            }
+            Err(AdapterError::new(
+                AdapterErrorKind::DispatchFailed,
+                diagnostic,
+            ))
+        }
+    }
+}
 
 /// Reads one schema-validated snapshot and captures the focused workspace/tab/pane/cwd tuple.
 /// A direct launcher never substitutes a broker process cwd, home directory, or root directory
@@ -905,5 +1081,120 @@ mod tests {
             combined_move_error_kind(&failed, &failed),
             AdapterErrorKind::DispatchFailed
         );
+    }
+    #[test]
+    fn malformed_plugin_creation_success_preserves_may_have_run_outcome() {
+        for (pane_type, result) in [
+            (PluginCommandPaneType::Popup, json!({"type":"other"})),
+            (PluginCommandPaneType::Overlay, json!({"type":"ok"})),
+            (
+                PluginCommandPaneType::Overlay,
+                json!({"type":"plugin_pane_opened"}),
+            ),
+            (
+                PluginCommandPaneType::Overlay,
+                json!({"type":"plugin_pane_opened","plugin_pane":{"pane":{}}}),
+            ),
+            (
+                PluginCommandPaneType::Overlay,
+                json!({"type":"plugin_pane_opened","plugin_pane":{"pane":{"pane_id":""}}}),
+            ),
+        ] {
+            let error = plugin_command_pane_response(HerdrResponse::Success(result), pane_type)
+                .expect_err("mutating success with missing placement evidence is uncertain");
+            assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
+            assert!(error.to_string().contains("may already be running"));
+            assert!(error.to_string().contains("inspect the host"));
+        }
+        assert_eq!(
+            plugin_command_pane_response(
+                HerdrResponse::Success(json!({"type":"ok"})),
+                PluginCommandPaneType::Popup
+            )
+            .expect("known popup success"),
+            PluginCommandPanePlacement::Popup
+        );
+        assert_eq!(
+            plugin_command_pane_response(
+                HerdrResponse::Success(
+                    json!({"type":"plugin_pane_opened","plugin_pane":{"pane":{"pane_id":"w1:p2"}}})
+                ),
+                PluginCommandPaneType::Overlay
+            )
+            .expect("known overlay success"),
+            PluginCommandPanePlacement::Pane(PaneId::new("w1:p2"))
+        );
+    }
+
+    #[test]
+    fn known_plugin_rejections_retain_cause_and_only_relevant_install_advice() {
+        for (code, advice) in [
+            ("plugin_not_found", Some("herdr plugin link")),
+            ("plugin_disabled", Some("herdr plugin enable")),
+            ("invalid_cwd", None),
+            ("plugin_pane_open_failed", None),
+            ("stale_context", None),
+        ] {
+            let error = plugin_command_pane_response(
+                HerdrResponse::Error {
+                    code: code.to_owned(),
+                    message: "specific host cause".to_owned(),
+                },
+                PluginCommandPaneType::Popup,
+            )
+            .expect_err("known host rejection is not success");
+            assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
+            assert!(error.to_string().contains(code));
+            assert!(error.to_string().contains("specific host cause"));
+            match advice {
+                Some(advice) => assert!(error.to_string().contains(advice)),
+                None => assert!(!error.to_string().contains("herdr plugin")),
+            }
+            assert!(!error.to_string().contains("may already be running"));
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_plugin_cwd_fails_before_any_host_request() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct NoRequestAuthority(AtomicUsize);
+        #[async_trait::async_trait]
+        impl HerdrRequestAuthority for NoRequestAuthority {
+            async fn request(&self, _: &str, _: Value) -> Result<HerdrResponse, AdapterError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(invalid("unexpected host request"))
+            }
+        }
+        let authority = NoRequestAuthority(AtomicUsize::new(0));
+        for pane_type in [PluginCommandPaneType::Overlay, PluginCommandPaneType::Popup] {
+            let error = open_plugin_command_pane_with(
+                &authority,
+                PluginCommandPaneLaunch {
+                    origin: FocusedPane {
+                        workspace: WorkspaceId::new("w1"),
+                        tab: TabId::new("w1:t1"),
+                        pane: PaneId::new("w1:p1"),
+                        cwd: "/captured".into(),
+                        columns: 80,
+                        rows: 24,
+                    },
+                    cwd: PathBuf::from(std::ffi::OsString::from_vec(b"/invalid/\xff".to_vec())),
+                    argv: vec!["/bin/echo".to_owned()],
+                    pane_type,
+                    width: None,
+                    height: None,
+                },
+            )
+            .await
+            .expect_err("non-UTF-8 cwd is a diagnostic, never a JSON panic");
+            assert_eq!(error.kind, AdapterErrorKind::InvalidRequest);
+            assert!(error.to_string().contains("UTF-8"));
+            assert_eq!(
+                authority.0.load(Ordering::SeqCst),
+                0,
+                "invalid encoding must fail before snapshot or mutating requests"
+            );
+        }
     }
 }

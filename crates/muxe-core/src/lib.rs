@@ -22,12 +22,12 @@ pub use action::{
     AbsolutePath, ActionCategory, ActionConstraint, ActionKind, ActionParameterName,
     ActionParameterSchema, ActionParameterType, ActionScalar, ActionSpec, CommandAction,
     CommandCwd, CommandWord, ConfigAction, ConstraintErrorLocation, ConstraintValidationPhase,
-    CreateCommand, Direction, IndexOrDirection, KeyboardAction, MenuAction, MenuTarget,
-    NativeActionCandidate, OmittedParameterBehavior, PaneAction, PaneIndex, PortableAction,
-    PortableActionKind, PortableActionResolutionError, PortableActionSchema, ResizeAmount,
-    ResolvedCommandAction, ResolvedCreateCommand, ResolvedKeyboardAction, ResolvedPaneAction,
-    ResolvedPaneTarget, ResolvedPortableAction, ResolvedSessionAction, ResolvedTabAction,
-    ResolvedTabTarget, SessionAction, TabAction, TabIndex,
+    CreateCommand, Direction, ExecutablePaneType, IndexOrDirection, KeyboardAction, MenuAction,
+    MenuTarget, NativeActionCandidate, OmittedParameterBehavior, PaneAction, PaneIndex,
+    PortableAction, PortableActionKind, PortableActionResolutionError, PortableActionSchema,
+    ResizeAmount, ResolvedCommandAction, ResolvedCreateCommand, ResolvedKeyboardAction,
+    ResolvedPaneAction, ResolvedPaneTarget, ResolvedPortableAction, ResolvedSessionAction,
+    ResolvedTabAction, ResolvedTabTarget, SessionAction, TabAction, TabIndex,
 };
 pub use condition::{
     ConditionEvaluationError, ConditionIr, ConditionProgram, PagesContext, evaluate_condition_ir,

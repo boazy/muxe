@@ -1364,6 +1364,45 @@ impl MenuCompiler<'_> {
             ParsedPortableAction::TabSwap { index, direction } => {
                 PortableAction::Tab(TabAction::Swap(index_or_direction(index, direction)))
             }
+            ParsedPortableAction::PaneOpen {
+                program,
+                args,
+                cwd,
+                pane_type,
+                direction,
+                focus,
+            } => {
+                if program
+                    .value
+                    .as_str()
+                    .is_some_and(|value| value.is_empty() || value.contains('\0'))
+                {
+                    return Err(vec![ConfigDiagnostic::error(
+                        DiagnosticCode::InvalidActionArguments,
+                        "pane:open program must be nonempty and contain no NUL bytes",
+                        program.value.span,
+                    )]);
+                }
+                PortableAction::Pane(PaneAction::Open {
+                    program,
+                    args: args.unwrap_or_default(),
+                    cwd,
+                    pane_type: pane_type.as_ref().map_or(
+                        crate::action::ExecutablePaneType::Split,
+                        |value| {
+                            crate::action::ExecutablePaneType::parse(
+                                value
+                                    .value
+                                    .as_str()
+                                    .expect("pane-type is a validated string"),
+                            )
+                            .expect("pane-type is validated")
+                        },
+                    ),
+                    direction,
+                    focus,
+                })
+            }
             ParsedPortableAction::PaneCreate {} => PortableAction::Pane(PaneAction::Create),
             ParsedPortableAction::PaneSplit {
                 direction,
@@ -1703,6 +1742,9 @@ macro_rules! parsed_value_type {
     (Direction) => {
         ActionScalar
     };
+    (PaneType) => {
+        ActionScalar
+    };
     (Scalar) => {
         ActionScalar
     };
@@ -1746,6 +1788,9 @@ macro_rules! take_parsed_value {
         $fields.take_scalar(ActionParameterName::$parameter)
     };
     ($fields:expr, $parameter:ident, Direction) => {
+        $fields.take_scalar(ActionParameterName::$parameter)
+    };
+    ($fields:expr, $parameter:ident, PaneType) => {
         $fields.take_scalar(ActionParameterName::$parameter)
     };
     ($fields:expr, $parameter:ident, Scalar) => {
@@ -1879,6 +1924,20 @@ fn parse_portable_action_fields(
                 }
                 ActionParameterType::Direction => {
                     ParsedActionValue::Scalar(action_direction_scalar(&field.value, &label)?)
+                }
+                ActionParameterType::PaneType => {
+                    let value = expect_string(
+                        &field.value,
+                        "`pane-type` must be split, overlay, or popup",
+                    )?;
+                    if crate::action::ExecutablePaneType::parse(value).is_none() {
+                        return Err(vec![ConfigDiagnostic::error(
+                            DiagnosticCode::InvalidActionArguments,
+                            "`pane-type` must be split, overlay, or popup",
+                            field.value.span.clone(),
+                        )]);
+                    }
+                    ParsedActionValue::Scalar(ActionScalar::new(field.value.clone().into_owned()))
                 }
                 ActionParameterType::Scalar => {
                     ParsedActionValue::Scalar(action_scalar(&field.value, &label)?)

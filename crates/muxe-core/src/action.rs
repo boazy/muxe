@@ -92,6 +92,8 @@ pub enum ActionParameterName {
     Index,
     #[strum(serialize = "direction")]
     Direction,
+    #[strum(serialize = "pane-type")]
+    PaneType,
     #[strum(serialize = "amount")]
     Amount,
     #[strum(serialize = "enabled")]
@@ -136,6 +138,8 @@ pub enum ActionParameterType {
     Index,
     #[strum(serialize = "direction or `$origin.` reference")]
     Direction,
+    #[strum(serialize = "`split`, `overlay`, or `popup`")]
+    PaneType,
     #[strum(serialize = "number or `$origin.` reference")]
     Scalar,
 }
@@ -162,6 +166,8 @@ pub enum OmittedParameterBehavior {
     DefaultShell,
     #[strum(serialize = "true")]
     True,
+    #[strum(serialize = "`split`")]
+    Split,
     #[strum(serialize = "one resize step")]
     ResizeStep,
     #[strum(serialize = "toggle the current state")]
@@ -524,6 +530,21 @@ macro_rules! portable_action_definitions {
                 };
             ],
         }
+        PaneOpen {
+            name: "pane:open",
+            category: Pane,
+            execution: Some(ExecutionMode::Await),
+            capabilities: ExecutionCapabilities::ASYNCHRONOUS,
+            parameters: [
+                program as Program: TextualContext [required = true];
+                args as Args: TextualContextSequence [default = EmptySequence];
+                cwd as Cwd: ContextPath [default = OriginPaneCwd];
+                pane_type as PaneType: PaneType [default = Split];
+                direction as Direction: Direction [default = HostDependent];
+                focus as Focus: Boolean [default = True];
+            ],
+            constraints: [],
+        }
         PaneCreate {
             name: "pane:create",
             category: Pane,
@@ -830,8 +851,45 @@ pub enum TabAction {
     Swap(IndexOrDirection),
 }
 
+/// Host-independent representations for an executable pane.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExecutablePaneType {
+    #[default]
+    Split,
+    Overlay,
+    Popup,
+}
+
+impl ExecutablePaneType {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "split" => Some(Self::Split),
+            "overlay" => Some(Self::Overlay),
+            "popup" => Some(Self::Popup),
+            _ => None,
+        }
+    }
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Overlay => "overlay",
+            Self::Popup => "popup",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaneAction {
+    Open {
+        pane_type: ExecutablePaneType,
+        direction: Option<ActionScalar>,
+        focus: Option<ActionScalar>,
+        program: ActionScalar,
+        args: Vec<ActionScalar>,
+        cwd: Option<ActionScalar>,
+    },
     Create,
     Split {
         direction: Option<ActionScalar>,
@@ -900,6 +958,7 @@ impl PortableAction {
             Self::Tab(TabAction::Focus(_)) => PortableActionKind::TabFocus,
             Self::Tab(TabAction::Move(_)) => PortableActionKind::TabMove,
             Self::Tab(TabAction::Swap(_)) => PortableActionKind::TabSwap,
+            Self::Pane(PaneAction::Open { .. }) => PortableActionKind::PaneOpen,
             Self::Pane(PaneAction::Create) => PortableActionKind::PaneCreate,
             Self::Pane(PaneAction::Split { .. }) => PortableActionKind::PaneSplit,
             Self::Pane(PaneAction::Close) => PortableActionKind::PaneClose,
@@ -1077,6 +1136,14 @@ pub enum ResizeAmount {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResolvedPaneAction {
+    Open {
+        pane_type: ExecutablePaneType,
+        direction: Option<Direction>,
+        focus: Option<bool>,
+        program: CommandWord,
+        args: Vec<CommandWord>,
+        cwd: Option<CommandCwd>,
+    },
     Create,
     Split {
         direction: Option<Direction>,
@@ -1226,6 +1293,30 @@ impl PortableAction {
             Self::Tab(TabAction::Swap(target)) => {
                 R::Tab(ResolvedTabAction::Swap(resolve_tab_target(target, origin)?))
             }
+            Self::Pane(PaneAction::Open {
+                pane_type,
+                direction,
+                focus,
+                program,
+                args,
+                cwd,
+            }) => R::Pane(ResolvedPaneAction::Open {
+                pane_type: *pane_type,
+                direction: direction
+                    .as_ref()
+                    .map(|value| resolve_direction(value, origin, "pane.direction"))
+                    .transpose()?,
+                focus: resolve_optional_bool(focus.as_ref(), origin, "pane.focus")?,
+                program: resolve_word(program, origin, "pane.program")?,
+                args: args
+                    .iter()
+                    .map(|value| resolve_word(value, origin, "pane.args"))
+                    .collect::<Result<_, _>>()?,
+                cwd: cwd
+                    .as_ref()
+                    .map(|value| resolve_cwd(value, origin, "pane.cwd"))
+                    .transpose()?,
+            }),
             Self::Pane(PaneAction::Create) => R::Pane(ResolvedPaneAction::Create),
             Self::Pane(PaneAction::Split {
                 direction,

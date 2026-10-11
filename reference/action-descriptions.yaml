@@ -70,6 +70,16 @@ actions:
       index: In Herdr, the stable public tab number from tab.list, not the current row position or tab.move insertion boundary.
       direction: Direction of the other tab.
 
+  pane:open:
+    summary: Starts an exact executable command inside a split, overlay, or popup terminal. Muxe does not invoke a shell unless you explicitly select one as the program.
+    parameters:
+      program: Executable name or path. Required; cannot be empty.
+      args: Exact arguments passed to the executable, including empty arguments.
+      cwd: Working directory of the command. A relative path is resolved against the saved origin pane's working directory.
+      pane-type: Terminal representation. Defaults to `split`. Size and position are not parameters of this action; the CLI exposes supported sizing options.
+      direction: Split direction. Omit for overlays and popups.
+      focus: Whether to focus the new terminal. `$origin.` references are not supported.
+
   pane:create:
     summary: Requests a new pane without specifying its position.
 

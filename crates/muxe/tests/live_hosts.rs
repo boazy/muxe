@@ -58,6 +58,8 @@
 //! records, the installed bridge digest restored, live sessions, and
 //! unbroken host witnesses.
 
+#[path = "support/executable_panes.rs"]
+mod executable_panes;
 #[path = "support/mod.rs"]
 mod support;
 

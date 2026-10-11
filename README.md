@@ -91,6 +91,7 @@ Each archive contains a complete installation:
 ```text
 muxe
 lib/muxe/muxe-zellij.wasm
+lib/muxe/herdr-plugin.toml
 share/muxe/completions/
 share/muxe/theme-palettes/LICENSES.txt
 share/muxe/theme-palettes/catalog.json
@@ -377,7 +378,7 @@ Receipt ownership for `--zellij-config` uses its recorded absolute, normalized K
 
 ## Herdr setup
 
-Muxe installs as a native executable, not as a Herdr manifest plugin. There is no `muxe integration install herdr` command.
+Muxe menus and executable split panes run through the native executable without a Herdr plugin. Executable overlays and popups require the optional persistent command-pane plugin described below. There is no `muxe integration install herdr` command.
 
 ### 1. Configure a root keybinding in Herdr
 
@@ -408,6 +409,31 @@ herdr server reload-config
 ```
 
 The `muxe` executable must be on the `PATH` inherited by the Herdr server process. Muxe never edits `config.toml`. When you no longer need Muxe, remove the `[[keys.command]]` block manually.
+
+### Optional: enable executable overlays and popups
+
+Link the manifest from the complete Muxe installation to your selected Herdr server:
+
+```sh
+herdr plugin link /absolute/path/to/muxe-installation/lib/muxe/herdr-plugin.toml
+```
+
+The manifest contains one command-pane entrypoint and no startup hooks. Herdr records this link persistently; Muxe does not register plugins automatically or modify Herdr configuration. Keep the installation at that path and ensure its `muxe` executable is on the Herdr server's `PATH`. After moving the installation, link the manifest from its new path.
+
+The manifest version (`0.1.0`) identifies the bundled plugin and runner's transport contract independently of the Muxe application version. Routine Muxe releases do not change that contract version.
+
+Use [`pane:open`](REFERENCE.md#paneopen) to run an executable inside a split, overlay, or popup from a menu. For example:
+
+```yaml
+action:
+  type: pane:open
+  pane-type: popup
+  program: htop
+```
+
+The corresponding CLI is `muxe pane open --pane-type popup -- htop`. Herdr popups are session-modal; Zellij maps `popup` and `overlay` to ordinary floating command panes. See the [action reference](REFERENCE.md#executable-pane-lifecycle) for supported options and lifecycle behavior.
+
+To remove the persistent link, run `herdr plugin unlink muxe.command-panes` against the same Herdr server before deleting the installation. Existing commands are not stopped by unlinking.
 
 ## Troubleshooting
 

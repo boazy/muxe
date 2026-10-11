@@ -157,6 +157,9 @@ _muxe() {
             muxe__subcmd__help__subcmd__menu,open)
                 cmd="muxe__subcmd__help__subcmd__menu__subcmd__open"
                 ;;
+            muxe__subcmd__help__subcmd__pane,exec)
+                cmd="muxe__subcmd__help__subcmd__pane__subcmd__exec"
+                ;;
             muxe__subcmd__help__subcmd__pane,open)
                 cmd="muxe__subcmd__help__subcmd__pane__subcmd__open"
                 ;;
@@ -229,11 +232,17 @@ _muxe() {
             muxe__subcmd__menu__subcmd__help,open)
                 cmd="muxe__subcmd__menu__subcmd__help__subcmd__open"
                 ;;
+            muxe__subcmd__pane,exec)
+                cmd="muxe__subcmd__pane__subcmd__exec"
+                ;;
             muxe__subcmd__pane,help)
                 cmd="muxe__subcmd__pane__subcmd__help"
                 ;;
             muxe__subcmd__pane,open)
                 cmd="muxe__subcmd__pane__subcmd__open"
+                ;;
+            muxe__subcmd__pane__subcmd__help,exec)
+                cmd="muxe__subcmd__pane__subcmd__help__subcmd__exec"
                 ;;
             muxe__subcmd__pane__subcmd__help,help)
                 cmd="muxe__subcmd__pane__subcmd__help__subcmd__help"
@@ -870,8 +879,22 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__help__subcmd__pane)
-            opts="open"
+            opts="open exec"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__help__subcmd__pane__subcmd__exec)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1334,7 +1357,7 @@ _muxe() {
             return 0
             ;;
         muxe__subcmd__pane)
-            opts="-h -V --help --version open help"
+            opts="-h -V --help --version open exec help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1347,9 +1370,37 @@ _muxe() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        muxe__subcmd__pane__subcmd__help)
-            opts="open help"
+        muxe__subcmd__pane__subcmd__exec)
+            opts="-h -V --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__pane__subcmd__help)
+            opts="open exec help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        muxe__subcmd__pane__subcmd__help__subcmd__exec)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

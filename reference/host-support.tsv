@@ -13,6 +13,7 @@ tab:rename	warning	Requires `name`; Zellij cannot prompt for a name.	Requires `n
 tab:focus	warning	Supports `index`, `next`, and `previous`. It does not support `left`, `right`, `up`, or `down`.	Not supported.
 tab:move	warning	Supports `direction` with `left`, `right`, `up`, or `down`. It does not support `index`.	Supports `index`. It does not support `direction`.
 tab:swap	warning	Not supported.	Supports `index`. Herdr performs the swap as two moves. If the second move fails, Herdr does not undo the first move.
+pane:open	warning	All split directions are supported; omitted direction lets Zellij choose. Overlay and popup both use a real floating command pane, not a session-modal popup. `focus: false` is unsupported.	Right/down splits (default down) need no plugin. Overlay and popup require the explicitly linked `muxe.command-panes` plugin; both focus the new terminal. A popup is session-modal and has no public pane ID. Omit direction for overlays/popups.
 pane:create	warning	Supported. Zellij chooses where to place the pane.	Not supported. Use `pane:split` with `right` or `down`.
 pane:split	warning	`direction` may be omitted; Zellij then chooses placement. All four directions are supported. `focus: false` is not supported. A `cwd` without `program` is not supported.	Requires `direction`, which must be `right` or `down`.
 pane:close	none	-	-

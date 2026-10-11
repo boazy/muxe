@@ -4855,7 +4855,10 @@ async fn finish_generic(
 
 fn requires_post_dismissal(action: &ResolvedPortableAction) -> bool {
     let (ResolvedPortableAction::Tab(muxe_core::ResolvedTabAction::Create { focus, .. })
-    | ResolvedPortableAction::Pane(muxe_core::ResolvedPaneAction::Split { focus, .. })) = action
+    | ResolvedPortableAction::Pane(
+        muxe_core::ResolvedPaneAction::Split { focus, .. }
+        | muxe_core::ResolvedPaneAction::Open { focus, .. },
+    )) = action
     else {
         return false;
     };
@@ -6858,19 +6861,22 @@ menus:
 
     #[tokio::test]
     async fn focused_creation_arms_only_after_ui_detach() {
+        for action in [
+            "tab:create",
+            "pane:open program=htop pane-type=popup",
+            "pane:open program=htop pane-type=overlay",
+            "pane:open program=htop",
+        ] {
+            assert_focused_creation_waits_for_detach(action).await;
+        }
+    }
+
+    async fn assert_focused_creation_waits_for_detach(action: &str) {
         let adapter = counting_adapter(false);
         let config = muxe_core::compile_yaml(
             CompiledGeneration(1),
             SourceId::new("<broker creation lifecycle>"),
-            r"
-version: 1
-menus:
-  main:
-    bindings:
-      t:
-        label: create tab
-        action: tab:create
-",
+            format!("version: 1\nmenus:\n  main:\n    bindings:\n      t:\n        label: create terminal\n        action: {action}\n"),
             KeyCapabilities::default(),
             Some(adapter.as_ref()),
         )
