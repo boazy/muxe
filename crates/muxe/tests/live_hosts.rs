@@ -2154,6 +2154,45 @@ async fn dismiss_owned_herdr_welcome(rig: &mut Rig, typescript: &Path) -> io::Re
         .await
 }
 
+async fn restart_popup_smoke_broker(rig: &mut Rig, target_bin: &Path) -> io::Result<()> {
+    // Menu attachments pin their configuration generation. These action/geometry smokes must
+    // load each configuration before attaching, rather than race the file watcher's debounce.
+    let broker = rig
+        .brokers
+        .last_mut()
+        .ok_or_else(|| io::Error::other("owned popup broker is gone"))?;
+    let retired = retire_broker(&broker.endpoint, &broker.tag).await;
+    let reaped = broker.child.terminate_and_reap().await.map(|_| ());
+    combine_body_and_cleanup(retired, reaped)?;
+    drop(rig.brokers.pop());
+    let herdr_binary = input_path("MUXE_HERDR_BINARY");
+    let socket = rig
+        .herdr
+        .as_ref()
+        .ok_or_else(|| io::Error::other("owned popup host is gone"))?
+        .socket();
+    let broker = spawn_serve_herdr(
+        "herdr-menu",
+        target_bin,
+        &herdr_binary,
+        socket,
+        &rig.discovery,
+        &rig.scoped_root,
+        &rig.config_file,
+        &rig.cache_dir,
+    )
+    .await?;
+    let endpoint = broker.endpoint.clone();
+    rig.brokers.push(broker);
+    assert_broker_serving(
+        &endpoint,
+        "herdr-menu",
+        &installed_version(target_bin).await?,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn assert_herdr_popup_diagnostics(
     rig: &mut Rig,
     target_bin: &Path,
@@ -2168,11 +2207,13 @@ async fn assert_herdr_popup_diagnostics(
         .parent()
         .ok_or_else(|| io::Error::other("installation root absent"))?
         .join("lib/muxe/herdr-plugin.toml");
+    let stable_manifest = rig.config_file.with_file_name("herdr-plugin.toml");
+    std::fs::copy(manifest, &stable_manifest)?;
     let mut link = tokio::process::Command::new(herdr_binary);
     apply_scoped_env(&mut link, &rig.scoped_root);
     link.env("HERDR_SOCKET_PATH", &socket)
         .args(["plugin", "link"])
-        .arg(manifest);
+        .arg(stable_manifest);
     let output = run_cli_bounded("owned-popup-plugin-link", &mut link).await?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -2276,6 +2317,7 @@ async fn assert_agent_usage_popup(
         &rig.config_file,
         serde_json::to_vec(&config).map_err(io::Error::other)?,
     )?;
+    restart_popup_smoke_broker(rig, target_bin).await?;
     let start = usize::try_from(std::fs::metadata(typescript)?.len()).map_err(io::Error::other)?;
     press_owned_popup_binding(
         rig,
@@ -2332,11 +2374,13 @@ async fn assert_sized_herdr_popup(
         .parent()
         .ok_or_else(|| io::Error::other("installation root absent"))?
         .join("lib/muxe/herdr-plugin.toml");
+    let stable_manifest = rig.config_file.with_file_name("herdr-plugin.toml");
+    std::fs::copy(manifest, &stable_manifest)?;
     let mut link = tokio::process::Command::new(herdr_binary);
     apply_scoped_env(&mut link, &rig.scoped_root);
     link.env("HERDR_SOCKET_PATH", &socket)
         .args(["plugin", "link"])
-        .arg(manifest);
+        .arg(stable_manifest);
     let output = run_cli_bounded("owned-sized-popup-plugin-link", &mut link).await?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -2362,6 +2406,7 @@ async fn assert_sized_herdr_popup(
             &rig.config_file,
             serde_json::to_vec(&config).map_err(io::Error::other)?,
         )?;
+        restart_popup_smoke_broker(rig, target_bin).await?;
         let label = format!("Sized popup {width} {height}");
         press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin, &label).await?;
         let (measured, actual) = poll_until(

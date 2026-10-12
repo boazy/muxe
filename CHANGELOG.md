@@ -4,6 +4,10 @@
 
 - Link the Herdr command-pane manifest from a stable location so removing an older Muxe installation does not break executable overlays and popups.
 
+### Testing
+
+- Make executable-popup smoke tests load each configuration before opening a menu, and exercise command-pane manifests copied outside the installation directory.
+
 ## [0.4.1] - 2026-10-12
 
 ### 🚀 Features
