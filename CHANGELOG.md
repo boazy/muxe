@@ -1,16 +1,18 @@
-## [Unreleased]
+## [0.4.2] - 2026-10-12
 
-### Bug fixes
+### 🐛 Bug Fixes
 
-- Verify and automatically repair the Herdr command-pane plugin during broker startup and before executable popup or overlay creation. Keep its managed manifest outside versioned installations and leave unrelated plugins unchanged.
+- Manage the Herdr command pane plugin automatically
 
-### Testing
+### 📚 Documentation
 
-- Exercise missing, stale, disabled, incorrect, and already-correct command-pane registrations through real menu, portable-action, and CLI launches.
-- Preserve broker exit status and output when popup smoke cleanup follows a retirement failure.
-- Remove stale-socket listener and partially written bootstrap PID marker races from owned fixtures.
-- Keep read-only socket-rebind assertions valid for both EOF and Linux connection-reset closures without permitting additional requests.
+- Keep Herdr command pane links outside versioned installations
 
+### 🧪 Testing
+
+- Load popup smoke configuration before opening menus
+- Make owned socket and PID fixtures deterministic
+- Make read-only socket rebind assertions portable
 ## [0.4.1] - 2026-10-12
 
 ### 🚀 Features
@@ -25,6 +27,10 @@
 ### 🧪 Testing
 
 - Verify account-free agent usage popup execution
+
+### 💼 Other
+
+- V0.4.1
 ## [0.4.0] - 2026-10-11
 
 ### 🚀 Features
