@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Documentation
+
+- Link the Herdr command-pane manifest from a stable location so removing an older Muxe installation does not break executable overlays and popups.
+
 ## [0.4.1] - 2026-10-12
 
 ### 🚀 Features

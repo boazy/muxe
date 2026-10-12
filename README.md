@@ -412,13 +412,20 @@ The `muxe` executable must be on the `PATH` inherited by the Herdr server proces
 
 ### Optional: enable executable overlays and popups
 
-Link the manifest from the complete Muxe installation to your selected Herdr server:
+Copy the bundled manifest to a stable location, then link that copy to your selected Herdr server:
 
 ```sh
-herdr plugin link /absolute/path/to/muxe-installation/lib/muxe/herdr-plugin.toml
+plugin_manifest="${XDG_CONFIG_HOME:-$HOME/.config}/muxe/herdr-plugin.toml"
+mkdir -p "$(dirname "$plugin_manifest")"
+cp /absolute/path/to/muxe-installation/lib/muxe/herdr-plugin.toml "$plugin_manifest"
+herdr plugin link "$plugin_manifest"
 ```
 
-The manifest contains one command-pane entrypoint and no startup hooks. Herdr records this link persistently; Muxe does not register plugins automatically or modify Herdr configuration. Keep the installation at that path and ensure its `muxe` executable is on the Herdr server's `PATH`. After moving the installation, link the manifest from its new path.
+The manifest contains one command-pane entrypoint and no startup hooks. Herdr records the manifest path persistently; Muxe does not register plugins automatically or modify Herdr configuration. The manifest runs `muxe pane exec` from the Herdr server's `PATH`, so the copy does not need to stay inside the Muxe installation.
+
+Version managers can remove an older installation during an upgrade. A plugin linked inside that installation then stops working, even if Herdr still lists it as enabled. A link through a `latest` symlink can also point to the resolved versioned directory. Keep the copied manifest at its stable path and copy and relink it when the bundled plugin contract changes.
+
+If executable overlays or popups fail after an upgrade, run `herdr plugin list --plugin muxe.command-panes --json`. A `manifest unavailable` warning means the saved link is broken; repeat the copy and link commands above using the current installation. The `muxe` executable must still be on the Herdr server's `PATH`.
 
 The manifest version (`0.1.0`) identifies the bundled plugin and runner's transport contract independently of the Muxe application version. Routine Muxe releases do not change that contract version.
 
