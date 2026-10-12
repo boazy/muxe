@@ -1243,7 +1243,6 @@ where
 mod tests {
     use super::*;
     use parking_lot::Mutex;
-    use std::os::unix::net::UnixListener;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1274,14 +1273,30 @@ mod tests {
         temp
     }
 
-    fn refuse_listener(listener: UnixListener) {
-        // A concurrent subprocess can retain an inherited descriptor until exec. Stop
-        // listening before closing our descriptor so the fixture is actually refused.
-        let socket = UnixStream::from(std::os::fd::OwnedFd::from(listener));
-        if let Err(error) = socket.shutdown(std::net::Shutdown::Both) {
-            // Darwin stops listening but reports ENOTCONN for an unconnected socket.
-            assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
-        }
+    fn bind_refused_socket(path: &Path) {
+        use nix::{
+            fcntl::{FcntlArg, FdFlag, fcntl},
+            sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, socket},
+        };
+        use std::os::fd::AsRawFd as _;
+
+        // Bind without ever listening. Even a concurrent fork retaining this descriptor cannot
+        // turn the stale fixture into a live listener; shutdown on a listener does not prove that.
+        let socket = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .expect("owned stale socket");
+        fcntl(&socket, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("close-on-exec stale socket");
+        bind(
+            socket.as_raw_fd(),
+            &UnixAddr::new(path).expect("owned socket path"),
+        )
+        .expect("bind stale socket without listening");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only stale socket");
     }
 
     struct OkReloader;
@@ -2304,13 +2319,7 @@ mod tests {
         for scenario in ["absent", "refused", "wrong-record", "live-pid", "symlink"] {
             let mut fixture = StaleFixture::new(host);
             if scenario == "refused" {
-                let listener = UnixListener::bind(fixture.endpoint.socket()).unwrap();
-                std::fs::set_permissions(
-                    fixture.endpoint.socket(),
-                    std::fs::Permissions::from_mode(0o600),
-                )
-                .unwrap();
-                refuse_listener(listener);
+                bind_refused_socket(fixture.endpoint.socket());
             } else if scenario == "symlink" {
                 let target = fixture.root.path().join("foreign");
                 std::fs::write(&target, b"user-owned").unwrap();
@@ -2386,9 +2395,7 @@ mod tests {
         for race in ["pid-reuse", "symlink", "rebind"] {
             let fixture = StaleFixture::new(HerdrFixtureHost);
             let socket = fixture.endpoint.socket();
-            let listener = UnixListener::bind(socket).unwrap();
-            std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-            refuse_listener(listener);
+            bind_refused_socket(socket);
             let observed = observe_stale_endpoint(socket).unwrap();
             let entries = fixture.registry.entries().unwrap();
             let result = fixture.registry.remove_exact_stale(
@@ -2413,10 +2420,7 @@ mod tests {
                         // filesystems recycle its number for the replacement.
                         std::fs::rename(socket, fixture.root.path().join("displaced-stale-socket"))
                             .unwrap();
-                        let rebound = UnixListener::bind(socket).unwrap();
-                        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
-                            .unwrap();
-                        refuse_listener(rebound);
+                        bind_refused_socket(socket);
                     }
                     let current = observe_stale_endpoint(socket)
                         .map_err(|error| RegistryError::Conflict(error.to_string()))?;

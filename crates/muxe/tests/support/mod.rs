@@ -3064,7 +3064,9 @@ mod scoped_spawn_tests {
             writeln!(
                 script,
                 "if [ \"$3\" = pipe ]; then\n\
-                 printf '%s\\n' \"$$\" > '{}'\n\
+                 event_pid='{}'\n\
+                 printf '%s\\n' \"$$\" > \"$event_pid.tmp\" || exit 3\n\
+                 mv \"$event_pid.tmp\" \"$event_pid\" || exit 3\n\
                  [ -z '{}' ] || printf '%s\\n' '{}'\n\
                  while IFS= read -r line; do :; done\n\
                  exit 0\n\
