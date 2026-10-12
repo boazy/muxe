@@ -272,7 +272,7 @@ Starts an exact executable command inside a split, overlay, or popup terminal. M
 > [!WARNING]
 > **Zellij:** All split directions are supported; omitted direction lets Zellij choose. Tiled splits reject width/height. Overlay and popup both use a real floating command pane and accept width/height as positive cells or 1%-100%; percentages floor against the viewport and overflow is clipped. `focus: false` is unsupported.
 >
-> **Herdr:** Right/down splits (default down) need no plugin: right accepts width only, down height only. Split percentages are 10%-90%; cells must occupy 10%-90% of the saved parent's live split axis. Overlay rejects dimensions. Popup accepts both positive-cell or 1%-100% dimensions as outer sizes, floored and clamped by the host. Overlay and popup require the explicitly linked `muxe.command-panes` plugin and focus the new terminal. Popup is session-modal with no public pane ID. Omit direction for overlays/popups.
+> **Herdr:** Right/down splits (default down) need no plugin: right accepts width only, down height only. Split percentages are 10%-90%; cells must occupy 10%-90% of the saved parent's live split axis. Overlay rejects dimensions. Popup accepts both positive-cell or 1%-100% dimensions as outer sizes, floored and clamped by the host. Overlay and popup use the automatically managed `muxe.command-panes` plugin and focus the new terminal. Popup is session-modal with no public pane ID. Omit direction for overlays/popups.
 
 ### `pane:create`
 
@@ -594,10 +594,10 @@ Context values and relative working directories use the saved origin, not the me
 
 | Host | Split | Overlay | Popup |
 |---|---|---|---|
-| Herdr | Right/down, default down; no plugin required | Persistent Muxe plugin; focused terminal | Persistent Muxe plugin; session-modal terminal |
+| Herdr | Right/down, default down; no plugin required | Managed Muxe plugin; focused terminal | Managed Muxe plugin; session-modal terminal |
 | Zellij | All four directions; host chooses if omitted | Floating command pane | Floating command pane, not session-modal |
 
-Herdr splits use `layout.apply` followed by `pane.move`. If placement fails, Muxe closes only the temporary tab returned by that creation. Herdr overlays/popups use the explicitly installed `muxe.command-panes` manifest entrypoint. See [Herdr setup](README.md#optional-enable-executable-overlays-and-popups). The entrypoint receives JSON argv through a reserved environment value and replaces itself with the executable. That transport value is removed before execution.
+Herdr splits use `layout.apply` followed by `pane.move`. If placement fails, Muxe closes only the temporary tab returned by that creation. Herdr overlays/popups use the automatically managed `muxe.command-panes` manifest entrypoint. Muxe verifies and repairs this plugin before creation; no manual link is required. See [Herdr setup](README.md#executable-overlays-and-popups). The entrypoint receives JSON argv through a reserved environment value and replaces itself with the executable. That transport value is removed before execution.
 
 If Herdr acknowledges creation but returns malformed placement evidence, Muxe reports an unknown outcome: the command may already be running. Inspect the host before deciding whether to repeat it. Muxe does not automatically repeat the request.
 

@@ -258,8 +258,9 @@ pub struct PluginCommandPaneLaunch {
     pub height: Option<crate::generated::request_types::PopupSize>,
 }
 
-/// Opens an exact command through the explicitly installed, persistent Muxe plugin.
-/// The host owns the command terminal and its lifetime; this creates no transient registry.
+/// Opens an exact command through Muxe's automatically managed persistent plugin.
+/// Registration is verified/repaired inside the same ordered host transaction;
+/// the host owns the command terminal and its lifetime.
 ///
 /// # Errors
 ///
@@ -271,18 +272,25 @@ pub async fn open_plugin_command_pane(
     runtime: &HerdrRuntime,
     launch: PluginCommandPaneLaunch,
 ) -> Result<PluginCommandPanePlacement, AdapterError> {
-    runtime.validate_method_set(&["session.snapshot", "plugin.pane.open"])?;
+    runtime.validate_method_set(&[
+        "session.snapshot",
+        "plugin.list",
+        "plugin.link",
+        "plugin.pane.open",
+    ])?;
     let lease = runtime.lease(IncarnationEpoch::INITIAL);
+    let cache = runtime.cache().clone();
     runtime
         .run_ordered(move |invoker| async move {
             let authority = RuntimeTransactionAuthority::new(invoker, lease);
-            open_plugin_command_pane_with(&authority, launch).await
+            open_plugin_command_pane_with(&authority, &cache, launch).await
         })
         .await?
 }
 
 pub(crate) async fn open_plugin_command_pane_with(
     authority: &dyn HerdrRequestAuthority,
+    cache: &crate::HerdrCache,
     launch: PluginCommandPaneLaunch,
 ) -> Result<PluginCommandPanePlacement, AdapterError> {
     if !launch.cwd.is_absolute() || launch.argv.first().is_none_or(String::is_empty) {
@@ -324,6 +332,19 @@ pub(crate) async fn open_plugin_command_pane_with(
         PluginCommandPaneType::Overlay => "overlay",
         PluginCommandPaneType::Popup => "popup",
     };
+    crate::managed_plugin::ensure_with(authority, cache).await?;
+    // Setup can make several host requests. Another client may change focus during repair;
+    // confirm the saved origin again immediately before opening the executable terminal.
+    let active = focused_pane_with(authority).await?;
+    if active.workspace != launch.origin.workspace
+        || active.tab != launch.origin.tab
+        || active.pane != launch.origin.pane
+    {
+        return Err(
+            invalid("Herdr overlays and popups require the captured origin to be active")
+                .with_safe_diagnostic(HerdrExecutionDiagnostic::OriginNotActive.safe()),
+        );
+    }
     let response = authority
         .request(
             "plugin.pane.open",
@@ -384,35 +405,15 @@ fn plugin_command_pane_response(
                 Ok(PluginCommandPanePlacement::Pane(PaneId::new(id)))
             }
         }
-        HerdrResponse::Error { code, message } => {
-            let mut diagnostic = format!("Herdr rejected plugin.pane.open ({code}): {message}.");
-            match code.as_str() {
-                "plugin_not_found" => diagnostic.push_str(
-                    " Install the persistent Muxe command-pane plugin with \
-                    `herdr plugin link <installation>/lib/muxe/herdr-plugin.toml`; \
-                    the installed muxe executable must be on the Herdr server's PATH.",
-                ),
-                "plugin_disabled" => {
-                    diagnostic.push_str(" Enable the persistent Muxe command-pane plugin with `herdr plugin enable ");
-                    diagnostic.push_str(COMMAND_PANE_PLUGIN_ID);
-                    diagnostic.push_str("`.");
-                }
-                _ => {}
-            }
+        HerdrResponse::Error { code, .. } => {
+            let cause = match code.as_str() {
+                "plugin_not_found" => HerdrExecutionDiagnostic::CommandPanePluginMissing,
+                "plugin_disabled" => HerdrExecutionDiagnostic::CommandPanePluginDisabled,
+                _ => HerdrExecutionDiagnostic::CommandPaneRejected,
+            };
             Err(
-                AdapterError::new(AdapterErrorKind::DispatchFailed, diagnostic)
-                    .with_safe_diagnostic(
-                        match code.as_str() {
-                            "plugin_not_found" => {
-                                HerdrExecutionDiagnostic::CommandPanePluginMissing
-                            }
-                            "plugin_disabled" => {
-                                HerdrExecutionDiagnostic::CommandPanePluginDisabled
-                            }
-                            _ => HerdrExecutionDiagnostic::CommandPaneRejected,
-                        }
-                        .safe(),
-                    ),
+                AdapterError::new(AdapterErrorKind::DispatchFailed, cause.safe().message())
+                    .with_safe_diagnostic(cause.safe()),
             )
         }
     }
@@ -1515,30 +1516,27 @@ mod tests {
     }
 
     #[test]
-    fn known_plugin_rejections_retain_cause_and_only_relevant_install_advice() {
-        for (code, advice) in [
-            ("plugin_not_found", Some("herdr plugin link")),
-            ("plugin_disabled", Some("herdr plugin enable")),
-            ("invalid_cwd", None),
-            ("plugin_pane_open_failed", None),
-            ("stale_context", None),
+    fn known_plugin_rejections_are_bounded_and_never_advise_manual_registration() {
+        for code in [
+            "plugin_not_found",
+            "plugin_disabled",
+            "invalid_cwd",
+            "plugin_pane_open_failed",
+            "stale_context",
         ] {
             let error = plugin_command_pane_response(
                 HerdrResponse::Error {
                     code: code.to_owned(),
-                    message: "specific host cause".to_owned(),
+                    message: "specific secret host cause".to_owned(),
                 },
                 PluginCommandPaneType::Popup,
             )
-            .expect_err("known host rejection is not success");
+            .expect_err("known rejection is not success or an unknown outcome");
             assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
-            assert!(error.to_string().contains(code));
-            assert!(error.to_string().contains("specific host cause"));
-            match advice {
-                Some(advice) => assert!(error.to_string().contains(advice)),
-                None => assert!(!error.to_string().contains("herdr plugin")),
-            }
-            assert!(!error.to_string().contains("may already be running"));
+            assert!(!error.message.contains("secret"));
+            assert!(!error.message.contains("herdr plugin link"));
+            assert!(!error.message.contains("herdr plugin enable"));
+            assert!(!error.message.contains("may already be running"));
         }
     }
     #[cfg(unix)]
@@ -1555,9 +1553,12 @@ mod tests {
             }
         }
         let authority = NoRequestAuthority(AtomicUsize::new(0));
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache = crate::HerdrCache::new(temp.path());
         for pane_type in [PluginCommandPaneType::Overlay, PluginCommandPaneType::Popup] {
             let error = open_plugin_command_pane_with(
                 &authority,
+                &cache,
                 PluginCommandPaneLaunch {
                     origin: FocusedPane {
                         workspace: WorkspaceId::new("w1"),

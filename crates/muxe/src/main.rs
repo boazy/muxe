@@ -1082,7 +1082,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
         })
         .await
         .wrap_err("could not connect the pinned Herdr server for broker startup")?;
-    let broker = muxe_broker::Broker::load(adapter, &command.config)
+    let broker = muxe_broker::Broker::load(adapter.clone(), &command.config)
         .await
         .wrap_err("could not load the broker configuration")?;
     let diagnostics = broker
@@ -1144,6 +1144,12 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
             bail!("starting a replacement broker requires both --handoff and --activation-journal")
         }
     };
+    // Connecting an adapter is read-only. Repair its owned host plugin only after this
+    // ordinary startup or replacement journal has been authorized, before publication.
+    adapter
+        .ensure_command_pane_plugin()
+        .await
+        .wrap_err("Muxe could not prepare its Herdr command-pane plugin")?;
     let registry = muxe::lifecycle::Registry::open(&command.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
     let mut entry = muxe::lifecycle::BrokerEntry::now(

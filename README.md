@@ -378,7 +378,7 @@ Receipt ownership for `--zellij-config` uses its recorded absolute, normalized K
 
 ## Herdr setup
 
-Muxe menus and executable split panes run through the native executable without a Herdr plugin. Executable overlays and popups require the optional persistent command-pane plugin described below. There is no `muxe integration install herdr` command.
+Muxe menus and executable split panes run through the native executable without a Herdr plugin. Muxe automatically manages the command-pane plugin used by executable overlays and popups. There is no `muxe integration install herdr` command.
 
 ### 1. Configure a root keybinding in Herdr
 
@@ -410,24 +410,17 @@ herdr server reload-config
 
 The `muxe` executable must be on the `PATH` inherited by the Herdr server process. Muxe never edits `config.toml`. When you no longer need Muxe, remove the `[[keys.command]]` block manually.
 
-### Optional: enable executable overlays and popups
+### Executable overlays and popups
 
-Copy the bundled manifest to a stable location, then link that copy to your selected Herdr server:
+Muxe manages the reserved `muxe.command-panes` plugin automatically. When a broker starts, it verifies the plugin before accepting requests. Generic executable overlay and popup launches check it again before creation. Missing, disabled, broken, or incorrect registrations are repaired and checked before the command is opened.
 
-```sh
-plugin_manifest="${XDG_CONFIG_HOME:-$HOME/.config}/muxe/herdr-plugin.toml"
-mkdir -p "$(dirname "$plugin_manifest")"
-cp /absolute/path/to/muxe-installation/lib/muxe/herdr-plugin.toml "$plugin_manifest"
-herdr plugin link "$plugin_manifest"
-```
+The compiled manifest is stored at `$CACHE_DIR/herdr/herdr-plugin.toml` (default: `~/.cache/muxe/herdr/herdr-plugin.toml`), outside versioned installations. Its directory is owner-only (`0700`), and its file is owner-only (`0600`). Removing an older installation no longer breaks the saved link. No manual copy or `herdr plugin link` step is required.
 
-The manifest contains one command-pane entrypoint and no startup hooks. Herdr records the manifest path persistently; Muxe does not register plugins automatically or modify Herdr configuration. The manifest runs `muxe pane exec` from the Herdr server's `PATH`, so the copy does not need to stay inside the Muxe installation.
+Muxe changes only its reserved plugin registration and managed manifest. It leaves unrelated plugins, old linked manifests, `config.toml`, and your Muxe configuration unchanged. The managed manifest has one command-pane entrypoint and no startup hooks, actions, or event handlers. A correct registration is not rewritten or relinked.
 
-Version managers can remove an older installation during an upgrade. A plugin linked inside that installation then stops working, even if Herdr still lists it as enabled. A link through a `latest` symlink can also point to the resolved versioned directory. Keep the copied manifest at its stable path and copy and relink it when the bundled plugin contract changes.
+If verification or repair fails, Muxe reports the reason and does not open the executable terminal. Unsafe ownership, symlinks, and hard-linked manifest files are refused. Muxe never repeats a pane-creation request whose outcome is unknown. Inspect `herdr plugin list --plugin muxe.command-panes --json` and the Muxe log for diagnostics.
 
-If executable overlays or popups fail after an upgrade, run `herdr plugin list --plugin muxe.command-panes --json`. A `manifest unavailable` warning means the saved link is broken; repeat the copy and link commands above using the current installation. The `muxe` executable must still be on the Herdr server's `PATH`.
-
-The manifest version (`0.1.0`) identifies the bundled plugin and runner's transport contract independently of the Muxe application version. Routine Muxe releases do not change that contract version.
+The manifest runs `muxe pane exec` from the Herdr server's `PATH`; the installed `muxe` executable must still be available there. The manifest version (`0.1.0`) identifies the plugin and runner's transport contract independently of the Muxe application version.
 
 Use [`pane:open`](REFERENCE.md#paneopen) to run an executable inside a split, overlay, or popup from a menu. For example:
 
@@ -444,7 +437,7 @@ The corresponding CLI is `muxe pane open --pane-type popup --width 80% --height 
 
 Zellij's pinned SDK omits floating coordinates from creation requests. Muxe creates the pane once, then requests placement for the exact terminal identified by the matching host completion. A brief default-size frame can appear before the update. Dispatch completion means the coordinate update was requested, not that the host acknowledged final geometry; a missing created-pane identity leaves the outcome unknown and is never retried.
 
-To remove the persistent link, run `herdr plugin unlink muxe.command-panes` against the same Herdr server before deleting the installation. Existing commands are not stopped by unlinking.
+For removal, retire the brokers before unlinking the managed plugin; see [Uninstallation and purge](#uninstallation-and-purge). An executable overlay or popup launch manages the plugin again if Muxe is still in use.
 
 ## Troubleshooting
 
@@ -455,7 +448,7 @@ If the menu does not open when pressing your hotkey:
 - **Inspect logs**: Check persistent logs at `$CACHE_DIR/logs/muxe.jsonl` (default: `~/.cache/muxe/logs/muxe.jsonl`). Native command failures add a payload-free event; stderr retains the complete diagnostic. Herdr notifications are best-effort; the log file is authoritative.
 - **Zellij permissions**: In Zellij, confirm that you accepted the host-owned permission prompt displayed when the bridge plugin loaded.
 
-If an action fails after its menu closes, inspect the `detached-execution` event in the same log. Its `message` retains a classified, payload-free reason, including command-pane plugin setup instructions or an unavailable saved origin. The `request_id` is the execution's 32-digit hexadecimal identity. Logs omit host response text, command arguments, environment values, and command output.
+If an action fails after its menu closes, inspect the `detached-execution` event in the same log. Its `message` retains a classified, payload-free reason, including command-pane verification or repair failures and an unavailable saved origin. The `request_id` is the execution's 32-digit hexadecimal identity. Logs omit host response text, command arguments, environment values, and command output.
 
 ## Upgrades, activation, and rollback
 
@@ -592,10 +585,9 @@ Uninstall in this order so that the integration receipt remains available to cle
    muxe broker retire --host all
    ```
 
-2. While `muxe` remains installed, remove the Zellij bridge:
-   ```sh
-   muxe integration uninstall zellij
-   ```
+2. Remove the integrations you use:
+   - **Zellij:** Run `muxe integration uninstall zellij` while Muxe remains installed.
+   - **Herdr:** Run `herdr plugin unlink muxe.command-panes` against each selected Herdr server. Existing commands are not stopped by unlinking.
 3. *(Optional)* If you also want to delete retained configuration files, themes, caches, and logs, run `muxe purge` before removing the executable:
    ```sh
    muxe purge --config --cache

@@ -12,7 +12,11 @@ use muxe_core::{
     ActionSpec, CompiledGeneration, ExecutionId, KeyCapabilities, MenuId, MenuName, SourceId,
 };
 use serde_json::{Value, json};
-use std::{io, path::Path, time::Duration};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 async fn invoke(runtime: &HerdrRuntime, method: &str, params: Value) -> io::Result<Value> {
     match runtime
@@ -43,67 +47,218 @@ async fn marker(path: &Path) -> io::Result<String> {
     .map_err(|_| io::Error::other(format!("command marker never appeared: {}", path.display())))?
 }
 
-async fn ensure_command_pane_plugin(
+const PLUGIN_ID: &str = "muxe.command-panes";
+const UNRELATED_PLUGIN_ID: &str = "owned.muxe-isolation-proof";
+const SHIPPED_MANIFEST: &str = include_str!("../../../../lib/muxe/herdr-plugin.toml");
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileInode(u64);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct OwnedFileSnapshot {
+    contents: Vec<u8>,
+    modified: std::time::SystemTime,
+    inode: FileInode,
+    mode: u32,
+    owner: nix::unistd::Uid,
+    group: nix::unistd::Gid,
+}
+
+fn file_snapshot(path: &Path) -> io::Result<OwnedFileSnapshot> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "owned plugin fixture is not a regular file",
+        ));
+    }
+    Ok(OwnedFileSnapshot {
+        contents: std::fs::read(path)?,
+        modified: metadata.modified()?,
+        inode: FileInode(metadata.ino()),
+        mode: metadata.permissions().mode(),
+        owner: nix::unistd::Uid::from_raw(metadata.uid()),
+        group: nix::unistd::Gid::from_raw(metadata.gid()),
+    })
+}
+
+pub(super) fn registry_snapshot(scoped: &Path) -> io::Result<OwnedFileSnapshot> {
+    file_snapshot(&scoped.join("config/herdr/plugins.json"))
+}
+
+async fn plugin_entry(runtime: &HerdrRuntime, plugin_id: &str) -> io::Result<Option<Value>> {
+    let reply = invoke(runtime, "plugin.list", json!({"plugin_id":plugin_id})).await?;
+    let plugins = reply["plugins"]
+        .as_array()
+        .ok_or_else(|| io::Error::other(format!("plugin.list has no plugins: {reply}")))?;
+    let mut matches = plugins
+        .iter()
+        .filter(|plugin| plugin["plugin_id"] == plugin_id);
+    let entry = matches.next().cloned();
+    if matches.next().is_some() {
+        return Err(io::Error::other("duplicate owned plugin registry entry"));
+    }
+    Ok(entry)
+}
+
+pub(super) async fn assert_plugin_missing(runtime: &HerdrRuntime) -> io::Result<()> {
+    if plugin_entry(runtime, PLUGIN_ID).await?.is_some() {
+        return Err(io::Error::other(
+            "fresh owned host already has the Muxe plugin",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ManagedPluginSnapshot {
+    entry: Value,
+    manifest: OwnedFileSnapshot,
+}
+
+pub(super) async fn managed_plugin_snapshot(
     runtime: &HerdrRuntime,
-    origin: &muxe_adapter_herdr::FocusedPane,
-    herdr_binary: &Path,
-    socket: &Path,
-    scoped: &Path,
-    manifest: &Path,
-) -> io::Result<()> {
-    let negative_launch = || muxe_adapter_herdr::PluginCommandPaneLaunch {
-        origin: origin.clone(),
-        cwd: origin.cwd.clone(),
-        argv: vec!["/usr/bin/false".into()],
-        pane_type: muxe_adapter_herdr::PluginCommandPaneType::Popup,
-        width: None,
-        height: None,
-    };
-    let error = muxe_adapter_herdr::open_plugin_command_pane(runtime, negative_launch())
-        .await
-        .err()
-        .ok_or_else(|| io::Error::other("unlinked plugin unexpectedly opened a terminal"))?;
-    if !error.to_string().contains("herdr plugin link") {
-        return Err(io::Error::other(format!(
-            "missing actionable install diagnostic: {error}"
-        )));
-    }
-    // Native link targets only this retained child's explicit socket.
-    let mut link = tokio::process::Command::new(herdr_binary);
-    support::apply_scoped_env(&mut link, scoped);
-    link.env("HERDR_SOCKET_PATH", socket)
-        .args(["plugin", "link"])
-        .arg(manifest);
-    let output = support::run_cli_bounded("owned-plugin-link", &mut link).await?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "plugin link failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    invoke(
-        runtime,
-        "plugin.disable",
-        json!({"plugin_id":"muxe.command-panes"}),
-    )
-    .await?;
-    let error = muxe_adapter_herdr::open_plugin_command_pane(runtime, negative_launch())
-        .await
-        .err()
-        .ok_or_else(|| io::Error::other("disabled plugin unexpectedly opened a terminal"))?;
-    if !error.to_string().contains("plugin_disabled")
-        || !error.to_string().contains("herdr plugin enable")
+    cache_dir: &Path,
+) -> io::Result<ManagedPluginSnapshot> {
+    let path = cache_dir.join("herdr/herdr-plugin.toml");
+    let manifest = file_snapshot(&path)?;
+    let canonical = std::fs::canonicalize(&path)?;
+    let entry = plugin_entry(runtime, PLUGIN_ID).await?.ok_or_else(|| {
+        io::Error::other("broker did not install the missing command pane plugin")
+    })?;
+    let expected_version = SHIPPED_MANIFEST
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("version = \"")
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .ok_or_else(|| io::Error::other("shipped plugin version absent"))?;
+    if manifest.contents != SHIPPED_MANIFEST.as_bytes()
+        || manifest.mode & 0o777 != 0o600
+        || entry["enabled"] != true
+        || entry["manifest_path"] != json!(canonical)
+        || entry["plugin_root"] != json!(canonical.parent())
+        || entry["version"] != expected_version
+        || entry["panes"]
+            != json!([{
+                "id":"command", "title":"Muxe command", "placement":"popup",
+                "command":["muxe","pane","exec"]
+            }])
+        || entry
+            .get("warnings")
+            .is_some_and(|warnings| warnings != &json!([]))
     {
         return Err(io::Error::other(format!(
-            "missing actionable disabled-plugin diagnostic: {error}"
+            "managed command pane plugin is not repaired: {entry}"
         )));
     }
-    invoke(
-        runtime,
-        "plugin.enable",
-        json!({"plugin_id":"muxe.command-panes"}),
-    )
-    .await?;
+    Ok(ManagedPluginSnapshot { entry, manifest })
+}
+
+pub(super) struct UnrelatedPluginSnapshot {
+    path: PathBuf,
+    entry: Value,
+    manifest: OwnedFileSnapshot,
+}
+
+impl UnrelatedPluginSnapshot {
+    pub(super) async fn install(runtime: &HerdrRuntime, root: &Path) -> io::Result<Self> {
+        let path = root.join("unrelated-plugin/herdr-plugin.toml");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let contents = SHIPPED_MANIFEST
+            .replace(PLUGIN_ID, UNRELATED_PLUGIN_ID)
+            .replace("[\"muxe\", \"pane\", \"exec\"]", "[\"/usr/bin/false\"]");
+        std::fs::write(&path, contents)?;
+        invoke(runtime, "plugin.link", json!({"path":path,"enabled":true})).await?;
+        let entry = plugin_entry(runtime, UNRELATED_PLUGIN_ID)
+            .await?
+            .ok_or_else(|| io::Error::other("unrelated owned fixture was not registered"))?;
+        let manifest = file_snapshot(&path)?;
+        Ok(Self {
+            path,
+            entry,
+            manifest,
+        })
+    }
+
+    pub(super) async fn assert_unchanged(&self, runtime: &HerdrRuntime) -> io::Result<()> {
+        if plugin_entry(runtime, UNRELATED_PLUGIN_ID).await?.as_ref() != Some(&self.entry)
+            || file_snapshot(&self.path)? != self.manifest
+        {
+            return Err(io::Error::other(
+                "Muxe repair changed the unrelated owned plugin",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PluginDamage {
+    Missing,
+    DeletedOldManifest,
+    Disabled,
+    WrongCommand,
+    WrongEntrypoint,
+    WrongVersion,
+    WrongManagedContents,
+}
+
+pub(super) const PLUGIN_DAMAGE_CASES: [PluginDamage; 7] = [
+    PluginDamage::Missing,
+    PluginDamage::DeletedOldManifest,
+    PluginDamage::Disabled,
+    PluginDamage::WrongCommand,
+    PluginDamage::WrongEntrypoint,
+    PluginDamage::WrongVersion,
+    PluginDamage::WrongManagedContents,
+];
+
+pub(super) async fn damage_plugin(
+    runtime: &HerdrRuntime,
+    root: &Path,
+    cache_dir: &Path,
+    damage: PluginDamage,
+) -> io::Result<()> {
+    if matches!(damage, PluginDamage::Missing) {
+        invoke(runtime, "plugin.unlink", json!({"plugin_id":PLUGIN_ID})).await?;
+        return Ok(());
+    }
+    if matches!(damage, PluginDamage::Disabled) {
+        invoke(runtime, "plugin.disable", json!({"plugin_id":PLUGIN_ID})).await?;
+        return Ok(());
+    }
+    if matches!(damage, PluginDamage::WrongManagedContents) {
+        std::fs::write(
+            cache_dir.join("herdr/herdr-plugin.toml"),
+            "invalid managed manifest fixture\n",
+        )?;
+        return Ok(());
+    }
+    let directory = root.join(format!("bad-muxe-plugin-{damage:?}"));
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("herdr-plugin.toml");
+    let contents = match damage {
+        PluginDamage::WrongCommand => {
+            SHIPPED_MANIFEST.replace("[\"muxe\", \"pane\", \"exec\"]", "[\"/usr/bin/false\"]")
+        }
+        PluginDamage::WrongEntrypoint => {
+            SHIPPED_MANIFEST.replace("id = \"command\"", "id = \"wrong-command\"")
+        }
+        PluginDamage::WrongVersion => {
+            SHIPPED_MANIFEST.replace("version = \"0.1.0\"", "version = \"0.0.0\"")
+        }
+        PluginDamage::DeletedOldManifest => SHIPPED_MANIFEST.to_owned(),
+        PluginDamage::Missing | PluginDamage::Disabled | PluginDamage::WrongManagedContents => {
+            unreachable!()
+        }
+    };
+    std::fs::write(&path, contents)?;
+    // These are deliberate corruptions of ONLY the exact Muxe ID, never prerequisites.
+    invoke(runtime, "plugin.link", json!({"path":path,"enabled":true})).await?;
+    if matches!(damage, PluginDamage::DeletedOldManifest) {
+        std::fs::remove_file(path)?;
+    }
     Ok(())
 }
 
@@ -305,7 +460,8 @@ async fn exercise_generic_pane(
         )));
     }
     eprintln!("{pane_type}: {actual}");
-    close_executable_pane(runtime, origin, pane_type).await
+    close_executable_pane(runtime, origin, pane_type).await?;
+    std::fs::remove_file(path)
 }
 
 async fn exercise_installed_cli(
@@ -315,6 +471,7 @@ async fn exercise_installed_cli(
     socket: &Path,
     origin: &muxe_adapter_herdr::FocusedPane,
     root: &Path,
+    runtime: &HerdrRuntime,
 ) -> io::Result<()> {
     // The packaged executable and public CLI reuse the same real plugin path.
     let path = root.join("cli-popup.marker");
@@ -337,7 +494,10 @@ async fn exercise_installed_cli(
             "--height",
             "12",
             "--",
-            "/usr/bin/touch",
+            "/bin/sh",
+            "-c",
+            "pwd > \"$1\"; sleep 120",
+            "owned-cli-proof",
         ])
         .arg(&path);
     let output = support::run_cli_bounded("owned-cli-popup", &mut cli).await?;
@@ -347,14 +507,52 @@ async fn exercise_installed_cli(
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !path.exists() {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+    support::poll_until(
+        "CLI executable retains the saved cwd",
+        Duration::from_secs(15),
+        async || {
+            let actual = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            if actual.ends_with('\n') && Path::new(actual.trim()) == origin.cwd {
+                Ok(())
+            } else {
+                Err("waiting for exact CLI cwd proof".to_owned())
+            }
+        },
+    )
+    .await?;
+    invoke(runtime, "popup.close", json!({})).await?;
+    std::fs::remove_file(path)
+}
+
+async fn exercise_noop_generic_panes(
+    runtime: &HerdrRuntime,
+    adapter: &HerdrAdapter,
+    origin: &muxe_adapter_herdr::FocusedPane,
+    root: &Path,
+    scoped: &Path,
+    cache_dir: &Path,
+) -> io::Result<(ManagedPluginSnapshot, OwnedFileSnapshot)> {
+    let correct = managed_plugin_snapshot(runtime, cache_dir).await?;
+    let registry = registry_snapshot(scoped)?;
+    for (ordinal, pane_type) in ["popup", "overlay"].into_iter().enumerate() {
+        exercise_generic_pane(
+            runtime,
+            adapter,
+            origin,
+            root,
+            pane_type,
+            ExecutionId(10 + ordinal as u64),
+        )
+        .await?;
+        if managed_plugin_snapshot(runtime, cache_dir).await? != correct
+            || registry_snapshot(scoped)? != registry
+        {
+            return Err(io::Error::other(
+                "already-correct plugin was rewritten or relinked",
+            ));
         }
-    })
-    .await
-    .map_err(|_| io::Error::other("CLI executable did not run"))?;
-    Ok(())
+    }
+    Ok((correct, registry))
 }
 
 async fn exercise_installed_plugin(
@@ -363,7 +561,6 @@ async fn exercise_installed_plugin(
     root: &Path,
     scoped: &Path,
     socket: &Path,
-    manifest: &Path,
 ) -> io::Result<()> {
     let config = HerdrAdapterConfig {
         socket_path: socket.to_path_buf(),
@@ -382,23 +579,80 @@ async fn exercise_installed_plugin(
     let origin = muxe_adapter_herdr::focused_pane(&runtime)
         .await
         .map_err(io::Error::other)?;
-    ensure_command_pane_plugin(&runtime, &origin, herdr_binary, socket, scoped, manifest).await?;
+    assert_plugin_missing(&runtime).await?;
+    let unrelated = UnrelatedPluginSnapshot::install(&runtime, root).await?;
+    let cache_dir = config.cache_dir.clone();
     let adapter = HerdrAdapter::connect(config)
         .await
         .map_err(io::Error::other)?;
-    for (ordinal, pane_type) in ["popup", "overlay"].into_iter().enumerate() {
-        exercise_generic_pane(
+    let body = async {
+        // Connecting must not register anything: startup authorization is a separate boundary.
+        assert_plugin_missing(&runtime).await?;
+        adapter
+            .ensure_command_pane_plugin()
+            .await
+            .map_err(io::Error::other)?;
+        unrelated.assert_unchanged(&runtime).await?;
+        let (correct, registry) = exercise_noop_generic_panes(
             &runtime,
             adapter.as_ref(),
             &origin,
             root,
-            pane_type,
-            ExecutionId(10 + ordinal as u64),
+            scoped,
+            &cache_dir,
         )
         .await?;
+        exercise_installed_cli(
+            installation,
+            scoped,
+            herdr_binary,
+            socket,
+            &origin,
+            root,
+            &runtime,
+        )
+        .await?;
+        if managed_plugin_snapshot(&runtime, &cache_dir).await? != correct
+            || registry_snapshot(scoped)? != registry
+        {
+            return Err(io::Error::other(
+                "already-correct CLI plugin was rewritten or relinked",
+            ));
+        }
+        unrelated.assert_unchanged(&runtime).await?;
+        for (ordinal, damage) in PLUGIN_DAMAGE_CASES.into_iter().enumerate() {
+            damage_plugin(&runtime, root, &cache_dir, damage).await?;
+            exercise_generic_pane(
+                &runtime,
+                adapter.as_ref(),
+                &origin,
+                root,
+                if ordinal % 2 == 0 { "popup" } else { "overlay" },
+                ExecutionId(20 + ordinal as u64),
+            )
+            .await?;
+            managed_plugin_snapshot(&runtime, &cache_dir).await?;
+            unrelated.assert_unchanged(&runtime).await?;
+            // Corrupt again: the standalone public CLI must repair independently of dispatch.
+            damage_plugin(&runtime, root, &cache_dir, damage).await?;
+            exercise_installed_cli(
+                installation,
+                scoped,
+                herdr_binary,
+                socket,
+                &origin,
+                root,
+                &runtime,
+            )
+            .await?;
+            managed_plugin_snapshot(&runtime, &cache_dir).await?;
+            unrelated.assert_unchanged(&runtime).await?;
+        }
+        Ok(())
     }
-    exercise_installed_cli(installation, scoped, herdr_binary, socket, &origin, root).await?;
-    adapter.shutdown().await.map_err(io::Error::other)
+    .await;
+    let cleanup = adapter.shutdown().await.map_err(io::Error::other);
+    super::combine_body_and_cleanup(body, cleanup)
 }
 
 #[tokio::test]
@@ -414,13 +668,6 @@ async fn installed_plugin_executes_generic_popup_overlay_and_cli() -> io::Result
     let root = support::short_tempdir("muxe-pane-exec-")?;
     let scoped = root.path().join("scoped");
     support::ensure_scoped_dirs(&scoped)?;
-    let manifest = installation.join("lib/muxe/herdr-plugin.toml");
-    let shipped = include_str!("../../../../lib/muxe/herdr-plugin.toml");
-    if std::fs::read_to_string(&manifest)? != shipped {
-        return Err(io::Error::other(
-            "installed persistent plugin differs from shipped manifest",
-        ));
-    }
     let mut server =
         support::OwnedHerdrServer::start(&herdr_binary, root.path(), &scoped, "panes").await?;
     // Keep the owned server in this outer scope so every exercise error still
@@ -431,7 +678,6 @@ async fn installed_plugin_executes_generic_popup_overlay_and_cli() -> io::Result
         root.path(),
         &scoped,
         server.socket(),
-        &manifest,
     )
     .await;
     let cleanup = server.shutdown().await.map(|diagnostics| {

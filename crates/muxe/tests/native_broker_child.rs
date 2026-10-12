@@ -13,7 +13,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,6 +43,34 @@ use tokio::{
     time::timeout,
 };
 
+struct CommandPaneRegistration {
+    manifest: PathBuf,
+    enabled: bool,
+}
+
+impl CommandPaneRegistration {
+    fn metadata(&self) -> Value {
+        json!({
+            "plugin_id": "muxe.command-panes",
+            "name": "Muxe command panes",
+            "version": "0.1.0",
+            "min_herdr_version": "0.8.2",
+            "description": "Run exact executable commands in Herdr overlays and popups through Muxe",
+            "manifest_path": self.manifest,
+            "plugin_root": self.manifest.parent(),
+            "enabled": self.enabled,
+            "platforms": ["linux", "macos"],
+            "panes": [{
+                "id": "command",
+                "title": "Muxe command",
+                "placement": "popup",
+                "command": ["muxe", "pane", "exec"],
+            }],
+            "source": {"kind": "local"},
+        })
+    }
+}
+
 struct FakeHerdr {
     _root: TempDir,
     socket: PathBuf,
@@ -51,12 +82,13 @@ impl FakeHerdr {
         let root = tempfile::tempdir_in("/tmp").expect("fake Herdr root");
         let socket = root.path().join("herdr.sock");
         let listener = UnixListener::bind(&socket).expect("fake Herdr socket");
+        let plugin = Arc::new(Mutex::new(None));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                tokio::spawn(handle_herdr_connection(stream));
+                tokio::spawn(handle_herdr_connection(stream, Arc::clone(&plugin)));
             }
         });
         Self {
@@ -77,7 +109,10 @@ impl Drop for FakeHerdr {
     }
 }
 
-async fn handle_herdr_connection(stream: UnixStream) {
+async fn handle_herdr_connection(
+    stream: UnixStream,
+    plugin: Arc<Mutex<Option<CommandPaneRegistration>>>,
+) {
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     if reader.read_until(b'\n', &mut line).await.unwrap_or(0) == 0 {
@@ -101,6 +136,37 @@ async fn handle_herdr_connection(stream: UnixStream) {
             "version": "0.8.2",
         }),
         "events.subscribe" => json!({"subscribed": true}),
+        "plugin.list" => {
+            let registered = plugin.lock();
+            let selected = registered.as_ref().filter(|_| {
+                request["params"]["plugin_id"]
+                    .as_str()
+                    .is_none_or(|id| id == "muxe.command-panes")
+            });
+            let entries = selected
+                .map(CommandPaneRegistration::metadata)
+                .into_iter()
+                .collect::<Vec<_>>();
+            json!({"type": "plugin_list", "plugins": entries})
+        }
+        "plugin.link" => {
+            let path = request["params"]["path"]
+                .as_str()
+                .expect("plugin manifest path");
+            let manifest = std::fs::canonicalize(path).expect("published managed manifest");
+            assert_eq!(
+                std::fs::read(&manifest).expect("read managed fixture manifest"),
+                include_bytes!("../../../lib/muxe/herdr-plugin.toml").as_slice(),
+                "the fixed test host accepts only the Muxe command-pane contract",
+            );
+            let registration = CommandPaneRegistration {
+                manifest,
+                enabled: request["params"]["enabled"].as_bool().unwrap_or(true),
+            };
+            let metadata = registration.metadata();
+            *plugin.lock() = Some(registration);
+            json!({"type": "plugin_linked", "plugin": metadata})
+        }
         _ => json!({}),
     };
     let response = json!({"id": id, "result": result});

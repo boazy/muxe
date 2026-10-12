@@ -259,10 +259,10 @@ fn render(host_support: &HostSupport, catalog: &ActionCatalog) -> String {
         Context values and relative working directories use the saved origin, not the menu or broker directory.\n\n\
         | Host | Split | Overlay | Popup |\n\
         |---|---|---|---|\n\
-        | Herdr | Right/down, default down; no plugin required | Persistent Muxe plugin; focused terminal | Persistent Muxe plugin; session-modal terminal |\n\
+        | Herdr | Right/down, default down; no plugin required | Managed Muxe plugin; focused terminal | Managed Muxe plugin; session-modal terminal |\n\
         | Zellij | All four directions; host chooses if omitted | Floating command pane | Floating command pane, not session-modal |\n\n\
         Herdr splits use `layout.apply` followed by `pane.move`. If placement fails, Muxe closes only the temporary tab returned by that creation. \
-        Herdr overlays/popups use the explicitly installed `muxe.command-panes` manifest entrypoint. See [Herdr setup](README.md#optional-enable-executable-overlays-and-popups). \
+        Herdr overlays/popups use the automatically managed `muxe.command-panes` manifest entrypoint. Muxe verifies and repairs this plugin before creation; no manual link is required. See [Herdr setup](README.md#executable-overlays-and-popups). \
         The entrypoint receives JSON argv through a reserved environment value and replaces itself with the executable. That transport value is removed before execution.\n\n\
         If Herdr acknowledges creation but returns malformed placement evidence, Muxe reports an unknown outcome: the command may already be running. Inspect the host before deciding whether to repeat it. Muxe does not automatically repeat the request.\n\n\
         Herdr's popup has no public pane ID or pane lifecycle events. Its program exits naturally, or `native.herdr.popup:close` closes the active popup. \

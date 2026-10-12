@@ -605,6 +605,7 @@ pub struct HerdrRuntime {
     expected: EndpointContinuityToken,
     server_version: HerdrServerVersion,
     send_queue: Arc<SendQueue>,
+    cache: HerdrCache,
 }
 impl HerdrRuntime {
     /// Acquires one runtime request schema from the configured executable, records its normalized
@@ -631,6 +632,7 @@ impl HerdrRuntime {
             identity,
             expected,
             server_version,
+            HerdrCache::new(&config.cache_dir),
         ))
     }
 
@@ -669,6 +671,7 @@ impl HerdrRuntime {
             identity,
             expected,
             server_version,
+            HerdrCache::new(socket.parent().expect("test socket has parent")),
         ))
     }
 
@@ -680,6 +683,10 @@ impl HerdrRuntime {
     #[must_use]
     pub(crate) fn schema(&self) -> &Arc<ApiSchema> {
         &self.schema
+    }
+
+    pub(crate) fn cache(&self) -> &HerdrCache {
+        &self.cache
     }
 
     /// Whether this connection parsed the cache-verified normalized request representation rather
@@ -904,6 +911,7 @@ impl HerdrRuntime {
         identity: HostIdentity,
         expected: EndpointContinuityToken,
         server_version: HerdrServerVersion,
+        cache: HerdrCache,
     ) -> Self {
         let lifecycle = QueueLifecycle::new();
         let invoker = GuardedHerdrInvoker {
@@ -920,6 +928,7 @@ impl HerdrRuntime {
             identity,
             expected,
             server_version,
+            cache,
             send_queue: SendQueue::start(invoker, lifecycle),
         }
     }
@@ -1764,6 +1773,7 @@ mod tests {
             identity,
             expected,
             server_version,
+            HerdrCache::new(temp.path()),
         );
 
         std::fs::remove_file(&path).unwrap();
@@ -1804,6 +1814,7 @@ mod tests {
             identity,
             expected,
             server_version,
+            HerdrCache::new(temp.path()),
         );
 
         let accepted = runtime
@@ -1849,6 +1860,7 @@ mod tests {
             identity,
             expected,
             server_version,
+            HerdrCache::new(temp.path()),
         );
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -1937,6 +1949,7 @@ mod tests {
             identity,
             expected,
             server_version,
+            HerdrCache::new(temp.path()),
         );
 
         let panicked: Result<(), AdapterError> = runtime

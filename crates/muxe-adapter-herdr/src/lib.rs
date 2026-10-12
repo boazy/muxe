@@ -17,6 +17,7 @@ mod cache;
 mod commands;
 pub mod generated;
 mod launch;
+mod managed_plugin;
 mod origin;
 mod runtime;
 mod schema;
@@ -49,10 +50,10 @@ impl HerdrExecutionDiagnostic {
     pub const fn safe(self) -> muxe_adapter_api::SafeAdapterDiagnostic {
         muxe_adapter_api::SafeAdapterDiagnostic::new(match self {
             Self::CommandPanePluginMissing => {
-                "Herdr command-pane plugin muxe.command-panes is not linked. Run `herdr plugin link <installation>/lib/muxe/herdr-plugin.toml`; the installed muxe executable must be on the Herdr server's PATH."
+                "Herdr lost the managed muxe.command-panes registration after verification. Retry verification before another open; ensure muxe is on the Herdr server's PATH."
             }
             Self::CommandPanePluginDisabled => {
-                "Herdr command-pane plugin muxe.command-panes is disabled. Run `herdr plugin enable muxe.command-panes`."
+                "Herdr disabled the managed muxe.command-panes registration after verification. Retry verification before another open."
             }
             Self::CommandPaneRejected => {
                 "Herdr rejected plugin.pane.open. Inspect the host plugin configuration; host response text is omitted."
@@ -148,6 +149,8 @@ pub(crate) fn pane_info(
 ///   and its `dispatch_tab_swap` preflight);
 /// - `layout.apply`, `pane.move`: UI trampoline create and move phases;
 /// - `tab.close`: transient-tab failure cleanup;
+/// - `plugin.list`, `plugin.link`: exact managed command-pane registration assurance;
+/// - `plugin.pane.open`: executable popup/overlay creation after registration assurance.
 /// - `notification.show`: capability-gated launcher failure reporting.
 ///
 /// The compatibility record carries this set so cross-version handoffs compare the
@@ -167,6 +170,9 @@ pub const VERIFIED_HERDR_METHODS: &[&str] = &[
     "pane.swap",
     "pane.zoom",
     "ping",
+    "plugin.link",
+    "plugin.list",
+    "plugin.pane.open",
     "session.snapshot",
     "tab.close",
     "tab.create",

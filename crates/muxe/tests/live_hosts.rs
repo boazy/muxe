@@ -2109,36 +2109,6 @@ async fn press_owned_popup_binding(
     .await
 }
 
-async fn wait_missing_plugin_log(log_path: &Path) -> io::Result<()> {
-    poll_until(
-        "missing plugin reason reaches durable log",
-        Duration::from_secs(10),
-        async || {
-            let contents = std::fs::read_to_string(log_path).map_err(|error| error.to_string())?;
-            let event = contents
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .find(|event| event["operation"] == "detached-execution")
-                .ok_or_else(|| format!("no detached event in {contents}"))?;
-            let reason = muxe_adapter_herdr::HerdrExecutionDiagnostic::CommandPanePluginMissing
-                .safe()
-                .message();
-            if !event["message"]
-                .as_str()
-                .is_some_and(|message| message.ends_with(reason))
-            {
-                return Err(format!("wrong missing-plugin classification: {event}"));
-            }
-            let request = event["request_id"].as_str().ok_or("missing execution ID")?;
-            if request.len() != 32 || !request.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(format!("unreadable execution ID: {request}"));
-            }
-            Ok(())
-        },
-    )
-    .await
-}
-
 async fn dismiss_owned_herdr_welcome(rig: &mut Rig, typescript: &Path) -> io::Result<()> {
     // Fresh HOME's welcome opens host settings; neither screen is a menu key target.
     rig.pty_clients
@@ -2162,7 +2132,18 @@ async fn restart_popup_smoke_broker(rig: &mut Rig, target_bin: &Path) -> io::Res
         .last_mut()
         .ok_or_else(|| io::Error::other("owned popup broker is gone"))?;
     let retired = retire_broker(&broker.endpoint, &broker.tag).await;
-    let reaped = broker.child.terminate_and_reap().await.map(|_| ());
+    if let Err(error) = &retired {
+        eprintln!("[herdr-menu] popup broker retire failed: {error}");
+    }
+    let reaped = broker.child.terminate_and_reap().await.map(|diagnostics| {
+        eprintln!(
+            "[herdr-menu] reaped {} (status {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            diagnostics.tag,
+            diagnostics.exit_status,
+            diagnostics.stdout_tail.lossy(),
+            diagnostics.stderr_tail.lossy(),
+        );
+    });
     combine_body_and_cleanup(retired, reaped)?;
     drop(rig.brokers.pop());
     let herdr_binary = input_path("MUXE_HERDR_BINARY");
@@ -2193,34 +2174,18 @@ async fn restart_popup_smoke_broker(rig: &mut Rig, target_bin: &Path) -> io::Res
     Ok(())
 }
 
-async fn assert_herdr_popup_diagnostics(
+async fn assert_herdr_popup_self_healing(
     rig: &mut Rig,
     target_bin: &Path,
     herdr_binary: &Path,
+    unrelated: &executable_panes::UnrelatedPluginSnapshot,
 ) -> io::Result<()> {
     let (socket, runtime, origin, typescript) =
         prepare_herdr_menu_origin(rig, herdr_binary).await?;
     dismiss_owned_herdr_welcome(rig, &typescript).await?;
-    press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin, "Owned popup").await?;
-    wait_missing_plugin_log(&rig.cache_dir.join("logs/muxe.jsonl")).await?;
-    let manifest = target_bin
-        .parent()
-        .ok_or_else(|| io::Error::other("installation root absent"))?
-        .join("lib/muxe/herdr-plugin.toml");
-    let stable_manifest = rig.config_file.with_file_name("herdr-plugin.toml");
-    std::fs::copy(manifest, &stable_manifest)?;
-    let mut link = tokio::process::Command::new(herdr_binary);
-    apply_scoped_env(&mut link, &rig.scoped_root);
-    link.env("HERDR_SOCKET_PATH", &socket)
-        .args(["plugin", "link"])
-        .arg(stable_manifest);
-    let output = run_cli_bounded("owned-popup-plugin-link", &mut link).await?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "owned plugin link failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+    let startup = executable_panes::managed_plugin_snapshot(&runtime, &rig.cache_dir).await?;
+    unrelated.assert_unchanged(&runtime).await?;
+    let registry = executable_panes::registry_snapshot(&rig.scoped_root)?;
     press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin, "Owned popup").await?;
     let proof = rig.workdir.join("muxe-popup-proof");
     poll_until(
@@ -2238,6 +2203,36 @@ async fn assert_herdr_popup_diagnostics(
     .await?;
     herdr_smoke_request(&runtime, "popup.close", serde_json::json!({})).await?;
     std::fs::remove_file(&proof)?;
+    if executable_panes::managed_plugin_snapshot(&runtime, &rig.cache_dir).await? != startup
+        || executable_panes::registry_snapshot(&rig.scoped_root)? != registry
+    {
+        return Err(io::Error::other(
+            "correct startup plugin was rewritten by the popup action",
+        ));
+    }
+    for damage in executable_panes::PLUGIN_DAMAGE_CASES {
+        executable_panes::damage_plugin(&runtime, rig.root.path(), &rig.cache_dir, damage).await?;
+        // No restart/relink: the real menu's generic pane:open repairs at dispatch time.
+        press_owned_popup_binding(rig, target_bin, &socket, &runtime, &origin, "Owned popup")
+            .await?;
+        poll_until(
+            "self-healed popup executes the actual command",
+            Duration::from_secs(10),
+            async || {
+                let cwd = std::fs::read_to_string(&proof).map_err(|error| error.to_string())?;
+                if Path::new(cwd.trim()) == origin.cwd {
+                    Ok(())
+                } else {
+                    Err(format!("{damage:?} popup did not retain its saved cwd"))
+                }
+            },
+        )
+        .await?;
+        executable_panes::managed_plugin_snapshot(&runtime, &rig.cache_dir).await?;
+        unrelated.assert_unchanged(&runtime).await?;
+        herdr_smoke_request(&runtime, "popup.close", serde_json::json!({})).await?;
+        std::fs::remove_file(&proof)?;
+    }
     herdr_smoke_request(
         &runtime,
         "pane.split",
@@ -2370,24 +2365,7 @@ async fn assert_sized_herdr_popup(
             origin.columns, origin.rows
         )));
     }
-    let manifest = target_bin
-        .parent()
-        .ok_or_else(|| io::Error::other("installation root absent"))?
-        .join("lib/muxe/herdr-plugin.toml");
-    let stable_manifest = rig.config_file.with_file_name("herdr-plugin.toml");
-    std::fs::copy(manifest, &stable_manifest)?;
-    let mut link = tokio::process::Command::new(herdr_binary);
-    apply_scoped_env(&mut link, &rig.scoped_root);
-    link.env("HERDR_SOCKET_PATH", &socket)
-        .args(["plugin", "link"])
-        .arg(stable_manifest);
-    let output = run_cli_bounded("owned-sized-popup-plugin-link", &mut link).await?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "owned plugin link failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+    executable_panes::managed_plugin_snapshot(&runtime, &rig.cache_dir).await?;
     let marker = rig.workdir.join("sized-popup-tty");
     for (width, height, expected_rows, expected_columns) in [
         ("80%", "70%", 18, 72),
@@ -2513,6 +2491,63 @@ async fn finish_herdr_menu_smoke(
     result
 }
 
+async fn retain_herdr_menu_continuity(rig: &mut Rig, herdr_binary: &Path) -> io::Result<()> {
+    if rig
+        .herdr
+        .as_mut()
+        .expect("owned server is retained")
+        .try_wait()?
+        .is_some()
+    {
+        return Err(io::Error::other(
+            "herdr-menu: Herdr server exited on startup",
+        ));
+    }
+    rig.continuity = Some(
+        ContinuityGuard::watch_herdr(
+            "herdr-menu",
+            muxe_adapter_herdr::HerdrAdapterConfig {
+                socket_path: rig
+                    .herdr
+                    .as_ref()
+                    .expect("owned server is retained")
+                    .socket()
+                    .to_path_buf(),
+                herdr_binary: herdr_binary.to_path_buf(),
+                cache_dir: rig.cache_dir.clone(),
+            },
+            rig.discovery.clone(),
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+async fn prepare_herdr_plugin_isolation(
+    rig: &Rig,
+    herdr_binary: &Path,
+) -> io::Result<(
+    muxe_adapter_herdr::HerdrRuntime,
+    executable_panes::UnrelatedPluginSnapshot,
+)> {
+    let server = rig
+        .herdr
+        .as_ref()
+        .ok_or_else(|| io::Error::other("herdr-menu: Herdr server is gone"))?;
+    let runtime =
+        muxe_adapter_herdr::HerdrRuntime::connect(muxe_adapter_herdr::HerdrAdapterConfig {
+            socket_path: server.socket().to_path_buf(),
+            herdr_binary: herdr_binary.to_path_buf(),
+            cache_dir: rig.cache_dir.clone(),
+        })
+        .await
+        .map_err(io::Error::other)?;
+    executable_panes::assert_plugin_missing(&runtime).await?;
+    let unrelated =
+        executable_panes::UnrelatedPluginSnapshot::install(&runtime, rig.root.path()).await?;
+    Ok((runtime, unrelated))
+}
+
 async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
     let target_bin = validate_installation(&input_path("MUXE_TARGET_INSTALLATION")).await;
     let target_version = installed_version(&target_bin).await?;
@@ -2540,38 +2575,19 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
         continuity: None,
     };
     let result = async {
-        if rig
-            .herdr
-            .as_mut()
-            .expect("owned server is retained")
-            .try_wait()?
-            .is_some()
-        {
-            return Err(io::Error::other(
-                "herdr-menu: Herdr server exited on startup",
-            ));
-        }
-        rig.continuity = Some(
-            ContinuityGuard::watch_herdr(
-                "herdr-menu",
-                muxe_adapter_herdr::HerdrAdapterConfig {
-                    socket_path: rig
-                        .herdr
-                        .as_ref()
-                        .expect("owned server is retained")
-                        .socket()
-                        .to_path_buf(),
-                    herdr_binary: herdr_binary.clone(),
-                    cache_dir: rig.cache_dir.clone(),
-                },
-                discovery.clone(),
-            )
-            .await?,
-        );
+        retain_herdr_menu_continuity(&mut rig, &herdr_binary).await?;
         let server = rig
             .herdr
             .as_ref()
             .ok_or_else(|| io::Error::other("herdr-menu: Herdr server is gone"))?;
+        let plugin_isolation = if matches!(
+            scenario,
+            HerdrMenuSmoke::ExecutablePopup | HerdrMenuSmoke::SizedPopup
+        ) {
+            Some(prepare_herdr_plugin_isolation(&rig, &herdr_binary).await?)
+        } else {
+            None
+        };
         let broker = spawn_serve_herdr(
             "herdr-menu",
             &target_bin,
@@ -2586,6 +2602,11 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
         let endpoint = broker.endpoint.clone();
         rig.brokers.push(broker);
         assert_broker_serving(&endpoint, "herdr-menu", &target_version).await?;
+        if let Some((runtime, unrelated)) = &plugin_isolation {
+            // Observe registration before any pane action: the actual broker did startup repair.
+            executable_panes::managed_plugin_snapshot(runtime, &rig.cache_dir).await?;
+            unrelated.assert_unchanged(runtime).await?;
+        }
         if matches!(scenario, HerdrMenuSmoke::BareTabCreate) {
             let socket = server.socket().to_path_buf();
             activate_herdr_smoke(&rig, &target_bin, &socket).await?;
@@ -2601,12 +2622,25 @@ async fn run_herdr_menu_smoke(scenario: HerdrMenuSmoke) -> io::Result<()> {
                 assert_herdr_navigation(&mut rig, &target_bin, &herdr_binary).await
             }
             HerdrMenuSmoke::ExecutablePopup => {
-                assert_herdr_popup_diagnostics(&mut rig, &target_bin, &herdr_binary).await
+                assert_herdr_popup_self_healing(
+                    &mut rig,
+                    &target_bin,
+                    &herdr_binary,
+                    &plugin_isolation
+                        .as_ref()
+                        .expect("popup owns plugin isolation fixture")
+                        .1,
+                )
+                .await
             }
             HerdrMenuSmoke::SizedPopup => {
                 assert_sized_herdr_popup(&mut rig, &target_bin, &herdr_binary).await
             }
+        }?;
+        if let Some((runtime, unrelated)) = &plugin_isolation {
+            unrelated.assert_unchanged(runtime).await?;
         }
+        Ok(())
     }
     .await;
     finish_herdr_menu_smoke(rig, scenario, result).await
@@ -3105,10 +3139,10 @@ async fn herdr_navigation_bindings_are_visible_and_dispatch() {
 
 #[tokio::test]
 #[ignore = "live Herdr: needs a staged install, Herdr binary, and MUXE_LIVE_HOSTS_APPROVED=true"]
-async fn herdr_popup_retains_failure_reason_and_executes_after_plugin_link() {
+async fn herdr_popup_self_heals_command_plugin_and_preserves_unrelated_plugins() {
     require_live_approval();
     if let Err(error) = run_herdr_menu_smoke(HerdrMenuSmoke::ExecutablePopup).await {
-        panic!("Herdr popup diagnostics regression failed: {error}");
+        panic!("Herdr popup self-repair regression failed: {error}");
     }
 }
 

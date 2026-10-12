@@ -78,6 +78,79 @@ impl HerdrCache {
         validate_owner_directory(&self.root)
     }
 
+    /// Publishes the compiled command-pane manifest at a version-independent,
+    /// owner-only path. Correct bytes and permissions are a genuine no-op.
+    pub(crate) fn command_pane_manifest(&self) -> std::io::Result<PathBuf> {
+        use std::io::Read;
+        const MANIFEST: &[u8] = include_bytes!("../../../lib/muxe/herdr-plugin.toml");
+        self.ensure_root()?;
+        let path = self.root.join("herdr-plugin.toml");
+        let mut correct = false;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "The managed Herdr manifest must be an owned regular file, not a directory or symlink",
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.uid() != Uid::current().as_raw() || metadata.nlink() != 1 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "The managed Herdr manifest has unsafe ownership or hard links",
+                        ));
+                    }
+                }
+                let mut options = OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+                }
+                let file = options.open(&path)?;
+                let opened = file.metadata()?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "The managed Herdr manifest changed while being validated",
+                        ));
+                    }
+                }
+                let mut stored = [0; MANIFEST.len() + 1];
+                let mut file = file.take(stored.len() as u64);
+                let mut length = 0;
+                while length < stored.len() {
+                    match file.read(&mut stored[length..]) {
+                        Ok(0) => break,
+                        Ok(count) => length += count,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                correct = &stored[..length] == MANIFEST;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    correct &= opened.permissions().mode() & 0o777 == 0o600;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if !correct {
+            write_atomic(&path, MANIFEST)?;
+            sync_parent(&path)?;
+        }
+        fs::canonicalize(path)
+    }
+
     fn entry_path(&self, prefix: &str, key_hash: &str) -> PathBuf {
         self.root.join(format!("{prefix}{key_hash}.json"))
     }
@@ -850,5 +923,103 @@ mod tests {
             Some(vec![true]),
             "the warm valid result must not be trusted for the invalid candidate"
         );
+    }
+}
+
+#[cfg(test)]
+mod managed_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_is_stable_compiled_owner_only_and_rewrites_only_owned_drift() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache = HerdrCache::new(temp.path());
+        let path = cache.command_pane_manifest().unwrap();
+        assert_eq!(
+            path,
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .join("herdr/herdr-plugin.toml")
+        );
+        let expected = include_bytes!("../../../lib/muxe/herdr-plugin.toml").as_slice();
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        fs::write(&path, b"owned obsolete contract").unwrap();
+        assert_eq!(cache.command_pane_manifest().unwrap(), path);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            cache.command_pane_manifest().unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_manifest_leaf_and_roots_are_never_followed_or_overwritten() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for kind in ["symlink", "directory", "hardlink"] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let cache = HerdrCache::new(temp.path());
+            let path = cache.command_pane_manifest().unwrap();
+            fs::remove_file(&path).unwrap();
+            let unrelated = temp.path().join("unrelated");
+            fs::write(&unrelated, b"must remain untouched").unwrap();
+            match kind {
+                "symlink" => symlink(&unrelated, &path).unwrap(),
+                "directory" => fs::create_dir(&path).unwrap(),
+                "hardlink" => fs::hard_link(&unrelated, &path).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(cache.command_pane_manifest().is_err(), "{kind}");
+            assert_eq!(fs::read(&unrelated).unwrap(), b"must remain untouched");
+            assert!(
+                fs::symlink_metadata(&path).is_ok(),
+                "unsafe entry must not be deleted"
+            );
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let unrelated = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("herdr");
+        symlink(unrelated.path(), &root).unwrap();
+        assert!(
+            HerdrCache::new(temp.path())
+                .command_pane_manifest()
+                .is_err()
+        );
+        assert!(!unrelated.path().join("herdr-plugin.toml").exists());
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            HerdrCache::new(temp.path())
+                .command_pane_manifest()
+                .is_err()
+        );
+        assert!(!root.join("herdr-plugin.toml").exists());
+        let parent_link = temp.path().join("linked-cache");
+        symlink(unrelated.path(), &parent_link).unwrap();
+        assert!(
+            HerdrCache::new(&parent_link)
+                .command_pane_manifest()
+                .is_err()
+        );
+        assert!(!unrelated.path().join("herdr").exists());
     }
 }

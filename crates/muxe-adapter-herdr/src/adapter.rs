@@ -570,6 +570,27 @@ impl HerdrAdapter {
         Ok(adapter)
     }
 
+    /// Verifies and, when needed, repairs only Muxe's command-pane registration.
+    /// Call only after broker startup/activation-journal authorization. Connecting
+    /// and preflighting the adapter never register plugins.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on lifecycle/endpoint loss, unsafe manifest paths, malformed
+    /// registry evidence, rejection, or an unknown registration outcome.
+    pub async fn ensure_command_pane_plugin(&self) -> Result<(), AdapterError> {
+        let authority = self.require_lifecycle()?;
+        authority
+            .runtime
+            .validate_method_set(crate::managed_plugin::METHODS)?;
+        let cache = self.cache.clone();
+        authority
+            .run_ordered(move |direct| async move {
+                crate::managed_plugin::ensure_with(&direct, &cache).await
+            })
+            .await?
+    }
+
     fn runtime(&self) -> Arc<HerdrRuntime> {
         self.incarnation
             .read()
@@ -1323,9 +1344,10 @@ impl HerdrAdapter {
         let results = self.dispatch_results_tx.clone();
         let action = action.clone();
         let origin = origin.clone();
+        let cache = self.cache.clone();
         self.admit_dispatch_task(execution, move || {
             let receiver = authority.try_run_ordered(move |direct| async move {
-                match perform_command_creation(&direct, &action, &origin).await {
+                match perform_command_creation(&direct, &cache, &action, &origin).await {
                     Ok(()) => DispatchCompletion::Succeeded { execution },
                     Err(error) if error.kind == AdapterErrorKind::OutcomeUnknown => {
                         DispatchCompletion::OutcomeUnknown { execution, error }
@@ -1701,7 +1723,12 @@ fn command_creation_methods(
             direction: Some(true),
             command: true,
         } => Some(&["session.snapshot", "layout.apply", "pane.move", "tab.close"]),
-        PortableRequestKind::PaneOpen { .. } => Some(&["session.snapshot", "plugin.pane.open"]),
+        PortableRequestKind::PaneOpen { .. } => Some(&[
+            "session.snapshot",
+            "plugin.list",
+            "plugin.link",
+            "plugin.pane.open",
+        ]),
         PortableRequestKind::TabCreate { command: true } => Some(&["layout.apply"]),
         _ => None,
     }
@@ -3840,6 +3867,7 @@ fn creation_requires_post_dismissal(action: &ResolvedPortableAction) -> bool {
 /// Opens the required command in the representation selected by `pane:open`.
 async fn perform_pane_open(
     authority: &IncarnationTransactionAuthority,
+    cache: &HerdrCache,
     action: &ResolvedPaneAction,
     origin: &muxe_core::OriginContext,
 ) -> Result<(), AdapterError> {
@@ -3915,6 +3943,7 @@ async fn perform_pane_open(
         muxe_core::ExecutablePaneType::Overlay | muxe_core::ExecutablePaneType::Popup => {
             crate::launch::open_plugin_command_pane_with(
                 authority,
+                cache,
                 crate::PluginCommandPaneLaunch {
                     origin: destination,
                     cwd,
@@ -3936,12 +3965,13 @@ async fn perform_pane_open(
 
 async fn perform_command_creation(
     authority: &IncarnationTransactionAuthority,
+    cache: &HerdrCache,
     action: &ResolvedPortableAction,
     origin: &muxe_core::OriginContext,
 ) -> Result<(), AdapterError> {
     match action {
         ResolvedPortableAction::Pane(pane @ ResolvedPaneAction::Open { .. }) => {
-            perform_pane_open(authority, pane, origin).await
+            perform_pane_open(authority, cache, pane, origin).await
         }
         ResolvedPortableAction::Pane(ResolvedPaneAction::Split {
             direction: None, ..

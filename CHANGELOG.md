@@ -1,12 +1,14 @@
 ## [Unreleased]
 
-### Documentation
+### Bug fixes
 
-- Link the Herdr command-pane manifest from a stable location so removing an older Muxe installation does not break executable overlays and popups.
+- Verify and automatically repair the Herdr command-pane plugin during broker startup and before executable popup or overlay creation. Keep its managed manifest outside versioned installations and leave unrelated plugins unchanged.
 
 ### Testing
 
-- Make executable-popup smoke tests load each configuration before opening a menu, and exercise command-pane manifests copied outside the installation directory.
+- Exercise missing, stale, disabled, incorrect, and already-correct command-pane registrations through real menu, portable-action, and CLI launches.
+- Preserve broker exit status and output when popup smoke cleanup follows a retirement failure.
+- Remove stale-socket listener and partially written bootstrap PID marker races from owned fixtures.
 
 ## [0.4.1] - 2026-10-12
 

@@ -20,6 +20,7 @@ async-trait.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+parking_lot.workspace = true
 tempfile.workspace = true
 muxe-adapter-zellij = { path = "../muxe-adapter-zellij" }
 muxe-protocol = { path = "../muxe-protocol" }
