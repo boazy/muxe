@@ -9,6 +9,7 @@
 - Exercise missing, stale, disabled, incorrect, and already-correct command-pane registrations through real menu, portable-action, and CLI launches.
 - Preserve broker exit status and output when popup smoke cleanup follows a retirement failure.
 - Remove stale-socket listener and partially written bootstrap PID marker races from owned fixtures.
+- Keep read-only socket-rebind assertions valid for both EOF and Linux connection-reset closures without permitting additional requests.
 
 ## [0.4.1] - 2026-10-12
 

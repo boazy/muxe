@@ -737,11 +737,20 @@ mod tests {
                 fixture::accept_inactive_hello(&mut stream).await;
                 fixture::write_control(&mut stream, "endpoint.welcome.v1", &fixture::welcome())
                     .await;
-                std::fs::remove_file(&path).unwrap();
+                // Keep the displaced inode named so the replacement cannot reuse its identity.
+                std::fs::rename(&path, path.with_extension("displaced")).unwrap();
                 let _replacement = UnixListener::bind(path).unwrap();
                 let mut bytes = Vec::new();
-                stream.read_to_end(&mut bytes).await.unwrap();
-                assert!(bytes.is_empty());
+                let result = stream.read_to_end(&mut bytes).await;
+                if let Err(error) = result {
+                    // Aborting with an unread welcome frame closes as ECONNRESET on Linux,
+                    // rather than a clean EOF. Neither close permits any post-hello request.
+                    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+                }
+                assert!(
+                    bytes.is_empty(),
+                    "rebind detection sent a post-hello request"
+                );
             });
             let (retirement, _) = watch::channel(false);
             let failure = resolve(
