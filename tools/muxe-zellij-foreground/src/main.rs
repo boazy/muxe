@@ -62,14 +62,14 @@ fn main() {
     let os_input = match get_server_os_input() {
         Ok(os_input) => os_input,
         Err(error) => {
-            eprintln!("failed to open terminal:\n{error}");
+            eprintln!("muxe-zellij-foreground cannot initialize terminal input:\n{error}");
             std::process::exit(1);
         }
     };
     if let Some(parent) = socket.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             eprintln!(
-                "muxe-zellij-foreground cannot create socket parent {}: {error}",
+                "muxe-zellij-foreground cannot create the session socket directory {}: {error}",
                 parent.display()
             );
             std::process::exit(1);

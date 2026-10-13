@@ -33,7 +33,7 @@ while IFS= read -r tag || test -n "$tag"; do
 done
 
 if [[ -z "$prev" ]]; then
-  echo "BLOCKED: no predecessor release exists for $TARGET." \
+  echo "BLOCKED: input tags contain no stable release version earlier than $TARGET." \
     "Live upgrade and rollback tests require a published earlier version." >&2
   exit 1
 fi

@@ -35,15 +35,15 @@ command -v gh >/dev/null 2>&1 || fail "gh CLI is required to fetch the predecess
 command -v tar >/dev/null 2>&1 || fail "tar is required to extract release archives"
 
 TARGET_ARCHIVE="$ARCHIVES/muxe-${TARGET}-${ASSET}.tar.gz"
-test -f "$TARGET_ARCHIVE" || fail "target archive $TARGET_ARCHIVE is absent; the assets job did not publish it"
+test -f "$TARGET_ARCHIVE" || fail "target archive $TARGET_ARCHIVE is absent; live upgrade tests cannot run"
 TARGET_DIR="$WORK/target"
 mkdir -p "$TARGET_DIR"
 tar -xzf "$TARGET_ARCHIVE" -C "$TARGET_DIR"
 TARGET_ROOT="$TARGET_DIR/muxe-${TARGET}-${ASSET}"
 test -x "$TARGET_ROOT/muxe" || fail "target archive has no executable muxe"
-test -f "$TARGET_ROOT/lib/muxe/muxe-zellij.wasm" || fail "target archive has no bridge WASM"
+test -f "$TARGET_ROOT/lib/muxe/muxe-zellij.wasm" || fail "target archive is missing lib/muxe/muxe-zellij.wasm"
 TARGET_VERSION="$("$TARGET_ROOT/muxe" --version | cut -d' ' -f2)"
-test "$TARGET_VERSION" = "${TARGET#v}" || fail "target binary reports $TARGET_VERSION, want ${TARGET#v}"
+test "$TARGET_VERSION" = "${TARGET#v}" || fail "target binary reports $TARGET_VERSION, expected ${TARGET#v}"
 TARGET_WASM="$(file_digest "$TARGET_ROOT/lib/muxe/muxe-zellij.wasm")"
 echo "target: tag=$TARGET asset=$ASSET binary=$TARGET_VERSION wasm_sha256=$TARGET_WASM"
 
@@ -54,25 +54,25 @@ gh release download "$PREV" \
   --repo "$GITHUB_REPOSITORY" \
   --pattern "muxe-${PREV}-${ASSET}.tar.gz" \
   --output "$PREV_ARCHIVE" \
-  || fail "no predecessor archive for $PREV; without a prior release artifact the upgrade matrix cannot run"
+  || fail "could not download the predecessor archive for $PREV; live upgrade and rollback tests cannot run"
 tar -xzf "$PREV_ARCHIVE" -C "$PREV_DIR"
 PREV_ROOT="$PREV_DIR/muxe-${PREV}-${ASSET}"
 test -x "$PREV_ROOT/muxe" || fail "predecessor archive has no executable muxe"
 PREV_VERSION="$("$PREV_ROOT/muxe" --version | cut -d' ' -f2)"
-test "$PREV_VERSION" = "${PREV#v}" || fail "predecessor binary reports $PREV_VERSION, want ${PREV#v}"
+test "$PREV_VERSION" = "${PREV#v}" || fail "predecessor binary reports $PREV_VERSION, expected ${PREV#v}"
 test "$PREV_VERSION" != "$TARGET_VERSION" || fail "predecessor and target report the same version $PREV_VERSION; an upgrade requires different versions"
 PREV_WASM="$(file_digest "$PREV_ROOT/lib/muxe/muxe-zellij.wasm")"
 echo "predecessor: tag=$PREV binary=$PREV_VERSION wasm_sha256=$PREV_WASM"
 echo "staged inputs: old=$PREV_ROOT@$PREV_VERSION target=$TARGET_ROOT@$TARGET_VERSION"
 echo "Running live upgrade and rollback tests"
 command -v cargo >/dev/null 2>&1 || fail "cargo is required to run the live-host runner"
-command -v zellij >/dev/null 2>&1 || fail "pinned zellij not on PATH for the live matrix"
-command -v herdr >/dev/null 2>&1 || fail "pinned herdr not on PATH for the live matrix"
+command -v zellij >/dev/null 2>&1 || fail "zellij is not on PATH; live upgrade and rollback tests require it"
+command -v herdr >/dev/null 2>&1 || fail "herdr is not on PATH; live upgrade and rollback tests require it"
 cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins \
-  || fail "fixture binaries did not build"
+  || fail "could not build the Zellij test helper binaries"
 FX="$PWD/tools/muxe-zellij-foreground/target/debug"
 for bin in muxe-zellij-foreground muxe-zellij-bootstrap muxe-zellij-permit muxe-zellij-fault-injector; do
-  test -x "$FX/$bin" || fail "fixture binary $bin missing after build"
+  test -x "$FX/$bin" || fail "test helper $bin is missing or not executable after the build"
 done
 MUXE_OLD_INSTALLATION="$PREV_ROOT" \
 MUXE_TARGET_INSTALLATION="$TARGET_ROOT" \

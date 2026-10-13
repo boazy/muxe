@@ -55,10 +55,15 @@ fn run(args: &Args) -> Result<(), String> {
 }
 
 fn generate(out: &Path, command: &mut clap::Command) -> Result<(), String> {
-    fs::create_dir_all(out).map_err(|error| format!("cannot create {}: {error}", out.display()))?;
+    fs::create_dir_all(out).map_err(|error| {
+        format!(
+            "cannot create completion output directory {}: {error}",
+            out.display()
+        )
+    })?;
     for (shell, file) in FILES {
         generate_to(shell, &mut command.clone(), "muxe", out)
-            .map_err(|error| format!("cannot generate {file}: {error}"))?;
+            .map_err(|error| format!("cannot generate completion file {file}: {error}"))?;
     }
     sync_dir(out)?;
     Ok(())
@@ -73,7 +78,7 @@ impl StagingDir {
         let base = std::env::temp_dir();
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("cannot determine staging timestamp: {error}"))?
+            .map_err(|error| format!("cannot create a staging directory timestamp because the system clock is before the Unix epoch: {error}"))?
             .as_nanos();
         let process_id = std::process::id();
 
@@ -86,7 +91,10 @@ impl StagingDir {
                 Ok(()) => return Ok(Self { path }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
-                    return Err(format!("cannot create {}: {error}", path.display()));
+                    return Err(format!(
+                        "cannot create staging directory {}: {error}",
+                        path.display()
+                    ));
                 }
             }
         }
@@ -112,21 +120,22 @@ fn verify(out: &Path, command: &mut clap::Command) -> Result<(), String> {
     let staging = StagingDir::new()?;
     let result = (|| {
         for (shell, file) in FILES {
-            generate_to(shell, &mut command.clone(), "muxe", staging.path())
-                .map_err(|error| format!("cannot generate {file}: {error}"))?;
+            generate_to(shell, &mut command.clone(), "muxe", staging.path()).map_err(|error| {
+                format!("cannot generate staged completion file {file}: {error}")
+            })?;
         }
         for (_, file) in FILES {
             let expected = fs::read(staging.path().join(file))
-                .map_err(|error| format!("cannot read staged {file}: {error}"))?;
+                .map_err(|error| format!("cannot read staged completion file {file}: {error}"))?;
             let actual = fs::read(out.join(file)).map_err(|error| {
                 format!(
-                    "committed {} missing or unreadable: {error}",
+                    "cannot read completion file {}: {error}",
                     out.join(file).display()
                 )
             })?;
             if expected != actual {
                 return Err(format!(
-                    "completion file {file} differs from generation; regenerate and commit"
+                    "completion file {file} does not match the current CLI definition; regenerate the completion files and commit the changes"
                 ));
             }
         }
@@ -139,7 +148,12 @@ fn verify(out: &Path, command: &mut clap::Command) -> Result<(), String> {
 fn sync_dir(directory: &Path) -> Result<(), String> {
     fs::File::open(directory)
         .and_then(|file| file.sync_all())
-        .map_err(|error| format!("cannot sync {}: {error}", directory.display()))
+        .map_err(|error| {
+            format!(
+                "cannot open or sync completion output directory {}: {error}",
+                directory.display()
+            )
+        })
 }
 
 #[cfg(test)]

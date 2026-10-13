@@ -141,7 +141,7 @@ def choose_bump(version: str) -> str:
 
     if not sys.stdin.isatty():
         fail(
-            "Choose a bump explicitly with --major, --minor, or --patch when stdin is not a TTY"
+            "Standard input is not an interactive terminal; select --major, --minor, or --patch"
         )
 
     prompt = questionary.select(
@@ -194,7 +194,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="verify prerequisites and preview cargo-release without changing or pushing anything",
+        help="check prerequisites and preview cargo-release without executing version changes or pushing",
     )
     return parser.parse_args()
 
@@ -205,12 +205,12 @@ def verify_clean_worktree() -> None:
         CONSOLE.print(
             Panel(
                 Text(diff.rstrip()),
-                title=Text("trunk()..@ is not empty", style="bold red"),
+                title=Text("Working-copy contents differ from trunk()", style="bold red"),
                 border_style="red",
             )
         )
         fail(
-            "Release must start from trunk() with no working-copy changes; empty commits are allowed"
+            "Release requires working-copy contents identical to trunk(); empty commits are allowed"
         )
     CONSOLE.print("[green]✓[/] Working copy has no changes relative to trunk()")
 
@@ -280,7 +280,7 @@ def confirm_ci_override(failing_checks: list[str]) -> None:
         )
     )
     if not sys.stdin.isatty():
-        fail("CI override requires an interactive terminal")
+        fail("GitHub Actions checks have not passed; release cannot continue without an interactive decision")
 
     decision = questionary.select(
         "Continue despite unsuccessful or incomplete CI checks?",
@@ -424,7 +424,7 @@ def wait_for_release_workflow(repository: str, commit: str) -> str:
                     return str(run["url"])
             time.sleep(WORKFLOW_DISCOVERY_INTERVAL_SECONDS)
     fail(
-        f"Release workflow did not appear within {int(WORKFLOW_DISCOVERY_TIMEOUT_SECONDS)} seconds"
+        f"No release workflow run was found for the pushed commit within {int(WORKFLOW_DISCOVERY_TIMEOUT_SECONDS)} seconds; the push has already completed"
     )
 
 
@@ -457,7 +457,7 @@ def release(level: str, *, dry_run: bool) -> None:
         verify_github_actions(repository, commit)
         cargo_release_version(level, execute=False)
         CONSOLE.print(
-            "[bold green]Dry run complete.[/] No files, bookmarks, tags, or remotes were changed."
+            "[bold green]Dry run complete.[/] cargo-release ran without --execute; nothing was pushed."
         )
         return
 
@@ -472,7 +472,7 @@ def main() -> int:
         level = arguments.level or choose_bump(current_version)
         release(level, dry_run=arguments.dry_run)
     except KeyboardInterrupt:
-        CONSOLE.print("\n[yellow]Release cancelled.[/]")
+        CONSOLE.print("\n[yellow]Release interrupted. Earlier steps may have changed local or remote state.[/]")
         return 130
     except ReleaseError as error:
         CONSOLE.print(f"[bold red]Release stopped:[/] {error}")

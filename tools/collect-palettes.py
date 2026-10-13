@@ -3,10 +3,10 @@
 # requires-python = ">=3.14"
 # dependencies = ["PyYAML==6.0.3"]
 # ///
-"""Collect the full pinned palette corpus and reproduce a compressed token table.
+"""Collect palette files from recorded commits and reproduce a compressed token table.
 
-Pins and complete file-inventory hashes live in assets/catalog.json. Downloads
-use one commit archive per collection repository and the pinned canonical URLs.
+Collection revisions and file-inventory hashes live in assets/catalog.json.
+Downloads use one commit archive per collection repository and recorded canonical URLs.
 --offline reuses preserved raw inputs without network access. Neither mode runs
 Muxe, modifies its assets, or establishes visual palette acceptance.
 """
@@ -297,7 +297,7 @@ def parse_yaml_file(spec: dict, entry: dict, out: Path, downloaded: dict) -> tup
                 token_name, token_value, state = (target if target != "unset" else "unset"), "", "unset"
             add_token(tokens, metadata, token_name, token_value, token_path=token_path, token_kind="directive", state=state, raw_line=yaml_line(text, child), line_number=child.start_mark.line + 1)
     if not tokens:
-        raise ValueError("no palette/color/include/unset tokens found")
+        raise ValueError("YAML file contains no recognized palette, color, include, or unset entries")
     return tokens, [metadata]
 
 
@@ -350,7 +350,7 @@ def parse_config_file(spec: dict, entry: dict, out: Path, downloaded: dict) -> t
             token_value = "" if token_value.casefold() in {"unset", "none", "null"} else token_value
         add_token(tokens, metadata, token_name, token_value, state=state, raw_line=line, line_number=no)
     if not tokens:
-        raise ValueError("no config tokens found")
+        raise ValueError("configuration file contains no recognized entries")
     return tokens, [metadata]
 
 
@@ -426,10 +426,10 @@ def blob_sha(data: bytes) -> str:
 def output_path(root: Path, relative: str) -> Path:
     path = PurePosixPath(relative)
     if path.is_absolute() or ".." in path.parts:
-        raise ValueError(f"unsafe evidence path: {relative}")
+        raise ValueError(f"output path must be relative and contain no '..' components: {relative}")
     target = root.joinpath(*path.parts)
     if not target.resolve().is_relative_to(root):
-        raise ValueError(f"evidence path escapes output directory: {relative}")
+        raise ValueError(f"output path resolves outside the output directory: {relative}")
     return target
 
 
@@ -497,7 +497,7 @@ def canonical_inputs(out: Path, catalog: dict, offline: bool) -> list[dict]:
             save_bytes(path, fetch(url))
         record = raw_record(out, path, "muxe-canonical", source["source_path"])
         if record["sha256"] != source["sha256"]:
-            raise ValueError(f"canonical source hash differs: {url}")
+            raise ValueError(f"canonical source SHA-256 does not match the catalog: {url}")
         records.append({**source, **record})
     save_json(out / "canonical-sources.json", {"files": records})
     return records
@@ -560,14 +560,14 @@ def collect(repo: Path, out: Path, offline: bool) -> dict:
     variant_ids = [v["id"] for v in catalog["variants"]]
     embedded_ids = {p.stem for p in (catalog_path.parent / "color-schemes").glob("*.yml")}
     if len(variant_ids) != len(set(variant_ids)) or set(variant_ids) != embedded_ids:
-        raise ValueError("catalog variant inventory differs from embedded YAML files")
+        raise ValueError("catalog variant identifiers are duplicated or differ from embedded YAML filenames")
     if {s["source_id"] for s in catalog["requested_collections"]} != set(FORMATS):
-        raise ValueError("expected all four requested palette collections")
+        raise ValueError("catalog requested_collections must contain exactly the four supported palette collections")
     specs = []
     for source in catalog["requested_collections"]:
         family, format_name, prefix = FORMATS[source["source_id"]]
         if not re.fullmatch(r"[0-9a-f]{40}", source["revision"]):
-            raise ValueError(f"collection is not commit-pinned: {source['source_id']}")
+            raise ValueError(f"collection revision must be a 40-character lowercase Git commit hash: {source['source_id']}")
         specs.append({**source, "source_family": family, "format": format_name, "prefix": prefix})
     if not offline:
         collect_archives(out, specs)
@@ -577,7 +577,7 @@ def collect(repo: Path, out: Path, offline: bool) -> dict:
         paths = sorted(p for p in root.rglob("*") if p.is_file())
         inventory = "".join(f"{p.relative_to(root).as_posix()}\t{sha256(p.read_bytes())}\n" for p in paths)
         if len(paths) != spec["file_count"] or sha256(inventory.encode()) != spec["inventory_sha256"]:
-            raise ValueError(f"incomplete or changed pinned inventory: {spec['source_id']}")
+            raise ValueError(f"collection file count or inventory SHA-256 does not match the catalog: {spec['source_id']}")
         token_count = 0
         for path in paths:
             source_path = spec["prefix"] + "/" + path.relative_to(root).as_posix()
@@ -625,14 +625,14 @@ def collect(repo: Path, out: Path, offline: bool) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True, help="Explicit evidence directory outside tracked source; raw/ is retained for the independent checker")
+    parser.add_argument("--output", type=Path, required=True, help="Collection output directory outside tracked source; raw/ is retained for the independent checker")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--offline", action="store_true", help="Use existing raw inputs in --output; make no network requests")
     args = parser.parse_args()
     out = args.output.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(out).free < FREE_SPACE_FLOOR:
-        raise SystemExit("pause collection: less than 25 GiB free")
+        raise SystemExit("collection stopped: output filesystem has less than 25 GiB free")
     save_json(out / "manifest.json", {"status": "incomplete"})
     try:
         manifest = collect(args.repo.expanduser().resolve(), out, args.offline)
@@ -640,7 +640,7 @@ def main() -> None:
         save_json(out / "manifest.json", {"status": "failed", "error": f"{type(error).__name__}: {error}"})
         raise
     save_json(out / "manifest.json", manifest)
-    print(f"Collected {manifest['requested_scheme_count']} pinned schemes plus 2 official Solarized variants and {manifest['muxe_variant_count']} Muxe assets; {manifest['table']['rows']} token rows in {out / 'tokens.tsv.gz'}")
+    print(f"Collected {manifest['requested_scheme_count']} schemes from the catalog's recorded commits plus 2 official Solarized variants and {manifest['muxe_variant_count']} Muxe assets; {manifest['table']['rows']} token rows in {out / 'tokens.tsv.gz'}")
 
 
 if __name__ == "__main__":

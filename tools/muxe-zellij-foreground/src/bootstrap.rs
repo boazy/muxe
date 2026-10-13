@@ -140,7 +140,7 @@ fn parse_args() -> BootstrapArgs {
         }
     }
     if rows == 0 || cols == 0 || timeout_secs == 0 {
-        eprintln!("muxe-zellij-bootstrap requires nonzero rows, cols, and timeout-secs");
+        eprintln!("muxe-zellij-bootstrap requires rows, cols, and timeout-secs to be greater than zero");
         std::process::exit(2);
     }
     BootstrapArgs {
@@ -171,7 +171,7 @@ fn main() {
     let args = parse_args();
     match run(args) {
         Ok(render_bytes) => {
-            println!("bootstrapped session: first render evidence ({render_bytes} bytes)");
+            println!("bootstrapped session: received first nonempty render ({render_bytes} bytes) and sent client detach notification");
         }
         Err(error) => {
             eprintln!("muxe-zellij-bootstrap: {error}");
@@ -193,7 +193,7 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
             Err(error) => {
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "could not connect to {}: {error}",
+                        "timed out connecting to session socket {}: {error}",
                         args.socket.display()
                     ));
                 }
@@ -231,7 +231,7 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
             cli_assets: assets,
             is_web_client: false,
         })
-        .map_err(|_| "could not send FirstClientConnected".to_owned())?;
+        .map_err(|_| "could not send the first-client initialization request (FirstClientConnected)".to_owned())?;
 
     // Await genuine initialized-session evidence on a worker thread: the
     // screen thread renders only after tabs spawn. Send success alone
@@ -260,8 +260,30 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
                 Ok((ServerToClientMsg::UnblockInputThread, _)) => {}
                 Ok((other, _)) => {
                     if let Some(sender) = evidence_tx.take() {
-                        let _ =
-                            sender.send(Err(format!("got {other:?} before any session render")));
+                        let response = match other {
+                            ServerToClientMsg::Render { .. } => "Render",
+                            ServerToClientMsg::UnblockInputThread => "UnblockInputThread",
+                            ServerToClientMsg::Exit { .. } => "Exit",
+                            ServerToClientMsg::Connected => "Connected",
+                            ServerToClientMsg::Log { .. } => "Log",
+                            ServerToClientMsg::LogError { .. } => "LogError",
+                            ServerToClientMsg::SwitchSession { .. } => "SwitchSession",
+                            ServerToClientMsg::UnblockCliPipeInput { .. } => "UnblockCliPipeInput",
+                            ServerToClientMsg::CliPipeOutput { .. } => "CliPipeOutput",
+                            ServerToClientMsg::QueryTerminalSize => "QueryTerminalSize",
+                            ServerToClientMsg::SetSoftKeyboard { .. } => "SetSoftKeyboard",
+                            ServerToClientMsg::StartWebServer => "StartWebServer",
+                            ServerToClientMsg::RenamedSession { .. } => "RenamedSession",
+                            ServerToClientMsg::ConfigFileUpdated => "ConfigFileUpdated",
+                            ServerToClientMsg::PaneRenderUpdate { .. } => "PaneRenderUpdate",
+                            ServerToClientMsg::SubscribedPaneClosed { .. } => "SubscribedPaneClosed",
+                            ServerToClientMsg::ForwardQueryToHost { .. } => "ForwardQueryToHost",
+                            ServerToClientMsg::EmitNestedSessionFrame { .. } => "EmitNestedSessionFrame",
+                            ServerToClientMsg::MobileState { .. } => "MobileState",
+                        };
+                        let _ = sender.send(Err(format!(
+                            "received server response {response} while waiting for the first nonempty session render"
+                        )));
                     }
                     return;
                 }
@@ -269,7 +291,7 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
                     if let Some(sender) = evidence_tx.take() {
                         let _ =
                             sender
-                                .send(Err("lost the server connection before any session render"
+                                .send(Err("lost the server connection before the first nonempty session render"
                                     .to_owned()));
                     }
                     return;
@@ -281,15 +303,15 @@ fn run(args: BootstrapArgs) -> Result<usize, String> {
     match evidence_rx.recv_timeout(remaining) {
         Ok(Ok(render_bytes)) => {
             std::fs::write(&args.ready_file, render_bytes.to_string())
-                .map_err(|error| format!("could not publish first-render evidence: {error}"))?;
+                .map_err(|error| format!("could not write the first-render byte count to --ready-file: {error}"))?;
             await_detach(deadline)?;
             sender
                 .send_client_msg(ClientToServerMsg::ClientExited)
-                .map_err(|_| "could not detach bootstrap client".to_owned())?;
+                .map_err(|_| "could not send the bootstrap client's detach notification (ClientExited)".to_owned())?;
             Ok(render_bytes)
         }
         Ok(Err(error)) => Err(error),
-        Err(_) => Err("no session render inside the timeout".to_owned()),
+        Err(_) => Err("session readiness wait ended without receiving a nonempty render".to_owned()),
     }
 }
 
@@ -300,15 +322,15 @@ fn await_detach(deadline: Instant) -> Result<(), String> {
         let result = std::io::stdin()
             .lock()
             .read_line(&mut line)
-            .map_err(|error| format!("could not read handoff: {error}"))
+            .map_err(|error| format!("could not read the detach command from standard input: {error}"))
             .and_then(|_| {
                 (line.trim_end() == "detach")
                     .then_some(())
-                    .ok_or_else(|| "expected explicit detach handoff".to_owned())
+                    .ok_or_else(|| "expected a line containing 'detach' on standard input".to_owned())
             });
         let _ = handoff_tx.send(result);
     });
     handoff_rx
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| "no retained-client handoff inside the timeout".to_owned())?
+        .map_err(|_| "bootstrap client detach wait ended without receiving a command".to_owned())?
 }

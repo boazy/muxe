@@ -3,7 +3,7 @@
 # requires-python = ">=3.14"
 # dependencies = ["PyYAML==6.0.3"]
 # ///
-"""Reproduce built-in palette provenance and contrast from pinned raw evidence.
+"""Reproduce built-in palette colors and contrast from preserved source files.
 
 Run with --evidence /path/to/muxe-color-evidence. No network, renderer, host,
 configuration, or repository writes. This checks data, not visual acceptance.
@@ -42,7 +42,7 @@ def digest(data: bytes) -> str:
 
 
 def channels(value: str) -> tuple[int, int, int]:
-    require(bool(HEX.fullmatch(value)), f"invalid RGB: {value}")
+    require(bool(HEX.fullmatch(value)), f"RGB color must use #RRGGBB notation: {value}")
     return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
 
 
@@ -106,7 +106,7 @@ def less_palette(text: str) -> dict[str, str]:
         if re.fullmatch(r"[\d.]+%?", expression):
             return float(expression.rstrip("%"))
         match = re.fullmatch(r"(hsl|hsla|darken|lighten|fade)\((.*)\)", expression)
-        require(match is not None, f"unsupported pinned Less expression: {expression}")
+        require(match is not None, f"cannot evaluate this Less color expression: {expression}")
         operation, body = match.groups()
         args = [evaluate(arg) for arg in body.split(",")]
         if operation in {"hsl", "hsla"}:
@@ -168,7 +168,7 @@ def canonical_palette(variant: dict, source_text: dict[str, str]) -> dict[str, s
     if name.startswith("everforest-"):
         text = next(t for t in texts if "function! everforest#get_palette" in t)
         blocks = re.findall(r"let palette[12] = \{(.*?)\\ \}", text, re.S)
-        require(len(blocks) == 8, "Everforest pinned palette block structure changed")
+        require(len(blocks) == 8, "Everforest source must contain eight palette blocks for the checker to select a variant")
         _, mode, weight = name.split("-")
         offset = {"hard": 0, "medium": 2, "soft": 4}[weight] + (mode == "light")
         chosen = blocks[offset] + blocks[6 + (mode == "light")]
@@ -178,7 +178,7 @@ def canonical_palette(variant: dict, source_text: dict[str, str]) -> dict[str, s
     if name.startswith("kanagawa-"):
         text = next(t for t in texts if "local palette = {" in t)
         return flatten_lua_colors(text.split("local palette = {", 1)[1])
-    raise ValueError(f"unrecognized canonical source adapter: {name}")
+    raise ValueError(f"no canonical source parser is defined for palette variant: {name}")
 
 
 def port_palette(path: Path, collection: str) -> dict[str, str]:
@@ -195,46 +195,46 @@ def port_palette(path: Path, collection: str) -> dict[str, str]:
             result[f"palette[{indexed[1]}]"] = indexed[2].lower()
         elif match:
             result[match[1]] = match[2].lower()
-    require(bool(result), f"no RGB tokens: {path}")
+    require(bool(result), f"no #RRGGBB color entries found in comparison file: {path}")
     return result
 
 
 def derived_color(item: dict, palette: dict[str, str]) -> str:
     source = palette[item["source_alias"]]
-    require(source == item["source_hex"], "derived source RGB changed")
+    require(source == item["source_hex"], "derivation's source color does not match its recorded RGB value")
     rgb, parameter = channels(source), item["parameter"]
     if item["operation"] == "scale_channels":
         return hex_rgb(c * parameter for c in rgb)
     if item["operation"] == "mix_channels":
         second = palette[item["second_alias"]]
-        require(second == item["second_hex"], "derived second source RGB changed")
+        require(second == item["second_hex"], "derivation's second source color does not match its recorded RGB value")
         return hex_rgb(a * (1 - parameter) + b * parameter for a, b in zip(rgb, channels(second)))
     if item["operation"] == "set_hsl_hue":
         _, lightness, saturation = colorsys.rgb_to_hls(*(c / 255 for c in rgb))
         return hex_rgb(c * 255 for c in colorsys.hls_to_rgb(parameter / 360, lightness, saturation))
-    raise ValueError(f"unsupported derivation: {item['operation']}")
+    raise ValueError(f"unsupported color derivation operation: {item['operation']}")
 
 
 def check_contrast(variant: dict, palette: dict[str, str]) -> None:
     roles = variant["semantic"]
     colors = {role: palette[alias] for role, alias in roles.items()}
     background = colors["base.background"]
-    require(background == palette[variant["upstream_roles"]["background"]], f"{variant['id']}: iconic source background changed")
-    require(len({colors[r] for r in ("base.text", "base.muted", "menu.separator")}) == 3, f"{variant['id']}: collapsed neutral roles")
-    require(contrast(colors["base.text"], background) > contrast(colors["base.muted"], background), f"{variant['id']}: secondary hierarchy reversed")
-    require(len({value for key, value in colors.items() if key.startswith("status.")}) == 5, f"{variant['id']}: collapsed states")
+    require(background == palette[variant["upstream_roles"]["background"]], f"{variant['id']}: base.background does not use the upstream background color")
+    require(len({colors[r] for r in ("base.text", "base.muted", "menu.separator")}) == 3, f"{variant['id']}: base.text, base.muted, and menu.separator must use distinct colors")
+    require(contrast(colors["base.text"], background) > contrast(colors["base.muted"], background), f"{variant['id']}: base.text must contrast with the background more than base.muted does")
+    require(len({value for key, value in colors.items() if key.startswith("status.")}) == 5, f"{variant['id']}: status roles must use five distinct colors")
     record = variant["contrast"]
     for role, slot in record["slots"].items():
         measured = contrast(colors[role], background)
-        require(abs(measured - slot["ratio"]) < 0.000001, f"{variant['id']}: stale {role} contrast")
-        require(slot["below_normal_text_reference"] == (measured < record["normal_text_reference"]), f"{variant['id']}: stale contrast disclosure")
+        require(abs(measured - slot["ratio"]) < 0.000001, f"{variant['id']}: recorded {role} contrast ratio does not match the measured ratio")
+        require(slot["below_normal_text_reference"] == (measured < record["normal_text_reference"]), f"{variant['id']}: recorded contrast comparison with the normal-text reference does not match the measured ratio")
     for key, role in (("chevron_badge", "menu.hotkey"), ("disabled_chevron_badge", "base.muted")):
         measured = contrast(background, colors[role])
-        require(abs(measured - record[key]["ratio"]) < 0.000001, f"{variant['id']}: stale {key} contrast")
-        require(record[key]["below_normal_text_reference"] == (measured < record["normal_text_reference"]), f"{variant['id']}: stale {key} disclosure")
+        require(abs(measured - record[key]["ratio"]) < 0.000001, f"{variant['id']}: recorded {key} contrast ratio does not match the measured ratio")
+        require(record[key]["below_normal_text_reference"] == (measured < record["normal_text_reference"]), f"{variant['id']}: recorded {key} comparison with the normal-text reference does not match the measured ratio")
     for pair, recorded in record["neutral_pair_contrast"].items():
         first, second = pair.split(" / ")
-        require(abs(contrast(colors[first], colors[second]) - recorded) < 0.000001, f"{variant['id']}: stale neutral-pair contrast")
+        require(abs(contrast(colors[first], colors[second]) - recorded) < 0.000001, f"{variant['id']}: recorded neutral-pair contrast ratio does not match the measured ratio")
 
 
 def main() -> None:
@@ -254,7 +254,7 @@ def main() -> None:
         for source in variant["sources"]:
             if source["url"] not in source_text:
                 data = (args.evidence / source["evidence_path"]).read_bytes()
-                require(digest(data) == source["sha256"], f"canonical digest: {source['url']}")
+                require(digest(data) == source["sha256"], f"canonical source SHA-256 does not match the catalog: {source['url']}")
                 source_text[source["url"]] = data.decode()
 
     source_palettes = {}
@@ -262,33 +262,33 @@ def main() -> None:
         root = args.evidence / collection["evidence_root"]
         paths = sorted(p for p in root.rglob("*") if p.is_file())
         inventory = "".join(f"{p.relative_to(root).as_posix()}\t{digest(p.read_bytes())}\n" for p in paths)
-        require(len(paths) == collection["file_count"], f"collection count: {collection['source_id']}")
-        require(digest(inventory.encode()) == collection["inventory_sha256"], f"collection inventory: {collection['source_id']}")
+        require(len(paths) == collection["file_count"], f"collection file count does not match the catalog: {collection['source_id']}")
+        require(digest(inventory.encode()) == collection["inventory_sha256"], f"collection inventory SHA-256 does not match the catalog: {collection['source_id']}")
         candidate_paths = {p.relative_to(root).as_posix() for p in paths if any(re.search(pattern, p.name, re.I) for pattern in FAMILIES.values())}
         records = [s for s in catalog["comparison_sources"] if s["collection"] == collection["source_id"]]
-        require(candidate_paths == {s["relative_path"] for s in records}, f"incomplete family candidate coverage: {collection['source_id']}")
+        require(candidate_paths == {s["relative_path"] for s in records}, f"catalog comparison sources do not match the collection's theme-family files: {collection['source_id']}")
         for source in records:
             path = root / source["relative_path"]
-            require(digest(path.read_bytes()) == source["sha256"], f"comparison digest: {source['source_path']}")
+            require(digest(path.read_bytes()) == source["sha256"], f"comparison source SHA-256 does not match the catalog: {source['source_path']}")
             palette = port_palette(path, collection["source_id"])
-            require(palette == source["palette"], f"comparison normalization: {source['source_path']}")
+            require(palette == source["palette"], f"parsed comparison palette does not match the catalog: {source['source_path']}")
             source_palettes[(source["collection"], source["source_path"])] = palette
 
     for variant in catalog["variants"]:
         palette = canonical_palette(variant, source_text)
         for item in variant.get("derived_colors", []):
             value = derived_color(item, palette)
-            require(value == item["hex"], f"{variant['id']}: derivation {item['palette_name']}")
+            require(value == item["hex"], f"{variant['id']}: computed color does not match the recorded derivation for {item['palette_name']}")
             palette[item["palette_name"]] = value
-        require(palette == variant["palette"], f"{variant['id']}: canonical palette incomplete or altered; missing={set(palette) - set(variant['palette'])}, extra={set(variant['palette']) - set(palette)}, changed={[k for k in palette.keys() & variant['palette'].keys() if palette[k] != variant['palette'][k]]}")
+        require(palette == variant["palette"], f"{variant['id']}: catalog palette differs from reproduced source palette; missing={set(palette) - set(variant['palette'])}, extra={set(variant['palette']) - set(palette)}, changed={[k for k in palette.keys() & variant['palette'].keys() if palette[k] != variant['palette'][k]]}")
         consumed = yaml.safe_load((assets / "color-schemes" / (variant["id"] + ".yml")).read_text())
         require(consumed["palette"] == palette, f"{variant['id']}: embedded palette differs from normalized source")
-        require(consumed["colors"] == variant["semantic"], f"{variant['id']}: consumed semantic map differs")
+        require(consumed["colors"] == variant["semantic"], f"{variant['id']}: embedded color-role mapping does not match the catalog")
         canonical_values = {value for key, value in palette.items() if not key.startswith("muxe_")}
         for comparison in variant["comparisons"]:
             alternative = source_palettes[(comparison["collection"], comparison["source_path"])]
             outside = {key: value for key, value in alternative.items() if value not in canonical_values}
-            require(outside == comparison["noncanonical_entries"], f"{variant['id']}: stale source discrepancy classification")
+            require(outside == comparison["noncanonical_entries"], f"{variant['id']}: comparison colors outside the canonical palette do not match the catalog's discrepancy record")
         check_contrast(variant, palette)
         print(f"{variant['id']}: {len(palette)} reproducible colors; source coverage, derivations and role contrasts agree")
     print(f"Reproduced {len(catalog['variants'])} schemes, {len(source_text)} official files, {len(source_palettes)} comparison files. Visual acceptance is separate.")

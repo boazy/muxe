@@ -222,17 +222,17 @@ def candidate_state(candidate: Candidate) -> dict:
 
 def description(candidate: Candidate) -> str:
     if "host-result-arm" in candidate.sources:
-        return "match constructs a concrete muxer enum value"
+        return "match arm refers to a concrete muxer enum value"
     if "named-host-arm" in candidate.sources:
-        return "match dispatches on concrete muxer variants"
+        return "match arm names a concrete muxer"
     if "host-match" in candidate.sources:
-        return "match contains muxer-specific behavior selection"
+        return "match may select behavior using muxer-specific state"
     if "host-let-else" in candidate.sources:
-        return "let-else skips host-specific work in shared code"
+        return "let-else may select host-specific work in shared code"
     if "host-if" in candidate.sources:
-        return "conditional selects behavior using muxer-specific state"
+        return "conditional may select behavior using muxer-specific state"
     if "host-comparison" in candidate.sources:
-        return "compares a muxer tag to select host behavior"
+        return "comparison may use a muxer tag to select host behavior"
     return "passage may contain muxer-specific behavior selection"
 
 
@@ -244,10 +244,10 @@ def reviewed_decisions(path: Path) -> dict[str, dict]:
         raise ValueError(f"{path} must be a JSON object keyed by path:start-end")
     for location, review in reviews.items():
         if not isinstance(review, dict) or review.get("classification") not in CLASSIFICATIONS:
-            raise ValueError(f"invalid manual classification at {location}")
+            raise ValueError(f"manual review must be an object with a supported classification at {location}")
         summary = review.get("description")
         if summary is not None and (not isinstance(summary, str) or not summary.strip() or "\n" in summary):
-            raise ValueError(f"invalid single-line description at {location}")
+            raise ValueError(f"manual review description must be a nonempty, single-line string at {location}")
     return reviews
 
 
@@ -321,7 +321,7 @@ def main() -> None:
     reviews = reviewed_decisions(review_path)
     missing_reviews = reviews.keys() - decisions.keys()
     if missing_reviews:
-        raise ValueError(f"manual reviews no longer match candidates: {sorted(missing_reviews)[:5]}")
+        raise ValueError(f"manual review locations were not found among the current candidates: {sorted(missing_reviews)[:5]}")
     effective = {key: reviews.get(key, {}).get("classification", label) for key, (label, _) in decisions.items()}
     included = [candidate for candidate in ordered if effective[candidate.key] in {"violation", "review"}]
     lines = []

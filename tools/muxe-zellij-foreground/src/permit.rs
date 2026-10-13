@@ -80,7 +80,7 @@ fn main() {
     if let Some(parent) = ZELLIJ_PLUGIN_PERMISSIONS_CACHE.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             eprintln!(
-                "muxe-zellij-permit cannot create cache parent {}: {error}",
+                "muxe-zellij-permit cannot create the permission cache directory {}: {error}",
                 parent.display()
             );
             std::process::exit(1);
@@ -91,7 +91,7 @@ fn main() {
         std::process::exit(1);
     }
     println!(
-        "permitted {key} ({} permissions) at {}",
+        "stored plugin permissions for {key} ({} permissions) in {}",
         permissions.len(),
         ZELLIJ_PLUGIN_PERMISSIONS_CACHE.display()
     );

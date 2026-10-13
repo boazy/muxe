@@ -38,7 +38,7 @@ fn barrier_timeout() -> Duration {
             if let Ok(secs) = text.parse::<u64>() {
                 Duration::from_secs(secs)
             } else {
-                eprintln!("fault-injector: invalid MUXE_FI_BARRIER_TIMEOUT_SECS={text:?}");
+                eprintln!("fault-injector: MUXE_FI_BARRIER_TIMEOUT_SECS must be a nonnegative integer, got {text:?}");
                 std::process::exit(2);
             }
         }
@@ -98,7 +98,7 @@ fn required_path(name: &str) -> PathBuf {
 
 fn required_str(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| {
-        eprintln!("fault-injector: {name} must be set");
+        eprintln!("fault-injector: {name} must be set to valid Unicode text");
         std::process::exit(2);
     })
 }
@@ -124,7 +124,7 @@ fn main() {
         exec_real(&real, &argv);
     }
     if present != configured.len() {
-        eprintln!("fault-injector: partial fault configuration is refused");
+        eprintln!("fault-injector: incomplete fault configuration; MUXE_FI_FINAL_SESSION, MUXE_FI_STABLE_URL, MUXE_FI_BARRIER_DIR, and MUXE_FI_FAIL_URL must all be set together");
         std::process::exit(2);
     }
     let final_session = required_str("MUXE_FI_FINAL_SESSION");
@@ -148,7 +148,7 @@ fn main() {
             exec_real(&real, &argv);
         }
         Err(error) => {
-            eprintln!("fault-injector: cannot claim the one-shot marker: {error}");
+            eprintln!("fault-injector: cannot create the marker that limits fault injection to one reload: {error}");
             std::process::exit(2);
         }
     }
@@ -159,7 +159,7 @@ fn main() {
         barrier_dir.join(format!("request-{final_session}")),
         b"reload-requested",
     ) {
-        eprintln!("fault-injector: cannot write the barrier request: {error}");
+        eprintln!("fault-injector: cannot write the reload-request notification file: {error}");
         std::process::exit(2);
     }
     let release = barrier_dir.join(format!("release-{final_session}"));
@@ -170,7 +170,7 @@ fn main() {
         }
         if Instant::now() >= deadline {
             eprintln!(
-                "fault-injector: barrier release never arrived; failing loudly instead of hanging activation"
+                "fault-injector: timed out waiting for the runner's release file; the held reload was not sent to Zellij"
             );
             std::process::exit(2);
         }
@@ -188,7 +188,7 @@ fn main() {
         }
     }
     if swapped != 1 {
-        eprintln!("fault-injector: expected exactly one stable URL in argv, found {swapped}");
+        eprintln!("fault-injector: expected exactly one command argument matching the stable plugin URL, found {swapped}");
         std::process::exit(2);
     }
     exec_real(&real, &fail_argv);
