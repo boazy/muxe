@@ -46,19 +46,19 @@ pub const EXPECTED_ZELLIJ_VERSION: &str = "0.46.0";
 pub fn assert_pinned_revision() {
     assert_eq!(
         PINNED_ZELLIJ_REVISION, EXPECTED_ZELLIJ_REVISION,
-        "generated Zellij inventory revision drift"
+        "generated Zellij API source revision does not match the required revision"
     );
     assert_eq!(
         PINNED_ZELLIJ_VERSION, EXPECTED_ZELLIJ_VERSION,
-        "generated Zellij inventory version drift"
+        "generated Zellij API version does not match the required version"
     );
     assert!(
         NATIVE_ZELLIJ_COMMAND_CONVERTER_HOLES.is_empty(),
-        "unconverted exposed Zellij commands must fail closed, never ship"
+        "cannot use the generated Zellij API: supported commands are missing argument converters"
     );
     assert!(
         ACTION_CONVERTER_HOLES.is_empty(),
-        "unconverted Zellij action types must fail closed, never ship"
+        "cannot use the generated Zellij API: action field types are missing converters"
     );
 }
 

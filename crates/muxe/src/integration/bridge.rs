@@ -49,7 +49,7 @@ pub enum BridgeError {
     #[error(transparent)]
     Fs(#[from] FsError),
     #[error(
-        "cannot overwrite the bridge file at {path}: its SHA-256 checksum is {found}, but the installation record expects {expected}"
+        "cannot use the bridge file at {path}: its SHA-256 checksum is {found}, but the saved record expects {expected}"
     )]
     ForeignBytes {
         path: PathBuf,
@@ -57,23 +57,23 @@ pub enum BridgeError {
         expected: String,
     },
     #[error(
-        "cannot overwrite the bridge file at {path}: no installation record exists for it. Its SHA-256 checksum is {found}"
+        "cannot overwrite the bridge file at {path}: the installation record does not identify it as a Muxe-installed file. Its SHA-256 checksum is {found}"
     )]
     UntrackedBytes { path: PathBuf, found: String },
-    #[error("staged bridge digest changed after write: expected {expected}, found {found}")]
+    #[error("bridge checksum verification failed: expected SHA-256 {expected}, found {found}")]
     StagedDigestChanged { expected: String, found: String },
     #[error(
-        "cannot replace the backup bridge at {path}: its SHA-256 checksum is {found}, but the saved record expects {recorded}"
+        "cannot use or replace the backup bridge at {path}: its SHA-256 checksum is {found}; the saved checksum is {recorded}"
     )]
     PreviousProtected {
         path: PathBuf,
         recorded: String,
         found: String,
     },
-    #[error("bridge destination at {} is not a regular owner-only file", path.display())]
+    #[error("cannot use bridge file at {}: it must be a regular file owned by the current user and accessible only to that user, not a directory or symbolic link", path.display())]
     UnsafeDestination { path: PathBuf },
     #[error(
-        "bridge destination at {} changed concurrently: expected {expected}, found {found}", path.display()
+        "cannot change the bridge file at {} because it changed during the operation: expected SHA-256 {expected}, found {found}", path.display()
     )]
     ConcurrentChange {
         path: PathBuf,
@@ -81,7 +81,7 @@ pub enum BridgeError {
         found: String,
     },
     #[error(
-        "bridge destination at {} appeared concurrently; refusing to overwrite", path.display()
+        "cannot install the bridge at {}: a file or other directory entry appeared there during installation; refusing to overwrite it", path.display()
     )]
     UnexpectedBytes { path: PathBuf },
 }
@@ -164,20 +164,34 @@ pub fn stage(stable: &Path, bytes: &[u8]) -> Result<PathBuf, BridgeError> {
         fsutil::create_staging_file(directory, BRIDGE_FILE_NAME, STAGING_TAG)?;
     let result = (|| {
         use std::io::Write;
-        file.write_all(bytes)
-            .map_err(|source| fsutil::io_error("writing staged bridge", &staging, source))?;
-        file.sync_all()
-            .map_err(|source| fsutil::io_error("synchronizing staged bridge", &staging, source))?;
+        file.write_all(bytes).map_err(|source| {
+            fsutil::io_error("writing temporary bridge file", &staging, source)
+        })?;
+        file.sync_all().map_err(|source| {
+            fsutil::io_error("saving temporary bridge file to disk", &staging, source)
+        })?;
         drop(file);
-        let staged_bytes = fs::read(&staging)
-            .map_err(|source| fsutil::io_error("verifying staged bridge", &staging, source))?;
+        let staged_bytes = fs::read(&staging).map_err(|source| {
+            fsutil::io_error(
+                "reading temporary bridge file for verification",
+                &staging,
+                source,
+            )
+        })?;
         let expected = fsutil::sha256_hex(bytes);
         let found = fsutil::sha256_hex(&staged_bytes);
         if found != expected {
             return Err(BridgeError::StagedDigestChanged { expected, found });
         }
-        fs::set_permissions(&staging, fs::Permissions::from_mode(BRIDGE_FILE_MODE))
-            .map_err(|source| fsutil::io_error("locking staged bridge mode", &staging, source))?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(BRIDGE_FILE_MODE)).map_err(
+            |source| {
+                fsutil::io_error(
+                    "setting owner-only temporary bridge permissions for",
+                    &staging,
+                    source,
+                )
+            },
+        )?;
         fsutil::sync_dir(directory)?;
         Ok(staging.clone())
     })();
@@ -213,12 +227,12 @@ pub fn backup(stable: &Path, authority: Option<&Sha256Digest>) -> Result<Backup,
             return Err(BridgeError::UnsafeDestination { path: previous });
         }
         let existing = fs::read(&previous)
-            .map_err(|source| fsutil::io_error("reading rollback copy", &previous, source))?;
+            .map_err(|source| fsutil::io_error("reading backup bridge file", &previous, source))?;
         let found = Sha256Digest::from_bytes(&existing);
         match authority {
             Some(recorded) if recorded == &found => {
                 fs::remove_file(&previous).map_err(|source| {
-                    fsutil::io_error("replacing rollback copy", &previous, source)
+                    fsutil::io_error("removing old backup bridge file", &previous, source)
                 })?;
             }
             Some(recorded) => {
@@ -231,14 +245,14 @@ pub fn backup(stable: &Path, authority: Option<&Sha256Digest>) -> Result<Backup,
             None => {
                 return Err(BridgeError::PreviousProtected {
                     path: previous,
-                    recorded: "<no recorded digest>".to_owned(),
+                    recorded: "<no checksum recorded>".to_owned(),
                     found: found.into_string(),
                 });
             }
         }
     }
     let stable_bytes = fs::read(stable)
-        .map_err(|source| fsutil::io_error("reading old bridge", stable, source))?;
+        .map_err(|source| fsutil::io_error("reading installed bridge", stable, source))?;
     let digest = Sha256Digest::from_bytes(&stable_bytes);
     if fs::hard_link(stable, &previous).is_err() {
         // Cross-device or unsupported: fall back to a synced byte copy.
@@ -249,14 +263,15 @@ pub fn backup(stable: &Path, authority: Option<&Sha256Digest>) -> Result<Backup,
         )?;
         let result = (|| {
             use std::io::Write;
-            file.write_all(&stable_bytes)
-                .map_err(|source| fsutil::io_error("writing rollback copy", &staging, source))?;
+            file.write_all(&stable_bytes).map_err(|source| {
+                fsutil::io_error("writing backup bridge file", &staging, source)
+            })?;
             file.sync_all().map_err(|source| {
-                fsutil::io_error("synchronizing rollback copy", &staging, source)
+                fsutil::io_error("saving backup bridge file to disk", &staging, source)
             })?;
             drop(file);
             fs::rename(&staging, &previous).map_err(|source| {
-                fsutil::io_error("installing rollback copy", &previous, source)
+                fsutil::io_error("installing backup bridge file", &previous, source)
             })?;
             fsutil::sync_dir_of(&previous)
         })();
@@ -266,8 +281,13 @@ pub fn backup(stable: &Path, authority: Option<&Sha256Digest>) -> Result<Backup,
         result?;
     }
     // Owner-verified: the backup must digest identically, however it was made.
-    let backed = fs::read(&previous)
-        .map_err(|source| fsutil::io_error("verifying rollback copy", &previous, source))?;
+    let backed = fs::read(&previous).map_err(|source| {
+        fsutil::io_error(
+            "reading backup bridge file for verification",
+            &previous,
+            source,
+        )
+    })?;
     let found = Sha256Digest::from_bytes(&backed);
     if found != digest {
         let _ = fs::remove_file(&previous);
@@ -299,7 +319,7 @@ pub fn check_previous(stable: &Path, authority: Option<&Sha256Digest>) -> Result
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
             return Err(BridgeError::Fs(fsutil::io_error(
-                "reading rollback copy metadata",
+                "checking backup bridge file",
                 &previous,
                 source,
             )));
@@ -309,7 +329,7 @@ pub fn check_previous(stable: &Path, authority: Option<&Sha256Digest>) -> Result
         return Err(BridgeError::UnsafeDestination { path: previous });
     }
     let bytes = fs::read(&previous)
-        .map_err(|source| fsutil::io_error("reading rollback copy", &previous, source))?;
+        .map_err(|source| fsutil::io_error("reading backup bridge file", &previous, source))?;
     let found = Sha256Digest::from_bytes(&bytes);
     match authority {
         Some(recorded) if recorded == &found => Ok(()),
@@ -320,7 +340,7 @@ pub fn check_previous(stable: &Path, authority: Option<&Sha256Digest>) -> Result
         }),
         None => Err(BridgeError::PreviousProtected {
             path: previous,
-            recorded: "<no recorded digest>".to_owned(),
+            recorded: "<no checksum recorded>".to_owned(),
             found: found.into_string(),
         }),
     }
@@ -338,7 +358,7 @@ pub fn ensure_backup(
     authority: Option<&Sha256Digest>,
 ) -> Result<Backup, BridgeError> {
     let stable_bytes = fs::read(stable)
-        .map_err(|source| fsutil::io_error("reading old bridge", stable, source))?;
+        .map_err(|source| fsutil::io_error("reading installed bridge", stable, source))?;
     let digest = Sha256Digest::from_bytes(&stable_bytes);
     let previous = previous_path(stable);
     if let Ok(metadata) = fs::symlink_metadata(&previous)
@@ -467,7 +487,7 @@ pub fn ensure_artifact(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(source) => {
             return Err(BridgeError::Fs(fsutil::io_error(
-                "inspecting bridge transaction artifact",
+                "checking bridge recovery file",
                 &path,
                 source,
             )));
@@ -571,7 +591,7 @@ pub fn install_artifact(
         }
         Err(source) => {
             return Err(BridgeError::Fs(fsutil::io_error(
-                "inspecting bridge artifact destination",
+                "checking bridge destination file",
                 destination,
                 source,
             )));
@@ -676,7 +696,7 @@ pub fn remove_if_matching(path: &Path, expected: &Sha256Digest) -> Result<bool, 
         }
         Err(source) => {
             return Err(BridgeError::Fs(fsutil::io_error(
-                "reading bridge artifact",
+                "checking bridge file before removal",
                 path,
                 source,
             )));
@@ -696,10 +716,7 @@ pub fn remove_if_matching(path: &Path, expected: &Sha256Digest) -> Result<bool, 
             expected: expected.as_str().to_owned(),
         });
     }
-    Ok(fsutil::remove_file_durable(
-        path,
-        "removing bridge artifact",
-    )?)
+    Ok(fsutil::remove_file_durable(path, "removing bridge file")?)
 }
 
 #[cfg(test)]

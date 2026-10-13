@@ -103,15 +103,15 @@ pub enum FsError {
     },
     #[error(transparent)]
     OwnerValidation(#[from] RuntimeError),
-    #[error("refusing ancestor directory {} with unexpected owner {actual}: expected {expected}", path.display())]
+    #[error("cannot use parent directory {}: it belongs to user ID {actual}, but the current user ID is {expected}", path.display())]
     WrongOwner {
         path: PathBuf,
         expected: u32,
         actual: u32,
     },
-    #[error("refusing to use non-regular file {}", path.display())]
+    #[error("cannot use {}: it must be a regular file, not a directory or symbolic link", path.display())]
     NotRegularFile { path: PathBuf },
-    #[error("expected a directory at {}", path.display())]
+    #[error("cannot use {}: it must be a directory, not a symbolic link", path.display())]
     NotDirectory { path: PathBuf },
     #[error("cannot use {} with permissions {:o}; expected permissions {:o}, accessible only to its owner", path.display(), actual, expected)]
     BadMode {
@@ -159,8 +159,15 @@ pub fn ensure_owner_dir(directory: &Path) -> Result<(), FsError> {
                 }
                 Err(source) => return Err(io_error("creating directory", directory, source)),
             }
-            fs::set_permissions(directory, fs::Permissions::from_mode(OWNER_DIR_MODE))
-                .map_err(|source| io_error("locking directory mode", directory, source))?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(OWNER_DIR_MODE)).map_err(
+                |source| {
+                    io_error(
+                        "setting owner-only directory permissions for",
+                        directory,
+                        source,
+                    )
+                },
+            )?;
             check_owner_directory(directory)
         }
         Err(source) => Err(io_error("checking directory", directory, source)),
@@ -285,7 +292,7 @@ fn open_existing_owner_file(path: &Path, append: bool) -> Result<Option<File>, F
             Ok(Some(file))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(io_error("opening owner file", path, source)),
+        Err(source) => Err(io_error("opening owner-only file", path, source)),
     }
 }
 
@@ -301,12 +308,14 @@ fn create_new_owner_file(path: &Path, append: bool) -> Result<Option<File>, FsEr
     match options.open(path) {
         Ok(file) => {
             file.set_permissions(fs::Permissions::from_mode(OWNER_FILE_MODE))
-                .map_err(|source| io_error("locking file mode", path, source))?;
+                .map_err(|source| {
+                    io_error("setting owner-only file permissions for", path, source)
+                })?;
             verify_opened_owner_file(path, &file)?;
             Ok(Some(file))
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-        Err(source) => Err(io_error("creating owner file", path, source)),
+        Err(source) => Err(io_error("creating owner-only file", path, source)),
     }
 }
 
@@ -322,7 +331,7 @@ fn verify_opened_owner_file(path: &Path, file: &File) -> Result<(), FsError> {
     check_exact_mode(path, &opened, OWNER_FILE_MODE)?;
     validate_owner_file(path)?;
     let named = fs::symlink_metadata(path)
-        .map_err(|source| io_error("checking owner file", path, source))?;
+        .map_err(|source| io_error("checking owner-only file", path, source))?;
     if !named.is_file() || named.file_type().is_symlink() {
         return Err(FsError::NotRegularFile {
             path: path.to_path_buf(),
@@ -353,9 +362,12 @@ pub fn create_staging_file(
         }
     }
     Err(FsError::Io {
-        operation: "creating unique staging file",
+        operation: "creating a temporary file in",
         path: directory.to_path_buf(),
-        source: io::Error::new(io::ErrorKind::AlreadyExists, "staging filename collision"),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "all attempted temporary filenames already exist",
+        ),
     })
 }
 
@@ -377,7 +389,7 @@ pub fn sync_file_and_parent(path: &Path) -> Result<(), FsError> {
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     let file = options
         .open(path)
-        .map_err(|source| io_error("opening file for durability replay", path, source))?;
+        .map_err(|source| io_error("opening file to confirm it is saved to disk", path, source))?;
     verify_opened_owner_file(path, &file)?;
     #[cfg(test)]
     if FAIL_DURABILITY_REPLAY.with(std::cell::Cell::get) {
@@ -388,7 +400,7 @@ pub fn sync_file_and_parent(path: &Path) -> Result<(), FsError> {
         ));
     }
     file.sync_all()
-        .map_err(|source| io_error("synchronizing file for durability replay", path, source))?;
+        .map_err(|source| io_error("saving file to disk", path, source))?;
     sync_dir_of(path)
 }
 
@@ -480,7 +492,7 @@ pub fn write_atomic(target: &Path, bytes: &[u8], tag: &str) -> Result<(), FsErro
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| FsError::Io {
-            operation: "resolving parent directory",
+            operation: "resolving the parent directory of",
             path: target.to_path_buf(),
             source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
         })?;
@@ -492,9 +504,9 @@ pub fn write_atomic(target: &Path, bytes: &[u8], tag: &str) -> Result<(), FsErro
     let (staging, mut file) = create_staging_file(directory, name, tag)?;
     let result = (|| {
         file.write_all(bytes)
-            .map_err(|source| io_error("writing staging file", &staging, source))?;
+            .map_err(|source| io_error("writing temporary file", &staging, source))?;
         file.sync_all()
-            .map_err(|source| io_error("synchronizing staging file", &staging, source))?;
+            .map_err(|source| io_error("saving temporary file to disk", &staging, source))?;
         drop(file);
         #[cfg(test)]
         fail_at_tagged_durability_boundary(DurabilityFault::BeforeRename, target, tag)?;
@@ -515,7 +527,7 @@ pub fn write_atomic_new(target: &Path, bytes: &[u8], tag: &str) -> Result<(), Fs
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| FsError::Io {
-            operation: "resolving parent directory",
+            operation: "resolving the parent directory of",
             path: target.to_path_buf(),
             source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
         })?;
@@ -527,15 +539,20 @@ pub fn write_atomic_new(target: &Path, bytes: &[u8], tag: &str) -> Result<(), Fs
     let (staging, mut file) = create_staging_file(directory, name, tag)?;
     let result = (|| {
         file.write_all(bytes)
-            .map_err(|source| io_error("writing staging file", &staging, source))?;
+            .map_err(|source| io_error("writing temporary file", &staging, source))?;
         file.sync_all()
-            .map_err(|source| io_error("synchronizing staging file", &staging, source))?;
+            .map_err(|source| io_error("saving temporary file to disk", &staging, source))?;
         drop(file);
-        fs::hard_link(&staging, target)
-            .map_err(|source| io_error("publishing new file", target, source))?;
+        fs::hard_link(&staging, target).map_err(|source| {
+            io_error(
+                "creating new file without replacing existing data",
+                target,
+                source,
+            )
+        })?;
         sync_dir_of(target)?;
         fs::remove_file(&staging)
-            .map_err(|source| io_error("removing published staging link", &staging, source))?;
+            .map_err(|source| io_error("removing temporary file", &staging, source))?;
         sync_dir(directory)
     })();
     if result.is_err() {

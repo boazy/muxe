@@ -100,7 +100,7 @@ impl HerdrCache {
                     if metadata.uid() != Uid::current().as_raw() || metadata.nlink() != 1 {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
-                            "The managed Herdr manifest has unsafe ownership or hard links",
+                            "The managed Herdr manifest is owned by another user or has more than one hard link",
                         ));
                     }
                 }
@@ -526,7 +526,10 @@ fn validate_owner_directory(path: &Path) -> std::io::Result<()> {
     if root_type.is_symlink() || !root_type.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            format!("Herdr cache root is not a directory: {}", path.display()),
+            format!(
+                "The Herdr cache path must be a directory, not a file or symbolic link: {}",
+                path.display()
+            ),
         ));
     }
     let metadata = fs::metadata(path)?;

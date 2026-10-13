@@ -317,7 +317,7 @@ fn config_value_from_yaml(
         YamlDataOwned::BadValue => {
             return Err(ConfigDiagnostic::error(
                 DiagnosticCode::YamlSyntax,
-                "YAML contains an invalid scalar",
+                "YAML contains an invalid value",
                 span,
             ));
         }

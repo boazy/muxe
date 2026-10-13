@@ -26,7 +26,7 @@ pub enum MenuDumpSelection<'a> {
 pub enum MenuDumpError {
     #[error("unknown menu `{0}`")]
     UnknownMenu(String),
-    #[error("compiled inline menu target `{0}` is missing")]
+    #[error("Muxe could not find inline menu `{0}` after loading the configuration")]
     MissingInlineMenu(String),
     #[error("could not encode the effective menu as JSON: {0}")]
     Encode(#[from] serde_json::Error),

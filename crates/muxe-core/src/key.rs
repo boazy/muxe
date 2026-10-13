@@ -523,8 +523,10 @@ impl fmt::Display for KeyParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => formatter.write_str("key is empty"),
-            Self::UnknownModifier(value) => write!(formatter, "unknown modifier `{value}`"),
-            Self::DuplicateModifier(value) => write!(formatter, "duplicate modifier `{value}`"),
+            Self::UnknownModifier(value) => write!(formatter, "unknown key modifier `{value}`"),
+            Self::DuplicateModifier(value) => {
+                write!(formatter, "key modifier `{value}` is repeated")
+            }
             Self::NonCanonicalModifierOrder => {
                 formatter.write_str("key modifiers must follow this order: ")?;
                 for (index, (name, _)) in CANONICAL_MODIFIERS.iter().enumerate() {
@@ -538,7 +540,10 @@ impl fmt::Display for KeyParseError {
             Self::MissingIdentity => {
                 formatter.write_str("key must name a character or named key after its modifiers")
             }
-            Self::InvalidUnicode(value) => write!(formatter, "invalid Unicode scalar `{value}`"),
+            Self::InvalidUnicode(value) => write!(
+                formatter,
+                "key Unicode code point `{value}` does not represent a valid character"
+            ),
             Self::UnknownNamedKey(value) => write!(formatter, "unknown named key `{value}`"),
             Self::InvalidSelector(value) => {
                 write!(

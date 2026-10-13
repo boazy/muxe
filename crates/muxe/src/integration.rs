@@ -61,7 +61,7 @@ pub enum IntegrationLockError {
         #[source]
         source: io::Error,
     },
-    #[error("cannot acquire integration lock at {}: {source}", path.display())]
+    #[error("cannot acquire the bridge installation lock at {}: {source}", path.display())]
     Acquire {
         path: PathBuf,
         #[source]
@@ -178,7 +178,10 @@ pub enum IntegrationError {
         journal.display()
     )]
     InstallJournalLive { journal: PathBuf },
-    #[error("fault injected after {step:?} (test hook)")]
+    #[error(
+        "installation test hook injected a failure at: {}",
+        install_step_description(*step)
+    )]
     FaultInjected { step: InstallStep },
     #[cfg(test)]
     #[error("fault injected after bridge removal (test hook)")]
@@ -187,9 +190,7 @@ pub enum IntegrationError {
     InconsistentJournal(String),
     #[error("could not read this Muxe build's compatibility information: {0}")]
     Compat(String),
-    #[error(
-        "cannot continue installation or removal because the audit log could not be written: {0}"
-    )]
+    #[error("could not write the bridge installation or removal audit log: {0}")]
     Audit(#[from] crate::logging::LogError),
 }
 
@@ -218,6 +219,18 @@ pub enum InstallStep {
     BeforeBridgeSwap,
     BridgeCommitted,
     BeforeReceiptCommit,
+}
+
+fn install_step_description(step: InstallStep) -> &'static str {
+    match step {
+        InstallStep::JournalWritten => "after saving the installation recovery record",
+        InstallStep::BridgeStaged => "after writing the temporary bridge file",
+        InstallStep::BeforeKdlApply => "before editing the Zellij configuration",
+        InstallStep::ConfigEdited => "after editing the Zellij configuration",
+        InstallStep::BeforeBridgeSwap => "before replacing the installed bridge",
+        InstallStep::BridgeCommitted => "after installing the bridge file",
+        InstallStep::BeforeReceiptCommit => "before saving the installation record",
+    }
 }
 
 #[cfg(test)]
@@ -471,7 +484,7 @@ pub fn existing_bridge_identity(config_dir: &Path) -> Result<Option<BridgeIdenti
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(PathError::BridgeIo {
-            operation: "inspect existing",
+            operation: "inspect existing bridge installation directory",
             path: directory,
             source,
         }),
@@ -486,7 +499,7 @@ pub fn existing_bridge_identity(config_dir: &Path) -> Result<Option<BridgeIdenti
 #[must_use]
 pub fn stable_bridge_path(config_dir: &Path) -> PathBuf {
     bridge_identity(config_dir)
-        .expect("stable bridge path requires a validated integration directory")
+        .expect("cannot resolve the installed bridge path because the installation directory could not be validated")
         .stable_path(std::ffi::OsStr::new(BRIDGE_FILE_NAME))
 }
 
@@ -667,7 +680,8 @@ fn install_fresh(
         .zellij;
     if bridge_compat.is_none() {
         return Err(IntegrationError::Compat(
-            "embedded record lacks Zellij compatibility".to_owned(),
+            "this Muxe build's embedded compatibility information does not include Zellij"
+                .to_owned(),
         ));
     }
     inputs.hooks.check(InstallStep::BeforeReceiptCommit)?;
@@ -692,7 +706,10 @@ fn install_fresh(
     log(
         inputs.logger,
         "install",
-        &format!("installed bridge {}", verification.packaged_digest),
+        &format!(
+            "installed Zellij bridge with SHA-256 {}",
+            verification.packaged_digest
+        ),
     )?;
     Ok(InstallOutcome {
         bridge_digest: verification.packaged_digest,
@@ -737,7 +754,7 @@ fn plan_config(
         ResolvedPolicy::Always => EditDecision::Apply,
         ResolvedPolicy::Ask => {
             let prompt = format!(
-                "Add or correct the Muxe nodes in {}?\n{}",
+                "Add or correct the Muxe configuration entries in {}?\n{}",
                 config_path.display(),
                 kdl::required_snippet(bridge_url)
             );
@@ -763,7 +780,7 @@ fn plan_config(
             None,
             decision,
             Some(format!(
-                "Could not edit {}: {error}\nAdd these nodes manually:\n{}",
+                "Could not edit {}: {error}\nRequired Muxe configuration for manual editing:\n{}",
                 config_path.display(),
                 kdl::required_snippet(bridge_url)
             )),
@@ -785,7 +802,7 @@ fn kdl_abort_snippet(
         | kdl::KdlError::UnsafePath { .. }
         | kdl::KdlError::ConcurrentChange { .. }
         | kdl::KdlError::CandidateRejected { .. } => Ok(format!(
-            "Could not edit {error} in {}.\nAdd these nodes manually:\n{}",
+            "Could not edit {}: {error}\nRequired Muxe configuration for manual editing:\n{}",
             config_path.display(),
             kdl::required_snippet(bridge_url)
         )),
@@ -950,7 +967,7 @@ fn remove_journal(directory: &Path) -> Result<(), IntegrationError> {
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(IntegrationError::Fs(fsutil::io_error(
-            "removing install journal",
+            "removing installation recovery record",
             &path,
             source,
         ))),
@@ -963,7 +980,9 @@ fn staged_name(staged: &Path) -> Result<String, IntegrationError> {
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .ok_or_else(|| {
-            IntegrationError::InconsistentJournal("staged bridge has no file name".to_owned())
+            IntegrationError::InconsistentJournal(
+                "the temporary bridge path has no filename".to_owned(),
+            )
         })
 }
 
@@ -1068,7 +1087,7 @@ fn validated_staging(
         || Path::new(&name).file_name().and_then(|base| base.to_str()) != Some(name.as_str())
     {
         return Err(IntegrationError::InconsistentJournal(
-            "the temporary bridge filename in the installation recovery record is empty or contains a path separator".to_owned(),
+            "the temporary bridge filename in the installation recovery record is invalid; expected a single filename without path separators, NUL characters, or `.` or `..`".to_owned(),
         ));
     }
     Ok(directory.join(name))
@@ -1087,7 +1106,7 @@ fn adopt_or_clean_staging(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(IntegrationError::Fs(fsutil::io_error(
-                "scanning integration directory",
+                "scanning bridge installation directory",
                 directory,
                 source,
             )));
@@ -1096,7 +1115,7 @@ fn adopt_or_clean_staging(
     let mut adopted = None;
     for entry in entries {
         let entry = entry.map_err(|source| {
-            fsutil::io_error("scanning integration directory", directory, source)
+            fsutil::io_error("scanning bridge installation directory", directory, source)
         })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -1105,7 +1124,7 @@ fn adopt_or_clean_staging(
         }
         let path = entry.path();
         let bytes = fs::read(&path)
-            .map_err(|source| fsutil::io_error("reading staging file", &path, source))?;
+            .map_err(|source| fsutil::io_error("reading temporary bridge file", &path, source))?;
         if Sha256Digest::from_bytes(&bytes) == journal.packaged_digest {
             adopted = Some(path);
         } else {
@@ -1198,7 +1217,7 @@ fn resume_with_staged(
             directory,
             &journal,
             logger,
-            "staged bridge missing; cannot complete swap",
+            "the temporary bridge file is missing, so the installed bridge cannot be replaced",
         );
     }
     commit_resumed(
@@ -1266,7 +1285,7 @@ fn verify_pre_swap_bridge_state(
             ))
         }
         (_, Err(source)) => Err(IntegrationError::Fs(fsutil::io_error(
-            "reading stable bridge",
+            "reading installed bridge",
             &stable,
             source,
         ))),
@@ -1289,7 +1308,7 @@ fn reapply_kdl(
         |error| match error {
             kdl::KdlError::Fs(source) => Reapply::Fatal(IntegrationError::Fs(source)),
             other => Reapply::Fatal(IntegrationError::InconsistentJournal(format!(
-                "cannot re-plan KDL edit: {other}"
+                "cannot prepare the Zellij configuration changes again: {other}"
             ))),
         },
     )?;
@@ -1302,7 +1321,7 @@ fn reapply_kdl(
             | kdl::KdlError::ConcurrentChange { .. }
             | kdl::KdlError::CandidateRejected { .. }),
         ) => Err(Reapply::AbortSnippet(format!(
-            "Could not edit {config_path}: {error}\nAdd these nodes manually:\n{}",
+            "Could not edit {config_path}: {error}\nRequired Muxe configuration for manual editing:\n{}",
             kdl::required_snippet(&journal.bridge_url)
         ))),
         Err(kdl::KdlError::Fs(source)) => Err(Reapply::Fatal(IntegrationError::Fs(source))),
@@ -1338,7 +1357,11 @@ fn rollback_kdl_and_journal(
         })?;
     }
     remove_journal(directory)?;
-    log(logger, "install-resume", &format!("rolled back: {context}"))?;
+    log(
+        logger,
+        "install-resume",
+        &format!("cancelled interrupted bridge installation: {context}"),
+    )?;
     Ok(ResumeOutcome::RolledBack)
 }
 
@@ -1366,14 +1389,14 @@ fn rollback_pending_nodes(config_path: &Path, pending: &[NodeRecord]) -> Result<
     }
     let candidate = kdl::apply_edits(&original, &edits);
     KdlDocument::parse_v1(&candidate)
-        .map_err(|error| format!("rollback candidate rejected: {error}"))?;
+        .map_err(|error| format!("the restored Zellij configuration would be invalid: {error}"))?;
     let current = std::fs::read(config_path)
         .map_err(|error| format!("cannot re-read {}: {error}", config_path.display()))?;
     if current != original.as_bytes() {
-        return Err("configuration changed concurrently".to_owned());
+        return Err("the Zellij configuration changed during restoration".to_owned());
     }
     kdl::write_raw_config(config_path, &candidate)
-        .map_err(|error| format!("cannot write rollback: {error}"))?;
+        .map_err(|error| format!("cannot write the restored Zellij configuration: {error}"))?;
     Ok(())
 }
 #[expect(
@@ -1402,7 +1425,7 @@ fn commit_resumed(
             // never silently proceed without them.
             if receipt.is_some() {
                 return Err(IntegrationError::InconsistentJournal(
-                    "stable bridge vanished outside the transaction".to_owned(),
+                    "the installed bridge file is missing, although the saved record identifies an earlier installation".to_owned(),
                 ));
             }
             if staged.is_none() {
@@ -1443,7 +1466,7 @@ fn commit_resumed(
                     }
                     _ => {
                         return Err(IntegrationError::InconsistentJournal(
-                            "stable bridge changed outside the transaction".to_owned(),
+                            "the installed bridge file does not match the checksums saved for this installation".to_owned(),
                         ));
                     }
                 }
@@ -1469,7 +1492,7 @@ fn commit_resumed(
             .map(|receipt| &receipt.bridge.installed_digest);
         if expected.as_ref() != vouched && receipt.is_some() {
             return Err(IntegrationError::InconsistentJournal(
-                "stable bridge changed outside the transaction".to_owned(),
+                "the installed bridge file no longer matches the checksum in the installation record".to_owned(),
             ));
         }
         bridge::commit(staged, stable, expected.as_ref())?;
@@ -1479,7 +1502,7 @@ fn commit_resumed(
         Some(config_path) => config_path,
         None => ConfigPath::from_input(stable).map_err(|error| {
             IntegrationError::InconsistentJournal(format!(
-                "cannot recover the default configuration identity: {error}"
+                "cannot recover the default configuration path: {error}"
             ))
         })?,
     };
@@ -1490,7 +1513,8 @@ fn commit_resumed(
         .zellij;
     if bridge_compat.is_none() {
         return Err(IntegrationError::Compat(
-            "embedded record lacks Zellij compatibility".to_owned(),
+            "this Muxe build's embedded compatibility information does not include Zellij"
+                .to_owned(),
         ));
     }
     let identity = BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))?;
@@ -1519,7 +1543,10 @@ fn commit_resumed(
     log(
         logger,
         "install-resume",
-        &format!("completed install {}", journal.packaged_digest),
+        &format!(
+            "completed interrupted Zellij bridge installation with SHA-256 {}",
+            journal.packaged_digest
+        ),
     )?;
     let outcome = InstallOutcome {
         bridge_digest: journal.packaged_digest.clone(),
@@ -1596,7 +1623,7 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
         ResolvedPolicy::Always => true,
         ResolvedPolicy::Ask => inputs
             .asker
-            .is_some_and(|ask| ask("Remove or restore Muxe-owned Zellij KDL nodes?")),
+            .is_some_and(|ask| ask("Remove the Zellij configuration entries Muxe created and restore entries Muxe replaced?")),
     };
     let plans = if remove_configs {
         preflight_uninstall_edits(&selected_records)?
@@ -1625,7 +1652,7 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
             outcome.unresolved.push(UnresolvedRecord {
                 node: Some(record.node),
                 config_path: Some(record.config_path.to_path_buf()),
-                reason: "configuration was not selected by --zellij-config; node left in place"
+                reason: "this configuration file was not selected by --zellij-config; the entry was left in place"
                     .to_owned(),
             });
         }
@@ -1643,7 +1670,8 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
                 outcome.unresolved.push(UnresolvedRecord {
                     node: Some(record.node),
                     config_path: Some(record.config_path.to_path_buf()),
-                    reason: "configuration edit declined; node left in place".to_owned(),
+                    reason: "configuration editing was declined; the entry was left in place"
+                        .to_owned(),
                 });
             }
         }
@@ -1667,7 +1695,7 @@ pub fn uninstall(inputs: UninstallInputs<'_>) -> Result<UninstallOutcome, Integr
         inputs.logger,
         "uninstall",
         &format!(
-            "bridge_removed={} receipt_removed={}",
+            "completed Zellij bridge removal: bridge file removed={} installation record removed={}",
             outcome.bridge_removed, outcome.receipt_removed
         ),
     )?;
@@ -1685,7 +1713,7 @@ fn refuse_interrupted_install(directory: &Path) -> Result<(), IntegrationError> 
         Ok(_) => Err(IntegrationError::InstallJournalLive { journal: path }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(IntegrationError::Fs(fsutil::io_error(
-            "checking interrupted install journal",
+            "checking installation recovery record",
             &path,
             source,
         ))),
@@ -1742,7 +1770,7 @@ fn bridge_absent(stable: &Path) -> Result<bool, IntegrationError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Ok(_) => Ok(false),
         Err(source) => Err(IntegrationError::Fs(fsutil::io_error(
-            "checking stable bridge before receipt removal",
+            "checking installed bridge before removing installation record",
             stable,
             source,
         ))),
@@ -1875,7 +1903,7 @@ fn preflight_uninstall_file(
                 node: Some(record.node),
                 config_path: Some(config_path.to_path_buf()),
                 reason: format!(
-                    "`{}` is absent without proven restored provenance; left untouched",
+                    "`{}` is missing, so Muxe cannot confirm that its original contents were restored; no change was made to this entry",
                     record.node.as_str()
                 ),
             }),
@@ -1991,7 +2019,7 @@ fn plan_uninstall_node(
         .collect();
     if blocks.len() > 1 {
         return Err(format!(
-            "ambiguous duplicate `{parent_name}` blocks; left untouched"
+            "more than one `{parent_name}` block exists; Muxe cannot determine which one to edit and left them untouched"
         ));
     }
     let Some(block) = blocks.first() else {
@@ -2016,7 +2044,7 @@ fn plan_uninstall_node(
         .unwrap_or_default();
     if children.len() > 1 {
         return Err(format!(
-            "ambiguous duplicate `{}` nodes; left untouched",
+            "more than one `{}` entry exists; Muxe cannot determine which one to edit and left them untouched",
             record.node.as_str()
         ));
     }
@@ -2061,7 +2089,7 @@ fn plan_uninstall_node(
         Disposition::Updated => {
             let previous = record.previous_text.clone().ok_or_else(|| {
                 format!(
-                    "`{}` lacks previous text; left untouched",
+                    "the installation record lacks the original text needed to restore `{}`; the entry was left untouched",
                     record.node.as_str()
                 )
             })?;
@@ -2287,7 +2315,7 @@ mod tests {
     }
 
     #[test]
-    fn install_refuses_foreign_bytes_with_both_digests() {
+    fn install_refuses_foreign_bytes_and_preserves_file() {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(
             temp.path(),
@@ -2301,9 +2329,18 @@ mod tests {
         fs::write(stable_bridge_path(temp.path()), b"intruder").unwrap();
         let wasm2 = b"wasm-v2";
         let error = install(install_inputs(temp.path(), wasm2)).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains(&fsutil::sha256_hex(b"intruder")));
-        assert!(message.contains(&digest));
+        assert!(matches!(
+            error,
+            IntegrationError::Bridge(bridge::BridgeError::ForeignBytes {
+                found,
+                expected,
+                ..
+            }) if found == fsutil::sha256_hex(b"intruder") && expected == digest
+        ));
+        assert_eq!(
+            fs::read(stable_bridge_path(temp.path())).unwrap(),
+            b"intruder"
+        );
     }
 
     #[test]

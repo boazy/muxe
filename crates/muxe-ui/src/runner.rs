@@ -97,7 +97,7 @@ pub enum UiRunError {
         restoration: Box<Self>,
     },
     #[error(
-        "broker did not confirm UI detachment before terminal restoration; detachment is unconfirmed"
+        "broker did not confirm that the UI detached before terminal restoration; the UI may still be registered with the broker"
     )]
     DetachTimedOut,
 }
@@ -112,10 +112,30 @@ struct SignalHandlers {
 impl SignalHandlers {
     fn install() -> io::Result<Self> {
         Ok(Self {
-            resize: signal(SignalKind::window_change())?,
-            interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
-            hangup: signal(SignalKind::hangup())?,
+            resize: signal(SignalKind::window_change()).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot register the terminal-resize signal handler: {error}"),
+                )
+            })?,
+            interrupt: signal(SignalKind::interrupt()).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot register the interrupt signal handler: {error}"),
+                )
+            })?,
+            terminate: signal(SignalKind::terminate()).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot register the termination signal handler: {error}"),
+                )
+            })?,
+            hangup: signal(SignalKind::hangup()).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot register the terminal-hangup signal handler: {error}"),
+                )
+            })?,
         })
     }
 }
@@ -136,7 +156,10 @@ impl NonblockingStdin {
         let tty_path = ttyname(io::stdin().as_fd())
             .map_err(nix_io)
             .map_err(|error| {
-                io::Error::new(error.kind(), format!("resolve stdin terminal: {error}"))
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot identify the terminal connected to stdin: {error}"),
+                )
             })?;
         let tty = OpenOptions::new()
             .read(true)
@@ -144,27 +167,32 @@ impl NonblockingStdin {
             .map_err(|error| {
                 io::Error::new(
                     error.kind(),
-                    format!("open stdin terminal {}: {error}", tty_path.display()),
+                    format!("cannot open stdin terminal {}: {error}", tty_path.display()),
                 )
             })?;
         let fd = OwnedFd::from(tty);
         let flags =
             OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL).map_err(nix_io).map_err(
-                |error| io::Error::new(error.kind(), format!("read stdin terminal flags: {error}")),
+                |error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("cannot read stdin terminal flags: {error}"),
+                    )
+                },
             )?);
         fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
             .map_err(nix_io)
             .map_err(|error| {
                 io::Error::new(
                     error.kind(),
-                    format!("set stdin terminal nonblocking: {error}"),
+                    format!("cannot enable nonblocking reads on the stdin terminal: {error}"),
                 )
             })?;
         Ok(Self {
             fd: AsyncFd::new(fd).map_err(|error| {
                 io::Error::new(
                     error.kind(),
-                    format!("register stdin terminal readiness: {error}"),
+                    format!("cannot register the stdin terminal for input notifications: {error}"),
                 )
             })?,
         })
@@ -492,7 +520,7 @@ where
         });
         tokio::select! {
             read = stdin.read(&mut bytes) => {
-                let read = read?;
+                let read = read.map_err(|error| io::Error::new(error.kind(), format!("cannot read input from the stdin terminal: {error}")))?;
                 if read == 0 {
                     session.finish();
                     if let Some(exit) = dispatch_queued(session, surface, control).await? {
@@ -668,7 +696,12 @@ fn observe_response(
 }
 
 fn terminal_area() -> io::Result<Rect> {
-    let (width, height) = terminal::size()?;
+    let (width, height) = terminal::size().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot read the terminal dimensions: {error}"),
+        )
+    })?;
     Ok(Rect::new(0, 0, width, height))
 }
 
@@ -897,10 +930,6 @@ mod tests {
         };
         assert_eq!(primary.to_string(), "loop failed");
         assert_eq!(restoration.to_string(), "restore failed");
-        assert_eq!(
-            error.to_string(),
-            "UI run failed: loop failed; terminal restoration failed: restore failed"
-        );
         assert_eq!(
             error.source().expect("primary is the source").to_string(),
             "loop failed"

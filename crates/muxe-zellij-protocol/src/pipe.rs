@@ -90,7 +90,7 @@ pub fn decode_event_subscription(payload: &str) -> Result<EventSubscription, Pip
     if !subscription.is_current() {
         return Err(PipeError::Validation {
             reason: format!(
-                "unsupported bridge protocol {}; expected {BRIDGE_PROTOCOL_VERSION}",
+                "unsupported Zellij bridge protocol version {}; required version is {BRIDGE_PROTOCOL_VERSION}",
                 subscription.protocol
             ),
         });
@@ -310,25 +310,27 @@ pub struct BridgeIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum PipeError {
     /// A JSON line exceeded [`MAX_PIPE_LINE_LEN`] bytes.
-    #[error("pipe line exceeds {MAX_PIPE_LINE_LEN} bytes ({actual} bytes)")]
+    #[error(
+        "Zellij pipe message exceeds the {MAX_PIPE_LINE_LEN}-byte limit ({actual} bytes received)"
+    )]
     LineTooLong {
         /// Observed byte length.
         actual: usize,
     },
     /// A line is not a valid typed frame.
-    #[error("invalid pipe frame: {reason}")]
+    #[error("invalid Zellij pipe message: {reason}")]
     InvalidFrame {
         /// Bounded reason; never echoes unbounded line content.
         reason: String,
     },
     /// A frame failed semantic validation.
-    #[error("pipe frame failed validation: {reason}")]
+    #[error("Zellij pipe message failed validation: {reason}")]
     Validation {
         /// Bounded reason.
         reason: String,
     },
     /// Serialization of an outbound frame failed.
-    #[error("could not encode pipe frame: {reason}")]
+    #[error("could not encode Zellij pipe message: {reason}")]
     Encode {
         /// Bounded reason.
         reason: String,
@@ -370,7 +372,7 @@ impl ValidatePipeRequest for PipeRequest {
         if self.protocol != BRIDGE_PROTOCOL_VERSION {
             return Err(PipeError::Validation {
                 reason: format!(
-                    "unsupported bridge protocol {}; expected {BRIDGE_PROTOCOL_VERSION}",
+                    "unsupported Zellij bridge protocol version {}; required version is {BRIDGE_PROTOCOL_VERSION}",
                     self.protocol
                 ),
             });
@@ -417,7 +419,7 @@ impl ValidatePipeEvent for PipeEvent {
         if self.protocol != BRIDGE_PROTOCOL_VERSION {
             return Err(PipeError::Validation {
                 reason: format!(
-                    "unsupported bridge protocol {}; expected {BRIDGE_PROTOCOL_VERSION}",
+                    "unsupported Zellij bridge protocol version {}; required version is {BRIDGE_PROTOCOL_VERSION}",
                     self.protocol
                 ),
             });
@@ -426,7 +428,7 @@ impl ValidatePipeEvent for PipeEvent {
             PipeEventKind::Response(response) => {
                 if self.request_id.is_none() {
                     return Err(PipeError::Validation {
-                        reason: "solicited response requires a request ID".to_owned(),
+                        reason: "response to a Zellij request is missing its request ID".to_owned(),
                     });
                 }
                 response.validate()
@@ -434,7 +436,8 @@ impl ValidatePipeEvent for PipeEvent {
             PipeEventKind::Event(event) => {
                 if self.request_id.is_some() {
                     return Err(PipeError::Validation {
-                        reason: "unsolicited event must not carry a request ID".to_owned(),
+                        reason: "Zellij event sent without a request must not include a request ID"
+                            .to_owned(),
                     });
                 }
                 event.validate()
@@ -492,7 +495,7 @@ impl ValidateBridgeEvent for BridgeEvent {
             Self::Heartbeat => Ok(()),
             Self::Health { .. } => Err(PipeError::Validation {
                 reason:
-                    "Zellij permits only Register, Heartbeat, and CaptureLost as unsolicited events"
+                    "Zellij permits only Register, Heartbeat, and CaptureLost events when there is no corresponding request"
                         .to_owned(),
             }),
             Self::Host(_) => Err(PipeError::Validation {
@@ -517,12 +520,13 @@ impl BridgeIdentity {
         require_non_empty("Zellij source revision", &self.source_revision)?;
         if self.action_fingerprint == [0; 32] || self.protocol_fingerprint == [0; 32] {
             return Err(PipeError::Validation {
-                reason: "bridge fingerprints must not be zero".to_owned(),
+                reason: "Zellij bridge command and pipe protocol fingerprints must not be zero"
+                    .to_owned(),
             });
         }
         if self.bridge_build_id.is_some_and(SchemaFingerprint::is_zero) {
             return Err(PipeError::Validation {
-                reason: "bridge build ID must not be zero".to_owned(),
+                reason: "Zellij compiled bridge ID must not be zero".to_owned(),
             });
         }
         Ok(())

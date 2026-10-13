@@ -36,7 +36,9 @@ pub enum PathError {
         "cannot locate the configuration and cache directories; set HOME to your home directory, or set XDG_CONFIG_HOME and XDG_CACHE_HOME to absolute paths"
     )]
     NoValidatedBase,
-    #[error("could not resolve the current directory while normalizing {path}: {source}")]
+    #[error(
+        "could not resolve the current directory while resolving relative path {path}: {source}"
+    )]
     CurrentDirectory {
         path: PathBuf,
         #[source]
@@ -46,25 +48,29 @@ pub enum PathError {
     RelativePath { path: PathBuf },
     #[error("the saved Zellij configuration path {path} must not contain a `.` path component")]
     DotComponent { path: PathBuf },
-    #[error("Zellij configuration path {path} must not contain `..`")]
+    #[error("Zellij configuration path {path} must not contain a `..` path component")]
     ParentTraversal { path: PathBuf },
-    #[error("could not {operation} the bridge installation path {path}: {source}")]
+    #[error("cannot {operation} {path}: {source}")]
     BridgeIo {
         operation: &'static str,
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("refusing non-directory or symlinked bridge integration directory {path}")]
+    #[error(
+        "cannot use bridge installation directory {path}: it must be a directory, not a symbolic link"
+    )]
     UnsafeBridgeDirectory { path: PathBuf },
     #[error(
         "the installed bridge at {path} must be a regular file, not a directory or symbolic link"
     )]
     UnsafeBridgeLeaf { path: PathBuf },
-    #[error("bridge integration directory {path} changed while resolving")]
+    #[error(
+        "cannot use bridge installation directory {path}: it changed while Muxe was resolving its path"
+    )]
     BridgeDirectoryChanged { path: PathBuf },
     #[error(
-        "the bridge installation directory {path} must have permissions 700, accessible only to its owner"
+        "the bridge installation directory {path} must be owned by the current user and have permissions 700, accessible only to that user"
     )]
     BridgeDirectoryNotOwnerOnly { path: PathBuf },
     #[error(
@@ -230,25 +236,25 @@ fn resolve_bridge_parent(parent: &Path, authority: &Path) -> Result<PathBuf, Pat
         match fs::symlink_metadata(&cursor) {
             Ok(_) => {
                 break fs::canonicalize(&cursor).map_err(|source| PathError::BridgeIo {
-                    operation: "canonicalize existing ancestor of",
+                    operation: "resolve existing parent directories for bridge installation at",
                     path: authority.to_path_buf(),
                     source,
                 })?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let name = cursor.file_name().ok_or_else(|| PathError::BridgeIo {
-                    operation: "resolve existing ancestor of",
+                    operation: "resolve existing parent directories for bridge installation at",
                     path: authority.to_path_buf(),
                     source: io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "no existing owned ancestor",
+                        "no existing parent directory could be found",
                     ),
                 })?;
                 missing.push(name.to_os_string());
                 cursor = cursor
                     .parent()
                     .ok_or_else(|| PathError::BridgeIo {
-                        operation: "resolve existing ancestor of",
+                        operation: "resolve existing parent directories for bridge installation at",
                         path: authority.to_path_buf(),
                         source: io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -259,7 +265,7 @@ fn resolve_bridge_parent(parent: &Path, authority: &Path) -> Result<PathBuf, Pat
             }
             Err(source) => {
                 return Err(PathError::BridgeIo {
-                    operation: "inspect ancestor of",
+                    operation: "inspect parent directories for bridge installation at",
                     path: authority.to_path_buf(),
                     source,
                 });
@@ -278,7 +284,7 @@ fn resolve_bridge_parent(parent: &Path, authority: &Path) -> Result<PathBuf, Pat
                     Ok(()) => {
                         fs::set_permissions(&next, fs::Permissions::from_mode(0o700)).map_err(
                             |source| PathError::BridgeIo {
-                                operation: "lock mode of created ancestor",
+                                operation: "set owner-only permissions for newly created parent directory",
                                 path: next.clone(),
                                 source,
                             },
@@ -288,7 +294,7 @@ fn resolve_bridge_parent(parent: &Path, authority: &Path) -> Result<PathBuf, Pat
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
                     Err(source) => {
                         return Err(PathError::BridgeIo {
-                            operation: "create bridge ancestor",
+                            operation: "create bridge parent directory",
                             path: next,
                             source,
                         });
@@ -297,7 +303,7 @@ fn resolve_bridge_parent(parent: &Path, authority: &Path) -> Result<PathBuf, Pat
             }
             Err(source) => {
                 return Err(PathError::BridgeIo {
-                    operation: "inspect bridge ancestor",
+                    operation: "inspect bridge parent directory",
                     path: next,
                     source,
                 });
@@ -310,7 +316,7 @@ fn resolve_bridge_parent(parent: &Path, authority: &Path) -> Result<PathBuf, Pat
 
 fn verify_bridge_ancestor(path: &Path, require_owner_only: bool) -> Result<PathBuf, PathError> {
     let named = fs::symlink_metadata(path).map_err(|source| PathError::BridgeIo {
-        operation: "inspect bridge ancestor",
+        operation: "inspect bridge parent directory",
         path: path.to_path_buf(),
         source,
     })?;
@@ -330,19 +336,19 @@ fn verify_bridge_ancestor(path: &Path, require_owner_only: bool) -> Result<PathB
         .read(true)
         .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     let descriptor = options.open(path).map_err(|source| PathError::BridgeIo {
-        operation: "open bridge ancestor",
+        operation: "open bridge parent directory",
         path: path.to_path_buf(),
         source,
     })?;
     let opened = descriptor
         .metadata()
         .map_err(|source| PathError::BridgeIo {
-            operation: "inspect opened bridge ancestor",
+            operation: "inspect opened bridge parent directory",
             path: path.to_path_buf(),
             source,
         })?;
     let named_after = fs::symlink_metadata(path).map_err(|source| PathError::BridgeIo {
-        operation: "reinspect bridge ancestor",
+        operation: "recheck bridge parent directory",
         path: path.to_path_buf(),
         source,
     })?;
@@ -352,13 +358,13 @@ fn verify_bridge_ancestor(path: &Path, require_owner_only: bool) -> Result<PathB
         });
     }
     let canonical = fs::canonicalize(path).map_err(|source| PathError::BridgeIo {
-        operation: "canonicalize bridge ancestor",
+        operation: "resolve the physical path of bridge parent directory",
         path: path.to_path_buf(),
         source,
     })?;
     let canonical_named =
         fs::symlink_metadata(&canonical).map_err(|source| PathError::BridgeIo {
-            operation: "inspect canonical bridge ancestor",
+            operation: "inspect resolved bridge parent directory",
             path: canonical.clone(),
             source,
         })?;
@@ -407,7 +413,7 @@ impl BridgeIdentity {
         let parent = integration_directory
             .parent()
             .ok_or_else(|| PathError::BridgeIo {
-                operation: "resolve parent of",
+                operation: "resolve the parent directory of bridge installation at",
                 path: integration_directory.to_path_buf(),
                 source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
             })?;
@@ -415,7 +421,7 @@ impl BridgeIdentity {
         let name = integration_directory
             .file_name()
             .ok_or_else(|| PathError::BridgeIo {
-                operation: "resolve final component of",
+                operation: "resolve the directory name for bridge installation at",
                 path: integration_directory.to_path_buf(),
                 source: io::Error::new(io::ErrorKind::InvalidInput, "path has no final component"),
             })?;
@@ -433,7 +439,7 @@ impl BridgeIdentity {
                     Ok(()) => {
                         fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).map_err(
                             |source| PathError::BridgeIo {
-                                operation: "lock mode of",
+                                operation: "set owner-only permissions for bridge installation directory",
                                 path: physical.clone(),
                                 source,
                             },
@@ -442,7 +448,7 @@ impl BridgeIdentity {
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(source) => {
                         return Err(PathError::BridgeIo {
-                            operation: "create",
+                            operation: "create bridge installation directory",
                             path: physical,
                             source,
                         });
@@ -451,7 +457,7 @@ impl BridgeIdentity {
             }
             Err(source) => {
                 return Err(PathError::BridgeIo {
-                    operation: "inspect",
+                    operation: "inspect bridge installation directory",
                     path: physical,
                     source,
                 });
@@ -468,12 +474,12 @@ impl BridgeIdentity {
         let parent = integration_directory
             .parent()
             .ok_or_else(|| PathError::BridgeIo {
-                operation: "resolve parent of",
+                operation: "resolve the parent directory of bridge installation at",
                 path: integration_directory.to_path_buf(),
                 source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
             })?;
         let canonical_parent = fs::canonicalize(parent).map_err(|source| PathError::BridgeIo {
-            operation: "canonicalize parent of",
+            operation: "resolve the physical parent directory of bridge installation at",
             path: integration_directory.to_path_buf(),
             source,
         })?;
@@ -481,7 +487,7 @@ impl BridgeIdentity {
         let name = integration_directory
             .file_name()
             .ok_or_else(|| PathError::BridgeIo {
-                operation: "resolve final component of",
+                operation: "resolve the directory name for bridge installation at",
                 path: integration_directory.to_path_buf(),
                 source: io::Error::new(io::ErrorKind::InvalidInput, "path has no final component"),
             })?;
@@ -494,7 +500,7 @@ impl BridgeIdentity {
         after_open: impl FnOnce(),
     ) -> Result<Self, PathError> {
         let named = fs::symlink_metadata(&physical).map_err(|source| PathError::BridgeIo {
-            operation: "inspect",
+            operation: "inspect bridge installation directory",
             path: physical.clone(),
             source,
         })?;
@@ -512,21 +518,21 @@ impl BridgeIdentity {
         let descriptor = options
             .open(&physical)
             .map_err(|source| PathError::BridgeIo {
-                operation: "open",
+                operation: "open bridge installation directory",
                 path: physical.clone(),
                 source,
             })?;
         let opened = descriptor
             .metadata()
             .map_err(|source| PathError::BridgeIo {
-                operation: "inspect opened",
+                operation: "inspect opened bridge installation directory",
                 path: physical.clone(),
                 source,
             })?;
         after_open();
         let named_after =
             fs::symlink_metadata(&physical).map_err(|source| PathError::BridgeIo {
-                operation: "reinspect",
+                operation: "recheck bridge installation directory",
                 path: physical.clone(),
                 source,
             })?;
@@ -538,13 +544,13 @@ impl BridgeIdentity {
             return Err(PathError::BridgeDirectoryChanged { path: physical });
         }
         let canonical = fs::canonicalize(&physical).map_err(|source| PathError::BridgeIo {
-            operation: "canonicalize",
+            operation: "resolve the physical path of bridge installation directory",
             path: physical.clone(),
             source,
         })?;
         let canonical_named =
             fs::symlink_metadata(&canonical).map_err(|source| PathError::BridgeIo {
-                operation: "inspect canonical",
+                operation: "inspect resolved bridge installation directory",
                 path: canonical.clone(),
                 source,
             })?;
@@ -559,7 +565,7 @@ impl BridgeIdentity {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(PathError::BridgeIo {
-                    operation: "inspect stable leaf in",
+                    operation: "inspect installed bridge file",
                     path: stable,
                     source,
                 });

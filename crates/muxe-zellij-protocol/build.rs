@@ -51,24 +51,35 @@ fn main() {
     frame(&mut hasher, b"inputs-v1");
     for relative in INPUTS {
         let path = workspace_root.join(relative);
-        let metadata = fs::symlink_metadata(&path)
-            .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()));
+        let metadata = fs::symlink_metadata(&path).unwrap_or_else(|error| {
+            panic!(
+                "could not inspect input for the compiled Zellij bridge ID at {}: {error}",
+                path.display()
+            )
+        });
         assert!(
             metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-            "bridge build ID input must be a regular non-symlink file: {}",
+            "input for the compiled Zellij bridge ID must be a regular file, not a symbolic link: {}",
             path.display()
         );
         frame(&mut hasher, relative.as_bytes());
         frame_length(&mut hasher, metadata.len());
-        let mut file = fs::File::open(&path)
-            .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+        let mut file = fs::File::open(&path).unwrap_or_else(|error| {
+            panic!(
+                "could not open input for the compiled Zellij bridge ID at {}: {error}",
+                path.display()
+            )
+        });
         let expected_len = metadata.len();
         let mut read_len = 0_u64;
         let mut buffer = [0_u8; 16 * 1024];
         loop {
-            let count = file
-                .read(&mut buffer)
-                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let count = file.read(&mut buffer).unwrap_or_else(|error| {
+                panic!(
+                    "could not read input for the compiled Zellij bridge ID at {}: {error}",
+                    path.display()
+                )
+            });
             if count == 0 {
                 break;
             }
@@ -77,7 +88,7 @@ fn main() {
                 .expect("input length fits u64");
             assert!(
                 read_len <= expected_len,
-                "bridge build ID input changed while hashing: {}",
+                "input changed while computing the compiled Zellij bridge ID: {}",
                 path.display()
             );
             hasher.update(&buffer[..count]);
@@ -85,7 +96,7 @@ fn main() {
         assert_eq!(
             read_len,
             expected_len,
-            "bridge build ID input changed while hashing: {}",
+            "input changed while computing the compiled Zellij bridge ID: {}",
             path.display()
         );
         println!("cargo:rerun-if-changed={}", path.display());
@@ -101,7 +112,7 @@ fn main() {
              pub const BRIDGE_BUILD_ID_HEX: &str = \"{hex}\";\n"
         ),
     )
-    .expect("write bridge build ID");
+    .expect("could not write the compiled Zellij bridge ID constants");
 }
 
 fn frame(hasher: &mut Sha256, value: &[u8]) {

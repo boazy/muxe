@@ -49,6 +49,16 @@ pub use service::{
 };
 pub use spawn::{ServeHerdrSpawn, ServeZellijSpawn, SpawnArgvError};
 
+const fn peer_role_description(role: muxe_protocol::PeerRole) -> &'static str {
+    match role {
+        muxe_protocol::PeerRole::Ui => "menu UI",
+        muxe_protocol::PeerRole::Launcher => "UI launcher",
+        muxe_protocol::PeerRole::Bridge => "host bridge",
+        muxe_protocol::PeerRole::ActivationCoordinator => "activation coordinator",
+        muxe_protocol::PeerRole::Broker => "broker",
+    }
+}
+
 /// Test-only, supervisor-owned gates parked between cleanup entry removal and
 /// task-slot removal. Each gate pauses one terminal pass in the B2 race window;
 /// its guard disarms and releases only that supervisor's gate on drop.

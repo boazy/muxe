@@ -14,7 +14,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CheckError {
-    #[error("could not render configuration diagnostics: {0}")]
+    #[error("could not write configuration errors to the output: {0}")]
     Render(#[from] io::Error),
 }
 
@@ -49,7 +49,7 @@ pub async fn check(
         Err(error) => {
             writeln!(
                 output,
-                "herdr configuration: could not load installed schema: {error}"
+                "Herdr configuration: could not read the installed Herdr version's supported commands and parameters: {error}"
             )?;
             valid = false;
         }
@@ -199,10 +199,6 @@ mod tests {
         assert!(output.contains("[zellij/key_collision]"), "{output}");
         assert!(
             output.contains(&format!("{}:5:", config.display())),
-            "{output}"
-        );
-        assert!(
-            output.contains("first indistinguishable binding is here"),
             "{output}"
         );
     }

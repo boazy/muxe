@@ -60,7 +60,7 @@ pub enum CaptureError {
     #[error("input capture is already active or being set up for this Zellij client")]
     Busy,
     /// No capture is active for this client.
-    #[error("no active capture for client")]
+    #[error("input capture is not active for this Zellij client")]
     NotCaptured,
     /// The supplied lease no longer owns capture.
     #[error("the supplied lease no longer owns input capture for this Zellij client")]

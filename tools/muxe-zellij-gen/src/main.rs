@@ -194,7 +194,7 @@ fn run() -> Result<()> {
         let existing = read(&arguments.output)?;
         if existing != generated {
             bail!(
-                "{} differs from a freshly materialized pinned fixture corpus at {}",
+                "{} differs from code generated from the configured Zellij source revision at {}",
                 arguments.output.display(),
                 fresh_root.display()
             );
@@ -214,7 +214,7 @@ fn run() -> Result<()> {
         let existing = read(&arguments.output)?;
         if existing != generated {
             bail!(
-                "{} is not reproducible from pin {}; run muxe-zellij-gen",
+                "{} differs from code generated using source manifest {}; run muxe-zellij-gen",
                 arguments.output.display(),
                 arguments.pin.display()
             );
@@ -348,7 +348,10 @@ fn parse_pin(path: &Path) -> Result<Pin> {
     let crate_name = pin_scalar(&source, "crate")?;
     let source_inputs = pin_array(&source, "source_inputs")?;
     if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("{} has invalid revision {revision:?}", path.display());
+        bail!(
+            "{} has invalid revision {revision:?}; expected 40 hexadecimal characters",
+            path.display()
+        );
     }
     if !repository.starts_with("https://") {
         bail!(
@@ -370,25 +373,27 @@ fn pin_scalar(source: &str, key: &str) -> Result<String> {
     let line = source
         .lines()
         .find(|line| line.starts_with(&prefix))
-        .ok_or_else(|| eyre::eyre!("pin manifest has no {key:?}"))?;
+        .ok_or_else(|| eyre::eyre!("Zellij source manifest is missing {key:?}"))?;
     let value = line[prefix.len()..].trim();
     value
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
         .map(str::to_owned)
-        .ok_or_else(|| eyre::eyre!("pin manifest {key:?} must be a quoted string"))
+        .ok_or_else(|| eyre::eyre!("Zellij source manifest {key:?} must be a quoted string"))
 }
 
 fn pin_array(source: &str, key: &str) -> Result<Vec<String>> {
     let prefix = format!("{key} = [");
     let start = source
         .find(&prefix)
-        .ok_or_else(|| eyre::eyre!("pin manifest has no {key:?}"))?
+        .ok_or_else(|| eyre::eyre!("Zellij source manifest is missing {key:?}"))?
         + prefix.len();
     let end = source[start..]
         .find(']')
         .map(|offset| start + offset)
-        .ok_or_else(|| eyre::eyre!("pin manifest {key:?} array is not closed"))?;
+        .ok_or_else(|| {
+            eyre::eyre!("Zellij source manifest {key:?} array is missing its closing ]")
+        })?;
     let values = source[start..end]
         .split(',')
         .map(str::trim)
@@ -398,11 +403,13 @@ fn pin_array(source: &str, key: &str) -> Result<Vec<String>> {
                 .strip_prefix('"')
                 .and_then(|value| value.strip_suffix('"'))
                 .map(str::to_owned)
-                .ok_or_else(|| eyre::eyre!("pin manifest {key:?} contains a non-string value"))
+                .ok_or_else(|| {
+                    eyre::eyre!("Zellij source manifest {key:?} contains a non-string value")
+                })
         })
         .collect::<Result<Vec<_>>>()?;
     if values.is_empty() {
-        bail!("pin manifest {key:?} must not be empty");
+        bail!("Zellij source manifest {key:?} must not be empty");
     }
     Ok(values)
 }
@@ -411,7 +418,7 @@ fn require_input(pin: &Pin, required: &str) -> Result<()> {
     if pin.source_inputs.iter().any(|input| input == required) {
         Ok(())
     } else {
-        bail!("pinned source_inputs must explicitly include {required}")
+        bail!("Zellij source manifest source_inputs must explicitly include {required}")
     }
 }
 
@@ -420,10 +427,10 @@ fn resolved_cargo_source_root(pin: &Pin) -> Result<PathBuf> {
     let output = Command::new(cargo)
         .args(["metadata", "--locked", "--format-version", "1"])
         .output()
-        .wrap_err("could not run cargo metadata for the pinned Zellij SDK")?;
+        .wrap_err("could not run cargo metadata to locate the configured Zellij SDK dependency")?;
     if !output.status.success() {
         bail!(
-            "cargo metadata could not resolve the pinned Zellij SDK: {}",
+            "cargo metadata could not resolve the configured Zellij SDK dependency: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -436,7 +443,7 @@ fn resolved_cargo_source_root(pin: &Pin) -> Result<PathBuf> {
         .collect::<Vec<_>>();
     if packages.len() != 1 {
         bail!(
-            "cargo metadata must resolve exactly one pinned SDK package {:?}, found {}",
+            "cargo metadata must resolve exactly one Zellij SDK package {:?}, found {}",
             pin.crate_name,
             packages.len()
         );
@@ -511,8 +518,9 @@ fn materialize_fixture_corpus(source_root: &Path, fixture_root: &Path, pin: &Pin
 }
 
 fn minimized_model_source(source: &str, relative: &str) -> Result<String> {
-    let file = syn::parse_file(source)
-        .wrap_err_with(|| format!("could not parse pinned fixture source {relative}"))?;
+    let file = syn::parse_file(source).wrap_err_with(|| {
+        format!("could not parse Zellij source {relative} for fixture generation")
+    })?;
     let mut reduced = String::new();
     let mut retained = 0usize;
     for item in file.items {
@@ -539,8 +547,9 @@ fn minimized_model_source(source: &str, relative: &str) -> Result<String> {
 }
 
 fn minimized_shim_source(source: &str, relative: &str) -> Result<String> {
-    let file = syn::parse_file(source)
-        .wrap_err_with(|| format!("could not parse pinned fixture source {relative}"))?;
+    let file = syn::parse_file(source).wrap_err_with(|| {
+        format!("could not parse Zellij source {relative} for fixture generation")
+    })?;
     let mut reduced = String::new();
     let mut retained = 0usize;
     for item in file.items {
@@ -615,7 +624,7 @@ fn fixture_source_hashes(fixture_root: &Path, pin: &Pin) -> Result<BTreeMap<Stri
     let actual = hashes.keys().cloned().collect::<BTreeSet<_>>();
     if expected != actual {
         bail!(
-            "{} source set drifts from pins/zellij.toml: missing [{}]; stale [{}]",
+            "{} lists different source files than pins/zellij.toml: missing [{}]; unexpected [{}]",
             path.display(),
             expected
                 .difference(&actual)
@@ -651,7 +660,7 @@ fn compare_fixture_corpus(expected_root: &Path, fresh_root: &Path, pin: &Pin) ->
         })?;
         if expected != fresh {
             bail!(
-                "checked-in minimized fixture {} differs from fresh materialization at {}",
+                "checked-in minimized fixture {} differs from the fixture regenerated from Zellij source at {}",
                 expected_root.join(&relative).display(),
                 fresh_root.join(&relative).display()
             );
@@ -664,7 +673,7 @@ fn compare_fixture_corpus(expected_root: &Path, fresh_root: &Path, pin: &Pin) ->
 fn fresh_fixture_root() -> Result<PathBuf> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .wrap_err("system clock predates Unix epoch")?
+        .wrap_err("cannot create a unique fixture directory: the system clock is earlier than 1970-01-01 UTC")?
         .as_nanos();
     let root = env::temp_dir().join(format!(
         "muxe-zellij-fixture-{}-{nonce}",
@@ -727,21 +736,21 @@ fn direct_action_types(source: &str) -> Result<BTreeSet<String>> {
 }
 
 fn action_enum(source: &str) -> Result<ItemEnum> {
-    let file = syn::parse_file(source).wrap_err("could not parse pinned actions.rs with syn")?;
+    let file = syn::parse_file(source).wrap_err("could not parse Zellij actions.rs with syn")?;
     file.items
         .into_iter()
         .find_map(|item| match item {
             Item::Enum(item) if item.ident == "Action" => Some(item),
             _ => None,
         })
-        .ok_or_else(|| eyre::eyre!("pinned actions.rs has no Action enum"))
+        .ok_or_else(|| eyre::eyre!("Zellij actions.rs has no Action enum"))
 }
 fn mirror_schema(source_root: &Path, roots: &BTreeSet<String>) -> Result<MirrorSchema> {
     let mut definitions = BTreeMap::new();
     for source in MIRROR_SOURCES {
         let source_path = source_root.join(source);
         let file = syn::parse_file(&read(&source_path)?)
-            .wrap_err_with(|| format!("could not parse pinned {}", source_path.display()))?;
+            .wrap_err_with(|| format!("could not parse Zellij source {}", source_path.display()))?;
         for item in file.items {
             let (name, item) = match item {
                 Item::Struct(item) => (item.ident.to_string(), ParsedType::Struct(item)),
@@ -773,7 +782,7 @@ fn mirror_schema(source_root: &Path, roots: &BTreeSet<String>) -> Result<MirrorS
         }
         let definition = definitions.get(&name).ok_or_else(|| {
             eyre::eyre!(
-                "Action mirror type {name:?} has no declaration in the explicitly pinned mirror sources"
+                "Zellij Action field type {name:?} has no declaration in the configured source files"
             )
         })?;
         for dependency in type_definition_dependencies(definition) {
@@ -904,7 +913,7 @@ fn intrinsic_type(name: &str) -> bool {
 }
 
 fn public_function_specs(source: &str) -> Result<BTreeMap<String, ShimFunction>> {
-    let file = syn::parse_file(source).wrap_err("could not parse pinned shim.rs with syn")?;
+    let file = syn::parse_file(source).wrap_err("could not parse Zellij shim.rs with syn")?;
     let mut functions = BTreeMap::new();
     for item in file.items {
         let Item::Fn(ItemFn {
@@ -952,11 +961,11 @@ fn public_function_specs(source: &str) -> Result<BTreeMap<String, ShimFunction>>
             )
             .is_some()
         {
-            bail!("pinned shim.rs has duplicate public function {name:?}");
+            bail!("Zellij shim.rs has duplicate public function {name:?}");
         }
     }
     if functions.is_empty() {
-        bail!("pinned shim.rs has no public functions");
+        bail!("Zellij shim.rs has no public functions");
     }
     Ok(functions)
 }
@@ -1082,7 +1091,7 @@ fn validate_exact_policy<T>(
     let stale = policy_names.difference(discovered).collect::<Vec<_>>();
     if !missing.is_empty() || !stale.is_empty() {
         bail!(
-            "{subject} policy drift: missing [{}]; stale [{}]",
+            "{subject} policy does not match the Zellij source declarations: missing [{}]; unexpected [{}]",
             missing
                 .iter()
                 .map(|name| name.as_str())
@@ -1139,7 +1148,9 @@ fn source_hashes(source_root: &Path, inputs: &[String]) -> Result<BTreeMap<Strin
     let mut hashes = BTreeMap::new();
     for input in inputs {
         if Path::new(input).is_absolute() || input.split('/').any(|component| component == "..") {
-            bail!("pin source input must be a relative in-tree path: {input:?}");
+            bail!(
+                "Zellij source input must be a relative path within the source directory: {input:?}"
+            );
         }
         hashes.insert(
             input.clone(),
@@ -1237,8 +1248,8 @@ fn render_action_tables(
     }
     output.push_str("];\n\n");
     output.push_str("pub const VALIDATION_RULES: &[(&str, &str)] = &[\n");
-    output.push_str("    (\"PercentOrFixed::Percent\", \"must not exceed 100, matching the pinned source parser\"),\n");
-    output.push_str("    (\"PluginUserConfiguration\", \"must not contain keys the pinned source constructor would silently discard\"),\n");
+    output.push_str("    (\"PercentOrFixed::Percent\", \"percentage must not exceed 100, as required by the Zellij parser\"),\n");
+    output.push_str("    (\"PluginUserConfiguration\", \"must not contain reserved keys that Zellij would discard when creating the plugin configuration\"),\n");
     output.push_str("];\n\n");
     Ok(())
 }
@@ -1300,17 +1311,15 @@ fn generate(
 
 fn function_policy_reason(class: FunctionClass) -> &'static str {
     match class {
-        FunctionClass::Exposed => {
-            "v1 native Zellij user command; state-changing and not a query, bridge primitive, or background integration"
-        }
+        FunctionClass::Exposed => "supported native Zellij command that changes host state",
         FunctionClass::Internal => {
-            "bridge lifecycle, client targeting, permission, capture, or subscription primitive; never user-dispatched"
+            "used internally by the bridge for lifecycle, client routing, permissions, capture, or subscriptions; not available as a user command"
         }
         FunctionClass::Query => {
-            "source query or input/output helper; v1 native command surface excludes queries"
+            "Zellij query or input/output helper; not available as a native Muxe command"
         }
         FunctionClass::Unsupported => {
-            "background integration or subsystem administration; excluded from the v1 native command surface"
+            "Zellij background integration or subsystem administration; not available as a native Muxe command"
         }
     }
 }
@@ -1696,7 +1705,7 @@ fn command_validated_to_source_expression(
         Type::ImplTrait(impl_trait) => {
             let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
                 eyre::eyre!(
-                    "unrecognized impl Trait command parameter {}",
+                    "cannot generate a Zellij command argument converter for impl Trait type {}",
                     type_text(ty)
                 )
             })?;
@@ -1797,7 +1806,10 @@ fn source_command_type_text(
         )),
         Type::ImplTrait(impl_trait) => {
             let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
-                eyre::eyre!("unrecognized impl Trait command return {}", type_text(ty))
+                eyre::eyre!(
+                    "cannot generate a Zellij command return converter for impl Trait type {}",
+                    type_text(ty)
+                )
             })?;
             source_command_type_text(&normalized, generic_types, mirror_schema)
         }
@@ -1829,7 +1841,10 @@ fn source_command_type_text(
                 "Path" | "PathBuf" => Ok("std::path::PathBuf".to_owned()),
                 "String" | "bool" | "char" | "usize" | "u8" | "u16" | "u32" | "u64" | "i32"
                 | "i64" | "f64" => Ok(name),
-                _ => bail!("no typed source return converter for {}", type_text(ty)),
+                _ => bail!(
+                    "cannot generate a Zellij command return converter for type {}",
+                    type_text(ty)
+                ),
             }
         }
         Type::Tuple(tuple) => {
@@ -1849,7 +1864,10 @@ fn source_command_type_text(
         }
         Type::Group(group) => source_command_type_text(&group.elem, generic_types, mirror_schema),
         Type::Paren(paren) => source_command_type_text(&paren.elem, generic_types, mirror_schema),
-        _ => bail!("no typed source return converter for {}", type_text(ty)),
+        _ => bail!(
+            "cannot generate a Zellij command return converter for type {}",
+            type_text(ty)
+        ),
     }
 }
 
@@ -1873,7 +1891,9 @@ fn source_path_return_expression(
     if selected_definition(name, mirror_schema).is_some() {
         return match name {
             "PaneId" => Ok(format!("from_zellij_pane_id({value})")),
-            _ => bail!("no source-to-validated command return converter for {name}"),
+            _ => bail!(
+                "cannot convert Zellij command return type {name} into its validated Muxe representation"
+            ),
         };
     }
     let arguments = type_arguments(segment)?;
@@ -1967,7 +1987,10 @@ fn source_return_to_validated_expression(
         }
         Type::ImplTrait(impl_trait) => {
             let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
-                eyre::eyre!("unrecognized impl Trait command return {}", type_text(ty))
+                eyre::eyre!(
+                    "cannot generate a Zellij command return converter for impl Trait type {}",
+                    type_text(ty)
+                )
             })?;
             source_return_to_validated_expression(&normalized, value, generic_types, mirror_schema)
         }
@@ -2118,7 +2141,7 @@ fn command_path_model_text(
         "String" | "bool" | "usize" | "u8" | "u16" | "u32" | "u64" | "i32" | "i64" | "f64" => {
             Ok(name.to_owned())
         }
-        _ => bail!("no typed command converter for {name}"),
+        _ => bail!("cannot generate a Zellij command argument converter for type {name}"),
     }
 }
 
@@ -2139,7 +2162,7 @@ fn command_model_type_text(
         Type::ImplTrait(impl_trait) => {
             let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
                 eyre::eyre!(
-                    "unrecognized impl Trait command parameter {}",
+                    "cannot generate a Zellij command argument converter for impl Trait type {}",
                     type_text(ty)
                 )
             })?;
@@ -2173,7 +2196,10 @@ fn command_model_type_text(
         Type::Paren(paren) => {
             command_model_type_text(&paren.elem, generic_types, flavor, mirror_schema)
         }
-        _ => bail!("no typed command converter for {}", type_text(ty)),
+        _ => bail!(
+            "cannot generate a Zellij command argument converter for type {}",
+            type_text(ty)
+        ),
     }
 }
 
@@ -2204,7 +2230,7 @@ fn command_raw_to_validated_expression(
         Type::ImplTrait(impl_trait) => {
             let normalized = normalized_trait_bounds(&impl_trait.bounds).ok_or_else(|| {
                 eyre::eyre!(
-                    "unrecognized impl Trait command parameter {}",
+                    "cannot generate a Zellij command argument converter for impl Trait type {}",
                     type_text(ty)
                 )
             })?;
@@ -2485,7 +2511,7 @@ fn render_validation_error(output: &mut String) {
     output.push_str("#[derive(Clone, Debug, Eq, PartialEq)]\n");
     output.push_str("pub struct ValidationError { pub type_name: &'static str, pub field: &'static str, pub message: String }\n");
     output.push_str("impl ValidationError { fn new(type_name: &'static str, field: &'static str, message: impl Into<String>) -> Self { Self { type_name, field, message: message.into() } } }\n");
-    output.push_str("impl std::fmt::Display for ValidationError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, \"{}::{}: {}\", self.type_name, self.field, self.message) } }\n");
+    output.push_str("impl std::fmt::Display for ValidationError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, \"invalid Zellij {} field '{}': {}\", self.type_name, self.field, self.message) } }\n");
     output.push_str("impl std::error::Error for ValidationError {}\n\n");
 }
 
@@ -2532,10 +2558,10 @@ fn render_plugin_user_configuration_validation(output: &mut String) {
     output.push_str("        let mut converted = std::collections::BTreeMap::new();\n");
     output.push_str("        for raw::MapEntry { key, value } in configuration {\n");
     output.push_str("            if RESERVED.contains(&key.as_str()) {\n");
-    output.push_str("                return Err(ValidationError::new(\"PluginUserConfiguration\", \"configuration\", format!(\"reserved key {key:?} would be discarded by the pinned Zellij constructor\")));\n");
+    output.push_str("                return Err(ValidationError::new(\"PluginUserConfiguration\", \"configuration\", format!(\"reserved key {key:?} would be discarded when Zellij creates the plugin configuration\")));\n");
     output.push_str("            }\n");
     output.push_str("            if converted.insert(key, value).is_some() {\n");
-    output.push_str("                return Err(ValidationError::new(\"PluginUserConfiguration\", \"configuration\", \"duplicate semantic key\"));\n");
+    output.push_str("                return Err(ValidationError::new(\"PluginUserConfiguration\", \"configuration\", \"multiple entries resolve to the same configuration key\"));\n");
     output.push_str("            }\n");
     output.push_str("        }\n");
     output.push_str("        Ok(Self(converted))\n");
@@ -2549,7 +2575,7 @@ fn render_percent_or_fixed_validation(output: &mut String) {
     output.push_str("    fn try_from(value: raw::PercentOrFixed) -> Result<Self, Self::Error> {\n");
     output.push_str("        match value {\n");
     output.push_str("            raw::PercentOrFixed::Percent(percent) if percent <= 100 => Ok(Self::Percent(percent)),\n");
-    output.push_str("            raw::PercentOrFixed::Percent(percent) => Err(ValidationError::new(\"PercentOrFixed\", \"percent\", format!(\"{percent} exceeds 100\"))),\n");
+    output.push_str("            raw::PercentOrFixed::Percent(percent) => Err(ValidationError::new(\"PercentOrFixed\", \"percent\", format!(\"percentage {percent} exceeds 100\"))),\n");
     output.push_str("            raw::PercentOrFixed::Fixed(fixed) => Ok(Self::Fixed(fixed)),\n");
     output.push_str("        }\n");
     output.push_str("    }\n");
@@ -2730,7 +2756,7 @@ fn raw_to_validated_expression(
                     let map_value =
                         raw_to_validated_expression(arguments[1], "map_value", mirror_schema)?;
                     Ok(format!(
-                        "{{ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry {{ key, value: map_value }} in {value} {{ let key = {key}; let map_value = {map_value}; if converted.insert(key, map_value).is_some() {{ return Err(ValidationError::new(\"BTreeMap\", \"key\", \"duplicate semantic key\")); }} }} converted }}"
+                        "{{ let mut converted = std::collections::BTreeMap::new(); for raw::MapEntry {{ key, value: map_value }} in {value} {{ let key = {key}; let map_value = {map_value}; if converted.insert(key, map_value).is_some() {{ return Err(ValidationError::new(\"BTreeMap\", \"key\", \"multiple entries resolve to the same map key\")); }} }} converted }}"
                     ))
                 }
                 "HashMap" => {
@@ -2738,7 +2764,7 @@ fn raw_to_validated_expression(
                     let map_value =
                         raw_to_validated_expression(arguments[1], "map_value", mirror_schema)?;
                     Ok(format!(
-                        "{{ let mut converted = std::collections::HashMap::new(); for raw::MapEntry {{ key, value: map_value }} in {value} {{ let key = {key}; let map_value = {map_value}; if converted.insert(key, map_value).is_some() {{ return Err(ValidationError::new(\"HashMap\", \"key\", \"duplicate semantic key\")); }} }} converted }}"
+                        "{{ let mut converted = std::collections::HashMap::new(); for raw::MapEntry {{ key, value: map_value }} in {value} {{ let key = {key}; let map_value = {map_value}; if converted.insert(key, map_value).is_some() {{ return Err(ValidationError::new(\"HashMap\", \"key\", \"multiple entries resolve to the same map key\")); }} }} converted }}"
                     ))
                 }
                 "Box" => {
@@ -3099,7 +3125,7 @@ fn type_arguments(segment: &syn::PathSegment) -> Result<Vec<&Type>> {
             })
             .collect()),
         syn::PathArguments::Parenthesized(_) => bail!(
-            "unsupported path arguments in {}",
+            "cannot generate a Zellij type converter with parenthesized type arguments: {}",
             segment.to_token_stream()
         ),
     }
@@ -3114,7 +3140,7 @@ fn source_type_path(definition: &TypeDefinition, type_name: &str) -> Result<Stri
         "zellij-utils/src/input/mouse.rs" => "zellij_utils::input::mouse",
         "zellij-utils/src/input/options.rs" => "zellij_utils::input::options",
         "zellij-utils/src/position.rs" => "zellij_utils::position",
-        source => bail!("no Rust module mapping for mirror source {source:?}"),
+        source => bail!("cannot locate the Rust module for Zellij type source {source:?}"),
     };
     Ok(format!("{module}::{type_name}"))
 }

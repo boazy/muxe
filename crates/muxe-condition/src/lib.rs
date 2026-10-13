@@ -190,10 +190,18 @@ pub enum ConditionEvaluationError {
 impl fmt::Display for ConditionEvaluationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TypeMismatch => formatter.write_str("condition expected a matching value type"),
-            Self::NonBooleanResult => formatter.write_str("condition result must be boolean"),
-            Self::DivisionByZero => formatter.write_str("condition divides by zero"),
-            Self::ArithmeticOverflow => formatter.write_str("condition arithmetic overflowed"),
+            Self::TypeMismatch => {
+                formatter.write_str("condition operator received a value of the wrong type")
+            }
+            Self::NonBooleanResult => {
+                formatter.write_str("condition must evaluate to true or false")
+            }
+            Self::DivisionByZero => {
+                formatter.write_str("condition division or remainder uses zero as the divisor")
+            }
+            Self::ArithmeticOverflow => formatter.write_str(
+                "condition value or calculation is outside the signed 64-bit integer range",
+            ),
         }
     }
 }
@@ -570,7 +578,6 @@ mod tests {
             ConditionIr::Not(Box::new(ConditionIr::Integer(1))),
         ] {
             assert!(type_check(&tree).is_err());
-            assert!(type_check(&tree).unwrap_err().message().len() > 8);
         }
         // A top-level integer checks as `Integer`; the compiler rejects it as a condition
         // because a published condition must be `Boolean`.

@@ -45,9 +45,9 @@ pub enum KdlError {
         path: std::path::PathBuf,
         node: &'static str,
     },
-    #[error("refusing non-regular Zellij configuration at {}", path.display())]
+    #[error("cannot edit Zellij configuration at {}: it must be a regular file, not a directory or symbolic link", path.display())]
     UnsafePath { path: PathBuf },
-    #[error("Zellij configuration at {} changed concurrently; retry", path.display())]
+    #[error("cannot edit Zellij configuration at {} because it changed during the operation", path.display())]
     ConcurrentChange { path: PathBuf },
     #[error("the proposed Zellij configuration changes are invalid: {detail}")]
     CandidateRejected { detail: String },
@@ -135,8 +135,8 @@ fn semantic(node: &KdlNode) -> String {
 /// synthetic parent is used, so sibling or brace-injected nodes cannot hide
 /// outside the validated span.
 pub(crate) fn validate_previous_node(node: ManagedNode, text: &str) -> Result<String, String> {
-    let document =
-        parse_original(Path::new("<receipt>"), text).map_err(|error| error.to_string())?;
+    let document = KdlDocument::parse_v1(text)
+        .map_err(|error| format!("cannot parse the saved original configuration entry: {error}"))?;
     if document.nodes().len() != 1 {
         return Err(format!(
             "the saved original {} configuration must contain exactly one top-level block",
@@ -209,7 +209,7 @@ pub fn plan(path: &Path, original: &str, bridge_url: &str) -> Result<ConfigPlan,
                 .get(&node.node)
                 .ok_or_else(|| KdlError::CandidateRejected {
                     detail: format!(
-                        "managed node `{}` missing after planning",
+                        "the proposed configuration is missing the `{}` entry",
                         node.node.as_str()
                     ),
                 })?;
@@ -244,7 +244,7 @@ fn snapshot_nodes(
             .iter()
             .filter(|node| node.name().value() == parent_name);
         let block = blocks.next().ok_or_else(|| KdlError::CandidateRejected {
-            detail: format!("`{parent_name}` block missing after planning"),
+            detail: format!("the proposed configuration is missing the `{parent_name}` block"),
         })?;
         if blocks.next().is_some() {
             return Err(KdlError::Ambiguous {
@@ -267,7 +267,10 @@ fn snapshot_nodes(
         }
         let Some(current) = children.pop() else {
             return Err(KdlError::CandidateRejected {
-                detail: format!("managed node `{}` missing after planning", managed.as_str()),
+                detail: format!(
+                    "the proposed configuration is missing the `{}` entry",
+                    managed.as_str()
+                ),
             });
         };
         let span = current.span();
@@ -801,7 +804,7 @@ fn minimal_plan(_path: &Path, bridge_url: &str) -> Result<ConfigPlan, KdlError> 
                     .find(|child| child.name().value() == MUXE_NODE)
             })
             .ok_or_else(|| KdlError::CandidateRejected {
-                detail: "minimal document lacks a managed node".to_owned(),
+                detail: "the proposed minimal configuration is missing a Muxe entry".to_owned(),
             })?;
         // Snapshot the exact span bytes: the written file carries this same
         // minimal document, so receipt digests match what verification reads.
@@ -1140,11 +1143,16 @@ fn verify_one_record(
         .nodes()
         .iter()
         .filter(|node| node.name().value() == parent_name);
-    let block = blocks
-        .next()
-        .ok_or_else(|| format!("`{}` is gone from {}", record.node.as_str(), parent_name))?;
+    let block = blocks.next().ok_or_else(|| {
+        format!(
+            "the `{parent_name}` block containing `{}` is missing",
+            record.node.as_str()
+        )
+    })?;
     if blocks.next().is_some() {
-        return Err(format!("ambiguous duplicate `{parent_name}` blocks"));
+        return Err(format!(
+            "more than one `{parent_name}` block exists; Muxe cannot determine which one to check"
+        ));
     }
     let mut children = block.children().map_or_else(Vec::new, |children| {
         children
@@ -1155,13 +1163,13 @@ fn verify_one_record(
     });
     if children.len() > 1 {
         return Err(format!(
-            "ambiguous duplicate `{}` nodes",
+            "more than one `{}` entry exists; Muxe cannot determine which one to check",
             record.node.as_str()
         ));
     }
     let Some(current) = children.pop() else {
         return Err(format!(
-            "`{}` is gone; ownership cannot be confirmed",
+            "`{}` is missing, so Muxe cannot confirm it matches the installation record",
             record.node.as_str()
         ));
     };
@@ -1179,7 +1187,7 @@ fn verify_one_record(
     probe.autoformat();
     if probe.to_string() != record.semantic {
         return Err(format!(
-            "`{}` semantics changed since installation",
+            "the settings in `{}` changed since installation",
             record.node.as_str()
         ));
     }

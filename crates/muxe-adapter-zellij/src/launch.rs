@@ -269,11 +269,11 @@ pub enum LaunchError {
     #[error("launch program must not be empty")]
     EmptyProgram,
     /// No argv at all (missing `-- <command>`).
-    #[error("launch argv must name a program after --")]
+    #[error("launch requires a program after --")]
     EmptyArgv,
     /// Non-UTF-8 argv entry: the Zellij pipe protocol carries string
     /// arguments, so the exact offending index is reported predispatch.
-    #[error("launch argv entry {index} is not valid UTF-8")]
+    #[error("launch argument at index {index} is not valid UTF-8 (index 0 is the program)")]
     NonUtf8Arg {
         /// Position in the original argv (0 is the program).
         index: usize,
@@ -282,7 +282,9 @@ pub enum LaunchError {
     #[error("menu panes must take focus; menu open does not support --no-focus")]
     MenuRequiresFocus,
     /// Menu without a captured origin working directory.
-    #[error("menu launches require the captured absolute origin working directory")]
+    #[error(
+        "cannot launch the menu without an absolute working directory captured from the origin pane"
+    )]
     MissingCwd,
     /// Relative working directory.
     #[error("launch working directory must be absolute")]

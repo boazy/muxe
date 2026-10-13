@@ -37,15 +37,14 @@ pub(crate) fn validate_native_candidate(
             return Err(extension_error(
                 Some(&field.name),
                 ValidationCode::AdditionalProperty,
-                "configured command invocation accepts only the literal binding selector"
-                    .to_owned(),
+                "configured command invocation accepts only a literal binding field".to_owned(),
             ));
         }
         if binding.is_some() {
             return Err(extension_error(
                 Some("binding"),
                 ValidationCode::AdditionalProperty,
-                "configured command invocation requires exactly one binding selector".to_owned(),
+                "configured command invocation requires exactly one binding field".to_owned(),
             ));
         }
         let ConfigValueKind::String(value) = &field.value.kind else {
@@ -64,14 +63,14 @@ pub(crate) fn validate_native_candidate(
         extension_error(
             Some("binding"),
             ValidationCode::Required,
-            "configured command invocation requires a binding selector".to_owned(),
+            "configured command invocation requires a binding field".to_owned(),
         )
     })?;
     if schema.method("command.invoke").is_none() {
         return Err(extension_error(
             None,
             ValidationCode::MissingMethod,
-            "installed Herdr schema does not advertise command.invoke".to_owned(),
+            "the installed Herdr schema does not define command.invoke, which is required to invoke a configured command".to_owned(),
         ));
     }
     Ok(ValidatedNativeAction::ConfiguredCommand(binding))

@@ -23,7 +23,9 @@ fn wasm_digest(profile: &str) -> String {
             if profile == "release"
                 || std::env::var("MUXE_REQUIRE_PACKAGED_WASM_SHA256").as_deref() == Ok("1") =>
         {
-            panic!("release native builds require MUXE_WASM_SHA256 from the verified staged bridge")
+            panic!(
+                "building the release executable requires MUXE_WASM_SHA256 to contain the SHA-256 checksum of the Zellij bridge being packaged"
+            )
         }
         Err(std::env::VarError::NotPresent) => UNAVAILABLE.to_owned(),
         Err(error) => panic!("cannot read MUXE_WASM_SHA256: {error}"),

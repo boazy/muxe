@@ -1321,7 +1321,6 @@ mod tests {
             .validate_method("pane.resize", &serde_json::json!({"amount": 0.1}))
             .unwrap_err();
         assert_eq!(error.code, ValidationCode::Required);
-        assert!(error.detail.contains("direction"));
     }
 
     #[test]

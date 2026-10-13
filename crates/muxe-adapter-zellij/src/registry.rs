@@ -46,26 +46,30 @@ pub struct BridgeRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum RegistryError {
     /// Event arrived for an unknown or displaced registration.
-    #[error("no matching active Zellij bridge registration for client '{client_id}'")]
+    #[error(
+        "no active Zellij bridge for client '{client_id}' matches the supplied registration ID"
+    )]
     Stale {
         /// Client that sent the event.
         client_id: ClientId,
     },
     /// The registration exhausted its sequential request ID space.
-    #[error("request ID space exhausted for client '{client_id}'")]
+    #[error(
+        "cannot allocate another Zellij request ID for client '{client_id}': its counter is exhausted"
+    )]
     RequestIdExhausted {
         /// Client whose active registration exhausted its request IDs.
         client_id: ClientId,
     },
     /// The active registration failed its compatibility handshake.
-    #[error("Zellij bridge registration for client '{client_id}' failed the compatibility check")]
+    #[error("Zellij bridge for client '{client_id}' is incompatible with this Muxe adapter")]
     Incompatible {
         /// Client whose registration cannot accept requests.
         client_id: ClientId,
     },
     /// A bridge reused an identity retired by an earlier registration epoch.
     #[error(
-        "Zellij bridge for client '{client_id}' reused a registration ID that is no longer active"
+        "Zellij bridge for client '{client_id}' reused a registration ID from an earlier connection"
     )]
     RetiredRegistration {
         /// Client attempting to reuse the retired registration.

@@ -165,7 +165,9 @@ pub struct Receipt {
 impl Receipt {
     fn from_persisted(raw: RawReceipt, directory: &Path) -> Result<Self, String> {
         let expected = BridgeIdentity::resolve(directory, std::ffi::OsStr::new(BRIDGE_FILE_NAME))
-            .map_err(|error| format!("cannot validate bridge identity: {error}"))?;
+            .map_err(|error| {
+            format!("cannot validate the bridge installation directory: {error}")
+        })?;
         let bridge_identity = match raw.schema_version {
             1 => {
                 let legacy = raw
@@ -205,7 +207,7 @@ impl Receipt {
             RECEIPT_SCHEMA_VERSION => raw
                 .bridge
                 .bridge_identity
-                .ok_or_else(|| "the installation record is missing its bridge directory identity (bridge.bridge_identity)".to_owned())?,
+                .ok_or_else(|| "the installation record is missing information identifying its bridge directory (bridge.bridge_identity)".to_owned())?,
             version => return Err(format!("unsupported installation record format version {version}")),
         };
         let receipt = Self {
@@ -352,7 +354,7 @@ struct RawNodeRecord {
 pub enum ReceiptError {
     #[error(transparent)]
     Fs(#[from] FsError),
-    #[error("the installation record at {} is not valid JSON: {source}", path.display())]
+    #[error("cannot decode or encode the installation record at {} as JSON: {source}", path.display())]
     Corrupt {
         path: PathBuf,
         #[source]
@@ -385,7 +387,7 @@ pub fn load(directory: &Path) -> Result<Option<Receipt>, ReceiptError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(ReceiptError::Fs(fsutil::io_error(
-                "reading receipt",
+                "reading installation record",
                 &path,
                 source,
             )));
@@ -448,7 +450,7 @@ pub fn remove(directory: &Path) -> Result<(), ReceiptError> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(ReceiptError::Fs(fsutil::io_error(
-            "removing receipt",
+            "removing installation record",
             &path,
             source,
         ))),

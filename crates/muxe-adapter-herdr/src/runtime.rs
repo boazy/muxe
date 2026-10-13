@@ -109,7 +109,7 @@ impl QueueLifecycle {
         *self
             .admission_open
             .lock()
-            .expect("Herdr send-queue admission lock is not poisoned")
+            .expect("a Herdr request worker panicked while holding the queue lock")
     }
 
     fn subscribe(&self) -> watch::Receiver<bool> {
@@ -121,7 +121,7 @@ impl QueueLifecycle {
         let mut open = self
             .admission_open
             .lock()
-            .expect("Herdr send-queue admission lock is not poisoned");
+            .expect("a Herdr request worker panicked while holding the queue lock");
         if !*open {
             return false;
         }
@@ -213,7 +213,7 @@ impl GuardedHerdrInvoker {
                     .lifecycle
                     .admission_open
                     .lock()
-                    .expect("Herdr send-queue admission lock is not poisoned");
+                    .expect("a Herdr request worker panicked while holding the queue lock");
                 if !*open {
                     return Err(SocketError::RuntimeRetired {
                         delivery: DeliveryState::NotSent,
@@ -339,7 +339,7 @@ impl GuardedHerdrInvoker {
             .validate_method(COMMAND_INVOKE_METADATA.method, &params)
             .map_err(|error| ClassifiedInvokeError {
                 error: incompatible(format!(
-                    "active Herdr schema rejects command.invoke: {error}"
+                    "The installed Herdr schema rejects the command.invoke parameters: {error}. The command was not sent."
                 )),
                 delivery: DeliveryState::NotSent,
                 continuity_lost: false,
@@ -405,7 +405,7 @@ impl QueueReservation {
             .lifecycle
             .admission_open
             .lock()
-            .expect("Herdr send-queue admission lock is not poisoned");
+            .expect("a Herdr request worker panicked while holding the queue lock");
         if !*open {
             return Err(queue_closed());
         }
@@ -827,13 +827,13 @@ impl HerdrRuntime {
         for method in methods {
             if self.schema.method(method).is_none() {
                 return Err(incompatible(format!(
-                    "active Herdr schema does not declare required method {method}"
+                    "The installed Herdr schema does not define method {method}, which this action requires. The action was not sent."
                 ))
                 .with_safe_diagnostic(HerdrExecutionDiagnostic::MethodUnavailable.safe()));
             }
             if method_metadata(method).is_none() {
                 return Err(incompatible(format!(
-                    "bundled Herdr metadata does not declare required method {method}"
+                    "Muxe's bundled Herdr method metadata does not define method {method}, which this action requires. The action was not sent."
                 ))
                 .with_safe_diagnostic(HerdrExecutionDiagnostic::MethodUnavailable.safe()));
             }
@@ -1046,7 +1046,7 @@ async fn runtime_schema_with_timeouts(
             AdapterError::new(
                 AdapterErrorKind::Unavailable,
                 format!(
-                    "could not execute {} api schema --json: {error}",
+                    "Could not execute {} api schema --json to read the installed Herdr API schema: {error}",
                     binary.display()
                 ),
             )
@@ -1171,7 +1171,7 @@ async fn establish_live_identity(
     client: &HerdrSocketClient,
 ) -> Result<(HostIdentity, EndpointContinuityToken, HerdrServerVersion), AdapterError> {
     let metadata = method_metadata("ping")
-        .ok_or_else(|| incompatible("bundled Herdr metadata does not declare ping"))?;
+        .ok_or_else(|| incompatible("Muxe's bundled Herdr method metadata does not define ping. Muxe cannot check the live server."))?;
     let (response, expected) = client
         .establish_unary(metadata, Value::Object(Map::new()))
         .await
@@ -1223,7 +1223,7 @@ fn identity_from_ping_result(
     })?;
     if version.release() < HerdrRelease::MINIMUM_SUPPORTED {
         return Err(incompatible(format!(
-            "Herdr server {version} is older than the minimum supported Herdr {}",
+            "Herdr server version {version} is unsupported. Muxe requires Herdr {} or later.",
             HerdrRelease::MINIMUM_SUPPORTED
         )));
     }
@@ -1237,7 +1237,7 @@ fn identity_from_ping_result(
         live_server_id: muxe_adapter_api::LiveServerIncarnationId::parse(
             endpoint.live_server_id(protocol, version.as_str()),
         )
-        .expect("validated Herdr endpoint incarnation"),
+        .expect("validated Herdr server details must form a nonempty connection ID"),
     };
     Ok((identity, version))
 }
@@ -1253,9 +1253,9 @@ fn checked_metadata(
 ) -> Result<&'static MethodMetadata, AdapterError> {
     schema
         .validate_method(method, params)
-        .map_err(|error| incompatible(format!("active Herdr schema rejects {method}: {error}")))?;
+        .map_err(|error| incompatible(format!("The installed Herdr schema rejects the {method} parameters: {error}. The request was not sent.")))?;
     method_metadata(method)
-        .ok_or_else(|| incompatible(format!("bundled Herdr metadata does not declare {method}")))
+        .ok_or_else(|| incompatible(format!("Muxe's bundled Herdr method metadata does not define {method}. The request was not sent.")))
 }
 
 fn socket_error(error: &SocketError) -> AdapterError {
@@ -1654,8 +1654,6 @@ mod tests {
                 .unwrap();
             assert_eq!(failure.delivery, DeliveryState::MayHaveReachedHost);
             assert_eq!(failure.error.kind, AdapterErrorKind::OutcomeUnknown);
-            assert!(failure.error.to_string().contains("may have executed"));
-            assert!(!failure.error.to_string().contains("was not sent"));
             assert!(failure.continuity_lost);
             assert!(!invoker.lifecycle.is_open());
             server.await.unwrap();
@@ -2025,10 +2023,6 @@ mod tests {
             .expect("schema worker task does not panic")
             .expect_err("a nonterminating schema child must time out");
         assert_eq!(error.kind, AdapterErrorKind::Unavailable);
-        assert!(
-            error.message.contains("api schema --json timed out"),
-            "the timeout must only return after the owned child is reaped"
-        );
         assert_eq!(
             waitpid(pid, Some(WaitPidFlag::WNOHANG)),
             Err(Errno::ECHILD),

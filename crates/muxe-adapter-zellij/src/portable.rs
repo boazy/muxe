@@ -808,7 +808,7 @@ pub fn map_post_dismissal_creation(
             if !focus.unwrap_or(true) {
                 return Err(PortableError::Incompatible {
                     action: "tab:create",
-                    reason: "post-dismissal dispatch requires focus=true",
+                    reason: "creating a tab after closing the menu requires focus=true",
                 });
             }
             let PortableMapping::HostAction { mut commands } = map_tab_action(tab, origin)? else {
@@ -816,7 +816,7 @@ pub fn map_post_dismissal_creation(
             };
             commands.pop().ok_or(PortableError::Incompatible {
                 action: "tab:create",
-                reason: "tab:create produced no host action",
+                reason: "Muxe did not produce a Zellij command to create the tab",
             })
         }
         ResolvedPortableAction::Pane(pane @ ResolvedPaneAction::Open { .. }) => {
@@ -830,7 +830,7 @@ pub fn map_post_dismissal_creation(
             if !focus.unwrap_or(true) {
                 return Err(PortableError::Incompatible {
                     action: "pane:split",
-                    reason: "post-dismissal dispatch requires focus=true",
+                    reason: "splitting a pane after closing the menu requires focus=true",
                 });
             }
             map_split(command, *direction, false, true).map(|action| RawNativeCommand::RunAction {
@@ -840,7 +840,7 @@ pub fn map_post_dismissal_creation(
         }
         _ => Err(PortableError::Incompatible {
             action: "creation",
-            reason: "post-dismissal dispatch is only valid for tab:create or pane:split",
+            reason: "this action cannot use the command queue for creating tabs or panes after closing the menu",
         }),
     }
 }
@@ -1098,7 +1098,7 @@ fn resolve_open_cwd(
         .or(origin.pane_cwd.as_deref())
         .ok_or(PortableError::Incompatible {
             action: "pane:open",
-            reason: "pane:open requires an explicit cwd or captured origin cwd",
+            reason: "provide cwd for pane:open when the origin pane's working directory was not captured",
         })?;
     let cwd = if cwd.is_absolute() {
         cwd.to_path_buf()
@@ -1106,7 +1106,9 @@ fn resolve_open_cwd(
         origin
             .pane_cwd
             .as_ref()
-            .ok_or(invalid("relative cwd requires captured origin cwd"))?
+            .ok_or(invalid(
+                "relative cwd requires a working directory captured from the origin pane",
+            ))?
             .join(cwd)
     };
     let cwd_text = cwd

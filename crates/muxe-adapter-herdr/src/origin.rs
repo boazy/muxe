@@ -171,7 +171,11 @@ fn validate_tuple_values(
         .iter()
         .filter_map(Value::as_object)
         .find(|workspace| string_field_is(workspace, "workspace_id", workspace_id.as_str()))
-        .ok_or_else(|| context_error(format!("{description} workspace is not live")))?;
+        .ok_or_else(|| {
+            context_error(format!(
+                "The {description} workspace was not found in the Herdr session snapshot."
+            ))
+        })?;
     let tabs = required_array(snapshot, "tabs")?;
     let tab = tabs
         .iter()
@@ -180,7 +184,7 @@ fn validate_tuple_values(
             string_field_is(tab, "tab_id", tab_id.as_str())
                 && string_field_is(tab, "workspace_id", workspace_id.as_str())
         })
-        .ok_or_else(|| context_error(format!("{description} tab is not live in its workspace")))?;
+        .ok_or_else(|| context_error(format!("The {description} tab was not found in its saved workspace in the Herdr session snapshot.")))?;
     let panes = required_array(snapshot, "panes")?;
     let pane = panes
         .iter()
@@ -190,7 +194,7 @@ fn validate_tuple_values(
                 && string_field_is(pane, "tab_id", tab_id.as_str())
                 && string_field_is(pane, "workspace_id", workspace_id.as_str())
         })
-        .ok_or_else(|| context_error(format!("{description} pane is not live in its tab")))?;
+        .ok_or_else(|| context_error(format!("The {description} pane was not found in its saved tab and workspace in the Herdr session snapshot.")))?;
     // Live pane cwd wins; the saved hint only fills the gap when the live pane reports no
     // absolute cwd. A textual mismatch is legitimate (launcher-to-attach `cd`, server-side
     // canonicalization such as /tmp becoming /private/tmp), never a capture failure.

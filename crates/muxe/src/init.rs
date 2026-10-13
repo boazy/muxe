@@ -26,11 +26,13 @@ pub struct InitResult {
 /// A failure to initialize Muxe's configuration tree.
 #[derive(Debug, Error)]
 pub enum InitError {
-    #[error("configuration already exists: {0}")]
+    #[error(
+        "cannot create starter configuration at {0}: the path already exists. Muxe will not overwrite it"
+    )]
     ExistingConfig(PathBuf),
-    #[error("configuration path has no parent directory: {0}")]
+    #[error("cannot initialize configuration at {0}: the path has no parent directory")]
     MissingParent(PathBuf),
-    #[error("expected a directory at {0}")]
+    #[error("cannot initialize configuration: expected a directory at {0}")]
     NotDirectory(PathBuf),
     #[error("error while {operation} {path}: {source}")]
     Io {
@@ -78,7 +80,7 @@ fn ensure_missing(path: &Path) -> Result<(), InitError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err(InitError::ExistingConfig(path.to_path_buf())),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(io_error("checking", path, source)),
+        Err(source) => Err(io_error("checking configuration path", path, source)),
     }
 }
 
@@ -100,7 +102,7 @@ fn ensure_directory(path: &Path) -> Result<(), InitError> {
                 Err(source) => Err(io_error("creating directory", path, source)),
             }
         }
-        Err(source) => Err(io_error("checking", path, source)),
+        Err(source) => Err(io_error("checking directory", path, source)),
     }
 }
 
@@ -130,8 +132,9 @@ fn ensure_owned_directory(path: &Path) -> Result<(), InitError> {
                 }
                 Err(source) => return Err(io_error("creating directory", path, source)),
             }
-            fs::set_permissions(path, fs::Permissions::from_mode(OWNER_DIR_MODE))
-                .map_err(|source| io_error("locking directory mode", path, source))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(OWNER_DIR_MODE)).map_err(
+                |source| io_error("setting owner-only directory permissions for", path, source),
+            )?;
             let actual = fs::symlink_metadata(path)
                 .map_err(|source| io_error("checking directory", path, source))?
                 .permissions()
@@ -139,16 +142,16 @@ fn ensure_owned_directory(path: &Path) -> Result<(), InitError> {
                 & 0o777;
             if actual != OWNER_DIR_MODE {
                 return Err(io_error(
-                    "locking directory mode",
+                    "verifying directory permissions for",
                     path,
                     io::Error::other(format!(
-                        "directory mode {actual:o} is not owner-only {OWNER_DIR_MODE:o}"
+                        "permissions are {actual:o}; expected {OWNER_DIR_MODE:o}, accessible only to the owner"
                     )),
                 ));
             }
             Ok(())
         }
-        Err(source) => Err(io_error("checking", path, source)),
+        Err(source) => Err(io_error("checking directory", path, source)),
     }
 }
 
@@ -202,17 +205,32 @@ fn create_staging_file(directory: &Path, config_path: &Path) -> Result<(PathBuf,
                 // The creation mode can only remove bits under an odd umask;
                 // lock the exact owner-only mode like `fsutil` staging does.
                 file.set_permissions(fs::Permissions::from_mode(OWNER_FILE_MODE))
-                    .map_err(|source| io_error("locking staging file mode", &path, source))?;
+                    .map_err(|source| {
+                        io_error(
+                            "setting owner-only temporary file permissions for",
+                            &path,
+                            source,
+                        )
+                    })?;
                 return Ok((path, file));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => return Err(io_error("creating staging file", &path, source)),
+            Err(source) => {
+                return Err(io_error(
+                    "creating temporary configuration file",
+                    &path,
+                    source,
+                ));
+            }
         }
     }
     Err(InitError::Io {
-        operation: "creating unique staging file",
+        operation: "creating a temporary configuration file in",
         path: directory.to_path_buf(),
-        source: io::Error::new(io::ErrorKind::AlreadyExists, "staging filename collision"),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "all attempted temporary filenames already exist",
+        ),
     })
 }
 

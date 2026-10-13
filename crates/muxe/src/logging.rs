@@ -43,9 +43,9 @@ const LOCK_FILE_NAME: &str = "muxe.jsonl.lock";
 pub enum LogError {
     #[error(transparent)]
     Fs(#[from] FsError),
-    #[error("log message exceeds {MAX_MESSAGE_LEN} bytes")]
+    #[error("could not record the log message because it exceeds {MAX_MESSAGE_LEN} bytes")]
     MessageTooLong,
-    #[error("log sink failed; record also written to stderr")]
+    #[error("could not write the Muxe log; the logging error was printed to stderr")]
     SinkFailed,
 }
 
@@ -157,11 +157,12 @@ impl Logger {
             "code": event.code,
             "message": event.message,
         });
-        let mut line = serde_json::to_string(&record)
-            .unwrap_or_else(|_| r#"{"message":"log encoding failed"}"#.to_owned());
+        let mut line = serde_json::to_string(&record).unwrap_or_else(|_| {
+            r#"{"message":"Muxe could not encode this log entry as JSON"}"#.to_owned()
+        });
         line.push('\n');
         if let Err(error) = self.append_bytes(line.as_bytes()) {
-            eprintln!("muxe log failure: {error}");
+            eprintln!("Muxe could not write its log: {error}");
             return Err(LogError::SinkFailed);
         }
         Ok(())

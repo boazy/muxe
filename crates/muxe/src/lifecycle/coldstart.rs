@@ -129,7 +129,7 @@ pub enum ColdstartError {
     #[error("could not complete broker startup: {0}")]
     Startup(String),
     /// Child process mechanics failed.
-    #[error("could not start the broker child: {0}")]
+    #[error("could not complete broker process startup: {0}")]
     Spawn(String),
     /// Stable bridge presence inspection or reload failed before spawning a Zellij broker.
     #[error("could not prepare the stable bridge: {0}")]
@@ -144,7 +144,7 @@ pub enum ColdstartError {
     #[error("could not safely use the broker endpoint: {0}")]
     EndpointConflict(String),
     #[error(
-        "The broker's older Status response includes a handoff ID but does not establish its activation phase. Muxe cannot safely attach the UI"
+        "The older broker reports a replacement request ID but does not say whether replacement finished. Muxe cannot safely connect the UI"
     )]
     LegacyActivationAmbiguous,
 }
@@ -390,7 +390,7 @@ impl<'de> Deserialize<'de> for ColdstartAttemptId {
         let bytes = <[u8; 16]>::deserialize(deserializer)?;
         (bytes != [0; 16])
             .then_some(Self(bytes))
-            .ok_or_else(|| serde::de::Error::custom("zero startup claim"))
+            .ok_or_else(|| serde::de::Error::custom("broker startup ownership ID is all zeros"))
     }
 }
 
@@ -431,7 +431,7 @@ fn read_spawn_intent(
     })?;
     if intent.schema_version != 1 || &intent.unit != unit || intent.endpoint != endpoint.socket() {
         return Err(ColdstartError::EndpointConflict(
-            "the saved broker startup record has an unsupported schema or belongs to a different activation target or socket".to_owned(),
+            "the saved broker startup record uses an unsupported schema or identifies a different broker group or socket".to_owned(),
         ));
     }
     Ok(Some(intent))
@@ -449,15 +449,21 @@ fn publish_spawn_intent(path: &Path, intent: &ColdstartSpawnIntent) -> Result<()
 }
 
 fn update_spawn_intent(path: &Path, intent: &ColdstartSpawnIntent) -> Result<(), ColdstartError> {
-    let bytes = serde_json::to_vec(intent)
-        .map_err(|error| ColdstartError::Spawn(format!("cannot encode child PID: {error}")))?;
-    fsutil::write_atomic(path, &bytes, "coldstart")
-        .map_err(|error| ColdstartError::Spawn(format!("cannot persist child PID: {error}")))?;
+    let bytes = serde_json::to_vec(intent).map_err(|error| {
+        ColdstartError::Spawn(format!(
+            "cannot encode the broker child's process ID: {error}"
+        ))
+    })?;
+    fsutil::write_atomic(path, &bytes, "coldstart").map_err(|error| {
+        ColdstartError::Spawn(format!(
+            "cannot save the broker child's process ID: {error}"
+        ))
+    })?;
     Ok(())
 }
 
 fn clear_spawn_intent(path: &Path) -> Result<(), ColdstartError> {
-    fsutil::remove_file_durable(path, "removing coldstart child intent")
+    fsutil::remove_file_durable(path, "removing the saved broker startup record")
         .map(|_| ())
         .map_err(|error| ColdstartError::EndpointConflict(error.to_string()))
 }
@@ -579,7 +585,7 @@ where
                 .is_some()
             {
                 return Err(ColdstartError::Startup(
-                    "owned broker child exited before registration".to_owned(),
+                    "the broker process started by Muxe exited before registering".to_owned(),
                 ));
             }
             if !child_socket_replaced(previous, inputs.endpoint.socket())? {
@@ -825,15 +831,18 @@ fn validate_status_identity<H: ColdstartPolicy>(
     {
         return Err(ColdstartError::IdentityMismatch {
             expected: format!(
-                "host={expected_host:?}, discovery key={expected_discovery}, process identity={expected_incarnation:?}, bridge={:?}",
-                bridge.map(BridgeIdentity::unit)
+                "host={expected_host:?}, host address={expected_discovery}, server ID={}, bridge ID={}",
+                expected_incarnation.map_or("not required", |id| id.as_str()),
+                bridge.map_or_else(|| "none".to_owned(), |identity| identity.unit().to_string())
             ),
             found: format!(
-                "host={:?}, discovery key={}, process identity={}, bridge={:?}",
+                "host={:?}, host address={}, server ID={}, bridge ID={}",
                 status.live_server.host,
                 status.live_server.discovery_key,
                 status.live_server.server_id.as_str(),
-                status.bridge_unit
+                status
+                    .bridge_unit
+                    .map_or_else(|| "none".to_owned(), |id| id.to_string())
             ),
         });
     }
@@ -868,12 +877,21 @@ fn validate_status_identity<H: ColdstartPolicy>(
         | ActivationPhase::Retired => false,
     };
     if !attachable {
+        let phase = match status.phase {
+            ActivationPhase::Ordinary => "normal operation",
+            ActivationPhase::Legacy => "an older broker's unconfirmed replacement state",
+            ActivationPhase::Preparing => "preparing for replacement",
+            ActivationPhase::Draining => "finishing existing work before replacement",
+            ActivationPhase::SupervisorOnly => {
+                "supervising child processes without serving UI requests"
+            }
+            ActivationPhase::TargetGated => "waiting for Muxe to confirm replacement",
+            ActivationPhase::TargetCommitted => "replacement confirmed",
+            ActivationPhase::Retired => "no longer serving requests",
+        };
         return Err(ColdstartError::EndpointConflict(format!(
-            "the broker is not ready for a UI connection (lifecycle={}, activation phase={:?}, handoff present={}, replacement version present={})",
-            status.lifecycle,
-            status.phase,
-            status.handoff_id.is_some(),
-            status.target.is_some()
+            "the broker running Muxe {} is not ready for a UI connection: {phase} (broker state: {}). Its replacement request and version must agree with that state",
+            status.current.muxe_version, status.lifecycle
         )));
     }
     Ok(())
@@ -937,7 +955,7 @@ fn reconcile_live_endpoint<S, C, R, H: ColdstartPolicy>(
     let proof = verified
         .status
         .registration
-        .expect("checked registration attestation");
+        .expect("validated broker status must include its registration details");
     let process_identity = entries
         .iter()
         .find(|known| {
@@ -1018,7 +1036,7 @@ fn ensure_no_activation_journal(cache_dir: &Path, unit: &UnitKind) -> Result<(),
     let path = journal::activation_dir(cache_dir).join(unit.journal_name());
     match fs::symlink_metadata(&path) {
         Ok(_) => Err(ColdstartError::Startup(format!(
-            "activation recovery is pending at {}",
+            "broker startup is blocked by an unfinished activation record at {}",
             path.display()
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1068,7 +1086,7 @@ fn observe_stale_endpoint(path: &Path) -> Result<StaleEndpointObservation, Colds
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
             let after = fs::symlink_metadata(path).map_err(|error| {
                 ColdstartError::EndpointConflict(format!(
-                    "stale endpoint {} changed after refusal: {error}",
+                    "unresponsive broker socket {} changed after refusing the connection: {error}",
                     path.display()
                 ))
             })?;
@@ -1182,7 +1200,7 @@ fn reconcile_absent_endpoint<S, C, R, H: ColdstartPolicy>(
     }
     if !recorded_process_is_dead(stale.server_pid)? {
         return Err(ColdstartError::EndpointConflict(format!(
-            "recorded broker PID {} is live or reused",
+            "process ID {} from the broker registry is still in use or Muxe cannot inspect it; replacement was refused",
             stale.server_pid
         )));
     }
@@ -2449,7 +2467,7 @@ mod tests {
         fsutil::write_atomic(&path, b"pending", "owned-journal").unwrap();
         assert!(matches!(
             ensure_broker(&inputs).await,
-            Err(ColdstartError::Startup(message)) if message.contains("activation recovery")
+            Err(ColdstartError::Startup(_))
         ));
         assert_eq!(spawner.0.load(Ordering::SeqCst), 0);
         fsutil::remove_file_durable(&path, "clear owned journal").unwrap();

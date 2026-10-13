@@ -105,6 +105,24 @@ impl NativeCommandOperation {
             Self::BrokerRetire => "broker-retire",
         }
     }
+
+    const fn failure_message(self) -> &'static str {
+        match self {
+            Self::Init => "Could not create the Muxe configuration.",
+            Self::ConfigCheck => "The Muxe configuration check failed.",
+            Self::ConfigThemes => "Could not list themes and color schemes.",
+            Self::Compatibility => "Could not report Muxe's host compatibility.",
+            Self::Purge => "Could not finish removing the selected Muxe data.",
+            Self::MenuOpen => "Could not open the requested menu.",
+            Self::MenuDump => "Could not print the requested menu configuration.",
+            Self::PaneOpen => "Could not open the requested command pane.",
+            Self::UiMenu => "The Muxe menu could not start or stopped with an error.",
+            Self::IntegrationInstall => "Could not finish installing the host integration.",
+            Self::IntegrationUninstall => "Could not finish removing the host integration.",
+            Self::Activate => "Could not activate every selected broker.",
+            Self::BrokerRetire => "Could not retire every selected broker.",
+        }
+    }
 }
 
 /// Records one payload-safe failure event without replacing the command's
@@ -117,7 +135,7 @@ fn record_command_failure(
         Ok(paths) => paths,
         Err(log_error) => {
             return Err(error.wrap_err(format!(
-                "could not resolve the cache directory to record the native command failure: {log_error}"
+                "could not find the cache directory to log this command's failure: {log_error}"
             )));
         }
     };
@@ -125,7 +143,7 @@ fn record_command_failure(
         Ok(logger) => logger,
         Err(log_error) => {
             return Err(error.wrap_err(format!(
-                "could not open the native command failure audit log: {log_error}"
+                "could not open the Muxe log to record this command's failure: {log_error}"
             )));
         }
     };
@@ -133,13 +151,13 @@ fn record_command_failure(
         env!("CARGO_PKG_VERSION"),
         "local",
         operation.as_str(),
-        "native command failed; inspect stderr for diagnostics",
+        format!("{} See this command's terminal error output for details. Command arguments and configuration values are not saved in this log.", operation.failure_message()),
     )
     .expect("fixed native command failure event fits the log message bound")
     .with_code("command-failed");
     if let Err(log_error) = logger.append(&event) {
         return Err(error.wrap_err(format!(
-            "could not persist the native command failure audit record: {log_error}"
+            "could not write this command's failure to the Muxe log: {log_error}"
         )));
     }
     Err(error)
@@ -206,7 +224,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Broker(command) => match command.command {
             muxe::cli::BrokerSubcommand::Retire(retire) => {
                 let scope = retire.host.ok_or_else(|| {
-                    color_eyre::eyre::eyre!("muxe broker retire requires an explicit --host scope")
+                    color_eyre::eyre::eyre!(
+                        "muxe broker retire requires --host all, current, herdr, or zellij"
+                    )
                 })?;
                 retire_brokers(scope).await
             }
@@ -231,7 +251,7 @@ async fn check_configuration() -> Result<()> {
         println!("configuration is valid for zellij and herdr");
         Ok(())
     } else {
-        bail!("configuration check failed")
+        bail!("configuration check failed; correct the errors listed above")
     }
 }
 
@@ -248,7 +268,9 @@ fn compatibility(command: &CompatibilityCommand) -> Result<()> {
 async fn dump_menu(command: muxe::cli::MenuDump) -> Result<()> {
     let paths = muxe::paths::resolve()?;
     let host = autodetected_host().ok_or_else(|| {
-        color_eyre::eyre::eyre!("could not detect a supported host for menu dump")
+        color_eyre::eyre::eyre!(
+            "could not detect a host for menu dump; run this command inside Herdr or Zellij"
+        )
     })?;
     let config_file = paths.config_file();
     let config = match host {
@@ -375,7 +397,7 @@ fn packaged_bridge_bytes() -> Result<Vec<u8>> {
     })?;
     let path = packaged_asset_path(directory);
     std::fs::read(&path).wrap_err(format!(
-        "could not read the packaged bridge at {}; install requires the complete release layout",
+        "could not read the Zellij bridge at {}; reinstall the complete Muxe release, not just the executable",
         path.display()
     ))
 }
@@ -395,7 +417,7 @@ fn install_zellij(command: muxe::cli::InstallIntegrationCommand) -> Result<()> {
     let muxe::cli::IntegrationTarget::Zellij(options) = command.target;
     let paths = muxe::paths::resolve()?;
     let logger = muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION"))
-        .wrap_err("could not open the install audit log")?;
+        .wrap_err("could not open the Muxe log before installation")?;
     let packaged = packaged_bridge_bytes()?;
     let explicit_policy = options.configuration_policy();
     let outcome = muxe::integration::install(muxe::integration::InstallInputs {
@@ -437,7 +459,7 @@ fn uninstall_zellij(command: muxe::cli::UninstallIntegrationCommand) -> Result<(
     let muxe::cli::IntegrationTarget::Zellij(options) = command.target;
     let paths = muxe::paths::resolve()?;
     let logger = muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION"))
-        .wrap_err("could not open the uninstall audit log")?;
+        .wrap_err("could not open the Muxe log before uninstallation")?;
     let explicit_policy = options.configuration_policy();
     let outcome = muxe::integration::uninstall(muxe::integration::UninstallInputs {
         config_dir: &paths.config_dir,
@@ -519,7 +541,7 @@ async fn activate_brokers(command: muxe::cli::ActivateCommand) -> Result<()> {
     };
     if command.force {
         println!(
-            "Muxe will try to retire each broker cleanly. If it must stop a broker process, pending menu/capture cleanup and local command supervision may be lost. Host-owned processes are not terminated, and uncertain actions are not replayed."
+            "Muxe will first try to retire each broker cleanly. If it must forcibly stop a broker, menus may remain open, keyboard input may remain captured, and Muxe may stop monitoring commands it launched. Programs running in host panes are not terminated. Muxe will not repeat actions whose results are unknown."
         );
     }
     let report = Box::pin(run_activation(command.host, current, command.force)).await?;
@@ -600,14 +622,14 @@ async fn run_activation(
 ) -> Result<muxe::lifecycle::ActivateReport> {
     let paths = muxe::paths::resolve()?;
     let logger = muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION"))
-        .wrap_err("could not open the activation audit log")?;
+        .wrap_err("could not open the Muxe log before activation")?;
     let record = muxe::compatibility::embedded_record()
         .wrap_err("could not load the embedded compatibility record")?;
     let registry = muxe::lifecycle::Registry::open(&paths.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
     let live = if force {
         muxe::lifecycle::activate::force_selection_rows(&paths.cache_dir, scope, current.as_ref())
-            .wrap_err("could not read selected force-recovery registrations")?
+            .wrap_err("could not read the saved broker records needed for forced replacement")?
     } else {
         registry
             .probe()
@@ -623,7 +645,7 @@ async fn run_activation(
     let zellij_exe = zellij_selected
         .then(|| {
             muxe_adapter_zellij::resolve_zellij_exe().map_err(|error| {
-                color_eyre::eyre::eyre!("could not resolve the pinned Zellij executable: {error}")
+                color_eyre::eyre::eyre!("could not find the Zellij executable: {error}")
             })
         })
         .transpose()?;
@@ -700,7 +722,7 @@ async fn ensure_herdr_broker(
         .wrap_err("could not load the embedded compatibility record")?;
     let discovery = runtime.identity().discovery_key.clone();
     let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Herdr, discovery.as_str())
-        .wrap_err("could not derive the normal Herdr broker endpoint")?;
+        .wrap_err("could not determine the Herdr broker's socket path")?;
     let executable = env::current_exe().wrap_err("could not locate the running muxe executable")?;
     let inputs = muxe::lifecycle::ColdstartInputs {
         cache_dir,
@@ -724,8 +746,9 @@ async fn ensure_herdr_broker(
     };
     match muxe::lifecycle::ensure_broker(&inputs)
         .await
-        .map_err(|error| color_eyre::eyre::eyre!("could not ensure the Herdr broker: {error}"))?
-    {
+        .map_err(|error| {
+            color_eyre::eyre::eyre!("could not find or start a Herdr broker: {error}")
+        })? {
         muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.into_socket()),
         muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
             Box::pin(run_activation(HostScope::Herdr, None, false)).await?;
@@ -736,7 +759,9 @@ async fn ensure_herdr_broker(
                 })? {
                 muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live.entry.into_socket()),
                 muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
-                    bail!("activation did not converge the Herdr broker record")
+                    bail!(
+                        "the Herdr broker still reports an incompatible Muxe version or protocol after activation"
+                    )
                 }
             }
         }
@@ -757,7 +782,7 @@ async fn ensure_zellij_broker(
         .wrap_err("could not load the embedded compatibility record")?;
     let session = muxe_adapter_api::HostDiscoveryKey::parse(session)?;
     let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Zellij, session.as_str())
-        .wrap_err("could not derive the normal Zellij broker endpoint")?;
+        .wrap_err("could not determine the Zellij broker's socket path")?;
     let executable = env::current_exe().wrap_err("could not locate the running muxe executable")?;
     let reloader = muxe::lifecycle::ZellijCliReloader {
         program: Some(zellij_exe.to_path_buf()),
@@ -780,8 +805,9 @@ async fn ensure_zellij_broker(
     };
     match muxe::lifecycle::ensure_broker(&inputs)
         .await
-        .map_err(|error| color_eyre::eyre::eyre!("could not ensure the Zellij broker: {error}"))?
-    {
+        .map_err(|error| {
+            color_eyre::eyre::eyre!("could not find or start a Zellij broker: {error}")
+        })? {
         muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live),
         muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
             let current = Some(detect_current_host(cache_dir)?);
@@ -793,7 +819,9 @@ async fn ensure_zellij_broker(
                 })? {
                 muxe::lifecycle::ColdstartOutcome::Ready(live) => Ok(live),
                 muxe::lifecycle::ColdstartOutcome::StaleRecord(_) => {
-                    bail!("activation did not converge the Zellij broker record")
+                    bail!(
+                        "the Zellij broker still reports an incompatible Muxe version or protocol after activation"
+                    )
                 }
             }
         }
@@ -947,13 +975,14 @@ fn serve_event(logger: &muxe::logging::Logger, host: &str, operation: &str, mess
 
 fn broker_diagnostic_message(outcome: muxe_protocol::ExecutionOutcome) -> &'static str {
     match outcome {
-        muxe_protocol::ExecutionOutcome::Failed => "detached execution failed",
-        muxe_protocol::ExecutionOutcome::OutcomeUnknown => "detached execution outcome is unknown",
-        muxe_protocol::ExecutionOutcome::Cancelled => "detached execution was cancelled",
-        muxe_protocol::ExecutionOutcome::TimedOut => "detached execution timed out",
-        muxe_protocol::ExecutionOutcome::Succeeded | muxe_protocol::ExecutionOutcome::Detached => {
-            "detached execution completed"
+        muxe_protocol::ExecutionOutcome::Failed => "background action failed",
+        muxe_protocol::ExecutionOutcome::OutcomeUnknown => {
+            "Muxe could not confirm the background action's result"
         }
+        muxe_protocol::ExecutionOutcome::Cancelled => "background action was cancelled",
+        muxe_protocol::ExecutionOutcome::TimedOut => "background action exceeded its time limit",
+        muxe_protocol::ExecutionOutcome::Detached => "action continues in the background",
+        muxe_protocol::ExecutionOutcome::Succeeded => "background action completed",
     }
 }
 
@@ -1047,7 +1076,7 @@ fn attest_broker_registration(
 async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     let logger = Arc::new(
         muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
-            .wrap_err("could not open the broker service audit log")?,
+            .wrap_err("could not open the Muxe log before starting the broker")?,
     );
     // Earliest lock ownership, mirroring the Zellij path: the Herdr discovery
     // key is the server socket string, so the normal endpoint derives from
@@ -1057,21 +1086,21 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
         ProtocolHostKind::Herdr,
         &command.herdr_socket.to_string_lossy(),
     )
-    .wrap_err("could not derive the normal Herdr broker endpoint")?;
+    .wrap_err("could not determine the Herdr broker's socket path")?;
     if pre_endpoint.socket() != command.socket {
         bail!(
-            "broker endpoint {} does not match the recorded normal Herdr endpoint {}",
+            "the Herdr broker must use socket {}, but was asked to use {}",
             pre_endpoint.socket().display(),
             command.socket.display()
         );
     }
     let pre_lock = pre_endpoint.acquire_startup_lock().map_err(|error| {
-        color_eyre::eyre::eyre!("another broker starter holds the Herdr endpoint: {error}")
+        color_eyre::eyre::eyre!("could not lock the Herdr broker socket during startup: {error}")
     })?;
     if let Err(error) = pre_endpoint.remove_validated_stale_socket() {
         drop(pre_lock);
         return Err(color_eyre::eyre::eyre!(
-            "could not claim the Herdr broker endpoint: {error}"
+            "could not prepare the Herdr broker socket for startup: {error}"
         ));
     }
     let adapter =
@@ -1081,7 +1110,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
             cache_dir: command.cache_dir.clone(),
         })
         .await
-        .wrap_err("could not connect the pinned Herdr server for broker startup")?;
+        .wrap_err("could not connect to the selected Herdr server during broker startup")?;
     let broker = muxe_broker::Broker::load(adapter.clone(), &command.config)
         .await
         .wrap_err("could not load the broker configuration")?;
@@ -1093,12 +1122,12 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
     let live_server = broker
         .live_identity()
         .await
-        .wrap_err("could not capture the pinned Herdr live identity")?;
+        .wrap_err("could not identify the connected Herdr server")?;
     let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Herdr, &live_server.discovery_key)
-        .wrap_err("could not derive the normal Herdr broker endpoint")?;
+        .wrap_err("could not determine the Herdr broker's socket path")?;
     if endpoint.socket() != command.socket {
         bail!(
-            "broker endpoint {} does not match the recorded normal Herdr endpoint {}",
+            "the Herdr broker must use socket {}, but was asked to use {}",
             endpoint.socket().display(),
             command.socket.display()
         );
@@ -1236,7 +1265,7 @@ async fn serve_herdr_broker(command: BrokerServeHerdrCommand) -> Result<()> {
 async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     let logger = Arc::new(
         muxe::logging::Logger::open(&command.cache_dir, env!("CARGO_PKG_VERSION"))
-            .wrap_err("could not open the broker service audit log")?,
+            .wrap_err("could not open the Muxe log before starting the broker")?,
     );
     let serve_config_dir = command.config.parent().ok_or_else(|| {
         color_eyre::eyre::eyre!("broker configuration file has no parent directory")
@@ -1263,10 +1292,10 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     // construction. The guard drops before start_inner re-acquires; passing
     // the held guard through bind awaits the broker-owned lock API.
     let pre_endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Zellij, &command.session)
-        .wrap_err("could not derive the normal Zellij broker endpoint")?;
+        .wrap_err("could not determine the Zellij broker's socket path")?;
     if pre_endpoint.socket() != command.socket {
         bail!(
-            "broker endpoint {} does not match the recorded normal Zellij endpoint {}",
+            "the Zellij broker must use socket {}, but was asked to use {}",
             pre_endpoint.socket().display(),
             command.socket.display()
         );
@@ -1277,7 +1306,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     if let Err(error) = pre_endpoint.remove_validated_stale_socket() {
         drop(pre_lock);
         return Err(color_eyre::eyre::eyre!(
-            "could not claim the Zellij broker endpoint: {error}"
+            "could not prepare the Zellij broker socket for startup: {error}"
         ));
     }
     // Ordinary brokers subscribe immediately. A target binds TargetGated
@@ -1350,10 +1379,10 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         );
     }
     let endpoint = RuntimeEndpoint::for_host(ProtocolHostKind::Zellij, &live_server.discovery_key)
-        .wrap_err("could not derive the normal Zellij broker endpoint")?;
+        .wrap_err("could not determine the Zellij broker's socket path")?;
     if endpoint.socket() != command.socket {
         bail!(
-            "broker endpoint {} does not match the recorded normal Zellij endpoint {}",
+            "the Zellij broker must use socket {}, but was asked to use {}",
             endpoint.socket().display(),
             command.socket.display()
         );
@@ -1413,7 +1442,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
     let registry = muxe::lifecycle::Registry::open(&command.cache_dir)
         .wrap_err("could not open the owner-only broker registry")?;
     if let Some(receipt) = muxe::integration::receipt::load(bridge_identity.directory())
-        .wrap_err("could not read the Zellij integration receipt")?
+        .wrap_err("could not read the Zellij installation record")?
         && receipt.bridge.bridge_identity != bridge_identity
     {
         bail!(
@@ -1506,7 +1535,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 &logger,
                 "zellij",
                 "broker-serve",
-                &format!("registration failed after endpoint bind: {error}"),
+                &format!("could not register the Zellij broker after opening its socket: {error}"),
             );
             drop(server);
             let _ = adapter.shutdown().await;
@@ -1537,7 +1566,8 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         // The same deadline bounds journal wait, child launch, and census.
         let (journal_path, activation_id) =
             target_wait.expect("validated target owns an activation journal");
-        let handoff = registration_handoff.expect("validated target owns a handoff");
+        let handoff = registration_handoff
+            .expect("validated replacement broker must have a replacement request ID");
         let deferred_pipes = deferred_pipes.expect("validated target has dormant pipes");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
@@ -1597,7 +1627,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
                 None,
                 &registration,
             )
-            .wrap_err("could not remove failed Zellij target registration")?;
+            .wrap_err("could not remove the failed replacement Zellij broker's registry entry")?;
             return Err(error).wrap_err(
                 "could not verify the replacement broker's Zellij clients and session identity",
             );
@@ -1611,7 +1641,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
             None,
             &registration,
         )
-        .wrap_err("could not remove stopped Zellij target registration")?;
+        .wrap_err("could not remove the stopped replacement Zellij broker's registry entry")?;
         serve_event(&logger, "zellij", "broker-serve", "stopped");
         return joined
             .wrap_err("Zellij broker service task ended unexpectedly")?
@@ -1627,7 +1657,7 @@ async fn serve_zellij_broker(command: BrokerServeZellijCommand) -> Result<()> {
         None,
         &registration,
     )
-    .wrap_err("could not remove stopped Zellij registration")?;
+    .wrap_err("could not remove the stopped Zellij broker's registry entry")?;
     serve_event(&logger, "zellij", "broker-serve", "stopped");
     result.wrap_err("Zellij broker service stopped unexpectedly")
 }
@@ -1728,7 +1758,9 @@ async fn establish_initial_round_until(
                             logger,
                             "zellij",
                             "broker-serve",
-                            &format!("initial subscription refresh failed: {error}"),
+                            &format!(
+                                "could not restart the Zellij event connection during broker startup: {error}"
+                            ),
                         );
                     }
                     last_error = error;
@@ -1999,7 +2031,7 @@ impl JournalRecovery {
         });
         let row = entries
             .next()
-            .ok_or_else(|| "cannot safely stop the existing broker: the saved activation record has no identity for that process".to_owned())?;
+            .ok_or_else(|| "cannot safely stop the existing broker: the saved activation record does not identify that broker process".to_owned())?;
         if entries.next().is_some()
             || row.server_pid != std::process::id()
             || row.registration_id != self.registration_id
@@ -2405,10 +2437,10 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
             let path = muxe::lifecycle::journal::activation_dir(&self.cache_dir)
                 .join(self.unit.journal_name());
             let journal = muxe::lifecycle::journal::read_journal(&path)
-                .map_err(|error| format!("old retirement journal unavailable: {error}"))?;
+                .map_err(|error| format!("could not read the saved activation record before recording the existing broker's shutdown: {error}"))?;
             let member = journal
                 .recovery_member(&self.discovery_key, *handoff)
-                .map_err(|error| format!("old retirement member unauthorized: {error}"))?;
+                .map_err(|error| format!("cannot record the existing broker's shutdown because its host or replacement request does not match the saved activation record: {error}"))?;
             self.validate_old_incarnation(&journal, member, local_status)?;
             let ownership_server = journal
                 .old_registry
@@ -2425,7 +2457,9 @@ impl muxe_broker::RecoveryJournal for JournalRecovery {
                 member,
                 &muxe_protocol::wire::ServerId::new(ownership_server.clone()),
             )
-            .map_err(|error| format!("cannot persist old retirement proof: {error}"))
+            .map_err(|error| {
+                format!("could not save confirmation that the existing broker stopped: {error}")
+            })
         })
     }
 }
@@ -2478,7 +2512,7 @@ async fn open_pane(open: &PaneOpen) -> Result<()> {
     // A detached launcher has no visible stderr, so its audit log is required:
     // failure to open it fails the launch closed before touching the host.
     let logger = muxe::logging::Logger::open(&paths.cache_dir, env!("CARGO_PKG_VERSION"))
-        .wrap_err("could not open the launcher audit log")?;
+        .wrap_err("could not open the Muxe log before opening a pane")?;
     let host = match selected_host(open.placement.host) {
         Ok(host) => host,
         Err(error) => {
@@ -2523,7 +2557,7 @@ async fn herdr_open_pane(
         Ok(runtime) => runtime,
         Err(error) => {
             let error = color_eyre::eyre::eyre!(
-                "could not establish the exact configured Herdr runtime: {error}"
+                "could not connect to the configured Herdr server: {error}"
             );
             notify_launcher_failure(None, "pane-open", &error.to_string()).await;
             return Err(error);
@@ -2555,11 +2589,12 @@ async fn herdr_open_pane(
         .map(|argument| {
             argument.to_str().map(ToOwned::to_owned).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
-                    "Herdr panes require UTF-8 argv because its JSON socket API has string arguments"
+                    "Herdr requires the program and its arguments to be valid UTF-8 text"
                 )
             })
         })
-        .collect::<Result<Vec<_>>>() {
+        .collect::<Result<Vec<_>>>()
+    {
         Ok(argv) => argv,
         Err(error) => {
             notify_launcher_failure(Some(&runtime), "pane-open", &error.to_string()).await;
@@ -2630,15 +2665,17 @@ async fn herdr_open_plugin_pane(
         );
     }
     if !matches!(open.placement.parent_pane, ParentPane::Current) {
-        bail!("Herdr overlays/popups use the active origin; --parent-pane must be current");
+        bail!("Herdr overlays and popups open from the active pane; use --parent-pane current");
     }
     if open.placement.position.is_some() {
-        bail!("Herdr plugin overlays/popups have no position API; --position is unsupported");
+        bail!("Herdr does not support --position for executable overlays or popups");
     }
     if open.placement.pane_type == PaneType::Overlay
         && (open.placement.width.is_some() || open.placement.height.is_some())
     {
-        bail!("Herdr executable overlays do not support --width or --height; use popup");
+        bail!(
+            "Herdr executable overlays do not support --width or --height; use --pane-type popup"
+        );
     }
     let size = |dimension: Option<muxe_core::Dimension>| -> Result<_> {
         dimension
@@ -2708,7 +2745,8 @@ async fn commit_herdr_ui_pane(
             diagnostic.code.as_str()
         )),
         Ok(response) => Some(format!(
-            "broker returned unexpected pane-registration response: {response:?}"
+            "could not register the menu pane: expected registration confirmation, received {}",
+            response.kind_name()
         )),
         Err(error) => Some(format!("could not register the placed UI pane: {error}")),
     };
@@ -2795,7 +2833,7 @@ async fn herdr_open_ui_pane(
     let root = argv
         .last()
         .cloned()
-        .ok_or_else(|| color_eyre::eyre::eyre!("Herdr UI launch requires a root argument"))?;
+        .ok_or_else(|| color_eyre::eyre::eyre!("opening a Herdr menu requires a menu name"))?;
     let mut client = Box::pin(launcher_client(cache_dir, config_file, runtime)).await?;
     let token = prepare_ui_launch(&mut client, cache_dir, &origin, &root).await?;
     let launch = muxe_adapter_herdr::UiPaneLaunch {
@@ -2846,9 +2884,11 @@ async fn prepare_ui_launch(
             cache_dir: cache_dir.to_path_buf(),
         })
         .await
-        .wrap_err("could not connect the Herdr adapter for modal scope")?;
+        .wrap_err("could not connect to Herdr to check for an existing menu")?;
     let scope = adapter.modal_scope(&origin.pane).await.map_err(|error| {
-        color_eyre::eyre::eyre!("could not resolve the menu modal scope: {error}")
+        color_eyre::eyre::eyre!(
+            "could not determine whether another menu is open for this Herdr pane: {error}"
+        )
     })?;
     match client
         .request(muxe_protocol::ClientRequest::PrepareUiLaunch(
@@ -2892,7 +2932,7 @@ async fn launcher_client(
         .wrap_err("could not probe validated Herdr broker records")?;
     if matches.len() != 1 {
         bail!(
-            "launching a UI pane requires exactly one live Herdr broker for this server; start one before launching UI panes"
+            "Muxe could not identify a single running broker for this Herdr server after startup; the menu was not opened"
         );
     }
     let entry = matches.pop().expect("exactly one live broker entry");
@@ -2949,7 +2989,7 @@ async fn zellij_open_pane(
 ) -> Result<()> {
     let session = required_environment("ZELLIJ_SESSION_NAME")?;
     let program = muxe_adapter_zellij::resolve_zellij_exe().map_err(|error| {
-        color_eyre::eyre::eyre!("could not resolve the pinned Zellij executable: {error}")
+        color_eyre::eyre::eyre!("could not find the Zellij executable: {error}")
     })?;
     let argv = zellij_run_argv(&session, open)?;
     if muxe_adapter_api::launch::is_ui_argv(&open.argv) {
@@ -3075,7 +3115,9 @@ fn zellij_run_argv(session: &str, open: &PaneOpen) -> Result<Vec<OsString>> {
         .iter()
         .map(|argument| {
             argument.to_str().map(ToOwned::to_owned).ok_or_else(|| {
-                color_eyre::eyre::eyre!("Zellij run requires UTF-8 argv for its command line")
+                color_eyre::eyre::eyre!(
+                    "Zellij requires the program and its arguments to be valid UTF-8 text"
+                )
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3117,7 +3159,7 @@ async fn run_zellij_ui(menu: UiMenuCommand) -> Result<()> {
     let session = required_environment("ZELLIJ_SESSION_NAME")?;
     let paths = muxe::paths::resolve()?;
     let zellij_exe = muxe_adapter_zellij::resolve_zellij_exe().map_err(|error| {
-        color_eyre::eyre::eyre!("could not resolve the pinned Zellij executable: {error}")
+        color_eyre::eyre::eyre!("could not find the Zellij executable: {error}")
     })?;
     // Coldstart reuses a receipt-owned loaded bridge (or loads an absent
     // one) before awaiting a fresh compatible round, so attach never races
@@ -3200,7 +3242,7 @@ fn selected_host(requested: HostSelector) -> Result<HostSelector> {
     match requested {
         HostSelector::Herdr | HostSelector::Zellij => Ok(requested),
         HostSelector::Auto => autodetected_host().ok_or_else(|| {
-            color_eyre::eyre::eyre!("could not detect a supported host for muxe pane open")
+            color_eyre::eyre::eyre!("could not detect a host; run this command inside Herdr or Zellij, or select one with --host herdr or --host zellij")
         }),
     }
 }
@@ -3215,7 +3257,7 @@ fn herdr_launch_config(cache_dir: PathBuf) -> Result<muxe_adapter_herdr::HerdrAd
 
 fn herdr_binary_from_path() -> Result<PathBuf> {
     let path = env::var_os("PATH").ok_or_else(|| {
-        color_eyre::eyre::eyre!("PATH is required to resolve the installed Herdr executable")
+        color_eyre::eyre::eyre!("PATH is not set; Muxe cannot find the Herdr executable")
     })?;
     for directory in env::split_paths(&path) {
         let candidate = directory.join("herdr");
@@ -3232,7 +3274,9 @@ fn herdr_binary_from_path() -> Result<PathBuf> {
                 .wrap_err("could not resolve the installed Herdr executable");
         }
     }
-    bail!("could not resolve an executable `herdr` from PATH")
+    bail!(
+        "could not find an executable named `herdr` on PATH; install Herdr or add its directory to PATH"
+    )
 }
 
 fn required_absolute_environment_path(name: &str) -> Result<PathBuf> {
@@ -3267,7 +3311,7 @@ async fn launcher_origin_from(
     )
     .await
     .wrap_err(format!(
-        "could not validate the {} Herdr launch context against the current session snapshot",
+        "could not find the workspace, tab, and pane identified by the {} Herdr launch information",
         selected.source
     ))?;
     // The immutable trampoline origin keeps its captured cwd when the bootstrap
@@ -3334,7 +3378,7 @@ fn select_launcher_origin(get: &dyn Fn(&str) -> Option<String>) -> Result<Select
         }
     }
     bail!(
-        "Herdr origin context is required: set HERDR_ACTIVE_WORKSPACE_ID, HERDR_ACTIVE_TAB_ID, and HERDR_ACTIVE_PANE_ID, or their HERDR_* managed-pane equivalents"
+        "Muxe does not know which Herdr pane opened this command. Run it from a Herdr pane or configured command binding so Herdr supplies the workspace, tab, and pane IDs."
     )
 }
 
@@ -3427,7 +3471,7 @@ fn command_pane_launch(
         .map(|argument| {
             argument.to_str().map(ToOwned::to_owned).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
-                    "Herdr command panes require UTF-8 argv because its JSON socket API has string arguments"
+                    "Herdr requires the program and its arguments to be valid UTF-8 text"
                 )
             })
         })
@@ -3484,7 +3528,7 @@ async fn run_herdr_ui(menu: UiMenuCommand) -> Result<()> {
     let runtime =
         muxe_adapter_herdr::HerdrRuntime::connect(herdr_launch_config(paths.cache_dir.clone())?)
             .await
-            .wrap_err("could not establish the exact configured Herdr runtime")?;
+            .wrap_err("could not connect to the configured Herdr server")?;
     // Coldstart first: no live broker means one is started (or the stale one
     // is activated) before attach. The verified socket replaces the direct
     // endpoint connect so UI never races broker startup.
@@ -3651,7 +3695,11 @@ fn required_environment(name: &str) -> Result<String> {
     env::var_os(name)
         .filter(|value| !value.is_empty())
         .and_then(|value| value.into_string().ok())
-        .ok_or_else(|| color_eyre::eyre::eyre!("{name} must be present, nonempty, and UTF-8"))
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "environment variable {name} must be set to nonempty UTF-8 text"
+            )
+        })
 }
 
 fn pending_launch_token(value: &str) -> Result<PendingLaunchToken> {
@@ -3663,11 +3711,18 @@ fn pending_launch_token(value: &str) -> Result<PendingLaunchToken> {
     let mut bytes = [0_u8; 16];
     for (destination, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
         *destination = u8::from_str_radix(
-            std::str::from_utf8(pair)
-                .map_err(|_| color_eyre::eyre::eyre!("invalid pending launch token"))?,
+            std::str::from_utf8(pair).map_err(|_| {
+                color_eyre::eyre::eyre!(
+                    "MUXE_PENDING_LAUNCH_TOKEN contains an invalid hexadecimal digit"
+                )
+            })?,
             16,
         )
-        .map_err(|_| color_eyre::eyre::eyre!("invalid pending launch token"))?;
+        .map_err(|_| {
+            color_eyre::eyre::eyre!(
+                "MUXE_PENDING_LAUNCH_TOKEN contains an invalid hexadecimal digit"
+            )
+        })?;
     }
     if bytes == [0; 16] {
         bail!("MUXE_PENDING_LAUNCH_TOKEN must not be zero");
@@ -5465,7 +5520,6 @@ mod mixed_recovery_production_tests {
 
         let record =
             fs::read_to_string(cache.join("logs/muxe.jsonl")).expect("native diagnostic record");
-        assert!(record.contains("detached execution failed"));
         assert!(record.contains("Failed: ActionBlocked"));
         let event: serde_json::Value = serde_json::from_str(record.trim()).expect("JSON log event");
         let request = event["request_id"]

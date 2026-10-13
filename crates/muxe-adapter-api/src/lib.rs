@@ -587,15 +587,15 @@ impl AdapterError {
                 "The action is incompatible with the host's supported methods or parameters."
             }
             AdapterErrorKind::DispatchFailed => {
-                "The host rejected the action; host response text is omitted."
+                "The host action failed; host response text is omitted."
             }
             AdapterErrorKind::OutcomeUnknown => {
                 "The action may have reached the host; inspect the host before repeating it."
             }
-            AdapterErrorKind::CaptureLost => "The host lost the menu input capture.",
+            AdapterErrorKind::CaptureLost => "The menu no longer has exclusive host input capture.",
             AdapterErrorKind::CancelUnsupported => "The host cannot cancel this execution.",
-            AdapterErrorKind::Unsupported => "The host does not support this execution operation.",
-            AdapterErrorKind::Shutdown => "The host adapter shut down before execution completed.",
+            AdapterErrorKind::Unsupported => "The host does not support this adapter operation.",
+            AdapterErrorKind::Shutdown => "The host adapter has shut down.",
         }
     }
 }

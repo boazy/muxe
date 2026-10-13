@@ -21,7 +21,7 @@ use thiserror::Error;
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum OriginError {
     /// A host-supplied identifier is empty or overlong.
-    #[error("invalid origin {field}: {reason}")]
+    #[error("cannot capture the Zellij origin ({field}): {reason}")]
     InvalidId {
         /// Which identifier failed.
         field: &'static str,
@@ -77,7 +77,7 @@ pub fn build_origin_context(
         Some("") => {
             return Err(OriginError::InvalidId {
                 field: "prior-pane",
-                reason: "bridge reported an empty prior pane",
+                reason: "bridge reported an empty ID for the pane focused before the menu opened",
             });
         }
         Some(pane) => Some(PaneId::new(pane)),

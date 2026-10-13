@@ -182,7 +182,9 @@ impl<'de> Deserialize<'de> for ProcessIdentity {
             } => namespace.valid() && start.0 != 0,
         };
         if !valid {
-            return Err(serde::de::Error::custom("invalid OS process incarnation"));
+            return Err(serde::de::Error::custom(
+                "invalid recorded OS process identity",
+            ));
         }
         Ok(Self(identity))
     }
@@ -314,19 +316,23 @@ impl ProcessIdentity {
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
-    #[error("the OS did not provide a valid exact broker process identity")]
+    #[error("broker process identity is missing or invalid")]
     Identity,
     #[error("the control peer does not belong to the current user or recorded broker process")]
     Peer,
-    #[error("the OS could not prove that this process owns the accepted control connection")]
+    #[error("the OS could not verify that this process owns the accepted control connection")]
     SocketOwnership,
-    #[error("the Linux PID namespace or procfs PID view cannot prove this process observation")]
+    #[error(
+        "cannot verify process status: the Linux PID namespace or procfs view does not provide a valid identity that matches the recorded process"
+    )]
     ObservationContext,
     #[error(
-        "the recorded process incarnation is ambiguous; a changed executable token is not proof of exit"
+        "cannot confirm that the recorded broker process exited; a PID or changed process identity alone is not enough"
     )]
     AmbiguousIncarnation,
-    #[error("the exact broker process did not exit before the hard-stop deadline")]
+    #[error(
+        "could not confirm that the recorded broker process exited before the hard-stop deadline"
+    )]
     ExitTimeout,
     #[error("the OS process operation failed: {0}")]
     Io(#[from] io::Error),

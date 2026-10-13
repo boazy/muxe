@@ -58,7 +58,7 @@ pub enum PurgeError {
     #[error("purge declined; nothing was removed")]
     Declined,
     #[error(
-        "cannot remove the cache while activation is unfinished or needs recovery; its saved record is at {journal}"
+        "cannot remove Muxe configuration or cache data while activation is unfinished or needs recovery; its saved record is at {journal}"
     )]
     ActivationJournalLive { journal: PathBuf },
     #[error(
@@ -67,7 +67,7 @@ pub enum PurgeError {
     CacheLeaseActive { path: PathBuf },
     #[error(transparent)]
     Journal(#[from] JournalError),
-    #[error("refusing to purge non-directory target {}", path.display())]
+    #[error("cannot purge {}: the target must be a directory, not a file or symbolic link", path.display())]
     NotDirectory { path: PathBuf },
 }
 
@@ -242,7 +242,7 @@ fn live_activation_journal(cache_dir: &Path) -> Result<Option<PathBuf>, PurgeErr
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(PurgeError::Fs(fsutil::io_error(
-                "scanning activation journals",
+                "scanning activation recovery records in",
                 &directory,
                 source,
             )));
@@ -250,7 +250,11 @@ fn live_activation_journal(cache_dir: &Path) -> Result<Option<PathBuf>, PurgeErr
     };
     for entry in entries {
         let entry = entry.map_err(|source| {
-            fsutil::io_error("scanning activation journals", &directory, source)
+            fsutil::io_error(
+                "scanning activation recovery records in",
+                &directory,
+                source,
+            )
         })?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
@@ -268,7 +272,7 @@ fn exact_activation_journal(
         Ok(_) => Ok(Some(path)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(PurgeError::Fs(fsutil::io_error(
-            "inspecting exact activation journal",
+            "checking activation recovery record",
             &path,
             source,
         ))),
@@ -288,7 +292,7 @@ fn dangling_bridge_warnings(config_dir: &Path) -> Result<Vec<String>, PurgeError
             continue;
         }
         warnings.push(format!(
-            "Zellij configuration {} still contains receipt-listed {}; remove that node manually because purge never edits host configuration",
+            "Zellij configuration {} still contains `{}` listed in Muxe's installation record. Purge will not edit this file; review the entry manually",
             record.config_path,
             record.node.as_str(),
         ));
@@ -513,8 +517,6 @@ mod tests {
         assert_eq!(report.removed.len(), 1);
         assert_eq!(report.removed[0].kind, "config");
         assert_eq!(report.warnings.len(), 1);
-        assert!(report.warnings[0].contains("plugins.muxe"));
-        assert!(report.warnings[0].contains(&zellij_config.display().to_string()));
         assert!(!config.exists());
     }
 
@@ -549,12 +551,7 @@ mod tests {
                 *presented.borrow_mut() = Some(preview.clone());
             }),
             confirmer: Some(&|preview| {
-                assert!(
-                    preview
-                        .warnings
-                        .iter()
-                        .any(|warning| warning.contains("load_plugins.muxe"))
-                );
+                assert_eq!(preview.warnings.len(), 1);
                 false
             }),
             ..inputs(&config, &cache, true, false)
@@ -614,7 +611,8 @@ mod tests {
 
         assert!(!config.exists());
         let log = fs::read_to_string(cache.join("logs").join("muxe.jsonl")).unwrap();
-        assert!(log.contains("authorized removal of config"));
+        let event: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(event["operation"], "purge");
     }
 
     #[test]

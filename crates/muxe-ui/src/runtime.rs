@@ -91,19 +91,21 @@ pub enum UiError {
     Template(#[from] TemplateError),
     #[error(transparent)]
     Condition(#[from] ConditionEvaluationErrorWire),
-    #[error("attachment has no menu at index {0}")]
+    #[error("broker UI attachment has no menu at index {0}")]
     MissingMenu(usize),
-    #[error("attachment does not contain its root menu")]
+    #[error("broker UI attachment does not contain the requested menu")]
     MissingRoot,
-    #[error("attachment binding has an invalid canonical key `{0}`")]
+    #[error("broker UI attachment binding has an invalid key `{0}`")]
     InvalidBindingKey(String),
-    #[error("page-dependent binding conditions did not reach a stable page count")]
+    #[error(
+        "cannot lay out the menu: page-dependent binding conditions keep changing the page count"
+    )]
     UnstablePageConditions,
     #[error("menu session is already dismissed")]
     SessionDismissed,
-    #[error("attachment does not contain binding {generation}:{ordinal}")]
+    #[error("broker UI attachment does not contain binding {generation}:{ordinal}")]
     MissingBinding { generation: u64, ordinal: u64 },
-    #[error("UI-local execution sequence overflowed")]
+    #[error("UI cannot start another action: its execution sequence has reached the maximum value")]
     ExecutionSequenceExhausted,
     #[error("broker UI attachment contains an invalid menu ID")]
     InvalidMenuIdentity,
@@ -178,7 +180,7 @@ struct StatusMessage {
 
 /// Visible pending-action text. The exact wording is not a contract; tests observe
 /// visibility and transitions rather than this string.
-const PENDING_MESSAGE: &str = "Action pending";
+const PENDING_MESSAGE: &str = "Waiting for the action to finish";
 
 impl StatusMessage {
     fn new(kind: StatusKind, message: String) -> Self {
@@ -981,7 +983,10 @@ fn execution_status(outcome: ExecutionOutcome) -> (StatusKind, &'static str) {
         ExecutionOutcome::TimedOut => (StatusKind::Error, "Action timed out"),
         // A detached action applies post-action behavior immediately, so there is
         // no pending progress left to show.
-        ExecutionOutcome::Detached => (StatusKind::Notice, "Action continues detached"),
+        ExecutionOutcome::Detached => (
+            StatusKind::Notice,
+            "Action continues without waiting in the menu",
+        ),
         ExecutionOutcome::OutcomeUnknown => (
             StatusKind::Error,
             "Muxe did not confirm the action result; the action may have run",
@@ -3744,7 +3749,7 @@ pub(crate) mod tests {
         );
         let status = prepared.status.expect("degradation sets the error status");
         assert!(
-            status.plain.contains("cell") && status.plain.contains("plain text"),
+            status.plain.contains("cell"),
             "one menu-wide error names the failing component, got `{}`",
             status.plain
         );

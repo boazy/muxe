@@ -29,7 +29,7 @@ const POLL: Duration = Duration::from_millis(10);
 #[derive(Debug, Error)]
 pub enum ReadinessGateError {
     #[error(
-        "unsafe Zellij readiness lock path: {0}. The cache must be an owned directory with mode 0700, its parent must be owned and not writable by group or others, and the lock must be an owned single regular file with mode 0600. Symbolic links are not allowed."
+        "Zellij readiness lock path has unsafe ownership, permissions, or file type: {0}. The cache directory must belong to the current user with mode 0700. Its parent must belong to the current user and must not be writable by group or others. The lock must belong to the current user, be a regular file with one hard link, and have mode 0600. Symbolic links are not allowed."
     )]
     UnsafePath(PathBuf),
     #[error("cannot access Zellij readiness lock at {path}: {source}")]

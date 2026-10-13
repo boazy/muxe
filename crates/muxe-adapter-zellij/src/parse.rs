@@ -65,7 +65,7 @@ pub struct ContextMismatch {
     pub parameter: String,
     /// Closed registry path (`origin.tab.index`).
     pub reference: String,
-    /// Declared domain of the reference (`UnsignedInteger`, `PaneId`, ...).
+    /// Human-readable type of the reference, such as `pane ID` or `text`.
     pub context_type: String,
     /// Generated rust type of the parameter (`usize`, `String`, ...).
     pub expected: String,
@@ -342,11 +342,32 @@ fn context_placeholder(
         name: display_member(member_name, is_action),
         parameter: display_key(key, is_action),
         reference: reference.path.as_str().to_owned(),
-        context_type: format!("{context_type:?}"),
+        context_type: context_type_description(context_type).to_owned(),
         expected: generated.to_owned(),
         kind: if is_action { "action" } else { "command" },
         member: member_kind(member_name, is_action),
     })))
+}
+
+fn context_type_description(context_type: ContextType) -> &'static str {
+    match context_type {
+        ContextType::HostKind => "host type",
+        ContextType::ServerId => "host connection ID",
+        ContextType::ClientId => "client ID",
+        ContextType::SessionId => "session ID",
+        ContextType::WorkspaceId => "workspace ID",
+        ContextType::TabId => "tab ID",
+        ContextType::UnsignedInteger => "non-negative integer",
+        ContextType::PaneId => "pane ID",
+        ContextType::PaneType => "pane type",
+        ContextType::AbsolutePath => "absolute path",
+        ContextType::String => "text",
+        ContextType::InvocationSource => "invocation source",
+        ContextType::WorktreeId => "worktree ID",
+        ContextType::AgentId => "agent ID",
+        ContextType::Url => "URL",
+        ContextType::LinkHandlerId => "link handler ID",
+    }
 }
 
 /// Looks up the generated rust type for one parameter: `(command, arg)` rows

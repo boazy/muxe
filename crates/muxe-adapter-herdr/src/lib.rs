@@ -50,40 +50,44 @@ impl HerdrExecutionDiagnostic {
     pub const fn safe(self) -> muxe_adapter_api::SafeAdapterDiagnostic {
         muxe_adapter_api::SafeAdapterDiagnostic::new(match self {
             Self::CommandPanePluginMissing => {
-                "Herdr lost the managed muxe.command-panes registration after verification. Retry verification before another open; ensure muxe is on the Herdr server's PATH."
+                "Herdr could not find muxe.command-panes when Muxe requested a command pane, although the plugin had passed verification. Check its registration before opening another command pane."
             }
             Self::CommandPanePluginDisabled => {
-                "Herdr disabled the managed muxe.command-panes registration after verification. Retry verification before another open."
+                "Herdr reported that muxe.command-panes was disabled when Muxe requested a command pane, although the plugin had passed verification. Check its registration before opening another command pane."
             }
             Self::CommandPaneRejected => {
-                "Herdr rejected plugin.pane.open. Inspect the host plugin configuration; host response text is omitted."
+                "Herdr rejected the command-pane request (plugin.pane.open). The host's response text is omitted."
             }
             Self::CommandPaneOutcomeUnknown => {
-                "Herdr accepted plugin.pane.open but placement evidence was invalid. The command may already be running; inspect the host before repeating it."
+                "Herdr reported success for plugin.pane.open, but Muxe could not confirm where the command pane opened. The command may already be running. Inspect Herdr before repeating it."
             }
             Self::OriginNotActive => {
-                "The captured origin is not active after menu dismissal; Herdr overlays and popups require that origin to be active."
+                "The saved origin pane, tab, or workspace is not focused after the menu closed. Herdr requires that pane, tab, and workspace to be focused before opening an overlay or popup."
             }
-            Self::OriginUnavailable => "The captured command-pane origin is no longer available.",
+            Self::OriginUnavailable => {
+                "The saved command-pane origin was not found in its workspace and tab in the Herdr session snapshot."
+            }
             Self::CapturedCwdUnavailable => {
-                "The captured Herdr pane has no absolute working directory; command-pane creation cannot use that origin."
+                "The saved Herdr origin pane has no absolute working directory. Muxe cannot use it as the command pane's working directory."
             }
             Self::OriginGeometryUnavailable => {
-                "The captured Herdr pane has no valid terminal geometry."
+                "Herdr did not report positive row and column counts for the saved origin pane. Muxe cannot calculate the command pane's size."
             }
             Self::CwdUnavailable => {
-                "The command pane requires an absolute UTF-8 working directory from the configured action or captured origin."
+                "The command pane requires an absolute UTF-8 working directory from the configured action or saved origin pane."
             }
-            Self::MethodUnavailable => "Herdr does not support a required execution method.",
+            Self::MethodUnavailable => {
+                "A method required to run this action is missing from the installed Herdr schema or Muxe's bundled method metadata."
+            }
             Self::HostRejected => "Herdr rejected the action; host response text is omitted.",
             Self::TransportFailed => {
-                "The Herdr execution transport failed; inspect host connectivity before repeating the action."
+                "Muxe could not complete communication with Herdr. Check the Herdr connection. If the action's outcome is unknown, inspect Herdr before repeating it."
             }
             Self::CleanupFailed => {
-                "Execution cleanup failed; inspect Herdr for retained command or menu panes."
+                "Muxe could not finish cleaning up an execution. Inspect Herdr for command or menu panes that may remain open."
             }
             Self::DimensionsInvalid => {
-                "Herdr executable-pane dimensions are invalid or unsupported for the selected placement; check the split axis, size bounds, and parent geometry."
+                "The requested Herdr command-pane dimensions are invalid or unsupported for this placement. Check the split direction, size bounds, and parent pane's row and column counts."
             }
         })
     }

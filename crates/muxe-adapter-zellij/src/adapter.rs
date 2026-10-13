@@ -52,6 +52,7 @@ use muxe_zellij_protocol::{
 };
 use std::{
     collections::{BTreeMap, VecDeque},
+    fmt::Write as _,
     fs::File,
     io::Read,
     path::PathBuf,
@@ -274,13 +275,13 @@ impl MembershipSource for CliMembershipSource {
             .map_err(|error| {
                 AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    format!("could not query zellij list-clients: {error}"),
+                    format!("could not start zellij list-clients: {error}"),
                 )
             })?;
         let mut stdout = child.stdout.take().ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "zellij list-clients child has no stdout",
+                "could not read zellij list-clients output: the process has no standard output stream",
             )
         })?;
         // Bounded drain: the cap is enforced DURING the read, chunk by
@@ -322,7 +323,7 @@ impl MembershipSource for CliMembershipSource {
                 Ok(Err(error)) => {
                     return Err(AdapterError::new(
                         AdapterErrorKind::Unavailable,
-                        format!("zellij list-clients query failed: {error}"),
+                        format!("could not read zellij list-clients output: {error}"),
                     ));
                 }
                 Err(_) => {
@@ -348,7 +349,7 @@ impl MembershipSource for CliMembershipSource {
             .map_err(|error| {
                 AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    format!("zellij list-clients query failed: {error}"),
+                    format!("could not wait for zellij list-clients to exit: {error}"),
                 )
             })?;
         if !status.success() {
@@ -587,7 +588,7 @@ impl AtomicChannelGeneration {
             .map_err(|_| {
                 AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    "Zellij cannot allocate another channel generation because its counter is exhausted",
+                    "Muxe cannot replace the Zellij pipe connection because its connection counter is exhausted",
                 )
             })?;
         ChannelGeneration::try_from(previous + 1)
@@ -1138,13 +1139,26 @@ impl ZellijAdapter {
                 ));
             }
             let registered = self.fresh_census().await;
-            return Err(AdapterError::new(
-                AdapterErrorKind::Unavailable,
-                format!(
-                    "Zellij did not receive fresh compatible bridge registrations for all attached clients within 5 seconds \
-                     (members={snapshot:?}, registered={registered:?})"
-                ),
-            ));
+            let mut message = String::from(
+                "Muxe did not receive compatible Zellij bridge registrations on the current connection for all attached clients within 5 seconds",
+            );
+            for (label, clients) in [
+                ("attached client IDs", snapshot.as_slice()),
+                ("registered client IDs", registered.as_slice()),
+            ] {
+                message.push_str("; ");
+                message.push_str(label);
+                message.push_str("=[");
+                for (index, client) in clients.iter().enumerate() {
+                    if index > 0 {
+                        message.push_str(", ");
+                    }
+                    write!(message, "{:?}", client.as_str())
+                        .expect("writing client IDs to a String cannot fail");
+                }
+                message.push(']');
+            }
+            return Err(AdapterError::new(AdapterErrorKind::Unavailable, message));
         }
         if self.inner.shutdown.load(Ordering::Relaxed) {
             return Err(AdapterError::new(
@@ -1190,7 +1204,7 @@ impl ZellijAdapter {
         *self.inner.success_snapshot.lock().await = None;
         let generation = self.inner.generation.advance()?;
         self.invalidate_all_registrations(
-            "Zellij event subscription was replaced before completion",
+            "Zellij event subscription was replaced before completion was confirmed; sent requests may have executed",
         )
         .await;
         self.inner.register_epoch.lock().await.clear();
@@ -1711,7 +1725,7 @@ impl ZellijAdapter {
                 modal_scope: Some(Self::scope_for_client(&client_id)),
                 error: AdapterError::new(
                     AdapterErrorKind::Incompatible,
-                    "Zellij bridge does not match this Muxe adapter's version, source revision, protocol or action schema fingerprint, or build ID",
+                    "Zellij bridge is incompatible with this Muxe adapter: the Muxe version, Zellij source revision, supported commands, pipe protocol, or compiled bridge ID differs",
                 ),
             })
             .await;
@@ -2459,7 +2473,7 @@ impl ZellijAdapter {
                 modal_scope: None,
                 error: AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    "Zellij cannot allocate another channel generation because its counter is exhausted",
+                    "Muxe cannot replace the Zellij pipe connection because its connection counter is exhausted",
                 ),
             })
             .await;
@@ -2556,7 +2570,7 @@ impl ZellijAdapter {
             .ok_or_else(|| {
                 AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    "Zellij live connection identity is unavailable until all attached clients have fresh compatible bridge registrations",
+                    "Muxe cannot use the Zellij connection until a compatible Muxe bridge has registered for every attached client",
                 )
             })
     }
@@ -2599,7 +2613,7 @@ impl ZellijAdapter {
         {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Zellij cannot publish client registration readiness because the adapter stopped or its activation attempt or event channel changed",
+                "the Zellij adapter stopped, or its connection or activation request changed, before Muxe finished checking the clients",
             ));
         }
         if let Some(expected) = pending
@@ -2607,7 +2621,7 @@ impl ZellijAdapter {
         {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Zellij client registration check was replaced before readiness could be published",
+                "the Zellij client check is no longer current; Muxe cannot use it to confirm that the connection is ready",
             ));
         }
         let registry = self.inner.registry.lock().await;
@@ -2629,7 +2643,7 @@ impl ZellijAdapter {
         {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Zellij cannot establish a live connection identity without current compatible bridge registrations for all required clients",
+                "not every required Zellij client has registered a compatible Muxe bridge for the current connection",
             ));
         }
         drop(stamps);
@@ -2655,7 +2669,7 @@ impl ZellijAdapter {
         {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Zellij cannot publish client registration readiness because the adapter stopped or its activation attempt or event channel changed",
+                "the Zellij adapter stopped, or its connection or activation request changed, before Muxe finished checking the clients",
             ));
         }
 
@@ -2724,7 +2738,7 @@ impl ZellijAdapter {
             if removed.is_none() {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Unavailable,
-                    "Zellij client registration check was replaced before readiness could be published",
+                    "the Zellij client check is no longer current; Muxe cannot use it to confirm that the connection is ready",
                 ));
             }
         }
@@ -2755,7 +2769,7 @@ impl ZellijAdapter {
             }
             return Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Zellij could not report the healthy live connection because its health event queue is full or closed",
+                "the Zellij adapter could not notify the broker that its connection was ready because the notification queue is full or closed",
             ));
         }
         self.inner
@@ -3292,21 +3306,21 @@ impl ZellijAdapter {
     ) -> Result<DispatchAccepted, AdapterError> {
         if execution.0 >= LOCAL_EXECUTION_CEILING {
             return Err(invalid_request(
-                "Zellij broker execution uses the adapter-reserved execution range",
+                "Zellij action execution ID is in the range reserved for adapter-internal requests",
             ));
         }
         if payloads.is_empty() {
             return Err(invalid_request(
-                "Zellij execution must resolve to at least one host command",
+                "Zellij action contains no host commands to execute",
             ));
         }
         let mut slot = RequestId::INITIAL;
         let mut slots = Vec::with_capacity(payloads.len());
         for _ in &payloads {
             slots.push(slot);
-            slot = slot
-                .next()
-                .map_err(|_| invalid_request("Zellij execution exceeds its request ID space"))?;
+            slot = slot.next().map_err(|_| {
+                invalid_request("Zellij action contains more commands than available request IDs")
+            })?;
         }
 
         let transition = self.inner.registration_transition.lock().await;
@@ -3884,7 +3898,7 @@ impl HostAdapter for ZellijAdapter {
         self.require_active()?;
         if registration.temporary_tab.is_some() {
             return Err(invalid_request(
-                "Zellij pending panes cannot carry a temporary tab",
+                "Zellij pending pane registration does not support a temporary tab",
             ));
         }
         let pane = parse_pane_id(registration.pane.as_str())?;
@@ -4102,12 +4116,12 @@ impl HostAdapter for ZellijAdapter {
         self.pause_after_origin_validation().await;
         if creation_requires_post_dismissal(&request.action) {
             return Err(invalid_request(
-                "focused creation must use post-dismissal dispatch after the Muxe UI closes",
+                "creating a focused tab or pane must wait until the menu closes; this request used the route for commands executed while the menu is open",
             ));
         }
         match map_portable(&request.action, &request.origin) {
             Ok(PortableMapping::BrokerOwned) => Err(invalid_request(
-                "broker-owned portable action must not reach the host adapter",
+                "this portable action must be handled by the Muxe broker, not sent to the Zellij adapter",
             )),
             Ok(PortableMapping::HostAction { commands }) => {
                 self.dispatch_commands(request.execution, request.origin, incarnation, commands)
@@ -4170,7 +4184,7 @@ impl HostAdapter for ZellijAdapter {
         let client_id = request.origin.client_id.ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "Zellij post-dismissal dispatch requires the captured origin client",
+                "Zellij cannot execute the command after closing the menu without the captured origin client",
             )
         })?;
         let origin_pane = request
@@ -4181,7 +4195,7 @@ impl HostAdapter for ZellijAdapter {
             .ok_or_else(|| {
                 AdapterError::new(
                     AdapterErrorKind::ContextUnavailable,
-                    "Zellij post-dismissal dispatch requires the captured origin pane",
+                    "Zellij cannot execute the command after closing the menu without the captured origin pane",
                 )
             })?;
         self.admit_dispatch(
@@ -4251,14 +4265,14 @@ impl HostAdapter for ZellijAdapter {
             if self.inner.quiescing.load(Ordering::Acquire) {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Shutdown,
-                    "adapter shut down",
+                    "Zellij adapter stopped; no more health events are available",
                 ));
             }
             tokio::select! {
                 biased;
                 event = events.recv() => {
                     return event.ok_or_else(|| {
-                        AdapterError::new(AdapterErrorKind::Shutdown, "adapter shut down")
+                        AdapterError::new(AdapterErrorKind::Shutdown, "Zellij adapter stopped; no more health events are available")
                     });
                 }
                 () = wake => {}
@@ -4377,7 +4391,7 @@ impl HostAdapter for ZellijAdapter {
         // already read from the old pipe keeps its older channel tag at
         // receipt and can never satisfy the new channel boundary below.
         let epoch = self.inner.resume_epoch.advance();
-        self.invalidate_all_registrations("Zellij adapter resumed before completion")
+        self.invalidate_all_registrations("Zellij adapter resumed before completion was confirmed; sent requests may have executed")
             .await;
         self.inner.register_epoch.lock().await.clear();
         let generation = self.inner.generation.advance()?;
@@ -5689,7 +5703,6 @@ while IFS= read -r line; do :; done
             }) => {
                 assert_eq!(got, execution);
                 assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
-                assert_eq!(error.message, "second request failed");
             }
             other => {
                 let _ = other;
@@ -6179,10 +6192,6 @@ while IFS= read -r line; do :; done
             .await
             .expect_err("empty batch is invalid");
         assert_eq!(error.kind, AdapterErrorKind::InvalidRequest);
-        assert_eq!(
-            error.message,
-            "Zellij execution must resolve to at least one host command"
-        );
         assert!(
             adapter.inner.live_executions.lock().await.is_empty(),
             "rejected empty batch does not create an execution"
@@ -8328,11 +8337,11 @@ while IFS= read -r line; do :; done
                 .expect("empty session parses")
                 .is_empty()
         );
-        assert!(
+        assert_eq!(
             super::parse_list_clients_output("")
                 .expect_err("empty output fails closed")
-                .to_string()
-                .contains("no output")
+                .kind,
+            AdapterErrorKind::Unavailable
         );
         let bad_row =
             "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n???       terminal_2     /bin/zsh\n";

@@ -136,7 +136,10 @@ where
                 log(
                     logger,
                     &label,
-                    &format!("retire of {} failed: {error}", entry.socket().display()),
+                    &format!(
+                        "could not confirm retirement of the broker at {}: {error}",
+                        entry.socket().display()
+                    ),
                 )?;
                 return Err(error.into());
             }

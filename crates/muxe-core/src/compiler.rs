@@ -462,19 +462,22 @@ fn compile_settings(
     {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
-            "`settings.timeout` is not valid at binding scope; use `settings.execution.timeout` for action execution",
+            "binding `settings.timeout` is not supported; use `settings.execution.timeout` to limit action execution time",
             timeout.name_span.clone(),
         )]);
     }
     validate_fields(value, allowed)?;
     if let Some(timeout) = value.field("timeout") {
-        base.timeout = parse_duration_value(&timeout.value, true)?;
+        base.timeout = parse_duration_value(&timeout.value, true, "settings.timeout")?;
     }
     if let Some(after) = value.field("after_action") {
         base.after_action = parse_after_action(&after.value)?;
     }
     if let Some(repeat) = value.field("repeat") {
-        base.repeat = Some(expect_bool(&repeat.value, "`repeat` must be boolean")?);
+        base.repeat = Some(expect_bool(
+            &repeat.value,
+            "`settings.repeat` must be `true` or `false`",
+        )?);
     }
     if let Some(execution) = value.field("execution") {
         validate_fields(
@@ -482,50 +485,57 @@ fn compile_settings(
             &["mode", "timeout", "on-timeout", "on-menu-control"],
         )?;
         if let Some(mode) = execution.value.field("mode") {
-            base.execution.mode =
-                match expect_string(&mode.value, "execution mode must be a string")? {
-                    "await" => ExecutionMode::Await,
-                    "detach" => ExecutionMode::Detach,
-                    _ => {
-                        return Err(vec![ConfigDiagnostic::error(
-                            DiagnosticCode::InvalidValue,
-                            "execution mode must be `await` or `detach`",
-                            mode.value.span.clone(),
-                        )]);
-                    }
-                };
+            base.execution.mode = match expect_string(
+                &mode.value,
+                "`settings.execution.mode` must be a string: `await` or `detach`",
+            )? {
+                "await" => ExecutionMode::Await,
+                "detach" => ExecutionMode::Detach,
+                _ => {
+                    return Err(vec![ConfigDiagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        "`settings.execution.mode` must be `await` or `detach`",
+                        mode.value.span.clone(),
+                    )]);
+                }
+            };
             base.execution_mode_explicit = true;
         }
         if let Some(timeout) = execution.value.field("timeout") {
-            base.execution.timeout = parse_duration_value(&timeout.value, true)?;
+            base.execution.timeout =
+                parse_duration_value(&timeout.value, true, "settings.execution.timeout")?;
         }
         if let Some(action) = execution.value.field("on-timeout") {
-            base.execution.on_timeout =
-                match expect_string(&action.value, "on-timeout must be a string")? {
-                    "detach" => TimeoutAction::Detach,
-                    "cancel" => TimeoutAction::Cancel,
-                    _ => {
-                        return Err(vec![ConfigDiagnostic::error(
-                            DiagnosticCode::InvalidValue,
-                            "on-timeout must be `detach` or `cancel`",
-                            action.value.span.clone(),
-                        )]);
-                    }
-                };
+            base.execution.on_timeout = match expect_string(
+                &action.value,
+                "`settings.execution.on-timeout` must be a string: `detach` or `cancel`",
+            )? {
+                "detach" => TimeoutAction::Detach,
+                "cancel" => TimeoutAction::Cancel,
+                _ => {
+                    return Err(vec![ConfigDiagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        "`settings.execution.on-timeout` must be `detach` or `cancel`",
+                        action.value.span.clone(),
+                    )]);
+                }
+            };
         }
         if let Some(action) = execution.value.field("on-menu-control") {
-            base.execution.on_menu_control =
-                match expect_string(&action.value, "on-menu-control must be a string")? {
-                    "detach" => MenuControlAction::Detach,
-                    "cancel" => MenuControlAction::Cancel,
-                    _ => {
-                        return Err(vec![ConfigDiagnostic::error(
-                            DiagnosticCode::InvalidValue,
-                            "on-menu-control must be `detach` or `cancel`",
-                            action.value.span.clone(),
-                        )]);
-                    }
-                };
+            base.execution.on_menu_control = match expect_string(
+                &action.value,
+                "`settings.execution.on-menu-control` must be a string: `detach` or `cancel`",
+            )? {
+                "detach" => MenuControlAction::Detach,
+                "cancel" => MenuControlAction::Cancel,
+                _ => {
+                    return Err(vec![ConfigDiagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        "`settings.execution.on-menu-control` must be `detach` or `cancel`",
+                        action.value.span.clone(),
+                    )]);
+                }
+            };
         }
     }
     if scope == SettingsScope::Global {
@@ -537,7 +547,8 @@ fn compile_settings(
             }
             if let Some(debounce) = reload.value.field("debounce") {
                 base.reload.debounce =
-                    parse_duration_value(&debounce.value, false)?.expect("`off` was rejected");
+                    parse_duration_value(&debounce.value, false, "settings.reload.debounce")?
+                        .expect("`off` was rejected");
             }
         }
         if let Some(host) = value.field("host") {
@@ -568,13 +579,16 @@ fn compile_settings(
 }
 
 fn parse_after_action(value: &ConfigValue) -> Result<AfterAction, Vec<ConfigDiagnostic>> {
-    match expect_string(value, "after_action must be a string")? {
+    match expect_string(
+        value,
+        "`settings.after_action` must be a string: `quit`, `return`, or `stay`",
+    )? {
         "quit" => Ok(AfterAction::Quit),
         "return" => Ok(AfterAction::Return),
         "stay" => Ok(AfterAction::Stay),
         _ => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
-            "after_action must be `quit`, `return`, or `stay`",
+            "`settings.after_action` must be `quit`, `return`, or `stay`",
             value.span.clone(),
         )]),
     }
@@ -756,7 +770,10 @@ fn parse_theme_document(document: &ConfigDocument) -> Result<Theme, Vec<ConfigDi
                         scalar_text(&field.value).map_err(|_| {
                             vec![ConfigDiagnostic::error(
                                 DiagnosticCode::InvalidTheme,
-                                "theme `settings` values must be scalars",
+                                format!(
+                                    "theme setting `{}` must be a string, number, or boolean",
+                                    field.name
+                                ),
                                 field.value.span.clone(),
                             )]
                         })?,
@@ -903,7 +920,7 @@ fn parse_color_scheme_document(
     if colors.values().any(|value| *value == "inherit") {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidColorScheme,
-            "`inherit` is reserved for the embedded default color scheme; user color values must be palette aliases or `#hex`",
+            "`inherit` is reserved for the embedded default color scheme; user color values must be color aliases, `#rgb`, or `#rrggbb`",
             document.root.span.clone(),
         )]);
     }
@@ -935,7 +952,7 @@ fn flatten_scalar_mapping<'value, Text>(
         if let ConfigValueKind::Mapping(_) = &field.value.kind {
             flatten_scalar_mapping(&field.value, &name, output, subject, to_text)?;
         } else {
-            let text = expect_string(&field.value, format!("{subject} values must be strings"))?;
+            let text = expect_string(&field.value, format!("{subject} `{name}` must be a string"))?;
             output.insert(name, to_text(text));
         }
     }
@@ -1242,7 +1259,7 @@ impl MenuCompiler<'_> {
                 if self.action_validator.is_none() {
                     return Err(vec![ConfigDiagnostic::error(
                         DiagnosticCode::NativeActionRejected,
-                        "native actions require an active adapter validator",
+                        "cannot validate native actions without a host adapter",
                         value.span.clone(),
                     )]);
                 }
@@ -1477,6 +1494,22 @@ fn positional_field(kind: &ActionKind, position: usize) -> Option<&'static str> 
         .find(|parameter| parameter.positional == Some(position))
         .map(|parameter| parameter.name.as_str())
 }
+fn unknown_action_argument_message(schema: &PortableActionSchema, field: &str) -> String {
+    let mut message = format!("action `{}` has no argument `{field}`; ", schema.kind);
+    if schema.parameters.is_empty() {
+        message.push_str("this action accepts no arguments");
+    } else {
+        message.push_str("allowed arguments: ");
+        for (index, parameter) in schema.parameters.iter().enumerate() {
+            if index != 0 {
+                message.push_str(", ");
+            }
+            message.push_str(parameter.name.as_str());
+        }
+    }
+    message
+}
+
 fn validate_portable_action_fields(
     schema: PortableActionSchema,
     fields: &[ActionField<'_>],
@@ -1516,7 +1549,7 @@ fn validate_portable_action_fields(
         .map(|field| {
             ConfigDiagnostic::error(
                 DiagnosticCode::InvalidActionArguments,
-                format!("unknown action argument `{}`", field.name),
+                unknown_action_argument_message(&schema, &field.name),
                 field.name_span.clone(),
             )
         })
@@ -1535,7 +1568,7 @@ fn validate_portable_action_fields(
             .map(|parameter| {
                 ConfigDiagnostic::error(
                     DiagnosticCode::MissingField,
-                    format!("action requires `{}`", parameter.name),
+                    format!("action `{}` requires `{}`", schema.kind, parameter.name),
                     fields
                         .first()
                         .map_or_else(|| fallback_span.clone(), |field| field.value.span.clone()),
@@ -1629,14 +1662,14 @@ fn validate_execution(
     if policy.execution_timeout_is_cancel() && !capabilities.cancellable {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
-            "on-timeout: cancel requires a cancellable action",
+            "`settings.execution.on-timeout: cancel` requires an action that the host can cancel",
             span,
         )]);
     }
     if policy.on_menu_control == MenuControlAction::Cancel && !capabilities.cancellable {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
-            "on-menu-control: cancel requires a cancellable action",
+            "`settings.execution.on-menu-control: cancel` requires an action that the host can cancel",
             span,
         )]);
     }
@@ -1921,7 +1954,11 @@ fn parse_portable_action_fields(
         let value =
             match parameter.value_type {
                 ActionParameterType::MenuName => ParsedActionValue::MenuName {
-                    value: expect_string(&field.value, "`menu` must be a menu ID")?.to_owned(),
+                    value: expect_string(
+                        &field.value,
+                        "menu:open `menu` must be a string naming a menu",
+                    )?
+                    .to_owned(),
                     span: field.value.span.clone(),
                 },
                 ActionParameterType::MenuMapping => {
@@ -1962,12 +1999,12 @@ fn parse_portable_action_fields(
                 ActionParameterType::PaneType => {
                     let value = expect_string(
                         &field.value,
-                        "`pane-type` must be split, overlay, or popup",
+                        "pane:open `pane-type` must be `split`, `overlay`, or `popup`",
                     )?;
                     if crate::action::ExecutablePaneType::parse(value).is_none() {
                         return Err(vec![ConfigDiagnostic::error(
                             DiagnosticCode::InvalidActionArguments,
-                            "`pane-type` must be split, overlay, or popup",
+                            "pane:open `pane-type` must be `split`, `overlay`, or `popup`",
                             field.value.span.clone(),
                         )]);
                     }
@@ -1992,33 +2029,7 @@ fn parse_portable_action_fields(
 }
 
 fn action_parameter_label(schema: PortableActionSchema, parameter: ActionParameterName) -> String {
-    let parameter_type = schema
-        .parameters
-        .iter()
-        .find(|candidate| candidate.name == parameter)
-        .map(|candidate| candidate.value_type)
-        .expect("label requested for declared parameter");
-    match (parameter_type, parameter) {
-        (ActionParameterType::StringContextOnly, _) => return "keyboard text".to_owned(),
-        (_, ActionParameterName::Enabled) => return "enabled".to_owned(),
-        (_, ActionParameterName::Visible) => return "pane visible".to_owned(),
-        (_, ActionParameterName::Index) => return "index".to_owned(),
-        _ => {}
-    }
-    let is_choice = schema.constraints.iter().any(|constraint| {
-        matches!(
-            constraint,
-            ActionConstraint::ExactlyOne { parameters, .. } if parameters.contains(&parameter)
-        )
-    });
-    if is_choice {
-        parameter.to_string()
-    } else {
-        format!(
-            "{} {parameter}",
-            schema.category.to_string().to_ascii_lowercase()
-        )
-    }
+    format!("action `{}` argument `{parameter}`", schema.kind)
 }
 fn validate_key_capabilities(
     required: KeyCapabilities,
@@ -2211,7 +2222,7 @@ fn compact_action_fields(
     let Some((type_token, arguments)) = tokens.split_first() else {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidAction,
-            "action is empty",
+            "action string is empty; specify an action name",
             span,
         )]);
     };
@@ -2252,7 +2263,10 @@ fn compact_action_fields(
             let Some(name) = positional_field(&kind, position) else {
                 return Err(vec![ConfigDiagnostic::error(
                     DiagnosticCode::InvalidActionArguments,
-                    "too many positional action arguments",
+                    format!(
+                        "action `{type_name}` does not accept a positional argument at position {}",
+                        position + 1
+                    ),
                     span,
                 )]);
             };
@@ -2317,7 +2331,10 @@ fn compact_tokens(value: &str) -> Result<Vec<String>, String> {
         started = true;
     }
     if quote.is_some() || escaped {
-        return Err("unterminated quoted compact action argument".to_owned());
+        return Err(
+            "quoted action argument is missing its closing quote or ends with an incomplete escape"
+                .to_owned(),
+        );
     }
     if started {
         tokens.push(current);
@@ -2370,7 +2387,7 @@ fn compact_scalar(token: &str, span: SourceSpan) -> Result<ConfigValue, Vec<Conf
     .map_err(|_| {
         vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
-            "compact action argument is not a valid YAML 1.2 scalar value",
+            "action argument is not a valid YAML 1.2 value (string, number, boolean, or null)",
             span.clone(),
         )]
     })?;
@@ -2386,7 +2403,7 @@ fn compact_scalar(token: &str, span: SourceSpan) -> Result<ConfigValue, Vec<Conf
     ) {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
-            "compact actions accept only scalar arguments; use a mapping with a `type` field for list or mapping arguments",
+            "action strings accept only string, number, boolean, null, or context-reference arguments; use an action mapping with `type` for lists or mappings",
             span,
         )]);
     }
@@ -2419,7 +2436,10 @@ fn compile_conditions(
         let Some(field) = value.field(name) else {
             return Ok(None);
         };
-        let source = expect_string(&field.value, "condition must be a CEL string")?;
+        let source = expect_string(
+            &field.value,
+            format!("`conditions.{name}` must be a string containing a CEL expression"),
+        )?;
         let program = ConditionProgram::compile(source, field.value.span.clone())
             .map_err(|error| vec![error])?;
         if program.uses_pages() && !pager {
@@ -2466,13 +2486,14 @@ impl Injection {
         validate_fields(&select.value, &["type", "value"])?;
         let selector_type = expect_string(
             &required_field(&select.value, "type")?.value,
-            "selector type must be string",
+            "injection `select.type` must be a string",
         )?;
         let selector_value = select
             .value
             .field("value")
             .map(|field| {
-                expect_string(&field.value, "selector value must be string").map(str::to_owned)
+                expect_string(&field.value, "injection `select.value` must be a string")
+                    .map(str::to_owned)
             })
             .transpose()?;
         let selector = Selector::parse(selector_type, selector_value, select.value.span.clone())?;
@@ -2491,14 +2512,14 @@ impl Injection {
         )?;
         let defaults = match expect_string(
             &required_field(&action.value, "type")?.value,
-            "injection action type must be string",
+            "injection `action.type` must be a string: `override` or `defaults`",
         )? {
             "override" => false,
             "defaults" => true,
             _ => {
                 return Err(vec![ConfigDiagnostic::error(
                     DiagnosticCode::InvalidInjection,
-                    "injection action type must be `override` or `defaults`",
+                    "injection `action.type` must be `override` or `defaults`",
                     action.value.span.clone(),
                 )]);
             }
@@ -2533,7 +2554,7 @@ impl Selector {
             value.ok_or_else(|| {
                 vec![ConfigDiagnostic::error(
                     DiagnosticCode::MissingField,
-                    "selector requires `value`",
+                    format!("injection selector `{kind}` requires `select.value`"),
                     span.clone(),
                 )]
             })
@@ -2546,7 +2567,7 @@ impl Selector {
                 .map_err(|error| {
                     vec![ConfigDiagnostic::error(
                         DiagnosticCode::InvalidInjection,
-                        error.to_string(),
+                        format!("invalid injection `select.value` regular expression: {error}"),
                         span,
                     )]
                 }),
@@ -2556,7 +2577,7 @@ impl Selector {
                 .map_err(|error| {
                     vec![ConfigDiagnostic::error(
                         DiagnosticCode::InvalidInjection,
-                        error.to_string(),
+                        format!("invalid injection `select.value` regular expression: {error}"),
                         span,
                     )]
                 }),
@@ -2712,14 +2733,14 @@ fn host_filter_matches(
         let text = host.as_str().ok_or_else(|| {
             vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidValue,
-                format!("`{name}` values must be host names"),
+                format!("`{name}` entries must be strings naming a host: `zellij` or `herdr`"),
                 host.span.clone(),
             )]
         })?;
         let kind = text.parse::<OriginHostKind>().map_err(|_| {
             vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidValue,
-                format!("unknown host `{text}` in `{name}`"),
+                format!("unknown host `{text}` in `{name}`; use `zellij` or `herdr`"),
                 host.span.clone(),
             )]
         })?;
@@ -2821,11 +2842,11 @@ fn reject_user_authored_inline_markers(value: &ConfigValue) -> Result<(), Vec<Co
                         diagnostics.push(
                             ConfigDiagnostic::error(
                                 DiagnosticCode::UnknownField,
-                                "`_muxe_inline_id` is reserved for compiler-generated inline menu identities",
+                                "`_muxe_inline_id` is an internal field and cannot be set in configuration",
                                 field.name_span.clone(),
                             )
                             .with_help(
-                                "this compiler-generated field cannot be authored in configuration",
+                                "remove `_muxe_inline_id`; Muxe identifies inline submenus automatically",
                             ),
                         );
                     }
@@ -2948,7 +2969,10 @@ fn validate_menu_cycles(
         if let Some(span) = detect_cycle(node, &graph, &mut visiting, &mut visited) {
             return Err(vec![ConfigDiagnostic::error(
                 DiagnosticCode::MenuCycle,
-                format!("menu reference cycle includes `{}`", node.display()),
+                format!(
+                    "menu `{}` can open itself through a cycle of menu references",
+                    node.display()
+                ),
                 span,
             )]);
         }
@@ -3057,7 +3081,9 @@ fn action_scalar(
         ConfigValueKind::Sequence(_) | ConfigValueKind::Mapping(_) => {
             Err(vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidActionArguments,
-                format!("{parameter} must be a scalar or typed context reference"),
+                format!(
+                    "{parameter} must be a string, number, boolean, null, or context reference; lists and mappings are not accepted"
+                ),
                 value.span.clone(),
             )])
         }
@@ -3077,7 +3103,17 @@ fn action_string_scalar(
         }
         ConfigValueKind::Context(_) => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::ContextTypeMismatch,
-            format!("{parameter} has an incompatible context reference type"),
+            format!(
+                "{parameter} cannot use this context reference; {}",
+                match allowance {
+                    ContextAllowance::StringOnly => "the referenced value must be a string",
+                    ContextAllowance::Textual =>
+                        "the referenced value must be textual, not an unsigned integer",
+                    ContextAllowance::AbsolutePath =>
+                        "the referenced value must be an absolute path",
+                    ContextAllowance::WorkspaceId => "the referenced value must be a workspace ID",
+                }
+            ),
             scalar.value.span.clone(),
         )]),
         _ => Err(vec![ConfigDiagnostic::error(
@@ -3098,7 +3134,7 @@ fn action_direction_scalar(
     {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
-            "direction must be left, right, up, down, next, or previous",
+            format!("{parameter} must be `left`, `right`, `up`, `down`, `next`, or `previous`"),
             scalar.value.span.clone(),
         )]);
     }
@@ -3114,12 +3150,14 @@ fn action_bool_scalar(
         ConfigValueKind::Boolean(_) => Ok(scalar),
         ConfigValueKind::Context(_) => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::ContextTypeMismatch,
-            format!("{parameter} has no boolean context reference in v1"),
+            format!(
+                "{parameter} must be `true` or `false`; configuration version 1 has no boolean context references"
+            ),
             scalar.value.span,
         )]),
         _ => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
-            format!("{parameter} must be boolean"),
+            format!("{parameter} must be `true` or `false`"),
             scalar.value.span,
         )]),
     }
@@ -3136,7 +3174,7 @@ fn action_index_scalar(value: &ConfigValue) -> Result<ActionScalar, Vec<ConfigDi
         }
         ConfigValueKind::Context(_) => Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::ContextTypeMismatch,
-            "index requires an unsigned-integer context reference",
+            "`index` context reference must provide a non-negative integer",
             scalar.value.span.clone(),
         )]),
         _ => Err(vec![ConfigDiagnostic::error(
@@ -3151,7 +3189,7 @@ fn action_key_sequence(value: &ConfigValue) -> Result<Vec<ActionScalar>, Vec<Con
     let ConfigValueKind::Sequence(values) = &value.kind else {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
-            "keys must be an array",
+            "keyboard:send `keys` must be a list of keys or string-valued context references",
             value.span.clone(),
         )]);
     };
@@ -3186,7 +3224,7 @@ fn action_string_sequence(
     let ConfigValueKind::Sequence(values) = &value.kind else {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidActionArguments,
-            format!("{parameter} must be an array"),
+            format!("{parameter} must be a list"),
             value.span.clone(),
         )]);
     };
@@ -3225,7 +3263,7 @@ fn string_sequence(
     let ConfigValueKind::Sequence(values) = &value.kind else {
         return Err(vec![ConfigDiagnostic::error(
             DiagnosticCode::InvalidValue,
-            format!("{name} must be an array"),
+            format!("`{name}` must be a list of strings"),
             value.span.clone(),
         )]);
     };
@@ -3260,7 +3298,7 @@ fn optional_duration(
 ) -> Result<Option<Duration>, Vec<ConfigDiagnostic>> {
     value
         .field(name)
-        .map(|field| parse_duration_value(&field.value, off_allowed))
+        .map(|field| parse_duration_value(&field.value, off_allowed, name))
         .transpose()
         .map(Option::flatten)
 }
@@ -3268,13 +3306,17 @@ fn optional_duration(
 fn parse_duration_value(
     value: &ConfigValue,
     off_allowed: bool,
+    field_name: &str,
 ) -> Result<Option<Duration>, Vec<ConfigDiagnostic>> {
-    let text = expect_string(value, "duration must be a string")?;
+    let text = expect_string(
+        value,
+        format!("`{field_name}` duration must be a string such as `500ms`, `10s`, or `1m`"),
+    )?;
     if text == "off" {
         return off_allowed.then_some(None).ok_or_else(|| {
             vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidValue,
-                "`off` is not valid here",
+                format!("`{field_name}` cannot be `off`; use a non-negative integer followed by `ms`, `s`, or `m`"),
                 value.span.clone(),
             )]
         });
@@ -3292,7 +3334,7 @@ fn parse_duration_value(
         .ok_or_else(|| {
             vec![ConfigDiagnostic::error(
                 DiagnosticCode::InvalidValue,
-                "duration must use ms, s, m, or off",
+                format!("`{field_name}` duration must be a non-negative integer followed by `ms`, `s`, or `m`{}", if off_allowed { ", or `off`" } else { "" }),
                 value.span.clone(),
             )]
         })
@@ -3305,7 +3347,7 @@ fn required_field<'a>(
     value.field(name).ok_or_else(|| {
         vec![ConfigDiagnostic::error(
             DiagnosticCode::MissingField,
-            format!("missing required `{name}`"),
+            format!("missing required field `{name}`"),
             value.span.clone(),
         )]
     })
@@ -3319,7 +3361,7 @@ fn required_field_mut<'a>(
     value.field_mut(name).ok_or_else(|| {
         vec![ConfigDiagnostic::error(
             DiagnosticCode::MissingField,
-            format!("missing required `{name}`"),
+            format!("missing required field `{name}`"),
             span,
         )]
     })
@@ -3396,14 +3438,18 @@ fn mapping_fields_mut<'a>(
 }
 
 fn validate_fields(value: &ConfigValue, allowed: &[&str]) -> Result<(), Vec<ConfigDiagnostic>> {
-    let fields = mapping_fields(value, "expected a mapping")?;
+    let fields = mapping_fields(value, "expected a YAML mapping of field names to values")?;
     let mut errors = Vec::new();
     for field in fields {
         if !allowed.contains(&field.name.as_str()) {
             let suggestion = nearest(&field.name, allowed);
             let diagnostic = ConfigDiagnostic::error(
                 DiagnosticCode::UnknownField,
-                format!("unknown field `{}`", field.name),
+                format!(
+                    "unknown field `{}`; allowed fields: {}",
+                    field.name,
+                    allowed.join(", ")
+                ),
                 field.name_span.clone(),
             );
             errors.push(if let Some(suggestion) = suggestion {

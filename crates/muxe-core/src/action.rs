@@ -461,7 +461,7 @@ macro_rules! portable_action_definitions {
                 ActionConstraint::Requires {
                     parameter: ActionParameterName::Args,
                     required_parameter: ActionParameterName::Program,
-                    message: "tab args requires `program`",
+                    message: "tab:create `args` requires `program`",
                 };
             ],
         }
@@ -496,7 +496,7 @@ macro_rules! portable_action_definitions {
                 ActionConstraint::ExactlyOne {
                     parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
                     validation_phase: ConstraintValidationPhase::AfterFields,
-                    message: "action requires exactly one of `index` or `direction`",
+                    message: "tab:focus requires exactly one of `index` or `direction`",
                     error_location: ConstraintErrorLocation::FirstFieldValue,
                 };
             ],
@@ -514,7 +514,7 @@ macro_rules! portable_action_definitions {
                 ActionConstraint::ExactlyOne {
                     parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
                     validation_phase: ConstraintValidationPhase::AfterFields,
-                    message: "action requires exactly one of `index` or `direction`",
+                    message: "tab:move requires exactly one of `index` or `direction`",
                     error_location: ConstraintErrorLocation::FirstFieldValue,
                 };
             ],
@@ -532,7 +532,7 @@ macro_rules! portable_action_definitions {
                 ActionConstraint::ExactlyOne {
                     parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
                     validation_phase: ConstraintValidationPhase::AfterFields,
-                    message: "action requires exactly one of `index` or `direction`",
+                    message: "tab:swap requires exactly one of `index` or `direction`",
                     error_location: ConstraintErrorLocation::FirstFieldValue,
                 };
             ],
@@ -578,7 +578,7 @@ macro_rules! portable_action_definitions {
                 ActionConstraint::Requires {
                     parameter: ActionParameterName::Args,
                     required_parameter: ActionParameterName::Program,
-                    message: "pane args requires `program`",
+                    message: "pane:split `args` requires `program`",
                 };
             ],
         }
@@ -603,7 +603,7 @@ macro_rules! portable_action_definitions {
                 ActionConstraint::ExactlyOne {
                     parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
                     validation_phase: ConstraintValidationPhase::AfterFields,
-                    message: "action requires exactly one of `index` or `direction`",
+                    message: "pane:focus requires exactly one of `index` or `direction`",
                     error_location: ConstraintErrorLocation::FirstFieldValue,
                 };
             ],
@@ -621,7 +621,7 @@ macro_rules! portable_action_definitions {
                 ActionConstraint::ExactlyOne {
                     parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
                     validation_phase: ConstraintValidationPhase::AfterFields,
-                    message: "action requires exactly one of `index` or `direction`",
+                    message: "pane:move requires exactly one of `index` or `direction`",
                     error_location: ConstraintErrorLocation::FirstFieldValue,
                 };
             ],
@@ -639,7 +639,7 @@ macro_rules! portable_action_definitions {
                 ActionConstraint::ExactlyOne {
                     parameters: &[ActionParameterName::Index, ActionParameterName::Direction],
                     validation_phase: ConstraintValidationPhase::AfterFields,
-                    message: "action requires exactly one of `index` or `direction`",
+                    message: "pane:swap requires exactly one of `index` or `direction`",
                     error_location: ConstraintErrorLocation::FirstFieldValue,
                 };
             ],
@@ -1505,7 +1505,11 @@ fn resolve_cwd(
 ) -> Result<CommandCwd, PortableActionResolutionError> {
     if let Some(value) = context_value(scalar, origin)? {
         let ContextValue::AbsolutePath(path) = value else {
-            return Err(invalid_value(scalar, parameter, "value must be a string"));
+            return Err(invalid_value(
+                scalar,
+                parameter,
+                "context reference must provide an absolute path",
+            ));
         };
         return AbsolutePath::new(path)
             .map(CommandCwd::Origin)
@@ -1528,7 +1532,7 @@ fn resolve_workspace(
             _ => Err(invalid_value(
                 scalar,
                 "tab.workspace-id",
-                "value must be a string",
+                "context reference must provide a workspace ID",
             )),
         };
     }
@@ -1675,7 +1679,7 @@ fn resolve_amount(
         _ => Err(invalid_value(
             scalar,
             "pane.amount",
-            "value must be a non-null scalar",
+            "value must be a string, number, or boolean",
         )),
     }
 }

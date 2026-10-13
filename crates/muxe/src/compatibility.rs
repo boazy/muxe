@@ -25,11 +25,11 @@ pub const HERDR_LATEST_VERIFIED: HerdrRelease = HerdrRelease::new(0, 9, 3);
 #[derive(Debug, Error)]
 pub enum CompatibilityError {
     #[error(
-        "the bundled Herdr protocol version {0} exceeds the range supported by Muxe's compatibility record"
+        "this Muxe build cannot represent its bundled Herdr protocol version {0}; the build's compatibility data is invalid"
     )]
     HerdrProtocolOutOfRange(u64),
     #[error(
-        "the bundled Herdr schema version {0} exceeds the range supported by Muxe's compatibility record"
+        "this Muxe build cannot represent its bundled Herdr API schema version {0}; the build's compatibility data is invalid"
     )]
     HerdrSchemaOutOfRange(u64),
     #[error("this Muxe build contains an invalid Herdr request-schema SHA-256 checksum")]
@@ -87,7 +87,7 @@ fn packaged_wasm_artifact() -> Result<PackagedWasmArtifact, CompatibilityError> 
     const DIGEST: &str = env!("MUXE_WASM_SHA256");
     if DIGEST == "unavailable" {
         return Ok(PackagedWasmArtifact::Unavailable {
-            reason: "no packaged bridge digest was supplied for this development build",
+            reason: "this development build does not include a checksum for the packaged Zellij bridge",
         });
     }
     if DIGEST.len() != 64
@@ -164,7 +164,7 @@ pub enum AssetVerificationError {
     #[error("this Muxe build contains invalid host compatibility information: {0}")]
     Embedded(#[from] CompatibilityError),
     #[error(
-        "the packaged Zellij bridge does not match this Muxe build: expected SHA-256 checksum {expected}, found {found}"
+        "the packaged Zellij bridge does not match this Muxe build: expected SHA-256 checksum {expected}, found {found}. Reinstall the complete Muxe release so the executable and bridge come from the same build"
     )]
     DigestMismatch { expected: String, found: String },
 }
@@ -220,28 +220,26 @@ pub fn render_human(record: &NativeCompatibilityRecord) -> String {
     match &handoff.herdr {
         Some(herdr) => {
             lines.push(format!(
-                "Herdr bundled schema: protocol {} schema {} (fingerprint {})",
+                "Herdr API definitions included in this build: protocol version {}, schema version {} (checksum {})",
                 herdr.protocol_version,
                 herdr.schema_version,
                 hex_lower(&herdr.schema_fingerprint.0)
             ));
             lines.push(format!(
-                "Herdr verified methods ({}): {}",
+                "Herdr API methods tested with Muxe ({}): {}",
                 record.herdr_verified_methods.len(),
                 record.herdr_verified_methods.join(", ")
             ));
         }
-        None => lines.push(
-            "Herdr fingerprints: unavailable (no verified adapter source in this build)".to_owned(),
-        ),
+        None => lines.push("Herdr compatibility checksums: unavailable in this build".to_owned()),
     }
     match &handoff.zellij {
         Some(zellij) => lines.push(format!(
-            "Zellij source revision {} (fingerprints embedded)",
+            "Zellij source revision {} (compatibility checksums included in this build)",
             zellij.source_revision
         )),
         None => lines.push(
-            "Zellij action/bridge fingerprints: unavailable (no verified adapter source in this build)"
+            "Zellij action and bridge compatibility checksums: unavailable in this build"
                 .to_owned(),
         ),
     }

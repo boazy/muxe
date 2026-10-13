@@ -51,15 +51,15 @@ pub(crate) fn persisted_host_label(host: HostKind) -> &'static str {
 pub enum RegistryError {
     #[error(transparent)]
     Fs(#[from] FsError),
-    #[error("registry at {} is corrupt: {source}", path.display())]
+    #[error("broker registry at {} is corrupt: {source}", path.display())]
     Corrupt {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
-    #[error("registry at {} uses unsupported schema version {version}", path.display())]
+    #[error("broker registry at {} uses unsupported schema version {version}", path.display())]
     UnsupportedVersion { path: PathBuf, version: u32 },
-    #[error("Muxe cannot update the broker registry: {0}")]
+    #[error("Muxe cannot use or update this broker registration: {0}")]
     Unauthorized(String),
     #[error("broker registry identity conflict: {0}")]
     Conflict(String),
@@ -370,7 +370,7 @@ impl<'a> NativeBrokerAuthority<'a> {
             || matching.next().is_some()
         {
             return Err(RegistryError::Unauthorized(
-                "the broker has no exact, unambiguous registration in the private native store"
+                "the saved broker registry has no unique entry matching this broker's socket and host identity"
                     .to_owned(),
             ));
         }
@@ -387,12 +387,13 @@ impl<'a> NativeBrokerAuthority<'a> {
         let path = super::journal::activation_dir(cache).join(snapshot.unit.journal_name());
         let saved = super::journal::read_journal(&path).map_err(|error| {
             RegistryError::Unauthorized(format!(
-                "cannot admit the private native activation record: {error}"
+                "cannot read the saved activation record to verify this broker: {error}"
             ))
         })?;
         if saved != *snapshot {
             return Err(RegistryError::Conflict(
-                "the private activation record changed before broker-role admission".to_owned(),
+                "the saved activation record changed before Muxe could verify this broker"
+                    .to_owned(),
             ));
         }
         let known = saved
@@ -413,7 +414,7 @@ impl<'a> NativeBrokerAuthority<'a> {
         .map_err(|error| RegistryError::Unauthorized(error.to_string()))?;
         if !known || units.len() != 1 || units[0].unit_kind() != saved.unit {
             return Err(RegistryError::Unauthorized(
-                "the broker is not an exact participant of the private native activation record"
+                "the broker does not match a broker and host group listed in the saved activation record"
                     .to_owned(),
             ));
         }
@@ -431,7 +432,7 @@ impl<'a> NativeBrokerAuthority<'a> {
                 || entry.live_server().is_none_or(|id| id.as_str().is_empty())
         }) {
             return Err(RegistryError::Unauthorized(
-                "the saved OS identity is not bound to a complete native self-registration"
+                "the saved OS process identity has a different process ID or lacks the broker's registration ID, start time, or server ID"
                     .to_owned(),
             ));
         }
@@ -485,8 +486,11 @@ impl MemberCensus {
         for entry in entries {
             if entry.bridge_identity.as_ref() != Some(identity) {
                 return Err(RegistryError::Unauthorized(format!(
-                    "registry entry contains a different managed bridge location (expected {identity}, received {:?})",
-                    entry.bridge_identity
+                    "registry entry contains a different managed bridge location (expected {identity}, received {})",
+                    entry
+                        .bridge_identity
+                        .as_ref()
+                        .map_or_else(|| "none".to_owned(), std::string::ToString::to_string)
                 )));
             }
             let member = entry.bridge_member.clone().ok_or_else(|| {
@@ -496,7 +500,7 @@ impl MemberCensus {
             })?;
             if member.as_str() != entry.discovery_key {
                 return Err(RegistryError::Unauthorized(format!(
-                    "the registered Zellij session name differs from the discovery key (session={}, discovery key={})",
+                    "the registered Zellij session name differs from the session used to find the broker (registered session={}, lookup session={})",
                     member.as_str(),
                     entry.discovery_key
                 )));
@@ -845,7 +849,7 @@ impl Registry {
             || entry.discovery_key != capability.discovery_key
         {
             return Err(RegistryError::Unauthorized(
-                "the replacement broker registration differs from its authorized session, socket, discovery key, or handoff ID".to_owned(),
+                "the replacement broker registration differs from its authorized session, socket, lookup session, or replacement request ID".to_owned(),
             ));
         }
         let _lock = RegistryLock::acquire(&self.lock_path)?;
@@ -874,7 +878,7 @@ impl Registry {
                 > 1
         {
             return Err(RegistryError::Conflict(
-                "another registration occupies the authorized target socket or bridge member"
+                "another broker registration claims the replacement socket or Zellij session"
                     .to_owned(),
             ));
         }
@@ -958,7 +962,7 @@ impl Registry {
         let row = matching.next();
         if matching.next().is_some() {
             return Err(RegistryError::Conflict(
-                "multiple registrations claim the target socket; leaving all rows unchanged"
+                "multiple broker registrations claim the replacement socket; no registry entries were changed by this check"
                     .to_owned(),
             ));
         }
@@ -968,7 +972,7 @@ impl Registry {
             .is_some_and(|row| row.discovery_key != authority.member.as_str())
         {
             return Err(RegistryError::Conflict(
-                "the target registration differs from its saved host identity".to_owned(),
+                "the replacement broker's registered host address differs from the saved activation record".to_owned(),
             ));
         }
         Ok(TargetPublicationGuard { _lock: lock, entry })
@@ -990,7 +994,7 @@ impl Registry {
                 continue;
             }
             if target.is_some() || row != expected {
-                return Err(RegistryError::Conflict("stopped replacement registry row differs from its certified transaction identity; leaving the row unchanged".to_owned()));
+                return Err(RegistryError::Conflict("the stopped replacement broker's registry entry is duplicated or differs from its saved stop-confirmation record; this check left the registry entry unchanged".to_owned()));
             }
             target = Some(index);
         }
@@ -1031,7 +1035,7 @@ impl Registry {
         let count = file.brokers.iter().filter(|entry| owns(entry)).count();
         if count > 1 {
             return Err(RegistryError::Conflict(
-                "more than one row claims this retired registration".to_owned(),
+                "more than one registry entry claims this retired broker's registration".to_owned(),
             ));
         }
         if count == 0 {
@@ -1145,7 +1149,7 @@ impl Registry {
         let mut file = self.read()?;
         if file.brokers != observed {
             return Err(RegistryError::Conflict(
-                "registry changed since endpoint observation".to_owned(),
+                "the broker registry changed after Muxe checked the socket".to_owned(),
             ));
         }
         let mut owners = file.brokers.iter().enumerate().filter(|(_, known)| {
@@ -1173,7 +1177,7 @@ impl Registry {
             .any(|(index, known)| known.socket == candidate.socket && Some(index) != owner)
         {
             return Err(RegistryError::Conflict(
-                "another registry owner occupies the live endpoint".to_owned(),
+                "another broker's registry entry claims the responding broker's socket".to_owned(),
             ));
         }
         revalidate()?;
@@ -1386,7 +1390,7 @@ fn validate_herdr_entry(entry: &BrokerEntry) -> Result<(), RegistryError> {
         || entry.handoff_id.is_some()
     {
         return Err(RegistryError::Unauthorized(
-            "the Herdr registry entry has a different host kind or contains Zellij bridge, session, or handoff fields".to_owned(),
+            "the Herdr registry entry has a different host kind or contains Zellij bridge, session, or replacement request fields".to_owned(),
         ));
     }
     Ok(())
@@ -1403,7 +1407,7 @@ fn validate_zellij_entry(
         || entry.handoff_id != handoff
     {
         return Err(RegistryError::Unauthorized(
-            "the Zellij registry entry has a different host kind, managed bridge location, or handoff ID than expected".to_owned(),
+            "the Zellij registry entry has a different host kind, managed bridge location, or replacement request ID than expected".to_owned(),
         ));
     }
     let member = entry.bridge_member.as_ref().ok_or_else(|| {
@@ -1411,7 +1415,7 @@ fn validate_zellij_entry(
     })?;
     if member.as_str() != entry.discovery_key {
         return Err(RegistryError::Unauthorized(format!(
-            "the registered Zellij session name differs from the discovery key (session={}, discovery key={})",
+            "the registered Zellij session name differs from the session used to find the broker (registered session={}, lookup session={})",
             member.as_str(),
             entry.discovery_key
         )));

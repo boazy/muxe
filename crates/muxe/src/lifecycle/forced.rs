@@ -95,7 +95,7 @@ fn write_ledger(
         path: path.clone(),
         source,
     })?;
-    fsutil::write_atomic(&path, &bytes, "forced commit participant stops")?;
+    fsutil::write_atomic(&path, &bytes, "saving broker stops for forced replacement")?;
     Ok(())
 }
 
@@ -120,7 +120,7 @@ fn read_ledger(
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "Muxe cannot use the saved stop record at {}: it belongs to a different activation target or decision. Muxe made no new stop request while checking this record; leave it unchanged",
+                "Muxe cannot use the saved stop record at {}: it belongs to a different broker group or activation decision. Muxe made no new stop request while checking this record; leave it unchanged",
                 path.display()
             ),
         });
@@ -191,7 +191,7 @@ fn read_ledger(
 fn typed_entry(row: &BrokerEntry) -> Result<RegisteredBroker, ActivateError> {
     let mut units = select_units(std::slice::from_ref(row), HostScope::All, None)?;
     let unit = units.pop().ok_or_else(|| ActivateError::UnitFailed {
-        reason: "unknown host participant cannot authorize forced recovery".to_owned(),
+        reason: "Muxe cannot authorize forced recovery: the saved broker registration has an unknown host kind".to_owned(),
     })?;
     // This is a persistence-to-domain boundary, not another host policy selector.
     Ok(unit.entries()[0].clone())
@@ -331,7 +331,7 @@ fn stored_participant_authority(
     let failure = |detail: &str| participant_failure(entry, detail);
     let identity = prior.map(|stop| &stop.process).or_else(|| entry.process_identity())
         .filter(|identity| identity.authorizes_stored_peer())
-        .ok_or_else(|| failure("its control endpoint is unavailable and the OS cannot re-identify it from saved data; no PID-only stop is permitted"))?;
+        .ok_or_else(|| failure("its control socket is unavailable and the OS cannot identify the process from the saved record; a process ID alone is insufficient to authorize a stop"))?;
     let process = muxe_process::BrokerStopHandle::resume_recorded(identity)
         .map_err(|error| failure(&error.to_string()))?;
     let endpoint = if target_owns_path {
@@ -420,7 +420,7 @@ pub(super) async fn resolve_commit<C: ControlPort, R: HostReloader>(
                             && row.discovery_key == member.member().as_str()
                     })
                     .ok_or_else(|| ActivateError::UnitFailed {
-                        reason: "saved old incarnation is missing".to_owned(),
+                        reason: "the saved activation record is missing the existing broker's registration".to_owned(),
                     })?,
                 ParticipantRole::Target => {
                     &saved
@@ -532,7 +532,7 @@ pub(super) async fn resolve_commit<C: ControlPort, R: HostReloader>(
                     .live_server
                     .as_ref()
                     .ok_or_else(|| ActivateError::UnitFailed {
-                        reason: "old stop proof lacks its saved live-server identity".to_owned(),
+                        reason: "the existing broker's stop-confirmation record is missing its saved server ID".to_owned(),
                     })?;
                 if !journal::has_old_retirement_receipt(
                     &journal::activation_dir(cache),
@@ -582,7 +582,7 @@ pub(super) fn validate_admission_scope(saved: &ActivationJournal) -> Result<(), 
     {
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "Muxe cannot authorize forced recovery for {}: its broker rows and members do not belong to the saved host unit. Leave this record unchanged; its participants were not stopped by this force attempt",
+                "Muxe cannot continue forced recovery using {}: the saved records disagree about which brokers belong to this activation. Leave the record unchanged. Muxe will not use it to stop brokers",
                 saved.unit.journal_name()
             ),
         });
@@ -608,7 +608,7 @@ fn release_retired_target_rows(
         };
         if let Some(endpoint) = proof.endpoint() {
             endpoint.remove_stopped().map_err(|error| ActivateError::UnitFailed {
-                reason: format!("Muxe cannot remove the certified stopped target socket for {}: {error}; its exact retirement record is retained and no other endpoint was removed", member.member().as_str()),
+                reason: format!("Muxe cannot remove the stopped replacement broker's socket for {}: {error}. Its matching stop-confirmation record was kept; no unrelated socket was removed while checking this socket", member.member().as_str()),
             })?;
         }
         registry.release_stopped_target(&proof)?;
@@ -651,7 +651,7 @@ where
         let original = journal::read_journal(&path)?;
         if original.unit != snapshot.unit {
             return Err(ActivateError::UnitFailed {
-                reason: "journal unit changed while acquiring its force lock".to_owned(),
+                reason: "the broker group in the saved activation record changed while Muxe acquired its forced-recovery lock".to_owned(),
             });
         }
         validate_admission_scope(&original)?;
@@ -747,7 +747,7 @@ where
             }
             return Err(ActivateError::UnitFailed {
                 reason: format!(
-                    "forced recovery cannot verify all old participants, target stops, or bridge rollback at {}; the saved decision is retained",
+                    "Muxe cannot continue forced recovery at {}: it could not verify every existing broker registration, confirm every replacement broker stopped, or confirm the bridge was restored. The saved activation decision was kept",
                     path.display()
                 ),
             });
@@ -785,7 +785,7 @@ where
         }
         return Err(ActivateError::UnitFailed {
             reason: format!(
-                "force cannot invent missing incarnation or durable participant proof for {}; its decision is retained",
+                "Muxe cannot continue forced recovery at {}: the saved activation record lacks the process identities or confirmations needed to determine what happened to its brokers. The saved activation decision was kept",
                 path.display()
             ),
         });

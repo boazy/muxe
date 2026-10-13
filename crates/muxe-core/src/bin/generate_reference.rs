@@ -93,13 +93,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let host_support = load_host_support(&PathBuf::from(host_support_path))?;
     let catalog = load_action_catalog(&catalog_path)?;
-    fs::write(PathBuf::from(output), render(&host_support, &catalog))?;
+    let output = PathBuf::from(output);
+    fs::write(&output, render(&host_support, &catalog))
+        .map_err(|error| format!("cannot write reference file {}: {error}", output.display()))?;
     Ok(())
 }
 
 fn load_action_catalog(path: &PathBuf) -> Result<ActionCatalog, Box<dyn std::error::Error>> {
-    let contents = fs::read_to_string(path)?;
-    let raw: RawActionCatalog = serde_saphyr::from_str(&contents)?;
+    let contents = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read action descriptions {}: {error}",
+            path.display()
+        )
+    })?;
+    let raw: RawActionCatalog = serde_saphyr::from_str(&contents).map_err(|error| {
+        format!(
+            "cannot parse action descriptions {}: {error}",
+            path.display()
+        )
+    })?;
     let mut actions = BTreeMap::new();
     for (action_name, raw_description) in raw.actions {
         let action = action_name.parse::<PortableActionKind>().map_err(|_| {
@@ -722,7 +734,8 @@ fn render_context_references(output: &mut String) {
 }
 
 fn load_host_support(path: &PathBuf) -> Result<HostSupport, Box<dyn std::error::Error>> {
-    let contents = fs::read_to_string(path)?;
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read host support table {}: {error}", path.display()))?;
     let mut rows = BTreeMap::new();
     for (line_number, line) in contents.lines().enumerate() {
         let line = line.trim();

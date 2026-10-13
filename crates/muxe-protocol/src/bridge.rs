@@ -17,16 +17,16 @@ pub enum BridgeProtocolScalarError {
     #[error("request ID must not be zero")]
     ZeroRequestId,
     /// Zero is not an installed channel generation.
-    #[error("channel generation must not be zero")]
+    #[error("bridge channel version counter must not be zero")]
     ZeroChannelGeneration,
     /// A counter cannot advance without reusing an earlier value.
-    #[error("{field} exhausted its value space")]
+    #[error("cannot advance {field}: the counter has reached its maximum value")]
     Exhausted {
         /// Counter whose value space was exhausted.
         field: &'static str,
     },
     /// The nil ULID is reserved and never identifies a registration.
-    #[error("registration ID must not be the nil ULID")]
+    #[error("registration ID must not be an all-zero ULID")]
     NilRegistration,
     /// The text is not a canonical ULID.
     #[error("invalid registration ULID: {0}")]

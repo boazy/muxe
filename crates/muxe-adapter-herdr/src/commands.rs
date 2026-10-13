@@ -145,7 +145,7 @@ impl Snapshot {
                 && (previous.command_id != command.command_id || previous.action != command.action)
             {
                 return Err(protocol(
-                    "Herdr command binding is ambiguous in the current manifest",
+                    "More than one command in the current Herdr manifest uses this binding. Muxe cannot choose which command to invoke.",
                 ));
             }
             selected = Some(command);
@@ -158,7 +158,7 @@ impl Snapshot {
         })?;
         if command.action == CommandAction::Unknown {
             return Err(protocol(
-                "Herdr command binding has an unsupported manifest action",
+                "The selected Herdr command binding refers to an action that Muxe cannot invoke.",
             ));
         }
         Ok(command.command_id)
@@ -304,7 +304,7 @@ pub(crate) async fn resolve(
                         .any(|method| method == "command.invoke")
                 {
                     return Err(protocol(
-                        "Herdr endpoint does not advertise generation-one command.invoke and the required codecs",
+                        "The Herdr command endpoint does not support protocol version 1, command.invoke, or the required message codecs. Muxe cannot discover the configured command.",
                     ));
                 }
                 welcome_received = true;
@@ -380,7 +380,9 @@ async fn read_frame(stream: &mut UnixStream, buffer: &mut Vec<u8>) -> Result<(),
     stream.read_exact(&mut header).await.map_err(read_error)?;
     let size = u32::from_le_bytes(header) as usize;
     if size == 0 {
-        return Err(protocol("empty Herdr endpoint envelope"));
+        return Err(protocol(
+            "The Herdr command endpoint returned an empty message.",
+        ));
     }
     if size > MAX_FRAME_BYTES {
         return Err(SocketError::ResponseTooLarge {
@@ -426,7 +428,9 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn take(&mut self, length: usize) -> Result<&'a [u8], SocketError> {
         if length > self.bytes.len() {
-            return Err(protocol("truncated Herdr endpoint envelope"));
+            return Err(protocol(
+                "The Herdr command endpoint message ended before all declared bytes were available.",
+            ));
         }
         let (value, rest) = self.bytes.split_at(length);
         self.bytes = rest;
@@ -439,44 +443,65 @@ impl<'a> Cursor<'a> {
             251 => (2, 251),
             252 => (4, 65_536),
             253 => (8, 4_294_967_296),
-            _ => return Err(protocol("invalid Herdr endpoint varint tag")),
+            _ => {
+                return Err(protocol(
+                    "The Herdr command endpoint message has an invalid variable-length integer tag.",
+                ));
+            }
         };
         let bytes = self.take(width)?;
         let mut raw = [0; 8];
         raw[..width].copy_from_slice(bytes);
         let value = u64::from_le_bytes(raw);
         if value < minimum {
-            return Err(protocol("noncanonical Herdr endpoint varint"));
+            return Err(protocol(
+                "The Herdr command endpoint message uses a noncanonical variable-length integer encoding.",
+            ));
         }
         Ok(value)
     }
     fn string(&mut self) -> Result<&'a str, SocketError> {
-        let size = usize::try_from(self.integer()?)
-            .map_err(|_| protocol("Herdr endpoint length overflow"))?;
-        std::str::from_utf8(self.take(size)?)
-            .map_err(|_| protocol("invalid UTF-8 in Herdr endpoint envelope"))
+        let size = usize::try_from(self.integer()?).map_err(|_| {
+            protocol(
+                "A string length in the Herdr command endpoint message exceeds the platform limit.",
+            )
+        })?;
+        std::str::from_utf8(self.take(size)?).map_err(|_| {
+            protocol("A string in the Herdr command endpoint message is not valid UTF-8.")
+        })
     }
     fn finish(&self) -> Result<(), SocketError> {
         if self.bytes.is_empty() {
             Ok(())
         } else {
-            Err(protocol("trailing bytes in Herdr endpoint envelope"))
+            Err(protocol(
+                "The Herdr command endpoint message has unexpected bytes after its payload.",
+            ))
         }
     }
 }
 fn decode_frame(bytes: &[u8]) -> Result<Frame<'_>, SocketError> {
     if bytes.len() > MAX_FRAME_BYTES {
-        return Err(protocol("Herdr endpoint envelope exceeds frame limit"));
+        return Err(protocol(
+            "The Herdr command endpoint message exceeds the allowed frame size.",
+        ));
     }
     let mut cursor = Cursor { bytes };
-    let tag = u32::try_from(cursor.integer()?)
-        .map_err(|_| protocol("Herdr endpoint variant tag overflow"))?;
+    let tag = u32::try_from(cursor.integer()?).map_err(|_| {
+        protocol(
+            "The message-type tag in the Herdr command endpoint message exceeds the 32-bit limit.",
+        )
+    })?;
     let frame = match tag {
         3 => {
             let reason = match cursor.take(1)?[0] {
                 0 => None,
                 1 => Some(cursor.string()?),
-                _ => return Err(protocol("invalid Herdr endpoint shutdown option")),
+                _ => {
+                    return Err(protocol(
+                        "The Herdr command endpoint shutdown message has an invalid optional-reason tag.",
+                    ));
+                }
             };
             Frame::Shutdown { reason }
         }

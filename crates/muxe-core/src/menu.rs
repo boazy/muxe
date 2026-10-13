@@ -31,7 +31,12 @@ pub struct InvalidMenuName {
 
 impl std::fmt::Display for InvalidMenuName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid menu name ({})", self.reason)
+        match self.reason {
+            "empty" => f.write_str("menu name must not be empty"),
+            "nul" => f.write_str("menu name must not contain a NUL character"),
+            "control" => f.write_str("menu name must not contain control characters"),
+            reason => write!(f, "invalid menu name: {reason}"),
+        }
     }
 }
 
@@ -70,7 +75,7 @@ impl MenuName {
         Self::parse(value).map_err(|error| {
             crate::diagnostic::ConfigDiagnostic::error(
                 crate::diagnostic::DiagnosticCode::InvalidValue,
-                format!("invalid menu name `{value}` ({})", error.reason),
+                format!("menu `{value}`: {error}"),
                 span,
             )
         })

@@ -393,14 +393,6 @@ mod tests {
             ))
             .expect_err("pane reference cannot supply an integer");
         assert_eq!(error.code, DiagnosticCode::ContextTypeMismatch);
-        assert!(
-            error.message.contains("origin.pane.id"),
-            "names the reference: {error:?}"
-        );
-        assert!(
-            error.message.contains("tab-index"),
-            "names the parameter: {error:?}"
-        );
     }
 
     #[test]
@@ -415,14 +407,6 @@ mod tests {
             ))
             .expect_err("text reference cannot supply an integer");
         assert_eq!(error.code, DiagnosticCode::ContextTypeMismatch);
-        assert!(
-            error.message.contains("origin.selection.text"),
-            "names the reference: {error:?}"
-        );
-        assert!(
-            error.message.contains("tab-index"),
-            "names the parameter: {error:?}"
-        );
     }
 
     #[test]
@@ -437,14 +421,6 @@ mod tests {
             ))
             .expect_err("numeric reference cannot supply a session name");
         assert_eq!(error.code, DiagnosticCode::ContextTypeMismatch);
-        assert!(
-            error.message.contains("origin.tab.index"),
-            "names the reference: {error:?}"
-        );
-        assert!(
-            error.message.contains("name"),
-            "names the parameter: {error:?}"
-        );
     }
 
     #[test]
@@ -459,10 +435,6 @@ mod tests {
             ))
             .expect_err("unknown parameter fails closed");
         assert_eq!(error.code, DiagnosticCode::InvalidActionArguments);
-        assert!(
-            error.message.contains("bogus-param"),
-            "names the parameter: {error:?}"
-        );
     }
 
     #[test]

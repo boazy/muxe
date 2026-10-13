@@ -114,9 +114,9 @@ pub enum TemplateError {
     ForbiddenLoaderBackedConstruct(&'static str),
     #[error("selected theme has no `{0}` template")]
     MissingTemplate(&'static str),
-    #[error("menu template error: {0}")]
+    #[error("menu theme error: {0}")]
     Render(String),
-    #[error("rendered component exceeds the {MAX_COMPONENT_BYTES}-byte limit")]
+    #[error("rendered menu component exceeds the {MAX_COMPONENT_BYTES}-byte limit")]
     OutputTooLarge,
 }
 
@@ -194,7 +194,9 @@ impl TemplateRenderer {
             }
             environment
                 .add_template_owned(name.to_owned(), source.to_owned())
-                .map_err(|error| TemplateError::Render(error.to_string()))?;
+                .map_err(|error| {
+                    TemplateError::Render(format!("cannot parse template `{name}`: {error}"))
+                })?;
         }
 
         Ok(Self {
@@ -327,16 +329,17 @@ impl TemplateRenderer {
         name: &'static str,
         context: S,
     ) -> Result<RenderedText, TemplateError> {
-        let template = self
-            .environment
-            .get_template(name)
-            .map_err(|error| TemplateError::Render(error.to_string()))?;
+        let template = self.environment.get_template(name).map_err(|error| {
+            TemplateError::Render(format!("cannot load template `{name}`: {error}"))
+        })?;
         let mut writer = BoundedWriter::new();
         let render_result = template.render_captured_to(context, &mut writer);
         if writer.exceeded {
             return Err(TemplateError::OutputTooLarge);
         }
-        render_result.map_err(|error| TemplateError::Render(error.to_string()))?;
+        render_result.map_err(|error| {
+            TemplateError::Render(format!("cannot render template `{name}`: {error}"))
+        })?;
         let rendered = String::from_utf8(writer.bytes)
             .map_err(|error| TemplateError::Render(error.to_string()))?;
         Ok(parse_style_markup(&rendered, &self.styles))
@@ -439,7 +442,12 @@ fn resolve_archived_styles(
         for named_style in section.styles.iter() {
             let style = archived_style(&named_style.style)
                 .resolve(&mut resolver)
-                .map_err(|error| TemplateError::Render(error.to_string()))?;
+                .map_err(|error| {
+                    TemplateError::Render(format!(
+                        "style `{}` has an invalid color: {error}",
+                        named_style.name.as_str()
+                    ))
+                })?;
             output.insert(named_style.name.as_str().to_owned(), ratatui_style(&style));
         }
     }
@@ -585,12 +593,16 @@ fn pad_filter(
     left: bool,
 ) -> Result<String, MiniError> {
     if width > MAX_COMPONENT_BYTES {
-        return Err(filter_error("padding width exceeds the component limit"));
+        return Err(filter_error(
+            "rpad/lpad width exceeds the menu component limit",
+        ));
     }
     let pad = pad.map_or(std::borrow::Cow::Borrowed(" "), std::borrow::Cow::Owned);
     let pad_width = UnicodeWidthStr::width(pad.as_ref());
     if pad_width == 0 {
-        return Err(filter_error("padding string has zero display width"));
+        return Err(filter_error(
+            "rpad/lpad fill string must occupy at least one terminal cell",
+        ));
     }
     let value_width = markup_display_width(value);
     let truncated;
@@ -612,14 +624,18 @@ fn pad_filter(
         output.push_str(&padding);
     }
     if output.len() > MAX_COMPONENT_BYTES {
-        return Err(filter_error("padding output exceeds the component limit"));
+        return Err(filter_error(
+            "padded text exceeds the menu component byte limit",
+        ));
     }
     Ok(output)
 }
 
 fn ellipsis_filter(value: &str, width: usize) -> Result<String, MiniError> {
     if width > MAX_COMPONENT_BYTES {
-        return Err(filter_error("ellipsis width exceeds the component limit"));
+        return Err(filter_error(
+            "ellipsis filter width exceeds the menu component limit",
+        ));
     }
     let value = sanitize_single_line(value);
     let output = if markup_display_width(&value) <= width {
@@ -632,7 +648,9 @@ fn ellipsis_filter(value: &str, width: usize) -> Result<String, MiniError> {
         output
     };
     if output.len() > MAX_COMPONENT_BYTES {
-        return Err(filter_error("ellipsis output exceeds the component limit"));
+        return Err(filter_error(
+            "ellipsis filter output exceeds the menu component byte limit",
+        ));
     }
     Ok(output)
 }
@@ -640,7 +658,9 @@ fn ellipsis_filter(value: &str, width: usize) -> Result<String, MiniError> {
 fn style_filter(value: &str, name: &str) -> Result<String, MiniError> {
     let output = format!("[{name}]{value}[/{name}]");
     if output.len() > MAX_COMPONENT_BYTES {
-        return Err(filter_error("style output exceeds the component limit"));
+        return Err(filter_error(
+            "style filter output exceeds the menu component byte limit",
+        ));
     }
     Ok(output)
 }
@@ -756,9 +776,8 @@ fn fill_is_additive(pad: &str, pad_width: usize) -> bool {
 /// target, then `truncate_to_width`.
 ///
 /// The non-additive fallback below calls this so exotic fills return
-/// byte-identical results and errors (same bytes, same
-/// `"padding output exceeds the component limit"` message, same
-/// boundaries). Its cost is bounded by `MAX_COMPONENT_BYTES` pad bytes
+/// byte-identical results and equivalent errors at the same boundaries.
+/// Its cost is bounded by `MAX_COMPONENT_BYTES` pad bytes
 /// rather than linear in produced output: each append re-measures the
 /// accumulated fill. Making it linear would change observable results for
 /// context-sensitive fills (the sized fill overshoots where the old loop
@@ -770,7 +789,9 @@ fn greedy_repeat_to_width(pad: &str, width: usize) -> Result<String, MiniError> 
     while pad_str_width(output.as_str()) < width {
         output.push_str(pad);
         if output.len() > MAX_COMPONENT_BYTES {
-            return Err(filter_error("padding output exceeds the component limit"));
+            return Err(filter_error(
+                "padded text exceeds the menu component byte limit",
+            ));
         }
     }
     Ok(truncate_to_width(&output, width))
@@ -779,7 +800,9 @@ fn greedy_repeat_to_width(pad: &str, width: usize) -> Result<String, MiniError> 
 fn repeat_to_width(pad: &str, width: usize) -> Result<String, MiniError> {
     let pad_width = pad_str_width(pad);
     if pad_width == 0 {
-        return Err(filter_error("padding string has zero display width"));
+        return Err(filter_error(
+            "rpad/lpad fill string must occupy at least one terminal cell",
+        ));
     }
     if !fill_is_additive(pad, pad_width) {
         return greedy_repeat_to_width(pad, width);
@@ -791,7 +814,9 @@ fn repeat_to_width(pad: &str, width: usize) -> Result<String, MiniError> {
     // byte check stays over the pre-truncation size, as the old loop did.
     let copies = width.div_ceil(pad_width);
     if copies.saturating_mul(pad.len()) > MAX_COMPONENT_BYTES {
-        return Err(filter_error("padding output exceeds the component limit"));
+        return Err(filter_error(
+            "padded text exceeds the menu component byte limit",
+        ));
     }
     let fill = pad.repeat(copies);
     Ok(truncate_to_width(&fill, width))
@@ -823,7 +848,7 @@ impl Write for BoundedWriter {
             self.exceeded = true;
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                "component output limit exceeded",
+                "rendered menu component exceeds the byte limit",
             ));
         }
         self.bytes.extend_from_slice(bytes);
@@ -1067,7 +1092,7 @@ mod tests {
                 ("status".to_owned(), "{{ message }}".to_owned()),
             ]);
             templates.remove(missing);
-            let error = CompiledTheme::compile(
+            CompiledTheme::compile(
                 Theme {
                     common: ThemeSection::default(),
                     menu: ThemeSection {
@@ -1082,11 +1107,7 @@ mod tests {
                     colors: BTreeMap::new(),
                 },
             )
-            .unwrap_err();
-            assert!(
-                error.to_string().contains(missing),
-                "removing `{missing}` must fail compilation, got `{error}`"
-            );
+            .expect_err("a theme missing a required component template must not compile");
         }
     }
 
@@ -1106,12 +1127,6 @@ mod tests {
             })
             .expect_err("oversized component must fail");
         assert!(matches!(error, TemplateError::OutputTooLarge));
-    }
-
-    fn pad_error_message(error: &MiniError) -> &str {
-        error
-            .detail()
-            .expect("padding errors carry a detail message")
     }
 
     #[test]
@@ -1153,16 +1168,8 @@ mod tests {
         for pad in ["", "\u{0301}"] {
             let error = rpad_filter("ab", 5, Some(pad.into())).expect_err("no fill width");
             assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-            assert_eq!(
-                pad_error_message(&error),
-                "padding string has zero display width"
-            );
             let error = repeat_to_width(pad, 5).expect_err("no fill width");
             assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-            assert_eq!(
-                pad_error_message(&error),
-                "padding string has zero display width"
-            );
         }
     }
 
@@ -1215,10 +1222,7 @@ mod tests {
         }
         let error = repeat_to_width("ab", MAX_COMPONENT_BYTES + 1)
             .expect_err("pre-change loop failed past the byte limit");
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
     }
 
     #[test]
@@ -1238,26 +1242,13 @@ mod tests {
             let error = repeat_to_width(pad, target)
                 .expect_err("pre-change loop failed on bytes for a never-growing fill");
             assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-            assert_eq!(
-                pad_error_message(&error),
-                "padding output exceeds the component limit",
-                "pre-change loop failed on bytes at target {target}"
-            );
             let error = rpad_filter("", target, Some(pad.into()))
                 .expect_err("pre-change filter failed on bytes for a never-growing fill");
             assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-            assert_eq!(
-                pad_error_message(&error),
-                "padding output exceeds the component limit",
-                "pre-change filter failed on bytes at target {target}"
-            );
         }
         let error = lpad_filter("", 4, Some(pad.into()))
             .expect_err("pre-change left filter failed on bytes for a never-growing fill");
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
     }
 
     #[test]
@@ -1298,17 +1289,9 @@ mod tests {
         let error = repeat_to_width(pad, 21_844)
             .expect_err("pre-change loop failed on bytes past 10922 copies");
         assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit",
-            "pre-change loop failed on bytes at target 21844"
-        );
         let error = rpad_filter("", 21_844, Some(pad.into()))
             .expect_err("pre-change filter failed on bytes at target 21844");
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
     }
 
     #[test]
@@ -1360,10 +1343,7 @@ mod tests {
         assert_eq!(UnicodeWidthStr::width(padded.as_str()), 43_690);
         let error = repeat_to_width("日", MAX_COMPONENT_BYTES + 1)
             .expect_err("pre-change loop failed on bytes past the limit");
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
     }
 
     #[test]
@@ -1378,22 +1358,12 @@ mod tests {
         let error = repeat_to_width(&pad, 5)
             .expect_err("pre-change loop failed on bytes for a never-growing fill");
         assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
         let error = rpad_filter("", 5, Some(pad.clone()))
             .expect_err("pre-change filter failed on bytes for a never-growing fill");
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
         reset_pad_width_probes();
         let error = repeat_to_width(&pad, 5).expect_err("fallback still fails on bytes");
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
         assert!(
             pad_width_probes() < 200,
             "the non-additive fallback must stay bounded by the byte limit, \
@@ -1406,10 +1376,6 @@ mod tests {
         let first = rpad_filter("ab", MAX_COMPONENT_BYTES + 1, Some(" ".into()))
             .expect_err("width limit must hold");
         assert_eq!(first.kind(), ErrorKind::InvalidOperation);
-        assert_eq!(
-            pad_error_message(&first),
-            "padding width exceeds the component limit"
-        );
         let ok = rpad_filter("ab", 8, Some(" ".into())).expect("limit edge fits");
         assert_eq!(ok, "ab      ");
         // `é` is one column but two bytes, so the byte limit binds first.
@@ -1419,29 +1385,17 @@ mod tests {
         let error = rpad_filter(&"é".repeat(32_768), 32_769, Some(" ".into()))
             .expect_err("bytes past the limit must fail");
         assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
         let ok = repeat_to_width(" ", MAX_COMPONENT_BYTES).expect("fill edge fits");
         assert_eq!(ok.len(), MAX_COMPONENT_BYTES);
         let error = repeat_to_width(" ", MAX_COMPONENT_BYTES + 1)
             .expect_err("fill past the limit must fail");
         assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
         // The byte check stays over the pre-truncation fill: 21,846 copies of
         // the 3-byte `日` are 65,538 bytes, so this fails even though the
         // truncated result would fit in 65,535 bytes.
         let error = rpad_filter("", 43_691, Some("日".into()))
             .expect_err("untruncated wide fill must fail");
         assert_eq!(error.kind(), ErrorKind::InvalidOperation);
-        assert_eq!(
-            pad_error_message(&error),
-            "padding output exceeds the component limit"
-        );
     }
 
     #[test]

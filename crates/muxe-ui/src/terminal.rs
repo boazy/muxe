@@ -198,11 +198,15 @@ pub enum NegotiationUpdate {
 /// A runtime Kitty negotiation failure. Each failure requires terminal restoration.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum KittyNegotiationError {
-    #[error("Kitty keyboard mode refused: expected flags {expected}, received {received}")]
+    #[error(
+        "terminal did not enable the requested Kitty keyboard features: requested flags {expected}, received {received}"
+    )]
     Refused { expected: u32, received: u32 },
-    #[error("Kitty keyboard mode did not respond before the UI deadline")]
+    #[error("terminal did not confirm Kitty keyboard mode before the UI deadline")]
     TimedOut,
-    #[error("too many key events arrived before Kitty mode was confirmed")]
+    #[error(
+        "UI cannot buffer more key events while waiting for the terminal to confirm Kitty keyboard mode"
+    )]
     PendingInputOverflow,
 }
 
@@ -480,7 +484,8 @@ impl<W: Write> TerminalSurface<W> {
             kitty_restore_needed: false,
             disable_raw_mode,
         };
-        enable_raw_mode()?;
+        enable_raw_mode()
+            .map_err(|error| terminal_error("cannot enable terminal raw mode", error))?;
         surface.raw_mode = true;
 
         let entry = surface.enter_terminal();
@@ -494,13 +499,23 @@ impl<W: Write> TerminalSurface<W> {
     }
 
     fn enter_terminal(&mut self) -> io::Result<()> {
-        self.writer_mut().queue(EnterAlternateScreen)?;
+        self.writer_mut()
+            .queue(EnterAlternateScreen)
+            .map_err(|error| {
+                terminal_error("cannot request the terminal alternate screen", error)
+            })?;
         self.screen = TerminalScreenState::Alternate;
-        self.writer_mut().flush()?;
+        self.writer_mut().flush().map_err(|error| {
+            terminal_error("cannot flush the terminal alternate-screen request", error)
+        })?;
 
-        self.writer_mut().queue(Hide)?;
+        self.writer_mut().queue(Hide).map_err(|error| {
+            terminal_error("cannot request that the terminal hide the cursor", error)
+        })?;
         self.screen = TerminalScreenState::CursorHidden;
-        self.writer_mut().flush()?;
+        self.writer_mut().flush().map_err(|error| {
+            terminal_error("cannot flush the terminal cursor-hide request", error)
+        })?;
         Ok(())
     }
 
@@ -535,7 +550,7 @@ impl<W: Write> TerminalSurface<W> {
             None => self
                 .output
                 .as_mut()
-                .expect("writer is stored on the surface before the first render"),
+                .expect("terminal writer must be available before the first render"),
         }
     }
 
@@ -554,10 +569,13 @@ impl<W: Write> TerminalSurface<W> {
         let negotiation = KittyNegotiation::new(capabilities);
         {
             let writer = self.writer_mut();
-            write!(writer, "\x1b[>{}u\x1b[?u", negotiation.expected_flags())?;
+            write!(writer, "\x1b[>{}u\x1b[?u", negotiation.expected_flags())
+                .map_err(|error| terminal_error("cannot request Kitty keyboard mode", error))?;
         }
         self.kitty_restore_needed = true;
-        self.writer_mut().flush()?;
+        self.writer_mut().flush().map_err(|error| {
+            terminal_error("cannot flush the Kitty keyboard mode request", error)
+        })?;
         Ok(negotiation)
     }
 
@@ -587,7 +605,14 @@ impl<W: Write> TerminalSurface<W> {
                 Ok(())
             } else {
                 terminal.backend_mut().set_area(area);
-                terminal.resize(area).and_then(|()| terminal.hide_cursor())
+                terminal
+                    .resize(area)
+                    .map_err(|error| terminal_error("cannot resize the menu display", error))
+                    .and_then(|()| {
+                        terminal.hide_cursor().map_err(|error| {
+                            terminal_error("cannot hide the terminal cursor after resizing", error)
+                        })
+                    })
             };
             self.terminal = Some(terminal);
             result?;
@@ -595,24 +620,33 @@ impl<W: Write> TerminalSurface<W> {
             let writer = self
                 .output
                 .take()
-                .expect("writer is stored on the surface before the first render");
+                .expect("terminal writer must be available before the first render");
             // Fixed viewports use only the supplied area; `with_options` performs no backend I/O.
             let fresh = Terminal::with_options(
                 AreaBackend::new(writer, area),
                 TerminalOptions {
                     viewport: Viewport::Fixed(area),
                 },
-            )?;
+            )
+            .map_err(|error| terminal_error("cannot create the menu display", error))?;
             self.terminal = Some(fresh);
             self.terminal
                 .as_mut()
                 .expect("stored terminal above")
-                .hide_cursor()?;
+                .hide_cursor()
+                .map_err(|error| {
+                    terminal_error(
+                        "cannot hide the terminal cursor before rendering the menu",
+                        error,
+                    )
+                })?;
         }
         let terminal = self.terminal.as_mut().expect("stored terminal above");
-        terminal.draw(|frame_context| {
-            render_surface(frame_context, frame, area);
-        })?;
+        terminal
+            .draw(|frame_context| {
+                render_surface(frame_context, frame, area);
+            })
+            .map_err(|error| terminal_error("cannot draw the menu in the terminal", error))?;
         Ok(())
     }
 
@@ -635,7 +669,7 @@ impl<W: Write> TerminalSurface<W> {
                 .write_all(b"\x1b[<u")
                 .and_then(|()| self.writer_mut().flush())
             {
-                first_error = Some(error);
+                first_error = Some(terminal_error("cannot reset Kitty keyboard mode", error));
             }
         }
         if self.screen == TerminalScreenState::CursorHidden {
@@ -645,7 +679,9 @@ impl<W: Write> TerminalSurface<W> {
                 .queue(Show)
                 .and_then(std::io::Write::flush)
             {
-                first_error.get_or_insert(error);
+                first_error.get_or_insert_with(|| {
+                    terminal_error("cannot restore the terminal cursor", error)
+                });
             }
         }
         if self.screen == TerminalScreenState::Alternate {
@@ -655,17 +691,38 @@ impl<W: Write> TerminalSurface<W> {
                 .queue(LeaveAlternateScreen)
                 .and_then(std::io::Write::flush)
             {
-                first_error.get_or_insert(error);
+                first_error.get_or_insert_with(|| {
+                    terminal_error("cannot leave the terminal alternate screen", error)
+                });
             }
         }
         if self.raw_mode {
             self.raw_mode = false;
             if let Err(error) = (self.disable_raw_mode)() {
-                first_error.get_or_insert(error);
+                first_error.get_or_insert_with(|| {
+                    terminal_error("cannot disable terminal raw mode", error)
+                });
             }
         }
         first_error.map_or(Ok(()), Err)
     }
+}
+
+#[derive(Debug, Error)]
+#[error("{operation}: {source}")]
+struct TerminalOperationError {
+    operation: &'static str,
+    source: io::Error,
+}
+
+fn terminal_error(operation: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        TerminalOperationError {
+            operation,
+            source: error,
+        },
+    )
 }
 
 /// Renders the title row, breadcrumb spans, and [`MenuGrid`] body into the current frame.

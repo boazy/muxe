@@ -28,7 +28,7 @@ impl FromStr for Dimension {
             .map_or((value, false), |number| (number, true));
         let number = number
             .parse()
-            .map_err(|_| "dimension must be terminal cells or a percentage")?;
+            .map_err(|_| "dimension must be a whole-number terminal-cell count or percentage, such as `80` or `50%`")?;
         Ok(if percent {
             Self::Percent(number)
         } else {

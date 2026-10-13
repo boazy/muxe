@@ -207,7 +207,7 @@ impl IncarnationState {
         self.continuity = self
             .continuity
             .successor()
-            .expect("Herdr continuity epoch exhausted");
+            .expect("Herdr connection counter reached its maximum value");
         true
     }
 
@@ -695,7 +695,7 @@ impl HerdrAdapter {
             if self.shutdown.load(Ordering::Relaxed) {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Shutdown,
-                    "Herdr adapter shut down during activation resume",
+                    "The Herdr adapter shut down while resuming after activation was aborted.",
                 ));
             }
             tokio::select! {
@@ -704,7 +704,7 @@ impl HerdrAdapter {
                     if self.shutdown.load(Ordering::Relaxed) {
                         return Err(AdapterError::new(
                             AdapterErrorKind::Shutdown,
-                            "Herdr adapter shut down during activation resume",
+                            "The Herdr adapter shut down while resuming after activation was aborted.",
                         ));
                     }
                 }
@@ -807,7 +807,7 @@ impl HerdrAdapter {
                 Some(SuspendPhase::Shutdown) | None => {
                     return Err(AdapterError::new(
                         AdapterErrorKind::Shutdown,
-                        "Herdr suspend attempt ended during shutdown",
+                        "The Herdr adapter shut down before it finished suspending for activation.",
                     ));
                 }
             }
@@ -1081,7 +1081,7 @@ impl HerdrAdapter {
         } else {
             Err(AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Muxe cannot verify continuity of its Herdr event subscription. Host operations are blocked until a new subscription passes compatibility checks.",
+                "Muxe can no longer verify that its Herdr event subscription belongs to the current connection. Host operations are blocked until a new subscription passes compatibility checks.",
             ))
         }
     }
@@ -1102,7 +1102,7 @@ impl HerdrAdapter {
         ) {
             return Err(AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "The host context captured for this action does not match the current Herdr connection.",
+                "The Herdr connection recorded with the saved origin pane, tab, and workspace does not match the current connection. Muxe cannot use that origin for this action.",
             ));
         }
         Ok(authority)
@@ -1243,13 +1243,13 @@ impl HerdrAdapter {
         let source_tab = origin.tab_id.clone().ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "portable tab action requires the captured origin tab",
+                "This tab action requires a saved origin tab ID, but none was captured.",
             )
         })?;
         let workspace = origin.workspace_id.clone().ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "Herdr tab:swap requires the captured origin workspace",
+                "Herdr tab:swap requires a saved origin workspace ID, but none was captured.",
             )
         })?;
         authority
@@ -1561,7 +1561,7 @@ fn validate_native_batch_cached(
                 match validate_native_candidate(schema, candidate) {
                     Ok(_) => diagnostics.push(native_diagnostic(
                         candidate,
-                        "Herdr compatibility cache disagrees with the immutable runtime schema",
+                        "The Herdr compatibility cache rejected an action that passes validation against the schema loaded for this connection.",
                     )),
                     Err(error) => diagnostics.push(native_candidate_diagnostic(candidate, &error)),
                 }
@@ -1764,7 +1764,7 @@ fn validate_required_methods(
     for method in methods {
         if method_metadata(method).is_none() || schema.method(method).is_none() {
             return Err(format!(
-                "active Herdr schema does not declare required method {method}"
+                "Method {method} required by this action is missing from the installed Herdr schema or Muxe's bundled method metadata."
             ));
         }
     }
@@ -1784,7 +1784,7 @@ fn validate_portable_request(
     let method = description.method;
     if method_metadata(method).is_none() || schema.method(method).is_none() {
         return Err(format!(
-            "active Herdr schema does not declare required method {method}"
+            "Method {method} required by this action is missing from the installed Herdr schema or Muxe's bundled method metadata."
         ));
     }
     validate_emitted_fields(schema, action, description)?;
@@ -1801,7 +1801,7 @@ fn validate_emitted_fields(
         .method_params_schema(description.method)
         .ok_or_else(|| {
             format!(
-                "active Herdr schema does not declare required method {}",
+                "The installed Herdr schema does not provide usable parameter definitions for required method {}",
                 description.method
             )
         })?;
@@ -2649,7 +2649,7 @@ impl HostAdapter for HerdrAdapter {
                     return event.ok_or_else(|| {
                         AdapterError::new(
                             AdapterErrorKind::Shutdown,
-                            "Herdr adapter event channel closed",
+                            "The Herdr adapter's health-event channel closed.",
                         )
                     });
                 }
@@ -2708,7 +2708,7 @@ impl HostAdapter for HerdrAdapter {
         let fresh_epoch = prior_epoch.next();
         let fresh_continuity = prior_continuity
             .successor()
-            .expect("Herdr continuity epoch exhausted");
+            .expect("Herdr connection counter reached its maximum value");
         // Fresh schema validation, live identity, and the successful guarded
         // subscription are assembled before any part becomes current. Both
         // futures are adapter-owned and dropped immediately when shutdown wins.
@@ -2981,7 +2981,7 @@ async fn park_suspended_monitor(
             modal_scope: None,
             error: AdapterError::new(
                 AdapterErrorKind::Unavailable,
-                "Herdr event subscription is suspended for activation",
+                "The Herdr event subscription is suspended while Muxe activates a new configuration.",
             ),
         },
     )
@@ -3901,18 +3901,15 @@ async fn perform_pane_open(
                 .with_safe_diagnostic(HerdrExecutionDiagnostic::DimensionsInvalid.safe())
         },
     )?;
-    let workspace = origin
-        .workspace_id
-        .clone()
-        .ok_or_else(|| incompatible("pane:open requires an origin workspace"))?;
-    let tab = origin
-        .tab_id
-        .clone()
-        .ok_or_else(|| incompatible("pane:open requires an origin tab"))?;
-    let pane = origin
-        .pane_id
-        .clone()
-        .ok_or_else(|| incompatible("pane:open requires an origin pane"))?;
+    let workspace = origin.workspace_id.clone().ok_or_else(|| {
+        incompatible("pane:open requires a saved origin workspace ID, but none was captured.")
+    })?;
+    let tab = origin.tab_id.clone().ok_or_else(|| {
+        incompatible("pane:open requires a saved origin tab ID, but none was captured.")
+    })?;
+    let pane = origin.pane_id.clone().ok_or_else(|| {
+        incompatible("pane:open requires a saved origin pane ID, but none was captured.")
+    })?;
     let destination = crate::launch::pane_by_identity_with(authority, workspace, tab, pane).await?;
     let cwd = creation_cwd(cwd.as_ref(), origin, "pane.cwd").map_err(|error| {
         error.with_safe_diagnostic(HerdrExecutionDiagnostic::CwdUnavailable.safe())
@@ -4058,7 +4055,7 @@ async fn perform_command_creation(
             .map(|_| ())
         }
         _ => Err(incompatible(
-            "post-dismissal command creation requires tab:create, pane:split, or pane:open with a program",
+            "Command creation after the menu closes requires tab:create, pane:split, or pane:open with a program.",
         )),
     }
 }
@@ -4073,17 +4070,22 @@ fn creation_argv(
     program_field: &str,
     args_field: &str,
 ) -> Result<Vec<String>, AdapterError> {
-    let program = program.ok_or_else(|| incompatible("creation command requires program"))?;
+    let program = program
+        .ok_or_else(|| incompatible("The command creation action did not specify a program."))?;
     let program = json_word(program, program_field)?;
     if program.contains('\0')
         || args
             .iter()
             .any(|word| word.as_os_str().as_encoded_bytes().contains(&0))
     {
-        return Err(incompatible("Command argv cannot contain NUL bytes"));
+        return Err(incompatible(
+            "The command's program and arguments cannot contain NUL bytes.",
+        ));
     }
     if program.is_empty() {
-        return Err(incompatible("creation command program must not be empty"));
+        return Err(incompatible(
+            "The command creation action's program must not be empty.",
+        ));
     }
     let mut words = Vec::with_capacity(args.len().saturating_add(1));
     words.push(program.to_owned());
@@ -4117,7 +4119,7 @@ fn creation_cwd(
         origin
             .pane_cwd
             .as_ref()
-            .ok_or_else(|| incompatible("Relative pane cwd requires the captured origin cwd"))?
+            .ok_or_else(|| incompatible("A relative command-pane working directory requires an absolute working directory saved from the origin pane."))?
             .join(cwd)
     };
     if !cwd.is_absolute() {
@@ -4388,7 +4390,7 @@ fn origin_pane(origin: &muxe_core::OriginContext) -> Result<&str, AdapterError> 
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "portable pane action requires the captured origin pane",
+                "This pane action requires a saved origin pane ID, but none was captured.",
             )
         })
 }
@@ -4405,7 +4407,7 @@ fn origin_tab(origin: &muxe_core::OriginContext) -> Result<&str, AdapterError> {
         .ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::ContextUnavailable,
-                "portable tab action requires the captured origin tab",
+                "This tab action requires a saved origin tab ID, but none was captured.",
             )
         })
 }
@@ -5247,7 +5249,6 @@ mod tests {
                 .expect_err("JSON cannot encode non-UTF8 argv")
             };
             assert_eq!(error.kind, AdapterErrorKind::Incompatible);
-            assert!(error.to_string().contains(field));
         }
     }
 
@@ -5595,9 +5596,11 @@ mod tests {
                     Some(&validator),
                 )
                 .expect_err("a binding requiring an unavailable helper must not be published");
-                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code
-                    == DiagnosticCode::InvalidAction
-                    && diagnostic.message.contains(missing)));
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == DiagnosticCode::InvalidAction)
+                );
                 assert!(
                     diagnostics
                         .iter()

@@ -190,7 +190,7 @@ impl FromStr for ParentPane {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.is_empty() {
-            return Err("parent pane cannot be empty".into());
+            return Err("parent pane must be `current` or a nonempty pane ID".into());
         }
         Ok(if value == "current" {
             Self::Current
@@ -213,16 +213,16 @@ impl FromStr for Position {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let (x, y) = value
             .split_once(',')
-            .ok_or_else(|| "position must use x,y terminal-cell coordinates".to_owned())?;
+            .ok_or_else(|| "position must contain two terminal-cell coordinates separated by a comma, for example 10,5".to_owned())?;
         if x.is_empty() || y.is_empty() || y.contains(',') {
-            return Err("position must use one x,y coordinate pair".into());
+            return Err("position must contain exactly two coordinates, for example 10,5".into());
         }
         Ok(Self {
             x: x.parse().map_err(|_| {
-                "position x must be an unsigned terminal-cell coordinate".to_owned()
+                "position x must be a whole number from 0 to 65535 terminal cells".to_owned()
             })?,
             y: y.parse().map_err(|_| {
-                "position y must be an unsigned terminal-cell coordinate".to_owned()
+                "position y must be a whole number from 0 to 65535 terminal cells".to_owned()
             })?,
         })
     }
@@ -418,7 +418,7 @@ fn parse_absolute_path(value: &str) -> Result<PathBuf, String> {
     if path.is_absolute() {
         Ok(path)
     } else {
-        Err("path must be absolute".to_owned())
+        Err("path must be absolute, starting with `/`".to_owned())
     }
 }
 

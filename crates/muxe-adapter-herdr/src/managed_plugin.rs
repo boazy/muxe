@@ -47,13 +47,13 @@ pub(crate) async fn ensure_with(
         HerdrResponse::Success(_) => {
             return Err(failure(
                 AdapterErrorKind::OutcomeUnknown,
-                "Herdr accepted the request to link the Muxe command-pane plugin, but returned an invalid plugin description. The link may have changed. No executable was launched. Inspect `herdr plugin list --plugin muxe.command-panes --json` before trying again.",
+                "Herdr reported success for linking muxe.command-panes, but returned a plugin description that did not match Muxe's required configuration. The registration may have changed. No executable was launched. Inspect `herdr plugin list --plugin muxe.command-panes --json` before trying again.",
             ));
         }
         HerdrResponse::Error { .. } => {
             return Err(failure(
                 AdapterErrorKind::DispatchFailed,
-                "Herdr refused to link the Muxe command-pane plugin. Check that its plugin registry is writable. No executable was launched.",
+                "Herdr rejected the request to link muxe.command-panes. No executable was launched. Inspect `herdr plugin list --plugin muxe.command-panes --json` and the plugin registry permissions.",
             ));
         }
     }
@@ -76,7 +76,7 @@ async fn request(
     authority.request(method, params).await.map_err(|error| {
         // Preserve transport/outcome classification and continuity notifications,
         // but never expose host payloads, argv or environment through diagnostics.
-        failure(error.kind, "Muxe could not finish checking or repairing its Herdr command-pane plugin. No executable was launched. Check the Herdr connection and inspect `herdr plugin list --plugin muxe.command-panes --json` before trying again.")
+        failure(error.kind, "Muxe could not finish checking or repairing its Herdr command-pane plugin. The registration may have changed if a repair request reached Herdr. No executable was launched. Check the Herdr connection and inspect `herdr plugin list --plugin muxe.command-panes --json` before trying again.")
     })
 }
 
@@ -100,7 +100,7 @@ async fn list(authority: &dyn HerdrRequestAuthority) -> Result<Value, AdapterErr
         )),
         HerdrResponse::Error { .. } => Err(failure(
             AdapterErrorKind::DispatchFailed,
-            "Herdr refused the request to list its plugins. Muxe could not verify the command-pane plugin. Check the Herdr version and plugin registry permissions. No executable was launched.",
+            "Herdr rejected the request to list muxe.command-panes. Muxe could not verify the command-pane plugin. No executable was launched.",
         )),
     }
 }

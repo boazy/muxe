@@ -38,7 +38,7 @@ pub struct ServeHerdrSpawn {
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum SpawnArgvError {
     /// The handoff/journal pair must be supplied together or not at all.
-    #[error("broker target startup requires both --handoff and --activation-journal")]
+    #[error("replacement broker startup requires both --handoff and --activation-journal")]
     HalfHandoff,
 }
 

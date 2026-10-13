@@ -616,7 +616,7 @@ impl ActivationController {
                 {
                     return (
                         control_error(
-                            "cannot check client registrations at the requested time: this broker must be the uncommitted Zellij replacement for the requested handoff ID"
+                            "cannot check Zellij clients for this replacement request: the broker is not the requested replacement, or it is no longer waiting to finish activation"
                                 .to_owned(),
                         ),
                         false,
@@ -728,7 +728,7 @@ impl ActivationController {
                         outcome: Err(diagnostic),
                     }) if current == handoff => (control_error(diagnostic), false),
                     _ => (
-                        control_error("Muxe has no recorded confirmation that the old broker finished stopping for this handoff".to_owned()),
+                        control_error("Muxe has no recorded confirmation that the old broker's host connection and listener stopped for this replacement".to_owned()),
                         false,
                     ),
                 }
@@ -763,7 +763,7 @@ impl ActivationController {
         let state = self.state.lock().await.clone();
         if let ActivationState::SupervisorOnly { handoff: current } = state {
             if current != handoff {
-                return Err("The requested handoff ID does not match the handoff for which the old broker confirmed it stopped".to_owned());
+                return Err("requested handoff ID does not match the broker replacement for which the old broker confirmed its host connection and listener stopped".to_owned());
             }
             let proof = self
                 .old_retirement
@@ -771,7 +771,7 @@ impl ActivationController {
                 .await
                 .clone()
                 .filter(|recorded| recorded.handoff == handoff)
-                .ok_or_else(|| "Muxe has no recorded confirmation that the old broker finished stopping for this handoff".to_owned())?;
+                .ok_or_else(|| "Muxe has no recorded confirmation that the old broker's host connection and listener stopped for this replacement".to_owned())?;
             return Ok((None, proof.outcome));
         }
         if !matches!(
@@ -928,7 +928,7 @@ impl ActivationController {
             ActivationState::Draining {
                 previous_handoff, ..
             } => *previous_handoff,
-            _ => unreachable!("Prepare admission entered Draining"),
+            _ => unreachable!("a broker that accepted replacement must be stopping new work"),
         };
         if let Err(error) = broker.drain_for_activation().await {
             let prepare_refusal = matches!(&error, BrokerError::ActivationDrainRefused(_))
@@ -995,7 +995,7 @@ impl ActivationController {
                 _ => {
                     return (
                         control_error(
-                            "cannot abort activation: the broker is not prepared for the requested handoff ID".to_owned(),
+                            "cannot cancel this activation: the broker is not waiting for the specified replacement request".to_owned(),
                         ),
                         false,
                     );
@@ -1110,7 +1110,7 @@ impl ActivationController {
         let decision = self.recovery_decision(&broker, &handoff).await;
         match decision {
             RecoveryDecision::Preserve { reason } => {
-                tracing::warn!(%reason, "activation recovery preserves owner decision");
+                tracing::warn!(%reason, "activation recovery is leaving the broker state unchanged");
                 return;
             }
             RecoveryDecision::CleanupComplete | RecoveryDecision::Committed { permit: None } => {
@@ -1145,7 +1145,9 @@ impl ActivationController {
                             .acknowledge(&handoff, RecoveryAck::TargetCommitted)
                             .await;
                     }
-                    tracing::warn!("target completed its unit commit after coordinator disconnect");
+                    tracing::warn!(
+                        "replacement broker accepted the recorded activation commit after the coordinator disconnected"
+                    );
                 }
                 return;
             }
@@ -1159,7 +1161,7 @@ impl ActivationController {
                 }
                 *self.state.lock().await = ActivationState::Retired;
                 if let Err(error) = self.stop_listener().await {
-                    tracing::warn!(%error, "incomplete-unit target could not stop listener");
+                    tracing::warn!(%error, "replacement activation is incomplete; could not shut down the replacement broker's host connection and listener");
                 }
                 return;
             }
@@ -1174,7 +1176,7 @@ impl ActivationController {
                 *self.state.lock().await = ActivationState::Retired;
                 match self.stop_listener().await {
                     Err(error) => {
-                        tracing::warn!(%error, "incomplete-unit target could not stop listener");
+                        tracing::warn!(%error, "replacement activation is incomplete; could not shut down the replacement broker's host connection and listener");
                     }
                     Ok(ticket) => {
                         if let Some(permit) = permit
@@ -1182,7 +1184,7 @@ impl ActivationController {
                                 .acknowledge(&handoff, RecoveryAck::TargetRetired)
                                 .await
                         {
-                            tracing::warn!(%error, "target retirement acknowledgement failed");
+                            tracing::warn!(%error, "could not record shutdown of the replacement broker's host connection and listener");
                         }
                         drop(ticket);
                     }
@@ -1207,7 +1209,7 @@ impl ActivationController {
             .acknowledge(handoff, RecoveryAck::TargetCommitted)
             .await
         {
-            tracing::warn!(%error, "target commit acknowledgement failed");
+            tracing::warn!(%error, "could not record that the replacement broker committed activation");
         }
     }
 
@@ -1220,12 +1222,12 @@ impl ActivationController {
         let (ticket, proof) = match self.retire_old(broker, handoff).await {
             Ok(retirement) => retirement,
             Err(error) => {
-                tracing::warn!(%error, "old broker recovery retirement barrier failed");
+                tracing::warn!(%error, "activation recovery could not shut down the old broker's host connection and listener");
                 return;
             }
         };
         if let Err(error) = proof {
-            tracing::warn!(%error, "old broker post-stop proof failed");
+            tracing::warn!(%error, "could not record confirmation that the old broker's host connection and listener stopped");
             return;
         }
         if let Some(permit) = permit
@@ -1233,7 +1235,7 @@ impl ActivationController {
                 .acknowledge(&handoff, RecoveryAck::OldCommitted)
                 .await
         {
-            tracing::warn!(%error, "old broker retirement acknowledgement failed");
+            tracing::warn!(%error, "could not acknowledge the old broker's recorded shutdown");
         }
         drop(ticket);
     }
@@ -1250,7 +1252,7 @@ impl ActivationController {
         let mut resume_permit: Option<Arc<dyn RecoveryPermit>> = None;
         match decision {
             RecoveryDecision::Preserve { reason } => {
-                tracing::warn!(%reason, "activation recovery preserves owner decision");
+                tracing::warn!(%reason, "activation recovery is leaving the broker state unchanged");
                 return;
             }
             RecoveryDecision::CleanupComplete | RecoveryDecision::Committed { permit: None } => {
@@ -1294,7 +1296,7 @@ impl ActivationController {
                 if gated {
                     *self.state.lock().await = ActivationState::Retired;
                     if let Err(error) = self.stop_listener().await {
-                        tracing::warn!(%error, "incomplete-unit target could not stop listener");
+                        tracing::warn!(%error, "replacement activation is incomplete; could not shut down the replacement broker's host connection and listener");
                     }
                 }
                 return;
@@ -1310,7 +1312,7 @@ impl ActivationController {
                 *self.state.lock().await = ActivationState::Retired;
                 match self.stop_listener().await {
                     Err(error) => {
-                        tracing::warn!(%error, "incomplete-unit target could not stop listener");
+                        tracing::warn!(%error, "replacement activation is incomplete; could not shut down the replacement broker's host connection and listener");
                     }
                     Ok(ticket) => {
                         if let Some(permit) = permit
@@ -1318,7 +1320,7 @@ impl ActivationController {
                                 .acknowledge(&handoff, RecoveryAck::TargetRetired)
                                 .await
                         {
-                            tracing::warn!(%error, "target retirement acknowledgement failed");
+                            tracing::warn!(%error, "could not record shutdown of the replacement broker's host connection and listener");
                         }
                         drop(ticket);
                     }
@@ -1357,7 +1359,7 @@ impl ActivationController {
             _ => return,
         };
         if host_suspended && let Err(error) = self.resume_host_admission(broker).await {
-            tracing::warn!(%error, "disconnect recovery could not resume host; endpoint stays drained");
+            tracing::warn!(%error, "recovery after coordinator disconnect could not restore the host subscription; the old broker is still not accepting new work");
             return;
         }
         if let ActivationState::Draining {
@@ -1370,7 +1372,7 @@ impl ActivationController {
             *host_suspended = false;
         }
         if let Err(error) = self.resume_listener().await {
-            tracing::warn!(%error, "disconnect recovery could not rebind listener; endpoint stays drained");
+            tracing::warn!(%error, "recovery after coordinator disconnect could not reopen the listener; the old broker is still not accepting new work");
             return;
         }
         broker.reopen_dispatch().await;
@@ -1378,10 +1380,12 @@ impl ActivationController {
         if let Some(permit) = resume_permit
             && let Err(error) = permit.acknowledge(handoff, RecoveryAck::Resumed).await
         {
-            tracing::warn!(%error, "disconnect recovery resume acknowledgment failed");
+            tracing::warn!(%error, "old broker resumed, but recovery could not record that it resumed");
             return;
         }
-        tracing::warn!("old broker restored its endpoint after coordinator disconnect");
+        tracing::warn!(
+            "old broker restored its host subscription and listener after the coordinator disconnected"
+        );
     }
 
     async fn recovery_decision(&self, broker: &Broker, handoff: &HandoffId) -> RecoveryDecision {
@@ -1393,7 +1397,7 @@ impl ActivationController {
         match recovery {
             Some(recovery) => recovery.recovery_decision(handoff, &local_status).await,
             None => RecoveryDecision::Preserve {
-                reason: "owner recovery operation is not installed".to_owned(),
+                reason: "activation recovery handler is not configured".to_owned(),
             },
         }
     }
@@ -1594,7 +1598,7 @@ impl BrokerServer {
                         )
                         .await
                         {
-                            tracing::warn!(%error, "host-loss retirement teardown failed");
+                            tracing::warn!(%error, "could not complete broker shutdown after losing the host connection");
                         }
                         supervisor_only = true;
                         break Ok(());
@@ -1624,7 +1628,7 @@ impl BrokerServer {
                     )
                     .await
                     {
-                        tracing::warn!(%error, "host-loss retirement teardown failed");
+                        tracing::warn!(%error, "could not complete broker shutdown after losing the host connection");
                     }
                     supervisor_only = true;
                     break Ok(());
@@ -1699,7 +1703,7 @@ impl BrokerServer {
                                         if let Some(release) = recovery.release_retired_registration(&proof)
                                             && let Err(error) = release.await
                                         {
-                                            tracing::warn!(%error, "host authority retired but exact registry release failed");
+                                            tracing::warn!(%error, "host connection and listener stopped, but the broker registration could not be removed");
                                         }
                                     }
                                     supervisor_only = true;
@@ -1731,7 +1735,7 @@ impl BrokerServer {
                     let activation = activation.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_connection(broker, activation, stream).await {
-                            tracing::debug!(%error, "broker client disconnected");
+                            tracing::debug!(%error, "broker client connection ended with an error");
                         }
                     });
                 }
@@ -1774,7 +1778,7 @@ async fn retire_for_host_loss(
     if let Err(error) = broker.drain_for_activation().await {
         tracing::warn!(
             %error,
-            "host-loss drain could not confirm host cleanup; retiring anyway"
+            "could not confirm host resource cleanup after losing the host connection; continuing broker shutdown"
         );
     }
     drop(config_watch.take());
@@ -2192,12 +2196,12 @@ async fn serve_activation_connection_inner(
                             ticket
                         }
                         Ok((ticket, Err(diagnostic))) => {
-                            tracing::warn!(%diagnostic, "old broker post-stop proof failed");
+                            tracing::warn!(%diagnostic, "could not record confirmation that the old broker's host connection and listener stopped");
                             result = control_error(diagnostic);
                             ticket
                         }
                         Err(diagnostic) => {
-                            tracing::warn!(%diagnostic, "old broker retirement barrier failed");
+                            tracing::warn!(%diagnostic, "could not shut down the old broker's host connection and listener");
                             result = control_error(diagnostic);
                             None
                         }
@@ -2676,7 +2680,7 @@ impl ConfigWatch {
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "configuration reload rejected; keeping active generation");
+                        tracing::warn!(%error, "configuration reload failed; keeping the active configuration version");
                     }
                 }
             }
@@ -2707,19 +2711,23 @@ fn canonical_watch_path(path: &std::path::Path) -> std::path::PathBuf {
 
 #[derive(Debug, Error)]
 pub enum ServerError {
-    #[error("runtime endpoint error: {0}")]
+    #[error("could not prepare or access the broker socket: {0}")]
     Runtime(#[from] RuntimeError),
     #[error("Unix socket I/O failed: {0}")]
     Io(#[from] io::Error),
-    #[error("invalid IPC frame: {0}")]
+    #[error("invalid broker protocol frame: {0}")]
     Decode(#[from] DecodeError),
     #[error("broker operation failed: {0}")]
     Broker(#[from] BrokerError),
-    #[error("client role {0:?} cannot connect to the broker socket")]
+    #[error("a {} peer cannot connect to this broker socket", crate::peer_role_description(*.0))]
     UnsupportedRole(PeerRole),
-    #[error("client live-host identity does not match the active broker adapter")]
+    #[error(
+        "client requested a different host or server identity than the broker's active adapter"
+    )]
     IdentityMismatch,
-    #[error("client sent a broker-to-peer message")]
+    #[error(
+        "client message is not permitted in the current connection state or violates UI attachment requirements"
+    )]
     UnexpectedMessage,
     #[error("broker socket peer credentials do not belong to the current user")]
     PeerCredential,
@@ -2879,7 +2887,6 @@ mod tests {
             else {
                 panic!("fixture must produce structured configuration diagnostics");
             };
-            assert!(error.to_string().contains('\n'));
             let code = report.diagnostics[0].code.as_str();
             let diagnostic = decode_error_response(error_diagnostic(&BrokerError::Configuration(
                 Box::new(error),

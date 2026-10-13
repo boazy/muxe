@@ -106,7 +106,7 @@ impl AsOfTick {
         (value != 0)
             .then_some(Self(value))
             .ok_or(ControlSemanticError::InvalidCompatibility(
-                "activation proof timestamp must be nonzero",
+                "activation check timestamp must be nonzero",
             ))
     }
 
@@ -315,12 +315,12 @@ impl CompatibilityRecord {
         if let Some(herdr) = &self.herdr {
             if herdr.protocol_version == 0 {
                 return Err(ControlSemanticError::InvalidCompatibility(
-                    "Herdr protocol version must be nonzero",
+                    "the broker's compatibility information must specify a Herdr protocol version greater than zero",
                 ));
             }
             if herdr.schema_version == 0 {
                 return Err(ControlSemanticError::InvalidCompatibility(
-                    "Herdr schema version must be nonzero",
+                    "the broker's compatibility information must specify a Herdr API schema version greater than zero",
                 ));
             }
             validate_fingerprint(herdr.schema_fingerprint)?;
@@ -502,7 +502,7 @@ fn validate_readiness(ready: &TargetReadiness) -> Result<(), ControlSemanticErro
     }
     if ready.proof_epoch.is_some_and(UnitReadinessEpochId::is_zero) {
         return Err(ControlSemanticError::InvalidCompatibility(
-            "client registration proof ID must be nonzero when supplied",
+            "client registration check ID must be nonzero when supplied",
         ));
     }
     Ok(())
@@ -625,12 +625,12 @@ impl ControlRequest {
                 handoff_id.validate("handoff ID")?;
                 if epoch.is_zero() {
                     return Err(ControlSemanticError::InvalidCompatibility(
-                        "client registration proof ID must be nonzero",
+                        "client registration check ID must be nonzero",
                     ));
                 }
                 if as_of.millis() == 0 {
                     return Err(ControlSemanticError::InvalidCompatibility(
-                        "activation proof timestamp must be nonzero",
+                        "activation check timestamp must be nonzero",
                     ));
                 }
                 Ok(())
@@ -915,7 +915,7 @@ pub fn encode_broker_control_response(
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ControlEncodeError {
-    #[error("control response violates the broker-to-coordinator contract: {0}")]
+    #[error("cannot encode the activation control response: message validation failed: {0}")]
     Semantic(ControlSemanticError),
     #[error("could not serialize control response: {0}")]
     Json(String),
@@ -971,7 +971,7 @@ fn copy_from_input<const N: usize>(
 pub enum ControlSemanticError {
     #[error("{0} must be nonzero")]
     ZeroNonce(&'static str),
-    #[error("handoff ID must be exactly 32 hexadecimal characters")]
+    #[error("broker replacement (handoff) ID must be exactly 32 hexadecimal characters")]
     InvalidHandoffHex,
     #[error("schema fingerprint must be nonzero")]
     ZeroFingerprint,
@@ -993,19 +993,19 @@ pub enum ControlSemanticError {
     InvalidText(&'static str),
     #[error("activation diagnostic exceeds the 4096-byte limit: {0} bytes")]
     DiagnosticTooLong(usize),
-    #[error("control message is illegal for this connection direction")]
+    #[error("control message was sent in the wrong direction for this connection")]
     WrongDirection,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ControlDecodeError {
-    #[error("invalid control prelude: {0}")]
+    #[error("invalid activation control handshake: {0}")]
     Prelude(#[source] DecodeError),
     #[error("zero-length control frames are invalid")]
     EmptyFrame,
-    #[error("control frame exceeds 64 KiB: {0}")]
+    #[error("control frame length {0} bytes exceeds the 64 KiB limit")]
     FrameTooLarge(u32),
-    #[error("truncated control stream after {0} bytes")]
+    #[error("activation control stream ended with an incomplete handshake or frame")]
     Truncated(usize),
     #[error("invalid control JSON: {0}")]
     InvalidJson(String),

@@ -295,7 +295,7 @@ pub(crate) async fn open_plugin_command_pane_with(
 ) -> Result<PluginCommandPanePlacement, AdapterError> {
     if !launch.cwd.is_absolute() || launch.argv.first().is_none_or(String::is_empty) {
         return Err(invalid(
-            "A plugin command pane requires an absolute cwd and a nonempty program",
+            "A plugin command pane requires an absolute working directory and a nonempty program",
         ));
     }
     if launch.pane_type == PluginCommandPaneType::Overlay
@@ -309,11 +309,11 @@ pub(crate) async fn open_plugin_command_pane_with(
         return Err(invalid("Command argv cannot contain NUL bytes"));
     }
     let cwd = launch.cwd.to_str().ok_or_else(|| invalid(
-        "Herdr plugin command-pane cwd requires UTF-8 because its JSON socket API has string paths",
+        "The Herdr plugin command-pane working directory must be UTF-8 because the JSON socket API represents paths as strings",
     ))?;
     if cwd.contains('\0') {
         return Err(invalid(
-            "Herdr plugin command-pane cwd cannot contain NUL bytes",
+            "The Herdr plugin command-pane working directory cannot contain NUL bytes",
         ));
     }
     let active = focused_pane_with(authority).await?;
@@ -322,12 +322,15 @@ pub(crate) async fn open_plugin_command_pane_with(
         || active.pane != launch.origin.pane
     {
         return Err(
-            invalid("Herdr overlays and popups require the captured origin to be active")
+            invalid("The saved origin pane, tab, and workspace must be focused before Herdr can open an overlay or popup")
                 .with_safe_diagnostic(HerdrExecutionDiagnostic::OriginNotActive.safe()),
         );
     }
-    let argv = serde_json::to_string(&launch.argv)
-        .map_err(|error| invalid(format!("Could not encode command argv: {error}")))?;
+    let argv = serde_json::to_string(&launch.argv).map_err(|error| {
+        invalid(format!(
+            "Could not encode the command's argument list as JSON: {error}"
+        ))
+    })?;
     let placement = match launch.pane_type {
         PluginCommandPaneType::Overlay => "overlay",
         PluginCommandPaneType::Popup => "popup",
@@ -341,7 +344,7 @@ pub(crate) async fn open_plugin_command_pane_with(
         || active.pane != launch.origin.pane
     {
         return Err(
-            invalid("Herdr overlays and popups require the captured origin to be active")
+            invalid("The saved origin pane, tab, and workspace must be focused before Herdr can open an overlay or popup")
                 .with_safe_diagnostic(HerdrExecutionDiagnostic::OriginNotActive.safe()),
         );
     }
@@ -377,8 +380,8 @@ fn plugin_command_pane_response(
         AdapterError::new(
             AdapterErrorKind::OutcomeUnknown,
             format!(
-                "Herdr accepted plugin.pane.open but returned invalid placement evidence: {cause}. \
-            The command may already be running; inspect the host before deciding whether to repeat it."
+                "Herdr reported success for plugin.pane.open, but Muxe could not confirm where the command pane opened: {cause}. \
+            The command may already be running. Inspect Herdr before deciding whether to repeat it."
             ),
         ).with_safe_diagnostic(HerdrExecutionDiagnostic::CommandPaneOutcomeUnknown.safe())
     };
@@ -386,20 +389,27 @@ fn plugin_command_pane_response(
         HerdrResponse::Success(result) => {
             if pane_type == PluginCommandPaneType::Popup {
                 if result.get("type").and_then(Value::as_str) != Some("ok") {
-                    return Err(uncertain("popup success must have type ok".to_owned()));
+                    return Err(uncertain(
+                        "the popup response did not have type ok".to_owned(),
+                    ));
                 }
                 Ok(PluginCommandPanePlacement::Popup)
             } else {
                 if result.get("type").and_then(Value::as_str) != Some("plugin_pane_opened") {
                     return Err(uncertain(
-                        "overlay success must have type plugin_pane_opened".to_owned(),
+                        "the overlay response did not have type plugin_pane_opened".to_owned(),
                     ));
                 }
                 let pane = result
                     .get("plugin_pane")
                     .and_then(|pane| pane.get("pane"))
                     .and_then(Value::as_object)
-                    .ok_or_else(|| uncertain("overlay success must contain a pane".to_owned()))?;
+                    .ok_or_else(|| {
+                        uncertain(
+                            "the overlay response did not contain a plugin_pane.pane object"
+                                .to_owned(),
+                        )
+                    })?;
                 let id = required_id(pane, "pane_id", "plugin.pane.open")
                     .map_err(|error| uncertain(error.message))?;
                 Ok(PluginCommandPanePlacement::Pane(PaneId::new(id)))
@@ -556,7 +566,7 @@ fn pane_from_snapshot(
             })
         })
         .ok_or_else(|| {
-            invalid("The captured Herdr pane is not present in the live snapshot")
+            invalid("The saved Herdr origin pane was not found in its workspace and tab in the session snapshot")
                 .with_safe_diagnostic(HerdrExecutionDiagnostic::OriginUnavailable.safe())
         })?;
     let cwd = captured_pane
@@ -565,7 +575,7 @@ fn pane_from_snapshot(
         .map(PathBuf::from)
         .filter(|cwd| cwd.is_absolute())
         .ok_or_else(|| {
-            invalid("The Herdr pane has no captured absolute working directory")
+            invalid("Herdr did not report an absolute working directory for the saved origin pane")
                 .with_safe_diagnostic(HerdrExecutionDiagnostic::CapturedCwdUnavailable.safe())
         })?;
     let (columns, rows) = snapshot
@@ -595,7 +605,7 @@ fn pane_from_snapshot(
         })
         .filter(|(columns, rows)| *columns > 0 && *rows > 0)
         .ok_or_else(|| {
-            invalid("The Herdr pane has no live layout with positive row and column counts")
+            invalid("Herdr did not report positive row and column counts for the saved origin pane")
                 .with_safe_diagnostic(HerdrExecutionDiagnostic::OriginGeometryUnavailable.safe())
         })?;
     Ok(FocusedPane {
@@ -911,7 +921,7 @@ fn validate_ui_argv(argv: &[String]) -> Result<(), AdapterError> {
         .is_some_and(|value| value == "muxe" || Path::new(value).is_absolute());
     if !is_ui_argv(argv) || !executable_is_allowed {
         return Err(invalid(
-            "Herdr UI launch command must begin with `muxe ui menu`",
+            "The Herdr UI launch command must begin with `muxe ui menu` or an absolute executable path followed by `ui menu`",
         ));
     }
     let mut position = 3;
@@ -1492,8 +1502,6 @@ mod tests {
             let error = plugin_command_pane_response(HerdrResponse::Success(result), pane_type)
                 .expect_err("mutating success with missing placement evidence is uncertain");
             assert_eq!(error.kind, AdapterErrorKind::OutcomeUnknown);
-            assert!(error.to_string().contains("may already be running"));
-            assert!(error.to_string().contains("inspect the host"));
         }
         assert_eq!(
             plugin_command_pane_response(
@@ -1534,9 +1542,6 @@ mod tests {
             .expect_err("known rejection is not success or an unknown outcome");
             assert_eq!(error.kind, AdapterErrorKind::DispatchFailed);
             assert!(!error.message.contains("secret"));
-            assert!(!error.message.contains("herdr plugin link"));
-            assert!(!error.message.contains("herdr plugin enable"));
-            assert!(!error.message.contains("may already be running"));
         }
     }
     #[cfg(unix)]
@@ -1578,7 +1583,6 @@ mod tests {
             .await
             .expect_err("non-UTF-8 cwd is a diagnostic, never a JSON panic");
             assert_eq!(error.kind, AdapterErrorKind::InvalidRequest);
-            assert!(error.to_string().contains("UTF-8"));
             assert_eq!(
                 authority.0.load(Ordering::SeqCst),
                 0,

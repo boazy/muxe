@@ -156,7 +156,7 @@ pub enum PipeTransportError {
         reason: String,
     },
     /// The channel is shut down.
-    #[error("pipe channel is closed")]
+    #[error("Zellij pipe connection is closed")]
     Closed,
 }
 
@@ -411,10 +411,10 @@ impl SubprocessChannel {
         let child_id = child.id().unwrap_or(0);
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or(PipeTransportError::Spawn {
-            reason: "zellij pipe child has no stdout".to_owned(),
+            reason: "zellij pipe process has no standard output stream".to_owned(),
         })?;
         let stderr = child.stderr.take().ok_or(PipeTransportError::Spawn {
-            reason: "zellij pipe child has no stderr".to_owned(),
+            reason: "zellij pipe process has no standard error stream".to_owned(),
         })?;
         // The process handle stays owned here so every respawn and close can
         // terminate and reap it with a bounded wait. Reader tasks own only
@@ -454,7 +454,7 @@ async fn terminate_child(mut previous: LiveChild) -> Result<(), PipeTransportErr
     // take the stdin lock to drop the handle and let a stdin-blocked child
     // observe EOF.
     let mut child = previous.child.take().ok_or(PipeTransportError::Reap {
-        reason: "replaced child has no process handle".to_owned(),
+        reason: "no process handle is available for the replaced zellij pipe process".to_owned(),
     })?;
     // Signal, then reap with a bounded wait. kill_on_drop is a backstop, not
     // proof: only wait() reaps the process.
@@ -463,7 +463,10 @@ async fn terminate_child(mut previous: LiveChild) -> Result<(), PipeTransportErr
     match tokio::time::timeout(REAP_TIMEOUT, child.wait()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(PipeTransportError::Reap {
-            reason: bounded(format!("pid {} wait failed: {error}", previous.child_id)),
+            reason: bounded(format!(
+                "could not wait for process {}: {error}",
+                previous.child_id
+            )),
         }),
         Err(_) => {
             // Bounded wait expired: refuse silent success. Park a deferred
@@ -476,7 +479,7 @@ async fn terminate_child(mut previous: LiveChild) -> Result<(), PipeTransportErr
             });
             Err(PipeTransportError::Reap {
                 reason: bounded(format!(
-                    "pid {} did not exit within {REAP_TIMEOUT:?}; stderr tail: {tail}",
+                    "process {} did not exit within {REAP_TIMEOUT:?}; last standard error output: {tail}",
                     previous.child_id
                 )),
             })
@@ -510,7 +513,7 @@ async fn read_lines(
                     .send((
                         epoch,
                         Err(PipeTransportError::Read {
-                            reason: "zellij pipe child exited".to_owned(),
+                            reason: "zellij pipe process exited".to_owned(),
                         }),
                     ))
                     .await;

@@ -758,7 +758,7 @@ impl Bridge {
                     CommandOutcome::succeeded()
                 }
                 (Some(_), _) => CommandOutcome::outcome_unknown(
-                    "Zellij did not identify the created terminal; placement was not requested. Check existing panes before repeating the command.",
+                    "Zellij did not confirm which floating terminal was created; Muxe did not request its size and position. Check existing panes before repeating the command.",
                 ),
                 (None, _) => CommandOutcome::succeeded(),
             };
@@ -936,13 +936,16 @@ impl Bridge {
                 BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
                     outcome: CommandOutcome::outcome_unknown(
-                        "bridge unloaded before command completion; inspect panes before repeating",
+                        "Zellij bridge unloaded before command completion was confirmed; the command may have executed. Check its effects before repeating it.",
                     ),
                 },
                 effects,
             );
         }
-        self.fail_post_dismissals("bridge unloading", effects);
+        self.fail_post_dismissals(
+            "cannot execute the command queued for menu dismissal: the Zellij bridge is unloading",
+            effects,
+        );
     }
 
     fn fail_post_dismissals(&mut self, reason: &str, effects: &mut dyn HostEffects) {
@@ -1053,8 +1056,8 @@ impl Bridge {
             && previous.next() != Ok(request.request_id)
         {
             eprintln!(
-                "muxe bridge: request ID {} followed by {} for registration {}",
-                previous, request.request_id, request.registration
+                "muxe Zellij bridge: request IDs are not consecutive: received {} after {} for bridge registration {}",
+                request.request_id, previous, request.registration
             );
         }
         self.last_request_id = Some(request.request_id);
@@ -1560,7 +1563,7 @@ impl Bridge {
                 effects.focus_pane(neighbor.id);
                 CommandOutcome::succeeded()
             }
-            None => CommandOutcome::failed("no tracked neighbor in that direction".to_owned()),
+            None => CommandOutcome::failed("cannot focus a neighboring pane: the bridge has no known origin pane or eligible neighbor in that direction".to_owned()),
         };
         self.release(cli_id, request_id, generation, effects);
         self.emit_for_request(
@@ -1601,13 +1604,13 @@ impl Bridge {
                 BridgeResponse::DispatchCompleted {
                     execution: pending.execution,
                     outcome: CommandOutcome::outcome_unknown(
-                        "bridge retired before command completion; inspect panes before repeating",
+                        "Zellij bridge stopped accepting requests before command completion was confirmed; the command may have executed. Check its effects before repeating it.",
                     ),
                 },
                 effects,
             );
         }
-        self.fail_post_dismissals("bridge retiring", effects);
+        self.fail_post_dismissals("cannot execute the command queued for menu dismissal: the Zellij bridge stopped accepting requests", effects);
     }
 
     /// Validates the request, asks Zellij to unblock the request child by its

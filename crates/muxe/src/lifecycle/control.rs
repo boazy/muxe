@@ -60,7 +60,7 @@ pub enum ControlError {
         diagnostic: String,
         prepare_refusal: Option<muxe_protocol::control::PrepareRefusalEvidence>,
     },
-    #[error("Invalid handoff ID: expected 32 hexadecimal characters")]
+    #[error("Invalid broker replacement request ID: expected 32 hexadecimal characters")]
     InvalidHandoffId,
     #[error("Muxe could not encode the control request. The request was not sent: {0}")]
     Encode(#[source] serde_json::Error),
@@ -70,7 +70,9 @@ pub enum ControlError {
         "the broker does not support checking client registrations at a shared time (StatusAt)"
     )]
     UnsupportedStatusAt,
-    #[error("broker response carried a mismatched request ID")]
+    #[error(
+        "the broker response has a different request ID; Muxe cannot match it to the request that was sent"
+    )]
     IdMismatch,
     #[error("The broker did not return the expected {expected} response. Received: {actual}")]
     UnexpectedResult {
@@ -78,7 +80,7 @@ pub enum ControlError {
         actual: ControlResultKind,
     },
     #[error(
-        "the broker's readiness response differs from the requested handoff or readiness-check ID (handoff: expected {expected_handoff}, received {actual_handoff:?}; readiness-check ID: expected {expected_epoch:?}, received {actual_epoch:?})"
+        "Muxe cannot confirm replacement broker readiness: the response does not identify replacement request {expected_handoff} and the requested client-registration check"
     )]
     ReadinessProofMismatch {
         expected_handoff: HandoffId,
@@ -86,7 +88,7 @@ pub enum ControlError {
         expected_epoch: muxe_protocol::UnitReadinessEpochId,
         actual_epoch: Option<muxe_protocol::UnitReadinessEpochId>,
     },
-    #[error("control operation timed out")]
+    #[error("the broker control request timed out; Muxe could not confirm its outcome")]
     Timeout,
     #[error(
         "Muxe cannot authenticate the broker process or match its saved identity: its owner or process identity is unavailable, or its PID, OS identity, or registration token differs from the saved record"
@@ -94,7 +96,7 @@ pub enum ControlError {
     PeerIdentity,
     #[error("the OS could not authorize or finish stopping the exact broker process: {0}")]
     Process(#[from] muxe_process::ProcessError),
-    #[error("Muxe could not obtain OS entropy for an authenticated control request: {0}")]
+    #[error("Muxe could not generate a random ID for the broker control request: {0}")]
     Entropy(String),
     #[error(
         "Muxe cannot authenticate this unresponsive older broker: its registration has no saved OS identity that uniquely identifies this process. No process was signalled"
@@ -204,7 +206,7 @@ fn new_request_id() -> Result<ControlRequestId, ControlError> {
     getrandom::getrandom(&mut bytes).map_err(|error| ControlError::Entropy(error.to_string()))?;
     if bytes == [0; 16] {
         return Err(ControlError::Entropy(
-            "the OS returned the reserved zero nonce".to_owned(),
+            "the random source returned an all-zero request ID, which is not allowed".to_owned(),
         ));
     }
     Ok(ControlRequestId(bytes))

@@ -189,9 +189,11 @@ pub enum ClientError {
     Io(#[from] std::io::Error),
     #[error("invalid broker frame: {0}")]
     Decode(#[from] DecodeError),
-    #[error("peer role {0:?} cannot be a broker client")]
+    #[error("a {} peer cannot connect as a broker client", crate::peer_role_description(*.0))]
     UnsupportedRole(PeerRole),
-    #[error("broker accepted a different host or server identity than the client requested")]
+    #[error(
+        "broker welcome response does not match the requested host, server identity, or request ID"
+    )]
     IdentityMismatch,
     #[error("broker closed the connection before a complete response")]
     ConnectionClosed,

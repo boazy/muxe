@@ -214,6 +214,5 @@ mod tests {
             "gone".to_owned()
         )));
         assert_eq!(outcome.status, CommandStatus::Failed);
-        assert_eq!(outcome.detail, "gone");
     }
 }

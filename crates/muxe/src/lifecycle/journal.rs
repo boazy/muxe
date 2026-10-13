@@ -108,7 +108,7 @@ impl HerdrUnitId {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(JournalError::Inconsistent(
-                "Herdr activation target ID is not 32 lowercase hexadecimal characters".to_owned(),
+                "Herdr broker-group ID must contain 32 lowercase hexadecimal characters".to_owned(),
             ));
         }
         Ok(Self(value))
@@ -200,7 +200,7 @@ pub fn acquire_unit_lock(cache_dir: &Path, unit: &UnitKind) -> Result<UnitLock, 
     match try_acquire_unit_lock(cache_dir, unit)? {
         UnitLockAttempt::Acquired(lock) => Ok(lock),
         UnitLockAttempt::Active => Err(JournalError::Inconsistent(format!(
-            "another process holds the activation-target lock at {}",
+            "another process holds the broker-group lock at {}",
             activation_dir(cache_dir)
                 .join(unit.journal_name())
                 .with_extension("lock")
@@ -232,7 +232,7 @@ pub fn try_acquire_unit_lock(
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     let file = options.open(&path).map_err(|source| {
         JournalError::Inconsistent(format!(
-            "cannot open the activation-target lock at {}: {source}",
+            "cannot open the broker-group lock at {}: {source}",
             path.display()
         ))
     })?;
@@ -243,7 +243,7 @@ pub fn try_acquire_unit_lock(
         })),
         Err((_, error)) if error == nix::errno::Errno::EWOULDBLOCK => Ok(UnitLockAttempt::Active),
         Err((_, error)) => Err(JournalError::Inconsistent(format!(
-            "cannot acquire the activation-target lock at {}: {error}",
+            "cannot acquire the broker-group lock at {}: {error}",
             path.display()
         ))),
     }
@@ -281,11 +281,13 @@ pub fn acquire_unit_lock_blocking(
 /// Returns a journal error when the cache/unit lock cannot be prepared or acquired.
 pub fn acquire_journal_lock_blocking(path: &Path) -> Result<UnitLock, JournalError> {
     let lock = path.with_extension("lock");
-    let activation = lock
-        .parent()
-        .ok_or_else(|| JournalError::Inconsistent("journal lock path has no parent".to_owned()))?;
+    let activation = lock.parent().ok_or_else(|| {
+        JournalError::Inconsistent("activation record lock path has no parent directory".to_owned())
+    })?;
     let cache_dir = activation.parent().ok_or_else(|| {
-        JournalError::Inconsistent("activation lock path has no cache parent".to_owned())
+        JournalError::Inconsistent(
+            "activation record lock path has no cache directory parent".to_owned(),
+        )
     })?;
     let cache = acquire_cache_lease(cache_dir)?;
     fsutil::ensure_owner_dir(activation)?;
@@ -344,7 +346,7 @@ fn acquire_cache_lock(cache_dir: &Path, mode: FlockArg) -> Result<CacheLease, Jo
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     let file = options.open(&path).map_err(|source| {
         JournalError::Inconsistent(format!(
-            "cannot open cache lifetime lock at {}: {source}",
+            "cannot open the lock protecting the cache directory at {}: {source}",
             path.display()
         ))
     })?;
@@ -370,13 +372,13 @@ fn acquire_lock_path_blocking(path: &Path) -> Result<Flock<fs::File>, JournalErr
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     let file = options.open(path).map_err(|source| {
         JournalError::Inconsistent(format!(
-            "cannot open the activation-target lock at {}: {source}",
+            "cannot open the broker-group lock at {}: {source}",
             path.display()
         ))
     })?;
     Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, error)| {
         JournalError::Inconsistent(format!(
-            "cannot acquire the activation-target lock at {}: {error}",
+            "cannot acquire the broker-group lock at {}: {error}",
             path.display()
         ))
     })
@@ -401,11 +403,11 @@ impl ActivationId {
     pub fn generate() -> Result<Self, JournalError> {
         let mut bytes = [0_u8; 16];
         getrandom::getrandom(&mut bytes).map_err(|error| {
-            JournalError::Inconsistent(format!("cannot generate activation identity: {error}"))
+            JournalError::Inconsistent(format!("cannot generate an activation ID: {error}"))
         })?;
         if bytes == [0; 16] {
             return Err(JournalError::Inconsistent(
-                "generated zero activation identity".to_owned(),
+                "generated activation ID is all zeros".to_owned(),
             ));
         }
         Ok(Self(bytes))
@@ -419,7 +421,7 @@ impl ActivationId {
     pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, JournalError> {
         if bytes == [0; 16] {
             return Err(JournalError::Inconsistent(
-                "activation identity is zero".to_owned(),
+                "activation ID is all zeros".to_owned(),
             ));
         }
         Ok(Self(bytes))
@@ -454,7 +456,7 @@ impl<'de> Deserialize<'de> for ActivationId {
         let value = String::deserialize(deserializer)?;
         let bytes = parse_hex::<16>(&value).map_err(serde::de::Error::custom)?;
         if bytes == [0; 16] {
-            return Err(serde::de::Error::custom("activation identity is zero"));
+            return Err(serde::de::Error::custom("activation ID is all zeros"));
         }
         Ok(Self(bytes))
     }
@@ -474,7 +476,8 @@ impl ActivationMemberId {
     pub fn new(value: String) -> Result<Self, JournalError> {
         if value.is_empty() || value.chars().any(char::is_control) {
             return Err(JournalError::Inconsistent(
-                "activation target name is empty or contains a control character".to_owned(),
+                "broker name in the activation record is empty or contains a control character"
+                    .to_owned(),
             ));
         }
         Ok(Self(value))
@@ -508,7 +511,7 @@ impl MemberEndpoint {
             })
         {
             return Err(JournalError::Inconsistent(
-                "activation target socket is not an absolute normalized path".to_owned(),
+                "broker socket in the activation record must be an absolute path without '.' or '..' components".to_owned(),
             ));
         }
         Ok(Self(path))
@@ -561,7 +564,7 @@ impl TargetProcessId {
     pub fn new(value: u32) -> Result<Self, JournalError> {
         if value == 0 {
             return Err(JournalError::Inconsistent(
-                "target process identity is zero".to_owned(),
+                "replacement broker process ID is zero".to_owned(),
             ));
         }
         Ok(Self(value))
@@ -590,7 +593,8 @@ impl TargetRetirementAuthority {
                     || server_id.as_str().chars().any(char::is_control) =>
             {
                 Err(JournalError::Inconsistent(
-                    "target server identity is empty or contains a control character".to_owned(),
+                    "replacement broker server ID is empty or contains a control character"
+                        .to_owned(),
                 ))
             }
             Self::RemoteServer { .. } => Ok(()),
@@ -716,7 +720,7 @@ impl TargetRetirementIntent {
                 })
                 .ok_or_else(|| {
                     JournalError::Inconsistent(
-                        "stopped target has no original host scope".to_owned(),
+                        "the stopped replacement broker has no saved registration for the original host".to_owned(),
                     )
                 })?;
             let same_host = row
@@ -741,7 +745,7 @@ impl TargetRetirementIntent {
                 && row.live_server.as_deref().is_some_and(|id| !id.is_empty())
                 && matches!(self.authority, TargetRetirementAuthority::OwnedProcess { process_id } if process_id.get() == row.server_pid);
             if !exact {
-                return Err(JournalError::Inconsistent("saved stopped-target registration differs from its forced transaction authority".to_owned()));
+                return Err(JournalError::Inconsistent("the stopped replacement broker's registration does not match its saved process, host, socket, or replacement request".to_owned()));
             }
         }
         if self.retired_endpoint.as_ref().is_some_and(|endpoint| {
@@ -752,7 +756,7 @@ impl TargetRetirementIntent {
                     .is_none_or(|row| endpoint.path() != row.socket)
         }) {
             return Err(JournalError::Inconsistent(
-                "saved stopped-target socket differs from its exact registration".to_owned(),
+                "the stopped replacement broker's saved socket is invalid or differs from its registration".to_owned(),
             ));
         }
         if !self.receipt_id.is_valid()
@@ -768,7 +772,7 @@ impl TargetRetirementIntent {
                 )?
         {
             return Err(JournalError::Inconsistent(
-                "the replacement broker's stop request differs from its saved activation, target, handoff, or process identity".to_owned(),
+                "the replacement broker's saved stop request is invalid or does not match this activation, replacement version, request ID, or process".to_owned(),
             ));
         }
         Ok(())
@@ -808,7 +812,7 @@ impl TargetRetirementIntent {
             || !has_target_retirement_receipt(&activation_dir(cache), journal, member)?
         {
             return Err(JournalError::Inconsistent(
-                "stopped target registration lacks its exact forced retirement receipt".to_owned(),
+                "Muxe cannot release the replacement broker's registration: its forced stop was not confirmed by the matching saved stop request and stop-confirmation file".to_owned(),
             ));
         }
         Ok(self
@@ -967,7 +971,7 @@ impl TransactionMember {
     ) -> Result<Self, JournalError> {
         if handoff_id.0 == [0; 16] {
             return Err(JournalError::Inconsistent(
-                "activation target has an all-zero handoff ID".to_owned(),
+                "broker in the activation record has an all-zero replacement request ID".to_owned(),
             ));
         }
         let id = MemberTransactionId::derive(activation, &member);
@@ -1414,7 +1418,7 @@ impl ActivationJournal {
         };
         if journal.transaction.progress().members.is_empty() {
             return Err(JournalError::Inconsistent(
-                "the saved activation record has no broker targets".to_owned(),
+                "the saved activation record lists no brokers".to_owned(),
             ));
         }
         Ok(journal)
@@ -1453,7 +1457,7 @@ impl ActivationJournal {
                 Ok(())
             }
             UnitKind::Zellij { .. } => Err(JournalError::Inconsistent(
-                "the saved activation target ID differs from the managed bridge location"
+                "the saved Zellij broker-group ID differs from the managed bridge location"
                     .to_owned(),
             )),
             UnitKind::Herdr { .. } => Err(JournalError::Inconsistent(
@@ -1483,7 +1487,7 @@ impl ActivationJournal {
             .find(|member| member.member() == discovery_key && member.handoff_id() == handoff)
             .ok_or_else(|| {
                 JournalError::Inconsistent(
-                    "the broker identity and handoff ID do not match exactly one saved activation target".to_owned(),
+                    "the broker identity and replacement request ID do not match exactly one broker in the saved activation record".to_owned(),
                 )
             })
     }
@@ -1516,7 +1520,7 @@ impl ActivationJournal {
             .find(|member| member.member() == discovery_key && member.handoff_id() == handoff)
             .ok_or_else(|| {
                 JournalError::Inconsistent(
-                    "the broker acknowledgement does not match exactly one saved activation target"
+                    "the broker acknowledgement does not match exactly one broker in the saved activation record"
                         .to_owned(),
                 )
             })?;
@@ -1640,7 +1644,7 @@ impl ActivationJournal {
             TransactionDirective::Prepare | TransactionDirective::Activate
         ) {
             return Err(JournalError::Inconsistent(
-                "replacement broker identities have already been saved with the readiness decision; no new replacement registration is allowed".to_owned(),
+                "the saved activation decision does not allow a new replacement broker to register; registration is allowed only while preparing or starting replacements".to_owned(),
             ));
         }
         let capability = self.target_restore_capability(discovery_key, endpoint, handoff)?;
@@ -1689,7 +1693,7 @@ impl ActivationJournal {
             });
         if !authorized {
             return Err(JournalError::Inconsistent(
-                "the saved activation record does not authorize this replacement broker's socket and handoff ID".to_owned(),
+                "the saved activation record does not authorize this replacement broker's socket and replacement request ID".to_owned(),
             ));
         }
         Ok(TargetRegistrationCapability::new(
@@ -1724,7 +1728,7 @@ impl ActivationJournal {
         let progress = self.transaction.progress();
         if progress.members.is_empty() {
             return Err(JournalError::Inconsistent(
-                "the saved activation record has no broker targets".to_owned(),
+                "the saved activation record lists no brokers".to_owned(),
             ));
         }
         let mut member_ids = std::collections::HashSet::new();
@@ -1739,13 +1743,13 @@ impl ActivationJournal {
                 || !handoffs.insert(member.handoff_id())
             {
                 return Err(JournalError::Inconsistent(
-                    "the saved activation record contains an invalid or duplicate broker target, socket, transaction ID, or handoff ID".to_owned(),
+                    "the saved activation record contains an invalid or duplicate broker name, socket, broker transaction ID, or replacement request ID".to_owned(),
                 ));
             }
             if self.is_forced() {
                 let stop = member.forced_stop.as_ref().ok_or_else(|| {
                     JournalError::Inconsistent(
-                        "forced replacement lacks exact old process and socket authority"
+                        "forced replacement lacks the saved identity of the existing broker process and socket"
                             .to_owned(),
                     )
                 })?;
@@ -1777,7 +1781,7 @@ impl ActivationJournal {
                     )
                 {
                     return Err(JournalError::Inconsistent(
-                        "forced stop proof differs from its old process, endpoint, or durable progress".to_owned()));
+                        "the saved forced-stop confirmation does not match the existing broker process, socket, or recorded stop progress".to_owned()));
                 }
             } else if member.old_record.is_none()
                 || member.forced_stop.is_some()
@@ -1787,7 +1791,7 @@ impl ActivationJournal {
                 )
             {
                 return Err(JournalError::Inconsistent(
-                    "ordinary activation requires observed old compatibility and cooperative old progress".to_owned()));
+                    "ordinary activation requires the existing broker's version and compatibility details, with progress from a cooperative replacement rather than a forced stop".to_owned()));
             }
             match (member.target, member.target_retirement.as_ref()) {
                 (
@@ -1820,7 +1824,7 @@ impl ActivationJournal {
                     .ok_or(JournalError::MissingZellijAuthority)?;
                 if identity.unit() != *bridge_unit {
                     return Err(JournalError::Inconsistent(
-                        "the saved bridge location differs from the activation target ID"
+                        "the saved bridge location differs from the Zellij broker-group ID"
                             .to_owned(),
                     ));
                 }
@@ -1836,7 +1840,7 @@ impl ActivationJournal {
                         != *census
                 {
                     return Err(JournalError::Inconsistent(
-                        "the saved session list or previous registry entries differ from the activation's broker targets".to_owned(),
+                        "the saved session list or previous registry entries differ from the brokers listed in this activation".to_owned(),
                     ));
                 }
                 let bridge = progress.bridge.as_ref().ok_or_else(|| {
@@ -1908,7 +1912,7 @@ impl ActivationJournal {
                     || progress.bridge.is_some()
                 {
                     return Err(JournalError::Inconsistent(
-                        "the saved Herdr activation record includes Zellij bridge files, a bridge location, or session registrations".to_owned(),
+                        "the saved Herdr activation record has an invalid broker-group ID or includes Zellij bridge files, a bridge location, or session registrations".to_owned(),
                     ));
                 }
             }
@@ -2085,13 +2089,13 @@ impl ActivationJournal {
         };
         if !proof_valid {
             return Err(JournalError::Inconsistent(
-                "the saved activation phase requires a readiness record with the expected schema and replacement broker identities".to_owned(),
+                "the saved readiness record is missing, invalid, or not allowed by the activation decision; Muxe cannot confirm the replacement brokers' identities".to_owned(),
             ));
         }
         let valid = valid && bridge_valid && rollback_target_barrier_valid;
         if !valid {
             return Err(JournalError::Inconsistent(
-                "the saved brokers' progress is not valid for the activation phase".to_owned(),
+                "the saved broker or bridge progress conflicts with the activation decision; Muxe cannot safely continue".to_owned(),
             ));
         }
         Ok(())
@@ -2148,7 +2152,7 @@ impl OldRetirementReceiptId {
         });
         let entry = entries.next().ok_or_else(|| {
             JournalError::Inconsistent(
-                "The saved activation record does not contain the existing broker's identity. Muxe cannot verify that it stopped for this handoff".to_owned(),
+                "The saved activation record does not contain the existing broker's identity. Muxe cannot verify that it stopped for this replacement request".to_owned(),
             )
         })?;
         if entries.next().is_some()
@@ -2159,7 +2163,7 @@ impl OldRetirementReceiptId {
             || entry.live_server.as_deref().is_none_or(str::is_empty)
         {
             return Err(JournalError::Inconsistent(
-                "The existing broker's saved identity is incomplete or matches more than one entry. Muxe cannot verify that it stopped for this handoff".to_owned(),
+                "The existing broker's saved identity is incomplete or matches more than one entry. Muxe cannot verify that it stopped for this replacement request".to_owned(),
             ));
         }
         let receipt = OldRetirementReceipt {
@@ -2210,7 +2214,7 @@ pub fn has_old_retirement_receipt(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(source) => {
             return Err(JournalError::Fs(fsutil::io_error(
-                "checking old retirement receipt",
+                "checking the existing broker's stop-confirmation file",
                 &path,
                 source,
             )));
@@ -2282,7 +2286,10 @@ pub fn remove_old_retirement_receipt(
     let (id, _) = OldRetirementReceiptId::for_member(journal, member)?;
     let path = id.path(directory);
     has_old_retirement_receipt(directory, journal, member)?;
-    fsutil::remove_file_durable(&path, "removing old retirement receipt")?;
+    fsutil::remove_file_durable(
+        &path,
+        "removing the existing broker's stop-confirmation file",
+    )?;
     Ok(())
 }
 
@@ -2363,7 +2370,7 @@ pub(crate) fn has_target_retirement_receipt(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(source) => {
             return Err(JournalError::Fs(fsutil::io_error(
-                "checking target retirement receipt",
+                "checking the replacement broker's stop-confirmation file",
                 &path,
                 source,
             )));
@@ -2394,7 +2401,7 @@ pub(crate) fn target_retirement_receipt_entry_exists(
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(JournalError::Fs(fsutil::io_error(
-            "checking target retirement receipt path",
+            "checking the replacement broker's stop-confirmation file path",
             &path,
             source,
         ))),
@@ -2459,7 +2466,7 @@ pub fn acknowledge_remote_target_retirement(
         .position(|member| member.member() == discovery_key && member.handoff_id() == handoff)
         .ok_or_else(|| {
             JournalError::Inconsistent(
-                "the replacement broker's stop acknowledgement does not match exactly one activation target".to_owned(),
+                "the replacement broker's stop acknowledgement does not match exactly one broker in the activation record".to_owned(),
             )
         })?;
     let member = journal.members()[index].clone();
@@ -2500,7 +2507,10 @@ pub(crate) fn remove_target_retirement_receipt(
     let intent = retirement_intent(member)?;
     let path = target_retirement_receipt_path(directory, intent);
     has_target_retirement_receipt(directory, journal, member)?;
-    fsutil::remove_file_durable(&path, "removing target retirement receipt")?;
+    fsutil::remove_file_durable(
+        &path,
+        "removing the replacement broker's stop-confirmation file",
+    )?;
     Ok(())
 }
 
@@ -2551,17 +2561,24 @@ pub(crate) fn retain_before_force(
         Ok(_) => {
             if fsutil::read_owner_file(&retained)? != bytes {
                 return Err(JournalError::Inconsistent(
-                    "retained activation evidence differs from the prior decision".to_owned(),
+                    "the retained activation record differs from the saved decision before forced replacement".to_owned(),
                 ));
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fsutil::write_atomic(&retained, &bytes, "retaining forced activation evidence")?;
+            fsutil::write_atomic(
+                &retained,
+                &bytes,
+                "retaining the activation record before forced replacement",
+            )?;
         }
         Err(error) => {
-            return Err(
-                fsutil::io_error("reading retained activation evidence", &retained, error).into(),
-            );
+            return Err(fsutil::io_error(
+                "reading the retained activation record",
+                &retained,
+                error,
+            )
+            .into());
         }
     }
     Ok(())
@@ -2610,7 +2627,7 @@ pub fn read_journal(path: &Path) -> Result<ActivationJournal, JournalError> {
 ///
 /// Returns [`JournalError`] when removal or directory sync fails.
 pub fn remove_journal(path: &Path) -> Result<(), JournalError> {
-    fsutil::remove_file_durable(path, "removing activation journal")?;
+    fsutil::remove_file_durable(path, "removing the saved activation record")?;
     Ok(())
 }
 
@@ -2632,7 +2649,7 @@ pub fn list_journals(cache_dir: &Path) -> Result<JournalEntries, JournalError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
             return Err(JournalError::Fs(fsutil::io_error(
-                "scanning activation journals",
+                "listing saved activation records",
                 &directory,
                 source,
             )));
@@ -2641,7 +2658,7 @@ pub fn list_journals(cache_dir: &Path) -> Result<JournalEntries, JournalError> {
     let mut journals = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| {
-            fsutil::io_error("scanning activation journals", &directory, source)
+            fsutil::io_error("listing saved activation records", &directory, source)
         })?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {

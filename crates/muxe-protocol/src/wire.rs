@@ -129,6 +129,16 @@ impl PeerRole {
     }
 }
 
+pub(crate) const fn peer_role_description(role: PeerRole) -> &'static str {
+    match role {
+        PeerRole::Ui => "menu UI",
+        PeerRole::Launcher => "UI launcher",
+        PeerRole::Bridge => "host bridge",
+        PeerRole::ActivationCoordinator => "activation coordinator",
+        PeerRole::Broker => "broker",
+    }
+}
+
 #[derive(
     Archive,
     Deserialize,
@@ -2264,6 +2274,14 @@ pub enum ConnectionPhase {
     Ready,
 }
 
+const fn connection_phase_description(phase: ConnectionPhase) -> &'static str {
+    match phase {
+        ConnectionPhase::AwaitingHello => "waiting for the client's hello message",
+        ConnectionPhase::AwaitingWelcome => "waiting for the broker's welcome response",
+        ConnectionPhase::Ready => "the connection is ready for requests and events",
+    }
+}
+
 pub trait Validate {
     /// Validates structural and semantic invariants.
     ///
@@ -2277,7 +2295,7 @@ pub trait Validate {
 pub enum SemanticError {
     #[error("{field} must not be empty")]
     Empty { field: &'static str },
-    #[error("{field} exceeds maximum length {maximum}: {actual}")]
+    #[error("{field} length {actual} exceeds the maximum of {maximum} bytes")]
     TooLong {
         field: &'static str,
         maximum: usize,
@@ -2289,15 +2307,15 @@ pub enum SemanticError {
     Control { field: &'static str },
     #[error("{field} contains invalid whitespace")]
     Whitespace { field: &'static str },
-    #[error("{0} must not be the zero nonce")]
+    #[error("{0} must not be all zero")]
     ZeroNonce(&'static str),
-    #[error("configuration generation must be nonzero")]
+    #[error("configuration version counter must be nonzero")]
     ZeroGeneration,
-    #[error("launch lease must be nonzero")]
+    #[error("UI launch reservation duration must be nonzero")]
     ZeroLease,
     #[error("invalid advertised frame limit: {0}")]
     InvalidFrameLimit(u32),
-    #[error("layout max item title length must be nonzero")]
+    #[error("maximum menu item title length must be nonzero")]
     ZeroLayoutTitleLength,
     #[error("vt100 escape timeout must be nonzero")]
     ZeroEscapeTimeout,
@@ -2311,7 +2329,7 @@ pub enum SemanticError {
     UnexpectedDiagnostic,
     #[error("blocked binding must include a diagnostic")]
     MissingDiagnostic,
-    #[error("an included, shown non-hidden binding requires a non-empty label")]
+    #[error("a visible, non-hidden binding must have a non-empty label")]
     MissingVisibleLabel,
     #[error("menu graph contains the same menu ID more than once")]
     DuplicateMenu,
@@ -2319,13 +2337,15 @@ pub enum SemanticError {
     MissingRootMenu,
     #[error("{field} must be an absolute path")]
     RelativePath { field: &'static str },
-    #[error("binding ID generation does not match the containing menu graph")]
+    #[error(
+        "binding ID belongs to a different configuration version than its containing menu graph"
+    )]
     BindingGenerationMismatch,
     #[error("local menu action targets a menu outside the menu graph")]
     UnknownMenuTarget,
-    #[error("message is illegal for {role:?} peer role")]
+    #[error("message is not permitted for a {} peer", peer_role_description(*.role))]
     IllegalMessageForRole { role: PeerRole },
-    #[error("message is illegal during {phase:?} for {role:?}")]
+    #[error("message is not permitted for a {} peer while {}", peer_role_description(*.role), connection_phase_description(*.phase))]
     IllegalSequence {
         role: PeerRole,
         phase: ConnectionPhase,

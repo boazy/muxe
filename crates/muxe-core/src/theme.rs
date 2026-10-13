@@ -65,14 +65,16 @@ impl Color {
             _ => return Err(ThemePairError::new("color must use `#rgb` or `#rrggbb`")),
         }
         if !value.is_ascii() {
-            return Err(ThemePairError::new("color contains a non-hex digit"));
+            return Err(ThemePairError::new(
+                "color contains a non-hexadecimal character",
+            ));
         }
         if let Some(index) = value.bytes().position(|byte| !byte.is_ascii_hexdigit()) {
             let message = match value.len() {
-                3 => "color contains a non-hex digit",
-                6 if index < 2 => "invalid red channel",
-                6 if index < 4 => "invalid green channel",
-                6 => "invalid blue channel",
+                3 => "color contains a non-hexadecimal character",
+                6 if index < 2 => "color red channel must contain two hexadecimal digits",
+                6 if index < 4 => "color green channel must contain two hexadecimal digits",
+                6 => "color blue channel must contain two hexadecimal digits",
                 _ => unreachable!("validated color length"),
             };
             return Err(ThemePairError::new(message));
@@ -165,7 +167,9 @@ impl ColorScheme {
             .or_else(|| self.palette.get(name))
             .copied()
             .ok_or_else(|| {
-                ThemePairError::new(format!("unknown palette or semantic color `{name}`"))
+                ThemePairError::new(format!(
+                    "unknown color `{name}`; no matching entry in `palette` or `colors`"
+                ))
             })
     }
 }
@@ -284,11 +288,13 @@ impl<'a> ColorResolver<'a> {
             .get_key_value(name)
             .or_else(|| graph.palette.get_key_value(name))
             .ok_or_else(|| {
-                ThemePairError::new(format!("unknown palette or semantic color `{name}`"))
+                ThemePairError::new(format!(
+                    "unknown color `{name}`; no matching entry in `palette` or `colors`"
+                ))
             })?;
         if !self.active.insert(key) {
             return Err(ThemePairError::new(format!(
-                "color alias cycle at `{name}`"
+                "color alias `{name}` refers back to itself through a cycle of aliases"
             )));
         }
         let result = match expression {
@@ -653,17 +659,28 @@ fn compile_theme_section(
     let styles = section
         .styles
         .into_iter()
-        .map(|(name, style)| style.resolve(resolver).map(|style| (name, style)))
+        .map(|(name, style)| {
+            style
+                .resolve(resolver)
+                .map_err(|error| {
+                    ThemePairError::new(format!(
+                        "theme style `{name}` has an invalid color: {error}"
+                    ))
+                })
+                .map(|style| (name, style))
+        })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    for template in section.templates.values() {
+    for (name, template) in &section.templates {
         if has_loader_backed_construct(template) {
-            return Err(ThemePairError::new(
-                "theme templates cannot load other templates; `include`, `import`, `from`, and `extends` are not supported",
-            ));
+            return Err(ThemePairError::new(format!(
+                "theme template `{name}` cannot load other templates; `include`, `import`, `from`, and `extends` are not supported",
+            )));
         }
         minijinja::Environment::new()
             .template_from_str(template)
-            .map_err(|error| ThemePairError::new(error.to_string()))?;
+            .map_err(|error| {
+                ThemePairError::new(format!("cannot parse theme template `{name}`: {error}"))
+            })?;
         for style_name in literal_style_tags(template) {
             if styles.contains_key(style_name)
                 || fallback.is_some_and(|common| common.styles.contains_key(style_name))
@@ -671,7 +688,7 @@ fn compile_theme_section(
                 continue;
             }
             return Err(ThemePairError::new(format!(
-                "template references unknown literal style `{style_name}`"
+                "theme template `{name}` references undefined style `{style_name}`"
             )));
         }
     }

@@ -514,36 +514,43 @@ impl std::fmt::Display for TruncationStage {
     }
 }
 
+const fn codec_description(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Rkyv => "rkyv binary messages",
+        Codec::ControlJsonV1 => "activation control JSON v1",
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
-    #[error("invalid protocol magic")]
+    #[error("protocol handshake does not start with the required MUXE signature")]
     BadMagic,
-    #[error("unknown codec byte {0}")]
+    #[error("protocol handshake specifies an unknown message encoding: {0}")]
     UnknownCodec(u8),
-    #[error("unknown peer role byte {0}")]
+    #[error("protocol handshake specifies an unknown peer role: {0}")]
     UnknownPeerRole(u8),
     #[error("protocol version mismatch: expected {expected}, received {received}")]
     ProtocolVersionMismatch { expected: u16, received: u16 },
-    #[error("codec mismatch: expected {expected:?}, received {received:?}")]
+    #[error("message encoding mismatch: expected {}, received {}", codec_description(*.expected), codec_description(*.received))]
     CodecMismatch { expected: Codec, received: Codec },
-    #[error("peer role mismatch: expected {expected:?}, received {received:?}")]
+    #[error("peer role mismatch: expected {}, received {}", crate::wire::peer_role_description(*.expected), crate::wire::peer_role_description(*.received))]
     PeerRoleMismatch {
         expected: PeerRole,
         received: PeerRole,
     },
-    #[error("schema fingerprint mismatch")]
+    #[error("peer uses a different message schema than this Muxe process")]
     SchemaFingerprintMismatch,
     #[error("frame limit mismatch: expected {expected}, received {received}")]
     FrameLimitMismatch { expected: u32, received: u32 },
-    #[error("zero-length frames are not valid rkyv archives")]
+    #[error("binary message frame must not be empty")]
     EmptyFrame,
     #[error("frame length {declared} exceeds maximum {maximum}")]
     FrameTooLarge { declared: u32, maximum: u32 },
     #[error("connection closed during {0}")]
     Truncated(TruncationStage),
-    #[error("invalid checked rkyv archive: {0}")]
+    #[error("binary message failed rkyv format validation: {0}")]
     InvalidArchive(String),
-    #[error("semantic protocol violation: {0}")]
+    #[error("protocol message failed validation: {0}")]
     Semantic(#[from] SemanticError),
     #[error("decoder is closed after a protocol error")]
     DecoderClosed,

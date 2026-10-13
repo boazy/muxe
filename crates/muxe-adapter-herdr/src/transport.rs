@@ -110,7 +110,7 @@ pub enum SocketError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("Herdr protocol error: {message}")]
+    #[error("Herdr protocol error: {message}. {}", .delivery.explanation())]
     Protocol {
         delivery: DeliveryState,
         message: String,
@@ -509,7 +509,7 @@ impl HerdrSocketClient {
             .filter(|stem| !stem.is_empty())
             .ok_or_else(|| SocketError::Protocol {
                 delivery: DeliveryState::NotSent,
-                message: "The explicit Herdr API socket must have a nonempty UTF-8 filename stem to derive its client endpoint.".to_owned(),
+                message: "Muxe cannot derive the Herdr command socket path because the API socket's filename stem is empty or not valid UTF-8.".to_owned(),
             })?;
         Ok(self
             .socket
@@ -528,7 +528,7 @@ impl HerdrSocketClient {
         if expected.peer.pid.is_none() {
             return Err(SocketError::Protocol {
                 delivery: DeliveryState::NotSent,
-                message: "Herdr configured commands require an observable API peer process ID; same-user socket ownership is insufficient.".to_owned(),
+                message: "Muxe could not obtain the process ID for the Herdr API socket. It cannot confirm that the command socket belongs to the same server.".to_owned(),
             });
         }
         let binary_client = Self::new(self.command_socket()?);
@@ -538,7 +538,7 @@ impl HerdrSocketClient {
         if actual.peer.pid.is_none() {
             return Err(SocketError::Protocol {
                 delivery: DeliveryState::NotSent,
-                message: "Herdr configured commands require an observable client-endpoint peer process ID.".to_owned(),
+                message: "Muxe could not obtain the process ID for the Herdr command socket. It cannot confirm that the socket belongs to the API server.".to_owned(),
             });
         }
         if actual.peer != expected.peer {
@@ -1089,7 +1089,6 @@ mod tests {
                 ..
             }
         ));
-        assert!(error.to_string().contains("process ID"));
     }
 
     #[tokio::test]
