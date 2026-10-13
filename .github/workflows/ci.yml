@@ -143,7 +143,7 @@ jobs:
           file_digest() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot compute SHA-256 checksums: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           hrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/herdr.toml)"
           hver="$(sed -n 's/^host_version = "\(.*\)"$/\1/p' pins/herdr.toml)"
@@ -153,7 +153,7 @@ jobs:
             Linux-x86_64) hkey="linux_x86_64" ;;
             Linux-aarch64) hkey="linux_aarch64" ;;
             Darwin-arm64) hkey="macos_aarch64" ;;
-            *) echo "no pinned Herdr asset for $(uname -s)-$(uname -m)"; exit 1 ;;
+            *) echo "Cannot download Herdr: this workflow has no release asset configured for $(uname -s)-$(uname -m)."; exit 1 ;;
           esac
           hasset="$(sed -n "s/^release_${hkey}_asset = \"\(.*\)\"$/\1/p" pins/herdr.toml)"
           hdigest="$(sed -n "s/^release_${hkey}_sha256 = \"\(.*\)\"$/\1/p" pins/herdr.toml)"
@@ -163,7 +163,7 @@ jobs:
           mkdir -p "$hdir"
           curl -fSL "$hrepo/releases/download/v$hver/$hasset" -o "$hdir/herdr"
           test "$(file_digest "$hdir/herdr")" = "$hdigest" || {
-            echo "Herdr release asset digest mismatch for $hasset"
+            echo "Downloaded Herdr asset $hasset does not match the SHA-256 checksum $hdigest configured in pins/herdr.toml."
             exit 1
           }
           chmod 755 "$hdir/herdr"
@@ -186,7 +186,7 @@ jobs:
           file_digest() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot compute SHA-256 checksums: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           expected="$(file_digest dist-wasm/muxe-zellij.wasm)"
           test "${#expected}" -eq 64
@@ -195,12 +195,12 @@ jobs:
           bin="target/release/muxe"
           test -x "$bin"
           command -v strings >/dev/null 2>&1 || {
-            echo "MISSING: strings (binutils) on this runner"
+            echo "Cannot check the executable's embedded bridge checksum: the strings command is unavailable on PATH."
             exit 1
           }
           strings "$bin" > strings.out
           grep -Fq "$expected" strings.out || {
-            echo "staging failure: native binary does not embed producer digest"
+            echo "Cannot verify $bin: the executable does not contain the packaged Zellij bridge's SHA-256 checksum $expected."
             exit 1
           }
           rm -rf "$RUNNER_TEMP/target-install"
@@ -235,10 +235,10 @@ jobs:
           set -euo pipefail
           mise exec -- cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
           fx="$PWD/tools/muxe-zellij-foreground/target/debug"
-          test -x "$fx/muxe-zellij-foreground" || { echo "MISSING: built foreground binary"; exit 1; }
-          test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
-          test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
-          test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
+          test -x "$fx/muxe-zellij-foreground" || { echo "Cannot run host tests: $fx/muxe-zellij-foreground is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-bootstrap" || { echo "Cannot run host tests: $fx/muxe-zellij-bootstrap is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-permit" || { echo "Cannot run host tests: $fx/muxe-zellij-permit is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-fault-injector" || { echo "Cannot run host tests: $fx/muxe-zellij-fault-injector is missing or is not executable."; exit 1; }
           # Run isolated fixture tests before the live host test.
           mise exec -- cargo test --locked -p muxe --test live_hosts scoped_spawn
           mise exec -- cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml
@@ -294,7 +294,7 @@ jobs:
           elif command -v shasum >/dev/null 2>&1; then
             digest="$(shasum -a 256 dist-wasm/muxe-zellij.wasm | cut -d' ' -f1)"
           else
-            echo "MISSING: no sha256sum or shasum on this runner" >&2
+            echo "Cannot compute the Zellij bridge's SHA-256 checksum: neither sha256sum nor shasum is available on PATH." >&2
             exit 1
           fi
           test "${#digest}" -eq 64
@@ -369,7 +369,7 @@ jobs:
           file_digest() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot compute SHA-256 checksums: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           hrepo="$(sed -n 's/^repository = "\(.*\)"$/\1/p' pins/herdr.toml)"
           hver="$(sed -n 's/^host_version = "\(.*\)"$/\1/p' pins/herdr.toml)"
@@ -383,7 +383,7 @@ jobs:
           mkdir -p "$hdir"
           curl -fSL "$hrepo/releases/download/v$hver/$hasset" -o "$hdir/herdr"
           test "$(file_digest "$hdir/herdr")" = "$hdigest" || {
-            echo "Herdr release asset digest mismatch for $hasset"
+            echo "Downloaded Herdr asset $hasset does not match the SHA-256 checksum $hdigest configured in pins/herdr.toml."
             exit 1
           }
           chmod 755 "$hdir/herdr"
@@ -393,8 +393,8 @@ jobs:
         # Missing hosts or unsupported commands fail this step.
         run: |
           set -euo pipefail
-          command -v zellij >/dev/null 2>&1 || { echo "MISSING: pinned zellij not on PATH"; exit 1; }
-          command -v herdr >/dev/null 2>&1 || { echo "MISSING: pinned herdr not on PATH"; exit 1; }
+          command -v zellij >/dev/null 2>&1 || { echo "Cannot run host tests: the zellij executable is not available on PATH."; exit 1; }
+          command -v herdr >/dev/null 2>&1 || { echo "Cannot run host tests: the herdr executable is not available on PATH."; exit 1; }
           zellij --version
           herdr --version
           herdr api schema --json > /dev/null
@@ -413,7 +413,7 @@ jobs:
           file_digest() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot compute SHA-256 checksums: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           expected="$(file_digest dist-wasm/muxe-zellij.wasm)"
           test "${#expected}" -eq 64
@@ -422,12 +422,12 @@ jobs:
           bin="target/release/muxe"
           test -x "$bin"
           command -v strings >/dev/null 2>&1 || {
-            echo "MISSING: strings (binutils) on this runner"
+            echo "Cannot check the executable's embedded bridge checksum: the strings command is unavailable on PATH."
             exit 1
           }
           strings "$bin" > strings.out
           grep -Fq "$expected" strings.out || {
-            echo "staging failure: native binary does not embed producer digest"
+            echo "Cannot verify $bin: the executable does not contain the packaged Zellij bridge's SHA-256 checksum $expected."
             exit 1
           }
           rm -rf "$RUNNER_TEMP/target-install"
@@ -460,10 +460,10 @@ jobs:
           set -euo pipefail
           mise exec -- cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
           fx="$PWD/tools/muxe-zellij-foreground/target/debug"
-          test -x "$fx/muxe-zellij-foreground" || { echo "MISSING: built foreground binary"; exit 1; }
-          test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
-          test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
-          test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
+          test -x "$fx/muxe-zellij-foreground" || { echo "Cannot run host tests: $fx/muxe-zellij-foreground is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-bootstrap" || { echo "Cannot run host tests: $fx/muxe-zellij-bootstrap is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-permit" || { echo "Cannot run host tests: $fx/muxe-zellij-permit is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-fault-injector" || { echo "Cannot run host tests: $fx/muxe-zellij-fault-injector is missing or is not executable."; exit 1; }
           # Run isolated fixture tests before the live host test.
           mise exec -- cargo test --locked -p muxe --test live_hosts scoped_spawn
           mise exec -- cargo test --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml

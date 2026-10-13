@@ -4,6 +4,7 @@
 
 - Clarify errors and log messages across the CLI, configuration compiler, menus, brokers, host adapters, protocol handling, installation, and release tools. Replace unexplained implementation terminology with the operation, affected object, and known outcome.
 - Identify the failed operation in privacy-safe command logs. Preserve uncertainty after a request may have reached the host, and avoid exposing host output in cleanup logs.
+- Clarify CI and release workflow failures by naming the missing executable, unsupported platform or release asset, and failed checksum comparison.
 
 ### Testing
 

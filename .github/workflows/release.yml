@@ -61,7 +61,7 @@ jobs:
             test "$GITHUB_REF_TYPE" = tag
             test "$GITHUB_REF_NAME" = "v$version"
           elif [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            echo "unsupported release event: $GITHUB_EVENT_NAME" >&2
+            echo "Cannot run the release workflow for event $GITHUB_EVENT_NAME; only a release-tag push or manual workflow run is supported." >&2
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -131,12 +131,12 @@ jobs:
           file_digest() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot compute SHA-256 checksums: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           manifest_check() {
             if command -v sha256sum >/dev/null 2>&1; then (cd "$2" && sha256sum -c "$1");
             elif command -v shasum >/dev/null 2>&1; then (cd "$2" && shasum -a 256 -c "$1");
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot verify the SHA-256 checksum file: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           test -f dist-wasm/muxe-zellij.wasm
           file dist-wasm/muxe-zellij.wasm | tee wasm-file.out
@@ -209,7 +209,7 @@ jobs:
           manifest_check() {
             if command -v sha256sum >/dev/null 2>&1; then (cd "$2" && sha256sum -c "$1");
             elif command -v shasum >/dev/null 2>&1; then (cd "$2" && shasum -a 256 -c "$1");
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot verify the SHA-256 checksum file: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           test -f bridge-stage/muxe-zellij.wasm
           test -f bridge-stage/muxe-zellij.sha256
@@ -217,7 +217,7 @@ jobs:
           bridge_build_id="$(cat bridge-stage/muxe-zellij.build-id)"
           test "${#bridge_build_id}" -eq 64
           case "$bridge_build_id" in
-            ""|*[!0-9a-f]*) echo "release failure: malformed bridge build ID"; exit 1 ;;
+            ""|*[!0-9a-f]*) echo "Cannot verify the Zellij bridge: bridge-stage/muxe-zellij.build-id must contain a nonempty lowercase hexadecimal build ID."; exit 1 ;;
           esac
           test "$bridge_build_id" != "$(printf '%064d' 0)"
           echo "BRIDGE_BUILD_ID=$bridge_build_id" >> "$GITHUB_ENV"
@@ -232,9 +232,9 @@ jobs:
         run: |
           set -euo pipefail
           expected="$(cut -d' ' -f1 bridge-stage/muxe-zellij.sha256)"
-          test "${#expected}" -eq 64 || { echo "release failure: malformed WebAssembly checksum"; exit 1; }
+          test "${#expected}" -eq 64 || { echo "Cannot build the release executable: the SHA-256 checksum in bridge-stage/muxe-zellij.sha256 must contain exactly 64 characters."; exit 1; }
           case "$expected" in
-            *[!0-9a-f]*) echo "release failure: WebAssembly checksum is not lowercase hex"; exit 1 ;;
+            *[!0-9a-f]*) echo "Cannot build the release executable: the SHA-256 checksum in bridge-stage/muxe-zellij.sha256 must use lowercase hexadecimal digits."; exit 1 ;;
           esac
           echo "MUXE_WASM_SHA256=$expected" >> "$GITHUB_ENV"
       - name: Install musl toolchain
@@ -257,19 +257,19 @@ jobs:
         run: |
           set -euo pipefail
           command -v readelf >/dev/null 2>&1 || {
-            echo "MISSING: readelf (binutils) on this runner"
+            echo "Cannot verify that the Linux executable is statically linked: readelf from binutils is unavailable on PATH."
             exit 1
           }
           bin="target/${{ matrix.target }}/release/muxe"
           # Capture readelf output before matching it. Piping to grep -q can
           # terminate readelf with SIGPIPE before it reports success.
           if ! headers="$(readelf -lW "$bin")"; then
-            echo "release failure: readelf cannot parse $bin"
+            echo "Cannot verify that $bin is statically linked: readelf could not read its ELF program headers."
             exit 1
           fi
           case "$headers" in
             *INTERP*)
-              echo "release failure: $bin carries an ELF interpreter"
+              echo "Cannot publish $bin: it requires an ELF dynamic loader, but Linux release executables must be statically linked."
               exit 1
               ;;
           esac
@@ -280,7 +280,7 @@ jobs:
           fi
           case "$dynamic" in
             *NEEDED*)
-              echo "release failure: $bin carries dynamic dependencies"
+              echo "Cannot publish $bin: it requires shared libraries, but Linux release executables must be statically linked."
               exit 1
               ;;
           esac
@@ -354,12 +354,12 @@ jobs:
           file_digest() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot compute SHA-256 checksums: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           manifest_check() {
             if command -v sha256sum >/dev/null 2>&1; then (cd "$2" && sha256sum -c "$1");
             elif command -v shasum >/dev/null 2>&1; then (cd "$2" && shasum -a 256 -c "$1");
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot verify the SHA-256 checksum file: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           rm -f dist/SHA256SUMS
           for archive in dist/muxe-v*.tar.gz; do
@@ -379,7 +379,7 @@ jobs:
           file_digest() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot compute SHA-256 checksums: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           rm -rf verify-tmp
           mkdir verify-tmp
@@ -403,20 +403,20 @@ jobs:
             if [ -z "$first_digest" ]; then
               first_digest="$digest"
             elif [ "$digest" != "$first_digest" ]; then
-              echo "release failure: WASM bytes differ in $name"
+              echo "Cannot publish $name: its Zellij bridge has a different SHA-256 checksum from the bridge in the first release archive."
               exit 1
             fi
           done
           test "$first_digest" = "$expected" || {
-            echo "release failure: archive WebAssembly checksum $first_digest"
-            echo "does not match the build's recorded checksum $expected"
+            echo "Cannot publish the release archives: their Zellij bridge SHA-256 checksum is $first_digest,"
+            echo "but the WebAssembly build recorded $expected."
             exit 1
           }
       - name: Compare native compatibility reports with WebAssembly build
         run: |
           set -euo pipefail
           command -v jq >/dev/null 2>&1 || {
-            echo "MISSING: jq on this runner"
+            echo "Cannot compare native compatibility reports: the jq command is unavailable on PATH."
             exit 1
           }
           test -f producer/muxe-zellij.build-id
@@ -429,7 +429,7 @@ jobs:
           for report in "${reports[@]}"; do
             report_id="$(jq -r '.hosts.zellij.bridge_build_id' "$report")"
             test "$report_id" = "$bridge_build_id" || {
-              echo "release failure: $report reports bridge ID $report_id, expected $bridge_build_id"
+              echo "Cannot publish the release: $report reports Zellij bridge build ID $report_id, but the WebAssembly build recorded $bridge_build_id."
               exit 1
             }
             test "$(jq -r '.packaged_wasm.sha256' "$report")" = "$expected_sha"
@@ -441,7 +441,7 @@ jobs:
         run: |
           set -euo pipefail
           command -v jq >/dev/null 2>&1 || {
-            echo "MISSING: jq on this runner"
+            echo "Cannot check the Linux executable's compatibility report: the jq command is unavailable on PATH."
             exit 1
           }
           # Read the checksum again: shell variables do not persist across steps.
@@ -461,7 +461,7 @@ jobs:
           test "$bridge_build_id" = "$expected_bridge_build_id"
           test "${#bridge_build_id}" -eq 64
           case "$bridge_build_id" in
-            ""|null|*[!0-9a-f]*) echo "invalid bridge build ID: $bridge_build_id"; exit 1 ;;
+            ""|null|*[!0-9a-f]*) echo "Cannot verify $bin: its compatibility report must contain a nonempty lowercase hexadecimal Zellij bridge build ID, but reported $bridge_build_id."; exit 1 ;;
           esac
           test "$bridge_build_id" != "$(printf '%064d' 0)"
       - name: Attest archive provenance
@@ -550,7 +550,7 @@ jobs:
           file_digest() {
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;
             elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1;
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot compute SHA-256 checksums: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           hasset="${{ matrix.herdr_asset }}"
           hdigest="${{ matrix.herdr_digest }}"
@@ -564,25 +564,25 @@ jobs:
             herdr-linux-x86_64) hkey="linux_x86_64" ;;
             herdr-linux-aarch64) hkey="linux_aarch64" ;;
             herdr-macos-aarch64) hkey="macos_aarch64" ;;
-            *) echo "no pinned Herdr digest key for $hasset"; exit 1 ;;
+            *) echo "Cannot select a SHA-256 checksum from pins/herdr.toml for unrecognized Herdr asset $hasset."; exit 1 ;;
           esac
           pin_digest="$(sed -n "s/^release_${hkey}_sha256 = \"\(.*\)\"$/\1/p" pins/herdr.toml)"
           test "$hdigest" = "$pin_digest" || {
-            echo "Herdr checksum for $hasset does not match pins/herdr.toml"
+            echo "Cannot download Herdr asset $hasset: its workflow matrix checksum $hdigest does not match the checksum $pin_digest in pins/herdr.toml."
             exit 1
           }
           hdir="$RUNNER_TEMP/herdr-host"
           mkdir -p "$hdir"
           curl -fSL "$hrepo/releases/download/v$hver/$hasset" -o "$hdir/herdr"
           test "$(file_digest "$hdir/herdr")" = "$hdigest" || {
-            echo "Herdr release asset digest mismatch for $hasset"
+            echo "Downloaded Herdr asset $hasset does not match the SHA-256 checksum $hdigest configured in pins/herdr.toml."
             exit 1
           }
           chmod 755 "$hdir/herdr"
           if [ "$(uname)" = "Darwin" ] \
             && xattr -p com.apple.quarantine "$hdir/herdr" >/dev/null 2>&1; then
             xattr -d com.apple.quarantine "$hdir/herdr" || {
-              echo "release failure: cannot clear macOS quarantine on $hdir/herdr"
+              echo "Cannot prepare Herdr for release tests: could not remove the macOS quarantine attribute from $hdir/herdr."
               exit 1
             }
           fi
@@ -657,13 +657,13 @@ jobs:
         run: |
           set -euo pipefail
           archive="host-stage/release-hosts-${{ matrix.asset }}.tar.gz"
-          test -f "$archive" || { echo "MISSING: prepared host archive $archive"; exit 1; }
+          test -f "$archive" || { echo "Cannot extract the host executables: $archive is missing or is not a regular file."; exit 1; }
           root="$RUNNER_TEMP/release-hosts"
           rm -rf "$root"
           mkdir -p "$root"
           tar -xzf "$archive" -C "$root"
-          test -x "$root/bin/zellij" || { echo "MISSING: prepared Zellij"; exit 1; }
-          test -x "$root/bin/herdr" || { echo "MISSING: prepared Herdr"; exit 1; }
+          test -x "$root/bin/zellij" || { echo "Cannot run release tests: $root/bin/zellij is missing or is not executable."; exit 1; }
+          test -x "$root/bin/herdr" || { echo "Cannot run release tests: $root/bin/herdr is missing or is not executable."; exit 1; }
           {
             echo "MUXE_ZELLIJ_BINARY=$root/bin/zellij"
             echo "MUXE_HERDR_BINARY=$root/bin/herdr"
@@ -681,24 +681,24 @@ jobs:
           version="$RELEASE_VERSION"
           archive="target-dist/muxe-v${version}-${{ matrix.asset }}.tar.gz"
           test -f "$archive" || {
-            echo "MISSING: current target archive $archive"
+            echo "Cannot extract the release installation: $archive is missing or is not a regular file."
             exit 1
           }
           rm -rf "$RUNNER_TEMP/target-install"
           mkdir -p "$RUNNER_TEMP/target-install"
           tar -xzf "$archive" -C "$RUNNER_TEMP/target-install"
           root="$RUNNER_TEMP/target-install/muxe-v${version}-${{ matrix.asset }}"
-          test -x "$root/muxe" || { echo "MISSING: target executable"; exit 1; }
+          test -x "$root/muxe" || { echo "Cannot run release tests: $root/muxe is missing or is not executable."; exit 1; }
           test -f "$root/lib/muxe/muxe-zellij.wasm" || {
-            echo "MISSING: target bridge WASM"
+            echo "Cannot run release tests: the Zellij bridge file $root/lib/muxe/muxe-zellij.wasm is missing or is not a regular file."
             exit 1
           }
           test ! -e "$root/bin/muxe" || {
-            echo "INVALID: target archive uses a bin-nested executable"
+            echo "Cannot run release tests: the archive contains $root/bin/muxe, but the executable must be at $root/muxe."
             exit 1
           }
           test "$("$root/muxe" --version | cut -d' ' -f2)" = "$version" || {
-            echo "target binary version mismatch"
+            echo "Cannot run release tests: $root/muxe does not report the expected release version $version."
             exit 1
           }
           echo "MUXE_TARGET_INSTALLATION=$root" >> "$GITHUB_ENV"
@@ -707,10 +707,10 @@ jobs:
           set -euo pipefail
           mise exec -- cargo build --locked --manifest-path tools/muxe-zellij-foreground/Cargo.toml --bins
           fx="$PWD/tools/muxe-zellij-foreground/target/debug"
-          test -x "$fx/muxe-zellij-foreground" || { echo "MISSING: built foreground binary"; exit 1; }
-          test -x "$fx/muxe-zellij-bootstrap" || { echo "MISSING: built bootstrap binary"; exit 1; }
-          test -x "$fx/muxe-zellij-permit" || { echo "MISSING: built permission seeder"; exit 1; }
-          test -x "$fx/muxe-zellij-fault-injector" || { echo "MISSING: built fault-injector binary"; exit 1; }
+          test -x "$fx/muxe-zellij-foreground" || { echo "Cannot run release tests: $fx/muxe-zellij-foreground is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-bootstrap" || { echo "Cannot run release tests: $fx/muxe-zellij-bootstrap is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-permit" || { echo "Cannot run release tests: $fx/muxe-zellij-permit is missing or is not executable."; exit 1; }
+          test -x "$fx/muxe-zellij-fault-injector" || { echo "Cannot run release tests: $fx/muxe-zellij-fault-injector is missing or is not executable."; exit 1; }
           {
             echo "MUXE_ZELLIJ_FOREGROUND_BINARY=$fx/muxe-zellij-foreground"
             echo "MUXE_ZELLIJ_BOOTSTRAP_BINARY=$fx/muxe-zellij-bootstrap"
@@ -748,7 +748,7 @@ jobs:
           manifest_check() {
             if command -v sha256sum >/dev/null 2>&1; then (cd "$2" && sha256sum -c "$1");
             elif command -v shasum >/dev/null 2>&1; then (cd "$2" && shasum -a 256 -c "$1");
-            else echo "MISSING: no sha256sum or shasum on this runner"; return 1; fi
+            else echo "Cannot verify the SHA-256 checksum file: neither sha256sum nor shasum is available on PATH."; return 1; fi
           }
           archives=(dist/muxe-v*.tar.gz)
           test "${#archives[@]}" -eq 3
