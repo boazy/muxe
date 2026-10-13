@@ -1,3 +1,14 @@
+## [Unreleased]
+
+### Bug fixes
+
+- Clarify errors and log messages across the CLI, configuration compiler, menus, brokers, host adapters, protocol handling, installation, and release tools. Replace unexplained implementation terminology with the operation, affected object, and known outcome.
+- Identify the failed operation in privacy-safe command logs. Preserve uncertainty after a request may have reached the host, and avoid exposing host output in cleanup logs.
+
+### Testing
+
+- Remove assertions that pin human error wording while retaining error codes, source locations, privacy checks, and lifecycle behavior checks.
+
 ## [0.4.2] - 2026-10-12
 
 ### 🐛 Bug Fixes

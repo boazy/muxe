@@ -445,10 +445,12 @@ If the menu does not open when pressing your hotkey:
 
 - **Check PATH**: Verify that the multiplexer process inherits a `PATH` containing `muxe`. Run `command -v muxe` from a pane inside your multiplexer session.
 - **Test direct execution**: Run `muxe ui menu main` (in Zellij) or `muxe menu open main` (in Herdr) directly from a shell prompt to observe immediate error output.
-- **Inspect logs**: Check persistent logs at `$CACHE_DIR/logs/muxe.jsonl` (default: `~/.cache/muxe/logs/muxe.jsonl`). Native command failures add a payload-free event; stderr retains the complete diagnostic. Herdr notifications are best-effort; the log file is authoritative.
+- **Inspect logs**: Check persistent logs at `$CACHE_DIR/logs/muxe.jsonl` (default: `~/.cache/muxe/logs/muxe.jsonl`). Command-failure events name the failed operation without copying private arguments or configuration values. Read the command's terminal error output for its detailed cause. Herdr notifications are best-effort.
 - **Zellij permissions**: In Zellij, confirm that you accepted the host-owned permission prompt displayed when the bridge plugin loaded.
 
 If an action fails after its menu closes, inspect the `detached-execution` event in the same log. Its `message` retains a classified, payload-free reason, including command-pane verification or repair failures and an unavailable saved origin. The `request_id` is the execution's 32-digit hexadecimal identity. Logs omit host response text, command arguments, environment values, and command output.
+
+Use the log's `operation`, `code`, and `request_id` fields to identify and correlate failures; the `message` text explains them for people and can change between releases. An unknown result means the action may have run. Check the host before repeating it. Configuration errors identify the offending field and source location where available.
 
 ## Upgrades, activation, and rollback
 
