@@ -4,7 +4,7 @@
 
 Muxe is a modal menu system for terminal multiplexers, inspired by `which-key`. When you press a configured hotkey in your multiplexer, Muxe opens a temporary menu bar that displays available keys, nested submenus, and actions.
 
-Muxe supports **Zellij** 0.46.0 and **Herdr** 0.8.2 or newer. The latest verified Herdr release is 0.9.3. See [Compatibility](#compatibility) for the version policy.
+Muxe supports **Zellij** 0.46.0 and **Herdr** 0.8.2 or newer. The latest verified Herdr release is 0.9.5. See [Compatibility](#compatibility) for the version policy.
 
 CI and lifecycle smoke tests require Zellij built from the exact source revision in [`pins/zellij.toml`](pins/zellij.toml): [`81f56e1aed4e17b822af5cb382a8f524e35f3eae`](https://github.com/zellij-org/zellij/commit/81f56e1aed4e17b822af5cb382a8f524e35f3eae). This revision fixes duplicate client cleanup and immediate client-ID reuse. Zellij still reports version `0.46.0`, so that version string alone does not establish that a binary contains the fix.
 
@@ -539,7 +539,7 @@ This command reads metadata built into the binary. It does not probe running hos
 | Multiplexer | Minimum supported | Latest verified |
 | ----------- | ----------------- | --------------- |
 | Zellij      | 0.46.0            | 0.46.0          |
-| Herdr       | 0.8.2             | 0.9.3           |
+| Herdr       | 0.8.2             | 0.9.5           |
 
 ### Herdr version policy
 
