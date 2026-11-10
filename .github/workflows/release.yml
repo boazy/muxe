@@ -487,15 +487,15 @@ jobs:
           - asset: linux-x64
             os: ubuntu-24.04
             herdr_asset: herdr-linux-x86_64
-            herdr_digest: 976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4
+            herdr_digest: 14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
           - asset: linux-arm64
             os: ubuntu-24.04-arm
             herdr_asset: herdr-linux-aarch64
-            herdr_digest: f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d
+            herdr_digest: 17d7536f2da50859523680ef279dffcac8e4a235f4e46fe8da6c2ec44141897c
           - asset: macos-arm64
             os: macos-15
             herdr_asset: herdr-macos-aarch64
-            herdr_digest: a5d4f4d504d8b309c91f811050559300faba31258425f53c50852fc96f6ae574
+            herdr_digest: fb77c2232a05a8035421382c894392f4174e4e38a18e48af3dd0290157c3a7e2
     runs-on: ${{ matrix.os }}
     env:
       ALLOW_LIVE_HOST_MATRIX: ${{ vars.ALLOW_LIVE_HOST_MATRIX }}

@@ -20,7 +20,7 @@ pub const ZELLIJ_LATEST_VERIFIED: &str = "0.46.0";
 pub const HERDR_MINIMUM: HerdrRelease = HerdrRelease::MINIMUM_SUPPORTED;
 /// Latest Herdr release verified against this build. It is reported only;
 /// Muxe accepts newer Herdr releases under every `version.check` policy.
-pub const HERDR_LATEST_VERIFIED: HerdrRelease = HerdrRelease::new(0, 9, 3);
+pub const HERDR_LATEST_VERIFIED: HerdrRelease = HerdrRelease::new(0, 9, 5);
 
 #[derive(Debug, Error)]
 pub enum CompatibilityError {
